@@ -141,8 +141,8 @@ start_ollama() {
         nohup ollama serve >"$HOME/.wizard/logs/ollama.log" 2>&1 &
     fi
 
-    local i
-    for i in $(seq 1 30); do
+    local _try
+    for _try in $(seq 1 30); do
         if ollama_running; then
             say "Ollama server is up"
             return
@@ -288,7 +288,10 @@ choose_model() {
             while true; do
                 ask mf "Path to Modelfile: "
                 [ -z "$mf" ] && continue
-                # Expand a leading ~ since the answer is not shell-expanded.
+                # Expand a leading ~ since the answer is not shell-expanded
+                # (the literal ~ in the patterns is intentional: it is what
+                # the user typed, not a path we expect the shell to expand).
+                # shellcheck disable=SC2088
                 case "$mf" in
                     "~/"*) mf="$HOME/${mf#\~/}" ;;
                     "~")   mf="$HOME" ;;

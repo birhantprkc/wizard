@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "Releasing version ${cargo_version}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          strip target/release/wizard
+          tar -C target/release -czf "wizard-${{ matrix.target }}.tar.gz" wizard
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wizard-${{ matrix.target }}
+          path: wizard-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum -- *.tar.gz > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          files: |
+            wizard-x86_64-unknown-linux-gnu.tar.gz
+            wizard-aarch64-unknown-linux-gnu.tar.gz
+            checksums.txt

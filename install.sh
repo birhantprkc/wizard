@@ -131,8 +131,8 @@ start_ollama() {
         nohup ollama serve >"$HOME/.wizard/logs/ollama.log" 2>&1 &
     fi
 
-    local i
-    for i in $(seq 1 30); do
+    local _try
+    for _try in $(seq 1 30); do
         if ollama_running; then
             say "Ollama server is up"
             return
@@ -144,23 +144,70 @@ start_ollama() {
 
 # --- model tier selection -----------------------------------------------
 
+is_uint() {
+    # True if $1 is a non-empty string of digits (safe for arithmetic).
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 detect_memory() {
     # Prefer GPU VRAM (largest single GPU — the model must fit on one card),
     # fall back to system RAM as a heuristic on CPU-only machines.
+    # On total detection failure, leave MEM_SOURCE empty so the caller can
+    # fall back to the smallest tier instead of dying.
+
+    # NVIDIA: nvidia-smi can exist but print nothing or garbage (driver
+    # mismatch, headless cloud images) — only trust a plain number.
     if command -v nvidia-smi >/dev/null 2>&1; then
         local vram_mib
         vram_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
             | sort -nr | head -n1 | tr -d '[:space:]' || true)"
-        if [ -n "$vram_mib" ] && [ "$vram_mib" -gt 0 ] 2>/dev/null; then
+        if is_uint "$vram_mib" && [ "$vram_mib" -gt 0 ]; then
             MEM_GB=$((vram_mib / 1024))
             MEM_SOURCE="GPU VRAM (nvidia-smi)"
             return
         fi
+        warn "nvidia-smi is present but did not report usable VRAM (driver mismatch?) — ignoring it"
     fi
+
+    # AMD: rocm-smi if present, else the amdgpu sysfs VRAM counter (bytes).
+    if command -v rocm-smi >/dev/null 2>&1; then
+        local vram_b
+        vram_b="$(rocm-smi --showmeminfo vram --csv 2>/dev/null \
+            | awk -F, '$2 ~ /^[0-9]+$/ {print $2}' | sort -nr | head -n1 || true)"
+        if is_uint "$vram_b" && [ "$vram_b" -gt 0 ]; then
+            MEM_GB=$((vram_b / 1024 / 1024 / 1024))
+            MEM_SOURCE="GPU VRAM (rocm-smi)"
+            return
+        fi
+        warn "rocm-smi is present but did not report usable VRAM — ignoring it"
+    fi
+    local sysfs_file vram_b best=0
+    for sysfs_file in /sys/class/drm/card[0-9]*/device/mem_info_vram_total; do
+        [ -r "$sysfs_file" ] || continue
+        vram_b="$(cat "$sysfs_file" 2>/dev/null || true)"
+        if is_uint "$vram_b" && [ "$vram_b" -gt "$best" ]; then
+            best="$vram_b"
+        fi
+    done
+    if [ "$best" -gt 0 ]; then
+        MEM_GB=$((best / 1024 / 1024 / 1024))
+        MEM_SOURCE="GPU VRAM (sysfs amdgpu)"
+        return
+    fi
+
     local mem_kb
-    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-    MEM_GB=$((mem_kb / 1024 / 1024))
-    MEM_SOURCE="system RAM (no GPU detected)"
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+    if is_uint "$mem_kb" && [ "$mem_kb" -gt 0 ]; then
+        MEM_GB=$((mem_kb / 1024 / 1024))
+        MEM_SOURCE="system RAM (no GPU detected)"
+        return
+    fi
+
+    MEM_GB=0
+    MEM_SOURCE=""
 }
 
 select_model() {
@@ -171,6 +218,12 @@ select_model() {
     fi
 
     detect_memory
+    if [ -z "$MEM_SOURCE" ]; then
+        MODEL="qwen3.5:9b"
+        warn "could not detect GPU VRAM or system RAM — falling back to the smallest model tier"
+        say "Selected model tier: ${MODEL} (override with WIZARD_MODEL=<tag>)"
+        return
+    fi
     say "Detected ${MEM_GB} GB of ${MEM_SOURCE}"
 
     if [ "$MEM_GB" -ge 24 ]; then
@@ -230,11 +283,37 @@ place_binary() {
     INSTALLED_PATH="${WIZARD_INSTALL_DIR}/wizard"
 }
 
+verify_checksum() {
+    # $1 = path to the downloaded tarball, $2 = asset name.
+    # Missing checksums.txt (older release) is a warning; a mismatch is fatal.
+    local tarball="$1" asset="$2" sums="${TMP_DIR}/checksums.txt" expected actual
+    if [ ! -f "$sums" ] \
+        && ! curl -fsSL -o "$sums" "${RELEASE_BASE}/checksums.txt" 2>/dev/null; then
+        warn "release has no checksums.txt — skipping checksum verification"
+        return
+    fi
+    expected="$(awk -v a="$asset" '$2 == a {print $1; exit}' "$sums" || true)"
+    if [ -z "$expected" ]; then
+        warn "checksums.txt has no entry for ${asset} — skipping checksum verification"
+        return
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        warn "sha256sum not found on PATH — skipping checksum verification"
+        return
+    fi
+    actual="$(sha256sum "$tarball" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}) — the download may be corrupted or tampered with; aborting"
+    fi
+    say "Checksum verified for ${asset}"
+}
+
 download_binary() {
     say "Downloading wizard binary from GitHub releases (${REPO}) ..."
     local asset bin
     for asset in "wizard-${ARCH}-unknown-linux-gnu.tar.gz" "wizard-linux-${ARCH}.tar.gz"; do
         if curl -fsSL -o "${TMP_DIR}/${asset}" "${RELEASE_BASE}/${asset}" 2>/dev/null; then
+            verify_checksum "${TMP_DIR}/${asset}" "${asset}"
             tar -xzf "${TMP_DIR}/${asset}" -C "$TMP_DIR" || continue
             bin="$(find "$TMP_DIR" -type f -name wizard | head -n1 || true)"
             if [ -n "$bin" ]; then
