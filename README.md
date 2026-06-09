@@ -107,6 +107,7 @@ Sessions are stored in `~/.wizard/sessions/`. Evolution history in `~/.wizard/ev
 | `/clear` | Clear conversation |
 | `/model` | Show or switch model |
 | `/mode` | Switch genie ↔ sovereign |
+| `/genie` / `/sovereign` | Switch mode directly |
 | `/evolve` | Self-extension: add skills, MCP servers, scripted tools (`--deep` rebuilds core) |
 | `/reload` | Reload skills, tools, and MCP servers without restart |
 | `/diff` | Show git diff sidebar |

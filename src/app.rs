@@ -105,6 +105,8 @@ impl SlashCommand {
                 Some(&"sovereign") => Ok(Self::Mode(Some(Mode::Sovereign))),
                 Some(other) => Err(format!("unknown mode '{other}' (genie|sovereign)")),
             },
+            "genie" => Ok(Self::Mode(Some(Mode::Genie))),
+            "sovereign" => Ok(Self::Mode(Some(Mode::Sovereign))),
             "evolve" => {
                 let deep = args.first() == Some(&"--deep");
                 let description = if deep { &args[1..] } else { &args[..] }.join(" ");
@@ -148,6 +150,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "mode",
         args: "[genie|sovereign]",
         description: "pick or switch personality mode",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "genie",
+        args: "",
+        description: "switch to genie mode",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "sovereign",
+        args: "",
+        description: "switch to sovereign mode",
         takes_args: false,
     },
     CommandSpec {
@@ -1141,6 +1155,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /clear                      clear the conversation\n  \
 /model [tag]                pick a model interactively, or switch directly\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
+/genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
@@ -1668,6 +1683,18 @@ mod tests {
             action,
             Some(AppAction::Command(SlashCommand::Mode(None)))
         ));
+    }
+
+    #[test]
+    fn genie_and_sovereign_parse_as_mode_switches() {
+        assert_eq!(
+            SlashCommand::parse("/genie"),
+            Some(Ok(SlashCommand::Mode(Some(Mode::Genie))))
+        );
+        assert_eq!(
+            SlashCommand::parse("/sovereign"),
+            Some(Ok(SlashCommand::Mode(Some(Mode::Sovereign))))
+        );
     }
 
     #[test]

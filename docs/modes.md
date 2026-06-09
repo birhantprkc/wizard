@@ -90,6 +90,8 @@ wizard --mode sovereign \
 ```
 /mode sovereign    # switch to autonomous behavior (still in TUI)
 /mode genie        # switch back to interactive confirmations
+/sovereign         # shorthand for /mode sovereign
+/genie             # shorthand for /mode genie
 ```
 
 Mode changes affect prompting and auto-approve behavior for the current session. The choice is not persisted unless you update `~/.wizard/config.toml`.
