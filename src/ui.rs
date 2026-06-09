@@ -381,7 +381,8 @@ fn tool_card_lines(
 }
 
 /// Git diff sidebar (`/diff`): separated from the chat by a single dim
-/// rule, syntax-highlighted (foreground colors only).
+/// rule, syntax-highlighted (foreground colors only). Lines wider than
+/// the sidebar are cut with a dim `…` instead of clipping silently.
 fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::new()
         .borders(Borders::LEFT)
@@ -390,8 +391,13 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" ± ", accent()),
             Span::styled("git diff", Style::default().fg(TEXT_DIM)),
         ]));
-    let paragraph = Paragraph::new(highlight_diff(&app.diff_text)).block(block);
-    frame.render_widget(paragraph, area);
+    let inner_width = block.inner(area).width as usize;
+    let lines: Vec<Line<'static>> = highlight_diff(&app.diff_text)
+        .lines
+        .into_iter()
+        .map(|line| truncate_line(line, inner_width))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 /// Bottom status line: model, mode, and turn state on the left; contextual
@@ -469,12 +475,21 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         .max(1);
 
     if app.input_mode == InputMode::Approval {
+        let placeholder = "awaiting approval — y approve · n deny";
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled("❯ ", dim().bold()),
-            Span::styled("awaiting approval — y approve · n deny", dim().italic()),
+            Span::styled(placeholder, dim().italic()),
         ]);
         frame.render_widget(Paragraph::new(Text::from(vec![rule, line])), area);
+        // Input is disabled: park the cursor in the gap after the
+        // placeholder, never on top of it. Without this the cursor stays
+        // where the last editable frame left it — the placeholder's first
+        // cell — and terminals/recorders that ignore cursor-hide draw a
+        // block over the text ("❯ ▌waiting approval").
+        let after = (pad + prompt_width + placeholder.width() + 1) as u16;
+        let cursor_x = (area.x + after).min(area.right().saturating_sub(1));
+        frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
         return;
     }
 
@@ -752,36 +767,252 @@ fn draw_approval_modal(frame: &mut Frame, app: &App) {
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs
 /// count as two) so the transcript can be pinned exactly to its bottom.
-/// A wide char that no longer fits wraps to the next line first;
-/// zero-width chars (combining marks) always stay with their base char.
+/// Wrapping is word-aware: a line breaks at the last space that fits, and
+/// only falls back to splitting mid-word when a single word exceeds the
+/// content width. Continuation lines keep the hanging indent of their
+/// source line (see [`hanging_indent`]), so gutter-indented content stays
+/// aligned under its text column. A wide char that no longer fits wraps to
+/// the next line first; zero-width chars (combining marks) always stay
+/// with their base char.
 fn wrap_lines(text: Text<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
     for line in text.lines {
-        let mut current: Vec<Span<'static>> = Vec::new();
-        let mut used = 0usize;
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let indent = hanging_indent(&line).min(width.saturating_sub(1));
+        let mut wrapper = LineWrapper::new(width, indent, &line);
         for span in line.spans {
             let style = span.style;
-            let mut buffer = String::new();
             for ch in span.content.chars() {
-                let ch_width = ch.width().unwrap_or(0);
-                if ch_width > 0 && used + ch_width > width && used > 0 {
-                    if !buffer.is_empty() {
-                        current.push(Span::styled(std::mem::take(&mut buffer), style));
-                    }
-                    out.push(Line::from(std::mem::take(&mut current)));
-                    used = 0;
-                }
-                buffer.push(ch);
-                used += ch_width;
-            }
-            if !buffer.is_empty() {
-                current.push(Span::styled(buffer, style));
+                wrapper.feed(ch, style);
             }
         }
-        out.push(Line::from(current));
+        out.append(&mut wrapper.finish());
     }
     out
+}
+
+/// Hanging indent (in display columns) for wrapped continuations of `line`:
+/// its leading spaces plus one optional short gutter mark — at most two
+/// columns of non-alphanumeric glyphs followed by a space, e.g. `❯ `, `· `,
+/// `✓ `, `  • `, `▌ `. This is how [`gutter_block`], tool cards, notices,
+/// and markdown bullets communicate their text column, so continuation
+/// lines stay aligned under it. Lines without such a prefix wrap to
+/// column 0.
+fn hanging_indent(line: &Line) -> usize {
+    let mut chars = line.spans.iter().flat_map(|span| span.content.chars());
+    let mut indent = 0usize;
+    let mut next = chars.next();
+    while let Some(ch) = next {
+        if ch != ' ' {
+            break;
+        }
+        indent += 1;
+        next = chars.next();
+    }
+    let mut mark = 0usize;
+    while let Some(ch) = next {
+        if ch == ' ' {
+            // Mark plus its trailing space hang the rest of the message.
+            return if mark > 0 { indent + mark + 1 } else { indent };
+        }
+        if ch.is_alphanumeric() || mark + ch.width().unwrap_or(0) > 2 {
+            return indent;
+        }
+        mark += ch.width().unwrap_or(0);
+        next = chars.next();
+    }
+    indent
+}
+
+/// Word-aware wrapping state for one source line. Characters are fed in
+/// one at a time (with their span style); words are held back until a
+/// space proves they are complete, then committed to the current output
+/// line or wrapped whole onto the next. Styles are preserved across
+/// breaks by carrying (text, style) runs rather than raw strings.
+struct LineWrapper {
+    width: usize,
+    /// Columns every continuation line starts with (hanging indent).
+    indent: usize,
+    /// Column the current output line started at: 0 for the first line,
+    /// `indent` afterwards.
+    start: usize,
+    /// Display columns used on the current output line.
+    used: usize,
+    current: Vec<(String, Style)>,
+    /// Word being accumulated, not yet committed to `current`.
+    word: Vec<(String, Style)>,
+    word_cols: usize,
+    /// Spaces seen since the last word, held back so a wrap can eat them.
+    spaces: Vec<(String, Style)>,
+    space_cols: usize,
+    /// Line-level style/alignment of the source line, re-applied to every
+    /// wrapped piece.
+    line_style: Style,
+    alignment: Option<Alignment>,
+    done: Vec<Line<'static>>,
+}
+
+impl LineWrapper {
+    fn new(width: usize, indent: usize, line: &Line<'static>) -> Self {
+        Self {
+            width,
+            indent,
+            start: 0,
+            used: 0,
+            current: Vec::new(),
+            word: Vec::new(),
+            word_cols: 0,
+            spaces: Vec::new(),
+            space_cols: 0,
+            line_style: line.style,
+            alignment: line.alignment,
+            done: Vec::new(),
+        }
+    }
+
+    /// Append one char to a run buffer, merging consecutive equal styles.
+    fn push_run(buffer: &mut Vec<(String, Style)>, ch: char, style: Style) {
+        match buffer.last_mut() {
+            Some((text, last)) if *last == style => text.push(ch),
+            _ => buffer.push((ch.to_string(), style)),
+        }
+    }
+
+    /// Move every run in `from` onto the end of `to`, merging styles.
+    fn append_runs(to: &mut Vec<(String, Style)>, from: &mut Vec<(String, Style)>) {
+        for (text, style) in from.drain(..) {
+            match to.last_mut() {
+                Some((last_text, last)) if *last == style => last_text.push_str(&text),
+                _ => to.push((text, style)),
+            }
+        }
+    }
+
+    fn feed(&mut self, ch: char, style: Style) {
+        if ch == ' ' {
+            self.commit_word();
+            Self::push_run(&mut self.spaces, ch, style);
+            self.space_cols += 1;
+            return;
+        }
+        let ch_width = ch.width().unwrap_or(0);
+        if ch_width == 0 && self.word.is_empty() && !self.spaces.is_empty() {
+            // A combining mark right after a space stays with that space.
+            Self::push_run(&mut self.spaces, ch, style);
+            return;
+        }
+        Self::push_run(&mut self.word, ch, style);
+        self.word_cols += ch_width;
+    }
+
+    /// Commit the buffered word: onto the current line when it fits after
+    /// the held spaces, else onto a fresh continuation line (the break
+    /// eats the spaces), hard-splitting only when the word alone exceeds
+    /// the content width.
+    fn commit_word(&mut self) {
+        if self.word.is_empty() {
+            return;
+        }
+        if self.used + self.space_cols + self.word_cols <= self.width {
+            self.flush_spaces();
+            self.flush_word();
+            return;
+        }
+        if self.used > self.start {
+            self.spaces.clear();
+            self.space_cols = 0;
+            self.newline();
+        } else {
+            // Line start: keep the source line's leading whitespace.
+            self.flush_spaces();
+        }
+        if self.used + self.word_cols <= self.width {
+            self.flush_word();
+        } else {
+            self.hard_split();
+        }
+    }
+
+    fn flush_spaces(&mut self) {
+        Self::append_runs(&mut self.current, &mut self.spaces);
+        self.used += self.space_cols;
+        self.space_cols = 0;
+    }
+
+    fn flush_word(&mut self) {
+        Self::append_runs(&mut self.current, &mut self.word);
+        self.used += self.word_cols;
+        self.word_cols = 0;
+    }
+
+    /// Char-level fallback for a word wider than the content width. A wide
+    /// char that no longer fits wraps first; zero-width chars (combining
+    /// marks) never split from their base char.
+    fn hard_split(&mut self) {
+        for (text, style) in std::mem::take(&mut self.word) {
+            for ch in text.chars() {
+                let ch_width = ch.width().unwrap_or(0);
+                if ch_width > 0 && self.used + ch_width > self.width && self.used > self.start {
+                    self.newline();
+                }
+                Self::push_run(&mut self.current, ch, style);
+                self.used += ch_width;
+            }
+        }
+        self.word_cols = 0;
+    }
+
+    /// Emit the current line and open a continuation at the hanging indent.
+    fn newline(&mut self) {
+        self.emit();
+        if self.indent > 0 {
+            self.current
+                .push((" ".repeat(self.indent), Style::default()));
+        }
+        self.used = self.indent;
+        self.start = self.indent;
+    }
+
+    fn emit(&mut self) {
+        let spans: Vec<Span<'static>> = std::mem::take(&mut self.current)
+            .into_iter()
+            .map(|(text, style)| Span::styled(text, style))
+            .collect();
+        let mut line = Line::from(spans);
+        line.style = self.line_style;
+        line.alignment = self.alignment;
+        self.done.push(line);
+    }
+
+    fn finish(&mut self) -> Vec<Line<'static>> {
+        self.commit_word();
+        if self.used + self.space_cols <= self.width {
+            // Trailing spaces that still fit are kept verbatim.
+            self.flush_spaces();
+        }
+        self.emit();
+        std::mem::take(&mut self.done)
+    }
+}
+
+/// Longest prefix of `text` that fits in `max` display columns (zero-width
+/// chars at the boundary stay attached).
+fn take_width(text: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in text.char_indices() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > max {
+            break;
+        }
+        used += ch_width;
+        end = index + ch.len_utf8();
+    }
+    &text[..end]
 }
 
 /// Truncate to `max` display columns (not chars), appending `…` when cut.
@@ -789,19 +1020,37 @@ fn truncate_width(text: &str, max: usize) -> String {
     if text.width() <= max {
         return text.to_string();
     }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if used + ch_width > budget {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
+    let mut out = take_width(text, max.saturating_sub(1)).to_string();
     out.push('…');
     out
+}
+
+/// Truncate a styled line to `max` display columns, appending a dim `…`
+/// when cut so clipped content is visible as such (used by the diff
+/// sidebar, where long lines would otherwise just stop mid-word).
+fn truncate_line(mut line: Line<'static>, max: usize) -> Line<'static> {
+    if line.width() <= max {
+        return line;
+    }
+    let budget = max.saturating_sub(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans.drain(..) {
+        let span_width = span.content.width();
+        if used + span_width <= budget {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        let kept = take_width(&span.content, budget - used);
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept.to_string(), span.style));
+        }
+        break;
+    }
+    spans.push(Span::styled("…", dim()));
+    line.spans = spans;
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,5 +1484,123 @@ impl MarkdownRenderer {
             self.lines.pop();
         }
         Text::from(self.lines)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten a line's spans into one comparable string.
+    fn flat(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn flats(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(flat).collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundaries() {
+        let lines = wrap_lines(Text::from(Line::raw("the quick brown fox")), 10);
+        assert_eq!(flats(&lines), ["the quick", "brown fox"]);
+    }
+
+    #[test]
+    fn wrap_moves_whole_word_instead_of_splitting() {
+        // The recorded defect: "one occurrence" split as "on / e occurrence".
+        let lines = wrap_lines(Text::from(Line::raw("one occurrence")), 12);
+        assert_eq!(flats(&lines), ["one", "occurrence"]);
+    }
+
+    #[test]
+    fn wrap_hard_splits_word_longer_than_width() {
+        let lines = wrap_lines(Text::from(Line::raw("abcdefghijkl")), 5);
+        assert_eq!(flats(&lines), ["abcde", "fghij", "kl"]);
+    }
+
+    #[test]
+    fn wrap_continuations_keep_hanging_indent() {
+        let line = Line::from(vec![
+            Span::styled("· ", accent()),
+            Span::raw("alpha beta gamma"),
+        ]);
+        let lines = wrap_lines(Text::from(line), 9);
+        assert_eq!(flats(&lines), ["· alpha", "  beta", "  gamma"]);
+        // The marker keeps its accent style; continuations stay raw.
+        assert_eq!(lines[0].spans[0].style, accent());
+    }
+
+    #[test]
+    fn wrap_keeps_styles_across_span_boundary_in_one_word() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        // "main.py" is one word spanning two styled spans: it must move to
+        // the next line whole, with both styles intact.
+        let line = Line::from(vec![
+            Span::styled("run ma", red),
+            Span::styled("in.py", blue),
+        ]);
+        let lines = wrap_lines(Text::from(line), 7);
+        assert_eq!(flats(&lines), ["run", "main.py"]);
+        assert_eq!(lines[1].spans[0].content.as_ref(), "ma");
+        assert_eq!(lines[1].spans[0].style, red);
+        assert_eq!(lines[1].spans[1].content.as_ref(), "in.py");
+        assert_eq!(lines[1].spans[1].style, blue);
+    }
+
+    #[test]
+    fn wrap_wide_chars_never_exceed_width() {
+        let lines = wrap_lines(Text::from(Line::raw("日本語のテスト")), 5);
+        assert_eq!(flats(&lines), ["日本", "語の", "テス", "ト"]);
+        for line in &lines {
+            assert!(line.width() <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_combining_marks_with_base_char() {
+        let lines = wrap_lines(Text::from(Line::raw("e\u{301}".repeat(5))), 3);
+        assert_eq!(flats(&lines), ["e\u{301}".repeat(3), "e\u{301}".repeat(2)]);
+    }
+
+    #[test]
+    fn wrap_leaves_short_lines_untouched() {
+        let line = Line::from(vec![Span::styled("❯ ", dim()), Span::raw("hi")]);
+        let lines = wrap_lines(Text::from(line.clone()), 10);
+        assert_eq!(lines, vec![line]);
+    }
+
+    #[test]
+    fn hanging_indent_detects_gutter_marks() {
+        assert_eq!(hanging_indent(&Line::raw("❯ hello")), 2);
+        assert_eq!(hanging_indent(&Line::raw("· hello")), 2);
+        assert_eq!(hanging_indent(&Line::raw("✓ tool")), 2);
+        assert_eq!(hanging_indent(&Line::raw("  • item")), 4);
+        assert_eq!(hanging_indent(&Line::raw("  plain")), 2);
+        assert_eq!(hanging_indent(&Line::raw("plain text")), 0);
+        // A dim rule is not a mark (wider than two columns of glyphs).
+        assert_eq!(hanging_indent(&Line::raw("────────")), 0);
+    }
+
+    #[test]
+    fn truncate_line_cuts_with_dim_ellipsis() {
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![Span::raw("abc"), Span::styled("defgh", red)]);
+        let out = truncate_line(line, 5);
+        assert_eq!(flat(&out), "abcd…");
+        assert_eq!(out.spans[1].style, red);
+        assert_eq!(out.spans.last().unwrap().content.as_ref(), "…");
+        assert_eq!(out.spans.last().unwrap().style, dim());
+        assert!(out.width() <= 5);
+    }
+
+    #[test]
+    fn truncate_line_leaves_fitting_lines_alone() {
+        let line = Line::raw("short");
+        assert_eq!(truncate_line(line.clone(), 10), line);
     }
 }

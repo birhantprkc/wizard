@@ -2,7 +2,7 @@
 
 **One line. Your sovereign coding wizard. Self-extending. Fully local.**
 
-<!-- demo.gif -->
+![Wizard fixing a bug: prompt, approval modal, tool call, diff](demo/demo.gif)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
