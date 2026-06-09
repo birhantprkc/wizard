@@ -15,7 +15,7 @@ The installer:
 3. Starts the Ollama server if needed
 4. Selects a model tier based on available VRAM
 5. Pulls the model from the official Ollama library
-6. Downloads the `wizard` binary from GitHub releases
+6. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
 7. Writes `~/.wizard/config.toml`
 
 ### Model tiers (automatic)
@@ -27,7 +27,9 @@ The installer:
 | 8–18 GB | `qwen3.5:9b` | ~6 GB |
 | < 8 GB | `qwen3.5:9b` (CPU / partial offload — slower) | ~6 GB |
 
-Tiers are ordered so the model's **total** footprint fits the available memory — note that an MoE model still needs all expert weights resident, so `qwen3.6:35b` lands in the top tier despite its small active-parameter count. VRAM is detected via `nvidia-smi` when a GPU is present. On CPU-only systems, the installer uses available system RAM as a heuristic.
+Tiers are ordered so the model's **total** footprint fits the available memory — note that an MoE model still needs all expert weights resident, so `qwen3.6:35b` lands in the top tier despite its small active-parameter count.
+
+VRAM detection covers both GPU vendors: NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or, failing that, the amdgpu sysfs VRAM counter (`/sys/class/drm/card*/device/mem_info_vram_total`). On CPU-only systems, the installer uses total system RAM as a heuristic. If neither GPU VRAM nor system RAM can be detected at all, the installer does not abort — it falls back to the smallest tier (`qwen3.5:9b`) with a warning, and you can override with `WIZARD_MODEL=<tag>`.
 
 ### Environment variables
 
@@ -101,7 +103,7 @@ Example:
 
 ## Updating
 
-Re-run the installer to get the latest binary and refresh config:
+Re-run the installer to get the latest binary (an existing `~/.wizard/config.toml` is left untouched):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash

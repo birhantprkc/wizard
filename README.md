@@ -2,28 +2,25 @@
 
 **One line. Your sovereign coding wizard. Self-extending. Fully local.**
 
+<!-- demo.gif -->
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-Wizard is a lightweight Rust + Ratatui coding agent that runs entirely on your machine. One command installs the binary, Ollama, and the official **Qwen 3.6** model — then you get an interactive TUI with tool calling, git integration, skills, and `/evolve` self-extension.
-
-No API keys. No cloud. Your code stays yours.
+One command installs the `wizard` binary, Ollama, and an official **Qwen 3.6** model sized to your hardware. Then you get a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. No API keys. No cloud. Your code stays yours.
 
 ---
 
-## Why Wizard?
+## Why Wizard
 
-Setting up a capable local coding agent on a fresh Linux server usually means:
+**Fully local, native-Ollama agent loop.** Wizard isn't a cloud agent with a local-model option bolted on — Ollama is the *only* backend in v0.1. The agent loop speaks Ollama's native `/api/chat` directly (streaming + native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), and the installer picks a model tier that actually fits your VRAM. Inference, prompts, sessions: all on your machine.
 
-1. Install Rust or download a binary
-2. Install Ollama
-3. Pull a model
-4. Clone a repo
-5. Configure provider keys or endpoints
-6. Figure out which model tag actually works
+**Tiered `/evolve` self-extension.** Wizard extends itself at runtime — new skills, MCP servers, scripted tools, and subagents are plain files under `~/.wizard/`, live after `/reload`, reverted by deleting the file. When a change genuinely needs new Rust, `/evolve --deep` proposes a diff to Wizard's own source, and — gated by your approval, a successful `cargo build --release`, and a `--version` smoke test — replaces its own binary. The old binary is kept as `wizard.prev` beside the new one, so rollback is one `mv`. Every evolution is logged with its diff to `~/.wizard/evolution.jsonl`. No magic, no unreviewable self-modification: gates and a paper trail.
 
-Wizard collapses that into **one line** with sensible defaults: official Qwen 3.6 from the [Ollama library](https://ollama.com/library/qwen3.6), pre-wired for agentic coding.
+**Runtime MCP.** Wizard is an MCP client (stdio and HTTP). Declare a server in `~/.wizard/mcp.toml` — or have `/evolve` register one — and its tools merge into the registry on `/reload`, no rebuild. Stdio servers are spawned with a cleared, allowlisted environment and dynamic-linker variables stripped; every request is time-bounded. This is the path for computer use, browser control, databases, and anything else shipped as an MCP server.
+
+**Genie / Sovereign dual modes.** Genie is the interactive default: full TUI, confirms every write, shell command, and evolution before it runs. Sovereign is the autonomous mode: headless-capable, auto-approves everything, circuit-breaks on repeated failures, controllable mid-run via a loop-control file. Same tools, same model — different trust posture, switchable live with `/genie` and `/sovereign`.
 
 ---
 
@@ -33,138 +30,80 @@ Wizard collapses that into **one line** with sensible defaults: official Qwen 3.
 # Install everything (binary + Ollama + model)
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 
-# Launch interactive TUI (genie mode — default)
+# Launch the interactive TUI (genie mode — default)
 wizard
 
 # Sovereign autonomous mode
 wizard --mode sovereign -p "refactor the auth module and add tests"
 
-# Self-extension: agent adds a capability to itself live (skill / tool / MCP)
-wizard --evolve -p "add a /status slash command"
+# Self-extension: add a capability live (skill / MCP server / scripted tool)
+wizard --evolve -p "add a skill for conventional commit messages"
 ```
 
-See [docs/getting-started.md](docs/getting-started.md) for full setup details.
+The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or amdgpu sysfs; system RAM on CPU-only boxes) and pulls the right tier:
+
+| Available VRAM | Model pulled | Approx. size |
+|----------------|--------------|--------------|
+| ≥ 24 GB | `qwen3.6:35b` | ~21–24 GB (MoE) |
+| 18–24 GB | `qwen3.6:27b` | ~17 GB (dense) |
+| 8–18 GB | `qwen3.5:9b` | ~6 GB |
+| < 8 GB / undetectable | `qwen3.5:9b` (CPU / partial offload) | ~6 GB |
+
+Release tarballs are verified against the release's `checksums.txt` before install. Want a different model? `WIZARD_MODEL=<tag>` or the [BYOM installer](docs/byom.md). Full details in [docs/getting-started.md](docs/getting-started.md).
 
 ---
 
-## Personality modes
+## How it compares
 
-| Mode | Command | Description |
-|------|---------|-------------|
-| **Genie** | `wizard` | Interactive TUI. Eager, creative, confirms risky actions (writes, shell, git) unless `--auto`. |
-| **Sovereign** | `wizard --mode sovereign` | Autonomous background agent. Proactive, long-running, auto-approves tools. Built for autonomous task loops. |
+Honest table — these are good tools, verified against their docs as of June 2026:
 
-Details: [docs/modes.md](docs/modes.md)
+| | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
+|---|---|---|---|---|
+| Local models | Ollama only — local is the design, not an option | Yes — Ollama + any OpenAI-compatible endpoint; top results come from cloud models | Yes — Ollama among 15+ providers | Yes — Ollama among 75+ providers |
+| MCP | Yes — stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes — one of the earliest and deepest integrations, 70+ documented extensions | Yes — local + remote servers, OAuth for remote |
+| Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | — | Extensions and recipes via MCP | TypeScript/JS plugin system |
+| Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |
+| Language | Rust | Python | Rust (TS desktop app) | TypeScript |
+| License | MIT | Apache-2.0 | Apache-2.0 | MIT |
 
----
+Credit where due: aider's git workflow (clean auto-commits per change) is still the reference; goose has the broadest MCP ecosystem and is now vendor-neutral under the Linux Foundation's Agentic AI Foundation; opencode is extremely active with the widest provider support and a first-rate TUI.
 
-## Features (v0.1)
-
-- **One-liner install** — binary, Ollama, and model in a single `curl | bash`
-- **Official Qwen 3.6** — `qwen3.6:27b` by default, with VRAM-aware fallbacks
-- **Ratatui TUI** — chat UI with tool output, git diff preview, session history
-- **Tool calling** — file I/O, shell, git, codebase search
-- **MCP client** — plug in external capabilities (computer use, browser, more) with no rebuild
-- **Skills** — drop markdown instructions in `skills/`; Wizard loads them into context
-- **Self-extension** — `/evolve` adds skills, MCP servers, and scripted tools live (`/reload`); deep source-rebuild lands in v0.2
-- **Lightweight** — single binary target < 60 MB (stripped release)
+Wizard's bet is narrower: one binary, one backend, fully local, and an agent that grows its own capabilities through audited, reversible steps.
 
 ---
 
-## Bring your own model
+## Limitations (v0.1)
 
-The default installer uses official Ollama models only. If you want a custom model (local GGUF, private registry, fine-tune):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install-byom.sh | bash
-```
-
-You choose the model; Wizard wires up the config. See [docs/byom.md](docs/byom.md).
+- **Linux only.** x86_64 and aarch64. macOS is planned for v0.2 — the installer currently refuses Darwin rather than half-working.
+- **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude or GPT-class models. Wizard mitigates (native tool-call probing, JSON fallback, retry prompts) but does not pretend otherwise. The 27B+ tiers are noticeably better agents than the 9B tier.
+- **No sandbox.** Tools run with your privileges; sovereign mode auto-approves them. Read [SECURITY.md](SECURITY.md) before running sovereign mode on anything you don't trust, and prefer a container/VM there.
+- **Context windows are finite.** Large codebases exceed what a local model can hold; Wizard searches and reads selectively rather than ingesting the repo, and long sessions will eventually push out early context.
 
 ---
 
-## Configuration
+## Docs
 
-Config lives at `~/.wizard/config.toml`:
-
-```toml
-model = "qwen3.6:27b"
-ollama_host = "http://127.0.0.1:11434"
-mode = "genie"          # genie | sovereign
-auto_approve = false    # skip confirmation prompts in genie mode
-max_steps = 25          # agent loop limit (genie)
-```
-
-Sessions are stored in `~/.wizard/sessions/`. Evolution history in `~/.wizard/evolution.jsonl`.
-
----
-
-## Slash commands (TUI)
-
-| Command | Description |
-|---------|-------------|
-| `/help` | Show available commands |
-| `/clear` | Clear conversation |
-| `/model` | Show or switch model |
-| `/mode` | Switch genie ↔ sovereign |
-| `/genie` / `/sovereign` | Switch mode directly |
-| `/evolve` | Self-extension: add skills, MCP servers, scripted tools (`--deep` rebuilds core) |
-| `/reload` | Reload skills, tools, and MCP servers without restart |
-| `/diff` | Show git diff sidebar |
-| `/quit` | Exit |
-
----
-
-## Architecture
-
-```
-install.sh  →  Ollama + qwen3.6  →  wizard binary  →  ~/.wizard/config.toml
-                                              ↓
-                                    ratatui TUI + agent loop
-                                              ↓
-                      tools (file, shell, git) + MCP + skills + subagents + /evolve
-```
-
-Full breakdown: [docs/architecture.md](docs/architecture.md)
-
----
-
-## Requirements
-
-- **OS:** Linux x86_64 or aarch64 (macOS planned v0.2)
-- **RAM/VRAM:** 8 GB minimum; 18 GB+ recommended for `qwen3.6:27b`
-- **Dependencies:** Ollama (installed automatically), `git`, `ripgrep` (optional, falls back to grep)
-
----
-
-## Roadmap
-
-| Version | Focus |
-|---------|-------|
-| **v0.1** | One-liner + TUI + genie/sovereign modes + MCP client + skills + scripted tools + runtime `/evolve` |
-| **v0.2** | Subagent swarms + deep `/evolve` (source rebuild) + plugin marketplace |
-| **v0.3** | `ollama launch wizard` integration |
-
----
+- [Getting started](docs/getting-started.md) — install, tiers, first run, troubleshooting
+- [Modes](docs/modes.md) — genie vs sovereign
+- [Self-extension](docs/evolve.md) — `/evolve` tiers, gates, rollback
+- [Bring your own model](docs/byom.md) — custom Ollama models
+- [Architecture](docs/architecture.md) — how it's built
+- [Security](SECURITY.md) — threat model, honest edition
 
 ## Development
 
-Wizard is built with Rust 2024, Ratatui, and Tokio. Ollama is the only LLM backend in v0.1.
+Rust 2024, Ratatui, Tokio. Single binary, < 60 MB stripped.
 
 ```bash
-git clone git@github.com:teddytennant/wizard.git
+git clone https://github.com/teddytennant/wizard
 cd wizard
 cargo build --release
 ./target/release/wizard
 ```
 
----
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
----
 
 ## Author
 
