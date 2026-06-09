@@ -22,11 +22,12 @@ The installer:
 
 | Available VRAM | Model pulled | Approx. size |
 |----------------|--------------|--------------|
-| ≥ 18 GB | `qwen3.6:27b` | ~17 GB |
-| 8–18 GB | `qwen3.6:35b` | ~24 GB (MoE, active ~3B params) |
-| < 8 GB | `qwen3.5:9b` | ~6 GB |
+| ≥ 26 GB | `qwen3.6:35b` | ~24 GB (MoE — fast active path, but the full weights must fit in memory) |
+| 18–26 GB | `qwen3.6:27b` | ~17 GB |
+| 8–18 GB | `qwen3.5:9b` | ~6 GB |
+| < 8 GB | `qwen3.5:9b` (CPU/partial offload — slower) | ~6 GB |
 
-VRAM is detected via `nvidia-smi` when a GPU is present. On CPU-only systems, the installer uses available system RAM as a heuristic.
+Tiers are ordered so the model's **total** footprint fits the available memory — note that an MoE model still needs all expert weights resident, so `qwen3.6:35b` lands in the top tier despite its small active-parameter count. VRAM is detected via `nvidia-smi` when a GPU is present. On CPU-only systems, the installer uses available system RAM as a heuristic.
 
 ### Environment variables
 
@@ -65,10 +66,10 @@ Run a single task without the TUI:
 wizard -p "find all TODO comments and list them by file"
 ```
 
-Combine with wizard mode for autonomous execution:
+Combine with sovereign mode for autonomous execution:
 
 ```bash
-wizard --mode wizard -p "implement JWT refresh tokens" --auto
+wizard --mode sovereign -p "implement JWT refresh tokens" --auto
 ```
 
 ## Working in a project
@@ -133,15 +134,13 @@ ollama pull qwen3.6:27b
 Switch to a smaller tier manually:
 
 ```bash
-ollama pull qwen3.6:35b   # MoE — lower active memory
-# or
-ollama pull qwen3.5:9b
+ollama pull qwen3.5:9b    # smallest tier, ~6 GB
 ```
 
 Then update `~/.wizard/config.toml`:
 
 ```toml
-model = "qwen3.6:35b"
+model = "qwen3.5:9b"
 ```
 
 ### Check Wizard logs
@@ -154,6 +153,7 @@ RUST_LOG=wizard=debug wizard
 
 ## Next steps
 
-- [Personality modes](modes.md) — genie vs wizard
+- [Personality modes](modes.md) — genie vs sovereign
+- [Self-extension](evolve.md) — how `/evolve` adds capabilities
 - [Bring your own model](byom.md) — custom Ollama models
 - [Architecture](architecture.md) — how Wizard works under the hood

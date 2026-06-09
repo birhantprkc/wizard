@@ -37,9 +37,9 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 wizard
 
 # Sovereign autonomous mode
-wizard --mode wizard -p "refactor the auth module and add tests"
+wizard --mode sovereign -p "refactor the auth module and add tests"
 
-# Self-extension: agent proposes changes to its own source
+# Self-extension: agent adds a capability to itself live (skill / tool / MCP)
 wizard --evolve -p "add a /status slash command"
 ```
 
@@ -52,7 +52,7 @@ See [docs/getting-started.md](docs/getting-started.md) for full setup details.
 | Mode | Command | Description |
 |------|---------|-------------|
 | **Genie** | `wizard` | Interactive TUI. Eager, creative, confirms risky actions (writes, shell, git) unless `--auto`. |
-| **Wizard** | `wizard --mode wizard` | Sovereign background agent. Proactive, long-running, auto-approves tools. Built for autonomous task loops. |
+| **Sovereign** | `wizard --mode sovereign` | Autonomous background agent. Proactive, long-running, auto-approves tools. Built for autonomous task loops. |
 
 Details: [docs/modes.md](docs/modes.md)
 
@@ -64,8 +64,9 @@ Details: [docs/modes.md](docs/modes.md)
 - **Official Qwen 3.6** — `qwen3.6:27b` by default, with VRAM-aware fallbacks
 - **Ratatui TUI** — chat UI with tool output, git diff preview, session history
 - **Tool calling** — file I/O, shell, git, codebase search
+- **MCP client** — plug in external capabilities (computer use, browser, more) with no rebuild
 - **Skills** — drop markdown instructions in `skills/`; Wizard loads them into context
-- **Self-extension** — `/evolve` proposes Rust patches, builds, and hot-reloads
+- **Self-extension** — `/evolve` adds skills, MCP servers, and scripted tools live (`/reload`); deep source-rebuild lands in v0.2
 - **Lightweight** — single binary target < 60 MB (stripped release)
 
 ---
@@ -89,7 +90,7 @@ Config lives at `~/.wizard/config.toml`:
 ```toml
 model = "qwen3.6:27b"
 ollama_host = "http://127.0.0.1:11434"
-mode = "genie"          # genie | wizard
+mode = "genie"          # genie | sovereign
 auto_approve = false    # skip confirmation prompts in genie mode
 max_steps = 25          # agent loop limit (genie)
 ```
@@ -105,8 +106,9 @@ Sessions are stored in `~/.wizard/sessions/`. Evolution history in `~/.wizard/ev
 | `/help` | Show available commands |
 | `/clear` | Clear conversation |
 | `/model` | Show or switch model |
-| `/mode` | Switch genie ↔ wizard |
-| `/evolve` | Enter self-extension mode |
+| `/mode` | Switch genie ↔ sovereign |
+| `/evolve` | Self-extension: add skills, MCP servers, scripted tools (`--deep` rebuilds core) |
+| `/reload` | Reload skills, tools, and MCP servers without restart |
 | `/diff` | Show git diff sidebar |
 | `/quit` | Exit |
 
@@ -119,7 +121,7 @@ install.sh  →  Ollama + qwen3.6  →  wizard binary  →  ~/.wizard/config.tom
                                               ↓
                                     ratatui TUI + agent loop
                                               ↓
-                              tools (file, shell, git) + skills + /evolve
+                      tools (file, shell, git) + MCP + skills + subagents + /evolve
 ```
 
 Full breakdown: [docs/architecture.md](docs/architecture.md)
@@ -138,8 +140,8 @@ Full breakdown: [docs/architecture.md](docs/architecture.md)
 
 | Version | Focus |
 |---------|-------|
-| **v0.1** | One-liner + TUI + genie/wizard modes + `/evolve` + skills |
-| **v0.2** | Plugin marketplace + multi-agent sovereign swarms |
+| **v0.1** | One-liner + TUI + genie/sovereign modes + MCP client + skills + scripted tools + runtime `/evolve` |
+| **v0.2** | Subagent swarms + deep `/evolve` (source rebuild) + plugin marketplace |
 | **v0.3** | `ollama launch wizard` integration |
 
 ---

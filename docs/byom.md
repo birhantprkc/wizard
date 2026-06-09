@@ -120,12 +120,12 @@ Wizard v0.1 expects models that support:
 
 | Capability | Required | Notes |
 |------------|----------|-------|
-| Tool calling | Yes | Agent loop depends on native function calling |
+| Tool calling | Recommended | Native preferred; Wizard falls back to a prompt-based JSON tool protocol when a model lacks native support |
 | Ollama `/api/chat` | Yes | Streaming responses |
 | Context ≥ 32K | Recommended | 128K+ preferred for large codebases |
 | Code quality | Recommended | Coding-oriented models perform best |
 
-Models without tool calling will not work with Wizard's agent loop in v0.1.
+Native tool calling through Ollama is historically inconsistent across models, so Wizard probes for it at startup: if the model advertises tools support it uses native function calling, otherwise it switches to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models — prefer a model with solid native tool calling for the smoothest agent loop.
 
 ## Remote Ollama
 

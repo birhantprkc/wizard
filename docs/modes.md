@@ -40,13 +40,13 @@ wizard
 [Wizard proposes patches → asks "Apply changes? [y/n]" → runs cargo test]
 ```
 
-## Wizard mode (sovereign)
+## Sovereign mode
 
 ```bash
-wizard --mode wizard -p "implement rate limiting on all API routes"
+wizard --mode sovereign -p "implement rate limiting on all API routes"
 ```
 
-Wizard mode is the autonomous, proactive agent. It runs with minimal human intervention and keeps working until the task is done or limits are hit.
+Sovereign mode is the autonomous, proactive agent. It runs with minimal human intervention and keeps working until the task is done or limits are hit.
 
 ### Behavior
 
@@ -63,12 +63,12 @@ Wizard mode is the autonomous, proactive agent. It runs with minimal human inter
 |------|--------|
 | `--max-hours 2` | Time limit for the run |
 | `--loop 10` | Max outer loop iterations |
-| `--auto` | Implicit in wizard mode; included for consistency |
+| `--auto` | Implicit in sovereign mode; included for consistency |
 | `--cwd /path/to/repo` | Set project root |
 
 ### Control file
 
-During a long wizard-mode run, write to `.wizard/loop-control` in the project:
+During a long sovereign-mode run, write to `.wizard/loop-control` in the project:
 
 | Value | Effect |
 |-------|--------|
@@ -79,7 +79,7 @@ During a long wizard-mode run, write to `.wizard/loop-control` in the project:
 ### Example
 
 ```bash
-wizard --mode wizard \
+wizard --mode sovereign \
   -p "add comprehensive tests for the payment module" \
   --max-hours 1 \
   --cwd ~/projects/myapp
@@ -88,8 +88,8 @@ wizard --mode wizard \
 ## Switching modes in the TUI
 
 ```
-/mode wizard    # switch to sovereign behavior (still in TUI)
-/mode genie     # switch back to interactive confirmations
+/mode sovereign    # switch to autonomous behavior (still in TUI)
+/mode genie        # switch back to interactive confirmations
 ```
 
 Mode changes affect prompting and auto-approve behavior for the current session. The choice is not persisted unless you update `~/.wizard/config.toml`.
@@ -100,7 +100,7 @@ Each mode injects a different system prompt:
 
 **Genie** emphasizes collaboration, explanation, and asking before destructive actions.
 
-**Wizard** emphasizes autonomy, completing the full task end-to-end, running tests, and committing when appropriate.
+**Sovereign** emphasizes autonomy, completing the full task end-to-end, running tests, and committing when appropriate.
 
 Both prompts include loaded skills from the `skills/` directory and any project-level `AGENTS.md`.
 
@@ -110,7 +110,7 @@ Both prompts include loaded skills from the `skills/` directory and any project-
 |-----------|-----------------|
 | Exploring unfamiliar code | Genie |
 | Quick one-off fix | Genie |
-| Large multi-file refactor | Wizard |
-| CI/automation/scripted runs | Wizard |
+| Large multi-file refactor | Sovereign |
+| CI/automation/scripted runs | Sovereign |
 | Learning what the agent will do | Genie |
-| Overnight autonomous work | Wizard |
+| Overnight autonomous work | Sovereign |
