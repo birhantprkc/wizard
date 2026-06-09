@@ -1,9 +1,20 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
-//! Layout: chat transcript (with optional git diff sidebar) above a status
-//! bar and the input line. Floating layers: the command-suggestion popup,
-//! the model/mode picker, and the approval modal.
+//! Layout: chat transcript (with optional git diff sidebar) above the input
+//! line and a quiet status line. Floating layers: the command-suggestion
+//! popup, the model/mode picker, and the approval modal.
+//!
+//! Design rules (do not regress):
+//! - **Transparent**: never paint a background color; everything renders on
+//!   `Color::Reset` so the user's terminal background shows through.
+//!   Selection reads through an accent marker + bold, not opaque slabs.
+//! - **One accent** ([`ACCENT`]) for chrome plus dim grays; green/red only
+//!   as success/error semantics, cyan only for inline code.
+//! - **No heavy boxes**: borderless sections separated by padding and dim
+//!   rules; rounded dim borders only on floating layers.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
@@ -11,32 +22,45 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, InputMode, PickerKind, TranscriptEntry};
+use crate::app::{App, InputMode, TranscriptEntry};
 use crate::config::Mode;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Accent color used for chrome (borders, prompt, highlights).
+/// The single accent color used for chrome (prompt, gutters, names,
+/// attention borders).
 const ACCENT: Color = Color::Magenta;
-/// Background of the status bar and selected rows.
-const SURFACE: Color = Color::Rgb(24, 24, 32);
-const SELECTION: Color = Color::Rgb(45, 45, 65);
+/// Dim chrome: rules, gutter marks, hints, secondary borders.
+const DIM: Color = Color::DarkGray;
+/// Secondary text (tool output, user echo, details).
+const TEXT_DIM: Color = Color::Gray;
+/// Inline code (block code gets syntect foreground colors, or [`TEXT_DIM`]
+/// when plain).
+const CODE: Color = Color::Cyan;
+
+fn dim() -> Style {
+    Style::default().fg(DIM)
+}
+
+fn accent() -> Style {
+    Style::default().fg(ACCENT)
+}
 
 /// Render one frame. The only entry point the main loop calls; everything
 /// else in this module is a helper.
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [main_area, status_area, input_area] = Layout::vertical([
-        Constraint::Min(3),
+    let [main_area, input_area, status_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(2),
         Constraint::Length(1),
-        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -50,8 +74,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_transcript(frame, app, main_area);
     }
 
-    draw_status_bar(frame, app, status_area);
     draw_input(frame, app, input_area);
+    draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
     if app.picker.is_none() && app.pending_approval.is_none() {
@@ -66,23 +90,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// Chat transcript: user/assistant messages with streaming markdown and
-/// collapsible tool cards. Shows the welcome screen while empty.
+/// collapsible tool cards. Borderless; a one-column side margin keeps the
+/// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     if app.transcript.is_empty() && app.streaming.is_empty() && !app.status.busy {
         draw_welcome(frame, app, area);
         return;
     }
 
-    let mut block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(Line::from(vec![
-            Span::styled(" ✦ ", Style::default().fg(ACCENT)),
-            Span::styled("wizard ", Style::default().fg(Color::White).bold()),
-        ]))
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let inner_width = inner.width as usize;
+    let inner_height = inner.height as usize;
 
     let lines = wrap_lines(transcript_text(app), inner_width);
     let total = lines.len();
@@ -92,94 +116,83 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let end = (start + inner_height).min(total);
     let visible: Vec<Line<'static>> = lines[start..end].to_vec();
 
-    if scroll > 0 {
-        block = block.title_top(
-            Line::from(Span::styled(
-                format!(" ↓ {scroll} more "),
-                Style::default().fg(Color::Yellow),
-            ))
-            .right_aligned(),
-        );
-    }
-    frame.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
+    frame.render_widget(Paragraph::new(Text::from(visible)), inner);
 
-    // Scrollbar along the right border once content overflows.
+    // Scrolled away from the tail: a quiet hint in the top-right corner.
+    if scroll > 0 {
+        let label = format!("↓ {scroll} more ");
+        let width = (label.width() as u16).min(inner.width);
+        let hint = Rect {
+            x: inner.right().saturating_sub(width),
+            y: inner.y,
+            width,
+            height: 1,
+        };
+        frame.render_widget(Clear, hint);
+        frame.render_widget(Paragraph::new(Span::styled(label, dim())), hint);
+    }
+
+    // A whisper of a scrollbar in the right margin once content overflows.
     if total > inner_height {
         let mut state = ScrollbarState::new(max_scroll + 1).position(start);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("┃")
-            .track_style(Style::default().fg(Color::DarkGray))
-            .thumb_style(Style::default().fg(ACCENT));
-        frame.render_stateful_widget(
-            scrollbar,
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut state,
-        );
+            .track_symbol(None)
+            .thumb_symbol("▐")
+            .thumb_style(dim());
+        frame.render_stateful_widget(scrollbar, area, &mut state);
     }
 }
 
-/// Welcome screen shown before the first message.
+/// Welcome screen shown before the first message: a small centered card,
+/// no borders, no banner art.
 fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().fg(Color::Cyan);
     let lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled("✦  ·  ✶  ·  ✦", Style::default().fg(ACCENT))),
+        Line::from(Span::styled("✦", accent())),
         Line::raw(""),
         Line::from(Span::styled(
-            "w  i  z  a  r  d",
-            Style::default().fg(Color::White).bold(),
+            "w i z a r d",
+            Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "your sovereign coding wizard — self-extending, fully local",
-            dim.italic(),
+            dim().italic(),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("model ", dim),
-            Span::styled(app.status.model.clone(), Style::default().fg(Color::White)),
-            Span::styled("   ·   mode ", dim),
+            Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+            Span::styled(" · ", dim()),
             mode_span(app.status.mode),
         ]),
         Line::raw(""),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("type a message", Style::default().fg(Color::White)),
-            Span::styled(" and press Enter to begin", dim),
+            Span::styled("type a message", Style::default().fg(TEXT_DIM)),
+            Span::styled(" and press Enter to begin", dim()),
         ]),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("/", key),
-            Span::styled("  commands — Tab completes, ↑/↓ select", dim),
+            Span::styled("/", accent()),
+            Span::styled("  commands — Tab completes, ↑/↓ select", dim()),
         ]),
         Line::from(vec![
-            Span::styled("/model", key),
-            Span::styled("  pick a model (or Ctrl-P)", dim),
+            Span::styled("/model", accent()),
+            Span::styled("  pick a model (or Ctrl-P)", dim()),
         ]),
         Line::from(vec![
-            Span::styled("/help", key),
-            Span::styled("  all commands & keys", dim),
+            Span::styled("/help", accent()),
+            Span::styled("  all commands & keys", dim()),
         ]),
     ];
 
     let height = lines.len() as u16;
-    let top = inner.height.saturating_sub(height) / 2;
+    let top = area.height.saturating_sub(height) / 2;
     let centered = Rect {
-        x: inner.x,
-        y: inner.y + top,
-        width: inner.width,
-        height: height.min(inner.height),
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: height.min(area.height),
     };
     frame.render_widget(
         Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
@@ -187,37 +200,70 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Colored span for a mode name (cyan genie, red sovereign).
+/// Colored span for a mode name: genie is quiet, sovereign is a warning.
 fn mode_span(mode: Mode) -> Span<'static> {
     match mode {
-        Mode::Genie => Span::styled("genie", Style::default().fg(Color::Cyan).bold()),
+        Mode::Genie => Span::styled("genie", Style::default().fg(TEXT_DIM)),
         Mode::Sovereign => Span::styled("sovereign", Style::default().fg(Color::Red).bold()),
+    }
+}
+
+/// Prefix a rendered block with a gutter: `marker` on the first line, a
+/// two-column indent on the rest, so the message hangs off its mark.
+fn gutter_block(lines: &mut Vec<Line<'static>>, text: Text<'static>, marker: Span<'static>) {
+    for (index, mut line) in text.lines.into_iter().enumerate() {
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        if index == 0 {
+            spans.push(marker.clone());
+        } else if !line.spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.append(&mut line.spans);
+        lines.push(Line::from(spans));
     }
 }
 
 /// Build the full (unwrapped) transcript text from app state.
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut prev_tool = false;
+    let mut prev_notice = false;
+    let mut first = true;
 
     for entry in &app.transcript {
+        let is_tool = matches!(entry, TranscriptEntry::ToolCard { .. });
+        let is_notice = matches!(entry, TranscriptEntry::Notice(_));
+        // Comfortable spacing between turns; runs of tool cards or notices
+        // stay tight so they read as one group.
+        let tight = (is_tool && prev_tool) || (is_notice && prev_notice);
+        if !first && !tight {
+            lines.push(Line::raw(""));
+        }
+        first = false;
+        prev_tool = is_tool;
+        prev_notice = is_notice;
+
         match entry {
             TranscriptEntry::User(message) => {
-                lines.push(Line::from(Span::styled(
-                    "you ❯",
-                    Style::default().fg(Color::Cyan).bold(),
-                )));
+                let mut user_lines: Vec<Line<'static>> = Vec::new();
                 for line in message.lines() {
-                    lines.push(Line::from(Span::raw(format!("  {line}"))));
+                    user_lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(TEXT_DIM),
+                    )));
                 }
-                lines.push(Line::raw(""));
+                gutter_block(
+                    &mut lines,
+                    Text::from(user_lines),
+                    Span::styled("❯ ", dim().bold()),
+                );
             }
             TranscriptEntry::Assistant(message) => {
-                lines.push(Line::from(Span::styled(
-                    "wizard ✦",
-                    Style::default().fg(Color::Magenta).bold(),
-                )));
-                lines.extend(render_markdown(message).lines);
-                lines.push(Line::raw(""));
+                gutter_block(
+                    &mut lines,
+                    render_markdown(message),
+                    Span::styled("· ", accent()),
+                );
             }
             TranscriptEntry::ToolCard {
                 name,
@@ -233,37 +279,53 @@ fn transcript_text(app: &App) -> Text<'static> {
                     output.as_deref(),
                     *is_error,
                     *collapsed,
+                    app.tick,
                 );
             }
             TranscriptEntry::Notice(message) => {
+                let style = if message.starts_with("error") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    dim().italic()
+                };
                 for line in message.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("• {line}"),
-                        Style::default().fg(Color::DarkGray).italic(),
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {line}"), style)));
                 }
             }
         }
     }
 
     if !app.streaming.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "wizard ✦",
-            Style::default().fg(Color::Magenta).bold(),
-        )));
-        lines.extend(render_markdown(&app.streaming).lines);
+        if !first {
+            lines.push(Line::raw(""));
+        }
+        // Streaming: the text itself arriving, with a soft cursor at the
+        // tail. Code blocks stay unhighlighted while in flight (cheap to
+        // re-render every frame).
+        let mut text = render_markdown_streaming(&app.streaming);
+        let tail = Span::styled("▍", dim());
+        match text.lines.last_mut() {
+            Some(last) => last.spans.push(tail),
+            None => text.lines.push(Line::from(tail)),
+        }
+        gutter_block(&mut lines, text, Span::styled("· ", accent()));
     } else if app.status.busy {
+        if !first {
+            lines.push(Line::raw(""));
+        }
         let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
-        lines.push(Line::from(Span::styled(
-            format!("{spinner} thinking…"),
-            Style::default().fg(Color::Yellow),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{spinner} "), accent()),
+            Span::styled("thinking…", dim().italic()),
+        ]));
     }
 
     Text::from(lines)
 }
 
-/// Render one tool invocation card into `lines`.
+/// Render one tool invocation as a compact single-line card: status glyph,
+/// tool name in accent, truncated args in dim. Output expands below only
+/// when relevant (errors, or Ctrl-T).
 fn tool_card_lines(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -271,124 +333,99 @@ fn tool_card_lines(
     output: Option<&str>,
     is_error: bool,
     collapsed: bool,
+    tick: u64,
 ) {
-    const MAX_ARG_LINES: usize = 8;
     const MAX_OUTPUT_LINES: usize = 200;
 
-    let (icon, style) = match (output, is_error) {
-        (None, _) => ('⚙', Style::default().fg(Color::Yellow)),
-        (Some(_), false) => ('✔', Style::default().fg(Color::Green)),
-        (Some(_), true) => ('✘', Style::default().fg(Color::Red)),
+    let glyph = match (output, is_error) {
+        (None, _) => Span::styled(
+            SPINNER[(tick as usize) % SPINNER.len()].to_string(),
+            accent(),
+        ),
+        (Some(_), false) => Span::styled("✓", Style::default().fg(Color::Green)),
+        (Some(_), true) => Span::styled("✗", Style::default().fg(Color::Red)),
     };
-    let marker = if collapsed { '▸' } else { '▾' };
 
-    let summary = truncate_chars(&serde_json::to_string(args).unwrap_or_default(), 60);
-    lines.push(Line::from(vec![
-        Span::styled(format!("{marker} {icon} "), style),
-        Span::styled(name.to_string(), style.bold()),
-        Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
-    ]));
+    let summary = if args.is_null() {
+        String::new()
+    } else {
+        truncate_width(&serde_json::to_string(args).unwrap_or_default(), 64)
+    };
+    let mut card = vec![
+        glyph,
+        Span::raw(" "),
+        Span::styled(name.to_string(), accent()),
+    ];
+    if !summary.is_empty() {
+        card.push(Span::styled(format!("  {summary}"), dim()));
+    }
+    let hidden = output.map(|text| text.lines().count()).unwrap_or(0);
+    if collapsed && hidden > 0 {
+        card.push(Span::styled(format!("  +{hidden} lines"), dim().italic()));
+    }
+    lines.push(Line::from(card));
 
-    if !collapsed {
-        let dim = Style::default().fg(Color::DarkGray);
-        if !args.is_null()
-            && let Ok(pretty) = serde_json::to_string_pretty(args)
-        {
-            let arg_lines: Vec<&str> = pretty.lines().collect();
-            for line in arg_lines.iter().take(MAX_ARG_LINES) {
-                lines.push(Line::from(Span::styled(format!("  │ {line}"), dim)));
-            }
-            if arg_lines.len() > MAX_ARG_LINES {
-                lines.push(Line::from(Span::styled(
-                    format!("  │ … (+{} lines)", arg_lines.len() - MAX_ARG_LINES),
-                    dim,
-                )));
-            }
+    if !collapsed && let Some(text) = output {
+        let body = Style::default().fg(TEXT_DIM);
+        let out_lines: Vec<&str> = text.lines().collect();
+        for line in out_lines.iter().take(MAX_OUTPUT_LINES) {
+            lines.push(Line::from(Span::styled(format!("  {line}"), body)));
         }
-        match output {
-            None => {
-                lines.push(Line::from(Span::styled(
-                    "  │ running…",
-                    Style::default().fg(Color::Yellow).italic(),
-                )));
-            }
-            Some(text) => {
-                let body_style = if is_error {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                let out_lines: Vec<&str> = text.lines().collect();
-                for line in out_lines.iter().take(MAX_OUTPUT_LINES) {
-                    lines.push(Line::from(Span::styled(format!("  {line}"), body_style)));
-                }
-                if out_lines.len() > MAX_OUTPUT_LINES {
-                    lines.push(Line::from(Span::styled(
-                        format!("  … (+{} lines)", out_lines.len() - MAX_OUTPUT_LINES),
-                        dim,
-                    )));
-                }
-            }
+        if out_lines.len() > MAX_OUTPUT_LINES {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{} lines", out_lines.len() - MAX_OUTPUT_LINES),
+                dim(),
+            )));
         }
     }
-    lines.push(Line::raw(""));
 }
 
-/// Git diff sidebar (`/diff`), syntax-highlighted.
+/// Git diff sidebar (`/diff`): separated from the chat by a single dim
+/// rule, syntax-highlighted (foreground colors only).
 fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(dim())
         .title(Line::from(vec![
-            Span::styled(" ± ", Style::default().fg(Color::Yellow)),
-            Span::styled("git diff ", Style::default().fg(Color::White).bold()),
-        ]))
-        .border_style(Style::default().fg(Color::DarkGray));
+            Span::styled(" ± ", accent()),
+            Span::styled("git diff", Style::default().fg(TEXT_DIM)),
+        ]));
     let paragraph = Paragraph::new(highlight_diff(&app.diff_text)).block(block);
     frame.render_widget(paragraph, area);
 }
 
-/// Status bar: identity, mode badge, model, busy state with elapsed time,
-/// and contextual key hints right-aligned.
+/// Bottom status line: model, mode, and turn state on the left; contextual
+/// key hints on the right. One quiet line, no background fill.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let badge = match app.status.mode {
-        Mode::Genie => Span::styled(
-            " GENIE ",
-            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-        ),
-        Mode::Sovereign => Span::styled(
-            " SOVEREIGN ",
-            Style::default().fg(Color::White).bg(Color::Red).bold(),
-        ),
-    };
-    let state = if app.status.busy {
-        let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+    let mut spans = vec![
+        Span::styled(" ✦ ", accent()),
+        Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+        Span::styled(" · ", dim()),
+        mode_span(app.status.mode),
+    ];
+    if let Some(label) = &app.rebuilding {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(format!("{spinner} "), accent()));
+        spans.push(Span::styled(format!("{label}…"), dim().italic()));
+    } else if app.status.busy {
         let elapsed = app
             .turn_started
             .map(|started| started.elapsed().as_secs())
             .unwrap_or(0);
-        Span::styled(
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(format!("{spinner} "), accent()));
+        spans.push(Span::styled(
             format!(
-                "{spinner} step {}/{} · {}s",
-                app.status.step, app.status.max_steps, elapsed
+                "step {}/{} · {elapsed}s",
+                app.status.step, app.status.max_steps
             ),
-            Style::default().fg(Color::Yellow),
-        )
-    } else {
-        Span::styled("● idle", Style::default().fg(Color::Green))
-    };
-
-    let separator = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
-    let line = Line::from(vec![
-        Span::styled(" ✦ wizard ", Style::default().fg(ACCENT).bold()),
-        badge,
-        separator.clone(),
-        Span::styled(app.status.model.clone(), Style::default().fg(Color::White)),
-        separator,
-        state,
-    ]);
+            dim(),
+        ));
+    }
+    let line = Line::from(spans);
     let left_width = line.width() as u16;
-    let bar_style = Style::default().bg(SURFACE);
-    frame.render_widget(Paragraph::new(line).style(bar_style), area);
+    frame.render_widget(Paragraph::new(line), area);
 
     // Contextual key hints, right-aligned in a sub-rect so the left side is
     // never overdrawn.
@@ -403,7 +440,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "/ commands · ↑ history · ^P model · ^C quit"
     };
-    let width = hints.chars().count() as u16 + 1;
+    let width = hints.width() as u16 + 1;
     if area.width > left_width + width {
         let hint_area = Rect {
             x: area.right().saturating_sub(width),
@@ -411,31 +448,35 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             width,
             height: 1,
         };
-        frame.render_widget(
-            Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)))
-                .style(bar_style),
-            hint_area,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(hints, dim())), hint_area);
     }
 }
 
-/// Input line with prompt symbol, cursor-aware horizontal scrolling, and
-/// inline ghost-text completion of the highlighted command suggestion.
+/// Input: a dim rule above a clean accent prompt — no box. Handles
+/// cursor-aware horizontal scrolling and inline ghost-text completion.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, border_color) = match app.input_mode {
-        InputMode::Chat => (" message ", Color::DarkGray),
-        InputMode::Command => (" command ", Color::Yellow),
-        InputMode::Approval => (" approval pending — answer y/n ", ACCENT),
-    };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(Style::default().fg(border_color));
+    if area.height < 2 || area.width < 6 {
+        return;
+    }
+    let rule = Line::from(Span::styled("─".repeat(area.width as usize), dim()));
 
-    let prompt = Span::styled("❯ ", Style::default().fg(ACCENT).bold());
+    // One column of left padding keeps the prompt aligned with the
+    // transcript margin.
+    let pad = 1usize;
     let prompt_width = 2usize;
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let budget = inner_width.saturating_sub(prompt_width + 1).max(1);
+    let budget = (area.width as usize)
+        .saturating_sub(pad + prompt_width + 1)
+        .max(1);
+
+    if app.input_mode == InputMode::Approval {
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("❯ ", dim().bold()),
+            Span::styled("awaiting approval — y approve · n deny", dim().italic()),
+        ]);
+        frame.render_widget(Paragraph::new(Text::from(vec![rule, line])), area);
+        return;
+    }
 
     let chars: Vec<char> = app.input.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
@@ -456,9 +497,13 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         end += 1;
     }
     let visible: String = chars[start..end].iter().collect();
-    let cursor_x = area.x + 1 + prompt_width as u16 + cursor_cols as u16;
+    let cursor_x = area.x + (pad + prompt_width) as u16 + cursor_cols as u16;
 
-    let mut spans = vec![prompt, Span::raw(visible)];
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled("❯ ", accent().bold()),
+        Span::raw(visible),
+    ];
 
     // Ghost text: the untyped remainder of the highlighted suggestion plus
     // its argument hint, dimmed (only when the whole input is visible and
@@ -479,32 +524,29 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             let room = budget.saturating_sub(used_cols);
             if !ghost.is_empty() && room > 0 {
                 let ghost: String = ghost.chars().take(room).collect();
-                spans.push(Span::styled(
-                    ghost,
-                    Style::default().fg(Color::DarkGray).italic(),
-                ));
+                spans.push(Span::styled(ghost, dim().italic()));
             }
         }
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![rule, Line::from(spans)])),
+        area,
+    );
 
-    if app.input_mode != InputMode::Approval && app.picker.is_none() {
+    if app.picker.is_none() {
         frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
     }
 }
 
-/// Command-suggestion popup floating above the input box (its bottom edge
-/// sits above the status bar, full input width so it covers the transcript
-/// border cleanly).
+/// Command-suggestion popup floating directly above the input rule.
 fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     if app.suggestions.is_empty() {
         return;
     }
 
     let rows = app.suggestions.len() as u16;
-    // The row directly above the input is the status bar; stack above it.
-    let bottom = input_area.y.saturating_sub(1);
+    let bottom = input_area.y;
     let height = (rows + 2).min(bottom);
     let area = Rect {
         x: input_area.x,
@@ -528,7 +570,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     // Columns left for the description: marker + padded usage + gap.
     let description_room = inner_width.saturating_sub(usage_width + 5);
 
-    // Window the rows so the ▸ selection stays visible on short terminals
+    // Window the rows so the ❯ selection stays visible on short terminals
     // (selection pinned to the bottom edge while moving down).
     let visible_rows = area.height.saturating_sub(2) as usize;
     let start = if app.suggestion_index >= visible_rows {
@@ -545,32 +587,26 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
         .take(visible_rows)
         .map(|(index, spec)| {
             let selected = index == app.suggestion_index;
-            let (marker, name_style, row_style) = if selected {
-                (
-                    "▸ ",
-                    Style::default().fg(Color::Cyan).bold().bg(SELECTION),
-                    Style::default().bg(SELECTION),
-                )
+            let (marker, name_style) = if selected {
+                ("❯ ", accent().bold())
             } else {
-                ("  ", Style::default().fg(Color::Cyan), Style::default())
+                ("  ", Style::default().fg(TEXT_DIM))
             };
             let usage = format!("/{} {}", spec.name, spec.args);
             Line::from(vec![
-                Span::styled(marker.to_string(), row_style.fg(Color::Cyan)),
+                Span::styled(marker, accent()),
                 Span::styled(format!("{usage:<usage_width$}"), name_style),
                 Span::styled(
-                    format!("  {}", truncate_chars(spec.description, description_room)),
-                    row_style.fg(Color::Gray),
+                    format!("  {}", truncate_width(spec.description, description_room)),
+                    dim(),
                 ),
             ])
-            .style(row_style)
         })
         .collect();
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(" commands ")
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(dim());
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
@@ -614,56 +650,39 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         .take(rows)
         .map(|(index, item)| {
             let selected = index == picker.selected;
-            let row_style = if selected {
-                Style::default().bg(SELECTION)
-            } else {
-                Style::default()
-            };
             let marker = if selected { "❯ " } else { "  " };
-            let value_style = if item.current {
-                row_style.fg(Color::Cyan).bold()
+            let value_style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
             } else {
-                row_style.fg(Color::White)
+                Style::default().fg(TEXT_DIM)
             };
-            // Ellipsize long model tags so the ● current marker stays visible.
-            let suffix = if item.current {
-                " ● current".chars().count()
-            } else {
-                0
-            };
+            // Ellipsize long model tags so the current marker stays visible.
+            let suffix = if item.current { " ●".width() } else { 0 };
             let value_room = inner_width.saturating_sub(2 + suffix + 1);
             let mut spans = vec![
-                Span::styled(marker.to_string(), row_style.fg(ACCENT)),
-                Span::styled(truncate_chars(&item.value, value_room), value_style),
+                Span::styled(marker, accent()),
+                Span::styled(truncate_width(&item.value, value_room), value_style),
             ];
             if item.current {
-                spans.push(Span::styled(" ● current", row_style.fg(Color::Green)));
+                spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
             }
             if !item.detail.is_empty() {
-                spans.push(Span::styled(
-                    format!("  {}", item.detail),
-                    row_style.fg(Color::Gray),
-                ));
+                spans.push(Span::styled(format!("  {}", item.detail), dim()));
             }
-            Line::from(spans).style(row_style)
+            Line::from(spans)
         })
         .collect();
 
-    let kind_icon = match picker.kind {
-        PickerKind::Model => "⚛",
-        PickerKind::Mode => "✦",
-    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(format!(" {kind_icon}{}", picker.title))
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦", accent()),
+            Span::styled(picker.title.clone(), Style::default().fg(TEXT_DIM)),
+        ]))
         .title_bottom(
-            Line::from(Span::styled(
-                " ↑↓ move · Enter select · Esc cancel ",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .centered(),
-        )
-        .border_style(Style::default().fg(ACCENT));
+            Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
+        );
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
@@ -695,14 +714,10 @@ fn draw_approval_modal(frame: &mut Frame, app: &App) {
     .intersection(frame_area);
     frame.render_widget(Clear, area);
 
-    let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled("tool: ", dim),
-            Span::styled(
-                pending.call.function.name.clone(),
-                Style::default().fg(Color::Yellow).bold(),
-            ),
+            Span::styled("tool ", dim()),
+            Span::styled(pending.call.function.name.clone(), accent().bold()),
         ]),
         Line::raw(""),
     ];
@@ -710,28 +725,35 @@ fn draw_approval_modal(frame: &mut Frame, app: &App) {
     for line in arg_lines.iter().take(shown) {
         lines.push(Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(TEXT_DIM),
         )));
     }
     if truncated {
-        lines.push(Line::from(Span::styled("…", dim)));
+        lines.push(Line::from(Span::styled("…", dim())));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("[y] approve", Style::default().fg(Color::Green).bold()),
+        Span::styled("y", Style::default().fg(Color::Green).bold()),
+        Span::styled(" approve", dim()),
         Span::raw("    "),
-        Span::styled("[n] deny", Style::default().fg(Color::Red).bold()),
+        Span::styled("n", Style::default().fg(Color::Red).bold()),
+        Span::styled(" deny", dim()),
     ]));
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(" approve tool call? ")
-        .border_style(Style::default().fg(ACCENT));
+        .border_style(accent())
+        .title(Line::from(vec![
+            Span::styled(" ✦", accent()),
+            Span::styled(" approve tool call? ", Style::default().fg(TEXT_DIM)),
+        ]));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs
 /// count as two) so the transcript can be pinned exactly to its bottom.
+/// A wide char that no longer fits wraps to the next line first;
+/// zero-width chars (combining marks) always stay with their base char.
 fn wrap_lines(text: Text<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -743,7 +765,7 @@ fn wrap_lines(text: Text<'static>, width: usize) -> Vec<Line<'static>> {
             let mut buffer = String::new();
             for ch in span.content.chars() {
                 let ch_width = ch.width().unwrap_or(0);
-                if used + ch_width > width && used > 0 {
+                if ch_width > 0 && used + ch_width > width && used > 0 {
                     if !buffer.is_empty() {
                         current.push(Span::styled(std::mem::take(&mut buffer), style));
                     }
@@ -762,18 +784,29 @@ fn wrap_lines(text: Text<'static>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let mut truncated: String = text.chars().take(max).collect();
-        truncated.push('…');
-        truncated
+/// Truncate to `max` display columns (not chars), appending `…` when cut.
+fn truncate_width(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
     }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
-// Diff highlighting (syntect)
+// Syntax highlighting (syntect) — foreground colors only, never backgrounds,
+// so the terminal's own background always shows through.
 // ---------------------------------------------------------------------------
 
 static SYNTECT_ASSETS: OnceLock<(SyntaxSet, Option<Theme>)> = OnceLock::new();
@@ -823,6 +856,8 @@ pub fn highlight_diff(diff: &str) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Map a syntect style to ratatui, keeping only the foreground color and
+/// font modifiers — backgrounds would paint over the terminal transparency.
 fn syntect_style(style: syntect::highlighting::Style) -> Style {
     let fg = style.foreground;
     let mut out = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
@@ -844,17 +879,17 @@ fn fallback_diff(diff: &str) -> Text<'static> {
         .lines()
         .map(|line| {
             let style = if line.starts_with("+++") || line.starts_with("---") {
-                Style::default().fg(Color::White).bold()
+                Style::default().add_modifier(Modifier::BOLD)
             } else if line.starts_with('+') {
                 Style::default().fg(Color::Green)
             } else if line.starts_with('-') {
                 Style::default().fg(Color::Red)
             } else if line.starts_with("@@") {
-                Style::default().fg(Color::Cyan)
+                accent()
             } else if line.starts_with("diff ") || line.starts_with("index ") {
-                Style::default().fg(Color::Yellow).bold()
+                Style::default().fg(TEXT_DIM).bold()
             } else {
-                Style::default()
+                dim()
             };
             Line::from(Span::styled(line.to_string(), style))
         })
@@ -862,13 +897,92 @@ fn fallback_diff(diff: &str) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Highlight one fenced code block, memoized: completed blocks are
+/// re-rendered every frame, so identical (lang, code) pairs hit the cache.
+fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    lang.hash(&mut hasher);
+    code.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Ok(guard) = cache.lock()
+        && let Some(lines) = guard.get(&key)
+    {
+        return lines.clone();
+    }
+
+    let (syntaxes, theme) = syntect_assets();
+    let syntax = if lang.is_empty() {
+        None
+    } else {
+        syntaxes.find_syntax_by_token(lang)
+    };
+    let lines: Vec<Line<'static>> = match (syntax, theme.as_ref()) {
+        (Some(syntax), Some(theme)) => {
+            let mut highlighter = HighlightLines::new(syntax, theme);
+            LinesWithEndings::from(code)
+                .map(|line| match highlighter.highlight_line(line, syntaxes) {
+                    Ok(ranges) => Line::from(
+                        ranges
+                            .into_iter()
+                            .map(|(style, content)| {
+                                Span::styled(
+                                    content.trim_end_matches('\n').to_string(),
+                                    syntect_style(style),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(_) => Line::from(Span::styled(
+                        line.trim_end_matches('\n').to_string(),
+                        Style::default().fg(TEXT_DIM),
+                    )),
+                })
+                .collect()
+        }
+        _ => code
+            .lines()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(TEXT_DIM),
+                ))
+            })
+            .collect(),
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 128 {
+            guard.clear();
+        }
+        guard.insert(key, lines.clone());
+    }
+    lines
+}
+
 // ---------------------------------------------------------------------------
 // Markdown rendering (pulldown-cmark)
 // ---------------------------------------------------------------------------
 
-/// Render markdown to styled terminal text (chat messages).
+/// Render completed markdown to styled terminal text (fenced code blocks
+/// syntax-highlighted, foreground colors only).
 pub fn render_markdown(source: &str) -> Text<'static> {
-    let mut renderer = MarkdownRenderer::default();
+    render_markdown_inner(source, true)
+}
+
+/// Render in-flight streaming markdown: identical, except code blocks stay
+/// plain so per-frame rendering stays cheap.
+fn render_markdown_streaming(source: &str) -> Text<'static> {
+    render_markdown_inner(source, false)
+}
+
+fn render_markdown_inner(source: &str, highlight: bool) -> Text<'static> {
+    let mut renderer = MarkdownRenderer {
+        highlight,
+        ..MarkdownRenderer::default()
+    };
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for event in Parser::new_ext(source, options) {
         renderer.event(event);
@@ -884,6 +998,12 @@ struct MarkdownRenderer {
     italic: usize,
     strike: usize,
     code_block: bool,
+    /// Syntax-highlight completed code blocks via syntect.
+    highlight: bool,
+    /// Fenced language and buffered source of the open code block (only
+    /// used when `highlight` is set).
+    code_lang: String,
+    code_buffer: String,
     heading: bool,
     /// One entry per open list; `Some(n)` carries the next ordered index.
     lists: Vec<Option<u64>>,
@@ -895,10 +1015,11 @@ impl MarkdownRenderer {
     fn style(&self) -> Style {
         let mut style = Style::default();
         if self.code_block {
-            return style.fg(Color::Green);
+            // In-flight (unhighlighted) block code: neutral, not loud.
+            return style.fg(TEXT_DIM);
         }
         if self.heading {
-            style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            style = style.fg(ACCENT).add_modifier(Modifier::BOLD);
         }
         if self.bold > 0 {
             style = style.add_modifier(Modifier::BOLD);
@@ -910,7 +1031,7 @@ impl MarkdownRenderer {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.quote_depth > 0 {
-            style = style.fg(Color::Gray);
+            style = style.fg(TEXT_DIM);
         }
         style
     }
@@ -935,10 +1056,8 @@ impl MarkdownRenderer {
 
     fn line_prefix(&mut self) {
         if self.quote_depth > 0 {
-            self.current.push(Span::styled(
-                "▌ ".repeat(self.quote_depth),
-                Style::default().fg(Color::DarkGray),
-            ));
+            self.current
+                .push(Span::styled("▌ ".repeat(self.quote_depth), dim()));
         }
         if self.code_block {
             self.current.push(Span::raw("  "));
@@ -947,7 +1066,12 @@ impl MarkdownRenderer {
 
     fn push_text(&mut self, text: &str) {
         if self.code_block {
-            // Code blocks carry embedded newlines.
+            if self.highlight {
+                // Buffered for one syntect pass when the block closes.
+                self.code_buffer.push_str(text);
+                return;
+            }
+            // Streaming: code blocks carry embedded newlines, plain style.
             let style = self.style();
             let mut first = true;
             for part in text.split('\n') {
@@ -972,10 +1096,8 @@ impl MarkdownRenderer {
             MdEvent::End(tag) => self.end(tag),
             MdEvent::Text(text) => self.push_text(&text),
             MdEvent::Code(code) => {
-                self.current.push(Span::styled(
-                    code.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
+                self.current
+                    .push(Span::styled(code.to_string(), Style::default().fg(CODE)));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
                 self.end_line();
@@ -983,18 +1105,13 @@ impl MarkdownRenderer {
             }
             MdEvent::Rule => {
                 self.flush();
-                self.lines.push(Line::from(Span::styled(
-                    "─".repeat(24),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                self.lines
+                    .push(Line::from(Span::styled("─".repeat(24), dim())));
                 self.blank_line();
             }
             MdEvent::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
-                self.current.push(Span::styled(
-                    marker.to_string(),
-                    Style::default().fg(Color::Cyan),
-                ));
+                self.current.push(Span::styled(marker.to_string(), dim()));
             }
             MdEvent::Html(html) | MdEvent::InlineHtml(html) => self.push_text(&html),
             _ => {}
@@ -1018,16 +1135,19 @@ impl MarkdownRenderer {
             }
             Tag::CodeBlock(kind) => {
                 self.flush();
+                self.code_lang.clear();
                 if let CodeBlockKind::Fenced(lang) = kind
                     && !lang.is_empty()
                 {
-                    self.lines.push(Line::from(Span::styled(
-                        format!("  ⌜{lang}⌟"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    self.code_lang.push_str(&lang);
+                    self.lines
+                        .push(Line::from(Span::styled(format!("  ⌜{lang}⌟"), dim())));
                 }
                 self.code_block = true;
-                self.line_prefix();
+                self.code_buffer.clear();
+                if !self.highlight {
+                    self.line_prefix();
+                }
             }
             Tag::List(start) => {
                 self.flush();
@@ -1045,8 +1165,7 @@ impl MarkdownRenderer {
                     }
                     _ => format!("{indent}• "),
                 };
-                self.current
-                    .push(Span::styled(bullet, Style::default().fg(Color::Cyan)));
+                self.current.push(Span::styled(bullet, dim()));
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
@@ -1074,7 +1193,18 @@ impl MarkdownRenderer {
                 self.blank_line();
             }
             TagEnd::CodeBlock => {
-                self.flush();
+                if self.highlight {
+                    let code = std::mem::take(&mut self.code_buffer);
+                    let lang = std::mem::take(&mut self.code_lang);
+                    for mut line in highlight_code_block(&lang, &code) {
+                        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                        spans.push(Span::raw("  "));
+                        spans.append(&mut line.spans);
+                        self.lines.push(Line::from(spans));
+                    }
+                } else {
+                    self.flush();
+                }
                 self.code_block = false;
                 self.blank_line();
             }
@@ -1091,10 +1221,8 @@ impl MarkdownRenderer {
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
             TagEnd::Link => {
                 if let Some(url) = self.link.take() {
-                    self.current.push(Span::styled(
-                        format!(" ({url})"),
-                        Style::default().fg(Color::Blue).underlined(),
-                    ));
+                    self.current
+                        .push(Span::styled(format!(" ({url})"), dim().underlined()));
                 }
             }
             _ => {}

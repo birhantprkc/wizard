@@ -3,7 +3,7 @@
 //! [`crate::event`].
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, DoneReason, session::Session, subagent};
@@ -42,6 +42,28 @@ pub enum TranscriptEntry {
     },
     /// System notice (mode switch, reload result, errors).
     Notice(String),
+}
+
+/// Outcome of a background agent rebuild (model switch, crash recovery),
+/// delivered to the main loop via [`Event::AgentRebuilt`].
+pub struct AgentRebuild {
+    /// Agent to restore into the main loop's slot. `None` when the rebuild
+    /// failed outright and no previous agent could be preserved.
+    pub agent: Option<Agent>,
+    /// On a successful model switch, the tag to record in config/status.
+    pub model: Option<String>,
+    /// Notice appended to the transcript.
+    pub notice: String,
+}
+
+impl std::fmt::Debug for AgentRebuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRebuild")
+            .field("agent", &self.agent.is_some())
+            .field("model", &self.model)
+            .field("notice", &self.notice)
+            .finish()
+    }
 }
 
 /// A gated tool call waiting for the user's y/n.
@@ -281,6 +303,10 @@ pub struct App {
     history_draft: String,
     /// When the in-flight turn started (drives the elapsed-time display).
     pub turn_started: Option<Instant>,
+    /// Label of an in-progress background agent rebuild (model switch,
+    /// crash recovery); rendered as a spinner in the status bar. Input that
+    /// needs the agent is rejected with a notice while this is `Some`.
+    pub rebuilding: Option<String>,
 }
 
 impl App {
@@ -315,6 +341,7 @@ impl App {
             history_pos: None,
             history_draft: String::new(),
             turn_started: None,
+            rebuilding: None,
         }
     }
 
@@ -562,6 +589,9 @@ impl App {
                 self.notice(message);
                 Ok(None)
             }
+            // Owned by the main loop (it holds the agent slot); never
+            // reaches here.
+            Event::AgentRebuilt(_) => Ok(None),
         }
     }
 
@@ -821,6 +851,10 @@ impl App {
                 if self.status.busy {
                     // Rejected input never ran; do not record it in history.
                     self.notice("the agent is busy — wait for the current turn to finish");
+                    return None;
+                }
+                if self.rebuilding.is_some() {
+                    self.notice("the agent is rebuilding — try again in a moment");
                     return None;
                 }
                 self.push_history(&input);
@@ -1207,13 +1241,16 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
             McpConfig::default()
         }
     };
-    let mut manager = match McpManager::connect_all(&mcp_config).await {
-        Ok(manager) => manager,
-        Err(err) => {
-            tracing::warn!("connecting MCP servers: {err:#}");
-            McpManager::empty()
-        }
-    };
+    // Shared with background rebuild tasks (model switch, crash recovery).
+    let manager = Arc::new(Mutex::new(
+        match McpManager::connect_all(&mcp_config).await {
+            Ok(manager) => manager,
+            Err(err) => {
+                tracing::warn!("connecting MCP servers: {err:#}");
+                McpManager::empty()
+            }
+        },
+    ));
 
     let mut agent_slot: Option<Agent> = Some(
         build_agent(
@@ -1221,7 +1258,7 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
             &config,
             &skills,
             &project_root,
-            &manager,
+            &*manager.lock().await,
             cli.resume,
         )
         .await?,
@@ -1249,6 +1286,22 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
         let Some(event) = events.next().await else {
             break;
         };
+
+        // A background rebuild finished: restore the agent into the slot.
+        if let Event::AgentRebuilt(rebuild) = event {
+            let rebuild = *rebuild;
+            app.rebuilding = None;
+            if let Some(model) = rebuild.model {
+                app.config.model = model.clone();
+                app.status.model = model;
+            }
+            if let Some(agent) = rebuild.agent {
+                agent_slot = Some(agent);
+            }
+            app.notice(rebuild.notice);
+            continue;
+        }
+
         let turn_done = matches!(&event, Event::Agent(AgentEvent::Done { .. }));
 
         let action = app.handle_event(event)?;
@@ -1292,18 +1345,18 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
                     None => app.notice("the agent is busy — wait for the current turn to finish"),
                 },
                 AppAction::Command(command) => {
-                    handle_command(
-                        command,
-                        &mut app,
-                        &client,
-                        &mut agent_slot,
-                        &mut manager,
-                        &mut skills,
-                        &project_root,
-                        &mcp_path,
+                    CommandContext {
+                        app: &mut app,
+                        client: &client,
+                        agent_slot: &mut agent_slot,
+                        manager: &manager,
+                        skills: &mut skills,
+                        project_root: &project_root,
+                        mcp_path: &mcp_path,
                         genie_max_steps,
-                        &events,
-                    )
+                        events: &events,
+                    }
+                    .run(command)
                     .await;
                 }
             }
@@ -1313,18 +1366,43 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
             match handle.await {
                 Ok(agent) => agent_slot = Some(agent),
                 Err(err) => {
+                    // The turn task panicked and took the agent with it.
+                    // Rebuild off the event loop so the TUI stays responsive.
                     app.notice(format!("agent task crashed: {err}"));
-                    match build_agent(&client, &app.config, &skills, &project_root, &manager, true)
+                    app.rebuilding = Some("restarting agent".to_string());
+                    let client = client.clone();
+                    let config = app.config.clone();
+                    let skills = skills.clone();
+                    let project_root = project_root.clone();
+                    let manager = Arc::clone(&manager);
+                    let notify = events.sender();
+                    tokio::spawn(async move {
+                        let manager = manager.lock().await;
+                        let rebuild = match build_agent(
+                            &client,
+                            &config,
+                            &skills,
+                            &project_root,
+                            &manager,
+                            true,
+                        )
                         .await
-                    {
-                        Ok(agent) => {
-                            agent_slot = Some(agent);
-                            app.notice("agent restarted from the last session");
-                        }
-                        Err(err) => app.notice(format!(
-                            "could not restart the agent: {err:#} — /quit and relaunch"
-                        )),
-                    }
+                        {
+                            Ok(agent) => AgentRebuild {
+                                agent: Some(agent),
+                                model: None,
+                                notice: "agent restarted from the last session".to_string(),
+                            },
+                            Err(err) => AgentRebuild {
+                                agent: None,
+                                model: None,
+                                notice: format!(
+                                    "could not restart the agent: {err:#} — /quit and relaunch"
+                                ),
+                            },
+                        };
+                        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+                    });
                 }
             }
         }
@@ -1339,248 +1417,307 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Execute one slash command against the running stack.
-//
-// This is the single dispatch point that wires every live subsystem of the
-// TUI together; bundling the borrows into a context struct would only move
-// the argument list without simplifying any call site (there is exactly one).
-#[allow(clippy::too_many_arguments)]
-async fn handle_command(
-    command: SlashCommand,
-    app: &mut App,
-    client: &OllamaClient,
-    agent_slot: &mut Option<Agent>,
-    manager: &mut McpManager,
-    skills: &mut Vec<Skill>,
-    project_root: &Path,
-    mcp_path: &Path,
+/// Everything a slash command may touch, borrowed from the main loop for
+/// the duration of one dispatch.
+struct CommandContext<'a> {
+    app: &'a mut App,
+    client: &'a OllamaClient,
+    agent_slot: &'a mut Option<Agent>,
+    manager: &'a Arc<Mutex<McpManager>>,
+    skills: &'a mut Vec<Skill>,
+    project_root: &'a Path,
+    mcp_path: &'a Path,
     genie_max_steps: u32,
-    events: &EventLoop,
-) {
-    match command {
-        SlashCommand::Help => {
-            app.notice(HELP_TEXT);
-        }
+    events: &'a EventLoop,
+}
 
-        SlashCommand::Quit => {
-            app.should_quit = true;
+impl CommandContext<'_> {
+    /// Execute one slash command against the running stack.
+    async fn run(mut self, command: SlashCommand) {
+        match command {
+            SlashCommand::Help => self.app.notice(HELP_TEXT),
+            SlashCommand::Quit => self.app.should_quit = true,
+            SlashCommand::Diff => self.toggle_diff().await,
+            SlashCommand::Clear => self.clear(),
+            SlashCommand::Model(None) => self.open_model_picker().await,
+            SlashCommand::Model(Some(tag)) => self.switch_model(tag),
+            SlashCommand::Mode(None) => self.open_mode_picker(),
+            SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
+            SlashCommand::Reload => self.reload().await,
+            SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
         }
+    }
 
-        SlashCommand::Diff => {
-            app.show_diff = !app.show_diff;
-            if app.show_diff {
-                app.diff_text = match git_diff_text(project_root).await {
-                    Ok(text) => text,
-                    Err(err) => format!("could not read git diff: {err:#}"),
-                };
-            }
+    /// True (with a notice) when the agent cannot be touched right now —
+    /// a turn is running or a background rebuild is in flight.
+    fn agent_unavailable(&mut self, action: &str) -> bool {
+        if self.app.status.busy {
+            self.app
+                .notice(format!("cannot {action} while a turn is running"));
+            true
+        } else if self.app.rebuilding.is_some() {
+            self.app
+                .notice(format!("cannot {action} while the agent is rebuilding"));
+            true
+        } else {
+            false
         }
+    }
 
-        SlashCommand::Clear => {
-            if app.status.busy {
-                app.notice("cannot clear while a turn is running");
-                return;
-            }
-            if let Some(agent) = agent_slot.as_mut()
-                && let Err(err) = agent.clear()
-            {
-                app.notice(format!("failed to rotate session: {err:#}"));
-                return;
-            }
-            app.transcript.clear();
-            app.streaming.clear();
-            app.scroll = 0;
-            app.notice("conversation cleared");
-        }
-
-        SlashCommand::Model(None) => {
-            if app.status.busy {
-                app.notice("cannot switch models while a turn is running");
-                return;
-            }
-            // Open the interactive model picker with all installed models.
-            match client.list_models().await {
-                Ok(models) if !models.is_empty() => {
-                    let current = app.config.model.clone();
-                    let items: Vec<PickerItem> = models
-                        .into_iter()
-                        .map(|model| PickerItem {
-                            current: model == current
-                                || model.split(':').next() == Some(current.as_str()),
-                            detail: String::new(),
-                            value: model,
-                        })
-                        .collect();
-                    let selected = items.iter().position(|item| item.current).unwrap_or(0);
-                    app.picker = Some(Picker {
-                        kind: PickerKind::Model,
-                        title: " select model ".to_string(),
-                        items,
-                        selected,
-                    });
-                }
-                Ok(_) => app.notice("no models installed — try `ollama pull <model>`"),
-                Err(err) => app.notice(format!("could not list models: {err:#}")),
-            }
-        }
-
-        SlashCommand::Model(Some(tag)) => {
-            if app.status.busy {
-                app.notice("cannot switch models while a turn is running");
-                return;
-            }
-            if let Ok(models) = client.list_models().await {
-                let known = models
-                    .iter()
-                    .any(|m| *m == tag || m.split(':').next() == Some(tag.as_str()));
-                if !known {
-                    app.notice(format!(
-                        "model '{tag}' is not installed (try `ollama pull {tag}`)"
-                    ));
-                    return;
-                }
-            }
-            app.config.model = tag.clone();
-            app.status.model = tag.clone();
-            let native_tools = match client.supports_native_tools(&tag).await {
-                Ok(supported) => supported,
-                Err(err) => {
-                    tracing::warn!("probing tool support for {tag}: {err:#}");
-                    false
-                }
+    async fn toggle_diff(&mut self) {
+        self.app.show_diff = !self.app.show_diff;
+        if self.app.show_diff {
+            self.app.diff_text = match git_diff_text(self.project_root).await {
+                Ok(text) => text,
+                Err(err) => format!("could not read git diff: {err:#}"),
             };
-            match agent_slot.as_mut() {
-                Some(agent) => {
-                    agent.set_model(tag.clone(), native_tools);
-                    app.notice(format!("switched to model {tag} (context preserved)"));
-                }
-                None => {
-                    match build_agent(client, &app.config, skills, project_root, manager, false)
-                        .await
-                    {
-                        Ok(agent) => {
-                            *agent_slot = Some(agent);
-                            app.notice(format!("switched to model {tag}"));
-                        }
-                        Err(err) => app.notice(format!("failed to switch model: {err:#}")),
-                    }
-                }
+        }
+    }
+
+    fn clear(&mut self) {
+        if self.agent_unavailable("clear") {
+            return;
+        }
+        if let Some(agent) = self.agent_slot.as_mut()
+            && let Err(err) = agent.clear()
+        {
+            self.app
+                .notice(format!("failed to rotate session: {err:#}"));
+            return;
+        }
+        self.app.transcript.clear();
+        self.app.streaming.clear();
+        self.app.scroll = 0;
+        self.app.notice("conversation cleared");
+    }
+
+    /// Open the interactive model picker with all installed models.
+    async fn open_model_picker(&mut self) {
+        if self.agent_unavailable("switch models") {
+            return;
+        }
+        match self.client.list_models().await {
+            Ok(models) if !models.is_empty() => {
+                let current = self.app.config.model.clone();
+                let items: Vec<PickerItem> = models
+                    .into_iter()
+                    .map(|model| PickerItem {
+                        current: model == current
+                            || model.split(':').next() == Some(current.as_str()),
+                        detail: String::new(),
+                        value: model,
+                    })
+                    .collect();
+                let selected = items.iter().position(|item| item.current).unwrap_or(0);
+                self.app.picker = Some(Picker {
+                    kind: PickerKind::Model,
+                    title: " select model ".to_string(),
+                    items,
+                    selected,
+                });
+            }
+            Ok(_) => self
+                .app
+                .notice("no models installed — try `ollama pull <model>`"),
+            Err(err) => self.app.notice(format!("could not list models: {err:#}")),
+        }
+    }
+
+    /// Switch models off the event loop: the validation probe and any agent
+    /// rebuild run in a background task and come back as
+    /// [`Event::AgentRebuilt`], so the TUI never freezes.
+    fn switch_model(&mut self, tag: String) {
+        if self.agent_unavailable("switch models") {
+            return;
+        }
+        let agent = self.agent_slot.take();
+        self.app.rebuilding = Some(format!("switching to {tag}"));
+        let client = self.client.clone();
+        let config = self.app.config.clone();
+        let skills = self.skills.clone();
+        let project_root = self.project_root.to_path_buf();
+        let manager = Arc::clone(self.manager);
+        let notify = self.events.sender();
+        tokio::spawn(async move {
+            let rebuild =
+                switch_model_task(agent, tag, &client, config, skills, project_root, manager).await;
+            let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+        });
+    }
+
+    /// Open the interactive mode picker.
+    fn open_mode_picker(&mut self) {
+        if self.agent_unavailable("switch modes") {
+            return;
+        }
+        let items = vec![
+            PickerItem {
+                value: "genie".to_string(),
+                detail: "interactive — confirms risky actions".to_string(),
+                current: self.app.mode == Mode::Genie,
+            },
+            PickerItem {
+                value: "sovereign".to_string(),
+                detail: "autonomous — auto-approves all tool calls".to_string(),
+                current: self.app.mode == Mode::Sovereign,
+            },
+        ];
+        let selected = items.iter().position(|item| item.current).unwrap_or(0);
+        self.app.picker = Some(Picker {
+            kind: PickerKind::Mode,
+            title: " select mode ".to_string(),
+            items,
+            selected,
+        });
+    }
+
+    fn switch_mode(&mut self, mode: Mode) {
+        if self.agent_unavailable("switch modes") {
+            return;
+        }
+        if let Some(agent) = self.agent_slot.as_mut() {
+            agent.set_mode(mode);
+        }
+        self.app.mode = mode;
+        self.app.config.mode = mode;
+        self.app.status.mode = mode;
+        match mode {
+            Mode::Sovereign => {
+                self.app.config.auto_approve = true;
+                self.app.config.max_steps = self
+                    .app
+                    .config
+                    .max_steps
+                    .max(Mode::Sovereign.default_max_steps());
+            }
+            Mode::Genie => {
+                self.app.config.auto_approve = false;
+                self.app.config.max_steps = self.genie_max_steps;
             }
         }
+        self.app.status.max_steps = self.app.config.max_steps;
+        self.app.notice(format!("switched to {mode} mode"));
+    }
 
-        SlashCommand::Mode(None) => {
-            if app.status.busy {
-                app.notice("cannot switch modes while a turn is running");
-                return;
+    async fn reload(&mut self) {
+        if self.agent_unavailable("reload") {
+            return;
+        }
+        *self.skills = load_skill_roots();
+        let mut manager = self.manager.lock().await;
+        match McpConfig::load(self.mcp_path) {
+            Ok(mcp_config) => {
+                if let Err(err) = manager.reload(&mcp_config).await {
+                    self.app.notice(format!("MCP reload warning: {err:#}"));
+                }
             }
-            // Open the interactive mode picker.
-            let items = vec![
-                PickerItem {
-                    value: "genie".to_string(),
-                    detail: "interactive — confirms risky actions".to_string(),
-                    current: app.mode == Mode::Genie,
+            Err(err) => self
+                .app
+                .notice(format!("could not reload MCP config: {err:#}")),
+        }
+        match build_registry(&manager, self.client).await {
+            Ok(registry) => {
+                let tool_count = registry.len();
+                if let Some(agent) = self.agent_slot.as_mut() {
+                    agent.set_registry(registry);
+                    agent.set_skills(self.skills.clone());
+                }
+                self.app.notice(format!(
+                    "reloaded: {tool_count} tools, {} skills",
+                    self.skills.len()
+                ));
+            }
+            Err(err) => self.app.notice(format!("reload failed: {err:#}")),
+        }
+    }
+
+    fn evolve(&mut self, deep: bool, description: String) {
+        let tier = if deep {
+            EvolveTier::Deep
+        } else {
+            EvolveTier::Runtime
+        };
+        self.app.notice(format!(
+            "evolving ({}): {description}",
+            if deep { "deep" } else { "runtime" }
+        ));
+        // The TUI cannot use the Evolver's stdin y/N gate (the terminal
+        // is in raw mode and owned by the event loop). The explicit
+        // `/evolve` command is treated as the user's approval; the
+        // outcome notice reports exactly what was added.
+        let request = EvolveRequest {
+            description,
+            tier,
+            auto_approve: true,
+        };
+        let mut evolver = Evolver::new(self.app.config.clone());
+        let notify = self.events.sender();
+        tokio::spawn(async move {
+            let message = match evolver.run(request).await {
+                Ok(outcome) => describe_evolve_outcome(&outcome),
+                Err(err) => format!("evolve failed: {err:#}"),
+            };
+            let _ = notify.send(Event::Notice(message)).await;
+        });
+    }
+}
+
+/// Background half of `/model <tag>`: validate the tag against the
+/// installed models, probe native tool support, then either retag the live
+/// agent (context preserved) or build a fresh one.
+async fn switch_model_task(
+    agent: Option<Agent>,
+    tag: String,
+    client: &OllamaClient,
+    mut config: Config,
+    skills: Vec<Skill>,
+    project_root: PathBuf,
+    manager: Arc<Mutex<McpManager>>,
+) -> AgentRebuild {
+    if let Ok(models) = client.list_models().await {
+        let known = models
+            .iter()
+            .any(|m| *m == tag || m.split(':').next() == Some(tag.as_str()));
+        if !known {
+            // Hand the untouched agent straight back.
+            return AgentRebuild {
+                agent,
+                model: None,
+                notice: format!("model '{tag}' is not installed (try `ollama pull {tag}`)"),
+            };
+        }
+    }
+    let native_tools = match client.supports_native_tools(&tag).await {
+        Ok(supported) => supported,
+        Err(err) => {
+            tracing::warn!("probing tool support for {tag}: {err:#}");
+            false
+        }
+    };
+    match agent {
+        Some(mut agent) => {
+            agent.set_model(tag.clone(), native_tools);
+            AgentRebuild {
+                agent: Some(agent),
+                model: Some(tag.clone()),
+                notice: format!("switched to model {tag} (context preserved)"),
+            }
+        }
+        None => {
+            config.model = tag.clone();
+            let manager = manager.lock().await;
+            match build_agent(client, &config, &skills, &project_root, &manager, false).await {
+                Ok(agent) => AgentRebuild {
+                    agent: Some(agent),
+                    model: Some(tag.clone()),
+                    notice: format!("switched to model {tag}"),
                 },
-                PickerItem {
-                    value: "sovereign".to_string(),
-                    detail: "autonomous — auto-approves all tool calls".to_string(),
-                    current: app.mode == Mode::Sovereign,
+                Err(err) => AgentRebuild {
+                    agent: None,
+                    model: None,
+                    notice: format!("failed to switch model: {err:#}"),
                 },
-            ];
-            let selected = items.iter().position(|item| item.current).unwrap_or(0);
-            app.picker = Some(Picker {
-                kind: PickerKind::Mode,
-                title: " select mode ".to_string(),
-                items,
-                selected,
-            });
-        }
-
-        SlashCommand::Mode(Some(mode)) => {
-            if app.status.busy {
-                app.notice("cannot switch modes while a turn is running");
-                return;
             }
-            if let Some(agent) = agent_slot.as_mut() {
-                agent.set_mode(mode);
-            }
-            app.mode = mode;
-            app.config.mode = mode;
-            app.status.mode = mode;
-            match mode {
-                Mode::Sovereign => {
-                    app.config.auto_approve = true;
-                    app.config.max_steps = app
-                        .config
-                        .max_steps
-                        .max(Mode::Sovereign.default_max_steps());
-                }
-                Mode::Genie => {
-                    app.config.auto_approve = false;
-                    app.config.max_steps = genie_max_steps;
-                }
-            }
-            app.status.max_steps = app.config.max_steps;
-            app.notice(format!("switched to {mode} mode"));
-        }
-
-        SlashCommand::Reload => {
-            if app.status.busy {
-                app.notice("cannot reload while a turn is running");
-                return;
-            }
-            *skills = load_skill_roots();
-            match McpConfig::load(mcp_path) {
-                Ok(mcp_config) => {
-                    if let Err(err) = manager.reload(&mcp_config).await {
-                        app.notice(format!("MCP reload warning: {err:#}"));
-                    }
-                }
-                Err(err) => app.notice(format!("could not reload MCP config: {err:#}")),
-            }
-            match build_registry(manager, client).await {
-                Ok(registry) => {
-                    let tool_count = registry.len();
-                    if let Some(agent) = agent_slot.as_mut() {
-                        agent.set_registry(registry);
-                        agent.set_skills(skills.clone());
-                    }
-                    app.notice(format!(
-                        "reloaded: {tool_count} tools, {} skills",
-                        skills.len()
-                    ));
-                }
-                Err(err) => app.notice(format!("reload failed: {err:#}")),
-            }
-        }
-
-        SlashCommand::Evolve { deep, description } => {
-            let tier = if deep {
-                EvolveTier::Deep
-            } else {
-                EvolveTier::Runtime
-            };
-            app.notice(format!(
-                "evolving ({}): {description}",
-                if deep { "deep" } else { "runtime" }
-            ));
-            // The TUI cannot use the Evolver's stdin y/N gate (the terminal
-            // is in raw mode and owned by the event loop). The explicit
-            // `/evolve` command is treated as the user's approval; the
-            // outcome notice reports exactly what was added.
-            let request = EvolveRequest {
-                description,
-                tier,
-                auto_approve: true,
-            };
-            let mut evolver = Evolver::new(app.config.clone());
-            let notify = events.sender();
-            tokio::spawn(async move {
-                let message = match evolver.run(request).await {
-                    Ok(outcome) => describe_evolve_outcome(&outcome),
-                    Err(err) => format!("evolve failed: {err:#}"),
-                };
-                let _ = notify.send(Event::Notice(message)).await;
-            });
         }
     }
 }
@@ -1836,6 +1973,20 @@ mod tests {
             .expect("key handled");
         assert_eq!(app.input, " world");
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn submit_rejected_while_agent_rebuilds() {
+        let mut app = app();
+        app.rebuilding = Some("switching to qwen3:0.6b".to_string());
+        type_str(&mut app, "hello");
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(action.is_none());
+        assert!(app.history.is_empty());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Notice(_))
+        ));
     }
 
     #[test]

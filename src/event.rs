@@ -25,6 +25,10 @@ pub enum Event {
     /// Out-of-band notice from a background task (`/evolve`, `/reload`),
     /// rendered as a [`crate::app::TranscriptEntry::Notice`].
     Notice(String),
+    /// A background agent rebuild (model switch, crash recovery) finished.
+    /// Carries the agent back to the main loop's slot (boxed: an [`Agent`]
+    /// is large next to the input variants).
+    AgentRebuilt(Box<crate::app::AgentRebuild>),
 }
 
 /// Owns the merged event channel. A background task pumps crossterm's
