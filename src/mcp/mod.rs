@@ -38,6 +38,30 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Hard cap on `tools/list` pagination so a misbehaving server that keeps
 /// returning cursors cannot spin us forever.
 const MAX_LIST_PAGES: usize = 64;
+/// Budget for one stdio JSON-RPC round trip, so a server that answers with
+/// the wrong ids (or nothing at all) cannot wedge a request forever. Matches
+/// the `tools/call` budget — the longest legitimate operation.
+const STDIO_REQUEST_TIMEOUT: Duration = Duration::from_secs(CALL_TIMEOUT_SECS);
+/// Stale/mismatched-id responses tolerated per request before we give up on
+/// the server instead of reading its stdout to EOF.
+const MAX_STALE_RESPONSES: usize = 50;
+
+/// Parent environment variables forwarded to a spawned stdio server. The
+/// child's environment is otherwise cleared so servers don't inherit API
+/// keys and other secrets from the wizard process.
+const STDIO_ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "LANG", "LC_ALL", "TERM", "USER", "SHELL", "TMPDIR",
+];
+
+/// Dynamic-linker variables never forwarded from `mcp.toml` to a stdio
+/// child: each one is a code-injection vector into the spawned process.
+const STDIO_ENV_DENYLIST: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+];
 
 /// Native tool names an MCP tool must never shadow in the registry; a tool
 /// advertised under one of these is namespaced `server__tool`.
@@ -374,8 +398,9 @@ impl McpConnection {
     }
 
     /// One write-then-read round trip over the child's pipes. Skips
-    /// notifications, junk lines, and stale responses; politely refuses
-    /// server-to-client requests.
+    /// notifications, junk lines, and (a bounded number of) stale responses;
+    /// politely refuses server-to-client requests. The whole round trip is
+    /// capped at [`STDIO_REQUEST_TIMEOUT`].
     async fn stdio_request(
         &self,
         transport: &StdioTransport,
@@ -385,57 +410,17 @@ impl McpConnection {
         let name = &self.config.name;
         let mut io = transport.io.lock().await;
         write_line(&mut io.stdin, message, name).await?;
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = io
-                .stdout
-                .read_line(&mut line)
-                .await
-                .with_context(|| format!("failed reading from MCP server '{name}'"))?;
-            if read == 0 {
-                bail!("MCP server '{name}' closed its stdout (crashed or exited)");
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let msg: Value = match serde_json::from_str(trimmed) {
-                Ok(msg) => msg,
-                Err(_) => {
-                    warn!(
-                        server = %name,
-                        "ignoring non-JSON line on MCP server stdout: {}",
-                        truncate(trimmed, 200)
-                    );
-                    continue;
-                }
-            };
-            if msg.get("method").is_some() {
-                if let Some(req_id) = msg.get("id") {
-                    // Server-to-client request (sampling, roots, ...): not
-                    // supported by this minimal client; answer so the server
-                    // doesn't hang waiting on us.
-                    let refusal = json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32601,
-                            "message": "method not supported by wizard",
-                        },
-                    });
-                    write_line(&mut io.stdin, &refusal, name).await?;
-                }
-                // Plain notification: ignore.
-                continue;
-            }
-            if !id_matches(msg.get("id"), id) {
-                debug!(server = %name, "ignoring stale MCP response");
-                continue;
-            }
-            return extract_result(msg, name);
-        }
+        timeout(
+            STDIO_REQUEST_TIMEOUT,
+            read_stdio_response(&mut io, id, name),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "MCP server '{name}' did not answer within {}s",
+                STDIO_REQUEST_TIMEOUT.as_secs()
+            )
+        })?
     }
 
     /// One streamable-HTTP round trip: POST the request, then read the
@@ -554,7 +539,90 @@ impl McpConnection {
     }
 }
 
-/// Spawn the stdio child process for `config` (does not handshake).
+/// Read lines from the child's stdout until the response matching `id`
+/// arrives. Skips notifications and junk lines, politely refuses
+/// server-to-client requests, and gives up after [`MAX_STALE_RESPONSES`]
+/// mismatched-id responses so a misbehaving server cannot spin us to EOF.
+async fn read_stdio_response(io: &mut StdioIo, id: u64, name: &str) -> Result<Value> {
+    let mut stale = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = io
+            .stdout
+            .read_line(&mut line)
+            .await
+            .with_context(|| format!("failed reading from MCP server '{name}'"))?;
+        if read == 0 {
+            bail!("MCP server '{name}' closed its stdout (crashed or exited)");
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(trimmed) {
+            Ok(msg) => msg,
+            Err(_) => {
+                warn!(
+                    server = %name,
+                    "ignoring non-JSON line on MCP server stdout: {}",
+                    truncate(trimmed, 200)
+                );
+                continue;
+            }
+        };
+        if msg.get("method").is_some() {
+            if let Some(req_id) = msg.get("id") {
+                // Server-to-client request (sampling, roots, ...): not
+                // supported by this minimal client; answer so the server
+                // doesn't hang waiting on us.
+                let refusal = json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32601,
+                        "message": "method not supported by wizard",
+                    },
+                });
+                write_line(&mut io.stdin, &refusal, name).await?;
+            }
+            // Plain notification: ignore.
+            continue;
+        }
+        if !id_matches(msg.get("id"), id) {
+            stale += 1;
+            if stale > MAX_STALE_RESPONSES {
+                bail!(
+                    "MCP server '{name}' sent more than {MAX_STALE_RESPONSES} responses \
+                     with mismatched ids; giving up on request {id}"
+                );
+            }
+            debug!(server = %name, "ignoring stale MCP response");
+            continue;
+        }
+        return extract_result(msg, name);
+    }
+}
+
+/// Split config-supplied env vars into the set passed to the child and the
+/// (sorted) names of dynamic-linker variables dropped for safety.
+fn filter_config_env(env: &HashMap<String, String>) -> (HashMap<String, String>, Vec<String>) {
+    let mut allowed = HashMap::with_capacity(env.len());
+    let mut denied = Vec::new();
+    for (key, value) in env {
+        if STDIO_ENV_DENYLIST.contains(&key.as_str()) {
+            denied.push(key.clone());
+        } else {
+            allowed.insert(key.clone(), value.clone());
+        }
+    }
+    denied.sort_unstable();
+    (allowed, denied)
+}
+
+/// Spawn the stdio child process for `config` (does not handshake). The
+/// child's environment is cleared down to [`STDIO_ENV_ALLOWLIST`] plus the
+/// config-supplied vars (minus [`STDIO_ENV_DENYLIST`]).
 fn spawn_stdio(config: &McpServerConfig) -> Result<StdioTransport> {
     let command = config.command.as_deref().ok_or_else(|| {
         anyhow!(
@@ -563,20 +631,34 @@ fn spawn_stdio(config: &McpServerConfig) -> Result<StdioTransport> {
         )
     })?;
     let program = shellexpand::tilde(command).into_owned();
-    let mut child = Command::new(&program)
+    let (env, denied) = filter_config_env(&config.env);
+    for variable in &denied {
+        warn!(
+            server = %config.name,
+            variable = %variable,
+            "dropping dynamic-linker environment variable from MCP server config"
+        );
+    }
+    let mut command = Command::new(&program);
+    command
         .args(&config.args)
-        .envs(&config.env)
+        .env_clear()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn MCP server '{}' (command: {program})",
-                config.name
-            )
-        })?;
+        .kill_on_drop(true);
+    for key in STDIO_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.envs(&env);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn MCP server '{}' (command: {program})",
+            config.name
+        )
+    })?;
 
     let stdin = child
         .stdin
@@ -1119,6 +1201,110 @@ done"#
         let tools = manager.tools().await.expect("tools should list");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "weather");
+    }
+
+    #[test]
+    fn filter_config_env_drops_dynamic_linker_vars() {
+        let mut env: HashMap<String, String> = HashMap::from([
+            ("PATH".to_string(), "/custom/bin".to_string()),
+            ("API_KEY".to_string(), "secret".to_string()),
+        ]);
+        for key in STDIO_ENV_DENYLIST {
+            env.insert((*key).to_string(), "/evil.so".to_string());
+        }
+        let (allowed, denied) = filter_config_env(&env);
+
+        let mut expected_denied: Vec<String> =
+            STDIO_ENV_DENYLIST.iter().map(|s| s.to_string()).collect();
+        expected_denied.sort_unstable();
+        assert_eq!(denied, expected_denied);
+        assert_eq!(allowed.len(), 2);
+        assert_eq!(allowed["PATH"], "/custom/bin");
+        assert_eq!(allowed["API_KEY"], "secret");
+    }
+
+    /// End to end: the child must see config-supplied vars, but neither the
+    /// denylisted linker vars nor the parent's environment (cargo always
+    /// sets `CARGO_MANIFEST_DIR` for test binaries).
+    #[tokio::test]
+    async fn stdio_child_env_is_cleared_and_filtered() {
+        let script = r#"while read -r line; do
+  case "$line" in
+    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"env","version":"0"}}}' ;;
+    *'"env/echo"'*) printf '{"jsonrpc":"2.0","id":2,"result":{"ok":"%s","ld":"%s","manifest":"%s"}}\n' "${WIZARD_MCP_TEST_OK:-unset}" "${LD_PRELOAD:-unset}" "${CARGO_MANIFEST_DIR:-unset}" ;;
+  esac
+done"#;
+        let connection = McpConnection::connect(McpServerConfig {
+            name: "envprobe".into(),
+            transport: McpTransport::Stdio,
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script.into()],
+            url: None,
+            env: HashMap::from([
+                ("WIZARD_MCP_TEST_OK".to_string(), "yes".to_string()),
+                ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+            ]),
+        })
+        .await
+        .expect("env probe server should connect");
+        let result = connection
+            .request("env/echo", json!({}))
+            .await
+            .expect("env/echo should answer");
+        assert_eq!(result["ok"], "yes");
+        assert_eq!(result["ld"], "unset");
+        assert_eq!(result["manifest"], "unset");
+        connection.close().await.ok();
+    }
+
+    /// A server that floods mismatched-id responses and then stalls must
+    /// produce a bounded error, not read stdout until EOF or timeout.
+    #[tokio::test]
+    async fn stale_response_flood_fails_with_bounded_error() {
+        let script = r#"read -r line
+i=0
+while [ "$i" -lt 60 ]; do
+  printf '%s\n' '{"jsonrpc":"2.0","id":999,"result":{}}'
+  i=$((i+1))
+done
+exec sleep 60"#;
+        let result = McpConnection::connect(McpServerConfig {
+            name: "flood".into(),
+            transport: McpTransport::Stdio,
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script.into()],
+            url: None,
+            env: HashMap::new(),
+        })
+        .await;
+        let Err(err) = result else {
+            panic!("a flood of stale responses should fail the request");
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("flood"), "got: {message}");
+        assert!(message.contains("mismatched ids"), "got: {message}");
+    }
+
+    /// A request the server never answers must hit the per-request timeout
+    /// instead of hanging. Time is paused after the handshake so the 120s
+    /// budget elapses instantly.
+    #[tokio::test]
+    async fn stdio_request_times_out_when_server_goes_silent() {
+        let connection = McpConnection::connect(fake_server_config("quiet", "tool"))
+            .await
+            .expect("fake server should connect");
+        // The fake server's `case` matches no pattern for this method and
+        // prints nothing, so the client would otherwise wait forever.
+        tokio::time::pause();
+        let err = connection
+            .request("wizard/unhandled", json!({}))
+            .await
+            .expect_err("an unanswered request should time out");
+        tokio::time::resume();
+        let message = format!("{err:#}");
+        assert!(message.contains("quiet"), "got: {message}");
+        assert!(message.contains("did not answer"), "got: {message}");
+        connection.close().await.ok();
     }
 
     #[test]
