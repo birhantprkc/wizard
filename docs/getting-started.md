@@ -20,12 +20,12 @@ The installer:
 
 ### Model tiers (automatic)
 
-| Available VRAM | Model pulled | Approx. size |
-|----------------|--------------|--------------|
-| ≥ 26 GB | `qwen3.6:35b` | ~24 GB (MoE — fast active path, but the full weights must fit in memory) |
-| 18–26 GB | `qwen3.6:27b` | ~17 GB |
+| Available VRAM | Model pulled | Approx. size (Q4_K_M) |
+|----------------|--------------|-----------------------|
+| ≥ 24 GB | `qwen3.6:35b` | ~21–24 GB (MoE, 36B total / 3B active — fast, but all weights must fit in memory) |
+| 18–24 GB | `qwen3.6:27b` | ~17 GB (dense) |
 | 8–18 GB | `qwen3.5:9b` | ~6 GB |
-| < 8 GB | `qwen3.5:9b` (CPU/partial offload — slower) | ~6 GB |
+| < 8 GB | `qwen3.5:9b` (CPU / partial offload — slower) | ~6 GB |
 
 Tiers are ordered so the model's **total** footprint fits the available memory — note that an MoE model still needs all expert weights resident, so `qwen3.6:35b` lands in the top tier despite its small active-parameter count. VRAM is detected via `nvidia-smi` when a GPU is present. On CPU-only systems, the installer uses available system RAM as a heuristic.
 
