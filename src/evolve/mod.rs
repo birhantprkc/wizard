@@ -521,7 +521,8 @@ impl Evolver {
                     reason,
                     outcome: Box::new(inner),
                 };
-                self.log_event(request, EvolveTier::Deep, &outcome, None, None)?;
+                // Log the tier that actually ran, not the one requested.
+                self.log_event(request, EvolveTier::Runtime, &outcome, None, None)?;
                 return Ok(outcome);
             }
         };
@@ -547,6 +548,12 @@ impl Evolver {
                 return Err(err.context("deep evolve build failed; the diff was reverted"));
             }
         };
+        if let Err(err) = smoke_test(&built) {
+            self.revert_diff(&source_dir);
+            return Err(err.context(
+                "deep evolve smoke test failed; the current binary was kept and the diff reverted",
+            ));
+        }
         self.commit_source(&source_dir, &request.description);
 
         let binary = self.install_binary(&built);
@@ -831,9 +838,10 @@ impl Evolver {
         match swap_in(built, &exe) {
             Ok(backup) => {
                 self.status(&format!(
-                    "Installed the new binary over {} (previous kept at {} for rollback).",
+                    "Installed the new binary over {}. To roll back: mv {} {}",
                     exe.display(),
-                    backup.display()
+                    backup.display(),
+                    exe.display()
                 ));
                 exe
             }
@@ -1294,6 +1302,31 @@ fn source_file_listing(root: &Path) -> String {
     files.sort();
     files.truncate(MAX_LISTED_FILES);
     files.join("\n")
+}
+
+/// Run `binary --version` and check it exits 0 printing a `wizard …`
+/// version line, before trusting it to replace the running executable.
+fn smoke_test(binary: &Path) -> Result<()> {
+    let output = Command::new(binary)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {} --version", binary.display()))?;
+    if !output.status.success() {
+        bail!(
+            "{} --version exited with {}",
+            binary.display(),
+            output.status
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim_start().starts_with("wizard") {
+        bail!(
+            "{} --version printed {:?} instead of a wizard version",
+            binary.display(),
+            stdout.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Move the running executable aside as `<name>.prev` (the rollback copy)

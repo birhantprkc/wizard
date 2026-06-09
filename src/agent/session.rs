@@ -163,6 +163,33 @@ mod tests {
     }
 
     #[test]
+    fn save_then_load_round_trips_through_a_fresh_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::create(dir.path()).unwrap();
+        let messages = [
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+            ChatMessage::tool_result("git_status", "clean"),
+        ];
+        for message in &messages {
+            session.append(message).unwrap();
+        }
+
+        // Reload through open_latest, as `--resume` would.
+        let reopened = Session::open_latest(dir.path())
+            .unwrap()
+            .expect("session exists");
+        assert_eq!(reopened.id, session.id);
+        let loaded = reopened.load_messages().unwrap();
+        assert_eq!(loaded.len(), messages.len());
+        for (loaded, original) in loaded.iter().zip(&messages) {
+            assert_eq!(loaded.role, original.role);
+            assert_eq!(loaded.content, original.content);
+            assert_eq!(loaded.tool_name, original.tool_name);
+        }
+    }
+
+    #[test]
     fn corrupt_and_blank_lines_are_skipped() {
         let tmp = TempDir::new();
         let session = Session::create(&tmp.0).unwrap();

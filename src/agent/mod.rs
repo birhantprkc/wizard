@@ -40,7 +40,8 @@ pub enum DoneReason {
     TimeLimit,
     /// Stopped via the loop-control file or user interrupt.
     Stopped,
-    /// Circuit breaker: repeated identical failures (sovereign).
+    /// Circuit breaker: repeated identical failures (sovereign) or too many
+    /// consecutive failures of one tool.
     CircuitBreaker,
 }
 
@@ -200,10 +201,61 @@ pub struct Agent {
     /// Circuit breaker state: signature of the last failing tool call and
     /// how many consecutive times it has failed identically.
     failure_streak: Option<(String, u32)>,
+    /// Per-tool consecutive-failure counts (args ignored).
+    tool_failures: ToolFailureCounter,
+    /// Warning from session resume (corrupt/unreadable file), emitted on
+    /// the next turn so the UI can surface it.
+    load_warning: Option<String>,
 }
 
 /// Consecutive identical failures that trip the sovereign circuit breaker.
 const CIRCUIT_BREAKER_LIMIT: u32 = 3;
+
+/// Consecutive failures of one tool (any args) before the model is nudged
+/// to change approach.
+const TOOL_FAILURE_NUDGE: u32 = 5;
+/// Consecutive failures of one tool (any args) before the turn ends with
+/// [`DoneReason::CircuitBreaker`].
+const TOOL_FAILURE_TRIP: u32 = 8;
+
+/// What [`ToolFailureCounter::record`] says to do after a tool result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureAction {
+    Continue,
+    /// Inject a system nudge telling the model to stop retrying the tool.
+    Nudge,
+    /// End the turn via the circuit breaker.
+    Trip,
+}
+
+/// Per-tool-name consecutive-failure counter, independent of arguments
+/// (catches models that jitter args to dodge the identical-failure
+/// breaker). A success of a tool resets that tool's count.
+#[derive(Debug, Default)]
+struct ToolFailureCounter {
+    counts: std::collections::HashMap<String, u32>,
+}
+
+impl ToolFailureCounter {
+    /// Record one tool result and return the action it warrants.
+    fn record(&mut self, name: &str, failed: bool) -> FailureAction {
+        if !failed {
+            self.counts.remove(name);
+            return FailureAction::Continue;
+        }
+        let count = self.counts.entry(name.to_string()).or_insert(0);
+        *count += 1;
+        match *count {
+            TOOL_FAILURE_NUDGE => FailureAction::Nudge,
+            count if count >= TOOL_FAILURE_TRIP => FailureAction::Trip,
+            _ => FailureAction::Continue,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.counts.clear();
+    }
+}
 
 impl Agent {
     /// Build an agent: compose the system prompt from `mode`, `skills`, and
@@ -220,10 +272,15 @@ impl Agent {
         native_tools: bool,
     ) -> Result<Self> {
         let agents_md = read_project_instructions(&project_root);
+        let mut load_warning = None;
         let prior = session
             .load_messages()
             .unwrap_or_else(|err| {
                 tracing::warn!("could not load session {}: {err}", session.path().display());
+                load_warning = Some(format!(
+                    "previous session {} could not be read ({err}); starting fresh",
+                    session.path().display()
+                ));
                 Vec::new()
             })
             .into_iter()
@@ -243,6 +300,8 @@ impl Agent {
             agents_md,
             deadline: None,
             failure_streak: None,
+            tool_failures: ToolFailureCounter::default(),
+            load_warning,
         };
         agent
             .history
@@ -285,6 +344,7 @@ impl Agent {
         self.session = Session::create(&Config::sessions_dir()?)?;
         self.history.truncate(1);
         self.failure_streak = None;
+        self.tool_failures.reset();
         Ok(())
     }
 
@@ -356,6 +416,9 @@ impl Agent {
         input: &str,
         events: mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
+        if let Some(warning) = self.load_warning.take() {
+            let _ = emit(&events, AgentEvent::Error(warning)).await;
+        }
         match self.turn_inner(input, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
@@ -504,7 +567,12 @@ impl Agent {
             {
                 return Ok(Some(DoneReason::Stopped));
             }
-            response.await.unwrap_or(false)
+            match response.await {
+                Ok(approved) => approved,
+                // Sender dropped without answering: the UI is tearing down,
+                // so end the turn instead of feeding the model a denial.
+                Err(_) => return Ok(Some(DoneReason::Stopped)),
+            }
         } else {
             true
         };
@@ -544,6 +612,7 @@ impl Agent {
         }
 
         let breaker_tripped = self.track_failure(&name, &args, &output);
+        let failure_action = self.tool_failures.record(&name, output.is_error);
         self.push(self.tool_feedback(&name, &output));
 
         if breaker_tripped {
@@ -555,6 +624,25 @@ impl Agent {
             )
             .await;
             return Ok(Some(DoneReason::CircuitBreaker));
+        }
+        match failure_action {
+            FailureAction::Continue => {}
+            FailureAction::Nudge => {
+                self.push(ChatMessage::system(format!(
+                    "Repeated failures with tool '{name}' ({TOOL_FAILURE_NUDGE} in a row) — \
+                     stop retrying it and change approach."
+                )));
+            }
+            FailureAction::Trip => {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!(
+                        "circuit breaker: '{name}' failed {TOOL_FAILURE_TRIP} times in a row"
+                    )),
+                )
+                .await;
+                return Ok(Some(DoneReason::CircuitBreaker));
+            }
         }
         Ok(None)
     }
@@ -933,5 +1021,68 @@ mod tests {
     fn loop_control_absent_file_is_none() {
         let tmp = TempDir::new();
         assert_eq!(read_loop_control(&tmp.0), None);
+    }
+
+    #[test]
+    fn tool_failures_nudge_then_trip() {
+        let mut counter = ToolFailureCounter::default();
+        for i in 1..TOOL_FAILURE_NUDGE {
+            assert_eq!(
+                counter.record("execute", true),
+                FailureAction::Continue,
+                "failure {i}"
+            );
+        }
+        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
+        for i in TOOL_FAILURE_NUDGE + 1..TOOL_FAILURE_TRIP {
+            assert_eq!(
+                counter.record("execute", true),
+                FailureAction::Continue,
+                "failure {i}"
+            );
+        }
+        assert_eq!(counter.record("execute", true), FailureAction::Trip);
+    }
+
+    #[test]
+    fn tool_failures_reset_on_success_of_that_tool() {
+        let mut counter = ToolFailureCounter::default();
+        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
+            counter.record("execute", true);
+        }
+        assert_eq!(counter.record("execute", false), FailureAction::Continue);
+        // The streak starts over after the success.
+        for i in 1..TOOL_FAILURE_NUDGE {
+            assert_eq!(
+                counter.record("execute", true),
+                FailureAction::Continue,
+                "failure {i}"
+            );
+        }
+        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
+    }
+
+    #[test]
+    fn tool_failures_count_per_tool_name() {
+        let mut counter = ToolFailureCounter::default();
+        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
+            counter.record("execute", true);
+            counter.record("write_file", true);
+        }
+        // Each tool reaches the nudge threshold independently; a success of
+        // one tool does not reset the other.
+        counter.record("write_file", false);
+        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
+        assert_eq!(counter.record("write_file", true), FailureAction::Continue);
+    }
+
+    #[test]
+    fn tool_failures_reset_clears_all_counts() {
+        let mut counter = ToolFailureCounter::default();
+        for _ in 0..TOOL_FAILURE_TRIP {
+            counter.record("execute", true);
+        }
+        counter.reset();
+        assert_eq!(counter.record("execute", true), FailureAction::Continue);
     }
 }
