@@ -8,6 +8,7 @@
 //! response is decoded back into Wizard's [`ChatChunk`] stream.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -17,6 +18,51 @@ use serde_json::{Value, json};
 
 use super::provider::LlmProvider;
 use super::{ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, Role, ToolCall};
+
+/// Supplies the `Authorization: Bearer` token for each request. The plain
+/// API-key case is [`StaticToken`]; OAuth-backed providers (xAI sign-in)
+/// plug in a source that refreshes the access token between calls.
+#[async_trait]
+pub trait TokenSource: Send + Sync + std::fmt::Debug {
+    /// The current bearer token, or `None` when the endpoint needs no auth.
+    /// May refresh an expiring token before returning it.
+    async fn bearer(&self) -> Result<Option<String>>;
+
+    /// Called once after an HTTP 401 from the API. Returns `true` when a
+    /// fresh token was obtained and the request should be retried.
+    async fn refresh_after_unauthorized(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// What the user should do about a persistent HTTP 401.
+    fn unauthorized_hint(&self) -> &str {
+        "check the configured API key env var"
+    }
+
+    /// Extra context appended to HTTP 403 errors (e.g. plan-gating hints).
+    fn forbidden_hint(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Fixed API key. An empty key means no `Authorization` header is sent
+/// (keyless local servers like vLLM or LM Studio).
+#[derive(Debug)]
+pub struct StaticToken(Option<String>);
+
+impl StaticToken {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        let key = api_key.into();
+        Self((!key.is_empty()).then_some(key))
+    }
+}
+
+#[async_trait]
+impl TokenSource for StaticToken {
+    async fn bearer(&self) -> Result<Option<String>> {
+        Ok(self.0.clone())
+    }
+}
 
 /// Client bound to one OpenAI-compatible endpoint.
 #[derive(Debug, Clone)]
@@ -28,8 +74,10 @@ pub struct OpenAiProvider {
     /// Default model tag (used only for [`LlmProvider::label`]; requests carry
     /// their own model).
     model: String,
-    /// Bearer API key; empty means no `Authorization` header is sent.
-    api_key: String,
+    /// Bearer token supplier (static key or refreshing OAuth source).
+    auth: Arc<dyn TokenSource>,
+    /// Vendor prefix for [`LlmProvider::label`] (`openai`, `xai`, ...).
+    vendor: &'static str,
 }
 
 impl OpenAiProvider {
@@ -40,13 +88,30 @@ impl OpenAiProvider {
         model: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_token_source(
+            base_url,
+            model,
+            Arc::new(StaticToken::new(api_key)),
+            "openai",
+        )
+    }
+
+    /// Build a client whose bearer token comes from `auth` on every request.
+    /// `vendor` is the label prefix shown in the UI (e.g. `xai`).
+    pub fn with_token_source(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        auth: Arc<dyn TokenSource>,
+        vendor: &'static str,
+    ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let http = reqwest::Client::builder().build().unwrap_or_default();
         Self {
             http,
             base_url,
             model: model.into(),
-            api_key: api_key.into(),
+            auth,
+            vendor,
         }
     }
 
@@ -54,13 +119,43 @@ impl OpenAiProvider {
         format!("{}{}", self.base_url, path)
     }
 
-    /// Attach the `Authorization: Bearer` header when a key is configured.
-    fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.api_key.is_empty() {
-            builder
-        } else {
-            builder.bearer_auth(&self.api_key)
+    /// Send a request with the current bearer token attached. On a 401 the
+    /// token source gets one chance to refresh, after which the request is
+    /// rebuilt (via `build`) and retried exactly once.
+    async fn send_authed<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut retried = false;
+        loop {
+            let mut request = build();
+            if let Some(token) = self.auth.bearer().await? {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !retried
+                && self.auth.refresh_after_unauthorized().await?
+            {
+                retried = true;
+                continue;
+            }
+            return Ok(response);
         }
+    }
+
+    /// Error for a non-success HTTP status, with the token source's hint
+    /// appended on 403 (e.g. OAuth plan gating).
+    fn http_failure(&self, status: reqwest::StatusCode, body: String) -> anyhow::Error {
+        let hint = if status == reqwest::StatusCode::FORBIDDEN {
+            self.auth
+                .forbidden_hint()
+                .map(|hint| format!(" ({hint})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        anyhow!("{} returned HTTP {status}: {body}{hint}", self.base_url)
     }
 
     /// Translate a native [`ChatRequest`] into the OpenAI Chat Completions
@@ -170,20 +265,20 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
 impl LlmProvider for OpenAiProvider {
     async fn health(&self) -> Result<()> {
         let response = self
-            .auth(self.http.get(self.url("/models")))
-            .send()
+            .send_authed(|| self.http.get(self.url("/models")))
             .await
             .with_context(|| format!("cannot reach {}", self.base_url))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(anyhow!(
-                "{} rejected the API key (HTTP 401) — check the configured API key env var",
-                self.base_url
+                "{} rejected the credentials (HTTP 401): {}",
+                self.base_url,
+                self.auth.unauthorized_hint()
             ));
         }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{} returned HTTP {status}: {body}", self.base_url));
+            return Err(self.http_failure(status, body));
         }
         Ok(())
     }
@@ -196,14 +291,13 @@ impl LlmProvider for OpenAiProvider {
 
     async fn list_models(&self) -> Result<Vec<String>> {
         let response = self
-            .auth(self.http.get(self.url("/models")))
-            .send()
+            .send_authed(|| self.http.get(self.url("/models")))
             .await
             .with_context(|| format!("listing models from {}", self.base_url))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{} returned HTTP {status}: {body}", self.base_url));
+            return Err(self.http_failure(status, body));
         }
         let models: ModelsResponse = response
             .json()
@@ -215,15 +309,13 @@ impl LlmProvider for OpenAiProvider {
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         let body = self.build_request_body(&request);
         let response = self
-            .auth(self.http.post(self.url("/chat/completions")))
-            .json(&body)
-            .send()
+            .send_authed(|| self.http.post(self.url("/chat/completions")).json(&body))
             .await
             .with_context(|| format!("chat request to {} failed", self.base_url))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{} returned HTTP {status}: {body}", self.base_url));
+            return Err(self.http_failure(status, body));
         }
         let bytes = response
             .bytes_stream()
@@ -236,7 +328,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn label(&self) -> String {
-        format!("openai:{}", self.model)
+        format!("{}:{}", self.vendor, self.model)
     }
 }
 
@@ -467,6 +559,26 @@ mod tests {
             "http://localhost:1234/v1/chat/completions"
         );
         assert_eq!(provider.label(), "openai:m");
+    }
+
+    #[test]
+    fn vendor_prefix_shows_in_the_label() {
+        let provider = OpenAiProvider::with_token_source(
+            "https://api.x.ai/v1",
+            "grok-4.3",
+            Arc::new(StaticToken::new("k")),
+            "xai",
+        );
+        assert_eq!(provider.label(), "xai:grok-4.3");
+    }
+
+    #[tokio::test]
+    async fn static_token_skips_the_header_when_empty() {
+        assert_eq!(
+            StaticToken::new("sk-test").bearer().await.expect("ok"),
+            Some("sk-test".to_string())
+        );
+        assert_eq!(StaticToken::new("").bearer().await.expect("ok"), None);
     }
 
     #[test]

@@ -13,8 +13,9 @@ use crate::cli::Cli;
 use crate::llm::anthropic::AnthropicProvider;
 use crate::llm::llamacpp::LlamaCppProvider;
 use crate::llm::ollama::OllamaClient;
-use crate::llm::openai::OpenAiProvider;
+use crate::llm::openai::{OpenAiProvider, StaticToken};
 use crate::llm::provider::LlmProvider;
+use crate::llm::xai_oauth;
 
 /// Personality mode. Shares tools and model; differs in prompting,
 /// temperature, step budget, and confirmation behavior (`docs/modes.md`).
@@ -73,6 +74,12 @@ pub enum ProviderKind {
     Openai,
     /// Anthropic Messages API.
     Anthropic,
+    /// xAI (Grok) Chat Completions at `https://api.x.ai/v1` with a plain API
+    /// key (default env var `XAI_API_KEY`).
+    Xai,
+    /// xAI via account sign-in: OAuth tokens from `wizard --login xai`
+    /// (stored in `~/.wizard/xai_oauth.json`), no API key needed.
+    XaiOauth,
 }
 
 impl fmt::Display for ProviderKind {
@@ -82,6 +89,8 @@ impl fmt::Display for ProviderKind {
             ProviderKind::Ollama => write!(f, "ollama"),
             ProviderKind::Openai => write!(f, "openai"),
             ProviderKind::Anthropic => write!(f, "anthropic"),
+            ProviderKind::Xai => write!(f, "xai"),
+            ProviderKind::XaiOauth => write!(f, "xaioauth"),
         }
     }
 }
@@ -145,7 +154,8 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     /// Base URL: llamacpp `http://127.0.0.1:8080`; ollama
     /// `http://127.0.0.1:11434`; openai `https://api.openai.com/v1`;
-    /// anthropic `https://api.anthropic.com`.
+    /// anthropic `https://api.anthropic.com`; xai / xaioauth
+    /// `https://api.x.ai/v1`.
     pub base_url: String,
     /// Model tag.
     pub model: String,
@@ -166,6 +176,20 @@ impl ProviderConfig {
             .as_ref()
             .and_then(|name| std::env::var(name).ok())
             .unwrap_or_default()
+    }
+
+    /// Like [`api_key`](Self::api_key) but with a per-kind default env var
+    /// when `api_key_env` is unset, warning when the key is missing.
+    fn cloud_key(&self, default_env: &str) -> String {
+        let env_name = self.api_key_env.as_deref().unwrap_or(default_env);
+        let key = std::env::var(env_name).unwrap_or_default();
+        if key.is_empty() {
+            tracing::warn!(
+                "provider '{}' has no API key (set {env_name}); requests will likely 401",
+                self.name,
+            );
+        }
+        key
     }
 
     /// Construct the concrete client for this provider. For cloud kinds a
@@ -206,6 +230,27 @@ impl ProviderConfig {
                     self.base_url.clone(),
                     self.model.clone(),
                     key,
+                )))
+            }
+            // xAI speaks the OpenAI-compatible Chat Completions API; only the
+            // credentials differ between the two kinds.
+            ProviderKind::Xai => {
+                let key = self.cloud_key(xai_oauth::DEFAULT_KEY_ENV);
+                Ok(Arc::new(OpenAiProvider::with_token_source(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    Arc::new(StaticToken::new(key)),
+                    "xai",
+                )))
+            }
+            ProviderKind::XaiOauth => {
+                let source = xai_oauth::XaiTokenSource::new()
+                    .context("setting up xAI OAuth token storage")?;
+                Ok(Arc::new(OpenAiProvider::with_token_source(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    Arc::new(source),
+                    "xai",
                 )))
             }
         }
@@ -708,6 +753,58 @@ mod tests {
         );
         assert!(parsed.providers[0].api_key_env.is_none());
         assert_eq!(parsed.active().kind, ProviderKind::LlamaCpp);
+    }
+
+    #[test]
+    fn xai_kinds_round_trip_through_toml() {
+        let original = Config {
+            providers: vec![
+                ProviderConfig {
+                    name: "xai".to_string(),
+                    kind: ProviderKind::Xai,
+                    base_url: "https://api.x.ai/v1".to_string(),
+                    model: "grok-4.3".to_string(),
+                    api_key_env: Some("XAI_API_KEY".to_string()),
+                    gguf_path: None,
+                },
+                ProviderConfig {
+                    name: "xai-account".to_string(),
+                    kind: ProviderKind::XaiOauth,
+                    base_url: "https://api.x.ai/v1".to_string(),
+                    model: "grok-4.3".to_string(),
+                    api_key_env: None,
+                    gguf_path: None,
+                },
+            ],
+            active_provider: Some("xai-account".to_string()),
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&original).expect("serialize");
+        // The serde names are what the /provider parser and Display use.
+        assert!(raw.contains("kind = \"xai\""), "raw: {raw}");
+        assert!(raw.contains("kind = \"xaioauth\""), "raw: {raw}");
+        let parsed: Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(parsed.providers[0].kind, ProviderKind::Xai);
+        assert_eq!(parsed.providers[0].api_key_env.as_deref(), Some("XAI_API_KEY"));
+        assert_eq!(parsed.providers[1].kind, ProviderKind::XaiOauth);
+        assert!(parsed.providers[1].api_key_env.is_none());
+        assert_eq!(parsed.active().kind, ProviderKind::XaiOauth);
+    }
+
+    #[test]
+    fn provider_kind_display_matches_serde_names() {
+        for (kind, name) in [
+            (ProviderKind::LlamaCpp, "llamacpp"),
+            (ProviderKind::Ollama, "ollama"),
+            (ProviderKind::Openai, "openai"),
+            (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::Xai, "xai"),
+            (ProviderKind::XaiOauth, "xaioauth"),
+        ] {
+            assert_eq!(kind.to_string(), name);
+            let json = serde_json::to_value(kind).expect("serialize kind");
+            assert_eq!(json, serde_json::json!(name), "Display and serde must agree");
+        }
     }
 
     #[test]

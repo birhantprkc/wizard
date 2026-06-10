@@ -70,6 +70,11 @@ pub struct Cli {
     #[arg(long)]
     pub gateway: bool,
 
+    /// Sign in to a provider account instead of starting the TUI. Currently
+    /// `xai`: OAuth in the browser, tokens stored in ~/.wizard/xai_oauth.json.
+    #[arg(long, value_name = "PROVIDER")]
+    pub login: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -223,7 +228,17 @@ mod tests {
         assert!(!cli.resume);
         assert!(!cli.onboard);
         assert!(!cli.gateway);
+        assert_eq!(cli.login, None);
         assert!(cli.command.is_none(), "bare wizard has no subcommand");
+    }
+
+    #[test]
+    fn login_flag_takes_a_provider() {
+        let cli = parse(&["--login", "xai"]).expect("--login xai parses");
+        assert_eq!(cli.login.as_deref(), Some("xai"));
+
+        let err = parse(&["--login"]).expect_err("--login without a provider is rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic; the default installer sets up a local stack ([llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF), so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
+Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in); the default installer sets up a local stack ([llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF), so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
 
 ## Install
 
@@ -114,7 +114,7 @@ The local default is llama.cpp; Ollama stays fully supported but is opt-in:
 
 - Explicit `[[providers]]` entries with `kind = "ollama"` behave exactly as before.
 - A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080`; add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
-- If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, then interactive setup.
+- If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` from the environment, then interactive setup.
 
 To switch an existing install to llama.cpp, add a provider from the TUI and point it at a GGUF:
 
@@ -137,14 +137,32 @@ Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speak
 
 ## Using a cloud or remote provider
 
-Any OpenAI-compatible endpoint or Anthropic works. Add one from the TUI and switch to it:
+Any OpenAI-compatible endpoint, Anthropic, or xAI works. Add one from the TUI and switch to it:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
+/provider add xai xai https://api.x.ai/v1 grok-4.3 XAI_API_KEY
 /provider use openai
 ```
 
 The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_BESPOKE=1` to choose everything on first run).
+
+### Signing in with an xAI account
+
+You can use xAI without an API key by signing in with your xAI account (OAuth 2.0 with PKCE):
+
+```bash
+wizard --login xai     # or /login xai from inside the TUI
+```
+
+Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. Then add the provider:
+
+```
+/provider add xai xaioauth https://api.x.ai/v1 grok-4.3
+/provider use xai
+```
+
+Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come back with HTTP 403, use the API-key flavor (`kind = "xai"` with `XAI_API_KEY`) instead.
 
 ## Headless mode
 

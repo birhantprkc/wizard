@@ -39,6 +39,15 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
         return bench::run(cmd.clone()).await;
     }
 
+    // `--login` is a one-shot credential flow: no config, no onboarding,
+    // no TUI. Tokens land in a dedicated file under ~/.wizard/.
+    if let Some(provider) = &cli.login {
+        return match provider.as_str() {
+            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}")).await,
+            other => anyhow::bail!("unknown login provider '{other}' (supported: xai)"),
+        };
+    }
+
     // First-run onboarding: build a fresh config interactively when requested,
     // or automatically on a fresh install in an interactive terminal. A
     // cancelled wizard exits gracefully without touching anything.
@@ -90,7 +99,7 @@ fn should_onboard(cli: &cli::Cli) -> Result<bool> {
     if cli.command.is_some() {
         return Ok(false);
     }
-    if cli.publish || cli.evolve || cli.gateway {
+    if cli.publish || cli.evolve || cli.gateway || cli.login.is_some() {
         return Ok(false);
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();

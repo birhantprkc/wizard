@@ -7,6 +7,7 @@ pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
 pub mod provider;
+pub mod xai_oauth;
 
 use std::pin::Pin;
 

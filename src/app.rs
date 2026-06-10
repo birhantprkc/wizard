@@ -113,6 +113,9 @@ pub enum SlashCommand {
     Provider(ProviderAction),
     /// `/server ...` — status / start / stop the local llama-server.
     Server(ServerAction),
+    /// `/login <provider>`: OAuth sign-in for providers that support it
+    /// (currently `xai`).
+    Login(String),
     Quit,
 }
 
@@ -146,7 +149,7 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
         Some("add") => {
             if args.len() < 5 {
                 return Err(
-                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]"
+                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|xai|xaioauth> <base_url> <model> [API_KEY_ENV]"
                         .to_string(),
                 );
             }
@@ -155,9 +158,11 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
                 "ollama" => ProviderKind::Ollama,
                 "openai" => ProviderKind::Openai,
                 "anthropic" => ProviderKind::Anthropic,
+                "xai" => ProviderKind::Xai,
+                "xaioauth" => ProviderKind::XaiOauth,
                 other => {
                     return Err(format!(
-                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic)"
+                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|xai|xaioauth)"
                     ));
                 }
             };
@@ -246,6 +251,10 @@ impl SlashCommand {
             }),
             "provider" => parse_provider(&args),
             "server" => parse_server(&args),
+            "login" => match args.first() {
+                Some(provider) => Ok(Self::Login((*provider).to_string())),
+                None => Err("usage: /login xai".to_string()),
+            },
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -315,6 +324,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[status|start|stop]",
         description: "manage the local llama-server",
         takes_args: false,
+    },
+    CommandSpec {
+        name: "login",
+        args: "<xai>",
+        description: "sign in to a provider account (xAI OAuth)",
+        takes_args: true,
     },
     CommandSpec {
         name: "diff",
@@ -1333,8 +1348,9 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
-/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic)\n  \
+/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/xai/xaioauth)\n  \
 /server [status|start|stop] manage the local llama-server\n  \
+/login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /quit                       exit\n\
@@ -1391,6 +1407,13 @@ const BYOP_ENV_FALLBACKS: &[(&str, ProviderKind, &str, &str, &str)] = &[
         "https://api.openai.com/v1",
         "gpt-4o",
         "openai",
+    ),
+    (
+        "XAI_API_KEY",
+        ProviderKind::Xai,
+        "https://api.x.ai/v1",
+        "grok-4.3",
+        "xai",
     ),
 ];
 
@@ -1708,6 +1731,7 @@ impl CommandContext<'_> {
             SlashCommand::Publish { branch } => self.publish(branch),
             SlashCommand::Provider(action) => self.provider(action).await,
             SlashCommand::Server(action) => self.server(action).await,
+            SlashCommand::Login(provider) => self.login(provider),
         }
     }
 
@@ -2036,7 +2060,7 @@ impl CommandContext<'_> {
             let synth = self.app.config.active();
             self.app.notice(format!(
                 "no providers configured — using the default: {} ({}) {} @ {}\n\
-                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]",
+                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic|xai|xaioauth> <base_url> <model> [API_KEY_ENV]",
                 synth.name, synth.kind, synth.model, synth.base_url
             ));
             return;
@@ -2201,6 +2225,41 @@ impl CommandContext<'_> {
             Err(err) => format!("could not stop llama-server: {err:#}"),
         };
         self.app.notice(message);
+    }
+
+    /// `/login <provider>`: run an OAuth sign-in in the background, streaming
+    /// progress (including the URL to open) into the transcript as notices.
+    fn login(&mut self, provider: String) {
+        if provider != "xai" {
+            self.app.notice(format!(
+                "unknown login provider '{provider}' (supported: xai)"
+            ));
+            return;
+        }
+        let notify = self.events.sender();
+        self.app
+            .notice("starting the xAI sign-in; your browser should open shortly");
+        tokio::spawn(async move {
+            let progress = {
+                let notify = notify.clone();
+                move |line: &str| {
+                    // The progress callback is sync; relay each line through
+                    // its own send task.
+                    let notify = notify.clone();
+                    let line = line.to_string();
+                    tokio::spawn(async move {
+                        let _ = notify.send(Event::Notice(line)).await;
+                    });
+                }
+            };
+            let message = match crate::llm::xai_oauth::login(progress).await {
+                Ok(()) => "signed in to xAI; add the provider with \
+                           /provider add xai xaioauth https://api.x.ai/v1 grok-4.3"
+                    .to_string(),
+                Err(err) => format!("xAI sign-in failed: {err:#}"),
+            };
+            let _ = notify.send(Event::Notice(message)).await;
+        });
     }
 
     /// Background half of `/server start` (and the post-switch auto-start):
@@ -2423,6 +2482,56 @@ mod tests {
         let parsed = SlashCommand::parse("/server restart").expect("is a slash command");
         let message = parsed.expect_err("unknown subcommand");
         assert!(message.contains("status|start|stop"), "got: {message}");
+    }
+
+    #[test]
+    fn provider_add_accepts_xai_kinds() {
+        let parsed =
+            SlashCommand::parse("/provider add xai xai https://api.x.ai/v1 grok-4.3 XAI_API_KEY")
+                .expect("is a slash command")
+                .expect("parses");
+        assert_eq!(
+            parsed,
+            SlashCommand::Provider(ProviderAction::Add {
+                name: "xai".to_string(),
+                kind: ProviderKind::Xai,
+                base_url: "https://api.x.ai/v1".to_string(),
+                model: "grok-4.3".to_string(),
+                api_key_env: Some("XAI_API_KEY".to_string()),
+            })
+        );
+
+        let parsed =
+            SlashCommand::parse("/provider add grok xaioauth https://api.x.ai/v1 grok-4.3")
+                .expect("is a slash command")
+                .expect("parses");
+        assert_eq!(
+            parsed,
+            SlashCommand::Provider(ProviderAction::Add {
+                name: "grok".to_string(),
+                kind: ProviderKind::XaiOauth,
+                base_url: "https://api.x.ai/v1".to_string(),
+                model: "grok-4.3".to_string(),
+                api_key_env: None,
+            })
+        );
+
+        // The error for an unknown kind names the xai kinds too.
+        let parsed = SlashCommand::parse("/provider add x bogus https://e.com m")
+            .expect("is a slash command");
+        let message = parsed.expect_err("unknown kind");
+        assert!(message.contains("xai|xaioauth"), "got: {message}");
+    }
+
+    #[test]
+    fn login_parses_with_a_provider_argument() {
+        assert_eq!(
+            SlashCommand::parse("/login xai"),
+            Some(Ok(SlashCommand::Login("xai".to_string())))
+        );
+        let parsed = SlashCommand::parse("/login").expect("is a slash command");
+        let message = parsed.expect_err("missing provider");
+        assert!(message.contains("/login xai"), "got: {message}");
     }
 
     #[test]
