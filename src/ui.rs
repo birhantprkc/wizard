@@ -7,8 +7,9 @@
 //! - **Transparent**: never paint a background color; everything renders on
 //!   `Color::Reset` so the user's terminal background shows through.
 //!   Selection reads through an accent marker + bold, not opaque slabs.
-//! - **One accent** ([`ACCENT`]) for chrome plus dim grays; green/red only
-//!   as success/error semantics, cyan only for inline code.
+//! - **Monochrome**: white accent plus dim grays only — no hues anywhere.
+//!   Emphasis reads through brightness and bold, semantics through glyphs
+//!   (✓/✗), never color.
 //! - **No heavy boxes**: borderless sections separated by padding and dim
 //!   rules; rounded dim borders only on floating layers.
 
@@ -37,14 +38,14 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 
 /// The single accent color used for chrome (prompt, gutters, names,
 /// attention borders).
-const ACCENT: Color = Color::Magenta;
+const ACCENT: Color = Color::White;
 /// Dim chrome: rules, gutter marks, hints, secondary borders.
 const DIM: Color = Color::DarkGray;
 /// Secondary text (tool output, user echo, details).
 const TEXT_DIM: Color = Color::Gray;
-/// Inline code (block code gets syntect foreground colors, or [`TEXT_DIM`]
-/// when plain).
-const CODE: Color = Color::Cyan;
+/// Inline code (block code gets grayscale syntect foregrounds, or
+/// [`TEXT_DIM`] when plain).
+const CODE: Color = Color::White;
 
 fn dim() -> Style {
     Style::default().fg(DIM)
@@ -204,7 +205,7 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
 fn mode_span(mode: Mode) -> Span<'static> {
     match mode {
         Mode::Genie => Span::styled("genie", Style::default().fg(TEXT_DIM)),
-        Mode::Sovereign => Span::styled("sovereign", Style::default().fg(Color::Red).bold()),
+        Mode::Sovereign => Span::styled("sovereign", Style::default().fg(Color::White).bold()),
     }
 }
 
@@ -284,7 +285,7 @@ fn transcript_text(app: &App) -> Text<'static> {
             }
             TranscriptEntry::Notice(message) => {
                 let style = if message.starts_with("error") {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(Color::White).bold()
                 } else {
                     dim().italic()
                 };
@@ -342,8 +343,8 @@ fn tool_card_lines(
             SPINNER[(tick as usize) % SPINNER.len()].to_string(),
             accent(),
         ),
-        (Some(_), false) => Span::styled("✓", Style::default().fg(Color::Green)),
-        (Some(_), true) => Span::styled("✗", Style::default().fg(Color::Red)),
+        (Some(_), false) => Span::styled("✓", Style::default().fg(TEXT_DIM)),
+        (Some(_), true) => Span::styled("✗", Style::default().fg(Color::White).bold()),
     };
 
     let summary = if args.is_null() {
@@ -679,7 +680,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
                 Span::styled(truncate_width(&item.value, value_room), value_style),
             ];
             if item.current {
-                spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" ●", Style::default().fg(Color::White)));
             }
             if !item.detail.is_empty() {
                 spans.push(Span::styled(format!("  {}", item.detail), dim()));
@@ -748,10 +749,10 @@ fn draw_approval_modal(frame: &mut Frame, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::Green).bold()),
+        Span::styled("y", Style::default().fg(Color::White).bold()),
         Span::styled(" approve", dim()),
         Span::raw("    "),
-        Span::styled("n", Style::default().fg(Color::Red).bold()),
+        Span::styled("n", Style::default().fg(Color::White).bold()),
         Span::styled(" deny", dim()),
     ]));
 
@@ -1105,11 +1106,14 @@ pub fn highlight_diff(diff: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-/// Map a syntect style to ratatui, keeping only the foreground color and
-/// font modifiers — backgrounds would paint over the terminal transparency.
+/// Map a syntect style to ratatui, collapsing the theme's foreground to its
+/// grayscale luminance (the UI is monochrome) and keeping font modifiers —
+/// backgrounds would paint over the terminal transparency.
 fn syntect_style(style: syntect::highlighting::Style) -> Style {
     let fg = style.foreground;
-    let mut out = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
+    let luma = (u32::from(fg.r) * 299 + u32::from(fg.g) * 587 + u32::from(fg.b) * 114) / 1000;
+    let luma = luma as u8;
+    let mut out = Style::default().fg(Color::Rgb(luma, luma, luma));
     if style.font_style.contains(FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
     }
@@ -1130,9 +1134,9 @@ fn fallback_diff(diff: &str) -> Text<'static> {
             let style = if line.starts_with("+++") || line.starts_with("---") {
                 Style::default().add_modifier(Modifier::BOLD)
             } else if line.starts_with('+') {
-                Style::default().fg(Color::Green)
+                Style::default().fg(Color::White)
             } else if line.starts_with('-') {
-                Style::default().fg(Color::Red)
+                Style::default().fg(TEXT_DIM)
             } else if line.starts_with("@@") {
                 accent()
             } else if line.starts_with("diff ") || line.starts_with("index ") {

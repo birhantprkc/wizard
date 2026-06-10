@@ -6,7 +6,7 @@
 //! - **Pure logic** ([`Answers`], [`Answers::into_config`], [`parse_chat_ids`],
 //!   and the option tables) — fully unit-tested without a terminal.
 //! - **TUI** ([`run`] and the private `select` / `text_input` event loops) —
-//!   ratatui + crossterm rendering in the existing aesthetic (magenta accent,
+//!   ratatui + crossterm rendering in the existing aesthetic (white accent,
 //!   dim rounded borders, transparent background).
 //!
 //! Keeping the answer → [`Config`] mapping pure means the interesting behavior
@@ -28,8 +28,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use crate::config::{Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind};
 use crate::hardware;
 
-/// Magenta accent, matching [`crate::ui`].
-const ACCENT: Color = Color::Magenta;
+/// White accent, matching [`crate::ui`].
+const ACCENT: Color = Color::White;
 /// Dim chrome (borders, hints).
 const DIM: Color = Color::DarkGray;
 /// Secondary text.
@@ -1000,8 +1000,11 @@ fn draw_notice(frame: &mut ratatui::Frame, message: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Red))
-        .title(Span::styled(" notice ", Style::default().fg(Color::Red)));
+        .border_style(Style::default().fg(Color::White))
+        .title(Span::styled(
+            " notice ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
