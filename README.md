@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs `wizard`: a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. It works with any OpenAI-compatible endpoint — OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama — or Anthropic, and switches providers live with `/provider`. The default installer also sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with a Qwen 3 GGUF sized to your hardware, so it runs out of the box without an API key; bring a cloud key instead if you prefer.
+One link, and you have a ready-to-go setup: the `wizard` binary installed and working out of the box. It's a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic, and switches providers live with `/provider`. By default the installer also sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with a Qwen 3 GGUF sized to your hardware, so it runs without an API key; bring a cloud key instead if you prefer.
 
 **Two ways in.** Take the batteries-included one-liner above and start working immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
 
