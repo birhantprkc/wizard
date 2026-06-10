@@ -17,11 +17,11 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, DoneReason, session::Session, subagent};
 use crate::cli::Cli;
-use crate::config::{Config, Mode};
+use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::llm::ToolCall;
-use crate::llm::ollama::OllamaClient;
+use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
@@ -108,7 +108,74 @@ pub enum SlashCommand {
     Publish {
         branch: Option<String>,
     },
+    /// `/provider ...` — add, remove, or switch LLM providers.
+    Provider(ProviderAction),
     Quit,
+}
+
+/// What a `/provider` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAction {
+    /// `/provider` / `/provider list` — show configured providers.
+    List,
+    /// `/provider use <name>` — switch the active provider.
+    Use(String),
+    /// `/provider add <name> <kind> <base_url> <model> [API_KEY_ENV]`.
+    Add {
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key_env: Option<String>,
+    },
+    /// `/provider remove <name>`.
+    Remove(String),
+}
+
+/// Parse the arguments to `/provider` (everything after the command word).
+fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
+    let action = match args.first().copied() {
+        None | Some("list") => ProviderAction::List,
+        Some("use") => match args.get(1) {
+            Some(name) => ProviderAction::Use((*name).to_string()),
+            None => return Err("usage: /provider use <name>".to_string()),
+        },
+        Some("add") => {
+            if args.len() < 5 {
+                return Err(
+                    "usage: /provider add <name> <ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]"
+                        .to_string(),
+                );
+            }
+            let kind = match args[2] {
+                "ollama" => ProviderKind::Ollama,
+                "openai" => ProviderKind::Openai,
+                "anthropic" => ProviderKind::Anthropic,
+                other => {
+                    return Err(format!(
+                        "unknown provider kind '{other}' (ollama|openai|anthropic)"
+                    ));
+                }
+            };
+            ProviderAction::Add {
+                name: args[1].to_string(),
+                kind,
+                base_url: args[3].to_string(),
+                model: args[4].to_string(),
+                api_key_env: args.get(5).map(|s| s.to_string()),
+            }
+        }
+        Some("remove") => match args.get(1) {
+            Some(name) => ProviderAction::Remove((*name).to_string()),
+            None => return Err("usage: /provider remove <name>".to_string()),
+        },
+        Some(other) => {
+            return Err(format!(
+                "unknown /provider subcommand '{other}' (list|use|add|remove)"
+            ));
+        }
+    };
+    Ok(SlashCommand::Provider(action))
 }
 
 impl SlashCommand {
@@ -147,6 +214,7 @@ impl SlashCommand {
             "publish" => Ok(Self::Publish {
                 branch: args.first().map(|s| s.to_string()),
             }),
+            "provider" => parse_provider(&args),
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -203,6 +271,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "publish",
         args: "[branch]",
         description: "fork & publish your Wizard, get a one-line installer",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "provider",
+        args: "[list|use|add|remove]",
+        description: "add, remove, or switch LLM providers",
         takes_args: false,
     },
     CommandSpec {
@@ -326,7 +400,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         let mode = config.mode;
         let status = StatusLine {
-            model: config.model.clone(),
+            model: config.active().model,
             mode,
             step: 0,
             max_steps: config.max_steps,
@@ -1058,7 +1132,10 @@ fn load_skill_roots() -> Vec<Skill> {
 /// Native + scripted + MCP tools, freshly composed, with the subagent
 /// spawner layered on top. The spawn tool captures the base registry
 /// (without itself) so subagents cannot recurse.
-async fn build_registry(manager: &McpManager, client: &OllamaClient) -> Result<ToolRegistry> {
+async fn build_registry(
+    manager: &McpManager,
+    client: &Arc<dyn LlmProvider>,
+) -> Result<ToolRegistry> {
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
         Ok(dir) => {
@@ -1078,7 +1155,7 @@ async fn build_registry(manager: &McpManager, client: &OllamaClient) -> Result<T
     let mut registry = subagent::scoped_registry(&base, None);
     registry.register(Arc::new(subagent::SpawnSubagentTool::new(
         subagent_configs,
-        client.clone(),
+        Arc::clone(client),
         Arc::clone(&base),
     )));
     Ok(registry)
@@ -1099,7 +1176,7 @@ fn attach_config_tools(registry: &mut crate::tools::registry::ToolRegistry, conf
 /// Build a fully wired [`Agent`]. `resume` reopens the latest session file
 /// instead of starting a new one.
 async fn build_agent(
-    client: &OllamaClient,
+    client: &Arc<dyn LlmProvider>,
     config: &Config,
     skills: &[Skill],
     project_root: &Path,
@@ -1117,15 +1194,16 @@ async fn build_agent(
     } else {
         Session::create(&sessions_dir)?
     };
-    let native_tools = match client.supports_native_tools(&config.model).await {
+    let model = config.active().model;
+    let native_tools = match client.supports_native_tools(&model).await {
         Ok(supported) => supported,
         Err(err) => {
-            tracing::warn!("probing tool support for {}: {err:#}", config.model);
+            tracing::warn!("probing tool support for {model}: {err:#}");
             false
         }
     };
     Agent::new(
-        client.clone(),
+        Arc::clone(client),
         registry,
         config.clone(),
         skills.to_vec(),
@@ -1218,6 +1296,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
+/provider [list|use|...]    add, remove, or switch LLM providers (ollama/openai/anthropic)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /quit                       exit\n\
@@ -1249,13 +1328,14 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
         anyhow::bail!("wizard needs a terminal for the TUI; pass -p \"task\" to run headless");
     }
 
-    let client = OllamaClient::new(&config.ollama_host);
-    client.health().await.with_context(|| {
-        format!(
-            "cannot reach Ollama at {} — is `ollama serve` running?",
-            config.ollama_host
-        )
-    })?;
+    let active = config.active();
+    let mut client: Arc<dyn LlmProvider> = active
+        .build()
+        .with_context(|| format!("building provider '{}'", active.name))?;
+    client
+        .health()
+        .await
+        .with_context(|| format!("LLM health check failed for {}", client.label()))?;
 
     let project_root = std::env::current_dir().context("resolving project root")?;
     let mut skills = load_skill_roots();
@@ -1374,7 +1454,7 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
                 AppAction::Command(command) => {
                     CommandContext {
                         app: &mut app,
-                        client: &client,
+                        client: &mut client,
                         agent_slot: &mut agent_slot,
                         manager: &manager,
                         skills: &mut skills,
@@ -1448,7 +1528,7 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
 /// the duration of one dispatch.
 struct CommandContext<'a> {
     app: &'a mut App,
-    client: &'a OllamaClient,
+    client: &'a mut Arc<dyn LlmProvider>,
     agent_slot: &'a mut Option<Agent>,
     manager: &'a Arc<Mutex<McpManager>>,
     skills: &'a mut Vec<Skill>,
@@ -1473,6 +1553,7 @@ impl CommandContext<'_> {
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
+            SlashCommand::Provider(action) => self.provider(action).await,
         }
     }
 
@@ -1526,7 +1607,7 @@ impl CommandContext<'_> {
         }
         match self.client.list_models().await {
             Ok(models) if !models.is_empty() => {
-                let current = self.app.config.model.clone();
+                let current = self.app.status.model.clone();
                 let items: Vec<PickerItem> = models
                     .into_iter()
                     .map(|model| PickerItem {
@@ -1716,6 +1797,163 @@ impl CommandContext<'_> {
             let _ = notify.send(Event::Notice(message)).await;
         });
     }
+
+    /// Persist `App.config` to disk, surfacing any error as a notice.
+    fn persist_config(&mut self) {
+        if let Err(err) = self.app.config.save() {
+            self.app
+                .notice(format!("could not save config: {err:#}"));
+        }
+    }
+
+    /// Rebuild the live client + agent from the current active provider (after
+    /// a `/provider use`/`add`). Runs synchronously; reports `summary` on
+    /// success. Mirrors how the model picker probes the backend inline.
+    async fn rebuild_active_provider(&mut self, summary: String) {
+        let provider = self.app.config.active();
+        let client = match provider.build() {
+            Ok(client) => client,
+            Err(err) => {
+                self.app
+                    .notice(format!("could not build provider '{}': {err:#}", provider.name));
+                return;
+            }
+        };
+        *self.client = client;
+        let manager = self.manager.lock().await;
+        match build_agent(
+            self.client,
+            &self.app.config,
+            self.skills,
+            self.project_root,
+            &manager,
+            false,
+        )
+        .await
+        {
+            Ok(agent) => {
+                *self.agent_slot = Some(agent);
+                self.app.status.model = self.app.config.active().model;
+                self.app.notice(summary);
+            }
+            Err(err) => {
+                *self.agent_slot = None;
+                self.app.notice(format!(
+                    "switched provider but could not start the agent: {err:#} — /quit and relaunch"
+                ));
+            }
+        }
+    }
+
+    /// Handle `/provider` subcommands: list, switch, add, or remove providers.
+    async fn provider(&mut self, action: ProviderAction) {
+        match action {
+            ProviderAction::List => self.provider_list(),
+            ProviderAction::Use(name) => self.provider_use(name).await,
+            ProviderAction::Add {
+                name,
+                kind,
+                base_url,
+                model,
+                api_key_env,
+            } => {
+                self.provider_add(name, kind, base_url, model, api_key_env)
+                    .await
+            }
+            ProviderAction::Remove(name) => self.provider_remove(name),
+        }
+    }
+
+    fn provider_list(&mut self) {
+        if self.app.config.providers.is_empty() {
+            let synth = self.app.config.active();
+            self.app.notice(format!(
+                "no providers configured — using the default: {} ({}) {} @ {}\n\
+                 add one with: /provider add <name> <ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]",
+                synth.name, synth.kind, synth.model, synth.base_url
+            ));
+            return;
+        }
+        let active = self.app.config.active().name;
+        let mut lines = String::from("configured providers:");
+        for provider in &self.app.config.providers {
+            let marker = if provider.name == active { "* " } else { "  " };
+            let key = provider
+                .api_key_env
+                .as_deref()
+                .map(|env| format!(" [key: ${env}]"))
+                .unwrap_or_default();
+            lines.push_str(&format!(
+                "\n{marker}{} ({}) {} @ {}{key}",
+                provider.name, provider.kind, provider.model, provider.base_url
+            ));
+        }
+        lines.push_str("\n(* = active)");
+        self.app.notice(lines);
+    }
+
+    async fn provider_use(&mut self, name: String) {
+        if self.agent_unavailable("switch providers") {
+            return;
+        }
+        if !self.app.config.providers.iter().any(|p| p.name == name) {
+            self.app
+                .notice(format!("no provider named '{name}' — try /provider list"));
+            return;
+        }
+        self.app.config.active_provider = Some(name.clone());
+        self.persist_config();
+        self.rebuild_active_provider(format!("switched to provider '{name}'"))
+            .await;
+    }
+
+    async fn provider_add(
+        &mut self,
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key_env: Option<String>,
+    ) {
+        if self.agent_unavailable("add a provider") {
+            return;
+        }
+        let provider = ProviderConfig {
+            name: name.clone(),
+            kind,
+            base_url,
+            model,
+            api_key_env: api_key_env.clone(),
+        };
+        // Dedup by name: replace an existing entry with the same name.
+        self.app.config.providers.retain(|p| p.name != name);
+        self.app.config.providers.push(provider);
+        self.app.config.active_provider = Some(name.clone());
+        self.persist_config();
+        let reminder = api_key_env
+            .map(|env| format!(" — remember to `export {env}=<key>` for this provider"))
+            .unwrap_or_default();
+        self.rebuild_active_provider(format!("added and switched to provider '{name}'{reminder}"))
+            .await;
+    }
+
+    fn provider_remove(&mut self, name: String) {
+        if self.app.config.active().name == name {
+            self.app.notice(format!(
+                "'{name}' is the active provider — switch with /provider use <other> first"
+            ));
+            return;
+        }
+        let before = self.app.config.providers.len();
+        self.app.config.providers.retain(|p| p.name != name);
+        if self.app.config.providers.len() == before {
+            self.app
+                .notice(format!("no provider named '{name}'"));
+            return;
+        }
+        self.persist_config();
+        self.app.notice(format!("removed provider '{name}'"));
+    }
 }
 
 /// Background half of `/model <tag>`: validate the tag against the
@@ -1724,7 +1962,7 @@ impl CommandContext<'_> {
 async fn switch_model_task(
     agent: Option<Agent>,
     tag: String,
-    client: &OllamaClient,
+    client: &Arc<dyn LlmProvider>,
     mut config: Config,
     skills: Vec<Skill>,
     project_root: PathBuf,

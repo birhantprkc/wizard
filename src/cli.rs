@@ -59,6 +59,15 @@ pub struct Cli {
     /// Resume the most recent session instead of starting fresh.
     #[arg(long)]
     pub resume: bool,
+
+    /// Re-run the first-run onboarding wizard even if a config already exists.
+    #[arg(long)]
+    pub onboard: bool,
+
+    /// Run the messaging gateway (e.g. Telegram) instead of the TUI. Reads the
+    /// `[gateway]` section of config.toml; a long-running headless process.
+    #[arg(long)]
+    pub gateway: bool,
 }
 
 #[cfg(test)]
@@ -90,6 +99,8 @@ mod tests {
         assert!(!cli.continuous);
         assert_eq!(cli.cwd, None);
         assert!(!cli.resume);
+        assert!(!cli.onboard);
+        assert!(!cli.gateway);
     }
 
     #[test]
@@ -108,6 +119,8 @@ mod tests {
             "--cwd",
             "/tmp/project",
             "--resume",
+            "--onboard",
+            "--gateway",
         ])
         .expect("full flag set parses");
         assert_eq!(cli.mode, Some(Mode::Sovereign));
@@ -121,6 +134,8 @@ mod tests {
             Some(std::path::Path::new("/tmp/project"))
         );
         assert!(cli.resume);
+        assert!(cli.onboard);
+        assert!(cli.gateway);
     }
 
     #[test]

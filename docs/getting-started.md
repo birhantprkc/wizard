@@ -27,9 +27,9 @@ The installer:
 | 8–18 GB | `qwen3.5:9b` | ~6 GB |
 | < 8 GB | `qwen3.5:9b` (CPU / partial offload — slower) | ~6 GB |
 
-Tiers are ordered so the model's **total** footprint fits the available memory — note that an MoE model still needs all expert weights resident, so `qwen3.6:35b` lands in the top tier despite its small active-parameter count.
+Tiers are ordered so the model's total footprint fits in available memory. An MoE model still needs all expert weights resident, which is why `qwen3.6:35b` lands in the top tier despite its small active-parameter count.
 
-VRAM detection covers both GPU vendors: NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or, failing that, the amdgpu sysfs VRAM counter (`/sys/class/drm/card*/device/mem_info_vram_total`). On CPU-only systems, the installer uses total system RAM as a heuristic. If neither GPU VRAM nor system RAM can be detected at all, the installer does not abort — it falls back to the smallest tier (`qwen3.5:9b`) with a warning, and you can override with `WIZARD_MODEL=<tag>`.
+VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back to the amdgpu sysfs counter (`/sys/class/drm/card*/device/mem_info_vram_total`). On CPU-only systems, total system RAM is used as a heuristic. If nothing can be detected, the installer warns and falls back to the smallest tier (`qwen3.5:9b`); override with `WIZARD_MODEL=<tag>`.
 
 ### Environment variables
 
@@ -50,7 +50,7 @@ On first launch, Wizard:
 
 - Verifies Ollama is reachable at `http://127.0.0.1:11434`
 - Confirms the configured model is available (`ollama list`)
-- Opens the Ratatui interface in **genie mode**
+- Opens the Ratatui interface in genie mode
 
 Type a task in natural language:
 
@@ -58,7 +58,7 @@ Type a task in natural language:
 > Add error handling to the fetch_user function in src/api.rs
 ```
 
-Wizard reads files, proposes changes, runs tests, and shows git diffs — all locally.
+Wizard reads files, proposes changes, runs tests, and shows git diffs. Everything runs locally.
 
 ## Headless mode
 

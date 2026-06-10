@@ -21,9 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::Cli;
 use crate::config::{Config, Mode};
-use crate::llm::{
-    ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall, ollama::OllamaClient,
-};
+use crate::llm::provider::LlmProvider;
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
 use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
@@ -182,7 +181,10 @@ async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
 /// The tool-calling agent. Owns the conversation history, the model client,
 /// the tool registry, and session persistence.
 pub struct Agent {
-    client: OllamaClient,
+    client: Arc<dyn LlmProvider>,
+    /// Active model tag (from `config.active().model`); switched by
+    /// [`Agent::set_model`].
+    model: String,
     registry: ToolRegistry,
     config: Config,
     mode: Mode,
@@ -267,7 +269,7 @@ impl Agent {
     /// sessions replay their persisted messages under a fresh system
     /// prompt).
     pub fn new(
-        client: OllamaClient,
+        client: Arc<dyn LlmProvider>,
         registry: ToolRegistry,
         config: Config,
         skills: Vec<Skill>,
@@ -276,6 +278,7 @@ impl Agent {
         native_tools: bool,
     ) -> Result<Self> {
         let agents_md = read_project_instructions(&project_root);
+        let model = config.active().model;
         let mut load_warning = None;
         let prior = session
             .load_messages()
@@ -293,6 +296,7 @@ impl Agent {
 
         let mut agent = Self {
             client,
+            model,
             registry,
             mode: config.mode,
             config,
@@ -364,7 +368,8 @@ impl Agent {
     /// (probe with [`OllamaClient::supports_native_tools`]); the system
     /// prompt is recomposed so the JSON tool protocol section matches.
     pub fn set_model(&mut self, model: String, native_tools: bool) {
-        self.config.model = model;
+        self.config.model = model.clone();
+        self.model = model;
         self.native_tools = native_tools;
         self.refresh_system_prompt();
     }
@@ -505,7 +510,7 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(String, Vec<ToolCall>)> {
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.model.clone(),
             messages: self.history.clone(),
             tools: if self.native_tools {
                 self.registry.specs()
@@ -660,7 +665,7 @@ impl Agent {
     /// Used by [`compact_if_needed`]; deltas are not forwarded to the UI.
     async fn summarize_transcript(&self, blob: &str) -> Result<String> {
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.model.clone(),
             messages: vec![
                 ChatMessage::system(
                     "Summarize the following Wizard agent transcript into a compact progress \
@@ -882,52 +887,41 @@ fn read_project_instructions(project_root: &Path) -> Option<String> {
     None
 }
 
-/// Sovereign-mode headless runner: builds an [`Agent`] and drives it in an
-/// outer loop. The goal comes from `cli.prompt`, or (on a self-evolve
-/// re-exec) from the persisted [`mission::Mission`]. With `--continuous` it
-/// runs perpetually — persisting a mission, self-directing the next action
-/// after each completed cycle, sleeping-and-waking through transient LLM
-/// outages, compacting context, and re-exec'ing itself after a self-evolve —
-/// until stopped via `.wizard/loop-control`, `--max-hours`, or the circuit
-/// breaker. Otherwise it honors the `--loop N` bound. Prints progress to
-/// stdout instead of the TUI.
-pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
-    let project_root = std::env::current_dir().context("determining project root")?;
-
-    // Goal resolution: an explicit `-p` wins; otherwise resume the standing
-    // mission (this is the path taken after a self-evolve re-exec, which
-    // relaunches without `-p`); otherwise there is nothing to do.
-    let goal = if let Some(prompt) = cli.prompt.clone() {
-        prompt
-    } else if let Some(existing) = mission::Mission::load(&project_root)? {
-        existing.goal
-    } else {
-        return Err(anyhow::anyhow!(
-            "headless mode needs a task: pass -p \"<task>\""
-        ));
-    };
-
-    let client = OllamaClient::new(&config.ollama_host);
+/// Build a fully wired headless [`Agent`]: construct the active provider's
+/// client, health-check it, probe native tool support, assemble the tool
+/// registry (native + scripted + MCP + subagent spawner + evolve + publish),
+/// load skills, and open/create the session.
+///
+/// This is the shared agent-construction path used by both the sovereign
+/// headless runner ([`run_headless`]) and the messaging gateway
+/// ([`crate::gateway`]). `resume` reopens the latest session instead of
+/// starting a new one.
+pub async fn build_headless_agent(
+    config: &Config,
+    project_root: &Path,
+    resume: bool,
+) -> Result<Agent> {
+    let active = config.active();
+    let model = active.model.clone();
+    let client = active
+        .build()
+        .with_context(|| format!("building provider '{}'", active.name))?;
     client
         .health()
         .await
-        .with_context(|| format!("Ollama health check failed for {}", config.ollama_host))?;
+        .with_context(|| format!("LLM health check failed for {}", client.label()))?;
 
-    let native_tools = match client.supports_native_tools(&config.model).await {
+    let native_tools = match client.supports_native_tools(&model).await {
         Ok(supported) => supported,
         Err(err) => {
             tracing::warn!(
-                "could not probe tool support for '{}': {err}; assuming native tools",
-                config.model
+                "could not probe tool support for '{model}': {err}; assuming native tools"
             );
             true
         }
     };
     if !native_tools {
-        println!(
-            "model '{}' lacks native tool calling; using the JSON tool protocol",
-            config.model
-        );
+        println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
     }
 
     // Tools: natives + scripted + MCP, then the subagent spawner on top.
@@ -963,7 +957,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     let mut registry = subagent::scoped_registry(&base, None);
     registry.register(Arc::new(subagent::SpawnSubagentTool::new(
         subagent_configs,
-        client.clone(),
+        Arc::clone(&client),
         Arc::clone(&base),
     )));
     registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
@@ -981,7 +975,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     });
 
     let sessions_dir = Config::sessions_dir()?;
-    let session = if cli.resume {
+    let session = if resume {
         match Session::open_latest(&sessions_dir)? {
             Some(session) => session,
             None => Session::create(&sessions_dir)?,
@@ -990,15 +984,47 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         Session::create(&sessions_dir)?
     };
 
-    let mut agent = Agent::new(
+    Agent::new(
         client,
         registry,
         config.clone(),
         skills,
-        project_root.clone(),
+        project_root.to_path_buf(),
         session,
         native_tools,
-    )?;
+    )
+}
+
+/// Sovereign-mode headless runner: builds an [`Agent`] and drives it in an
+/// outer loop. The goal comes from `cli.prompt`, or (on a self-evolve
+/// re-exec) from the persisted [`mission::Mission`]. With `--continuous` it
+/// runs perpetually — persisting a mission, self-directing the next action
+/// after each completed cycle, sleeping-and-waking through transient LLM
+/// outages, compacting context, and re-exec'ing itself after a self-evolve —
+/// until stopped via `.wizard/loop-control`, `--max-hours`, or the circuit
+/// breaker. Otherwise it honors the `--loop N` bound. Prints progress to
+/// stdout instead of the TUI.
+pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
+    let project_root = std::env::current_dir().context("determining project root")?;
+
+    // Goal resolution: an explicit `-p` wins; otherwise resume the standing
+    // mission (this is the path taken after a self-evolve re-exec, which
+    // relaunches without `-p`); otherwise there is nothing to do.
+    let goal = if let Some(prompt) = cli.prompt.clone() {
+        prompt
+    } else if let Some(existing) = mission::Mission::load(&project_root)? {
+        existing.goal
+    } else {
+        return Err(anyhow::anyhow!(
+            "headless mode needs a task: pass -p \"<task>\""
+        ));
+    };
+
+    let active = config.active();
+    let model = active.model.clone();
+    let endpoint = active.base_url.clone();
+
+    let mut agent = build_headless_agent(&config, &project_root, cli.resume).await?;
     agent.set_deadline(
         cli.max_hours
             .map(|hours| Instant::now() + Duration::from_secs_f64(hours * 3600.0)),
@@ -1037,8 +1063,8 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     });
 
     println!(
-        "wizard {} — model {} @ {} — task: {goal}",
-        config.mode, config.model, config.ollama_host
+        "wizard {} — model {model} @ {endpoint} — task: {goal}",
+        config.mode
     );
 
     // Continuous mode persists a long-lived mission so the loop survives

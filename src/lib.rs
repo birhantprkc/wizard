@@ -10,11 +10,16 @@ pub mod cli;
 pub mod config;
 pub mod event;
 pub mod evolve;
+pub mod gateway;
+pub mod hardware;
 pub mod llm;
 pub mod mcp;
+pub mod onboarding;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+
+use std::io::IsTerminal;
 
 use anyhow::Result;
 
@@ -23,7 +28,20 @@ use crate::config::Mode;
 /// Top-level entry point: load config, apply CLI overrides, and dispatch to
 /// the selected run mode (genie TUI, sovereign headless loop, or `--evolve`).
 pub async fn run(cli: cli::Cli) -> Result<()> {
-    let mut config = config::Config::load()?;
+    // First-run onboarding: build a fresh config interactively when requested,
+    // or automatically on a fresh install in an interactive terminal. A
+    // cancelled wizard exits gracefully without touching anything.
+    let mut config = if should_onboard(&cli)? {
+        match onboarding::run().await? {
+            Some(config) => config,
+            None => {
+                println!("onboarding cancelled — run `wizard --onboard` any time.");
+                return Ok(());
+            }
+        }
+    } else {
+        config::Config::load()?
+    };
     config.apply_cli(&cli);
 
     if let Some(dir) = &cli.cwd {
@@ -38,8 +56,37 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
         return evolve::run_cli(config, cli).await;
     }
 
+    if cli.gateway {
+        return gateway::run(config, cli).await;
+    }
+
     match config.mode {
         Mode::Genie => app::run_tui(config, cli).await,
         Mode::Sovereign => agent::run_headless(config, cli).await,
     }
+}
+
+/// Decide whether to run onboarding before the normal flow.
+///
+/// `--onboard` forces it (when a terminal is available); otherwise it runs
+/// only on a genuine first run: the config file is absent, stdin/stdout are a
+/// terminal, and this is not a publish / evolve / gateway invocation or a
+/// headless-with-prompt sovereign run. A non-interactive run never onboards,
+/// so piping into Wizard never blocks.
+fn should_onboard(cli: &cli::Cli) -> Result<bool> {
+    if cli.publish || cli.evolve || cli.gateway {
+        return Ok(false);
+    }
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !interactive {
+        return Ok(false);
+    }
+    if cli.onboard {
+        return Ok(true);
+    }
+    // Headless-with-prompt sovereign runs are batch jobs — don't interrupt them.
+    let headless_with_prompt =
+        cli.prompt.is_some() && (cli.mode == Some(Mode::Sovereign) || cli.continuous);
+    let config_missing = !config::Config::path()?.exists();
+    Ok(config_missing && !headless_with_prompt)
 }

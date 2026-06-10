@@ -1,8 +1,8 @@
 # Bring your own model (BYOM)
 
-The default Wizard installer pulls **official Ollama library models** only (`qwen3.6:27b`, `qwen3.6:35b`, or `qwen3.5:9b`). This keeps the one-liner simple and avoids shipping custom model weights.
+The default Wizard installer pulls only official Ollama library models (`qwen3.6:27b`, `qwen3.6:35b`, or `qwen3.5:9b`), so the one-liner never ships custom model weights.
 
-If you need a different model — a fine-tune, a private registry tag, a local GGUF via Modelfile — use the BYOM installer.
+If you need a different model (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the BYOM installer.
 
 ## Install with BYOM
 
@@ -14,7 +14,7 @@ This script:
 
 1. Installs the `wizard` binary (same as the main installer)
 2. Installs Ollama if needed
-3. **Does not** pull any model automatically
+3. Does not pull any model automatically
 4. Walks you through model selection
 5. Writes your choice to `~/.wizard/config.toml`
 
@@ -125,7 +125,7 @@ Wizard v0.1 expects models that support:
 | Context ≥ 32K | Recommended | 128K+ preferred for large codebases |
 | Code quality | Recommended | Coding-oriented models perform best |
 
-Native tool calling through Ollama is historically inconsistent across models, so Wizard probes for it at startup: if the model advertises tools support it uses native function calling, otherwise it switches to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models — prefer a model with solid native tool calling for the smoothest agent loop.
+Native tool calling through Ollama varies by model, so Wizard probes for it at startup: models that advertise tools support get native function calling, others fall back to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models, so prefer one with solid native tool calling.
 
 ## Remote Ollama
 
@@ -140,7 +140,7 @@ Ensure the model is pulled on that server, not just locally.
 
 ## Disclaimer
 
-The BYOM installer lets **you** choose any Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
+The BYOM installer lets you choose any Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
 
 The default `install.sh` one-liner uses only official Qwen models from the Ollama library.
 

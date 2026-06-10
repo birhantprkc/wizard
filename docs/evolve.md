@@ -1,13 +1,13 @@
 # Self-extension (`/evolve`)
 
-Wizard can extend itself. `/evolve` lets the agent give itself new capabilities — a new skill, an external tool server, a scripted tool, a subagent, or (when needed) brand-new Rust in its own core.
+Wizard can extend itself. `/evolve` lets the agent add new capabilities: a skill, an external tool server, a scripted tool, a subagent, or, when needed, new Rust in its own core.
 
-The design follows the two self-modifying agents that pioneered this pattern:
+The design borrows from the two self-modifying agents that pioneered this pattern:
 
-- **[Pi](https://newsletter.pragmaticengineer.com/p/building-pi-and-what-makes-self-modifying)** modifies its own installed source in place and `/reload`s it live. It gets away with this because it's interpreted (Node/TS) — no compile step.
-- **[Hermes](https://hermes-agent.nousresearch.com/docs/)** never recompiles. It adds capability through portable **skills**, **MCP servers** (the channel for things like computer use), programmatic **scripted tools** (`execute_code`), and isolated **subagents**.
+- **[Pi](https://newsletter.pragmaticengineer.com/p/building-pi-and-what-makes-self-modifying)** modifies its own installed source in place and `/reload`s it live, which works because it's interpreted (Node/TS) and has no compile step.
+- **[Hermes](https://hermes-agent.nousresearch.com/docs/)** never recompiles. It adds capability through portable skills, MCP servers (the channel for things like computer use), programmatic scripted tools (`execute_code`), and isolated subagents.
 
-Wizard is compiled Rust, so it can't do Pi-style edit-and-reload on its core for free. Instead it copies Hermes' model for the common case and reserves real recompilation for the rare one. Hence **two tiers**.
+Wizard is compiled Rust, so it can't edit-and-reload its own core the way Pi does. It uses Hermes' model for the common case and recompiles only when a change has to live in the binary, which gives two tiers.
 
 ---
 
@@ -17,7 +17,7 @@ Works on every install, including the one-line `curl | bash` binary. `/evolve` w
 
 ### Skills
 
-Markdown capability — guidelines, workflows, domain knowledge — injected into the system prompt.
+A Markdown file of guidelines, workflows, or domain knowledge, injected into the system prompt.
 
 ```
 > /evolve add a skill for writing conventional commit messages
@@ -27,7 +27,7 @@ Wizard writes `skills/conventional-commits/SKILL.md` and reloads it into context
 
 ### MCP servers
 
-The path for capabilities that live **outside** Wizard — **computer use**, browser control, databases, search, anything shipped as an [MCP](https://modelcontextprotocol.io) server. Wizard is an MCP client; registering a server merges its tools into the registry with no rebuild.
+The path for capabilities that live outside Wizard: computer use, browser control, databases, search, anything shipped as an [MCP](https://modelcontextprotocol.io) server. Wizard is an MCP client; registering a server merges its tools into the registry with no rebuild.
 
 ```
 > /evolve give yourself computer use via an MCP server
@@ -46,7 +46,7 @@ args = ["mcp-computer-use"]
 
 ### Scripted tools
 
-The agent authors a small script (the Hermes `execute_code` analog), saved to `~/.wizard/tools/` and run through the `execute` sandbox. Good for glue and project-specific automation that doesn't warrant a whole MCP server.
+The agent authors a small script (the Hermes `execute_code` analog), saved to `~/.wizard/tools/` and run through the `execute` sandbox. Good for glue and project-specific automation that doesn't warrant an MCP server.
 
 ```
 > /evolve add a tool that renders a mermaid diagram to PNG
@@ -56,7 +56,7 @@ Saved as `~/.wizard/tools/mermaid-png.sh` with a manifest describing its name, a
 
 ### Subagents
 
-Configure a named, reusable subagent with its own prompt, tool scope, and step budget — for fan-out or specialized sub-tasks.
+Configure a named, reusable subagent with its own prompt, tool scope, and step budget, for fan-out or specialized sub-tasks.
 
 ```
 > /evolve add a "reviewer" subagent that audits diffs for security issues
@@ -66,7 +66,7 @@ Configure a named, reusable subagent with its own prompt, tool scope, and step b
 
 ## Tier 2 — deep evolve (recompiles core)
 
-When a change genuinely needs new Rust in Wizard itself — a new built-in tool kind, a protocol change, a TUI panel — use `--deep`:
+When a change needs new Rust in Wizard itself (a new built-in tool kind, a protocol change, a TUI panel), use `--deep`:
 
 ```
 > /evolve --deep add a /status slash command showing token usage
@@ -74,14 +74,14 @@ When a change genuinely needs new Rust in Wizard itself — a new built-in tool 
 
 The pipeline:
 
-1. **Locate source** — `~/.wizard/src`, cloned from the repo on first use.
-2. **Ensure a toolchain** — if `cargo` is absent, install it just-in-time via `rustup --profile minimal` (~0.5–1 GB, only on the first deep evolve). The default installer ships **no** toolchain, so the lightweight install stays lightweight; you pay for the compiler only if you actually deep-evolve.
+1. **Locate source**: `~/.wizard/src`, cloned from the repo on first use.
+2. **Ensure a toolchain**: if `cargo` is absent, install it via `rustup --profile minimal` (~0.5–1 GB, first deep evolve only). The default installer ships no toolchain; you pay for the compiler only if you use this tier.
 3. **Propose a diff** over Wizard's own source.
 4. **Approve** (skipped with `--auto`).
 5. **`cargo build --release`.**
 6. **`exec`-replace** the running process with the new binary.
 
-If there's no toolchain or source and one can't be provisioned (offline, no `rustup`), deep evolve **falls back to Tier 1** and tells you so, rather than failing.
+If there's no toolchain or source and one can't be provisioned (offline, no `rustup`), deep evolve falls back to Tier 1 and says so, rather than failing.
 
 To install the toolchain eagerly at setup time (air-gapped or offline-first machines):
 
@@ -101,16 +101,16 @@ WIZARD_WITH_TOOLCHAIN=1 curl -fsSL https://raw.githubusercontent.com/teddytennan
 | Add a specialized sub-worker | Subagent (1) | No |
 | Change Wizard's own built-in behavior or UI | Deep (2) | Yes |
 
-Rule of thumb: if an MCP server or script can do it, stay in Tier 1 — it's instant, reversible, and works on every install. Reach for `--deep` only when the capability has to live inside the binary.
+If an MCP server or script can do it, stay in Tier 1: it's instant, reversible, and works on every install. Use `--deep` only when the capability has to live inside the binary.
 
 ---
 
 ## Logging and rollback
 
-Every evolution — tier 1 or 2 — is appended to `~/.wizard/evolution.jsonl` with a timestamp, the change, and (for deep evolve) the diff and build result. Tier-1 changes are plain files under `~/.wizard/`; delete the file and `/reload` to revert. Deep evolve keeps the prior binary so you can roll back to it.
+Every evolution, tier 1 or 2, is appended to `~/.wizard/evolution.jsonl` with a timestamp, the change, and (for deep evolve) the diff and build result. Tier-1 changes are plain files under `~/.wizard/`; delete the file and `/reload` to revert. Deep evolve keeps the prior binary so you can roll back to it.
 
 ---
 
 ## Safety
 
-`/evolve` widens what the agent can do to your machine — review what it adds. MCP servers and scripted tools run with **your** privileges and can make their own network and system calls. In **sovereign mode**, `/evolve` changes are auto-approved along with everything else; only run unattended evolution on machines and tasks where that's acceptable. See the [security model](architecture.md#security-model).
+`/evolve` widens what the agent can do to your machine, so review what it adds. MCP servers and scripted tools run with your privileges and can make their own network and system calls. **In sovereign mode, `/evolve` changes are auto-approved along with everything else**; only run unattended evolution on machines and tasks where that's acceptable. See the [security model](architecture.md#security-model).

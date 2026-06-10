@@ -8,21 +8,34 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary, Ollama, and an official **Qwen 3.6** model sized to your hardware. Then you get a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. No API keys. No cloud. Your code stays yours.
+One command installs the `wizard` binary, Ollama, and an official Qwen 3.6 model sized to your hardware. The result is a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. Local is the default; there are no API keys and no cloud services until you ask for one.
+
+**Two ways in.** Take the batteries-included one-liner above and start coding immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BESPOKE=1 bash
+wizard   # launches onboarding on first run
+```
+
+Want a richer default loadout instead? Install [**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal) — the same Wizard preconfigured with a browser, a roster of subagents, and hardware-sized model selection, in one line.
 
 ---
 
 ## Why Wizard
 
-**Fully local, native-Ollama agent loop.** Wizard isn't a cloud agent with a local-model option bolted on — Ollama is the *only* backend in v0.1. The agent loop speaks Ollama's native `/api/chat` directly (streaming + native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), and the installer picks a model tier that actually fits your VRAM. Inference, prompts, sessions: all on your machine.
+**Local-first, native-Ollama agent loop — with a runtime escape hatch.** Wizard ships local-first: the agent loop speaks Ollama's native `/api/chat` directly (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), and the installer picks a model tier that fits your VRAM. Inference, prompts, and sessions stay on your machine by default. When you want frontier muscle, `/provider add` registers an OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, …) or Anthropic; `/provider use` switches between them live, and your key is read from an environment variable rather than stored on disk.
 
-**Tiered `/evolve` self-extension.** Wizard extends itself at runtime — new skills, MCP servers, scripted tools, and subagents are plain files under `~/.wizard/`, live after `/reload`, reverted by deleting the file. When a change genuinely needs new Rust, `/evolve --deep` proposes a diff to Wizard's own source, and — gated by your approval, a successful `cargo build --release`, and a `--version` smoke test — replaces its own binary. The old binary is kept as `wizard.prev` beside the new one, so rollback is one `mv`. Every evolution is logged with its diff to `~/.wizard/evolution.jsonl`. No magic, no unreviewable self-modification: gates and a paper trail.
+**Onboarding from scratch.** The bespoke path (`WIZARD_BESPOKE=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions — provider, model (with a VRAM-aware suggestion for local models), messaging gateway, and mode — and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
 
-**Runtime MCP.** Wizard is an MCP client (stdio and HTTP). Declare a server in `~/.wizard/mcp.toml` — or have `/evolve` register one — and its tools merge into the registry on `/reload`, no rebuild. Stdio servers are spawned with a cleared, allowlisted environment and dynamic-linker variables stripped; every request is time-bounded. This is the path for computer use, browser control, databases, and anything else shipped as an MCP server.
+**Messaging gateway.** Run Wizard headless as a bot you can talk to from your phone. `wizard --gateway` connects the configured gateway (Telegram, or `none` for terminal-only), runs each inbound message as a sovereign agent turn in your project, and replies with the result — chat-ID allow-list and env-var token included. Configure it in onboarding or `[gateway]` in config.toml.
 
-**Genie / Sovereign dual modes.** Genie is the interactive default: full TUI, confirms every write, shell command, and evolution before it runs. Sovereign is the autonomous mode: headless-capable, auto-approves everything, circuit-breaks on repeated failures, controllable mid-run via a loop-control file. Same tools, same model — different trust posture, switchable live with `/genie` and `/sovereign`.
+**Tiered `/evolve` self-extension.** Wizard extends itself at runtime. New skills, MCP servers, scripted tools, and subagents are plain files under `~/.wizard/`, live after `/reload` and reverted by deleting the file. When a change needs new Rust, `/evolve --deep` proposes a diff to Wizard's own source and, gated by your approval, a successful `cargo build --release`, and a `--version` smoke test, replaces its own binary. The old binary is kept as `wizard.prev` beside the new one, so rollback is a single `mv`, and every evolution is logged with its diff to `~/.wizard/evolution.jsonl`.
 
-**Perpetual `--continuous` mode.** Sovereign can also run *forever*. Given one goal, `--continuous` never stops at "done": it persists a durable mission to `.wizard/mission.toml`, self-directs the next most valuable action each cycle, sleeps-and-wakes through transient model-server outages instead of dying, compacts its own context so it never overflows, and — when it improves itself via `evolve`, up to rebuilding its own binary — re-execs into the new image and resumes the mission. Zero human in the loop; the kill switch is one line in `.wizard/loop-control`, and deep self-modification stays gated by an automated build + smoke test with `wizard.prev` rollback. See [docs/modes.md](docs/modes.md#continuous-mode-perpetual-sovereign).
+**Runtime MCP.** Wizard is an MCP client (stdio and HTTP). Declare a server in `~/.wizard/mcp.toml`, or have `/evolve` register one, and its tools merge into the registry on `/reload` without a rebuild. Stdio servers are spawned with a cleared, allowlisted environment and dynamic-linker variables stripped, and every request is time-bounded. This is the path for computer use, browser control, databases, and anything else shipped as an MCP server.
+
+**Genie / Sovereign dual modes.** Genie is the interactive default: a full TUI that confirms every write, shell command, and evolution before it runs. Sovereign is the autonomous mode: headless-capable, auto-approving, circuit-breaking on repeated failures, and controllable mid-run via a loop-control file. Both use the same tools and model; they differ only in trust posture, and you can switch live with `/genie` and `/sovereign`.
+
+**Perpetual `--continuous` mode.** Given one goal, `--continuous` runs sovereign mode indefinitely. It persists a durable mission to `.wizard/mission.toml`, picks the next most valuable action each cycle, sleeps through transient model-server outages instead of dying, and compacts its own context so it never overflows. When it improves itself via `evolve`, up to rebuilding its own binary, it re-execs into the new image and resumes the mission. No human is in the loop; the kill switch is one line in `.wizard/loop-control`, and deep self-modification stays behind the same automated build, smoke-test, and rollback gates. See [docs/modes.md](docs/modes.md#continuous-mode-perpetual-sovereign).
 
 **Make it your own Wizard.** After a deep evolve modifies Wizard's source, run `/publish` (or `wizard --publish`) to fork the upstream repo to your GitHub account, push your modified `~/.wizard/src` to a branch, and get a one-line installer for your variant:
 
@@ -30,7 +43,9 @@ One command installs the `wizard` binary, Ollama, and an official **Qwen 3.6** m
 curl -fsSL https://raw.githubusercontent.com/<owner>/wizard/<ref>/install.sh | WIZARD_REPO=<owner>/wizard WIZARD_REF=<ref> WIZARD_BUILD_FROM_SOURCE=1 bash
 ```
 
-Anyone who runs it gets your Wizard — built from your source on their machine, carrying your behavioral charter ([WIZARD.md](WIZARD.md)) as part of the binary. Publish is gated and logged to `~/.wizard/evolution.jsonl`. It requires `gh` authenticated (`gh auth login`). Forks install from source because they don't ship prebuilt release binaries by default. See [docs/market.md](docs/market.md).
+Anyone who runs it gets your Wizard, built from your source on their machine and carrying your behavioral charter ([WIZARD.md](WIZARD.md)) in the binary. Publish is approval-gated and logged, and requires an authenticated `gh` (`gh auth login`). Forks install from source because they don't ship prebuilt release binaries by default. See [docs/market.md](docs/market.md).
+
+[**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal) is the reference example of this: a configured distribution of Wizard with a preconfigured Playwright browser, a roster of ready subagents (reviewer, researcher, tester, documenter), and VRAM-based model selection baked into the defaults. See [docs/arsenal.md](docs/arsenal.md).
 
 ---
 
@@ -51,6 +66,20 @@ wizard --continuous -p "keep hardening this codebase: tests, docs, performance"
 
 # Self-extension: add a capability live (skill / MCP server / scripted tool)
 wizard --evolve -p "add a skill for conventional commit messages"
+
+# Re-run onboarding from scratch (provider, model, gateway, mode)
+wizard --onboard
+
+# Run as a messaging bot (reads the [gateway] section of config.toml)
+wizard --gateway
+```
+
+Add or switch model providers at any time from inside the TUI:
+
+```
+/provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
+/provider use openai          # switch the live agent to it
+/provider list                # show configured providers
 ```
 
 The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or amdgpu sysfs; system RAM on CPU-only boxes) and pulls the right tier:
@@ -62,33 +91,33 @@ The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or a
 | 8–18 GB | `qwen3.5:9b` | ~6 GB |
 | < 8 GB / undetectable | `qwen3.5:9b` (CPU / partial offload) | ~6 GB |
 
-Release tarballs are verified against the release's `checksums.txt` before install. Want a different model? `WIZARD_MODEL=<tag>` or the [BYOM installer](docs/byom.md). Full details in [docs/getting-started.md](docs/getting-started.md).
+Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or use the [BYOM installer](docs/byom.md). Full details in [docs/getting-started.md](docs/getting-started.md).
 
 ---
 
 ## How it compares
 
-Honest table — these are good tools, verified against their docs as of June 2026:
+Verified against each tool's documentation as of June 2026:
 
 | | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
 |---|---|---|---|---|
-| Local models | Ollama only — local is the design, not an option | Yes — Ollama + any OpenAI-compatible endpoint; top results come from cloud models | Yes — Ollama among 15+ providers | Yes — Ollama among 75+ providers |
+| Local models | Local-first on Ollama by default; OpenAI-compatible + Anthropic addable at runtime via `/provider` | Yes — Ollama + any OpenAI-compatible endpoint; top results come from cloud models | Yes — Ollama among 15+ providers | Yes — Ollama among 75+ providers |
 | MCP | Yes — stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes — one of the earliest and deepest integrations, 70+ documented extensions | Yes — local + remote servers, OAuth for remote |
 | Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | — | Extensions and recipes via MCP | TypeScript/JS plugin system |
 | Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |
 | Language | Rust | Python | Rust (TS desktop app) | TypeScript |
 | License | MIT | Apache-2.0 | Apache-2.0 | MIT |
 
-Credit where due: aider's git workflow (clean auto-commits per change) is still the reference; goose has the broadest MCP ecosystem and is now vendor-neutral under the Linux Foundation's Agentic AI Foundation; opencode is extremely active with the widest provider support and a first-rate TUI.
+aider's git workflow (clean auto-commits per change) is still the reference; goose has the broadest MCP ecosystem and is now vendor-neutral under the Linux Foundation's Agentic AI Foundation; opencode has the widest provider support and a polished TUI.
 
-Wizard's bet is narrower: one binary, one backend, fully local, and an agent that grows its own capabilities through audited, reversible steps.
+Wizard's bet is narrower: one binary, local-first, an onboarding that starts from your choices rather than someone's defaults, and an agent that grows its own capabilities through audited, reversible steps.
 
 ---
 
 ## Limitations (v0.1)
 
-- **Linux only.** x86_64 and aarch64. macOS is planned for v0.2 — the installer currently refuses Darwin rather than half-working.
-- **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude or GPT-class models. Wizard mitigates (native tool-call probing, JSON fallback, retry prompts) but does not pretend otherwise. The 27B+ tiers are noticeably better agents than the 9B tier.
+- **Linux only.** x86_64 and aarch64. macOS is planned for v0.2; the installer currently refuses Darwin rather than half-working.
+- **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude or GPT-class models. Wizard mitigates this with native tool-call probing, a JSON fallback, and retry prompts. The 27B+ tiers make much better agents than the 9B tier.
 - **No sandbox.** Tools run with your privileges; sovereign mode auto-approves them. Read [SECURITY.md](SECURITY.md) before running sovereign mode on anything you don't trust, and prefer a container/VM there.
 - **Context windows are finite.** Large codebases exceed what a local model can hold; Wizard searches and reads selectively rather than ingesting the repo, and long sessions will eventually push out early context.
 
@@ -100,9 +129,10 @@ Wizard's bet is narrower: one binary, one backend, fully local, and an agent tha
 - [Modes](docs/modes.md) — genie vs sovereign
 - [Self-extension](docs/evolve.md) — `/evolve` tiers, gates, rollback
 - [Fork and distribute](docs/market.md) — publish your evolved Wizard; one-line installer for your fork
+- [Wizard Arsenal](docs/arsenal.md) — the configured fork: preconfigured browser, subagents, and model selection
 - [Bring your own model](docs/byom.md) — custom Ollama models
 - [Architecture](docs/architecture.md) — how it's built
-- [Security](SECURITY.md) — threat model, honest edition
+- [Security](SECURITY.md) — threat model
 - [WIZARD.md](WIZARD.md) — the agent's bundled behavioral charter; inherited and editable by every fork
 
 ## Development

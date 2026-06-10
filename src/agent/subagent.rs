@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{Config, Mode};
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role, ollama::OllamaClient};
+use crate::llm::provider::LlmProvider;
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role};
 use crate::tools::{Tool, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
 
 use super::prompts;
@@ -145,13 +146,13 @@ pub fn scoped_registry(parent: &ToolRegistry, scope: Option<&[String]>) -> ToolR
 pub async fn spawn(
     config: &SubagentConfig,
     task: &str,
-    client: &OllamaClient,
+    client: &Arc<dyn LlmProvider>,
     registry: &ToolRegistry,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
     let model = Config::load()
-        .map(|c| c.model)
-        .unwrap_or_else(|_| Config::default().model);
+        .map(|c| c.active().model)
+        .unwrap_or_else(|_| Config::default().active().model);
     let scoped = scoped_registry(registry, config.tool_scope.as_deref());
     let native_tools = match client.supports_native_tools(&model).await {
         Ok(supported) => supported,
@@ -273,7 +274,7 @@ pub struct SpawnSubagentTool {
     /// Available subagent definitions, by name.
     pub configs: Vec<SubagentConfig>,
     /// Model client shared with the parent loop.
-    client: OllamaClient,
+    client: Arc<dyn LlmProvider>,
     /// Parent tool set subagents scope down from. Built without the spawn
     /// tool itself, so subagents cannot recurse.
     registry: Arc<ToolRegistry>,
@@ -284,7 +285,7 @@ pub struct SpawnSubagentTool {
 impl SpawnSubagentTool {
     pub fn new(
         configs: Vec<SubagentConfig>,
-        client: OllamaClient,
+        client: Arc<dyn LlmProvider>,
         registry: Arc<ToolRegistry>,
     ) -> Self {
         let roster = configs

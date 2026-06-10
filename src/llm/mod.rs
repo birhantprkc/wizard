@@ -2,9 +2,20 @@
 //! (not the OpenAI-compatible shim). Shared by the agent loop, the tool
 //! registry, and the TUI.
 
+pub mod anthropic;
 pub mod ollama;
+pub mod openai;
+pub mod provider;
 
+use std::pin::Pin;
+
+use anyhow::Result;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
+
+/// Boxed stream of [`ChatChunk`]s yielded by every provider's `chat_stream`.
+/// Shared across [`ollama`], [`openai`], and [`anthropic`].
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
 /// Message role on the Ollama `/api/chat` wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,11 +4,16 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::Cli;
+use crate::llm::anthropic::AnthropicProvider;
+use crate::llm::ollama::OllamaClient;
+use crate::llm::openai::OpenAiProvider;
+use crate::llm::provider::LlmProvider;
 
 /// Personality mode. Shares tools and model; differs in prompting,
 /// temperature, step budget, and confirmation behavior (`docs/modes.md`).
@@ -50,6 +55,149 @@ impl fmt::Display for Mode {
     }
 }
 
+/// Which backend a [`ProviderConfig`] talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// Local Ollama server (native `/api/chat`).
+    Ollama,
+    /// OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Groq,
+    /// together.ai, vLLM, LM Studio, ...).
+    Openai,
+    /// Anthropic Messages API.
+    Anthropic,
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProviderKind::Ollama => write!(f, "ollama"),
+            ProviderKind::Openai => write!(f, "openai"),
+            ProviderKind::Anthropic => write!(f, "anthropic"),
+        }
+    }
+}
+
+/// Which messaging gateway, if any, Wizard exposes (`wizard --gateway`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum GatewayKind {
+    /// No gateway — terminal only.
+    #[default]
+    None,
+    /// Telegram bot (long-poll `getUpdates` / `sendMessage`).
+    Telegram,
+}
+
+impl fmt::Display for GatewayKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GatewayKind::None => write!(f, "none"),
+            GatewayKind::Telegram => write!(f, "telegram"),
+        }
+    }
+}
+
+/// Configuration for the optional messaging gateway. Bot tokens are never
+/// stored here — only the name of the environment variable that holds the
+/// token (`token_env`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    /// Which gateway to run (default [`GatewayKind::None`]).
+    #[serde(default)]
+    pub kind: GatewayKind,
+    /// Name of the env var holding the bot token (default
+    /// `WIZARD_TELEGRAM_TOKEN`); the token itself is never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    /// Allowed inbound chat IDs. Empty means "allow all".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_chat_ids: Vec<i64>,
+}
+
+impl GatewayConfig {
+    /// Default name of the env var holding a Telegram bot token.
+    pub const DEFAULT_TOKEN_ENV: &'static str = "WIZARD_TELEGRAM_TOKEN";
+
+    /// The env var name to read the bot token from, falling back to
+    /// [`Self::DEFAULT_TOKEN_ENV`] when unset.
+    pub fn token_env(&self) -> &str {
+        self.token_env
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_TOKEN_ENV)
+    }
+}
+
+/// A named LLM provider. Cloud keys are never stored here — only the name of
+/// the environment variable holding the key (`api_key_env`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// Unique id, e.g. `"local"`, `"openai"`, `"claude"`.
+    pub name: String,
+    /// Backend kind.
+    pub kind: ProviderKind,
+    /// Base URL: ollama `http://127.0.0.1:11434`; openai
+    /// `https://api.openai.com/v1`; anthropic `https://api.anthropic.com`.
+    pub base_url: String,
+    /// Model tag.
+    pub model: String,
+    /// Name of the env var holding the API key (cloud only); the key itself is
+    /// never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Read the API key from `api_key_env`, or empty when unset/missing.
+    fn api_key(&self) -> String {
+        self.api_key_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok())
+            .unwrap_or_default()
+    }
+
+    /// Construct the concrete client for this provider. For cloud kinds a
+    /// missing key is a soft warning (the client is still built so `health()`
+    /// can report the real error).
+    pub fn build(&self) -> Result<Arc<dyn LlmProvider>> {
+        match self.kind {
+            ProviderKind::Ollama => Ok(Arc::new(OllamaClient::new(self.base_url.clone()))),
+            ProviderKind::Openai => {
+                let key = self.api_key();
+                if key.is_empty() {
+                    tracing::warn!(
+                        "provider '{}' has no API key (set {}); requests will likely 401",
+                        self.name,
+                        self.api_key_env.as_deref().unwrap_or("an env var")
+                    );
+                }
+                Ok(Arc::new(OpenAiProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    key,
+                )))
+            }
+            ProviderKind::Anthropic => {
+                let key = self.api_key();
+                if key.is_empty() {
+                    tracing::warn!(
+                        "provider '{}' has no API key (set {}); requests will likely 401",
+                        self.name,
+                        self.api_key_env.as_deref().unwrap_or("an env var")
+                    );
+                }
+                Ok(Arc::new(AnthropicProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    key,
+                )))
+            }
+        }
+    }
+}
+
 /// Contents of `~/.wizard/config.toml`. Unknown keys are ignored; missing
 /// keys take the documented defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +227,18 @@ pub struct Config {
     /// When the serialized chat history exceeds this many bytes, compact older
     /// messages into a summary.
     pub compact_threshold_bytes: usize,
+    /// Configured LLM providers. Empty means "use the legacy `model` /
+    /// `ollama_host` fields as a single local Ollama provider".
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+    /// Name of the active provider in [`providers`](Self::providers). `None`
+    /// (or an unknown name) selects the first configured provider.
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    /// Optional messaging gateway (`wizard --gateway`). Defaults to
+    /// [`GatewayKind::None`] — terminal only.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 impl Default for Config {
@@ -94,6 +254,9 @@ impl Default for Config {
             retry_max_secs: 300,
             cycle_pause_secs: 0,
             compact_threshold_bytes: 48_000,
+            providers: Vec::new(),
+            active_provider: None,
+            gateway: GatewayConfig::default(),
         }
     }
 }
@@ -187,6 +350,46 @@ impl Config {
         Ok(config)
     }
 
+    /// The effective active provider. When [`providers`](Self::providers) is
+    /// non-empty, returns the one named by
+    /// [`active_provider`](Self::active_provider) (or the first if unset or
+    /// unknown). Otherwise synthesizes a local Ollama provider from the legacy
+    /// `model` / `ollama_host` fields — guaranteeing back-compat with config
+    /// files that predate the `providers` table.
+    pub fn active(&self) -> ProviderConfig {
+        if !self.providers.is_empty() {
+            let chosen = self
+                .active_provider
+                .as_ref()
+                .and_then(|name| self.providers.iter().find(|p| &p.name == name))
+                .or_else(|| self.providers.first());
+            if let Some(provider) = chosen {
+                return provider.clone();
+            }
+        }
+        ProviderConfig {
+            name: "local".to_string(),
+            kind: ProviderKind::Ollama,
+            base_url: self.ollama_host.clone(),
+            model: self.model.clone(),
+            api_key_env: None,
+        }
+    }
+
+    /// Index of the effective active provider in [`providers`](Self::providers),
+    /// when any are configured.
+    fn active_index(&self) -> Option<usize> {
+        if self.providers.is_empty() {
+            return None;
+        }
+        Some(
+            self.active_provider
+                .as_ref()
+                .and_then(|name| self.providers.iter().position(|p| &p.name == name))
+                .unwrap_or(0),
+        )
+    }
+
     /// Apply environment-variable overrides on top of file/default config.
     /// Empty values are ignored.
     fn apply_env(&mut self) {
@@ -195,11 +398,20 @@ impl Config {
 
     /// Testable core of [`apply_env`]: `lookup` supplies the value of an
     /// environment variable, or `None` when unset.
+    ///
+    /// `WIZARD_MODEL` overrides the legacy `model` field and, when providers
+    /// are explicitly configured, the active provider's model too;
+    /// `WIZARD_OLLAMA_HOST` overrides the legacy `ollama_host` (which feeds the
+    /// synthesized local provider).
     fn apply_env_from(&mut self, lookup: impl Fn(&str) -> Option<String>) {
         if let Some(model) = lookup("WIZARD_MODEL")
             && !model.trim().is_empty()
         {
-            self.model = model.trim().to_string();
+            let model = model.trim().to_string();
+            self.model = model.clone();
+            if let Some(index) = self.active_index() {
+                self.providers[index].model = model;
+            }
         }
         if let Some(host) = lookup("WIZARD_OLLAMA_HOST") {
             let host = host.trim().trim_end_matches('/');
@@ -300,6 +512,19 @@ mod tests {
             retry_max_secs: 600,
             cycle_pause_secs: 30,
             compact_threshold_bytes: 96_000,
+            providers: vec![ProviderConfig {
+                name: "openai".to_string(),
+                kind: ProviderKind::Openai,
+                base_url: "https://api.openai.com/v1".to_string(),
+                model: "gpt-4o".to_string(),
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
+            }],
+            active_provider: Some("openai".to_string()),
+            gateway: GatewayConfig {
+                kind: GatewayKind::Telegram,
+                token_env: Some("MY_BOT_TOKEN".to_string()),
+                allowed_chat_ids: vec![42, -100123],
+            },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -316,6 +541,120 @@ mod tests {
             parsed.compact_threshold_bytes,
             original.compact_threshold_bytes
         );
+        assert_eq!(parsed.providers.len(), 1);
+        assert_eq!(parsed.providers[0].name, "openai");
+        assert_eq!(parsed.providers[0].kind, ProviderKind::Openai);
+        assert_eq!(parsed.providers[0].api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(parsed.active_provider.as_deref(), Some("openai"));
+        assert_eq!(parsed.gateway.kind, GatewayKind::Telegram);
+        assert_eq!(parsed.gateway.token_env.as_deref(), Some("MY_BOT_TOKEN"));
+        assert_eq!(parsed.gateway.allowed_chat_ids, vec![42, -100123]);
+    }
+
+    #[test]
+    fn gateway_defaults_to_none_and_round_trips() {
+        // A config without a [gateway] table defaults to None / terminal only.
+        let config: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(config.gateway.kind, GatewayKind::None);
+        assert!(config.gateway.token_env.is_none());
+        assert!(config.gateway.allowed_chat_ids.is_empty());
+        assert_eq!(config.gateway.token_env(), GatewayConfig::DEFAULT_TOKEN_ENV);
+
+        // A Telegram gateway round-trips through TOML.
+        let raw = toml::to_string_pretty(&Config {
+            gateway: GatewayConfig {
+                kind: GatewayKind::Telegram,
+                token_env: None,
+                allowed_chat_ids: vec![7],
+            },
+            ..Config::default()
+        })
+        .expect("serialize");
+        let parsed: Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(parsed.gateway.kind, GatewayKind::Telegram);
+        assert_eq!(parsed.gateway.allowed_chat_ids, vec![7]);
+    }
+
+    #[test]
+    fn legacy_config_migrates_to_synthesized_local_provider() {
+        // A config with only model/ollama_host (no providers table) yields a
+        // local Ollama provider from active().
+        let config: Config =
+            toml::from_str("model = \"qwen3.5:9b\"\nollama_host = \"http://10.0.0.5:11434\"")
+                .expect("valid toml");
+        assert!(config.providers.is_empty());
+        let active = config.active();
+        assert_eq!(active.name, "local");
+        assert_eq!(active.kind, ProviderKind::Ollama);
+        assert_eq!(active.base_url, "http://10.0.0.5:11434");
+        assert_eq!(active.model, "qwen3.5:9b");
+        assert!(active.api_key_env.is_none());
+    }
+
+    #[test]
+    fn active_selects_by_name_and_falls_back_to_first() {
+        let providers = vec![
+            ProviderConfig {
+                name: "local".to_string(),
+                kind: ProviderKind::Ollama,
+                base_url: "http://127.0.0.1:11434".to_string(),
+                model: "qwen3.6:27b".to_string(),
+                api_key_env: None,
+            },
+            ProviderConfig {
+                name: "claude".to_string(),
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com".to_string(),
+                model: "claude-fable-5".to_string(),
+                api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            },
+        ];
+
+        // Explicit selection by name.
+        let config = Config {
+            providers: providers.clone(),
+            active_provider: Some("claude".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.active().name, "claude");
+        assert_eq!(config.active().kind, ProviderKind::Anthropic);
+
+        // Unset active_provider falls back to the first.
+        let config = Config {
+            providers: providers.clone(),
+            active_provider: None,
+            ..Config::default()
+        };
+        assert_eq!(config.active().name, "local");
+
+        // Unknown active_provider also falls back to the first.
+        let config = Config {
+            providers,
+            active_provider: Some("missing".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.active().name, "local");
+    }
+
+    #[test]
+    fn env_model_overrides_active_provider_when_configured() {
+        let mut config = Config {
+            providers: vec![ProviderConfig {
+                name: "openai".to_string(),
+                kind: ProviderKind::Openai,
+                base_url: "https://api.openai.com/v1".to_string(),
+                model: "gpt-4o".to_string(),
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
+            }],
+            active_provider: Some("openai".to_string()),
+            ..Config::default()
+        };
+        config.apply_env_from(|name| match name {
+            "WIZARD_MODEL" => Some("gpt-4o-mini".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.active().model, "gpt-4o-mini");
+        assert_eq!(config.model, "gpt-4o-mini", "legacy field also updated");
     }
 
     #[test]

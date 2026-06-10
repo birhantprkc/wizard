@@ -95,7 +95,7 @@ max_steps = 25
 
 ### LLM client (`llm/ollama.rs`)
 
-Thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the OpenAI-compatible `/v1/chat/completions` shim — the native endpoint exposes Ollama's streaming and `tool_calls` fields directly):
+Thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the OpenAI-compatible `/v1/chat/completions` shim; the native endpoint exposes Ollama's streaming and `tool_calls` fields directly):
 
 - Streaming token delivery to the TUI
 - Native tool-call round-trips, with a prompt-based JSON fallback when the model lacks native tool support
@@ -132,7 +132,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 
 Genie mode gates write/shell/git tools behind user confirmation. Sovereign mode auto-approves.
 
-Beyond these built-ins, the registry also serves **scripted tools** (agent-authored scripts in `~/.wizard/tools/`, run through the `execute` sandbox — the Hermes `execute_code` analog) and **MCP tools** (see below). All three kinds present a uniform interface to the agent loop, so the model calls them identically.
+Beyond these built-ins, the registry also serves scripted tools (agent-authored scripts in `~/.wizard/tools/`, run through the `execute` sandbox; the Hermes `execute_code` analog) and MCP tools (see below). All three kinds present the same interface to the agent loop, so the model calls them identically.
 
 ### MCP client (`mcp/`)
 
@@ -140,8 +140,8 @@ Wizard speaks the Model Context Protocol as a client, so external capabilities p
 
 - Servers are declared in `~/.wizard/mcp.toml` (stdio or HTTP transport)
 - On startup (and on `/reload`), Wizard lists each server's tools and merges them into the registry
-- This is the supported path for **computer use**, browser control, database access, and any other capability shipped as an MCP server
-- `/evolve` can register a new MCP server live (tier 1) — no rebuild required
+- This is the supported path for computer use, browser control, database access, and any other capability shipped as an MCP server
+- `/evolve` can register a new MCP server live (tier 1) without a rebuild
 
 ### Subagents (`agent/subagent.rs`)
 
@@ -165,14 +165,14 @@ Skills are loaded at startup and on `/reload`.
 
 ### Self-extension (`evolve/`)
 
-Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Modeled on how Hermes and Pi extend themselves, Wizard splits self-extension into two tiers so it works on the prebuilt binary, not just dev installs. Full walkthrough in [evolve.md](evolve.md).
+Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Self-extension is split into two tiers so it works on the prebuilt binary, not just dev installs. Full walkthrough in [evolve.md](evolve.md).
 
-**Tier 1 — runtime extension (default; no recompile).** `/evolve` can add a skill, register an MCP server, author a scripted tool, or configure a subagent. Changes are written under `~/.wizard/` and activated by `/reload` — live, Pi-style, but on data/config rather than core source. This is how most new capability (including computer use, via MCP) is added, and it works on every install.
+**Tier 1 — runtime extension (default; no recompile).** Adds a skill, registers an MCP server, authors a scripted tool, or configures a subagent. Changes are written under `~/.wizard/` and activated by `/reload`. This covers most new capability (including computer use, via MCP) and works on every install.
 
-**Tier 2 — deep evolve (`/evolve --deep`; recompiles core).** For changes that genuinely require new Rust:
+**Tier 2 — deep evolve (`/evolve --deep`; recompiles core).** For changes that require new Rust in the core:
 
 1. Locate source (`~/.wizard/src`; cloned from the repo on first use)
-2. Ensure a Rust toolchain — installed just-in-time via `rustup --profile minimal` if absent (~0.5–1 GB, only on the first deep evolve)
+2. Ensure a Rust toolchain (installed via `rustup` on first use if absent; see [Install scripts](#install-scripts))
 3. Agent proposes a unified diff over its own source
 4. User approves (unless `--auto`)
 5. `cargo build --release`
@@ -207,7 +207,7 @@ Ratatui + crossterm terminal UI:
 
 ### `install.sh` (default)
 
-Official models only. VRAM-aware tier selection. No custom Modelfiles. Installs the binary, Ollama, and the model — **no Rust toolchain**, keeping the default footprint lean (the binary plus Ollama and the model, which dominates disk). The toolchain required for deep evolve (Tier 2) is installed just-in-time on the first `/evolve --deep`. Set `WIZARD_WITH_TOOLCHAIN=1` to install it eagerly at setup time (e.g. for air-gapped machines).
+Official models only. VRAM-aware tier selection. No custom Modelfiles. Installs the binary, Ollama, and the model, but no Rust toolchain, keeping the default footprint lean. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
 ### `install-byom.sh` (optional)
 
@@ -230,9 +230,9 @@ Target release binary: **< 60 MB** (strip + LTO).
 ## Security model
 
 - All inference is local via Ollama; no model data leaves the machine
-- No outbound API calls from the core loop in v0.1 (except `ollama pull` during install). **Note:** MCP servers and scripted tools you add can make their own network and system calls — they run with your privileges, so only register ones you trust
-- The `execute` tool runs real shell commands and **cannot be confined to the working directory** (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
-- **Genie mode** gates writes, shell, and git behind explicit approval. **Sovereign mode auto-approves all model-generated tool calls** — including shell and `/evolve` changes. This is the primary risk surface: run sovereign mode only on tasks and repos where unattended local command execution is acceptable
+- No outbound API calls from the core loop in v0.1 (except `ollama pull` during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
+- The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
+- Genie mode gates writes, shell, and git behind explicit approval. **Sovereign mode auto-approves all model-generated tool calls**, including shell and `/evolve` changes. This is the primary risk surface: run sovereign mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training
 
 ## Roadmap additions

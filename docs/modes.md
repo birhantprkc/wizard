@@ -9,7 +9,7 @@ wizard
 wizard --mode genie
 ```
 
-Genie is the interactive, conversational mode. It is eager and creative — "your wish is my command" — but asks before doing anything risky.
+Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) but asks before doing anything risky.
 
 ### Behavior
 
@@ -93,32 +93,32 @@ wizard --continuous -p "keep hardening this codebase: tests, docs, performance"
 ```
 
 `--continuous` turns sovereign mode into a perpetual, self-directing agent. Given an
-initial goal it works toward it and **does not stop when a sub-task completes** — it
-records the cycle, re-examines the project, and chooses the next most valuable action.
-When the mission itself is fully done it shifts to high-value improvements (tests, docs,
-robustness) or extends its own capabilities via the `evolve` tool. There is no human in
-the loop; the automated rails below are what keep it safe.
+initial goal, it does not stop when a sub-task completes: it records the cycle,
+re-examines the project, and chooses the next most valuable action. When the mission is
+done it moves on to high-value improvements (tests, docs, robustness) or extends its own
+capabilities via the `evolve` tool. There is no human in the loop; the automated rails
+below keep it safe.
 
 ### What makes it run forever
 
 - **Durable mission.** The goal is persisted to `<project>/.wizard/mission.toml` along
   with a cycle count and rolling progress log. It survives restarts and binary
-  self-replacement — relaunch with `--continuous` (no `-p`) and it resumes the mission.
+  self-replacement: relaunch with `--continuous` (no `-p`) and it resumes the mission.
 - **Sleep-and-wake.** Transient Ollama failures (server unreachable, busy, `429`/`5xx`,
-  dropped stream) no longer abort the run. The loop backs off exponentially
+  dropped stream) do not abort the run. The loop backs off exponentially
   (`retry_base_secs` → `retry_max_secs`) and retries indefinitely, so a paused or
-  restarting model server is waited out, not fatal.
+  restarting model server is waited out.
 - **Context compaction.** When the conversation grows past `compact_threshold_bytes`,
   older history is summarized into a compact progress note so a run can continue
   indefinitely without overflowing the model's context window.
 - **Self-evolution + re-exec.** When the agent calls `evolve` (adding a skill, MCP
-  server, scripted tool, subagent, or — with `deep` — rebuilding its own binary), the
-  loop saves the mission and re-execs into the freshly built/extended image to load the
-  new capabilities, then resumes the mission.
+  server, scripted tool, or subagent, or rebuilding its own binary with `deep`), the
+  loop saves the mission, re-execs into the freshly built image to load the new
+  capabilities, and resumes the mission.
 
 ### Stopping it
 
-The same `.wizard/loop-control` file is your kill switch — write `stop` for a graceful
+The same `.wizard/loop-control` file is the kill switch: write `stop` for a graceful
 shutdown after the current step, or `pause` to hold. `--max-hours` and the circuit
 breaker (3 identical failures in a row) also terminate a continuous run. Deep
 self-modification remains gated by an automated `cargo build` + `--version` smoke test,

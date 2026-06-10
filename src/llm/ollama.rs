@@ -4,17 +4,20 @@
 //! small. Provides a startup health probe, a native-tool-support probe, and
 //! NDJSON streaming chat.
 
-use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 
+use super::provider::LlmProvider;
 use super::{ChatChunk, ChatRequest};
 
 /// Boxed NDJSON chunk stream returned by [`OllamaClient::chat_stream`].
-pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
+/// Re-exported from [`crate::llm`] so existing `ollama::ChatStream` paths
+/// keep compiling.
+pub use super::ChatStream;
 
 /// How long to wait for a TCP/TLS connection before declaring Ollama down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -213,6 +216,29 @@ impl OllamaClient {
             })
             .boxed();
         Ok(decode_ndjson(bytes))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OllamaClient {
+    async fn health(&self) -> Result<()> {
+        OllamaClient::health(self).await
+    }
+
+    async fn supports_native_tools(&self, model: &str) -> Result<bool> {
+        OllamaClient::supports_native_tools(self, model).await
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        OllamaClient::list_models(self).await
+    }
+
+    async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
+        OllamaClient::chat_stream(self, request).await
+    }
+
+    fn label(&self) -> String {
+        self.host().to_string()
     }
 }
 

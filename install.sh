@@ -22,6 +22,9 @@
 #   WIZARD_REPO                owner/repo to install from   (default teddytennant/wizard)
 #   WIZARD_REF                 git ref/branch when building from source (default main)
 #   WIZARD_BUILD_FROM_SOURCE   1 = build from source instead of downloading a release (default 0)
+#   WIZARD_BESPOKE             1 = start from scratch: skip writing config.toml and the
+#                                  model pull, so the first `wizard` run launches the
+#                                  interactive onboarding wizard            (default 0)
 
 set -euo pipefail
 
@@ -35,6 +38,7 @@ WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-main}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
+WIZARD_BESPOKE="${WIZARD_BESPOKE:-0}"
 
 REPO="${WIZARD_REPO}"
 RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
@@ -246,6 +250,10 @@ select_model() {
 }
 
 pull_model() {
+    if [ "$WIZARD_BESPOKE" = "1" ]; then
+        say "Bespoke install: skipping model pull — onboarding will pick your model on first run"
+        return
+    fi
     if [ "$WIZARD_SKIP_MODEL_PULL" = "1" ]; then
         say "Skipping model pull (WIZARD_SKIP_MODEL_PULL=1)"
         return
@@ -398,6 +406,15 @@ build_from_source() {
 write_config() {
     local cfg="$HOME/.wizard/config.toml"
     mkdir -p "$HOME/.wizard"
+    if [ "$WIZARD_BESPOKE" = "1" ]; then
+        if [ -f "$cfg" ]; then
+            say "Bespoke install requested, but a config already exists at ${cfg} — leaving it untouched"
+            say "Run 'wizard --onboard' to reconfigure from scratch"
+        else
+            say "Bespoke install: no config written — the first 'wizard' run will start onboarding"
+        fi
+        return
+    fi
     if [ -f "$cfg" ]; then
         say "Existing config found at ${cfg} — leaving it untouched"
         say "To switch models, edit it: model = \"${MODEL}\""
@@ -440,7 +457,11 @@ main() {
 
     printf '\n'
     if [ "$BINARY_INSTALLED" = "1" ]; then
-        say "Done. Run: wizard"
+        if [ "$WIZARD_BESPOKE" = "1" ]; then
+            say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
+        else
+            say "Done. Run: wizard"
+        fi
     else
         say "Setup finished, but the wizard binary was NOT installed — see the build-from-source steps above."
     fi
