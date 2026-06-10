@@ -19,6 +19,9 @@
 #   WIZARD_SKIP_MODEL_PULL     1 = skip `ollama pull`       (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL 1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN      1 = eagerly install a Rust toolchain for deep evolve (default 0)
+#   WIZARD_REPO                owner/repo to install from   (default teddytennant/wizard)
+#   WIZARD_REF                 git ref/branch when building from source (default main)
+#   WIZARD_BUILD_FROM_SOURCE   1 = build from source instead of downloading a release (default 0)
 
 set -euo pipefail
 
@@ -29,9 +32,12 @@ WIZARD_MODEL="${WIZARD_MODEL:-}"
 WIZARD_SKIP_MODEL_PULL="${WIZARD_SKIP_MODEL_PULL:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
+WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
+WIZARD_REF="${WIZARD_REF:-main}"
+WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
 
-REPO="teddytennant/wizard"
-RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
+REPO="${WIZARD_REPO}"
+RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
 OLLAMA_URL="http://127.0.0.1:11434"
 
 ARCH=""
@@ -336,19 +342,55 @@ download_binary() {
 
 # --- rust toolchain (optional, for deep evolve) -------------------------
 
+ensure_rust_toolchain() {
+    # Add ~/.cargo/bin to PATH for this session in case rustup was previously
+    # installed without modifying the shell profile (--no-modify-path).
+    case ":${PATH}:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+    if command -v cargo >/dev/null 2>&1; then
+        say "Rust toolchain already present (cargo found)"
+        return
+    fi
+    say "Installing minimal Rust toolchain via rustup ..."
+    curl -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
+        || die "rustup installation failed — install Rust manually from https://rustup.rs"
+    export PATH="$HOME/.cargo/bin:$PATH"
+    command -v cargo >/dev/null 2>&1 \
+        || die "cargo not found after rustup install — check ~/.cargo/bin"
+    say "Rust toolchain installed under ~/.cargo"
+}
+
 install_toolchain() {
     if [ "$WIZARD_WITH_TOOLCHAIN" != "1" ]; then
         return
     fi
-    if command -v cargo >/dev/null 2>&1; then
-        say "Rust toolchain already present (cargo found); skipping toolchain install"
-        return
-    fi
-    say "Installing minimal Rust toolchain for deep evolve (WIZARD_WITH_TOOLCHAIN=1) ..."
-    curl -fsSL https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
-        || die "rustup installation failed — install Rust manually from https://rustup.rs"
-    say "Toolchain installed under ~/.cargo (deep evolve will find it)"
+    say "Ensuring Rust toolchain for deep evolve (WIZARD_WITH_TOOLCHAIN=1) ..."
+    ensure_rust_toolchain
+}
+
+# --- build from source --------------------------------------------------
+
+build_from_source() {
+    command -v git >/dev/null 2>&1 \
+        || die "git is required to build from source but was not found on PATH"
+    say "Building wizard from source (${WIZARD_REPO}@${WIZARD_REF}) ..."
+    local src_dir="${TMP_DIR}/wizard-src"
+    git clone --depth 1 --branch "$WIZARD_REF" \
+        "https://github.com/${WIZARD_REPO}" "$src_dir" \
+        || die "git clone failed — check WIZARD_REPO (${WIZARD_REPO}) and WIZARD_REF (${WIZARD_REF})"
+    ensure_rust_toolchain
+    say "Running cargo build --release (this may take several minutes) ..."
+    ( cd "$src_dir" && cargo build --release ) \
+        || die "cargo build --release failed — see output above for details"
+    local bin="${src_dir}/target/release/wizard"
+    [ -f "$bin" ] \
+        || die "build succeeded but target/release/wizard not found in ${src_dir}"
+    place_binary "$bin"
+    BINARY_INSTALLED=1
+    say "Installed wizard (built from source) to ${INSTALLED_PATH}"
 }
 
 # --- config -------------------------------------------------------------
@@ -382,7 +424,17 @@ main() {
     start_ollama
     select_model
     pull_model
-    download_binary
+
+    if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
+        build_from_source
+    else
+        download_binary
+        if [ "$BINARY_INSTALLED" != "1" ]; then
+            say "No prebuilt binary found; falling back to building from source ..."
+            build_from_source
+        fi
+    fi
+
     install_toolchain
     write_config
 

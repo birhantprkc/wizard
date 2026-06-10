@@ -19,7 +19,7 @@ use crate::agent::{Agent, AgentEvent, DoneReason, session::Session, subagent};
 use crate::cli::Cli;
 use crate::config::{Config, Mode};
 use crate::event::{Event, EventLoop};
-use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver};
+use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::llm::ToolCall;
 use crate::llm::ollama::OllamaClient;
 use crate::mcp::{McpConfig, McpManager};
@@ -104,6 +104,10 @@ pub enum SlashCommand {
     Reload,
     /// Toggle the git diff sidebar.
     Diff,
+    /// `/publish [branch]` — fork Wizard and get a one-line installer.
+    Publish {
+        branch: Option<String>,
+    },
     Quit,
 }
 
@@ -140,6 +144,9 @@ impl SlashCommand {
             }
             "reload" => Ok(Self::Reload),
             "diff" => Ok(Self::Diff),
+            "publish" => Ok(Self::Publish {
+                branch: args.first().map(|s| s.to_string()),
+            }),
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -191,6 +198,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[--deep] <desc>",
         description: "self-extend: add a skill, tool, or MCP server",
         takes_args: true,
+    },
+    CommandSpec {
+        name: "publish",
+        args: "[branch]",
+        description: "fork & publish your Wizard, get a one-line installer",
+        takes_args: false,
     },
     CommandSpec {
         name: "diff",
@@ -1071,6 +1084,18 @@ async fn build_registry(manager: &McpManager, client: &OllamaClient) -> Result<T
     Ok(registry)
 }
 
+/// Attach the config-dependent tools (evolve, publish) to a registry built
+/// by [`build_registry`]. Called by [`build_agent`] after the base registry
+/// is assembled.
+fn attach_config_tools(registry: &mut crate::tools::registry::ToolRegistry, config: &Config) {
+    registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
+        config.clone(),
+    )));
+    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
+        config.clone(),
+    )));
+}
+
 /// Build a fully wired [`Agent`]. `resume` reopens the latest session file
 /// instead of starting a new one.
 async fn build_agent(
@@ -1081,7 +1106,8 @@ async fn build_agent(
     manager: &McpManager,
     resume: bool,
 ) -> Result<Agent> {
-    let registry = build_registry(manager, client).await?;
+    let mut registry = build_registry(manager, client).await?;
+    attach_config_tools(&mut registry, config);
     let sessions_dir = Config::sessions_dir()?;
     let session = if resume {
         match Session::open_latest(&sessions_dir)? {
@@ -1191,6 +1217,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
 /genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
+/publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /quit                       exit\n\
@@ -1445,6 +1472,7 @@ impl CommandContext<'_> {
             SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
+            SlashCommand::Publish { branch } => self.publish(branch),
         }
     }
 
@@ -1656,6 +1684,34 @@ impl CommandContext<'_> {
             let message = match evolver.run(request).await {
                 Ok(outcome) => describe_evolve_outcome(&outcome),
                 Err(err) => format!("evolve failed: {err:#}"),
+            };
+            let _ = notify.send(Event::Notice(message)).await;
+        });
+    }
+
+    /// Fork Wizard to the user's GitHub and surface the one-liner install
+    /// command. Runs in a background task so the TUI stays responsive.
+    fn publish(&mut self, branch: Option<String>) {
+        self.app.notice(format!(
+            "publishing Wizard{}…",
+            branch
+                .as_deref()
+                .map(|b| format!(" (branch: {b})"))
+                .unwrap_or_default()
+        ));
+        let config = self.app.config.clone();
+        let notify = self.events.sender();
+        tokio::spawn(async move {
+            let req = PublishRequest {
+                branch,
+                auto_approve: true,
+            };
+            let message = match publish(&config, req, false).await {
+                Ok(outcome) => format!(
+                    "publish: forked to {}  (branch: {})\n\nInstall one-liner:\n{}",
+                    outcome.fork_url, outcome.branch, outcome.install_one_liner
+                ),
+                Err(err) => format!("publish failed: {err:#}"),
             };
             let _ = notify.send(Event::Notice(message)).await;
         });

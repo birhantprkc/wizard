@@ -969,6 +969,9 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
         config.clone(),
     )));
+    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
+        config.clone(),
+    )));
 
     // Skills: repo/bundled roots + user (~/.wizard/skills), user shadowing.
     let skill_roots = crate::skills::default_roots();

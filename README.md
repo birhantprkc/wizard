@@ -24,6 +24,14 @@ One command installs the `wizard` binary, Ollama, and an official **Qwen 3.6** m
 
 **Perpetual `--continuous` mode.** Sovereign can also run *forever*. Given one goal, `--continuous` never stops at "done": it persists a durable mission to `.wizard/mission.toml`, self-directs the next most valuable action each cycle, sleeps-and-wakes through transient model-server outages instead of dying, compacts its own context so it never overflows, and — when it improves itself via `evolve`, up to rebuilding its own binary — re-execs into the new image and resumes the mission. Zero human in the loop; the kill switch is one line in `.wizard/loop-control`, and deep self-modification stays gated by an automated build + smoke test with `wizard.prev` rollback. See [docs/modes.md](docs/modes.md#continuous-mode-perpetual-sovereign).
 
+**Make it your own Wizard.** After a deep evolve modifies Wizard's source, run `/publish` (or `wizard --publish`) to fork the upstream repo to your GitHub account, push your modified `~/.wizard/src` to a branch, and get a one-line installer for your variant:
+
+```
+curl -fsSL https://raw.githubusercontent.com/<owner>/wizard/<ref>/install.sh | WIZARD_REPO=<owner>/wizard WIZARD_REF=<ref> WIZARD_BUILD_FROM_SOURCE=1 bash
+```
+
+Anyone who runs it gets your Wizard — built from your source on their machine, carrying your behavioral charter ([WIZARD.md](WIZARD.md)) as part of the binary. Publish is gated and logged to `~/.wizard/evolution.jsonl`. It requires `gh` authenticated (`gh auth login`). Forks install from source because they don't ship prebuilt release binaries by default. See [docs/market.md](docs/market.md).
+
 ---
 
 ## Quick start
@@ -91,9 +99,11 @@ Wizard's bet is narrower: one binary, one backend, fully local, and an agent tha
 - [Getting started](docs/getting-started.md) — install, tiers, first run, troubleshooting
 - [Modes](docs/modes.md) — genie vs sovereign
 - [Self-extension](docs/evolve.md) — `/evolve` tiers, gates, rollback
+- [Fork and distribute](docs/market.md) — publish your evolved Wizard; one-line installer for your fork
 - [Bring your own model](docs/byom.md) — custom Ollama models
 - [Architecture](docs/architecture.md) — how it's built
 - [Security](SECURITY.md) — threat model, honest edition
+- [WIZARD.md](WIZARD.md) — the agent's bundled behavioral charter; inherited and editable by every fork
 
 ## Development
 

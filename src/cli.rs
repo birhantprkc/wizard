@@ -29,6 +29,11 @@ pub struct Cli {
     #[arg(long, requires = "evolve")]
     pub deep: bool,
 
+    /// Fork Wizard to your GitHub and print a one-line installer for your
+    /// variant. Requires `gh` authenticated (`gh auth login`).
+    #[arg(long)]
+    pub publish: bool,
+
     /// Skip confirmation prompts (implicit in sovereign mode).
     #[arg(long)]
     pub auto: bool,

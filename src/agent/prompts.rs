@@ -1,9 +1,13 @@
 //! System prompts: genie vs sovereign personalities, plus composition with
-//! skills and project `AGENTS.md`.
+//! skills, the bundled WIZARD.md charter, and project `AGENTS.md`.
 
 use crate::config::Mode;
 use crate::llm::ToolSpec;
 use crate::skills::Skill;
+
+/// The behavioral charter bundled into the binary at compile time.
+/// It governs agent behavior in both modes and is inherited by every fork.
+const WIZARD_CHARTER: &str = include_str!("../../WIZARD.md");
 
 /// Genie: interactive, collaborative, explains itself, asks before
 /// destructive actions.
@@ -33,9 +37,9 @@ repeat a failing action verbatim.
 - Keep edits minimal and consistent with the existing code style.
 - Commit when a coherent unit of work passes tests, with a clear message.";
 
-/// Compose the full system prompt for `mode`: personality prompt, then a
-/// rendered skills section, then the project's `AGENTS.md` contents (if
-/// present at the project root).
+/// Compose the full system prompt for `mode`: personality prompt, then the
+/// bundled `WIZARD.md` charter, then a rendered skills section, then the
+/// project's `AGENTS.md` contents (if present at the project root).
 pub fn build_system_prompt(mode: Mode, skills: &[Skill], agents_md: Option<&str>) -> String {
     let base = match mode {
         Mode::Genie => GENIE_SYSTEM_PROMPT,
@@ -43,6 +47,11 @@ pub fn build_system_prompt(mode: Mode, skills: &[Skill], agents_md: Option<&str>
     };
 
     let mut prompt = base.to_string();
+
+    // Inject the bundled WIZARD.md charter so every session — genie and
+    // sovereign alike — operates under it, and so forks inherit it.
+    prompt.push_str("\n\n## Wizard charter (WIZARD.md)\n\n");
+    prompt.push_str(WIZARD_CHARTER);
 
     let skills_section = crate::skills::render_for_prompt(skills);
     if !skills_section.is_empty() {
@@ -87,4 +96,44 @@ pub fn render_tool_protocol(specs: &[ToolSpec]) -> String {
         ));
     }
     section
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled WIZARD.md charter must appear in the composed system prompt
+    /// for both modes. This verifies the `include_str!` path is correct and
+    /// the charter is actually injected.
+    #[test]
+    fn system_prompt_contains_wizard_charter() {
+        for mode in [Mode::Genie, Mode::Sovereign] {
+            let prompt = build_system_prompt(mode, &[], None);
+            assert!(
+                prompt.contains("## Wizard charter (WIZARD.md)"),
+                "charter header missing in {mode} prompt"
+            );
+            // Marker from WIZARD.md §1 ("build the capability" prime directive).
+            assert!(
+                prompt.contains("build the capability"),
+                "charter body missing in {mode} prompt"
+            );
+        }
+    }
+
+    /// Skills and AGENTS.md appear after the charter.
+    #[test]
+    fn charter_comes_before_agents_md() {
+        let prompt = build_system_prompt(Mode::Genie, &[], Some("# Project rules"));
+        let charter_pos = prompt
+            .find("## Wizard charter (WIZARD.md)")
+            .expect("charter present");
+        let agents_pos = prompt
+            .find("## Project instructions (AGENTS.md)")
+            .expect("AGENTS.md section present");
+        assert!(
+            charter_pos < agents_pos,
+            "charter must appear before project instructions"
+        );
+    }
 }

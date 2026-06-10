@@ -6,6 +6,7 @@
 pub mod evolve;
 pub mod file;
 pub mod git;
+pub mod publish;
 pub mod registry;
 pub mod scripted;
 pub mod shell;

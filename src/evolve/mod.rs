@@ -1,10 +1,14 @@
-//! Tiered self-extension (`/evolve`). See `docs/evolve.md`.
+//! Tiered self-extension (`/evolve`) and fork-and-distribute (`/publish`).
+//! See `docs/evolve.md` and `docs/market.md`.
 //!
 //! Tier 1 (runtime, default): write a skill, MCP server entry, scripted
 //! tool, or subagent under `~/.wizard/` and activate via `/reload`.
 //! Tier 2 (`--deep`): propose a diff over Wizard's own source, build, and
 //! `exec`-replace the running binary. Falls back to Tier 1 when no
 //! toolchain/source can be provisioned.
+
+pub mod publish;
+pub use publish::{publish, PublishOutcome, PublishRequest};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -928,6 +932,31 @@ impl Evolver {
             println!("{message}");
         }
     }
+}
+
+/// CLI entry point for `wizard --publish`: forks Wizard to the user's GitHub
+/// and prints the fork URL and one-line installer to stdout.
+pub async fn run_publish_cli(config: Config, cli: Cli) -> Result<()> {
+    use publish::PublishRequest;
+
+    let branch = cli.prompt.clone().and_then(|p| {
+        let p = p.trim().to_string();
+        (!p.is_empty()).then_some(p)
+    });
+
+    let req = PublishRequest {
+        branch,
+        auto_approve: config.auto_approve || cli.auto,
+    };
+
+    let outcome = publish::publish(&config, req, true).await?;
+    println!("Fork:    {}", outcome.fork_url);
+    println!("Branch:  {}", outcome.branch);
+    if let Some(sha) = &outcome.commit {
+        println!("Commit:  {sha}");
+    }
+    println!("\nInstall one-liner:\n{}", outcome.install_one_liner);
+    Ok(())
 }
 
 /// CLI entry point for `wizard --evolve [-p "..."] [--deep]`: runs one

@@ -30,6 +30,10 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
         std::env::set_current_dir(dir)?;
     }
 
+    if cli.publish {
+        return evolve::run_publish_cli(config, cli).await;
+    }
+
     if cli.evolve {
         return evolve::run_cli(config, cli).await;
     }
