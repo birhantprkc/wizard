@@ -87,15 +87,20 @@ fn version_prints_name_and_version() {
 }
 
 #[test]
-fn unreachable_ollama_host_fails_with_actionable_error() {
+fn unreachable_ollama_provider_fails_with_actionable_error() {
     let home = TempDir::new();
     // Port 1 on localhost: connection refused immediately, no server needed.
     let bogus = "http://127.0.0.1:1";
-    let output = run_wizard(
+    // Ollama is opt-in: only an explicit provider entry selects it.
+    write_config(
         &home.0,
-        &["--mode", "sovereign", "-p", "do nothing"],
-        &[("WIZARD_OLLAMA_HOST", bogus)],
+        "[[providers]]\n\
+         name = \"local\"\n\
+         kind = \"ollama\"\n\
+         base_url = \"http://127.0.0.1:1\"\n\
+         model = \"qwen3.5:9b\"\n",
     );
+    let output = run_wizard(&home.0, &["--mode", "sovereign", "-p", "do nothing"], &[]);
 
     assert!(
         !output.status.success(),
@@ -195,24 +200,36 @@ fn fresh_config_resolves_to_the_llamacpp_provider() {
 }
 
 #[test]
-fn legacy_ollama_config_still_resolves_to_ollama() {
+fn legacy_ollama_config_resolves_to_llamacpp() {
     let home = TempDir::new();
     // A pre-llama.cpp config: legacy top-level keys, none of the new ones.
+    // The synthesized local provider is llama.cpp regardless — Ollama is
+    // opt-in via an explicit [[providers]] entry.
     write_config(
         &home.0,
         "model = \"qwen3.5:9b\"\nollama_host = \"http://127.0.0.1:1\"\n",
     );
-    let output = run_wizard(&home.0, &["--mode", "sovereign", "-p", "do nothing"], &[]);
+    // Point llama.cpp at port 1 (instant refusal) and empty the PATH so
+    // auto-spawn is impossible: the failure is deterministic even on
+    // machines with a real llama-server on the default port.
+    let output = run_wizard(
+        &home.0,
+        &["--mode", "sovereign", "-p", "do nothing"],
+        &[
+            ("WIZARD_LLAMACPP_HOST", "http://127.0.0.1:1"),
+            ("PATH", "/nonexistent"),
+        ],
+    );
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ollama serve") && stderr.contains("http://127.0.0.1:1"),
-        "a legacy config must keep resolving to Ollama at its host:\n{stderr}"
+        stderr.contains("llama-server") && stderr.contains("http://127.0.0.1:1"),
+        "a legacy config must resolve to llama.cpp:\n{stderr}"
     );
     assert!(
-        !stderr.contains("llama-server"),
-        "a legacy config must not be re-pointed at llama.cpp:\n{stderr}"
+        !stderr.contains("ollama serve"),
+        "a legacy config must not resolve to Ollama:\n{stderr}"
     );
 }
 

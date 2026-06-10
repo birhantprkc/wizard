@@ -1351,12 +1351,134 @@ Ctrl-C                      quit";
 // Genie-mode entry point
 // ---------------------------------------------------------------------------
 
+/// True for backends that run on this machine (no API key, no cloud).
+fn is_local_kind(kind: ProviderKind) -> bool {
+    matches!(kind, ProviderKind::LlamaCpp | ProviderKind::Ollama)
+}
+
+/// Build `provider`'s client and prove it usable: for local llama.cpp this
+/// spawns `llama-server` when possible (the terminal is still in normal mode
+/// at startup, so spawn/load progress prints straight to stdout), then runs
+/// the provider's health probe.
+async fn try_provider(provider: &ProviderConfig) -> Result<Arc<dyn LlmProvider>> {
+    let client = provider
+        .build()
+        .with_context(|| format!("building provider '{}'", provider.name))?;
+    if provider.kind == ProviderKind::LlamaCpp {
+        server::ensure_running(provider, &|line: &str| println!("{line}")).await?;
+    }
+    client
+        .health()
+        .await
+        .with_context(|| format!("LLM health check failed for {}", client.label()))?;
+    Ok(client)
+}
+
+/// Cloud providers synthesized from standard API-key env vars when the local
+/// backend is unavailable and nothing usable is configured:
+/// `(key env var, kind, base URL, model, provider name)`.
+const BYOP_ENV_FALLBACKS: &[(&str, ProviderKind, &str, &str, &str)] = &[
+    (
+        "ANTHROPIC_API_KEY",
+        ProviderKind::Anthropic,
+        "https://api.anthropic.com",
+        "claude-fable-5",
+        "anthropic",
+    ),
+    (
+        "OPENAI_API_KEY",
+        ProviderKind::Openai,
+        "https://api.openai.com/v1",
+        "gpt-4o",
+        "openai",
+    ),
+];
+
+/// Resolve a working LLM client at startup. The active provider is tried
+/// first. A failing *local* backend (llama.cpp not installed, server not
+/// running, no model file, …) is not fatal: Wizard falls back to
+/// bring-your-own-provider — any configured cloud provider, then one
+/// synthesized from a standard API-key env var, then (interactively) the
+/// onboarding wizard. The chosen fallback becomes the active provider in the
+/// in-memory config so the session's picker and status bar reflect it; only
+/// onboarding persists anything to disk.
+async fn startup_client(config: &mut Config) -> Result<Arc<dyn LlmProvider>> {
+    let active = config.active();
+    let local_err = match try_provider(&active).await {
+        Ok(client) => return Ok(client),
+        Err(err) if is_local_kind(active.kind) => err,
+        Err(err) => return Err(err),
+    };
+    println!("local model unavailable: {local_err:#}");
+
+    // Any other configured cloud provider.
+    for provider in config.providers.clone() {
+        if is_local_kind(provider.kind) || provider.name == active.name {
+            continue;
+        }
+        match try_provider(&provider).await {
+            Ok(client) => {
+                println!(
+                    "falling back to provider '{}' ({})",
+                    provider.name, provider.model
+                );
+                config.active_provider = Some(provider.name);
+                return Ok(client);
+            }
+            Err(err) => println!("provider '{}' is also unavailable: {err:#}", provider.name),
+        }
+    }
+
+    // A provider synthesized from a standard API-key env var.
+    for &(key_env, kind, base_url, model, name) in BYOP_ENV_FALLBACKS {
+        if !std::env::var(key_env).is_ok_and(|v| !v.trim().is_empty()) {
+            continue;
+        }
+        let provider = ProviderConfig {
+            name: name.to_string(),
+            kind,
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key_env: Some(key_env.to_string()),
+            gguf_path: None,
+        };
+        match try_provider(&provider).await {
+            Ok(client) => {
+                println!("falling back to {model} via ${key_env}");
+                // Replace any same-named (failed) entry so active() resolves
+                // to this one.
+                config.providers.retain(|p| p.name != provider.name);
+                config.active_provider = Some(provider.name.clone());
+                config.providers.push(provider);
+                return Ok(client);
+            }
+            Err(err) => println!("{name} via ${key_env} is also unavailable: {err:#}"),
+        }
+    }
+
+    // Nothing usable: let the user bring their own provider interactively.
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        println!("no working provider — opening setup so you can pick one (Esc to cancel).");
+        if let Some(new_config) = crate::onboarding::run().await? {
+            let active = new_config.active();
+            let client = try_provider(&active).await?;
+            *config = new_config;
+            return Ok(client);
+        }
+    }
+
+    Err(local_err.context(
+        "the local model is unavailable and no fallback provider is configured — \
+         run `wizard --onboard` to set one up",
+    ))
+}
+
 /// Genie-mode entry point: set up the terminal (raw mode + alternate
-/// screen), build the agent stack (Ollama client, registry with scripted +
+/// screen), build the agent stack (LLM provider, registry with scripted +
 /// MCP tools, skills, session), pre-fill `cli.prompt` if given, and drive
 /// the [`EventLoop`](crate::event::EventLoop) until quit. Restores the
 /// terminal on exit and on panic.
-pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
+pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
     // No usable terminal: run headless when a task was given, otherwise we
     // cannot do anything sensible.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
@@ -1366,20 +1488,7 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
         anyhow::bail!("wizard needs a terminal for the TUI; pass -p \"task\" to run headless");
     }
 
-    let active = config.active();
-    let mut client: Arc<dyn LlmProvider> = active
-        .build()
-        .with_context(|| format!("building provider '{}'", active.name))?;
-    // llama.cpp gets a lifecycle hand: when nothing answers, Wizard starts
-    // the server itself. The terminal is still in normal mode here, so the
-    // spawn/load progress prints straight to stdout.
-    if active.kind == ProviderKind::LlamaCpp {
-        server::ensure_running(&active, &|line: &str| println!("{line}")).await?;
-    }
-    client
-        .health()
-        .await
-        .with_context(|| format!("LLM health check failed for {}", client.label()))?;
+    let mut client = startup_client(&mut config).await?;
 
     let project_root = std::env::current_dir().context("resolving project root")?;
     let mut skills = load_skill_roots();

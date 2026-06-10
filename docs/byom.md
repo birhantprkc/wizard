@@ -119,14 +119,18 @@ If `ollama list` shows your model, select it directly. No pull step.
 
 ### Manual configuration
 
-You can also edit config by hand — the legacy top-level keys still resolve to an Ollama provider:
+You can also edit config by hand — Ollama is selected with an explicit provider entry:
 
 ```toml
 # ~/.wizard/config.toml
-model = "my-custom-model"
-ollama_host = "http://127.0.0.1:11434"
 mode = "genie"
 auto_approve = true
+
+[[providers]]
+name = "local"
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "my-custom-model"
 ```
 
 Verify the model works:
@@ -161,10 +165,13 @@ base_url = "http://gpu-server.local:8080"
 model = "Qwen3.6-27B-Q4_K_M"
 ```
 
-For a remote Ollama instance, the legacy keys work too:
+For a remote Ollama instance, use an explicit provider entry too:
 
 ```toml
-ollama_host = "http://gpu-server.local:11434"
+[[providers]]
+name = "gpu-box"
+kind = "ollama"
+base_url = "http://gpu-server.local:11434"
 model = "qwen3.6:27b"
 ```
 

@@ -1003,7 +1003,9 @@ fn draw_notice(frame: &mut ratatui::Frame, message: &str) {
         .border_style(Style::default().fg(Color::White))
         .title(Span::styled(
             " notice ",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);

@@ -110,11 +110,11 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 
 ## Migrating from Ollama
 
-Existing installs keep working without changes:
+The local default is llama.cpp; Ollama stays fully supported but is opt-in:
 
-- A legacy config that sets top-level `model` / `ollama_host` still resolves to an Ollama provider — only the from-scratch default changed.
 - Explicit `[[providers]]` entries with `kind = "ollama"` behave exactly as before.
-- `WIZARD_OLLAMA_HOST` still works and opts the local provider back into Ollama.
+- A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080` — add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
+- If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, then interactive setup.
 
 To switch an existing install to llama.cpp, add a provider from the TUI and point it at a GGUF:
 

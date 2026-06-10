@@ -105,7 +105,9 @@ model = "Qwen3.6-27B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
-When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` — unless the file carries the legacy `model` / `ollama_host` keys, in which case it synthesizes an Ollama provider so pre-llama.cpp configs keep working unchanged.
+When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` (legacy `model` / `ollama_host`-only files included — Ollama is opt-in via an explicit `[[providers]]` entry).
+
+At TUI startup, a local backend that is missing or cannot start is not fatal: Wizard falls back to bring-your-own-provider — first any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and finally the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
 
 ### LLM clients (`llm/`)
 

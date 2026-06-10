@@ -219,7 +219,8 @@ impl ProviderConfig {
 pub struct Config {
     /// Model tag for the synthesized local provider (default `qwen3.6:27b`).
     pub model: String,
-    /// Base URL of the Ollama server (legacy local backend).
+    /// Base URL of the Ollama server — only used by explicitly configured
+    /// Ollama providers; the synthesized local default is always llama.cpp.
     pub ollama_host: String,
     /// Base URL of the local llama.cpp `llama-server` — feeds the synthesized
     /// default provider when `providers` is empty.
@@ -262,12 +263,6 @@ pub struct Config {
     /// [`GatewayKind::None`] — terminal only.
     #[serde(default)]
     pub gateway: GatewayConfig,
-    /// Set during [`load`](Self::load) when the file carries the legacy
-    /// `model` / `ollama_host` keys but none of the llama.cpp ones: such
-    /// files predate the llama.cpp default, so [`active`](Self::active)
-    /// keeps synthesizing an Ollama provider for them. Never persisted.
-    #[serde(skip)]
-    legacy_ollama: bool,
 }
 
 impl Default for Config {
@@ -288,7 +283,6 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             gateway: GatewayConfig::default(),
-            legacy_ollama: false,
         }
     }
 }
@@ -382,29 +376,19 @@ impl Config {
         Ok(config)
     }
 
-    /// Parse a config file, detecting legacy Ollama-era files on the way: a
-    /// file that names `model` or `ollama_host` but none of the llama.cpp
-    /// keys predates the llama.cpp default, so [`active`](Self::active) must
-    /// keep synthesizing an Ollama provider for it. Files written by current
-    /// versions always carry `llamacpp_host` and are never flagged.
+    /// Parse a config file. Unknown keys are ignored; missing keys take the
+    /// documented defaults. Ollama-era files (`model` / `ollama_host` only)
+    /// parse fine but synthesize a llama.cpp provider like everything else —
+    /// Ollama is opt-in via an explicit `[[providers]]` entry.
     fn from_toml(raw: &str) -> Result<Self, toml::de::Error> {
-        let mut config: Config = toml::from_str(raw)?;
-        let table: toml::Table = raw.parse()?;
-        config.legacy_ollama = (table.contains_key("model") || table.contains_key("ollama_host"))
-            && !table.contains_key("llamacpp_host")
-            && !table.contains_key("gguf_path");
-        Ok(config)
+        toml::from_str(raw)
     }
 
     /// The effective active provider. When [`providers`](Self::providers) is
     /// non-empty, returns the one named by
     /// [`active_provider`](Self::active_provider) (or the first if unset or
     /// unknown). Otherwise synthesizes a local llama.cpp provider from
-    /// `model` / `llamacpp_host` / `gguf_path` — unless the config file
-    /// carried the legacy `model` / `ollama_host` keys (or
-    /// `WIZARD_OLLAMA_HOST` is set), in which case the synthesized provider
-    /// stays Ollama so configs that predate the `providers` table keep
-    /// working unchanged.
+    /// `model` / `llamacpp_host` / `gguf_path`.
     pub fn active(&self) -> ProviderConfig {
         if !self.providers.is_empty() {
             let chosen = self
@@ -415,16 +399,6 @@ impl Config {
             if let Some(provider) = chosen {
                 return provider.clone();
             }
-        }
-        if self.legacy_ollama {
-            return ProviderConfig {
-                name: "local".to_string(),
-                kind: ProviderKind::Ollama,
-                base_url: self.ollama_host.clone(),
-                model: self.model.clone(),
-                api_key_env: None,
-                gguf_path: None,
-            };
         }
         ProviderConfig {
             name: "local".to_string(),
@@ -461,11 +435,10 @@ impl Config {
     ///
     /// `WIZARD_MODEL` overrides the legacy `model` field and, when providers
     /// are explicitly configured, the active provider's model too;
-    /// `WIZARD_OLLAMA_HOST` overrides `ollama_host` and opts the synthesized
-    /// local provider back into Ollama; `WIZARD_LLAMACPP_HOST` overrides
-    /// `llamacpp_host` (and wins over Ollama when both are set);
-    /// `WIZARD_GGUF_PATH` overrides `gguf_path` and, when the active provider
-    /// is llamacpp, its `gguf_path` too.
+    /// `WIZARD_OLLAMA_HOST` overrides `ollama_host` (used by explicitly
+    /// configured Ollama providers); `WIZARD_LLAMACPP_HOST` overrides
+    /// `llamacpp_host`; `WIZARD_GGUF_PATH` overrides `gguf_path` and, when
+    /// the active provider is llamacpp, its `gguf_path` too.
     fn apply_env_from(&mut self, lookup: impl Fn(&str) -> Option<String>) {
         if let Some(model) = lookup("WIZARD_MODEL")
             && !model.trim().is_empty()
@@ -480,18 +453,12 @@ impl Config {
             let host = host.trim().trim_end_matches('/');
             if !host.is_empty() {
                 self.ollama_host = host.to_string();
-                // Pointing Wizard at an Ollama host opts the synthesized
-                // local provider back into Ollama.
-                self.legacy_ollama = true;
             }
         }
         if let Some(host) = lookup("WIZARD_LLAMACPP_HOST") {
             let host = host.trim().trim_end_matches('/');
             if !host.is_empty() {
                 self.llamacpp_host = host.to_string();
-                // An explicit llama.cpp host wins over legacy Ollama
-                // detection (and over WIZARD_OLLAMA_HOST).
-                self.legacy_ollama = false;
             }
         }
         if let Some(path) = lookup("WIZARD_GGUF_PATH") {
@@ -616,7 +583,6 @@ mod tests {
                 token_env: Some("MY_BOT_TOKEN".to_string()),
                 allowed_chat_ids: vec![42, -100123],
             },
-            legacy_ollama: false,
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -673,23 +639,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_migrates_to_synthesized_local_provider() {
-        // A file with only model/ollama_host (no providers table) predates
-        // the llama.cpp default — active() must keep yielding Ollama.
+    fn legacy_ollama_config_synthesizes_llamacpp() {
+        // A file with only model/ollama_host (no providers table) still
+        // parses, but the synthesized local provider is llama.cpp — Ollama
+        // is opt-in via an explicit [[providers]] entry.
         let config =
             Config::from_toml("model = \"qwen3.5:9b\"\nollama_host = \"http://10.0.0.5:11434\"")
                 .expect("valid toml");
         assert!(config.providers.is_empty());
         let active = config.active();
         assert_eq!(active.name, "local");
-        assert_eq!(active.kind, ProviderKind::Ollama);
-        assert_eq!(active.base_url, "http://10.0.0.5:11434");
+        assert_eq!(active.kind, ProviderKind::LlamaCpp);
+        assert_eq!(active.base_url, "http://127.0.0.1:8080");
         assert_eq!(active.model, "qwen3.5:9b");
         assert!(active.api_key_env.is_none());
-
-        // model alone is enough to flag a legacy file.
-        let config = Config::from_toml("model = \"qwen3.5:9b\"").expect("valid toml");
-        assert_eq!(config.active().kind, ProviderKind::Ollama);
+        assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
     }
 
     #[test]
@@ -711,8 +675,8 @@ mod tests {
 
     #[test]
     fn saved_default_config_stays_llamacpp_on_reload() {
-        // save() writes every field, including ollama_host — the presence of
-        // llamacpp_host must keep the file from being flagged as legacy.
+        // save() writes every field, including ollama_host — its presence
+        // must not change the synthesized llama.cpp default.
         let raw = toml::to_string_pretty(&Config::default()).expect("serialize");
         assert!(raw.contains("ollama_host"), "save writes legacy fields");
         let config = Config::from_toml(&raw).expect("parse back");
@@ -838,24 +802,21 @@ mod tests {
     }
 
     #[test]
-    fn env_ollama_host_opts_back_into_ollama_synthesis() {
-        // A fresh config (llama.cpp default) pointed at an Ollama host via
-        // the env var must synthesize an Ollama provider at that host.
+    fn env_ollama_host_does_not_change_synthesized_kind() {
+        // The env var updates the field (for explicitly configured Ollama
+        // providers) but the synthesized local provider stays llama.cpp.
         let mut config = Config::default();
         config.apply_env_from(|name| match name {
             "WIZARD_OLLAMA_HOST" => Some("http://10.0.0.5:11434".to_string()),
             _ => None,
         });
-        let active = config.active();
-        assert_eq!(active.kind, ProviderKind::Ollama);
-        assert_eq!(active.base_url, "http://10.0.0.5:11434");
+        assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
+        assert_eq!(config.active().kind, ProviderKind::LlamaCpp);
     }
 
     #[test]
-    fn env_llamacpp_host_overrides_and_wins_over_ollama() {
-        // Even a legacy file flips to llama.cpp when the host is explicit.
+    fn env_llamacpp_host_overrides_synthesized_base_url() {
         let mut config = Config::from_toml("model = \"qwen3.5:9b\"").expect("valid toml");
-        assert_eq!(config.active().kind, ProviderKind::Ollama);
         config.apply_env_from(|name| match name {
             "WIZARD_OLLAMA_HOST" => Some("http://10.0.0.5:11434".to_string()),
             "WIZARD_LLAMACPP_HOST" => Some("http://10.0.0.5:8080///".to_string()),
