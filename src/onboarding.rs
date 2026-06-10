@@ -24,9 +24,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::config::{
-    Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind,
-};
+use crate::config::{Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind};
 use crate::hardware;
 
 /// Magenta accent, matching [`crate::ui`].
@@ -287,7 +285,10 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
 
     // Step 4 — mode.
     let mode_options = [
-        Opt::new("Genie — interactive", "confirms risky actions (recommended)"),
+        Opt::new(
+            "Genie — interactive",
+            "confirms risky actions (recommended)",
+        ),
         Opt::new("Sovereign — autonomous", "auto-approves all tool calls"),
     ];
     let mode = match select(
@@ -347,7 +348,12 @@ fn pick_model(
         None => return Ok(None),
     };
     if selected == custom_index {
-        match text_input(terminal, "Custom model tag", "Enter the exact model tag.", custom_default)? {
+        match text_input(
+            terminal,
+            "Custom model tag",
+            "Enter the exact model tag.",
+            custom_default,
+        )? {
             Some(model) => Ok(Some(model)),
             None => Ok(None),
         }
@@ -358,7 +364,10 @@ fn pick_model(
 
 fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let (suggested, explanation) = hardware::suggest_model();
-    let mut models: Vec<(String, String)> = vec![(suggested.clone(), "recommended for this machine".to_string())];
+    let mut models: Vec<(String, String)> = vec![(
+        suggested.clone(),
+        "recommended for this machine".to_string(),
+    )];
     for tier in OLLAMA_TIERS {
         if *tier != suggested {
             models.push(((*tier).to_string(), String::new()));
@@ -382,9 +391,23 @@ fn collect_openai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let models: Vec<(String, String)> = OPENAI_MODELS
         .iter()
         .enumerate()
-        .map(|(i, m)| ((*m).to_string(), if i == 0 { "default".to_string() } else { String::new() }))
+        .map(|(i, m)| {
+            (
+                (*m).to_string(),
+                if i == 0 {
+                    "default".to_string()
+                } else {
+                    String::new()
+                },
+            )
+        })
         .collect();
-    let model = match pick_model(terminal, "OpenAI-compatible model.", &models, OPENAI_MODELS[0])? {
+    let model = match pick_model(
+        terminal,
+        "OpenAI-compatible model.",
+        &models,
+        OPENAI_MODELS[0],
+    )? {
         Some(model) => model,
         None => return Ok(None),
     };
@@ -414,11 +437,20 @@ fn collect_anthropic(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         .map(|(i, m)| {
             (
                 (*m).to_string(),
-                if i == 0 { "latest Claude (default)".to_string() } else { String::new() },
+                if i == 0 {
+                    "latest Claude (default)".to_string()
+                } else {
+                    String::new()
+                },
             )
         })
         .collect();
-    let model = match pick_model(terminal, "Anthropic Claude model.", &models, ANTHROPIC_MODELS[0])? {
+    let model = match pick_model(
+        terminal,
+        "Anthropic Claude model.",
+        &models,
+        ANTHROPIC_MODELS[0],
+    )? {
         Some(model) => model,
         None => return Ok(None),
     };
@@ -541,10 +573,7 @@ fn setup_terminal() -> Result<Tui> {
 /// path; idempotent.
 fn restore_terminal_best_effort() {
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen
-        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -571,8 +600,7 @@ impl Opt {
 /// True when `key` is Esc or Ctrl-C — the universal cancel chord.
 fn is_cancel(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Esc)
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c')))
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')))
 }
 
 /// Render a vertical list of options; navigate with ↑/↓, confirm with Enter.
@@ -639,7 +667,11 @@ fn text_input(
             KeyCode::Backspace => {
                 buffer.pop();
             }
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 buffer.push(c);
             }
             _ => {}
@@ -708,7 +740,10 @@ fn frame_body(frame: &mut ratatui::Frame, title: &str, subtitle: &str, footer: &
     frame.render_widget(block, body);
 
     frame.render_widget(
-        Paragraph::new(Span::styled(format!("  {footer}"), Style::default().fg(DIM))),
+        Paragraph::new(Span::styled(
+            format!("  {footer}"),
+            Style::default().fg(DIM),
+        )),
         foot,
     );
     inner
@@ -797,9 +832,15 @@ fn draw_notice(frame: &mut ratatui::Frame, message: &str) {
     frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(format!("  {message}"), Style::default().fg(TEXT_DIM))),
+            Line::from(Span::styled(
+                format!("  {message}"),
+                Style::default().fg(TEXT_DIM),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  press any key to continue", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  press any key to continue",
+                Style::default().fg(DIM),
+            )),
         ])
         .alignment(Alignment::Left),
         inner,
@@ -860,7 +901,10 @@ mod tests {
         let config = answers.into_config();
         assert_eq!(config.active().name, "claude");
         assert_eq!(config.active().kind, ProviderKind::Anthropic);
-        assert_eq!(config.active().api_key_env.as_deref(), Some(ANTHROPIC_KEY_ENV));
+        assert_eq!(
+            config.active().api_key_env.as_deref(),
+            Some(ANTHROPIC_KEY_ENV)
+        );
         // Legacy fields untouched (still defaults) since this isn't an Ollama choice.
         assert_eq!(config.model, defaults.model);
         assert_eq!(config.ollama_host, defaults.ollama_host);
@@ -900,7 +944,10 @@ mod tests {
     #[test]
     fn parse_chat_ids_rejects_non_numeric() {
         let err = parse_chat_ids("42, abc").expect_err("non-numeric must error");
-        assert!(err.contains("abc"), "error should name the bad token: {err}");
+        assert!(
+            err.contains("abc"),
+            "error should name the bad token: {err}"
+        );
     }
 
     #[test]

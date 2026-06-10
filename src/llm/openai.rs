@@ -519,7 +519,10 @@ mod tests {
 
         let tool_msg = &body["messages"][3];
         assert_eq!(tool_msg["role"], "tool");
-        assert_eq!(tool_msg["tool_call_id"], id, "result correlates to the call");
+        assert_eq!(
+            tool_msg["tool_call_id"], id,
+            "result correlates to the call"
+        );
         assert_eq!(tool_msg["content"], "fn main() {}");
 
         assert_eq!(body["tools"][0]["type"], "function");

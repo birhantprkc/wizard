@@ -8,7 +8,7 @@
 //! toolchain/source can be provisioned.
 
 pub mod publish;
-pub use publish::{publish, PublishOutcome, PublishRequest};
+pub use publish::{PublishOutcome, PublishRequest, publish};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};

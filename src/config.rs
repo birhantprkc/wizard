@@ -124,9 +124,7 @@ impl GatewayConfig {
     /// The env var name to read the bot token from, falling back to
     /// [`Self::DEFAULT_TOKEN_ENV`] when unset.
     pub fn token_env(&self) -> &str {
-        self.token_env
-            .as_deref()
-            .unwrap_or(Self::DEFAULT_TOKEN_ENV)
+        self.token_env.as_deref().unwrap_or(Self::DEFAULT_TOKEN_ENV)
     }
 }
 
@@ -544,7 +542,10 @@ mod tests {
         assert_eq!(parsed.providers.len(), 1);
         assert_eq!(parsed.providers[0].name, "openai");
         assert_eq!(parsed.providers[0].kind, ProviderKind::Openai);
-        assert_eq!(parsed.providers[0].api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            parsed.providers[0].api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
         assert_eq!(parsed.active_provider.as_deref(), Some("openai"));
         assert_eq!(parsed.gateway.kind, GatewayKind::Telegram);
         assert_eq!(parsed.gateway.token_env.as_deref(), Some("MY_BOT_TOKEN"));

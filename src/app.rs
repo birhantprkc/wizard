@@ -1801,8 +1801,7 @@ impl CommandContext<'_> {
     /// Persist `App.config` to disk, surfacing any error as a notice.
     fn persist_config(&mut self) {
         if let Err(err) = self.app.config.save() {
-            self.app
-                .notice(format!("could not save config: {err:#}"));
+            self.app.notice(format!("could not save config: {err:#}"));
         }
     }
 
@@ -1814,8 +1813,10 @@ impl CommandContext<'_> {
         let client = match provider.build() {
             Ok(client) => client,
             Err(err) => {
-                self.app
-                    .notice(format!("could not build provider '{}': {err:#}", provider.name));
+                self.app.notice(format!(
+                    "could not build provider '{}': {err:#}",
+                    provider.name
+                ));
                 return;
             }
         };
@@ -1947,8 +1948,7 @@ impl CommandContext<'_> {
         let before = self.app.config.providers.len();
         self.app.config.providers.retain(|p| p.name != name);
         if self.app.config.providers.len() == before {
-            self.app
-                .notice(format!("no provider named '{name}'"));
+            self.app.notice(format!("no provider named '{name}'"));
             return;
         }
         self.persist_config();

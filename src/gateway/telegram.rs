@@ -35,7 +35,9 @@ impl Telegram {
     /// or empty token is an actionable error telling the user to export it.
     pub fn connect(config: &GatewayConfig) -> Result<Self> {
         let env_name = config.token_env();
-        let token = std::env::var(env_name).ok().filter(|t| !t.trim().is_empty());
+        let token = std::env::var(env_name)
+            .ok()
+            .filter(|t| !t.trim().is_empty());
         let token = token.with_context(|| {
             format!(
                 "Telegram bot token not set: export {env_name}=<token> (create a bot via \

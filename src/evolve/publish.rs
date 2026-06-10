@@ -122,10 +122,7 @@ pub async fn publish(
         let stderr = String::from_utf8_lossy(&fork_output.stderr);
         // gh exits non-zero with "already exists" when the fork is present.
         if !stderr.contains("already exists") {
-            bail!(
-                "`gh repo fork {UPSTREAM_SLUG}` failed: {}",
-                stderr.trim()
-            );
+            bail!("`gh repo fork {UPSTREAM_SLUG}` failed: {}", stderr.trim());
         }
         if verbose {
             println!("Fork already exists — verifying it is accessible…");
@@ -302,9 +299,7 @@ fn command_exists(cmd: &str) -> bool {
 
 /// Run `args[0] args[1..]`, capturing stdout, and return it on success.
 fn run_command_stdout(args: &[&str]) -> Result<String> {
-    let (&cmd, rest) = args
-        .split_first()
-        .ok_or_else(|| anyhow!("empty command"))?;
+    let (&cmd, rest) = args.split_first().ok_or_else(|| anyhow!("empty command"))?;
     let output = Command::new(cmd)
         .args(rest)
         .stdout(Stdio::piped())
@@ -379,7 +374,10 @@ mod tests {
         let line = install_one_liner("bob", "wizard", "my-feature");
         assert!(line.contains("WIZARD_REF=my-feature"), "ref in env var");
         assert!(line.contains("WIZARD_REPO=bob/wizard"), "repo in env var");
-        assert!(line.contains("WIZARD_BUILD_FROM_SOURCE=1"), "build flag set");
+        assert!(
+            line.contains("WIZARD_BUILD_FROM_SOURCE=1"),
+            "build flag set"
+        );
         assert!(
             line.contains("/bob/wizard/my-feature/install.sh"),
             "ref in URL"
