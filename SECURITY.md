@@ -1,6 +1,6 @@
 # Security
 
-Wizard is a coding agent that runs shell commands, writes files, and — if you ask it to — recompiles and replaces its own binary. This document describes what protections exist, what they actually cover, and where you are trusting the model, the tools, or yourself. It is written to be honest rather than reassuring.
+Wizard is an agent that runs shell commands, writes files, and — if you ask it to — recompiles and replaces its own binary. This document describes what protections exist, what they actually cover, and where you are trusting the model, the tools, or yourself. It is written to be honest rather than reassuring.
 
 ## The short version
 

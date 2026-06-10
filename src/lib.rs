@@ -1,4 +1,4 @@
-//! Wizard — a single-binary, fully local coding agent.
+//! Wizard — a single-binary, fully local agent.
 //!
 //! A Ratatui front end on top of an Ollama-backed agent loop with an
 //! extensible tool set (native + scripted + MCP) and tiered self-extension.

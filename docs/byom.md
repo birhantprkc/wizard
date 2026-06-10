@@ -94,7 +94,7 @@ Create a `Modelfile` pointing at a GGUF on disk or HuggingFace:
 FROM /path/to/your-model.Q4_K_M.gguf
 PARAMETER temperature 0.6
 PARAMETER num_ctx 131072
-SYSTEM You are a coding assistant. Use tools precisely.
+SYSTEM You are a careful assistant. Use tools precisely.
 ```
 
 Then:

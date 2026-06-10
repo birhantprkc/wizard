@@ -6,7 +6,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard-arsenal/main/install.sh | bash
 ```
 
-Wizard Arsenal is [Wizard](https://github.com/teddytennant/wizard) with a fuller default loadout. The binary is upstream Wizard — the same fully local, self-extending Ratatui coding agent — built from source on your machine. What Arsenal adds is the *configuration*: a preconfigured browser, a roster of ready-to-use subagents, and a hardware-sized model, all written into `~/.wizard/` for you so the first run is already equipped.
+Wizard Arsenal is [Wizard](https://github.com/teddytennant/wizard) with a fuller default loadout. The binary is upstream Wizard — the same fully local, self-extending Ratatui agent — built from source on your machine. What Arsenal adds is the *configuration*: a preconfigured browser, a roster of ready-to-use subagents, and a hardware-sized model, all written into `~/.wizard/` for you so the first run is already equipped.
 
 Everything still runs locally. There are no API keys and no cloud services unless you add a provider yourself.
 

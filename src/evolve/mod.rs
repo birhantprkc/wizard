@@ -23,7 +23,6 @@ use serde_json::Value;
 use crate::agent::subagent::SubagentConfig;
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::llm::ollama::OllamaClient;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest};
 use crate::mcp::{McpConfig, McpServerConfig, McpTransport};
 use crate::tools::scripted::ScriptManifest;
@@ -211,7 +210,7 @@ struct SubagentProposal {
 
 /// System prompt for the Tier-1 planning turn: pick one channel, emit one
 /// JSON object describing the artifact.
-const TIER1_SYSTEM_PROMPT: &str = r##"You are Wizard's self-extension planner. Wizard is a local coding agent that can extend itself at runtime through exactly four channels. Given the user's request, choose the single best channel and respond with ONLY one JSON object — no prose, no markdown fences, no comments.
+const TIER1_SYSTEM_PROMPT: &str = r##"You are Wizard's self-extension planner. Wizard is a local agent that can extend itself at runtime through exactly four channels. Given the user's request, choose the single best channel and respond with ONLY one JSON object — no prose, no markdown fences, no comments.
 
 Channels and their exact JSON shapes:
 
@@ -234,7 +233,7 @@ Native tool names available for "tool_scope": read_file, write_file, edit_file, 
 Picking a channel: use a skill for knowledge or process, an mcp_server for capabilities that live outside Wizard, a scripted_tool for small executable glue, and a subagent for a specialized, reusable sub-worker. Keep names short and filesystem-safe. Make the artifact complete and immediately usable."##;
 
 /// System prompt for the deep-evolve (Tier 2) diff-authoring turn.
-const DEEP_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve engineer. Wizard is a single-binary Rust 2024 coding agent (Ratatui TUI + Ollama-backed agent loop) and you are modifying its own source checkout. Produce ONE unified diff that implements the requested change.
+const DEEP_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve engineer. Wizard is a single-binary Rust 2024 agent (Ratatui TUI + Ollama-backed agent loop) and you are modifying its own source checkout. Produce ONE unified diff that implements the requested change.
 
 Rules:
 - Output ONLY the diff, inside a single ```diff fenced code block. No other text.
@@ -888,11 +887,15 @@ impl Evolver {
             .context("the model did not produce a usable evolution proposal"))
     }
 
-    /// Stream one completion from Ollama and return the accumulated text.
+    /// Stream one completion from the active provider and return the
+    /// accumulated text.
     async fn complete(&self, messages: &[ChatMessage]) -> Result<String> {
-        let client = OllamaClient::new(self.config.ollama_host.clone());
+        let active = self.config.active();
+        let client = active
+            .build()
+            .with_context(|| format!("building provider '{}'", active.name))?;
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: active.model,
             messages: messages.to_vec(),
             tools: Vec::new(),
             stream: true,

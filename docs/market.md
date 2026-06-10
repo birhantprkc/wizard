@@ -1,6 +1,6 @@
 # Fork and distribute
 
-Wizard is a self-owning coding agent: when it modifies its own source (a deep evolve, tier 2), you can publish that variant as a GitHub fork under your account and hand anyone a one-line command that installs your Wizard.
+Wizard is a self-owning agent: when it modifies its own source (a deep evolve, tier 2), you can publish that variant as a GitHub fork under your account and hand anyone a one-line command that installs your Wizard.
 
 ---
 

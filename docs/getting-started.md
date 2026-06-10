@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI coding agent powered by [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a local Qwen 3 GGUF. Ollama remains fully supported — see [Using Ollama instead](#using-ollama-instead).
+Wizard installs in one command and launches as a terminal UI agent powered by [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a local Qwen 3 GGUF. Ollama remains fully supported — see [Using Ollama instead](#using-ollama-instead).
 
 ## Install
 

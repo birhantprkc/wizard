@@ -17,7 +17,7 @@ Genie is the interactive, conversational mode. It is eager and creative ("your w
 - Bypasses permissions: auto-approves all tool calls — no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
 - Default loop limit: 25 agent steps per turn
-- Best for: pair programming, exploration, incremental changes
+- Best for: collaboration, exploration, incremental changes
 
 > To restore per-action confirmation prompts, set `auto_approve = false` in `~/.wizard/config.toml`.
 

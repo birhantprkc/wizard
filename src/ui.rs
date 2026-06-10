@@ -157,7 +157,7 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "your sovereign coding wizard — self-extending, fully local",
+            "your sovereign agent — self-extending, fully local",
             dim().italic(),
         )),
         Line::raw(""),

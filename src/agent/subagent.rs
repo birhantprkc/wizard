@@ -61,10 +61,10 @@ pub struct SubagentResult {
 pub fn builtin_configs() -> Vec<SubagentConfig> {
     vec![SubagentConfig {
         name: "worker".to_string(),
-        description: "General-purpose worker for self-contained coding sub-tasks: \
+        description: "General-purpose worker for self-contained sub-tasks: \
                       investigate, edit, run commands, and report back."
             .to_string(),
-        system_prompt: "You are a focused subagent of Wizard, a local coding agent. Complete \
+        system_prompt: "You are a focused subagent of Wizard, a local agent. Complete \
                         the given sub-task end-to-end using the provided tools, then reply \
                         with a concise final report of what you found or changed. Do not ask \
                         questions; make reasonable decisions and note them in your report."

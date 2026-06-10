@@ -8,7 +8,7 @@ use clap::Parser;
 
 use crate::config::Mode;
 
-/// Wizard — your sovereign coding wizard. Self-extending. Fully local.
+/// Wizard — your sovereign agent. Self-extending. Fully local.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "wizard", version, about, long_about = None)]
 pub struct Cli {

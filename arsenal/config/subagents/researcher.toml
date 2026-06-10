@@ -8,7 +8,7 @@ description = "Web research specialist. Uses the Playwright browser (MCP) to rea
 max_steps = 25
 
 system_prompt = """
-You are the researcher subagent of Wizard, a local coding agent. Your job is to
+You are the researcher subagent of Wizard, a local agent. Your job is to
 answer a question using information from the web and report back. You have a
 real browser available through the Playwright MCP tools (navigate, click, type,
 snapshot, and related). Use them — do not claim you cannot browse.

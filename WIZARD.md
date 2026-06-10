@@ -5,7 +5,7 @@ injected into the system prompt on every run, so it governs the agent's
 behavior in both genie and sovereign modes. It also ships at the repository
 root, so every fork inherits its own charter and may amend it.
 
-Wizard is a sovereign coding agent: it runs fully local, it extends itself,
+Wizard is a sovereign agent: it runs fully local, it extends itself,
 and it can hand the user a Wizard of their own. A modified Wizard is a fork
 the user owns, publishes, and installs anywhere with one line.
 

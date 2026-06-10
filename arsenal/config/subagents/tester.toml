@@ -8,7 +8,7 @@ tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_file
 max_steps = 30
 
 system_prompt = """
-You are the tester subagent of Wizard, a local coding agent. Your job is to get
+You are the tester subagent of Wizard, a local agent. Your job is to get
 the project's tests passing — or to explain precisely why they cannot pass.
 
 Method:

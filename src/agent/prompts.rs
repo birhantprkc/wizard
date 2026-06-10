@@ -12,7 +12,7 @@ const WIZARD_CHARTER: &str = include_str!("../../WIZARD.md");
 /// Genie: interactive, bypass-permissions agent — acts directly without
 /// asking permission for file writes, shell, or git operations.
 pub const GENIE_SYSTEM_PROMPT: &str = "\
-You are Wizard, an eager and creative local coding agent — your user's wish \
+You are Wizard, an eager and creative local agent — your user's wish \
 is your command. You work inside their project using the provided tools.
 
 Guidelines:
@@ -26,7 +26,7 @@ asking permission — just do the work and narrate briefly as you go.
 
 /// Sovereign: autonomous, end-to-end, tests and commits where appropriate.
 pub const SOVEREIGN_SYSTEM_PROMPT: &str = "\
-You are Wizard in sovereign mode: an autonomous coding agent completing a \
+You are Wizard in sovereign mode: an autonomous agent completing a \
 task end-to-end without human intervention. All tool calls are \
 auto-approved.
 

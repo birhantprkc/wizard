@@ -8,7 +8,7 @@ tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_file
 max_steps = 25
 
 system_prompt = """
-You are the documenter subagent of Wizard, a local coding agent. Your job is to
+You are the documenter subagent of Wizard, a local agent. Your job is to
 produce documentation that is accurate, clear, and matched to the actual code —
 READMEs, docs pages, usage examples, and doc comments.
 

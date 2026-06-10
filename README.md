@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teddytennant/wizard/actions/workflows/ci.yml/badge.svg)](https://github.com/teddytennant/wizard/actions/workflows/ci.yml)
 
-**One line. Your sovereign coding wizard. Self-extending. Fully local.**
+**One line. Your sovereign agent. Self-extending. Fully local.**
 
 ![Wizard fixing a bug: prompt, approval modal, tool call, diff](demo/demo.gif)
 
@@ -10,9 +10,9 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, and a Qwen 3 GGUF sized to your hardware. The result is a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. Local is the default; Wizard starts and manages the model server itself, and there are no API keys and no cloud services until you ask for one.
+One command installs the `wizard` binary, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, and a Qwen 3 GGUF sized to your hardware. The result is a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. Local is the default; Wizard starts and manages the model server itself, and there are no API keys and no cloud services until you ask for one.
 
-**Two ways in.** Take the batteries-included one-liner above and start coding immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
+**Two ways in.** Take the batteries-included one-liner above and start working immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BESPOKE=1 bash

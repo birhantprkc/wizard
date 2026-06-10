@@ -1,6 +1,6 @@
 # Wizard Arsenal
 
-Wizard Arsenal is a preconfigured distribution of Wizard: the same local, self-extending coding agent, shipped with a fuller default loadout so the first run is already equipped. It is a separate repository ([`teddytennant/wizard-arsenal`](https://github.com/teddytennant/wizard-arsenal)) that installs the upstream `wizard` binary and then lays down a richer configuration under `~/.wizard/`.
+Wizard Arsenal is a preconfigured distribution of Wizard: the same local, self-extending agent, shipped with a fuller default loadout so the first run is already equipped. It is a separate repository ([`teddytennant/wizard-arsenal`](https://github.com/teddytennant/wizard-arsenal)) that installs the upstream `wizard` binary and then lays down a richer configuration under `~/.wizard/`.
 
 The binary is unchanged upstream Wizard. Arsenal adds *configuration*, not source — everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
 
