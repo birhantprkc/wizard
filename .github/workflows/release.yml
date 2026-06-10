@@ -23,7 +23,7 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -47,7 +47,7 @@ jobs:
           strip target/release/wizard
           tar -C target/release -czf "wizard-${{ matrix.target }}.tar.gz" wizard
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wizard-${{ matrix.target }}
           path: wizard-${{ matrix.target }}.tar.gz
@@ -58,7 +58,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
