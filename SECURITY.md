@@ -58,7 +58,7 @@ mv /usr/local/bin/wizard.prev /usr/local/bin/wizard
 
 (Adjust the path if you installed elsewhere; Wizard prints the exact rollback command when it installs.)
 
-Be clear about what the smoke test is: it proves the new binary launches and reports a version, nothing more. It does not prove the change is correct, safe, or what you asked for. The meaningful gate is you reading the diff at step 1 — which is why running deep evolve with the default auto-approval (both genie and sovereign) means letting a local model rewrite its own agent loop unsupervised. Every deep evolution is logged with its diff to `~/.wizard/evolution.jsonl`, and the source checkout at `~/.wizard/src` keeps the change as a git commit, so there is always a record of what changed.
+Be clear about what the smoke test is: it proves the new binary launches and reports a version, nothing more. It does not prove the change is correct, safe, or what you asked for. The meaningful gate is you reading the diff at step 1 — which is why running deep evolve with the default auto-approval (both genie and sovereign) means letting the model rewrite its own agent loop unsupervised. Every deep evolution is logged with its diff to `~/.wizard/evolution.jsonl`, and the source checkout at `~/.wizard/src` keeps the change as a git commit, so there is always a record of what changed.
 
 ## No sandbox
 
@@ -66,7 +66,7 @@ All tools run directly with your user's privileges. The `execute` tool runs real
 
 Also note that the model reads files and tool output as instructions-adjacent context. A hostile string in a repository you point Wizard at (a README, a test fixture, a commit message) can attempt to steer the model's tool calls — classic prompt injection. The `auto_approve = false` confirmation gate is your defense against prompt injection; by default, both modes operate without it.
 
-Recommendation: for any Wizard run on untrusted or semi-trusted tasks — third-party repos, code review of unknown patches, anything internet-derived — run Wizard inside a container or VM with only the project mounted. Inference is local via Ollama, so a fully offline container works fine.
+Recommendation: for any Wizard run on untrusted or semi-trusted tasks — third-party repos, code review of unknown patches, anything internet-derived — run Wizard inside a container or VM with only the project mounted. With a local provider (llama.cpp or Ollama) a fully offline container works; with a cloud provider, allow only that provider's API endpoint.
 
 ## Install-path trust
 
@@ -82,11 +82,11 @@ The recommended install is `curl | bash`, and you should be honest with yourself
    install -m 755 target/release/wizard ~/.local/bin/wizard
    ```
 
-The installer also runs Ollama's official install script (`curl -fsSL https://ollama.com/install.sh | sh`) if Ollama is absent — same trust consideration, different vendor. Skip it with `WIZARD_SKIP_OLLAMA_INSTALL=1` if you manage Ollama yourself.
+The default installer also downloads `llama-server` from llama.cpp's official GitHub releases and a GGUF from Hugging Face; with `WIZARD_USE_OLLAMA=1` it instead runs Ollama's official install script (`curl -fsSL https://ollama.com/install.sh | sh`) if Ollama is absent — same trust consideration, different vendor. Skip these with `WIZARD_SKIP_LLAMACPP_INSTALL=1` / `WIZARD_SKIP_OLLAMA_INSTALL=1` if you manage the model runtime yourself.
 
-## What stays local
+## Where your data goes
 
-All inference goes to your Ollama instance (`http://127.0.0.1:11434` by default). The core agent loop makes no outbound API calls in v0.1; prompts, code, and sessions stay on your machine. The exceptions are the things you add: MCP servers and scripted tools can make whatever network calls they like, and deep evolve clones the source repo and may install a Rust toolchain via rustup on first use.
+Inference goes to whichever provider is active: the core loop sends prompts, code context, and tool output to that endpoint and nowhere else. With the default local provider that endpoint is `llama-server` on your machine (`http://127.0.0.1:8080`); with a cloud provider it is that vendor's API, under their data-handling terms. The other network actors are the things you add: MCP servers and scripted tools can make whatever calls they like, and deep evolve clones the source repo and may install a Rust toolchain via rustup on first use.
 
 ## Reporting a vulnerability
 

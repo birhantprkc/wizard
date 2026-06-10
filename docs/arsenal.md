@@ -1,6 +1,6 @@
 # Wizard Arsenal
 
-Wizard Arsenal is a preconfigured distribution of Wizard: the same local, self-extending agent, shipped with a fuller default loadout so the first run is already equipped. It is a separate repository ([`teddytennant/wizard-arsenal`](https://github.com/teddytennant/wizard-arsenal)) that installs the upstream `wizard` binary and then lays down a richer configuration under `~/.wizard/`.
+Wizard Arsenal is a preconfigured distribution of Wizard: the same self-extending agent, shipped with a fuller default loadout so the first run is already equipped. It is a separate repository ([`teddytennant/wizard-arsenal`](https://github.com/teddytennant/wizard-arsenal)) that installs the upstream `wizard` binary and then lays down a richer configuration under `~/.wizard/`.
 
 The binary is unchanged upstream Wizard. Arsenal adds *configuration*, not source — everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
 
@@ -79,9 +79,9 @@ Everything else — genie/sovereign modes, `/evolve` tiers and gates, `--continu
 
 ---
 
-## Providers: local by default, cloud optional
+## Providers
 
-Arsenal's `config.toml` uses Wizard's provider blocks. Its template defaults to local Ollama (a fully supported provider — upstream Wizard's own from-scratch default is llama.cpp):
+Arsenal's `config.toml` uses Wizard's provider blocks — any OpenAI-compatible endpoint, Anthropic, or a local server. Its template defaults to local Ollama (a fully supported provider — upstream Wizard's own from-scratch default is llama.cpp):
 
 ```toml
 active_provider = "local"
@@ -115,7 +115,7 @@ wizard
 
 ### Removing a provider
 
-Comment it out (or delete its `[[provider]]` block) and make sure `active_provider` points at one that remains, or switch with `/provider`. Drop back to fully local at any time by setting `active_provider = "local"`.
+Comment it out (or delete its `[[provider]]` block) and make sure `active_provider` points at one that remains, or switch with `/provider`. Switch back to the local model at any time by setting `active_provider = "local"`.
 
 ---
 

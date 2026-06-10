@@ -1,6 +1,6 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui front end on top of a local llama.cpp-backed agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Wizard manages the `llama-server` lifecycle itself; Ollama, OpenAI-compatible, and Anthropic providers are supported alongside.
+Wizard is a single-binary Rust application: a Ratatui front end on top of a provider-agnostic agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Providers are interchangeable — any OpenAI-compatible endpoint, Anthropic, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
 
 ## High-level overview
 
@@ -254,8 +254,8 @@ Target release binary: **< 60 MB** (strip + LTO).
 
 ## Security model
 
-- All inference is local by default (llama.cpp or Ollama); no model data leaves the machine until you add a cloud provider
-- No outbound API calls from the core loop in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
+- Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the default install, or the configured cloud API
+- Beyond the active provider, the core loop makes no outbound API calls in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
 - Both modes auto-approve tool calls (writes, shell, git, and `/evolve` changes) by default. An opt-in y/n confirmation gate is available via `auto_approve = false`. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run sovereign mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training

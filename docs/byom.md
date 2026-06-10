@@ -1,8 +1,8 @@
 # Bring your own model (BYOM)
 
-The default Wizard installer downloads only official Qwen GGUF quants, so the one-liner never ships custom model weights. Bringing your own is easy on both local backends.
+Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default installer downloads only official Qwen GGUF quants, so the one-liner never ships custom weights — swapping in your own is easy on both local backends.
 
-## Any GGUF with llama.cpp (the default backend)
+## Any GGUF with llama.cpp (the default local backend)
 
 With the llama.cpp default there is no special installer: `llama-server` loads any GGUF directly. Download one (Hugging Face hosts Q4_K_M-class quants of most open models) and point the provider at it in `~/.wizard/config.toml`:
 

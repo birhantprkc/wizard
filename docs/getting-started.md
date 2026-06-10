@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent powered by [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a local Qwen 3 GGUF. Ollama remains fully supported — see [Using Ollama instead](#using-ollama-instead).
+Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic; the default installer sets up a local stack — [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF — so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
 
 ## Install
 
@@ -86,7 +86,7 @@ Type a task in natural language:
 > Add error handling to the fetch_user function in src/api.rs
 ```
 
-Wizard reads files, applies changes, runs tests, and shows git diffs. Everything runs locally.
+Wizard reads files, applies changes, runs tests, and shows git diffs.
 
 ## Configuration
 
@@ -134,6 +134,17 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 ```
 
 Or pick "Local — Ollama" in onboarding (`wizard --onboard`). Wizard speaks Ollama's native `/api/chat` for these providers, as before.
+
+## Using a cloud or remote provider
+
+Any OpenAI-compatible endpoint or Anthropic works. Add one from the TUI and switch to it:
+
+```
+/provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
+/provider use openai
+```
+
+The last argument names the environment variable holding your API key — the key itself is never written to disk; export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_BESPOKE=1` to choose everything on first run).
 
 ## Headless mode
 
