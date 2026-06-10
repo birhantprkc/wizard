@@ -5,29 +5,28 @@ Wizard is a coding agent that runs shell commands, writes files, and — if you 
 ## The short version
 
 - Everything Wizard does runs **as you**, with your privileges. There is no sandbox.
-- **Genie mode** (the default) asks before anything that changes state. **Sovereign mode approves everything automatically** — treat it accordingly.
+- **Both modes auto-approve tool calls by default** — everything runs without per-action confirmation. To restore a y/n gate, set `auto_approve = false` in your config. Sovereign mode additionally runs non-interactively and continuously, self-directing with no human in the loop.
 - MCP servers and scripted tools are programs you chose to run. Wizard scrubs their environment and bounds their time, but it cannot make an untrustworthy program trustworthy.
-- Deep `/evolve` is gated by approval, a successful build, and a smoke test, and it keeps the old binary next to the new one for rollback.
+- Deep `/evolve` requires a successful build and a smoke test, and keeps the old binary for rollback; with `auto_approve = false`, you also confirm the diff before the build starts.
 
-## The approval gate (Genie mode)
+## Tool-call approval model
 
-In genie mode, every tool that can change state is gated behind an explicit y/n confirmation before it runs:
+Both modes — genie and sovereign — **auto-approve tool calls by default**. Every file write, shell command, MCP call, scripted tool, and `/evolve` runs without a per-action y/n prompt unless you opt in to the confirmation gate. The state-changing tools are:
 
 - **File writes** — `write_file` and `edit_file`
 - **Shell** — `execute` (this is also how git commits, pushes, and any other command happen)
 - **Scripted tools** — agent-authored scripts in `~/.wizard/tools/`
 - **MCP tools** — every tool served by an MCP server
-- **Subagents** — spawning a subagent (which runs with auto-approval inside its own isolated context)
-- **`/evolve`** — runtime evolutions confirm before writing ("Apply this change?"); deep evolutions confirm before building ("Apply this diff and rebuild Wizard?")
+- **Subagents** — spawning a subagent (which also runs with auto-approval by default)
+- **`/evolve`** — runtime and deep evolutions run without confirmation by default
 
-Read-only tools (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`) run without confirmation.
+Read-only tools (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`) are always non-destructive.
 
-Two things turn the gate off:
+**To restore per-action confirmation:** set `auto_approve = false` in `~/.wizard/config.toml`. With that flag, every state-changing tool call pauses for an explicit y/n before it runs. This is the only confirmation gate; it is off by default.
 
-- **`--auto`** skips confirmations while keeping the interactive TUI.
-- **Sovereign mode** auto-approves *all* tool calls — shell, writes, MCP, scripted tools, and `/evolve` included. That is the point of the mode: it runs unattended. The implication is that whatever the model decides to do, happens. A confused or prompt-injected model in sovereign mode can run arbitrary commands as you with no human in the loop. Only run sovereign mode on tasks and machines where that is acceptable, and prefer a container or VM for anything you would not run by hand (see "No sandbox" below).
+**Sovereign mode** adds non-interactive continuous operation on top of the shared auto-approve default: it completes the task then keeps going — self-directing and self-improving via `evolve` with no human in the loop, persisting a durable mission. A confused or prompt-injected model (in either mode) can run arbitrary commands as you. Only run Wizard on tasks and machines where that is acceptable, and prefer a container or VM for anything you would not run by hand (see "No sandbox" below).
 
-The gate is a consent mechanism, not a containment mechanism. Approving a shell command means trusting everything that command does.
+The auto-approve default is a convenience choice, not a containment mechanism. Tool calls run with your full privileges whether or not the gate is on.
 
 ## MCP servers
 
@@ -37,7 +36,7 @@ Wizard is an MCP client: servers declared in `~/.wizard/mcp.toml` (stdio or HTTP
 - **Dynamic-linker variables are dropped.** `env` entries in `mcp.toml` are passed through to the child, *except* `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, and `DYLD_LIBRARY_PATH` — each of those is a code-injection vector into the spawned process, so they are never forwarded (a warning is logged when one is dropped).
 - **Per-request timeouts.** Connect/initialize is bounded at 20 s, `tools/list` at 30 s per page (with a hard cap on pagination), and each `tools/call` at 120 s. A wedged or malicious server can waste your time, not hang Wizard forever.
 - **No name shadowing.** An MCP tool that advertises a native tool's name (`execute`, `write_file`, …) is namespaced `server__tool` instead of replacing the built-in.
-- **Approval-gated.** In genie mode every MCP tool call asks first.
+- **Auto-approved by default.** MCP tool calls run without confirmation unless `auto_approve = false` is set.
 
 What Wizard does **not** do: an MCP server is an arbitrary program *you* configured Wizard to run. It executes with your full privileges, can open its own network connections, read your files, and do anything else your user can. The environment scrubbing limits accidental secret leakage and one specific injection vector — it does not contain a server that is itself malicious. Register only servers you trust, the same way you would vet anything you pipe to `sh`.
 
@@ -47,7 +46,7 @@ The same applies to scripted tools: they are scripts under `~/.wizard/tools/` th
 
 `/evolve --deep` is the unusual one: the agent proposes a diff to Wizard's own Rust source, builds it, and replaces the running binary. The gates, in order:
 
-1. **Approval.** You see the proposed unified diff and must confirm ("Apply this diff and rebuild Wizard?") — unless you are in sovereign mode or passed `--auto`, in which case this gate is off.
+1. **Approval.** With `auto_approve = false`, you see the proposed unified diff and must confirm ("Apply this diff and rebuild Wizard?") before the build starts. With the default auto-approve setting, this gate is off and the build proceeds immediately.
 2. **Build.** `cargo build --release` must succeed. On failure, the diff is reverted and the running binary is untouched.
 3. **Smoke test.** The freshly built binary is executed with `--version` and must exit 0 and print a `wizard` version string. On failure, the diff is reverted and the current binary is kept.
 
@@ -59,15 +58,15 @@ mv /usr/local/bin/wizard.prev /usr/local/bin/wizard
 
 (Adjust the path if you installed elsewhere; Wizard prints the exact rollback command when it installs.)
 
-Be clear about what the smoke test is: it proves the new binary launches and reports a version, nothing more. It does not prove the change is correct, safe, or what you asked for. The meaningful gate is you reading the diff at step 1 — which is why running deep evolve with auto-approval (sovereign mode) means letting a local model rewrite its own agent loop unsupervised. Every deep evolution is logged with its diff to `~/.wizard/evolution.jsonl`, and the source checkout at `~/.wizard/src` keeps the change as a git commit, so there is always a record of what changed.
+Be clear about what the smoke test is: it proves the new binary launches and reports a version, nothing more. It does not prove the change is correct, safe, or what you asked for. The meaningful gate is you reading the diff at step 1 — which is why running deep evolve with the default auto-approval (both genie and sovereign) means letting a local model rewrite its own agent loop unsupervised. Every deep evolution is logged with its diff to `~/.wizard/evolution.jsonl`, and the source checkout at `~/.wizard/src` keeps the change as a git commit, so there is always a record of what changed.
 
 ## No sandbox
 
 All tools run directly with your user's privileges. The `execute` tool runs real shell commands and cannot be confined to the working directory — absolute paths, `cd ..`, pipes, and network access are all reachable. The same is true of MCP servers and scripted tools. Treat tool execution as full local access, because it is.
 
-Also note that the model reads files and tool output as instructions-adjacent context. A hostile string in a repository you point Wizard at (a README, a test fixture, a commit message) can attempt to steer the model's tool calls — classic prompt injection. The genie approval gate is your defense; sovereign mode removes it.
+Also note that the model reads files and tool output as instructions-adjacent context. A hostile string in a repository you point Wizard at (a README, a test fixture, a commit message) can attempt to steer the model's tool calls — classic prompt injection. The `auto_approve = false` confirmation gate is your defense against prompt injection; by default, both modes operate without it.
 
-Recommendation: for sovereign-mode runs on untrusted or semi-trusted tasks — third-party repos, code review of unknown patches, anything internet-derived — run Wizard inside a container or VM with only the project mounted. Inference is local via Ollama, so a fully offline container works fine.
+Recommendation: for any Wizard run on untrusted or semi-trusted tasks — third-party repos, code review of unknown patches, anything internet-derived — run Wizard inside a container or VM with only the project mounted. Inference is local via Ollama, so a fully offline container works fine.
 
 ## Install-path trust
 

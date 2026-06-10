@@ -77,7 +77,7 @@ The pipeline:
 1. **Locate source**: `~/.wizard/src`, cloned from the repo on first use.
 2. **Ensure a toolchain**: if `cargo` is absent, install it via `rustup --profile minimal` (~0.5–1 GB, first deep evolve only). The default installer ships no toolchain; you pay for the compiler only if you use this tier.
 3. **Propose a diff** over Wizard's own source.
-4. **Approve** (skipped with `--auto`).
+4. **Approve** (skipped by default; opt in via `auto_approve = false`).
 5. **`cargo build --release`.**
 6. **`exec`-replace** the running process with the new binary.
 
@@ -113,4 +113,4 @@ Every evolution, tier 1 or 2, is appended to `~/.wizard/evolution.jsonl` with a 
 
 ## Safety
 
-`/evolve` widens what the agent can do to your machine, so review what it adds. MCP servers and scripted tools run with your privileges and can make their own network and system calls. **In sovereign mode, `/evolve` changes are auto-approved along with everything else**; only run unattended evolution on machines and tasks where that's acceptable. See the [security model](architecture.md#security-model).
+`/evolve` widens what the agent can do to your machine, so review what it adds. MCP servers and scripted tools run with your privileges and can make their own network and system calls. **Both modes auto-approve `/evolve` changes by default**; only run unattended evolution on machines and tasks where that's acceptable. Set `auto_approve = false` to gate each change with a confirmation prompt. See the [security model](architecture.md#security-model).

@@ -58,7 +58,7 @@ Type a task in natural language:
 > Add error handling to the fetch_user function in src/api.rs
 ```
 
-Wizard reads files, proposes changes, runs tests, and shows git diffs. Everything runs locally.
+Wizard reads files, applies changes, runs tests, and shows git diffs. Everything runs locally.
 
 ## Headless mode
 

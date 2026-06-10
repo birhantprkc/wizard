@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::Cli;
 use crate::llm::anthropic::AnthropicProvider;
+use crate::llm::llamacpp::LlamaCppProvider;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::LlmProvider;
@@ -21,10 +22,12 @@ use crate::llm::provider::LlmProvider;
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Mode {
-    /// Interactive TUI. Confirms risky actions (writes, shell, git).
+    /// Interactive TUI. Bypass-permissions: auto-approves tool calls and acts
+    /// without per-action prompts.
     #[default]
     Genie,
-    /// Autonomous agent. Auto-approves all tool calls.
+    /// Autonomous agent. Works continuously without human intervention;
+    /// self-directing and self-improving.
     Sovereign,
 }
 
@@ -60,6 +63,9 @@ impl fmt::Display for Mode {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum ProviderKind {
+    /// Local llama.cpp `llama-server` (OpenAI-compatible `/v1` API plus the
+    /// native `/health` probe). The default local backend.
+    LlamaCpp,
     /// Local Ollama server (native `/api/chat`).
     Ollama,
     /// OpenAI-compatible Chat Completions endpoint (OpenAI, OpenRouter, Groq,
@@ -72,6 +78,7 @@ pub enum ProviderKind {
 impl fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ProviderKind::LlamaCpp => write!(f, "llamacpp"),
             ProviderKind::Ollama => write!(f, "ollama"),
             ProviderKind::Openai => write!(f, "openai"),
             ProviderKind::Anthropic => write!(f, "anthropic"),
@@ -136,8 +143,9 @@ pub struct ProviderConfig {
     pub name: String,
     /// Backend kind.
     pub kind: ProviderKind,
-    /// Base URL: ollama `http://127.0.0.1:11434`; openai
-    /// `https://api.openai.com/v1`; anthropic `https://api.anthropic.com`.
+    /// Base URL: llamacpp `http://127.0.0.1:8080`; ollama
+    /// `http://127.0.0.1:11434`; openai `https://api.openai.com/v1`;
+    /// anthropic `https://api.anthropic.com`.
     pub base_url: String,
     /// Model tag.
     pub model: String,
@@ -145,6 +153,10 @@ pub struct ProviderConfig {
     /// never persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Path to the GGUF model file (llamacpp only) — used when Wizard spawns
+    /// `llama-server` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gguf_path: Option<String>,
 }
 
 impl ProviderConfig {
@@ -161,6 +173,10 @@ impl ProviderConfig {
     /// can report the real error).
     pub fn build(&self) -> Result<Arc<dyn LlmProvider>> {
         match self.kind {
+            ProviderKind::LlamaCpp => Ok(Arc::new(LlamaCppProvider::new(
+                self.base_url.clone(),
+                self.model.clone(),
+            ))),
             ProviderKind::Ollama => Ok(Arc::new(OllamaClient::new(self.base_url.clone()))),
             ProviderKind::Openai => {
                 let key = self.api_key();
@@ -201,13 +217,22 @@ impl ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Ollama model tag (default `qwen3.6:27b`).
+    /// Model tag for the synthesized local provider (default `qwen3.6:27b`).
     pub model: String,
-    /// Base URL of the Ollama server.
+    /// Base URL of the Ollama server (legacy local backend).
     pub ollama_host: String,
+    /// Base URL of the local llama.cpp `llama-server` — feeds the synthesized
+    /// default provider when `providers` is empty.
+    pub llamacpp_host: String,
+    /// Path to the GGUF model file for the synthesized llama.cpp provider —
+    /// used when Wizard spawns `llama-server` itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gguf_path: Option<String>,
     /// Default personality mode.
     pub mode: Mode,
-    /// Skip confirmation prompts in genie mode.
+    /// Bypass per-action confirmation prompts. Default true: genie bypasses
+    /// permissions. Set false to restore the y/n gate for tools that request
+    /// approval.
     pub auto_approve: bool,
     /// Agent loop limit per turn (genie). Sovereign uses its own default
     /// unless this is explicitly raised above it.
@@ -237,6 +262,12 @@ pub struct Config {
     /// [`GatewayKind::None`] — terminal only.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// Set during [`load`](Self::load) when the file carries the legacy
+    /// `model` / `ollama_host` keys but none of the llama.cpp ones: such
+    /// files predate the llama.cpp default, so [`active`](Self::active)
+    /// keeps synthesizing an Ollama provider for them. Never persisted.
+    #[serde(skip)]
+    legacy_ollama: bool,
 }
 
 impl Default for Config {
@@ -244,8 +275,10 @@ impl Default for Config {
         Self {
             model: "qwen3.6:27b".to_string(),
             ollama_host: "http://127.0.0.1:11434".to_string(),
+            llamacpp_host: "http://127.0.0.1:8080".to_string(),
+            gguf_path: None,
             mode: Mode::Genie,
-            auto_approve: false,
+            auto_approve: true,
             max_steps: 25,
             continuous: false,
             retry_base_secs: 5,
@@ -255,6 +288,7 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             gateway: GatewayConfig::default(),
+            legacy_ollama: false,
         }
     }
 }
@@ -330,8 +364,8 @@ impl Config {
 
     /// Load config from disk, falling back to defaults when the file is
     /// missing, then apply env overrides (`WIZARD_MODEL`,
-    /// `WIZARD_OLLAMA_HOST`). Creates the `~/.wizard` directory tree on
-    /// first run.
+    /// `WIZARD_OLLAMA_HOST`, `WIZARD_LLAMACPP_HOST`, `WIZARD_GGUF_PATH`).
+    /// Creates the `~/.wizard` directory tree on first run.
     pub fn load() -> Result<Self> {
         Self::ensure_dirs()?;
 
@@ -339,7 +373,7 @@ impl Config {
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+            Self::from_toml(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
             Self::default()
         };
@@ -348,12 +382,29 @@ impl Config {
         Ok(config)
     }
 
+    /// Parse a config file, detecting legacy Ollama-era files on the way: a
+    /// file that names `model` or `ollama_host` but none of the llama.cpp
+    /// keys predates the llama.cpp default, so [`active`](Self::active) must
+    /// keep synthesizing an Ollama provider for it. Files written by current
+    /// versions always carry `llamacpp_host` and are never flagged.
+    fn from_toml(raw: &str) -> Result<Self, toml::de::Error> {
+        let mut config: Config = toml::from_str(raw)?;
+        let table: toml::Table = raw.parse()?;
+        config.legacy_ollama = (table.contains_key("model") || table.contains_key("ollama_host"))
+            && !table.contains_key("llamacpp_host")
+            && !table.contains_key("gguf_path");
+        Ok(config)
+    }
+
     /// The effective active provider. When [`providers`](Self::providers) is
     /// non-empty, returns the one named by
     /// [`active_provider`](Self::active_provider) (or the first if unset or
-    /// unknown). Otherwise synthesizes a local Ollama provider from the legacy
-    /// `model` / `ollama_host` fields — guaranteeing back-compat with config
-    /// files that predate the `providers` table.
+    /// unknown). Otherwise synthesizes a local llama.cpp provider from
+    /// `model` / `llamacpp_host` / `gguf_path` — unless the config file
+    /// carried the legacy `model` / `ollama_host` keys (or
+    /// `WIZARD_OLLAMA_HOST` is set), in which case the synthesized provider
+    /// stays Ollama so configs that predate the `providers` table keep
+    /// working unchanged.
     pub fn active(&self) -> ProviderConfig {
         if !self.providers.is_empty() {
             let chosen = self
@@ -365,12 +416,23 @@ impl Config {
                 return provider.clone();
             }
         }
+        if self.legacy_ollama {
+            return ProviderConfig {
+                name: "local".to_string(),
+                kind: ProviderKind::Ollama,
+                base_url: self.ollama_host.clone(),
+                model: self.model.clone(),
+                api_key_env: None,
+                gguf_path: None,
+            };
+        }
         ProviderConfig {
             name: "local".to_string(),
-            kind: ProviderKind::Ollama,
-            base_url: self.ollama_host.clone(),
+            kind: ProviderKind::LlamaCpp,
+            base_url: self.llamacpp_host.clone(),
             model: self.model.clone(),
             api_key_env: None,
+            gguf_path: self.gguf_path.clone(),
         }
     }
 
@@ -399,8 +461,11 @@ impl Config {
     ///
     /// `WIZARD_MODEL` overrides the legacy `model` field and, when providers
     /// are explicitly configured, the active provider's model too;
-    /// `WIZARD_OLLAMA_HOST` overrides the legacy `ollama_host` (which feeds the
-    /// synthesized local provider).
+    /// `WIZARD_OLLAMA_HOST` overrides `ollama_host` and opts the synthesized
+    /// local provider back into Ollama; `WIZARD_LLAMACPP_HOST` overrides
+    /// `llamacpp_host` (and wins over Ollama when both are set);
+    /// `WIZARD_GGUF_PATH` overrides `gguf_path` and, when the active provider
+    /// is llamacpp, its `gguf_path` too.
     fn apply_env_from(&mut self, lookup: impl Fn(&str) -> Option<String>) {
         if let Some(model) = lookup("WIZARD_MODEL")
             && !model.trim().is_empty()
@@ -415,6 +480,29 @@ impl Config {
             let host = host.trim().trim_end_matches('/');
             if !host.is_empty() {
                 self.ollama_host = host.to_string();
+                // Pointing Wizard at an Ollama host opts the synthesized
+                // local provider back into Ollama.
+                self.legacy_ollama = true;
+            }
+        }
+        if let Some(host) = lookup("WIZARD_LLAMACPP_HOST") {
+            let host = host.trim().trim_end_matches('/');
+            if !host.is_empty() {
+                self.llamacpp_host = host.to_string();
+                // An explicit llama.cpp host wins over legacy Ollama
+                // detection (and over WIZARD_OLLAMA_HOST).
+                self.legacy_ollama = false;
+            }
+        }
+        if let Some(path) = lookup("WIZARD_GGUF_PATH") {
+            let path = path.trim();
+            if !path.is_empty() {
+                self.gguf_path = Some(path.to_string());
+                if let Some(index) = self.active_index()
+                    && self.providers[index].kind == ProviderKind::LlamaCpp
+                {
+                    self.providers[index].gguf_path = Some(path.to_string());
+                }
             }
         }
     }
@@ -468,8 +556,10 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
+        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert!(config.gguf_path.is_none());
         assert_eq!(config.mode, Mode::Genie);
-        assert!(!config.auto_approve);
+        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
         assert!(!config.continuous);
         assert_eq!(config.retry_base_secs, 5);
@@ -502,6 +592,8 @@ mod tests {
         let original = Config {
             model: "llama3.3:70b".to_string(),
             ollama_host: "http://10.0.0.5:11434".to_string(),
+            llamacpp_host: "http://10.0.0.5:8080".to_string(),
+            gguf_path: Some("/models/qwen3-8b-q4_k_m.gguf".to_string()),
             mode: Mode::Sovereign,
             auto_approve: true,
             max_steps: 200,
@@ -516,6 +608,7 @@ mod tests {
                 base_url: "https://api.openai.com/v1".to_string(),
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
+                gguf_path: None,
             }],
             active_provider: Some("openai".to_string()),
             gateway: GatewayConfig {
@@ -523,11 +616,14 @@ mod tests {
                 token_env: Some("MY_BOT_TOKEN".to_string()),
                 allowed_chat_ids: vec![42, -100123],
             },
+            legacy_ollama: false,
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
         assert_eq!(parsed.model, original.model);
         assert_eq!(parsed.ollama_host, original.ollama_host);
+        assert_eq!(parsed.llamacpp_host, original.llamacpp_host);
+        assert_eq!(parsed.gguf_path, original.gguf_path);
         assert_eq!(parsed.mode, original.mode);
         assert_eq!(parsed.auto_approve, original.auto_approve);
         assert_eq!(parsed.max_steps, original.max_steps);
@@ -578,10 +674,10 @@ mod tests {
 
     #[test]
     fn legacy_config_migrates_to_synthesized_local_provider() {
-        // A config with only model/ollama_host (no providers table) yields a
-        // local Ollama provider from active().
-        let config: Config =
-            toml::from_str("model = \"qwen3.5:9b\"\nollama_host = \"http://10.0.0.5:11434\"")
+        // A file with only model/ollama_host (no providers table) predates
+        // the llama.cpp default — active() must keep yielding Ollama.
+        let config =
+            Config::from_toml("model = \"qwen3.5:9b\"\nollama_host = \"http://10.0.0.5:11434\"")
                 .expect("valid toml");
         assert!(config.providers.is_empty());
         let active = config.active();
@@ -590,6 +686,64 @@ mod tests {
         assert_eq!(active.base_url, "http://10.0.0.5:11434");
         assert_eq!(active.model, "qwen3.5:9b");
         assert!(active.api_key_env.is_none());
+
+        // model alone is enough to flag a legacy file.
+        let config = Config::from_toml("model = \"qwen3.5:9b\"").expect("valid toml");
+        assert_eq!(config.active().kind, ProviderKind::Ollama);
+    }
+
+    #[test]
+    fn fresh_default_synthesizes_llamacpp() {
+        // No config file at all: the synthesized provider is llama.cpp.
+        let config = Config::default();
+        let active = config.active();
+        assert_eq!(active.name, "local");
+        assert_eq!(active.kind, ProviderKind::LlamaCpp);
+        assert_eq!(active.base_url, "http://127.0.0.1:8080");
+        assert_eq!(active.model, "qwen3.6:27b");
+        assert!(active.api_key_env.is_none());
+        assert!(active.gguf_path.is_none());
+
+        // An empty file is equivalent to no file.
+        let config = Config::from_toml("").expect("valid toml");
+        assert_eq!(config.active().kind, ProviderKind::LlamaCpp);
+    }
+
+    #[test]
+    fn saved_default_config_stays_llamacpp_on_reload() {
+        // save() writes every field, including ollama_host — the presence of
+        // llamacpp_host must keep the file from being flagged as legacy.
+        let raw = toml::to_string_pretty(&Config::default()).expect("serialize");
+        assert!(raw.contains("ollama_host"), "save writes legacy fields");
+        let config = Config::from_toml(&raw).expect("parse back");
+        assert_eq!(config.active().kind, ProviderKind::LlamaCpp);
+    }
+
+    #[test]
+    fn llamacpp_provider_round_trips_through_toml() {
+        let original = Config {
+            providers: vec![ProviderConfig {
+                name: "local".to_string(),
+                kind: ProviderKind::LlamaCpp,
+                base_url: "http://127.0.0.1:8080".to_string(),
+                model: "qwen3-8b".to_string(),
+                api_key_env: None,
+                gguf_path: Some("/home/u/.wizard/models/qwen3-8b-q4_k_m.gguf".to_string()),
+            }],
+            active_provider: Some("local".to_string()),
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&original).expect("serialize");
+        assert!(raw.contains("kind = \"llamacpp\""), "raw: {raw}");
+        let parsed: Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(parsed.providers.len(), 1);
+        assert_eq!(parsed.providers[0].kind, ProviderKind::LlamaCpp);
+        assert_eq!(
+            parsed.providers[0].gguf_path.as_deref(),
+            Some("/home/u/.wizard/models/qwen3-8b-q4_k_m.gguf")
+        );
+        assert!(parsed.providers[0].api_key_env.is_none());
+        assert_eq!(parsed.active().kind, ProviderKind::LlamaCpp);
     }
 
     #[test]
@@ -601,6 +755,7 @@ mod tests {
                 base_url: "http://127.0.0.1:11434".to_string(),
                 model: "qwen3.6:27b".to_string(),
                 api_key_env: None,
+                gguf_path: None,
             },
             ProviderConfig {
                 name: "claude".to_string(),
@@ -608,6 +763,7 @@ mod tests {
                 base_url: "https://api.anthropic.com".to_string(),
                 model: "claude-fable-5".to_string(),
                 api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                gguf_path: None,
             },
         ];
 
@@ -646,6 +802,7 @@ mod tests {
                 base_url: "https://api.openai.com/v1".to_string(),
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
+                gguf_path: None,
             }],
             active_provider: Some("openai".to_string()),
             ..Config::default()
@@ -681,11 +838,78 @@ mod tests {
     }
 
     #[test]
+    fn env_ollama_host_opts_back_into_ollama_synthesis() {
+        // A fresh config (llama.cpp default) pointed at an Ollama host via
+        // the env var must synthesize an Ollama provider at that host.
+        let mut config = Config::default();
+        config.apply_env_from(|name| match name {
+            "WIZARD_OLLAMA_HOST" => Some("http://10.0.0.5:11434".to_string()),
+            _ => None,
+        });
+        let active = config.active();
+        assert_eq!(active.kind, ProviderKind::Ollama);
+        assert_eq!(active.base_url, "http://10.0.0.5:11434");
+    }
+
+    #[test]
+    fn env_llamacpp_host_overrides_and_wins_over_ollama() {
+        // Even a legacy file flips to llama.cpp when the host is explicit.
+        let mut config = Config::from_toml("model = \"qwen3.5:9b\"").expect("valid toml");
+        assert_eq!(config.active().kind, ProviderKind::Ollama);
+        config.apply_env_from(|name| match name {
+            "WIZARD_OLLAMA_HOST" => Some("http://10.0.0.5:11434".to_string()),
+            "WIZARD_LLAMACPP_HOST" => Some("http://10.0.0.5:8080///".to_string()),
+            _ => None,
+        });
+        let active = config.active();
+        assert_eq!(active.kind, ProviderKind::LlamaCpp);
+        assert_eq!(
+            active.base_url, "http://10.0.0.5:8080",
+            "host trailing slashes are trimmed"
+        );
+        assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
+    }
+
+    #[test]
+    fn env_gguf_path_feeds_synthesized_and_active_llamacpp_provider() {
+        // Synthesized provider picks up the path.
+        let mut config = Config::default();
+        config.apply_env_from(|name| match name {
+            "WIZARD_GGUF_PATH" => Some("  /models/a.gguf  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.gguf_path.as_deref(), Some("/models/a.gguf"));
+        assert_eq!(config.active().gguf_path.as_deref(), Some("/models/a.gguf"));
+
+        // An explicitly configured active llamacpp provider is updated too;
+        // other kinds are left alone.
+        let mut config = Config {
+            providers: vec![ProviderConfig {
+                name: "local".to_string(),
+                kind: ProviderKind::LlamaCpp,
+                base_url: "http://127.0.0.1:8080".to_string(),
+                model: "qwen3-8b".to_string(),
+                api_key_env: None,
+                gguf_path: None,
+            }],
+            active_provider: Some("local".to_string()),
+            ..Config::default()
+        };
+        config.apply_env_from(|name| match name {
+            "WIZARD_GGUF_PATH" => Some("/models/b.gguf".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.active().gguf_path.as_deref(), Some("/models/b.gguf"));
+    }
+
+    #[test]
     fn env_unset_keeps_existing_values() {
         let mut config = Config::default();
         config.apply_env_from(|_| None);
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
+        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert!(config.gguf_path.is_none());
     }
 
     #[test]
@@ -694,10 +918,19 @@ mod tests {
         config.apply_env_from(|name| match name {
             "WIZARD_MODEL" => Some("   ".to_string()),
             "WIZARD_OLLAMA_HOST" => Some("".to_string()),
+            "WIZARD_LLAMACPP_HOST" => Some("  ".to_string()),
+            "WIZARD_GGUF_PATH" => Some("".to_string()),
             _ => None,
         });
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
+        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert!(config.gguf_path.is_none());
+        assert_eq!(
+            config.active().kind,
+            ProviderKind::LlamaCpp,
+            "empty env values do not opt into Ollama"
+        );
     }
 
     #[test]
@@ -732,6 +965,7 @@ mod tests {
     #[test]
     fn auto_flag_forces_auto_approve_in_genie() {
         let mut config = Config::default();
+        config.auto_approve = false; // start from the opt-in gated posture
         config.apply_cli(&cli(&["--auto"]));
         assert_eq!(config.mode, Mode::Genie);
         assert!(config.auto_approve);
@@ -743,7 +977,7 @@ mod tests {
         let mut config = Config::default();
         config.apply_cli(&cli(&[]));
         assert_eq!(config.mode, Mode::Genie);
-        assert!(!config.auto_approve);
+        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
     }
 

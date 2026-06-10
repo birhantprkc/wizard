@@ -91,6 +91,7 @@ impl Answers {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
+            gguf_path: None,
         };
 
         // Mirror an Ollama choice into the legacy fields so config files remain
@@ -287,9 +288,9 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     let mode_options = [
         Opt::new(
             "Genie — interactive",
-            "confirms risky actions (recommended)",
+            "bypass permissions; acts without asking (recommended)",
         ),
-        Opt::new("Sovereign — autonomous", "auto-approves all tool calls"),
+        Opt::new("Sovereign — autonomous", "autonomous; works continuously"),
     ];
     let mode = match select(
         terminal,
@@ -536,6 +537,9 @@ fn print_summary(config: &Config) {
     println!("Next steps:");
 
     match provider.kind {
+        ProviderKind::LlamaCpp => {
+            println!("  • start the server: llama-server -m <model.gguf> --port 8080");
+        }
         ProviderKind::Ollama => {
             println!("  • pull the model:  ollama pull {}", provider.model);
         }

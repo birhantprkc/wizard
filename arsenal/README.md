@@ -51,7 +51,7 @@ If you want to follow upstream development, read the [Wizard README](https://git
 # Install: Ollama + a VRAM-sized model + the wizard binary + the Arsenal config
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard-arsenal/main/install.sh | bash
 
-# Launch (genie mode — interactive, confirms risky actions)
+# Launch (genie mode — interactive, bypass-permissions by default)
 wizard
 
 # Try the preconfigured browser (Playwright MCP must have started — `/reload` if needed)

@@ -89,7 +89,7 @@ Loaded from `~/.wizard/config.toml` with optional env overrides:
 model = "qwen3.6:27b"
 ollama_host = "http://127.0.0.1:11434"
 mode = "genie"
-auto_approve = false
+auto_approve = true
 max_steps = 25
 ```
 
@@ -130,7 +130,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `git_status` | Working tree status |
 | `git_diff` | Staged/unstaged diff |
 
-Genie mode gates write/shell/git tools behind user confirmation. Sovereign mode auto-approves.
+Both modes auto-approve tool calls by default. Genie is conversational and interactive; sovereign works continuously without human input.
 
 Beyond these built-ins, the registry also serves scripted tools (agent-authored scripts in `~/.wizard/tools/`, run through the `execute` sandbox; the Hermes `execute_code` analog) and MCP tools (see below). All three kinds present the same interface to the agent loop, so the model calls them identically.
 
@@ -174,7 +174,7 @@ Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Self-extension is sp
 1. Locate source (`~/.wizard/src`; cloned from the repo on first use)
 2. Ensure a Rust toolchain (installed via `rustup` on first use if absent; see [Install scripts](#install-scripts))
 3. Agent proposes a unified diff over its own source
-4. User approves (unless `--auto`)
+4. User approves (skipped by default; opt in via `auto_approve = false`)
 5. `cargo build --release`
 6. Replace the running process via `exec` (hot-reload)
 
@@ -232,7 +232,7 @@ Target release binary: **< 60 MB** (strip + LTO).
 - All inference is local via Ollama; no model data leaves the machine
 - No outbound API calls from the core loop in v0.1 (except `ollama pull` during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
-- Genie mode gates writes, shell, and git behind explicit approval. **Sovereign mode auto-approves all model-generated tool calls**, including shell and `/evolve` changes. This is the primary risk surface: run sovereign mode only on tasks and repos where unattended local command execution is acceptable
+- Both modes auto-approve tool calls (writes, shell, git, and `/evolve` changes) by default. An opt-in y/n confirmation gate is available via `auto_approve = false`. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run sovereign mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training
 
 ## Roadmap additions

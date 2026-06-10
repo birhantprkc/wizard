@@ -145,8 +145,9 @@ pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
 /// - `parameters` returns a JSON Schema object; `execute` receives arguments
 ///   already validated against nothing — implementations must deserialize
 ///   defensively and return [`ToolError::InvalidArgs`] on shape mismatch.
-/// - `requires_approval` tools are gated behind user confirmation in genie
-///   mode (sovereign mode auto-approves).
+/// - `requires_approval` marks tools that CAN trigger the y/n gate; the gate
+///   only fires when per-action confirmation is enabled (`auto_approve = false`
+///   in config). Both modes auto-approve by default.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique tool name as advertised to the model (snake_case).
@@ -158,7 +159,7 @@ pub trait Tool: Send + Sync {
     /// JSON Schema describing the arguments object.
     fn parameters(&self) -> serde_json::Value;
 
-    /// Whether genie mode must confirm before running this tool.
+    /// Whether this tool opts into the y/n gate when `auto_approve` is false.
     fn requires_approval(&self) -> bool {
         false
     }

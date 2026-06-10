@@ -143,17 +143,18 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
         Some("add") => {
             if args.len() < 5 {
                 return Err(
-                    "usage: /provider add <name> <ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]"
+                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]"
                         .to_string(),
                 );
             }
             let kind = match args[2] {
+                "llamacpp" => ProviderKind::LlamaCpp,
                 "ollama" => ProviderKind::Ollama,
                 "openai" => ProviderKind::Openai,
                 "anthropic" => ProviderKind::Anthropic,
                 other => {
                     return Err(format!(
-                        "unknown provider kind '{other}' (ollama|openai|anthropic)"
+                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic)"
                     ));
                 }
             };
@@ -1662,12 +1663,12 @@ impl CommandContext<'_> {
         let items = vec![
             PickerItem {
                 value: "genie".to_string(),
-                detail: "interactive — confirms risky actions".to_string(),
+                detail: "interactive — bypass permissions; acts without asking".to_string(),
                 current: self.app.mode == Mode::Genie,
             },
             PickerItem {
                 value: "sovereign".to_string(),
-                detail: "autonomous — auto-approves all tool calls".to_string(),
+                detail: "autonomous — works continuously; self-directing".to_string(),
                 current: self.app.mode == Mode::Sovereign,
             },
         ];
@@ -1700,7 +1701,7 @@ impl CommandContext<'_> {
                     .max(Mode::Sovereign.default_max_steps());
             }
             Mode::Genie => {
-                self.app.config.auto_approve = false;
+                self.app.config.auto_approve = true;
                 self.app.config.max_steps = self.genie_max_steps;
             }
         }
@@ -1870,7 +1871,7 @@ impl CommandContext<'_> {
             let synth = self.app.config.active();
             self.app.notice(format!(
                 "no providers configured — using the default: {} ({}) {} @ {}\n\
-                 add one with: /provider add <name> <ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]",
+                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic> <base_url> <model> [API_KEY_ENV]",
                 synth.name, synth.kind, synth.model, synth.base_url
             ));
             return;
@@ -1925,6 +1926,7 @@ impl CommandContext<'_> {
             base_url,
             model,
             api_key_env: api_key_env.clone(),
+            gguf_path: None,
         };
         // Dedup by name: replace an existing entry with the same name.
         self.app.config.providers.retain(|p| p.name != name);

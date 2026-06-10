@@ -35,9 +35,11 @@ Want a richer default loadout instead? Install [**Wizard Arsenal**](https://gith
 
 **Smaller attack surface by construction.** Wizard is harder to attack than agent harnesses built on memory-unsafe languages: a single Rust binary with no garbage-collected runtime, no interpreter to inject into, and the memory-safety guarantees that rule out the buffer overflows and use-after-frees that plague C/C++ tooling. Self-extension shrinks the attack surface further. Because every user assembles a different loadout of skills, MCP servers, and scripted tools through `/evolve`, there is no single uniform tool surface to target — an exploit written against one person's Wizard does not transfer to the next, and unused capabilities simply aren't present to be attacked. Each install converges on the minimal set of tools its owner actually uses.
 
-**Genie / Sovereign dual modes.** Genie is the interactive default: a full TUI that confirms every write, shell command, and evolution before it runs. Sovereign is the autonomous mode: headless-capable, auto-approving, circuit-breaking on repeated failures, and controllable mid-run via a loop-control file. Both use the same tools and model; they differ only in trust posture, and you can switch live with `/genie` and `/sovereign`.
+**Genie / Sovereign dual modes.** Genie is the interactive default: a full Ratatui TUI that bypasses permissions and acts directly — it reads, writes, shells, and runs git without pausing to ask, narrating briefly as it goes. Sovereign is the autonomous mode: headless-capable, self-directing, circuit-breaking on repeated failures, and controllable mid-run via a loop-control file. Both modes auto-approve tool calls by default; the difference is interactivity and continuity. Switch live with `/genie` and `/sovereign`.
 
 **Perpetual `--continuous` mode.** Given one goal, `--continuous` runs sovereign mode indefinitely. It persists a durable mission to `.wizard/mission.toml`, picks the next most valuable action each cycle, sleeps through transient model-server outages instead of dying, and compacts its own context so it never overflows. When it improves itself via `evolve`, up to rebuilding its own binary, it re-execs into the new image and resumes the mission. No human is in the loop; the kill switch is one line in `.wizard/loop-control`, and deep self-modification stays behind the same automated build, smoke-test, and rollback gates. See [docs/modes.md](docs/modes.md#continuous-mode-perpetual-sovereign).
+
+**`wizard bench` — measure, don't vibe.** Wizard records every headless task it runs as a trajectory (prompt, starting commit, outcome, duration) in `.wizard/trajectories.jsonl`. Promote the good ones into benchmark cases with a check command, and `wizard bench run` replays them in isolated git worktrees against any harness — this build, a candidate build, or another agent CLI entirely — scoring each case and printing pass rates. `wizard bench compare` then shows the case-by-case delta, so "the new model is better" becomes a number measured on your own work. No LLM or config needed to run the bench itself. See [docs/bench.md](docs/bench.md).
 
 **Make it your own Wizard.** After a deep evolve modifies Wizard's source, run `/publish` (or `wizard --publish`) to fork the upstream repo to your GitHub account, push your modified `~/.wizard/src` to a branch, and get a one-line installer for your variant:
 
@@ -68,6 +70,9 @@ wizard --continuous -p "keep hardening this codebase: tests, docs, performance"
 
 # Self-extension: add a capability live (skill / MCP server / scripted tool)
 wizard --evolve -p "add a skill for conventional commit messages"
+
+# Replay your recorded tasks against this build (see docs/bench.md)
+wizard bench run
 
 # Re-run onboarding from scratch (provider, model, gateway, mode)
 wizard --onboard
@@ -120,7 +125,7 @@ Wizard's bet is narrower: one binary, local-first, an onboarding that starts fro
 
 - **Linux only.** x86_64 and aarch64. macOS is planned for v0.2; the installer currently refuses Darwin rather than half-working.
 - **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude or GPT-class models. Wizard mitigates this with native tool-call probing, a JSON fallback, and retry prompts. The 27B+ tiers make much better agents than the 9B tier.
-- **No sandbox.** Tools run with your privileges; sovereign mode auto-approves them. Read [SECURITY.md](SECURITY.md) before running sovereign mode on anything you don't trust, and prefer a container/VM there.
+- **No sandbox.** Tools run with your privileges; Wizard auto-approves tool calls by default in both modes. Read [SECURITY.md](SECURITY.md) before running on anything you don't trust, and prefer a container/VM for autonomous or continuous work.
 - **Context windows are finite.** Large codebases exceed what a local model can hold; Wizard searches and reads selectively rather than ingesting the repo, and long sessions will eventually push out early context.
 
 ---

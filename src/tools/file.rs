@@ -141,7 +141,8 @@ pub struct WriteFileArgs {
     pub content: String,
 }
 
-/// `write_file` — create or overwrite a file. Approval-gated in genie mode.
+/// `write_file` — create or overwrite a file. Opts into the approval gate
+/// (only active when `auto_approve = false`).
 pub struct WriteFileTool;
 
 #[async_trait]
@@ -213,7 +214,8 @@ pub struct EditFileArgs {
     pub replace_all: bool,
 }
 
-/// `edit_file` — exact search-and-replace edit. Approval-gated in genie mode.
+/// `edit_file` — exact search-and-replace edit. Opts into the approval gate
+/// (only active when `auto_approve = false`).
 pub struct EditFileTool;
 
 #[async_trait]

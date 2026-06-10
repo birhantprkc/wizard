@@ -34,7 +34,8 @@ pub struct Cli {
     #[arg(long)]
     pub publish: bool,
 
-    /// Skip confirmation prompts (implicit in sovereign mode).
+    /// Force auto-approve for this run (already the default; useful when
+    /// config has `auto_approve = false` to restore bypass behavior).
     #[arg(long)]
     pub auto: bool,
 
@@ -68,6 +69,127 @@ pub struct Cli {
     /// `[gateway]` section of config.toml; a long-running headless process.
     #[arg(long)]
     pub gateway: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Top-level subcommands. Absent for the classic flag-driven modes.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum Command {
+    /// Benchmark harness: record real tasks, replay them against any agent
+    /// CLI, compare pass rates.
+    Bench {
+        #[command(subcommand)]
+        cmd: BenchCmd,
+    },
+}
+
+/// `wizard bench` subcommands. Self-contained: no flag here depends on the
+/// top-level flags (which are not global), and none of them load
+/// `~/.wizard/config.toml` or trigger onboarding.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum BenchCmd {
+    /// Create a benchmark case by hand.
+    Add {
+        /// Case id; `[a-zA-Z0-9_-]+` only (it becomes a file and worktree name).
+        #[arg(long)]
+        id: String,
+
+        /// Task prompt handed to the harness command.
+        #[arg(long)]
+        prompt: String,
+
+        /// Shell command run in the replayed worktree; exit 0 means pass.
+        #[arg(long)]
+        check: String,
+
+        /// Git ref to replay from; resolved to a full commit sha at add time.
+        #[arg(long, default_value = "HEAD")]
+        git_ref: String,
+
+        /// Harness timeout in seconds.
+        #[arg(long, default_value_t = 900)]
+        timeout: u64,
+
+        /// Check-command timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        check_timeout: u64,
+
+        /// Tag for grouping cases (repeatable).
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+
+        /// Free-form notes stored with the case.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+
+    /// List cases (and recorded trajectories with --trajectories).
+    List {
+        /// Also show the last 20 recorded trajectories.
+        #[arg(long)]
+        trajectories: bool,
+    },
+
+    /// Promote a recorded trajectory into a case by attaching a check command.
+    Promote {
+        /// Trajectory id or unique id-prefix (see `wizard bench list --trajectories`).
+        trajectory: String,
+
+        /// Shell command run in the replayed worktree; exit 0 means pass.
+        #[arg(long)]
+        check: String,
+
+        /// Case id; defaults to the trajectory id.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Harness timeout in seconds.
+        #[arg(long, default_value_t = 900)]
+        timeout: u64,
+
+        /// Check-command timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        check_timeout: u64,
+
+        /// Tag for grouping cases (repeatable).
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+
+        /// Free-form notes stored with the case.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+
+    /// Replay cases against a harness command in isolated git worktrees.
+    Run {
+        /// Harness command template; `{prompt}` is replaced with the
+        /// shell-quoted case prompt. Defaults to this binary in sovereign mode.
+        #[arg(long)]
+        runner: Option<String>,
+
+        /// Label stored in the result file name and summary.
+        #[arg(long, default_value = "run")]
+        label: String,
+
+        /// Run only this case id (repeatable; default: all cases).
+        #[arg(long = "case")]
+        case: Vec<String>,
+
+        /// Keep the per-case worktrees for inspection instead of removing them.
+        #[arg(long)]
+        keep_worktrees: bool,
+    },
+
+    /// Compare two result files case-by-case.
+    Compare {
+        /// First result JSON (baseline).
+        a: PathBuf,
+
+        /// Second result JSON.
+        b: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -101,6 +223,7 @@ mod tests {
         assert!(!cli.resume);
         assert!(!cli.onboard);
         assert!(!cli.gateway);
+        assert!(cli.command.is_none(), "bare wizard has no subcommand");
     }
 
     #[test]
@@ -165,5 +288,78 @@ mod tests {
     fn rejects_unknown_mode() {
         let err = parse(&["--mode", "warlock"]).expect_err("unknown mode must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn bench_add_parses_with_defaults() {
+        let cli = parse(&["bench", "add", "--id", "x", "--prompt", "y", "--check", "z"])
+            .expect("bench add parses");
+        let Some(Command::Bench {
+            cmd:
+                BenchCmd::Add {
+                    id,
+                    prompt,
+                    check,
+                    git_ref,
+                    timeout,
+                    check_timeout,
+                    tag,
+                    notes,
+                },
+        }) = cli.command
+        else {
+            panic!("expected bench add");
+        };
+        assert_eq!(id, "x");
+        assert_eq!(prompt, "y");
+        assert_eq!(check, "z");
+        assert_eq!(git_ref, "HEAD");
+        assert_eq!(timeout, 900);
+        assert_eq!(check_timeout, 300);
+        assert!(tag.is_empty());
+        assert_eq!(notes, None);
+    }
+
+    #[test]
+    fn bench_add_requires_id_prompt_and_check() {
+        let err = parse(&["bench", "add", "--id", "x"]).expect_err("missing args rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn bench_run_parses_repeatable_case_filter() {
+        let cli = parse(&[
+            "bench", "run", "--runner", "true", "--case", "a", "--case", "b",
+        ])
+        .expect("bench run parses");
+        let Some(Command::Bench {
+            cmd:
+                BenchCmd::Run {
+                    runner,
+                    label,
+                    case,
+                    keep_worktrees,
+                },
+        }) = cli.command
+        else {
+            panic!("expected bench run");
+        };
+        assert_eq!(runner.as_deref(), Some("true"));
+        assert_eq!(label, "run");
+        assert_eq!(case, vec!["a".to_string(), "b".to_string()]);
+        assert!(!keep_worktrees);
+    }
+
+    #[test]
+    fn bench_compare_parses_positional_paths() {
+        let cli = parse(&["bench", "compare", "a.json", "b.json"]).expect("bench compare parses");
+        let Some(Command::Bench {
+            cmd: BenchCmd::Compare { a, b },
+        }) = cli.command
+        else {
+            panic!("expected bench compare");
+        };
+        assert_eq!(a, PathBuf::from("a.json"));
+        assert_eq!(b, PathBuf::from("b.json"));
     }
 }

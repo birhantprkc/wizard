@@ -1,6 +1,6 @@
 # Personality modes
 
-Wizard ships with two personalities that share the same tools and model but differ in autonomy, prompting, and confirmation behavior.
+Wizard ships with two personalities that share the same tools and model but differ in autonomy, interaction style, and step budget.
 
 ## Genie mode (default)
 
@@ -9,21 +9,23 @@ wizard
 wizard --mode genie
 ```
 
-Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) but asks before doing anything risky.
+Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) and acts without asking — it bypasses permissions and executes file writes, shell commands, git commits, and evolutions directly, narrating briefly as it goes.
 
 ### Behavior
 
 - Full Ratatui interface with chat history and tool output panels
-- Confirms before: file writes, shell commands, git commits (unless `--auto`)
+- Bypasses permissions: auto-approves all tool calls — no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
 - Default loop limit: 25 agent steps per turn
 - Best for: pair programming, exploration, incremental changes
+
+> To restore per-action confirmation prompts, set `auto_approve = false` in `~/.wizard/config.toml`.
 
 ### Flags
 
 | Flag | Effect |
 |------|--------|
-| `--auto` | Skip confirmation prompts (still interactive TUI) |
+| `--auto` | Auto-approve flag; now the default for genie — pass for scripting compatibility or when `auto_approve = false` is set in config |
 | `-p "task"` | Pre-fill the first message |
 | `--resume` | Continue the last session |
 
@@ -37,7 +39,7 @@ wizard
 
 > Fix the issues you found
 
-[Wizard proposes patches → asks "Apply changes? [y/n]" → runs cargo test]
+[Wizard applies patches directly → runs cargo test → reports results]
 ```
 
 ## Sovereign mode
@@ -143,18 +145,18 @@ appended to `~/.wizard/evolution.jsonl`.
 
 ```
 /mode sovereign    # switch to autonomous behavior (still in TUI)
-/mode genie        # switch back to interactive confirmations
+/mode genie        # switch back to interactive (Ratatui TUI) mode
 /sovereign         # shorthand for /mode sovereign
 /genie             # shorthand for /mode genie
 ```
 
-Mode changes affect prompting and auto-approve behavior for the current session. The choice is not persisted unless you update `~/.wizard/config.toml`.
+Mode changes affect prompting, step budget, and interaction style for the current session. The choice is not persisted unless you update `~/.wizard/config.toml`.
 
 ## System prompts
 
 Each mode injects a different system prompt:
 
-**Genie** emphasizes collaboration, explanation, and asking before destructive actions.
+**Genie** emphasizes collaboration, explanation, and narrating actions as it goes.
 
 **Sovereign** emphasizes autonomy, completing the full task end-to-end, running tests, and committing when appropriate.
 

@@ -51,8 +51,9 @@ pub enum DoneReason {
 pub enum AgentEvent {
     /// Streaming assistant text delta.
     TextDelta(String),
-    /// A gated tool call awaits user approval (genie mode without `--auto`).
-    /// Send `true` on `respond` to run it, `false` to deny.
+    /// A tool call is requesting approval via the opt-in y/n gate (only fires
+    /// when `auto_approve = false`). Send `true` on `respond` to run it,
+    /// `false` to deny.
     ApprovalRequest {
         call: ToolCall,
         respond: oneshot::Sender<bool>,
@@ -1039,7 +1040,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     let _ = std::io::stdout().flush();
                 }
                 AgentEvent::ApprovalRequest { respond, .. } => {
-                    // Sovereign auto-approves; this is a safety net.
+                    // Both modes auto-approve by default; this is a safety net for the opt-in gating path.
                     let _ = respond.send(true);
                 }
                 AgentEvent::ToolStarted { name, args } => {
@@ -1110,9 +1111,27 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             println!("\n=== iteration {iteration}/{max_iterations} ===");
         }
 
+        let turn_started = Instant::now();
+        let turn_prompt = input.clone();
         match agent.run_turn(&input, tx.clone()).await {
             Ok(reason) => {
                 final_reason = reason;
+                // Record the completed turn as a benchmark candidate
+                // (`wizard bench promote`). Infallible and silent inside
+                // bench replays, so it can never affect the run itself.
+                crate::bench::record::record(
+                    &project_root,
+                    &turn_prompt,
+                    &format!("{reason:?}"),
+                    turn_started.elapsed(),
+                    &model,
+                    if config.continuous {
+                        "continuous"
+                    } else {
+                        "sovereign"
+                    },
+                )
+                .await;
                 match reason {
                     DoneReason::MaxSteps => {
                         input = "Continue the task from where you left off. If it is already \

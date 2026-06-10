@@ -104,7 +104,7 @@ You can also edit config by hand:
 model = "my-custom-model"
 ollama_host = "http://127.0.0.1:11434"
 mode = "genie"
-auto_approve = false
+auto_approve = true
 ```
 
 Verify the model works:

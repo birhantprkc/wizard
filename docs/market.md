@@ -62,10 +62,9 @@ Tier-1 evolutions (skills, MCP server registrations, scripted tools, subagents) 
 
 ## Gated and logged
 
-Like deep evolve, publish is gated:
+Like deep evolve, publish is logged and can be gated:
 
-- In **genie mode**: `/publish` shows you the fork target, branch, and source commit before proceeding. You confirm before anything is pushed.
-- In **sovereign mode**: publish auto-approves (same standing consent as all sovereign actions).
+Both modes auto-approve `/publish` by default. Genie narrates the fork target, branch, and source commit as it proceeds; sovereign publishes as part of its unattended flow. Set `auto_approve = false` to require explicit confirmation before anything is pushed.
 
 Every publication is appended to `~/.wizard/evolution.jsonl` alongside deep-evolve records, with the fork repo, branch, and the short commit SHA that was pushed.
 

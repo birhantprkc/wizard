@@ -1,6 +1,7 @@
 //! `evolve` tool: lets the agent extend or rebuild ITSELF at runtime.
-//! Wraps the tiered self-extension pipeline (`crate::evolve`). In sovereign
-//! mode this is auto-approved; in genie mode it is gated behind confirmation
+//! Wraps the tiered self-extension pipeline (`crate::evolve`). Auto-approved
+//! by default in both modes (genie bypasses permissions, sovereign is
+//! autonomous); subject to the y/n gate only when auto-approve is disabled
 //! (`requires_approval` = true). A successful deep rebuild drops a re-exec
 //! marker so the continuous loop relaunches into the new binary.
 
@@ -85,7 +86,7 @@ impl Tool for EvolveTool {
             } else {
                 EvolveTier::Runtime
             },
-            // The Tool-layer/genie approval gate already governs whether this
+            // The tool-layer approval gate already governs whether this
             // `execute` is reached, so the pipeline itself need not re-prompt.
             auto_approve: true,
         };
