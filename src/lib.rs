@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod bench;
 pub mod cli;
 pub mod config;
 pub mod event;
@@ -28,6 +29,15 @@ use crate::config::Mode;
 /// Top-level entry point: load config, apply CLI overrides, and dispatch to
 /// the selected run mode (genie TUI, sovereign headless loop, or `--evolve`).
 pub async fn run(cli: cli::Cli) -> Result<()> {
+    // Bench is self-contained tooling: it must work with no config and no
+    // LLM, so dispatch before onboarding and before the config load.
+    if let Some(cli::Command::Bench { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return bench::run(cmd.clone()).await;
+    }
+
     // First-run onboarding: build a fresh config interactively when requested,
     // or automatically on a fresh install in an interactive terminal. A
     // cancelled wizard exits gracefully without touching anything.
@@ -74,6 +84,11 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
 /// headless-with-prompt sovereign run. A non-interactive run never onboards,
 /// so piping into Wizard never blocks.
 fn should_onboard(cli: &cli::Cli) -> Result<bool> {
+    // Subcommands (bench) are dispatched before this is ever consulted; the
+    // check here is a defensive guarantee that they can never onboard.
+    if cli.command.is_some() {
+        return Ok(false);
+    }
     if cli.publish || cli.evolve || cli.gateway {
         return Ok(false);
     }
