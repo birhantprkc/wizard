@@ -964,8 +964,10 @@ mod tests {
 
     #[test]
     fn auto_flag_forces_auto_approve_in_genie() {
-        let mut config = Config::default();
-        config.auto_approve = false; // start from the opt-in gated posture
+        let mut config = Config {
+            auto_approve: false, // start from the opt-in gated posture
+            ..Config::default()
+        };
         config.apply_cli(&cli(&["--auto"]));
         assert_eq!(config.mode, Mode::Genie);
         assert!(config.auto_approve);

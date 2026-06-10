@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref (frequent pushes to main).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,17 +26,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Steps ordered cheapest-first so failures surface fast:
+      # fmt -> clippy -> test -> release build.
+      # --locked makes Cargo.lock drift a hard failure instead of a
+      # silent re-resolve.
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
   shellcheck:
     name: Shellcheck installers

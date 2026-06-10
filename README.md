@@ -1,5 +1,7 @@
 # Wizard
 
+[![CI](https://github.com/teddytennant/wizard/actions/workflows/ci.yml/badge.svg)](https://github.com/teddytennant/wizard/actions/workflows/ci.yml)
+
 **One line. Your sovereign coding wizard. Self-extending. Fully local.**
 
 ![Wizard fixing a bug: prompt, approval modal, tool call, diff](demo/demo.gif)

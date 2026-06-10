@@ -14,7 +14,9 @@
 #   WIZARD_SKIP_OLLAMA_INSTALL 1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN      1 = eagerly install a Rust toolchain for deep evolve (default 0)
 #   WIZARD_REPO                owner/repo to install from   (default teddytennant/wizard)
-#   WIZARD_REF                 git ref/branch when building from source (default main)
+#   WIZARD_REF                 git ref/tag when building from source
+#                              (default: latest release tag, falling back to
+#                              main only when the repo has no release)
 #   WIZARD_BUILD_FROM_SOURCE   1 = build from source instead of downloading a release (default 0)
 #
 # Disclaimer: you choose the model. Wizard does not ship, endorse, or maintain
@@ -29,7 +31,7 @@ WIZARD_MODEL="${WIZARD_MODEL:-}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
-WIZARD_REF="${WIZARD_REF:-main}"
+WIZARD_REF="${WIZARD_REF:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
 
 REPO="${WIZARD_REPO}"
@@ -188,23 +190,79 @@ place_binary() {
     INSTALLED_PATH="${WIZARD_INSTALL_DIR}/wizard"
 }
 
+download_release_asset() {
+    # $1 = release asset name, $2 = output path.
+    # Plain curl covers public releases; on a private repo the unauthenticated
+    # asset URL returns plain 404, so fall back to an authenticated
+    # `gh release download` when the gh CLI is available.
+    local asset="$1" out="$2"
+    if curl -fsSL -o "$out" "${RELEASE_BASE}/${asset}" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$out"
+    if command -v gh >/dev/null 2>&1; then
+        if gh release download --repo "$REPO" --pattern "$asset" \
+            --output "$out" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$out"
+    fi
+    return 1
+}
+
+verify_checksum() {
+    # $1 = path to the downloaded tarball, $2 = asset name.
+    # Missing checksums.txt (older release) is a warning; a mismatch is fatal.
+    local tarball="$1" asset="$2" sums="${TMP_DIR}/checksums.txt" expected actual
+    if [ ! -f "$sums" ] \
+        && ! download_release_asset "checksums.txt" "$sums"; then
+        warn "release has no checksums.txt — skipping checksum verification"
+        return
+    fi
+    expected="$(awk -v a="$asset" '$2 == a {print $1; exit}' "$sums" || true)"
+    if [ -z "$expected" ]; then
+        warn "checksums.txt has no entry for ${asset} — skipping checksum verification"
+        return
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        warn "sha256sum not found on PATH — skipping checksum verification"
+        return
+    fi
+    actual="$(sha256sum "$tarball" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}) — the download may be corrupted or tampered with; aborting"
+    fi
+    say "Checksum verified for ${asset}"
+}
+
 download_binary() {
     say "Downloading wizard binary from GitHub releases (${REPO}) ..."
     local asset bin
     for asset in "wizard-${ARCH}-unknown-linux-gnu.tar.gz" "wizard-linux-${ARCH}.tar.gz"; do
-        if curl -fsSL -o "${TMP_DIR}/${asset}" "${RELEASE_BASE}/${asset}" 2>/dev/null; then
+        if download_release_asset "$asset" "${TMP_DIR}/${asset}"; then
+            verify_checksum "${TMP_DIR}/${asset}" "${asset}"
             tar -xzf "${TMP_DIR}/${asset}" -C "$TMP_DIR" || continue
             bin="$(find "$TMP_DIR" -type f -name wizard | head -n1 || true)"
-            if [ -n "$bin" ]; then
-                place_binary "$bin"
-                BINARY_INSTALLED=1
-                say "Installed wizard to ${INSTALLED_PATH}"
-                return
+            if [ -z "$bin" ]; then
+                warn "no wizard binary inside ${asset}"
+                continue
             fi
+            chmod 755 "$bin"
+            # Sanity check before installing — catches a corrupt download or
+            # a glibc mismatch instead of declaring success with a dud binary.
+            if ! "$bin" --version >/dev/null 2>&1; then
+                warn "the binary from ${asset} does not run on this system"
+                continue
+            fi
+            place_binary "$bin"
+            BINARY_INSTALLED=1
+            say "Installed wizard to ${INSTALLED_PATH}"
+            return
         fi
     done
 
     warn "could not download a prebuilt wizard binary for linux/${ARCH}"
+    warn "(a 404 here also happens when ${REPO} is private — 'gh auth login' enables an authenticated download)"
     warn "you can build it from source instead (requires a Rust toolchain):"
     printf '\n' >&2
     printf '    git clone https://github.com/%s ~/.wizard/src\n' "$REPO" >&2
@@ -246,14 +304,45 @@ install_toolchain() {
 
 # --- build from source --------------------------------------------------
 
+resolve_source_ref() {
+    # Prefer the newest published release tag so a source build compiles a
+    # known-good, CI-passed commit instead of the moving tip of main. An
+    # explicit WIZARD_REF always wins; main is the last resort, used only
+    # when the repo has no published release at all.
+    local tag
+    if [ -n "$WIZARD_REF" ]; then
+        printf '%s' "$WIZARD_REF"
+        return
+    fi
+    tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 \
+        | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+    if [ -z "$tag" ]; then
+        # API unavailable (rate limit, proxy): derive the tag from the
+        # /releases/latest redirect instead.
+        tag="$(curl -fsI -o /dev/null -w '%{redirect_url}' \
+            "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+        tag="${tag##*/}"
+        [ "$tag" = "latest" ] && tag=""
+    fi
+    if [ -n "$tag" ]; then
+        printf '%s' "$tag"
+    else
+        warn "no published release found for ${REPO} — building from main (unreviewed tip; set WIZARD_REF to pin a ref)"
+        printf 'main'
+    fi
+}
+
 build_from_source() {
     command -v git >/dev/null 2>&1 \
         || die "git is required to build from source but was not found on PATH"
-    say "Building wizard from source (${WIZARD_REPO}@${WIZARD_REF}) ..."
+    local ref
+    ref="$(resolve_source_ref)"
+    say "Building wizard from source (${WIZARD_REPO}@${ref}) ..."
     local src_dir="${TMP_DIR}/wizard-src"
-    git clone --depth 1 --branch "$WIZARD_REF" \
+    git clone --depth 1 --branch "$ref" \
         "https://github.com/${WIZARD_REPO}" "$src_dir" \
-        || die "git clone failed — check WIZARD_REPO (${WIZARD_REPO}) and WIZARD_REF (${WIZARD_REF})"
+        || die "git clone failed — check WIZARD_REPO (${WIZARD_REPO}) and the ref (${ref})"
     ensure_rust_toolchain
     say "Running cargo build --release (this may take several minutes) ..."
     ( cd "$src_dir" && cargo build --release ) \
@@ -261,6 +350,8 @@ build_from_source() {
     local bin="${src_dir}/target/release/wizard"
     [ -f "$bin" ] \
         || die "build succeeded but target/release/wizard not found in ${src_dir}"
+    "$bin" --version >/dev/null 2>&1 \
+        || die "the built binary does not run ('wizard --version' failed) — the ${ref} ref may be broken"
     place_binary "$bin"
     BINARY_INSTALLED=1
     say "Installed wizard (built from source) to ${INSTALLED_PATH}"
