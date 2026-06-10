@@ -2,7 +2,7 @@
 
 Wizard Arsenal is a preconfigured distribution of Wizard: the same self-extending agent, shipped with a fuller default loadout so the first run is already equipped. It is a separate repository ([`teddytennant/wizard-arsenal`](https://github.com/teddytennant/wizard-arsenal)) that installs the upstream `wizard` binary and then lays down a richer configuration under `~/.wizard/`.
 
-The binary is unchanged upstream Wizard. Arsenal adds *configuration*, not source — everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
+The binary is unchanged upstream Wizard. Arsenal adds *configuration*, not source: everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
 
 ---
 
@@ -14,10 +14,10 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard-arsenal/main/in
 
 The installer:
 
-1. Detects GPU VRAM (or system RAM on CPU-only boxes) and selects a Qwen model tier — the same logic as the [upstream installer](getting-started.md#model-tiers-automatic).
-2. Stages `~/.wizard/config.toml` from the Arsenal template, substituting the selected model — **only if no config exists**.
+1. Detects GPU VRAM (or system RAM on CPU-only boxes) and selects a Qwen model tier, using the same logic as the [upstream installer](getting-started.md#model-tiers-automatic).
+2. Stages `~/.wizard/config.toml` from the Arsenal template, substituting the selected model, **only if no config exists**.
 3. Runs upstream Wizard's installer from source, which installs the local model runtime (llama.cpp's `llama-server` by default; Ollama with `WIZARD_USE_OLLAMA=1`), fetches the model, and builds and installs the `wizard` binary.
-4. Lays down the Arsenal configuration: `~/.wizard/mcp.toml` and `~/.wizard/subagents/*.toml` — each only if it is not already present.
+4. Lays down the Arsenal configuration: `~/.wizard/mcp.toml` and `~/.wizard/subagents/*.toml`, each only if it is not already present.
 
 Nothing under `~/.wizard/` that already exists is overwritten. If you have an existing Wizard install, Arsenal adds only what is missing.
 
@@ -39,7 +39,7 @@ args = ["-y", "@playwright/mcp@latest"]
 
 This is exactly the browser recipe from [WIZARD.md §2](../WIZARD.md), shipped ready instead of acquired via `/evolve`. When Wizard starts (or after `/reload`), the server's navigate / click / type / snapshot tools merge into the registry, and the agent can read pages, fill forms, and do computer-use style tasks.
 
-It requires **Node and `npx`** on your PATH. If Node is missing, the server is skipped with a warning at startup and the rest of Wizard works normally — install Node, then `/reload`.
+It requires **Node and `npx`** on your PATH. If Node is missing, the server is skipped with a warning at startup and the rest of Wizard works normally; install Node, then `/reload`.
 
 ### A roster of subagents
 
@@ -52,7 +52,7 @@ It requires **Node and `npx`** on your PATH. If Node is missing, the server is s
 | `tester` | Runs the test suite, diagnoses failures, fixes code or tests. | read / write / edit / search / execute |
 | `documenter` | Writes and updates docs and comments to match the code. | read / write / edit / search |
 
-These are plain TOML files. Edit them, add your own, or delete the ones you don't want — they follow the same format as any [user-defined subagent](evolve.md). Changes take effect on the next run or `/reload`.
+These are plain TOML files. Edit them, add your own, or delete the ones you don't want; they follow the same format as any [user-defined subagent](evolve.md). Changes take effect on the next run or `/reload`.
 
 ```
 > use the reviewer subagent to review my staged changes
@@ -75,13 +75,13 @@ Arsenal uses the same VRAM detection as upstream and writes the selected tier in
 | `config.toml` | One local `[[providers]]` entry (llama.cpp by default) | `[[provider]]` blocks + `active_provider`, plus cloud templates |
 | Model selection | VRAM-tiered | VRAM-tiered (identical) |
 
-Everything else — genie/sovereign modes, `/evolve` tiers and gates, `--continuous`, `/publish` — is identical, because it is the same binary.
+Everything else (genie/sovereign modes, `/evolve` tiers and gates, `--continuous`, `/publish`) is identical, because it is the same binary.
 
 ---
 
 ## Providers
 
-Arsenal's `config.toml` uses Wizard's provider blocks — any OpenAI-compatible endpoint, Anthropic, or a local server. Its template defaults to local Ollama (a fully supported provider — upstream Wizard's own from-scratch default is llama.cpp):
+Arsenal's `config.toml` uses Wizard's provider blocks: any OpenAI-compatible endpoint, Anthropic, or a local server. Its template defaults to local Ollama (a fully supported provider; upstream Wizard's own from-scratch default is llama.cpp):
 
 ```toml
 active_provider = "local"
@@ -95,7 +95,7 @@ model = "qwen3.6:27b"   # whatever tier the installer selected
 
 ### Adding a provider
 
-The fastest way is `/provider` in the TUI, which adds and switches providers without editing files. To do it by hand, the shipped config carries commented templates for OpenAI and Anthropic — uncomment one and set `active_provider`:
+The fastest way is `/provider` in the TUI, which adds and switches providers without editing files. To do it by hand, the shipped config carries commented templates for OpenAI and Anthropic; uncomment one and set `active_provider`:
 
 ```toml
 [[provider]]
@@ -106,7 +106,7 @@ model = "claude-fable-5"
 api_key_env = "ANTHROPIC_API_KEY"
 ```
 
-The key is read from the named environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) at runtime — it is never written to `config.toml`. Export it in your shell before launching:
+The key is read from the named environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) at runtime; it is never written to `config.toml`. Export it in your shell before launching:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
@@ -121,7 +121,7 @@ Comment it out (or delete its `[[provider]]` block) and make sure `active_provid
 
 ## Relationship to upstream
 
-Arsenal is a distribution layer, not a fork of the binary. To change Wizard's *behavior* (new built-in tools, TUI features, an amended charter), deep-evolve upstream Wizard and [publish your own fork](market.md) — that ships modified source. Arsenal is for shipping a richer *configuration* on top of stock Wizard.
+Arsenal is a distribution layer, not a fork of the binary. To change Wizard's *behavior* (new built-in tools, TUI features, an amended charter), deep-evolve upstream Wizard and [publish your own fork](market.md); that ships modified source. Arsenal is for shipping a richer *configuration* on top of stock Wizard.
 
 Follow upstream at [`teddytennant/wizard`](https://github.com/teddytennant/wizard).
 
@@ -129,7 +129,7 @@ Follow upstream at [`teddytennant/wizard`](https://github.com/teddytennant/wizar
 
 ## See also
 
-- [Getting started](getting-started.md) — install, tiers, first run
-- [Self-extension](evolve.md) — `/evolve`, subagents, MCP servers
-- [Fork and distribute](market.md) — publish a modified-source fork
-- [WIZARD.md](../WIZARD.md) — the behavioral charter (browser recipe in §2)
+- [Getting started](getting-started.md): install, tiers, first run
+- [Self-extension](evolve.md): `/evolve`, subagents, MCP servers
+- [Fork and distribute](market.md): publish a modified-source fork
+- [WIZARD.md](../WIZARD.md): the behavioral charter (browser recipe in §2)

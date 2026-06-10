@@ -12,36 +12,36 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 One link, and you have a ready-to-go setup: the `wizard` binary installed and working out of the box. It's a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic, and switches providers live with `/provider`. By default the installer also sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with a Qwen 3 GGUF sized to your hardware, so it runs without an API key; bring a cloud key instead if you prefer.
 
-**Two ways in.** Take the batteries-included one-liner above and start working immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
+**Two ways in.** Take the batteries-included one-liner above and start working immediately, or take the **bespoke** path: a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BESPOKE=1 bash
 wizard   # launches onboarding on first run
 ```
 
-Want a richer default loadout instead? Install [**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal) — the same Wizard preconfigured with a browser, a roster of subagents, and hardware-sized model selection, in one line.
+Want a richer default loadout instead? Install [**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal): the same Wizard preconfigured with a browser, a roster of subagents, and hardware-sized model selection, in one line.
 
 ---
 
 ## Why Wizard
 
-**Any provider, switchable live.** The agent loop speaks the OpenAI-compatible chat API — streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support — so any compatible endpoint works: OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, plus Ollama (`kind = "ollama"`, native API) and Anthropic. `/provider add` registers a new endpoint, `/provider use` switches the live agent to it, and API keys are read from environment variables rather than stored on disk. Running a model locally is one fully-managed option: the default install ships `llama-server` with a GGUF tier picked for your VRAM, and Wizard handles the server's lifecycle itself — when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit so the next launch is instant.
+**Any provider, switchable live.** The agent loop speaks the OpenAI-compatible chat API (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), so any compatible endpoint works: OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, plus Ollama (`kind = "ollama"`, native API) and Anthropic. `/provider add` registers a new endpoint, `/provider use` switches the live agent to it, and API keys are read from environment variables rather than stored on disk. Running a model locally is one fully-managed option: the default install ships `llama-server` with a GGUF tier picked for your VRAM, and Wizard handles the server's lifecycle itself: when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit so the next launch is instant.
 
-**Onboarding from scratch.** The bespoke path (`WIZARD_BESPOKE=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions — provider, model (with a VRAM-aware suggestion for local models), messaging gateway, and mode — and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
+**Onboarding from scratch.** The bespoke path (`WIZARD_BESPOKE=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions (provider, model with a VRAM-aware suggestion for local models, messaging gateway, and mode) and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
 
-**Messaging gateway.** Run Wizard headless as a bot you can talk to from your phone. `wizard --gateway` connects the configured gateway (Telegram, or `none` for terminal-only), runs each inbound message as a sovereign agent turn in your project, and replies with the result — chat-ID allow-list and env-var token included. Configure it in onboarding or `[gateway]` in config.toml.
+**Messaging gateway.** Run Wizard headless as a bot you can talk to from your phone. `wizard --gateway` connects the configured gateway (Telegram, or `none` for terminal-only), runs each inbound message as a sovereign agent turn in your project, and replies with the result; chat-ID allow-list and env-var token included. Configure it in onboarding or `[gateway]` in config.toml.
 
 **Tiered `/evolve` self-extension.** Wizard extends itself at runtime. New skills, MCP servers, scripted tools, and subagents are plain files under `~/.wizard/`, live after `/reload` and reverted by deleting the file. When a change needs new Rust, `/evolve --deep` proposes a diff to Wizard's own source and, gated by your approval, a successful `cargo build --release`, and a `--version` smoke test, replaces its own binary. The old binary is kept as `wizard.prev` beside the new one, so rollback is a single `mv`, and every evolution is logged with its diff to `~/.wizard/evolution.jsonl`.
 
 **Runtime MCP.** Wizard is an MCP client (stdio and HTTP). Declare a server in `~/.wizard/mcp.toml`, or have `/evolve` register one, and its tools merge into the registry on `/reload` without a rebuild. Stdio servers are spawned with a cleared, allowlisted environment and dynamic-linker variables stripped, and every request is time-bounded. This is the path for computer use, browser control, databases, and anything else shipped as an MCP server.
 
-**Smaller attack surface by construction.** Wizard is harder to attack than agent harnesses built on memory-unsafe languages: a single Rust binary with no garbage-collected runtime, no interpreter to inject into, and the memory-safety guarantees that rule out the buffer overflows and use-after-frees that plague C/C++ tooling. Self-extension shrinks the attack surface further. Because every user assembles a different loadout of skills, MCP servers, and scripted tools through `/evolve`, there is no single uniform tool surface to target — an exploit written against one person's Wizard does not transfer to the next, and unused capabilities simply aren't present to be attacked. Each install converges on the minimal set of tools its owner actually uses.
+**Smaller attack surface by construction.** Wizard is harder to attack than agent harnesses built on memory-unsafe languages: a single Rust binary with no garbage-collected runtime, no interpreter to inject into, and the memory-safety guarantees that rule out the buffer overflows and use-after-frees that plague C/C++ tooling. Self-extension shrinks the attack surface further. Because every user assembles a different loadout of skills, MCP servers, and scripted tools through `/evolve`, there is no single uniform tool surface to target: an exploit written against one person's Wizard does not transfer to the next, and unused capabilities simply aren't present to be attacked. Each install converges on the minimal set of tools its owner actually uses.
 
-**Genie / Sovereign dual modes.** Genie is the interactive default: a full Ratatui TUI that bypasses permissions and acts directly — it reads, writes, shells, and runs git without pausing to ask, narrating briefly as it goes. Sovereign is the autonomous mode: headless-capable, self-directing, circuit-breaking on repeated failures, and controllable mid-run via a loop-control file. Both modes auto-approve tool calls by default; the difference is interactivity and continuity. Switch live with `/genie` and `/sovereign`.
+**Genie / Sovereign dual modes.** Genie is the interactive default: a full Ratatui TUI that bypasses permissions and acts directly. It reads, writes, shells, and runs git without pausing to ask, narrating briefly as it goes. Sovereign is the autonomous mode: headless-capable, self-directing, circuit-breaking on repeated failures, and controllable mid-run via a loop-control file. Both modes auto-approve tool calls by default; the difference is interactivity and continuity. Switch live with `/genie` and `/sovereign`.
 
 **Perpetual `--continuous` mode.** Given one goal, `--continuous` runs sovereign mode indefinitely. It persists a durable mission to `.wizard/mission.toml`, picks the next most valuable action each cycle, sleeps through transient model-server outages instead of dying, and compacts its own context so it never overflows. When it improves itself via `evolve`, up to rebuilding its own binary, it re-execs into the new image and resumes the mission. No human is in the loop; the kill switch is one line in `.wizard/loop-control`, and deep self-modification stays behind the same automated build, smoke-test, and rollback gates. See [docs/modes.md](docs/modes.md#continuous-mode-perpetual-sovereign).
 
-**`wizard bench` — measure, don't vibe.** Wizard records every headless task it runs as a trajectory (prompt, starting commit, outcome, duration) in `.wizard/trajectories.jsonl`. Promote the good ones into benchmark cases with a check command, and `wizard bench run` replays them in isolated git worktrees against any harness — this build, a candidate build, or another agent CLI entirely — scoring each case and printing pass rates. `wizard bench compare` then shows the case-by-case delta, so "the new model is better" becomes a number measured on your own work. No LLM or config needed to run the bench itself. See [docs/bench.md](docs/bench.md).
+**`wizard bench`: measure, don't vibe.** Wizard records every headless task it runs as a trajectory (prompt, starting commit, outcome, duration) in `.wizard/trajectories.jsonl`. Promote the good ones into benchmark cases with a check command, and `wizard bench run` replays them in isolated git worktrees against any harness (this build, a candidate build, or another agent CLI entirely), scoring each case and printing pass rates. `wizard bench compare` then shows the case-by-case delta, so "the new model is better" becomes a number measured on your own work. No LLM or config needed to run the bench itself. See [docs/bench.md](docs/bench.md).
 
 **Make it your own Wizard.** After a deep evolve modifies Wizard's source, run `/publish` (or `wizard --publish`) to fork the upstream repo to your GitHub account, push your modified `~/.wizard/src` to a branch, and get a one-line installer for your variant:
 
@@ -61,13 +61,13 @@ Anyone who runs it gets your Wizard, built from your source on their machine and
 # Install (binary + a default local model setup)
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 
-# Launch the interactive TUI (genie mode — default)
+# Launch the interactive TUI (genie mode, the default)
 wizard
 
 # Sovereign autonomous mode
 wizard --mode sovereign -p "refactor the auth module and add tests"
 
-# Perpetual mode — keeps working and self-improving until you stop it
+# Perpetual mode: keeps working and self-improving until you stop it
 wizard --continuous -p "keep hardening this codebase: tests, docs, performance"
 
 # Self-extension: add a capability live (skill / MCP server / scripted tool)
@@ -83,7 +83,7 @@ wizard --onboard
 wizard --gateway
 ```
 
-Add or switch model providers at any time from inside the TUI — any OpenAI-compatible endpoint or Anthropic:
+Add or switch model providers at any time from inside the TUI, with any OpenAI-compatible endpoint or Anthropic:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
@@ -112,7 +112,7 @@ The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or a
 
 Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or point `gguf_path` at any GGUF ([BYOM](docs/byom.md)). Prefer Ollama? `WIZARD_USE_OLLAMA=1` at install time keeps the previous Ollama-based flow. Full details in [docs/getting-started.md](docs/getting-started.md).
 
-**Migrating from Ollama?** An explicit `[[providers]]` entry with `kind = "ollama"` keeps working exactly as before. The synthesized local default is llama.cpp: a legacy config that only sets top-level `model` / `ollama_host` now resolves to `llama-server` at `http://127.0.0.1:8080` (set `gguf_path` so Wizard can start it for you). To stay on Ollama, add the provider explicitly: `/provider add local ollama http://127.0.0.1:11434 <model>`. And if the local backend isn't installed or can't start, Wizard doesn't give up — it falls back to any configured cloud provider, then to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, and finally opens setup so you can bring your own provider.
+**Migrating from Ollama?** An explicit `[[providers]]` entry with `kind = "ollama"` keeps working exactly as before. The synthesized local default is llama.cpp: a legacy config that only sets top-level `model` / `ollama_host` now resolves to `llama-server` at `http://127.0.0.1:8080` (set `gguf_path` so Wizard can start it for you). To stay on Ollama, add the provider explicitly: `/provider add local ollama http://127.0.0.1:11434 <model>`. And if the local backend isn't installed or can't start, Wizard doesn't give up: it falls back to any configured cloud provider, then to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, and finally opens setup so you can bring your own provider.
 
 ---
 
@@ -123,8 +123,8 @@ Verified against each tool's documentation as of June 2026:
 | | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
 |---|---|---|---|---|
 | Providers | Any OpenAI-compatible endpoint + Anthropic, switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
-| MCP | Yes — stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes — one of the earliest and deepest integrations, 70+ documented extensions | Yes — local + remote servers, OAuth for remote |
-| Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | — | Extensions and recipes via MCP | TypeScript/JS plugin system |
+| MCP | Yes: stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes: one of the earliest and deepest integrations, 70+ documented extensions | Yes: local + remote servers, OAuth for remote |
+| Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | None | Extensions and recipes via MCP | TypeScript/JS plugin system |
 | Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |
 | Language | Rust | Python | Rust (TS desktop app) | TypeScript |
 | License | MIT | Apache-2.0 | Apache-2.0 | MIT |
@@ -146,15 +146,15 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 ## Docs
 
-- [Getting started](docs/getting-started.md) — install, tiers, first run, troubleshooting
-- [Modes](docs/modes.md) — genie vs sovereign
-- [Self-extension](docs/evolve.md) — `/evolve` tiers, gates, rollback
-- [Fork and distribute](docs/market.md) — publish your evolved Wizard; one-line installer for your fork
-- [Wizard Arsenal](docs/arsenal.md) — the configured fork: preconfigured browser, subagents, and model selection
-- [Bring your own model](docs/byom.md) — any GGUF, or custom Ollama models
-- [Architecture](docs/architecture.md) — how it's built
-- [Security](SECURITY.md) — threat model
-- [WIZARD.md](WIZARD.md) — the agent's bundled behavioral charter; inherited and editable by every fork
+- [Getting started](docs/getting-started.md): install, tiers, first run, troubleshooting
+- [Modes](docs/modes.md): genie vs sovereign
+- [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
+- [Fork and distribute](docs/market.md): publish your evolved Wizard; one-line installer for your fork
+- [Wizard Arsenal](docs/arsenal.md): the configured fork with preconfigured browser, subagents, and model selection
+- [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
+- [Architecture](docs/architecture.md): how it's built
+- [Security](SECURITY.md): threat model
+- [WIZARD.md](WIZARD.md): the agent's bundled behavioral charter; inherited and editable by every fork
 
 ## Development
 
@@ -169,12 +169,12 @@ cargo build --release
 
 ## Acknowledgements
 
-Local inference is powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org) — the default install ships its `llama-server`, and Wizard's run-it-locally option stands on that project's work. [Ollama](https://ollama.com) is a first-class supported provider.
+Local inference is powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org): the default install ships its `llama-server`, and Wizard's run-it-locally option stands on that project's work. [Ollama](https://ollama.com) is a first-class supported provider.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
 
 ## Author
 
-Teddy Tennant — [github.com/teddytennant](https://github.com/teddytennant)
+Teddy Tennant ([github.com/teddytennant](https://github.com/teddytennant))

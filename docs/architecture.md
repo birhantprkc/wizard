@@ -1,6 +1,6 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui front end on top of a provider-agnostic agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Providers are interchangeable — any OpenAI-compatible endpoint, Anthropic, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
+Wizard is a single-binary Rust application: a Ratatui front end on top of a provider-agnostic agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
 
 ## High-level overview
 
@@ -105,9 +105,9 @@ model = "Qwen3.6-27B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
-When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` (legacy `model` / `ollama_host`-only files included — Ollama is opt-in via an explicit `[[providers]]` entry).
+When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry).
 
-At TUI startup, a local backend that is missing or cannot start is not fatal: Wizard falls back to bring-your-own-provider — first any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and finally the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
+At TUI startup, a local backend that is missing or cannot start is not fatal: Wizard falls back to bring-your-own-provider: first any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and finally the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
 
 ### LLM clients (`llm/`)
 
@@ -121,7 +121,7 @@ All providers implement the `LlmProvider` trait (health, model listing, streamin
 
 ### llama-server lifecycle (`server.rs`)
 
-When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself — at TUI/headless/gateway startup and after `/provider use` switches to a llama.cpp provider. Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group (it survives Wizard's exit and Ctrl-C), logs to `~/.wizard/llama-server.log`, and its PID is recorded in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s (503 = model still loading). `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling, so a recycled PID can never kill an unrelated process.
+When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself, at TUI/headless/gateway startup and after `/provider use` switches to a llama.cpp provider. Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group (it survives Wizard's exit and Ctrl-C), logs to `~/.wizard/llama-server.log`, and its PID is recorded in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s (503 = model still loading). `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling, so a recycled PID can never kill an unrelated process.
 
 ### Agent loop (`agent/mod.rs`)
 
@@ -188,9 +188,9 @@ Skills are loaded at startup and on `/reload`.
 
 Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Self-extension is split into two tiers so it works on the prebuilt binary, not just dev installs. Full walkthrough in [evolve.md](evolve.md).
 
-**Tier 1 — runtime extension (default; no recompile).** Adds a skill, registers an MCP server, authors a scripted tool, or configures a subagent. Changes are written under `~/.wizard/` and activated by `/reload`. This covers most new capability (including computer use, via MCP) and works on every install.
+**Tier 1, runtime extension (default; no recompile).** Adds a skill, registers an MCP server, authors a scripted tool, or configures a subagent. Changes are written under `~/.wizard/` and activated by `/reload`. This covers most new capability (including computer use, via MCP) and works on every install.
 
-**Tier 2 — deep evolve (`/evolve --deep`; recompiles core).** For changes that require new Rust in the core:
+**Tier 2, deep evolve (`/evolve --deep`; recompiles core).** For changes that require new Rust in the core:
 
 1. Locate source (`~/.wizard/src`; cloned from the repo on first use)
 2. Ensure a Rust toolchain (installed via `rustup` on first use if absent; see [Install scripts](#install-scripts))
@@ -232,11 +232,11 @@ Ratatui + crossterm terminal UI:
 
 ### `install.sh` (default)
 
-VRAM-aware tier selection. Installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), and a Qwen 3 GGUF, but no Rust toolchain, keeping the default footprint lean. No server is started at install time — Wizard spawns it on first run. `WIZARD_USE_OLLAMA=1` selects the previous Ollama-based flow instead. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+VRAM-aware tier selection. Installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), and a Qwen 3 GGUF, but no Rust toolchain, keeping the default footprint lean. No server is started at install time; Wizard spawns it on first run. `WIZARD_USE_OLLAMA=1` selects the previous Ollama-based flow instead. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
 ### `install-byom.sh` (optional)
 
-Same binary install, but user selects any Ollama model. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF — see [byom.md](byom.md).
+Same binary install, but user selects any Ollama model. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF; see [byom.md](byom.md).
 
 ## Dependencies
 
@@ -265,5 +265,5 @@ Target release binary: **< 60 MB** (strip + LTO).
 | Version | Architecture change |
 |---------|-------------------|
 | v0.2 | Subagent swarms, deep `/evolve` source rebuild, plugin marketplace (dynamic `.so` / WASM) |
-| v0.3 | `ollama launch wizard` — Ollama-native launcher integration |
+| v0.3 | `ollama launch wizard` (Ollama-native launcher integration) |
 | Future | tree-sitter symbol search, tmux background tasks, remote subagent execution |

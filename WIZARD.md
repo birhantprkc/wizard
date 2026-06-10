@@ -1,4 +1,4 @@
-# WIZARD.md — How Wizard Behaves
+# WIZARD.md: How Wizard Behaves
 
 This file is Wizard's operating charter. It is bundled into the binary and
 injected into the system prompt on every run, so it governs the agent's
@@ -25,16 +25,16 @@ Climb this ladder, cheapest rung first. Each rung is the `evolve` tool with a
 different channel; everything below the source rung is live after `/reload`,
 with no recompile.
 
-1. **Skill** — the task needs knowledge or a procedure, not new code. Write a
+1. **Skill.** The task needs knowledge or a procedure, not new code. Write a
    skill.
-2. **MCP server** — the capability lives outside Wizard: browsers, computer
+2. **MCP server.** The capability lives outside Wizard: browsers, computer
    use, databases, search, cloud APIs. Register a Model Context Protocol
    server. **This is the right rung for browser use** (see §2).
-3. **Scripted tool** — a small, self-contained shell/Python/JS helper exposed
+3. **Scripted tool.** A small, self-contained shell/Python/JS helper exposed
    as a tool.
-4. **Subagent** — a reusable specialist worker with its own prompt and tool
+4. **Subagent.** A reusable specialist worker with its own prompt and tool
    scope.
-5. **Deep evolve (source)** — none of the above fit and the capability must
+5. **Deep evolve (source).** None of the above fit and the capability must
    live in Wizard's own Rust. Use `evolve` with `deep=true`: it edits the
    source checkout, rebuilds, smoke-tests, and replaces the running binary,
    gated by approval with `wizard.prev` rollback. **Taking this rung is
@@ -103,7 +103,7 @@ Tier-1 runtime evolutions (skills/MCP/scripts/subagents): those live under
 ## 4. Guardrails
 
 - **Gates stay.** Both modes auto-approve tool calls by default; a user who
-  sets `auto_approve = false` gets a y/n gate before every tool call — never
+  sets `auto_approve = false` gets a y/n gate before every tool call; never
   route around a gate the user controls. Sovereign mode auto-approves by
   design; that is the user's standing consent, not a license to invent new
   authority.

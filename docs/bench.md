@@ -1,11 +1,11 @@
-# `wizard bench` — trajectory recording and replay benchmarks
+# `wizard bench`: trajectory recording and replay benchmarks
 
 `wizard bench` turns your own real work into a benchmark. Wizard records
 every headless agent turn as a *trajectory*; you promote the interesting ones
 into *cases* by attaching a check command; the runner replays cases against
 any harness command in isolated git worktrees and prints pass-rate numbers.
 Compare two result files and you have an A/B answer to "did this model /
-prompt / build actually get better?" — measured on your tasks, not someone
+prompt / build actually get better?", measured on your tasks, not someone
 else's leaderboard.
 
 Bench is fully self-contained: it never loads `~/.wizard/config.toml`, never
@@ -24,7 +24,7 @@ Everything lives project-locally:
    or `--continuous`). Every completed turn appends one line to
    `.wizard/trajectories.jsonl`: the prompt, the HEAD sha before the turn,
    whether the repo was dirty, the done reason, duration, model, and mode.
-   Recording is best-effort and silent — it can never break a run — and it is
+   Recording is best-effort and silent (it can never break a run), and it is
    suppressed inside bench replays (the runner sets `WIZARD_BENCH=1`).
 
 2. **Promote.** Inspect what you have, then attach a check command:
@@ -35,7 +35,7 @@ Everything lives project-locally:
    ```
 
    Promote refuses trajectories with no recorded sha (not a git repo) or a
-   dirty working tree at record time — a replay could not reproduce that
+   dirty working tree at record time; a replay could not reproduce that
    starting state. You can also write a case by hand:
 
    ```bash
@@ -61,7 +61,7 @@ Everything lives project-locally:
 `.wizard/bench/cases/<id>.toml`:
 
 ```toml
-id = "fix-auth"                       # [a-zA-Z0-9_-]+ — becomes a file/worktree name
+id = "fix-auth"                       # [a-zA-Z0-9_-]+; becomes a file/worktree name
 prompt = "fix the auth module tests"  # handed to the harness via {prompt}
 base_ref = "0123abcd…"                # full commit sha the worktree starts from
 check = "cargo test -q -p auth"       # exit 0 = pass, run after the harness
@@ -93,7 +93,7 @@ wizard bench run --label claude \
 
 Each case runs in its own detached worktree of `base_ref` under a temp dir,
 with stdin closed, output captured, and `WIZARD_BENCH=1` in the environment.
-The harness's exit code is recorded but does not decide the outcome — only
+The harness's exit code is recorded but does not decide the outcome; only
 the check command does (some harnesses exit nonzero on benign conditions).
 A harness that overruns `timeout_secs` is killed and scored `timeout`;
 infrastructure failures (missing ref, worktree errors) score `error`.
@@ -106,17 +106,18 @@ Each run writes a JSON file with the resolved runner, per-case results
 
 ```
 touch-case  PASS  harness 0.0s  check 0.0s
-1/1 passed (100%) — results: .wizard/bench/results/baseline-1781234567.json
+1/1 passed (100%), results: .wizard/bench/results/baseline-1781234567.json
 ```
 
-`compare` prints the union of case ids with a marker per case — `↑` a pass
-gained from A to B, `↓` a pass lost, blank unchanged, `—` missing on one
-side — followed by both summaries and the delta in percentage points.
+`compare` prints the union of case ids with a marker per case (`↑` a pass
+gained from A to B, `↓` a pass lost, blank unchanged, an em dash for a case
+missing on one side), followed by both summaries and the delta in
+percentage points.
 
 ## Current limitations
 
 - Cases run sequentially; there is no parallelism yet.
-- Only headless (sovereign / continuous) turns are recorded — genie TUI
+- Only headless (sovereign / continuous) turns are recorded; genie TUI
   sessions don't land in the trajectory log.
 - Replays need the recorded base sha to still exist and require a clean tree
   at record time; dirty trajectories cannot be promoted.

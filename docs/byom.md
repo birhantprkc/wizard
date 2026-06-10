@@ -1,6 +1,6 @@
 # Bring your own model (BYOM)
 
-Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default installer downloads only official Qwen GGUF quants, so the one-liner never ships custom weights — swapping in your own is easy on both local backends.
+Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default installer downloads only official Qwen GGUF quants, so the one-liner never ships custom weights; swapping in your own is easy on both local backends.
 
 ## Any GGUF with llama.cpp (the default local backend)
 
@@ -17,7 +17,7 @@ gguf_path = "/home/you/.wizard/models/my-coder-Q4_K_M.gguf"
 
 Wizard starts `llama-server` with that file automatically (see [getting started](getting-started.md#first-run)). Alternatively:
 
-- Run `wizard --onboard` and pick "Type a custom GGUF path…" in the model step — it lists GGUFs already in `~/.wizard/models/` first.
+- Run `wizard --onboard` and pick "Type a custom GGUF path…" in the model step; it lists GGUFs already in `~/.wizard/models/` first.
 - Override per run with `WIZARD_GGUF_PATH=/path/to/model.gguf` (and `WIZARD_MODEL=<tag>` for the label).
 
 Prefer a model that supports tool calling; Wizard spawns the server with `--jinja` so OpenAI-style tool calls work, and falls back to a prompt-based JSON tool protocol for models without native support.
@@ -119,7 +119,7 @@ If `ollama list` shows your model, select it directly. No pull step.
 
 ### Manual configuration
 
-You can also edit config by hand — Ollama is selected with an explicit provider entry:
+You can also edit config by hand; Ollama is selected with an explicit provider entry:
 
 ```toml
 # ~/.wizard/config.toml
@@ -155,7 +155,7 @@ Native tool calling varies by model, so Wizard probes for it at startup: models 
 
 ### Remote servers
 
-Point Wizard at a model server on another machine — it connects instead of spawning (Wizard only starts `llama-server` for loopback URLs):
+Point Wizard at a model server on another machine and it connects instead of spawning (Wizard only starts `llama-server` for loopback URLs):
 
 ```toml
 [[providers]]
@@ -185,7 +185,7 @@ The default `install.sh` one-liner downloads only official Qwen quants.
 
 ## Switching back to official models
 
-Re-run the standard installer — it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards (or run `wizard --onboard` and pick the recommended tier):
+Re-run the standard installer: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards (or run `wizard --onboard` and pick the recommended tier):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash

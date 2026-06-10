@@ -9,12 +9,12 @@ wizard
 wizard --mode genie
 ```
 
-Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) and acts without asking — it bypasses permissions and executes file writes, shell commands, git commits, and evolutions directly, narrating briefly as it goes.
+Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) and acts without asking: it bypasses permissions and executes file writes, shell commands, git commits, and evolutions directly, narrating briefly as it goes.
 
 ### Behavior
 
 - Full Ratatui interface with chat history and tool output panels
-- Bypasses permissions: auto-approves all tool calls — no per-action y/n prompt
+- Bypasses permissions: auto-approves all tool calls, with no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
 - Default loop limit: 25 agent steps per turn
 - Best for: collaboration, exploration, incremental changes
@@ -25,7 +25,7 @@ Genie is the interactive, conversational mode. It is eager and creative ("your w
 
 | Flag | Effect |
 |------|--------|
-| `--auto` | Auto-approve flag; now the default for genie — pass for scripting compatibility or when `auto_approve = false` is set in config |
+| `--auto` | Auto-approve flag; now the default for genie. Pass for scripting compatibility or when `auto_approve = false` is set in config |
 | `-p "task"` | Pre-fill the first message |
 | `--resume` | Continue the last session |
 
@@ -65,7 +65,7 @@ Sovereign mode is the autonomous, proactive agent. It runs with minimal human in
 |------|--------|
 | `--max-hours 2` | Time limit for the run |
 | `--loop 10` | Max outer loop iterations |
-| `--continuous` | Run perpetually — never stop at "done" (implies sovereign). See below |
+| `--continuous` | Run perpetually, never stopping at "done" (implies sovereign). See below |
 | `--auto` | Implicit in sovereign mode; included for consistency |
 | `--cwd /path/to/repo` | Set project root |
 

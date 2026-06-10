@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic; the default installer sets up a local stack — [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF — so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
+Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama) or Anthropic; the default installer sets up a local stack ([llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF), so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
 
 ## Install
 
@@ -17,16 +17,16 @@ The installer:
 5. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
 6. Writes `~/.wizard/config.toml` (an existing config is never touched)
 
-The installer does **not** start a model server — Wizard starts `llama-server` itself on first run.
+The installer does **not** start a model server; Wizard starts `llama-server` itself on first run.
 
 ### Model tiers (automatic)
 
 | Available VRAM | GGUF downloaded | Approx. size |
 |----------------|-----------------|--------------|
-| ≥ 24 GB | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | ~21 GB (MoE, 36B total / 3B active — fast, but all weights must fit in memory) |
+| ≥ 24 GB | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | ~21 GB (MoE, 36B total / 3B active: fast, but all weights must fit in memory) |
 | 18–24 GB | `Qwen3.6-27B-Q4_K_M.gguf` | ~16 GB (dense) |
 | 8–18 GB | `Qwen3.5-9B-Q4_K_M.gguf` | ~6 GB |
-| < 8 GB | `Qwen3.5-9B-Q4_K_M.gguf` (CPU / partial offload — slower) | ~6 GB |
+| < 8 GB | `Qwen3.5-9B-Q4_K_M.gguf` (CPU / partial offload, slower) | ~6 GB |
 
 Tiers are ordered so the model's total footprint fits in available memory. An MoE model still needs all expert weights resident, which is why the 35B lands in the top tier despite its small active-parameter count.
 
@@ -113,7 +113,7 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 The local default is llama.cpp; Ollama stays fully supported but is opt-in:
 
 - Explicit `[[providers]]` entries with `kind = "ollama"` behave exactly as before.
-- A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080` — add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
+- A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080`; add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
 - If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` from the environment, then interactive setup.
 
 To switch an existing install to llama.cpp, add a provider from the TUI and point it at a GGUF:
@@ -133,7 +133,7 @@ Install with the previous flow (installs Ollama, starts it, pulls the model):
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_USE_OLLAMA=1 bash
 ```
 
-Or pick "Local — Ollama" in onboarding (`wizard --onboard`). Wizard speaks Ollama's native `/api/chat` for these providers, as before.
+Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speaks Ollama's native `/api/chat` for these providers, as before.
 
 ## Using a cloud or remote provider
 
@@ -144,7 +144,7 @@ Any OpenAI-compatible endpoint or Anthropic works. Add one from the TUI and swit
 /provider use openai
 ```
 
-The last argument names the environment variable holding your API key — the key itself is never written to disk; export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_BESPOKE=1` to choose everything on first run).
+The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_BESPOKE=1` to choose everything on first run).
 
 ## Headless mode
 
@@ -207,7 +207,7 @@ Check the log first:
 tail -50 ~/.wizard/llama-server.log
 ```
 
-Common causes: the GGUF at `gguf_path` is missing or truncated (re-run the installer — the download resumes), or the model doesn't fit in memory (see below).
+Common causes: the GGUF at `gguf_path` is missing or truncated (re-run the installer; the download resumes), or the model doesn't fit in memory (see below).
 
 ### llama-server not found
 
@@ -253,7 +253,7 @@ RUST_LOG=wizard=debug wizard
 
 ## Next steps
 
-- [Personality modes](modes.md) — genie vs sovereign
-- [Self-extension](evolve.md) — how `/evolve` adds capabilities
-- [Bring your own model](byom.md) — any GGUF, or custom Ollama models
-- [Architecture](architecture.md) — how Wizard works under the hood
+- [Personality modes](modes.md): genie vs sovereign
+- [Self-extension](evolve.md): how `/evolve` adds capabilities
+- [Bring your own model](byom.md): any GGUF, or custom Ollama models
+- [Architecture](architecture.md): how Wizard works under the hood

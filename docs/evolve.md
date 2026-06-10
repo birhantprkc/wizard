@@ -11,7 +11,7 @@ Wizard is compiled Rust, so it can't edit-and-reload its own core the way Pi doe
 
 ---
 
-## Tier 1 — runtime extension (default, no recompile)
+## Tier 1: runtime extension (default, no recompile)
 
 Works on every install, including the one-line `curl | bash` binary. `/evolve` writes config/data under `~/.wizard/` and `/reload` activates it live. Four channels:
 
@@ -64,7 +64,7 @@ Configure a named, reusable subagent with its own prompt, tool scope, and step b
 
 ---
 
-## Tier 2 — deep evolve (recompiles core)
+## Tier 2: deep evolve (recompiles core)
 
 When a change needs new Rust in Wizard itself (a new built-in tool kind, a protocol change, a TUI panel), use `--deep`:
 
