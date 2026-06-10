@@ -93,7 +93,6 @@ All inference goes to your Ollama instance (`http://127.0.0.1:11434` by default)
 
 If you find a security issue in Wizard:
 
-- Preferred: open a private report via **GitHub security advisories** on [teddytennant/wizard](https://github.com/teddytennant/wizard/security/advisories)
-- Or email **192647641+teddytennant@users.noreply.github.com**
+- Open a private report via **GitHub security advisories** on [teddytennant/wizard](https://github.com/teddytennant/wizard/security/advisories)
 
 Please include reproduction steps and the version (`wizard --version`). Reports are read by a human; expect an acknowledgment, not an SLA — this is a small open-source project.
