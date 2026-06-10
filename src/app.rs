@@ -23,6 +23,7 @@ use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRe
 use crate::llm::ToolCall;
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
+use crate::server;
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
 
@@ -110,6 +111,8 @@ pub enum SlashCommand {
     },
     /// `/provider ...` — add, remove, or switch LLM providers.
     Provider(ProviderAction),
+    /// `/server ...` — status / start / stop the local llama-server.
+    Server(ServerAction),
     Quit,
 }
 
@@ -179,6 +182,32 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
     Ok(SlashCommand::Provider(action))
 }
 
+/// What a `/server` subcommand does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAction {
+    /// `/server` / `/server status` — health of the local llama-server.
+    Status,
+    /// `/server start` — start llama-server for the active provider.
+    Start,
+    /// `/server stop` — stop the llama-server Wizard started.
+    Stop,
+}
+
+/// Parse the arguments to `/server` (everything after the command word).
+fn parse_server(args: &[&str]) -> Result<SlashCommand, String> {
+    let action = match args.first().copied() {
+        None | Some("status") => ServerAction::Status,
+        Some("start") => ServerAction::Start,
+        Some("stop") => ServerAction::Stop,
+        Some(other) => {
+            return Err(format!(
+                "unknown /server subcommand '{other}' (status|start|stop)"
+            ));
+        }
+    };
+    Ok(SlashCommand::Server(action))
+}
+
 impl SlashCommand {
     /// Parse a `/...` input line. `None` when `input` is not a slash
     /// command; `Some(Err(msg))` for an unknown command or bad arguments.
@@ -216,6 +245,7 @@ impl SlashCommand {
                 branch: args.first().map(|s| s.to_string()),
             }),
             "provider" => parse_provider(&args),
+            "server" => parse_server(&args),
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -278,6 +308,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "provider",
         args: "[list|use|add|remove]",
         description: "add, remove, or switch LLM providers",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "server",
+        args: "[status|start|stop]",
+        description: "manage the local llama-server",
         takes_args: false,
     },
     CommandSpec {
@@ -1297,7 +1333,8 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
-/provider [list|use|...]    add, remove, or switch LLM providers (ollama/openai/anthropic)\n  \
+/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic)\n  \
+/server [status|start|stop] manage the local llama-server\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /quit                       exit\n\
@@ -1333,6 +1370,12 @@ pub async fn run_tui(config: Config, cli: Cli) -> Result<()> {
     let mut client: Arc<dyn LlmProvider> = active
         .build()
         .with_context(|| format!("building provider '{}'", active.name))?;
+    // llama.cpp gets a lifecycle hand: when nothing answers, Wizard starts
+    // the server itself. The terminal is still in normal mode here, so the
+    // spawn/load progress prints straight to stdout.
+    if active.kind == ProviderKind::LlamaCpp {
+        server::ensure_running(&active, &|line: &str| println!("{line}")).await?;
+    }
     client
         .health()
         .await
@@ -1555,6 +1598,7 @@ impl CommandContext<'_> {
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
             SlashCommand::Provider(action) => self.provider(action).await,
+            SlashCommand::Server(action) => self.server(action).await,
         }
     }
 
@@ -1822,6 +1866,18 @@ impl CommandContext<'_> {
             }
         };
         *self.client = client;
+        // A switch to llama.cpp may target a server that is not up yet:
+        // kick off the auto-start in the background (the rebuild below
+        // proceeds regardless; probes fall back until the model loads).
+        if provider.kind == ProviderKind::LlamaCpp
+            && server::probe(&provider.base_url).await == server::Health::Down
+        {
+            self.app.notice(format!(
+                "llama-server at {} is not running — starting it…",
+                provider.base_url
+            ));
+            self.start_server_task(provider.clone());
+        }
         let manager = self.manager.lock().await;
         match build_agent(
             self.client,
@@ -1955,6 +2011,113 @@ impl CommandContext<'_> {
         }
         self.persist_config();
         self.app.notice(format!("removed provider '{name}'"));
+    }
+
+    /// Handle `/server` subcommands: status, start, or stop the local
+    /// llama-server.
+    async fn server(&mut self, action: ServerAction) {
+        match action {
+            ServerAction::Status => self.server_status().await,
+            ServerAction::Start => self.server_start().await,
+            ServerAction::Stop => self.server_stop(),
+        }
+    }
+
+    /// The active provider when it is llama.cpp; otherwise a notice that
+    /// `/server` does not apply.
+    fn llamacpp_provider(&mut self) -> Option<ProviderConfig> {
+        let provider = self.app.config.active();
+        if provider.kind == ProviderKind::LlamaCpp {
+            Some(provider)
+        } else {
+            self.app.notice(format!(
+                "the active provider '{}' is {} — /server only manages a local llama.cpp server",
+                provider.name, provider.kind
+            ));
+            None
+        }
+    }
+
+    async fn server_status(&mut self) {
+        let Some(provider) = self.llamacpp_provider() else {
+            return;
+        };
+        let spawned = server::spawned_pid()
+            .map(|pid| format!(" (PID {pid}, started by wizard)"))
+            .unwrap_or_default();
+        let line = match server::probe(&provider.base_url).await {
+            server::Health::Ready => {
+                format!("llama-server at {}: ready{spawned}", provider.base_url)
+            }
+            server::Health::Loading => format!(
+                "llama-server at {}: loading its model{spawned}",
+                provider.base_url
+            ),
+            server::Health::Down => format!(
+                "llama-server at {}: not running — start it with /server start",
+                provider.base_url
+            ),
+        };
+        self.app.notice(line);
+    }
+
+    async fn server_start(&mut self) {
+        let Some(provider) = self.llamacpp_provider() else {
+            return;
+        };
+        if server::probe(&provider.base_url).await == server::Health::Ready {
+            self.app.notice(format!(
+                "llama-server at {} is already running",
+                provider.base_url
+            ));
+            return;
+        }
+        self.app
+            .notice(format!("starting llama-server at {}…", provider.base_url));
+        self.start_server_task(provider);
+    }
+
+    fn server_stop(&mut self) {
+        let message = match server::stop() {
+            Ok(server::StopOutcome::Stopped(pid)) => format!("stopped llama-server (PID {pid})"),
+            Ok(server::StopOutcome::NotRecorded) => {
+                "wizard has not started a llama-server — nothing to stop".to_string()
+            }
+            Ok(server::StopOutcome::NotRunning(pid)) => {
+                format!("llama-server (PID {pid}) already exited")
+            }
+            Ok(server::StopOutcome::NotOurs { pid, name }) => {
+                format!("refusing to stop PID {pid}: it is '{name}', not llama-server")
+            }
+            Err(err) => format!("could not stop llama-server: {err:#}"),
+        };
+        self.app.notice(message);
+    }
+
+    /// Background half of `/server start` (and the post-switch auto-start):
+    /// ensure a llama-server is running for `provider`, streaming progress
+    /// into the transcript as notices.
+    fn start_server_task(&self, provider: ProviderConfig) {
+        let notify = self.events.sender();
+        tokio::spawn(async move {
+            let progress = {
+                let notify = notify.clone();
+                move |line: &str| {
+                    // The progress callback is sync; relay each line through
+                    // its own send task.
+                    let notify = notify.clone();
+                    let line = line.to_string();
+                    tokio::spawn(async move {
+                        let _ = notify.send(Event::Notice(line)).await;
+                    });
+                }
+            };
+            let message = match server::ensure_running(&provider, &progress).await {
+                Ok(()) => format!("llama-server at {} is ready", provider.base_url),
+                Err(err) => format!("llama-server: {err:#}"),
+            };
+            let _ = notify.send(Event::Notice(message)).await;
+        });
     }
 }
 
@@ -2128,6 +2291,29 @@ mod tests {
             SlashCommand::parse("/sovereign"),
             Some(Ok(SlashCommand::Mode(Some(Mode::Sovereign))))
         );
+    }
+
+    #[test]
+    fn server_subcommands_parse() {
+        assert_eq!(
+            SlashCommand::parse("/server"),
+            Some(Ok(SlashCommand::Server(ServerAction::Status)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/server status"),
+            Some(Ok(SlashCommand::Server(ServerAction::Status)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/server start"),
+            Some(Ok(SlashCommand::Server(ServerAction::Start)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/server stop"),
+            Some(Ok(SlashCommand::Server(ServerAction::Stop)))
+        );
+        let parsed = SlashCommand::parse("/server restart").expect("is a slash command");
+        let message = parsed.expect_err("unknown subcommand");
+        assert!(message.contains("status|start|stop"), "got: {message}");
     }
 
     #[test]

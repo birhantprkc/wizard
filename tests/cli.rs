@@ -37,6 +37,8 @@ fn run_wizard(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         .env("HOME", home)
         .env_remove("WIZARD_MODEL")
         .env_remove("WIZARD_OLLAMA_HOST")
+        .env_remove("WIZARD_LLAMACPP_HOST")
+        .env_remove("WIZARD_GGUF_PATH")
         .current_dir(home);
     for (key, value) in envs {
         command.env(key, value);
@@ -122,6 +124,99 @@ fn unreachable_ollama_host_fails_with_actionable_error() {
 }
 
 #[test]
+fn unreachable_llamacpp_host_fails_with_actionable_error() {
+    let home = TempDir::new();
+    // Port 1 on localhost: connection refused immediately, no server needed.
+    let bogus = "http://127.0.0.1:1";
+    // An empty PATH guarantees auto-spawn is impossible even on machines
+    // that have llama-server installed, so the failure is deterministic.
+    let output = run_wizard(
+        &home.0,
+        &["--mode", "sovereign", "-p", "do nothing"],
+        &[("WIZARD_LLAMACPP_HOST", bogus), ("PATH", "/nonexistent")],
+    );
+
+    assert!(
+        !output.status.success(),
+        "an unreachable host must be a failure"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "clean exit code, not a crash"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(bogus),
+        "error must name the configured host:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("llama-server"),
+        "error must tell the user how to fix it:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "must fail gracefully, not panic:\n{stderr}"
+    );
+}
+
+/// Write `~/.wizard/config.toml` under the fake home.
+fn write_config(home: &Path, contents: &str) {
+    let dir = home.join(".wizard");
+    std::fs::create_dir_all(&dir).expect("create .wizard dir");
+    std::fs::write(dir.join("config.toml"), contents).expect("write config.toml");
+}
+
+#[test]
+fn fresh_config_resolves_to_the_llamacpp_provider() {
+    let home = TempDir::new();
+    // A config written by current versions always carries `llamacpp_host`;
+    // point it at port 1 so the probe fails instantly instead of touching
+    // whatever might really be listening on the default port.
+    write_config(&home.0, "llamacpp_host = \"http://127.0.0.1:1\"\n");
+    let output = run_wizard(
+        &home.0,
+        &["--mode", "sovereign", "-p", "do nothing"],
+        &[("PATH", "/nonexistent")],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("llama-server") && stderr.contains("http://127.0.0.1:1"),
+        "the synthesized provider must be llama.cpp at the configured host:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("ollama serve"),
+        "a fresh config must not resolve to Ollama:\n{stderr}"
+    );
+}
+
+#[test]
+fn legacy_ollama_config_still_resolves_to_ollama() {
+    let home = TempDir::new();
+    // A pre-llama.cpp config: legacy top-level keys, none of the new ones.
+    write_config(
+        &home.0,
+        "model = \"qwen3.5:9b\"\nollama_host = \"http://127.0.0.1:1\"\n",
+    );
+    let output = run_wizard(&home.0, &["--mode", "sovereign", "-p", "do nothing"], &[]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ollama serve") && stderr.contains("http://127.0.0.1:1"),
+        "a legacy config must keep resolving to Ollama at its host:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("llama-server"),
+        "a legacy config must not be re-pointed at llama.cpp:\n{stderr}"
+    );
+}
+
+#[test]
 fn headless_mode_without_a_prompt_is_an_actionable_error() {
     let home = TempDir::new();
     let output = run_wizard(
@@ -136,4 +231,68 @@ fn headless_mode_without_a_prompt_is_an_actionable_error() {
         stderr.contains("-p"),
         "error must point at the missing -p flag:\n{stderr}"
     );
+}
+
+/// Real inference end to end: auto-spawn llama-server, load a GGUF, run one
+/// sovereign turn. Opt-in only — set `WIZARD_E2E_GGUF` to a local GGUF path
+/// (small models recommended); skipped otherwise so `cargo test` never loads
+/// a model.
+#[test]
+fn e2e_inference_with_auto_spawned_llama_server() {
+    let Some(gguf) = std::env::var("WIZARD_E2E_GGUF")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        eprintln!("skipping: set WIZARD_E2E_GGUF=/path/to/model.gguf to run");
+        return;
+    };
+    assert!(
+        Path::new(&gguf).exists(),
+        "WIZARD_E2E_GGUF points at a missing file: {gguf}"
+    );
+    assert!(
+        Command::new("llama-server")
+            .arg("--version")
+            .output()
+            .is_ok(),
+        "WIZARD_E2E_GGUF is set but llama-server is not on PATH"
+    );
+
+    let home = TempDir::new();
+    // An uncommon port so the test never collides with a llama-server the
+    // developer is actually running on the default 8080.
+    let host = "http://127.0.0.1:18434";
+    let output = run_wizard(
+        &home.0,
+        &[
+            "--mode",
+            "sovereign",
+            "--loop",
+            "1",
+            "--max-hours",
+            "0.2",
+            "-p",
+            "Reply with the single word DONE. Do not use any tools.",
+        ],
+        &[("WIZARD_LLAMACPP_HOST", host), ("WIZARD_GGUF_PATH", &gguf)],
+    );
+
+    // The spawned server deliberately outlives wizard; stop it before any
+    // assertion can bail out of the test.
+    let pid_file = home.0.join(".wizard").join("llama-server.pid");
+    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sovereign run must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("started llama-server"),
+        "wizard must report the server it spawned:\n{stdout}"
+    );
+    assert!(!stderr.contains("panicked"), "must not panic:\n{stderr}");
 }

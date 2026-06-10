@@ -8,7 +8,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary, Ollama, and an official Qwen 3.6 model sized to your hardware. The result is a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. Local is the default; there are no API keys and no cloud services until you ask for one.
+One command installs the `wizard` binary, [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, and a Qwen 3 GGUF sized to your hardware. The result is a Ratatui TUI coding agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. Local is the default; Wizard starts and manages the model server itself, and there are no API keys and no cloud services until you ask for one.
 
 **Two ways in.** Take the batteries-included one-liner above and start coding immediately, or take the **bespoke** path — a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
 
@@ -23,7 +23,7 @@ Want a richer default loadout instead? Install [**Wizard Arsenal**](https://gith
 
 ## Why Wizard
 
-**Local-first, native-Ollama agent loop — with a runtime escape hatch.** Wizard ships local-first: the agent loop speaks Ollama's native `/api/chat` directly (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), and the installer picks a model tier that fits your VRAM. Inference, prompts, and sessions stay on your machine by default. When you want frontier muscle, `/provider add` registers an OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, …) or Anthropic; `/provider use` switches between them live, and your key is read from an environment variable rather than stored on disk.
+**Local-first on llama.cpp — with a runtime escape hatch.** Wizard ships local-first: by default the agent loop speaks `llama-server`'s OpenAI-compatible API (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), and the installer picks a GGUF tier that fits your VRAM. Wizard manages the server's lifecycle itself: when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit — the next launch is instant. Inference, prompts, and sessions stay on your machine by default. Ollama stays fully supported as a provider (`kind = "ollama"`), and existing Ollama configs keep working untouched. When you want frontier muscle, `/provider add` registers an OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, …) or Anthropic; `/provider use` switches between them live, and your key is read from an environment variable rather than stored on disk.
 
 **Onboarding from scratch.** The bespoke path (`WIZARD_BESPOKE=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions — provider, model (with a VRAM-aware suggestion for local models), messaging gateway, and mode — and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
 
@@ -56,7 +56,7 @@ Anyone who runs it gets your Wizard, built from your source on their machine and
 ## Quick start
 
 ```bash
-# Install everything (binary + Ollama + model)
+# Install everything (binary + llama.cpp + model)
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 
 # Launch the interactive TUI (genie mode — default)
@@ -89,16 +89,26 @@ Add or switch model providers at any time from inside the TUI:
 /provider list                # show configured providers
 ```
 
-The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or amdgpu sysfs; system RAM on CPU-only boxes) and pulls the right tier:
+Wizard runs its own model server. When the active provider is llama.cpp and nothing answers at its port, Wizard spawns `llama-server` with the configured GGUF (`gguf_path` in `~/.wizard/config.toml`), logs it to `~/.wizard/llama-server.log`, and waits for the model to load. The server is detached and keeps serving after Wizard exits. Control it from the TUI:
 
-| Available VRAM | Model pulled | Approx. size |
-|----------------|--------------|--------------|
-| ≥ 24 GB | `qwen3.6:35b` | ~21–24 GB (MoE) |
-| 18–24 GB | `qwen3.6:27b` | ~17 GB (dense) |
-| 8–18 GB | `qwen3.5:9b` | ~6 GB |
-| < 8 GB / undetectable | `qwen3.5:9b` (CPU / partial offload) | ~6 GB |
+```
+/server status   # ready / loading its model / not running
+/server stop     # stop the server Wizard started (and only that one)
+/server start    # start it again
+```
 
-Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or use the [BYOM installer](docs/byom.md). Full details in [docs/getting-started.md](docs/getting-started.md).
+The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or amdgpu sysfs; system RAM on CPU-only boxes) and downloads the right GGUF tier from Hugging Face into `~/.wizard/models/`:
+
+| Available VRAM | GGUF downloaded | Approx. size |
+|----------------|-----------------|--------------|
+| ≥ 24 GB | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | ~21 GB (MoE) |
+| 18–24 GB | `Qwen3.6-27B-Q4_K_M.gguf` | ~16 GB (dense) |
+| 8–18 GB | `Qwen3.5-9B-Q4_K_M.gguf` | ~6 GB |
+| < 8 GB / undetectable | `Qwen3.5-9B-Q4_K_M.gguf` (CPU / partial offload) | ~6 GB |
+
+Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or point `gguf_path` at any GGUF ([BYOM](docs/byom.md)). Prefer Ollama? `WIZARD_USE_OLLAMA=1` at install time keeps the previous Ollama-based flow. Full details in [docs/getting-started.md](docs/getting-started.md).
+
+**Migrating from Ollama?** You don't have to do anything: a config that sets `model` / `ollama_host`, or any `kind = "ollama"` provider, keeps working exactly as before — only the from-scratch default changed. Switch to llama.cpp whenever you like with `/provider add local llamacpp http://127.0.0.1:8080 <model>` (then set `gguf_path` in config so Wizard can start the server for you).
 
 ---
 
@@ -108,7 +118,7 @@ Verified against each tool's documentation as of June 2026:
 
 | | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
 |---|---|---|---|---|
-| Local models | Local-first on Ollama by default; OpenAI-compatible + Anthropic addable at runtime via `/provider` | Yes — Ollama + any OpenAI-compatible endpoint; top results come from cloud models | Yes — Ollama among 15+ providers | Yes — Ollama among 75+ providers |
+| Local models | Local-first on llama.cpp by default (manages `llama-server` itself); Ollama, OpenAI-compatible + Anthropic addable at runtime via `/provider` | Yes — Ollama + any OpenAI-compatible endpoint; top results come from cloud models | Yes — Ollama among 15+ providers | Yes — Ollama among 75+ providers |
 | MCP | Yes — stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes — one of the earliest and deepest integrations, 70+ documented extensions | Yes — local + remote servers, OAuth for remote |
 | Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | — | Extensions and recipes via MCP | TypeScript/JS plugin system |
 | Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |
@@ -137,7 +147,7 @@ Wizard's bet is narrower: one binary, local-first, an onboarding that starts fro
 - [Self-extension](docs/evolve.md) — `/evolve` tiers, gates, rollback
 - [Fork and distribute](docs/market.md) — publish your evolved Wizard; one-line installer for your fork
 - [Wizard Arsenal](docs/arsenal.md) — the configured fork: preconfigured browser, subagents, and model selection
-- [Bring your own model](docs/byom.md) — custom Ollama models
+- [Bring your own model](docs/byom.md) — any GGUF, or custom Ollama models
 - [Architecture](docs/architecture.md) — how it's built
 - [Security](SECURITY.md) — threat model
 - [WIZARD.md](WIZARD.md) — the agent's bundled behavioral charter; inherited and editable by every fork
@@ -152,6 +162,10 @@ cd wizard
 cargo build --release
 ./target/release/wizard
 ```
+
+## Acknowledgements
+
+Local inference is powered by [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org) — Wizard's default backend is its `llama-server`, and the whole local-first story stands on that project's work. [Ollama](https://ollama.com) remains a first-class supported provider.
 
 ## License
 

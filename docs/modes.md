@@ -106,7 +106,7 @@ below keep it safe.
 - **Durable mission.** The goal is persisted to `<project>/.wizard/mission.toml` along
   with a cycle count and rolling progress log. It survives restarts and binary
   self-replacement: relaunch with `--continuous` (no `-p`) and it resumes the mission.
-- **Sleep-and-wake.** Transient Ollama failures (server unreachable, busy, `429`/`5xx`,
+- **Sleep-and-wake.** Transient model-server failures (llama-server or Ollama unreachable, busy, `429`/`5xx`,
   dropped stream) do not abort the run. The loop backs off exponentially
   (`retry_base_secs` → `retry_max_secs`) and retries indefinitely, so a paused or
   restarting model server is waited out.

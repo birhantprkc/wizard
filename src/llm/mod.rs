@@ -3,6 +3,7 @@
 //! registry, and the TUI.
 
 pub mod anthropic;
+pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
 pub mod provider;
@@ -14,7 +15,7 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Boxed stream of [`ChatChunk`]s yielded by every provider's `chat_stream`.
-/// Shared across [`ollama`], [`openai`], and [`anthropic`].
+/// Shared across [`llamacpp`], [`ollama`], [`openai`], and [`anthropic`].
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
 /// Message role on the Ollama `/api/chat` wire.

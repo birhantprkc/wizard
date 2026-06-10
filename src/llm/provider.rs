@@ -1,11 +1,11 @@
 //! The provider abstraction: one trait every LLM backend implements so the
 //! agent loop, the tool registry, and the TUI are decoupled from any specific
-//! API (Ollama, OpenAI-compatible, Anthropic, ...).
+//! API (llama.cpp, Ollama, OpenAI-compatible, Anthropic, ...).
 //!
-//! Concrete implementations live in sibling modules ([`super::ollama`],
-//! [`super::openai`], [`super::anthropic`]). A provider is built from a
-//! [`crate::config::ProviderConfig`] and handed to the agent as an
-//! `Arc<dyn LlmProvider>`.
+//! Concrete implementations live in sibling modules ([`super::llamacpp`],
+//! [`super::ollama`], [`super::openai`], [`super::anthropic`]). A provider is
+//! built from a [`crate::config::ProviderConfig`] and handed to the agent as
+//! an `Arc<dyn LlmProvider>`.
 
 use async_trait::async_trait;
 

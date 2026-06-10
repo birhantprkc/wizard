@@ -1,30 +1,34 @@
 #!/usr/bin/env bash
 #
-# Wizard installer (official models).
+# Wizard installer (llama.cpp-powered local models).
 #
 #   curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 #
 # Steps:
 #   1. Detect OS and CPU architecture
-#   2. Install Ollama if absent
-#   3. Start the Ollama server if it is down
-#   4. Select a model tier based on available VRAM (or system RAM on CPU-only)
-#   5. Pull the model from the official Ollama library
-#   6. Download the `wizard` binary from GitHub releases
-#   7. Write ~/.wizard/config.toml (never clobbers an existing one)
+#   2. Install llama.cpp's `llama-server` from official GitHub releases if absent
+#   3. Select a model tier based on available VRAM (or system RAM on CPU-only)
+#   4. Download the matching Qwen3 GGUF (Q4_K_M) from Hugging Face
+#   5. Download the `wizard` binary from GitHub releases
+#   6. Write ~/.wizard/config.toml (never clobbers an existing one)
+#
+# No server is started here: wizard launches llama-server itself on first run.
+# Set WIZARD_USE_OLLAMA=1 for the previous Ollama-based flow.
 #
 # Environment variables:
-#   WIZARD_INSTALL_DIR         where to place the binary    (default /usr/local/bin)
-#   WIZARD_MODEL               force a specific model tag   (default auto-detected)
-#   WIZARD_SKIP_MODEL_PULL     1 = skip `ollama pull`       (default 0)
-#   WIZARD_SKIP_OLLAMA_INSTALL 1 = Ollama managed elsewhere (default 0)
-#   WIZARD_WITH_TOOLCHAIN      1 = eagerly install a Rust toolchain for deep evolve (default 0)
-#   WIZARD_REPO                owner/repo to install from   (default teddytennant/wizard)
-#   WIZARD_REF                 git ref/branch when building from source (default main)
-#   WIZARD_BUILD_FROM_SOURCE   1 = build from source instead of downloading a release (default 0)
-#   WIZARD_BESPOKE             1 = start from scratch: skip writing config.toml and the
-#                                  model pull, so the first `wizard` run launches the
-#                                  interactive onboarding wizard            (default 0)
+#   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin)
+#   WIZARD_MODEL                 force a specific model tier  (default auto-detected)
+#   WIZARD_SKIP_MODEL_PULL       1 = skip the model download  (default 0)
+#   WIZARD_SKIP_LLAMACPP_INSTALL 1 = llama-server managed elsewhere (default 0)
+#   WIZARD_USE_OLLAMA            1 = use Ollama instead of llama.cpp (default 0)
+#   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
+#   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
+#   WIZARD_REPO                  owner/repo to install from   (default teddytennant/wizard)
+#   WIZARD_REF                   git ref/branch when building from source (default main)
+#   WIZARD_BUILD_FROM_SOURCE     1 = build from source instead of downloading a release (default 0)
+#   WIZARD_BESPOKE               1 = start from scratch: skip writing config.toml and the
+#                                    model download, so the first `wizard` run launches the
+#                                    interactive onboarding wizard            (default 0)
 
 set -euo pipefail
 
@@ -33,6 +37,8 @@ set -euo pipefail
 WIZARD_INSTALL_DIR="${WIZARD_INSTALL_DIR:-/usr/local/bin}"
 WIZARD_MODEL="${WIZARD_MODEL:-}"
 WIZARD_SKIP_MODEL_PULL="${WIZARD_SKIP_MODEL_PULL:-0}"
+WIZARD_SKIP_LLAMACPP_INSTALL="${WIZARD_SKIP_LLAMACPP_INSTALL:-0}"
+WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
@@ -42,10 +48,17 @@ WIZARD_BESPOKE="${WIZARD_BESPOKE:-0}"
 
 REPO="${WIZARD_REPO}"
 RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
+LLAMACPP_REPO="ggml-org/llama.cpp"
+LLAMACPP_URL="http://127.0.0.1:8080"
+LLAMA_BIN_DIR="$HOME/.wizard/bin"
+MODELS_DIR="$HOME/.wizard/models"
 OLLAMA_URL="http://127.0.0.1:11434"
 
 ARCH=""
 MODEL=""
+GGUF_FILE=""
+GGUF_URL=""
+GGUF_PATH=""
 MEM_GB=0
 MEM_SOURCE=""
 BINARY_INSTALLED=0
@@ -92,7 +105,149 @@ require_curl() {
     command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH"
 }
 
-# --- ollama -------------------------------------------------------------
+# --- llama.cpp ----------------------------------------------------------
+
+llamacpp_asset_url() {
+    # $1 = release asset variant, e.g. "ubuntu-x64" or "ubuntu-vulkan-x64".
+    # Picks the newest release that actually carries the asset — the most
+    # recent tag can still be mid-upload and missing some platforms.
+    local url tag
+    url="$(curl -fsSL "https://api.github.com/repos/${LLAMACPP_REPO}/releases?per_page=8" 2>/dev/null \
+        | grep -o "https://[^\"]*/llama-b[0-9]*-bin-${1}\.tar\.gz" | head -n1 || true)"
+    if [ -n "$url" ]; then
+        printf '%s' "$url"
+        return
+    fi
+    # API unavailable (rate limit, proxy): derive the tag from the
+    # /releases/latest redirect and verify the constructed URL exists.
+    tag="$(curl -fsI -o /dev/null -w '%{redirect_url}' \
+        "https://github.com/${LLAMACPP_REPO}/releases/latest" 2>/dev/null || true)"
+    tag="${tag##*/}"
+    if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
+        return 1
+    fi
+    url="https://github.com/${LLAMACPP_REPO}/releases/download/${tag}/llama-${tag}-bin-${1}.tar.gz"
+    curl -fsI -o /dev/null "$url" 2>/dev/null || return 1
+    printf '%s' "$url"
+}
+
+have_vulkan_loader() {
+    command -v vulkaninfo >/dev/null 2>&1 && return 0
+    ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so'
+}
+
+llamacpp_variants() {
+    # Candidate release-asset variants, preferred first. llama.cpp ships no
+    # Linux CUDA release asset; Vulkan is the prebuilt GPU backend (and it
+    # falls back to CPU at runtime when no usable GPU is present), so try it
+    # when a GPU and a Vulkan loader were detected, with plain CPU as the
+    # safe fallback.
+    local suffix="x64"
+    [ "$ARCH" = "aarch64" ] && suffix="arm64"
+    case "$MEM_SOURCE" in
+        "GPU VRAM"*)
+            if have_vulkan_loader; then
+                printf 'ubuntu-vulkan-%s\n' "$suffix"
+            fi
+            ;;
+    esac
+    printf 'ubuntu-%s\n' "$suffix"
+}
+
+expose_llama_server() {
+    # wizard looks for llama-server on PATH when it starts the server
+    # itself, so link it next to the wizard binary when possible.
+    local src="${LLAMA_BIN_DIR}/llama-server"
+    if [ ! -e "${WIZARD_INSTALL_DIR}/llama-server" ]; then
+        if [ -d "$WIZARD_INSTALL_DIR" ] && [ -w "$WIZARD_INSTALL_DIR" ]; then
+            ln -sfn "$src" "${WIZARD_INSTALL_DIR}/llama-server"
+        elif command -v sudo >/dev/null 2>&1; then
+            say "Need elevated permissions to link llama-server into ${WIZARD_INSTALL_DIR}"
+            sudo ln -sfn "$src" "${WIZARD_INSTALL_DIR}/llama-server" || true
+        fi
+    fi
+    if ! command -v llama-server >/dev/null 2>&1; then
+        case ":$PATH:" in
+            *":${LLAMA_BIN_DIR}:"*) ;;
+            *) warn "${LLAMA_BIN_DIR} is not on your PATH — add it so wizard can find llama-server" ;;
+        esac
+    fi
+}
+
+install_llamacpp() {
+    if [ "$WIZARD_SKIP_LLAMACPP_INSTALL" = "1" ]; then
+        say "Skipping llama.cpp install (WIZARD_SKIP_LLAMACPP_INSTALL=1)"
+        return
+    fi
+    if command -v llama-server >/dev/null 2>&1; then
+        say "llama-server already installed ($(command -v llama-server))"
+        return
+    fi
+    if [ -x "${LLAMA_BIN_DIR}/llama-server" ]; then
+        say "llama-server already installed at ${LLAMA_BIN_DIR}/llama-server"
+        expose_llama_server
+        return
+    fi
+
+    # The Vulkan-vs-CPU choice needs to know whether a GPU is present.
+    [ -n "$MEM_SOURCE" ] || detect_memory
+
+    say "Installing llama-server (llama.cpp official releases) ..."
+    local variant url archive dir bin dest
+    for variant in $(llamacpp_variants); do
+        url="$(llamacpp_asset_url "$variant" || true)"
+        if [ -z "$url" ]; then
+            warn "no llama.cpp release asset found for ${variant}"
+            continue
+        fi
+        archive="${TMP_DIR}/llamacpp-${variant}.tar.gz"
+        say "Downloading ${url##*/} ..."
+        if ! curl -fL --progress-bar -o "$archive" "$url"; then
+            warn "download failed for ${url##*/}"
+            continue
+        fi
+        dir="${TMP_DIR}/llamacpp-${variant}"
+        mkdir -p "$dir"
+        if ! tar -xzf "$archive" -C "$dir"; then
+            warn "could not extract ${url##*/}"
+            continue
+        fi
+        bin="$(find "$dir" -type f -name llama-server | head -n1 || true)"
+        if [ -z "$bin" ]; then
+            warn "no llama-server binary inside ${url##*/}"
+            continue
+        fi
+        chmod 755 "$bin"
+        # Sanity check before keeping it — a Vulkan build without a usable
+        # loader (or a glibc mismatch) fails here, and we try the next variant.
+        if ! "$bin" --version >/dev/null 2>&1; then
+            warn "the ${variant} build does not run on this system — trying the next variant"
+            continue
+        fi
+        # Keep the whole release tree: llama-server resolves its shared
+        # libraries via an \$ORIGIN runpath, so the .so files must stay next
+        # to the real binary. PATH only needs the symlink.
+        dest="$HOME/.wizard/llama.cpp"
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        cp -R "$(dirname "$bin")"/. "$dest/"
+        mkdir -p "$LLAMA_BIN_DIR"
+        ln -sfn "${dest}/llama-server" "${LLAMA_BIN_DIR}/llama-server"
+        say "Installed llama-server to ${dest} (${variant} build)"
+        expose_llama_server
+        return
+    done
+
+    warn "could not install a prebuilt llama-server for linux/${ARCH}"
+    warn "install it yourself — wizard will start it automatically once it is on PATH:"
+    printf '\n' >&2
+    printf '    brew install llama.cpp                  # Homebrew / Linuxbrew\n' >&2
+    printf '    nix profile install nixpkgs#llama-cpp   # Nix / NixOS\n' >&2
+    printf '    https://github.com/%s — build from source\n' "$LLAMACPP_REPO" >&2
+    printf '\n' >&2
+}
+
+# --- ollama (WIZARD_USE_OLLAMA=1) ---------------------------------------
 
 ollama_running() {
     curl -fsS --max-time 3 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1
@@ -247,6 +402,56 @@ select_model() {
         warn "less than 8 GB available — ${MODEL} will run on CPU / partial offload and may be slow"
     fi
     say "Selected model tier: ${MODEL}"
+}
+
+gguf_for_model() {
+    # Map a model tier tag to its Q4_K_M GGUF on Hugging Face. Leaves
+    # GGUF_FILE/GGUF_URL empty for tags with no known download.
+    GGUF_FILE=""
+    GGUF_URL=""
+    case "$1" in
+        qwen3.6:35b)
+            GGUF_FILE="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/${GGUF_FILE}"
+            ;;
+        qwen3.6:27b)
+            GGUF_FILE="Qwen3.6-27B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/${GGUF_FILE}"
+            ;;
+        qwen3.5:9b)
+            GGUF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/${GGUF_FILE}"
+            ;;
+    esac
+}
+
+download_gguf() {
+    if [ "$WIZARD_BESPOKE" = "1" ]; then
+        say "Bespoke install: skipping model download — onboarding will pick your model on first run"
+        return
+    fi
+    gguf_for_model "$MODEL"
+    if [ -z "$GGUF_FILE" ]; then
+        warn "no known GGUF download for '${MODEL}' — set gguf_path in ~/.wizard/config.toml to your own .gguf file"
+        return
+    fi
+    GGUF_PATH="${MODELS_DIR}/${GGUF_FILE}"
+    if [ -f "$GGUF_PATH" ]; then
+        say "Model already downloaded: ${GGUF_PATH}"
+        return
+    fi
+    if [ "$WIZARD_SKIP_MODEL_PULL" = "1" ]; then
+        say "Skipping model download (WIZARD_SKIP_MODEL_PULL=1)"
+        return
+    fi
+    mkdir -p "$MODELS_DIR"
+    say "Downloading ${GGUF_FILE} from Hugging Face (several GB — this can take a while) ..."
+    # -C - resumes a partial download from an interrupted earlier run.
+    if ! curl -fL -C - --progress-bar -o "${GGUF_PATH}.partial" "$GGUF_URL"; then
+        die "failed to download ${GGUF_URL} — check connectivity and disk space, then re-run (the download resumes)"
+    fi
+    mv "${GGUF_PATH}.partial" "$GGUF_PATH"
+    say "Saved ${GGUF_PATH}"
 }
 
 pull_model() {
@@ -417,18 +622,48 @@ write_config() {
     fi
     if [ -f "$cfg" ]; then
         say "Existing config found at ${cfg} — leaving it untouched"
-        say "To switch models, edit it: model = \"${MODEL}\""
+        say "To switch models or providers, edit it or use /provider inside wizard"
         return
     fi
     say "Writing ${cfg}"
-    cat >"$cfg" <<EOF
+    if [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+        cat >"$cfg" <<EOF
 # Wizard configuration — see https://github.com/${REPO}
-model = "${MODEL}"
-ollama_host = "${OLLAMA_URL}"
+active_provider = "local"
 mode = "genie"
 auto_approve = false
 max_steps = 25
+
+[[providers]]
+name = "local"
+kind = "ollama"
+base_url = "${OLLAMA_URL}"
+model = "${MODEL}"
 EOF
+        return
+    fi
+    # llama-server ignores the request model name; the GGUF stem keeps
+    # wizard's labels meaningful. gguf_path lets wizard start the server.
+    local model_name="$MODEL"
+    if [ -n "$GGUF_FILE" ]; then
+        model_name="${GGUF_FILE%.gguf}"
+    fi
+    cat >"$cfg" <<EOF
+# Wizard configuration — see https://github.com/${REPO}
+active_provider = "local"
+mode = "genie"
+auto_approve = false
+max_steps = 25
+
+[[providers]]
+name = "local"
+kind = "llamacpp"
+base_url = "${LLAMACPP_URL}"
+model = "${model_name}"
+EOF
+    if [ -n "$GGUF_PATH" ]; then
+        printf 'gguf_path = "%s"\n' "$GGUF_PATH" >>"$cfg"
+    fi
 }
 
 # --- main ---------------------------------------------------------------
@@ -437,10 +672,18 @@ main() {
     say "Wizard installer"
     require_curl
     detect_platform
-    install_ollama
-    start_ollama
-    select_model
-    pull_model
+
+    if [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+        say "Using Ollama as the local provider (WIZARD_USE_OLLAMA=1)"
+        install_ollama
+        start_ollama
+        select_model
+        pull_model
+    else
+        install_llamacpp
+        select_model
+        download_gguf
+    fi
 
     if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
         build_from_source
@@ -459,8 +702,10 @@ main() {
     if [ "$BINARY_INSTALLED" = "1" ]; then
         if [ "$WIZARD_BESPOKE" = "1" ]; then
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
-        else
+        elif [ "$WIZARD_USE_OLLAMA" = "1" ]; then
             say "Done. Run: wizard"
+        else
+            say "Done. Run: wizard — it starts llama-server with your model automatically."
         fi
     else
         say "Setup finished, but the wizard binary was NOT installed — see the build-from-source steps above."

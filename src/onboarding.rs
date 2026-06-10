@@ -13,6 +13,7 @@
 //! is testable; the TUI layer is a thin shell over it.
 
 use std::io::Stdout;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,6 +42,8 @@ const TEXT_DIM: Color = Color::Gray;
 /// Which provider family the user picked in step 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
+    /// Local llama.cpp `llama-server` (the recommended default).
+    LlamaCpp,
     /// Local Ollama server.
     Ollama,
     /// OpenAI or any OpenAI-compatible endpoint.
@@ -67,6 +70,9 @@ pub struct Answers {
     pub model: String,
     /// Env var holding the API key (cloud providers only).
     pub api_key_env: Option<String>,
+    /// Path to the GGUF model file (llama.cpp only) — lets Wizard spawn
+    /// `llama-server` itself.
+    pub gguf_path: Option<String>,
     /// Messaging gateway to configure.
     pub gateway_kind: GatewayKind,
     /// Env var holding the gateway bot token (Telegram only).
@@ -91,7 +97,7 @@ impl Answers {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
-            gguf_path: None,
+            gguf_path: self.gguf_path.clone(),
         };
 
         // Mirror an Ollama choice into the legacy fields so config files remain
@@ -99,6 +105,14 @@ impl Answers {
         if self.kind == ProviderKind::Ollama {
             config.model = self.model.clone();
             config.ollama_host = self.base_url.clone();
+        }
+
+        // Mirror a llama.cpp choice into the top-level fields so the same
+        // local provider is synthesized if the providers table ever empties
+        // (e.g. `/provider remove`).
+        if self.kind == ProviderKind::LlamaCpp {
+            config.llamacpp_host = self.base_url.clone();
+            config.gguf_path = self.gguf_path.clone();
         }
 
         config.providers = vec![provider];
@@ -144,6 +158,8 @@ const ANTHROPIC_MODELS: &[&str] = &[
 /// Ollama tier options offered alongside the hardware-suggested default.
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
+/// Default base URL for a local llama.cpp `llama-server`.
+const LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080";
 /// Default base URL for a local Ollama server.
 const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// Default base URL for the OpenAI API.
@@ -198,6 +214,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     // Step 1 — provider.
     let provider_options = [
+        Opt::new("Local — llama.cpp (recommended)", "private, no API key"),
         Opt::new("Local — Ollama", "private, no API key"),
         Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
         Opt::new("Anthropic (Claude)", "claude-fable-5"),
@@ -216,15 +233,19 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
 
     // Step 2 — model (+ key env / base url, depending on provider).
     let collected = match provider {
-        0 => match collect_ollama(terminal)? {
+        0 => match collect_llamacpp(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        1 => match collect_openai(terminal)? {
+        1 => match collect_ollama(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        2 => match collect_anthropic(terminal)? {
+        2 => match collect_openai(terminal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+        3 => match collect_anthropic(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
@@ -311,6 +332,7 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         base_url: collected.base_url,
         model: collected.model,
         api_key_env: collected.api_key_env,
+        gguf_path: collected.gguf_path,
         gateway_kind,
         gateway_token_env,
         gateway_allowed_chat_ids,
@@ -326,6 +348,7 @@ struct ProviderAnswers {
     base_url: String,
     model: String,
     api_key_env: Option<String>,
+    gguf_path: Option<String>,
 }
 
 /// Pick a model from `models` plus a "type a custom tag" row; on the custom
@@ -363,6 +386,140 @@ fn pick_model(
     }
 }
 
+/// `~/.wizard/models/` — where `install.sh` downloads GGUF files.
+fn models_dir() -> PathBuf {
+    Config::wizard_dir()
+        .map(|dir| dir.join("models"))
+        .unwrap_or_else(|_| PathBuf::from("~/.wizard/models"))
+}
+
+/// List `*.gguf` files in `dir`, sorted by name. Empty when the directory is
+/// missing or unreadable.
+fn existing_ggufs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Model tag for a GGUF path: the filename without the `.gguf` extension
+/// (e.g. `/x/Qwen3.6-27B-Q4_K_M.gguf` → `Qwen3.6-27B-Q4_K_M`).
+fn gguf_model_tag(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
+fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let (suggested, explanation) = hardware::suggest_gguf();
+    let dir = models_dir();
+    let existing = existing_ggufs(&dir);
+
+    // Each option stands for a GGUF path. GGUFs already on disk come first
+    // (so a downloaded model is the default), followed by the tiers the
+    // installer knows how to fetch.
+    let mut options: Vec<Opt> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    for path in &existing {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        options.push(Opt::new(label, "found in ~/.wizard/models"));
+        paths.push(path.display().to_string());
+    }
+    for tier in hardware::GGUF_TIERS {
+        if existing
+            .iter()
+            .any(|path| path.file_name().is_some_and(|name| name == tier.file))
+        {
+            continue; // already listed as a downloaded model
+        }
+        let detail = if tier.file == suggested.file {
+            format!("{} — recommended for this machine", tier.name)
+        } else {
+            tier.name.to_string()
+        };
+        options.push(Opt::new(tier.file, detail));
+        paths.push(dir.join(tier.file).display().to_string());
+    }
+    let custom_index = options.len();
+    options.push(Opt::new("Type a custom GGUF path…", ""));
+    let default = if existing.is_empty() {
+        paths
+            .iter()
+            .position(|path| {
+                Path::new(path)
+                    .file_name()
+                    .is_some_and(|n| n == suggested.file)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let selected = match select(terminal, "Model", &explanation, &options, default)? {
+        Some(index) => index,
+        None => return Ok(None),
+    };
+    let gguf_path = if selected == custom_index {
+        // Re-prompt until a non-empty path is entered.
+        loop {
+            let path = match text_input(
+                terminal,
+                "GGUF path",
+                "Absolute path to a .gguf model file.",
+                "",
+            )? {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            if path.trim().is_empty() {
+                notice(terminal, "enter a path to a .gguf file")?;
+            } else {
+                break path;
+            }
+        }
+    } else {
+        paths[selected].clone()
+    };
+
+    let base_url = match text_input(
+        terminal,
+        "llama-server URL",
+        "Where llama-server listens. Wizard starts it for you if it isn't running.",
+        LLAMACPP_BASE_URL,
+    )? {
+        Some(value) => value.trim_end_matches('/').to_string(),
+        None => return Ok(None),
+    };
+
+    Ok(Some(ProviderAnswers {
+        provider: ProviderChoice::LlamaCpp,
+        provider_name: "local".to_string(),
+        kind: ProviderKind::LlamaCpp,
+        base_url,
+        model: gguf_model_tag(&gguf_path),
+        api_key_env: None,
+        gguf_path: Some(gguf_path),
+    }))
+}
+
 fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let (suggested, explanation) = hardware::suggest_model();
     let mut models: Vec<(String, String)> = vec![(
@@ -385,6 +542,7 @@ fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: OLLAMA_BASE_URL.to_string(),
         model,
         api_key_env: None,
+        gguf_path: None,
     }))
 }
 
@@ -428,6 +586,7 @@ fn collect_openai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: OPENAI_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        gguf_path: None,
     }))
 }
 
@@ -471,6 +630,7 @@ fn collect_anthropic(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: ANTHROPIC_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        gguf_path: None,
     }))
 }
 
@@ -509,6 +669,7 @@ fn collect_custom(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url,
         model,
         api_key_env,
+        gguf_path: None,
     }))
 }
 
@@ -537,9 +698,18 @@ fn print_summary(config: &Config) {
     println!("Next steps:");
 
     match provider.kind {
-        ProviderKind::LlamaCpp => {
-            println!("  • start the server: llama-server -m <model.gguf> --port 8080");
-        }
+        ProviderKind::LlamaCpp => match provider.gguf_path.as_deref() {
+            Some(path) if Path::new(path).exists() => {
+                println!("  • llama-server starts automatically (model: {path})");
+            }
+            Some(path) => {
+                println!("  • download the model to: {path}");
+                println!("    (Wizard then starts llama-server automatically)");
+            }
+            None => {
+                println!("  • start the server: llama-server -m <model.gguf> --port 8080");
+            }
+        },
         ProviderKind::Ollama => {
             println!("  • pull the model:  ollama pull {}", provider.model);
         }
@@ -863,6 +1033,7 @@ mod tests {
             base_url: OLLAMA_BASE_URL.to_string(),
             model: "qwen3.6:27b".to_string(),
             api_key_env: None,
+            gguf_path: None,
             gateway_kind: GatewayKind::None,
             gateway_token_env: None,
             gateway_allowed_chat_ids: Vec::new(),
@@ -887,6 +1058,59 @@ mod tests {
         assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
         assert_eq!(config.gateway.kind, GatewayKind::None);
         assert_eq!(config.mode, Mode::Genie);
+    }
+
+    #[test]
+    fn llamacpp_answers_carry_gguf_and_skip_legacy_ollama_fields() {
+        let answers = Answers {
+            provider: ProviderChoice::LlamaCpp,
+            kind: ProviderKind::LlamaCpp,
+            base_url: "http://127.0.0.1:9090".to_string(),
+            model: "Qwen3.6-27B-Q4_K_M".to_string(),
+            gguf_path: Some("/home/u/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf".to_string()),
+            ..base_answers()
+        };
+        let defaults = Config::default();
+        let config = answers.into_config();
+        assert_eq!(config.active().kind, ProviderKind::LlamaCpp);
+        assert_eq!(config.active().model, "Qwen3.6-27B-Q4_K_M");
+        assert_eq!(
+            config.active().gguf_path.as_deref(),
+            Some("/home/u/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf")
+        );
+        // Top-level llamacpp fields mirror the choice…
+        assert_eq!(config.llamacpp_host, "http://127.0.0.1:9090");
+        assert_eq!(config.gguf_path, config.active().gguf_path);
+        // …while the legacy Ollama fields stay at their defaults.
+        assert_eq!(config.model, defaults.model);
+        assert_eq!(config.ollama_host, defaults.ollama_host);
+    }
+
+    #[test]
+    fn gguf_model_tag_strips_directory_and_extension() {
+        assert_eq!(
+            gguf_model_tag("/home/u/.wizard/models/Qwen3.5-9B-Q4_K_M.gguf"),
+            "Qwen3.5-9B-Q4_K_M"
+        );
+        assert_eq!(gguf_model_tag("model.gguf"), "model");
+        assert_eq!(gguf_model_tag(""), "default");
+    }
+
+    #[test]
+    fn existing_ggufs_lists_only_gguf_files_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["b.gguf", "a.GGUF", "notes.txt"] {
+            std::fs::write(dir.path().join(name), b"x").expect("write");
+        }
+        std::fs::create_dir(dir.path().join("sub.gguf")).expect("mkdir");
+        let found = existing_ggufs(dir.path());
+        let names: Vec<_> = found
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert_eq!(names, vec!["a.GGUF", "b.gguf"]);
+        // Missing directory → empty, not an error.
+        assert!(existing_ggufs(&dir.path().join("missing")).is_empty());
     }
 
     #[test]

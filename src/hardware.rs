@@ -1,8 +1,8 @@
 //! Best-effort VRAM/RAM detection, ported from `install.sh`'s
-//! `detect_memory` / `select_model`. Used to suggest an Ollama model that fits
-//! the machine. Everything here is defensive: external commands may be absent
-//! or print garbage, so only plain unsigned integers `> 0` are trusted, and
-//! total failure yields `None`.
+//! `detect_memory` / `select_model`. Used to suggest a local model (GGUF for
+//! llama.cpp, tag for Ollama) that fits the machine. Everything here is
+//! defensive: external commands may be absent or print garbage, so only plain
+//! unsigned integers `> 0` are trusted, and total failure yields `None`.
 
 use std::process::Command;
 
@@ -154,6 +154,68 @@ pub fn suggest_model() -> (String, String) {
     }
 }
 
+/// A GGUF model tier for llama.cpp: a display name plus the exact filename the
+/// installer downloads into `~/.wizard/models/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GgufModel {
+    /// Human-facing name, e.g. `"Qwen3.6 27B"`.
+    pub name: &'static str,
+    /// Filename under `~/.wizard/models/`, e.g. `"Qwen3.6-27B-Q4_K_M.gguf"`.
+    pub file: &'static str,
+}
+
+/// GGUF tiers (largest first), the Q4_K_M counterparts of the Ollama tags in
+/// [`suggest_ollama_model`]. `install.sh` downloads these exact filenames.
+pub const GGUF_TIERS: &[GgufModel] = &[
+    GgufModel {
+        name: "Qwen3.6 35B",
+        file: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    },
+    GgufModel {
+        name: "Qwen3.6 27B",
+        file: "Qwen3.6-27B-Q4_K_M.gguf",
+    },
+    GgufModel {
+        name: "Qwen3.5 9B",
+        file: "Qwen3.5-9B-Q4_K_M.gguf",
+    },
+];
+
+/// Suggest a GGUF tier for a given memory budget (GB). Same boundaries as
+/// [`suggest_ollama_model`].
+pub fn suggest_gguf_model(gb: u64) -> &'static GgufModel {
+    if gb >= 24 {
+        &GGUF_TIERS[0]
+    } else if gb >= 18 {
+        &GGUF_TIERS[1]
+    } else {
+        &GGUF_TIERS[2]
+    }
+}
+
+/// Run detection and return `(tier, explanation)` for llama.cpp. Falls back to
+/// the smallest tier with an explanatory note when nothing can be detected.
+pub fn suggest_gguf() -> (&'static GgufModel, String) {
+    match detect_memory() {
+        Some(detected) => {
+            let tier = suggest_gguf_model(detected.gb);
+            let explanation = format!(
+                "Detected {} GB of {} → {}",
+                detected.gb, detected.source, tier.file
+            );
+            (tier, explanation)
+        }
+        None => {
+            let tier = suggest_gguf_model(0);
+            let explanation = format!(
+                "Could not detect GPU VRAM or system RAM; defaulting to {}",
+                tier.file
+            );
+            (tier, explanation)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +238,37 @@ mod tests {
         assert_eq!(parse_positive("12 kB"), None);
         assert_eq!(parse_positive("MemTotal:"), None);
         assert_eq!(parse_positive(""), None);
+    }
+
+    #[test]
+    fn gguf_tier_boundaries_match_ollama_tiers() {
+        assert_eq!(suggest_gguf_model(7).file, "Qwen3.5-9B-Q4_K_M.gguf");
+        assert_eq!(suggest_gguf_model(17).file, "Qwen3.5-9B-Q4_K_M.gguf");
+        assert_eq!(suggest_gguf_model(18).file, "Qwen3.6-27B-Q4_K_M.gguf");
+        assert_eq!(suggest_gguf_model(23).file, "Qwen3.6-27B-Q4_K_M.gguf");
+        assert_eq!(
+            suggest_gguf_model(24).file,
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+        );
+        // Every boundary picks the same tier in both tables.
+        for gb in [0, 17, 18, 23, 24, 48] {
+            let gguf = suggest_gguf_model(gb);
+            let tag = suggest_ollama_model(gb);
+            // "qwen3.6:27b" ↔ "Qwen3.6 27B": compare the size suffix.
+            let size = tag.split(':').nth(1).unwrap().to_uppercase();
+            assert!(
+                gguf.name.ends_with(&size),
+                "tier mismatch at {gb} GB: {tag} vs {}",
+                gguf.name
+            );
+        }
+    }
+
+    #[test]
+    fn suggest_gguf_returns_a_known_tier() {
+        let (tier, explanation) = suggest_gguf();
+        assert!(GGUF_TIERS.contains(tier), "unexpected tier {tier:?}");
+        assert!(explanation.contains(tier.file));
     }
 
     #[test]

@@ -16,7 +16,7 @@ The installer:
 
 1. Detects GPU VRAM (or system RAM on CPU-only boxes) and selects a Qwen model tier — the same logic as the [upstream installer](getting-started.md#model-tiers-automatic).
 2. Stages `~/.wizard/config.toml` from the Arsenal template, substituting the selected model — **only if no config exists**.
-3. Runs upstream Wizard's installer from source, which installs Ollama, pulls the model, and builds and installs the `wizard` binary.
+3. Runs upstream Wizard's installer from source, which installs the local model runtime (llama.cpp's `llama-server` by default; Ollama with `WIZARD_USE_OLLAMA=1`), fetches the model, and builds and installs the `wizard` binary.
 4. Lays down the Arsenal configuration: `~/.wizard/mcp.toml` and `~/.wizard/subagents/*.toml` — each only if it is not already present.
 
 Nothing under `~/.wizard/` that already exists is overwritten. If you have an existing Wizard install, Arsenal adds only what is missing.
@@ -72,7 +72,7 @@ Arsenal uses the same VRAM detection as upstream and writes the selected tier in
 | Binary | Upstream `wizard` | Same upstream `wizard` (no source changes) |
 | Browser | Add via `/evolve` when needed | Preconfigured in `mcp.toml` |
 | Subagents | One built-in `worker` | `worker` + reviewer / researcher / tester / documenter |
-| `config.toml` | `model` / `ollama_host` / `mode` | `[[provider]]` blocks + `active_provider`, plus cloud templates |
+| `config.toml` | One local `[[providers]]` entry (llama.cpp by default) | `[[provider]]` blocks + `active_provider`, plus cloud templates |
 | Model selection | VRAM-tiered | VRAM-tiered (identical) |
 
 Everything else — genie/sovereign modes, `/evolve` tiers and gates, `--continuous`, `/publish` — is identical, because it is the same binary.
@@ -81,7 +81,7 @@ Everything else — genie/sovereign modes, `/evolve` tiers and gates, `--continu
 
 ## Providers: local by default, cloud optional
 
-Arsenal's `config.toml` uses Wizard's provider blocks. The default is local Ollama:
+Arsenal's `config.toml` uses Wizard's provider blocks. Its template defaults to local Ollama (a fully supported provider — upstream Wizard's own from-scratch default is llama.cpp):
 
 ```toml
 active_provider = "local"

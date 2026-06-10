@@ -1,10 +1,32 @@
 # Bring your own model (BYOM)
 
-The default Wizard installer pulls only official Ollama library models (`qwen3.6:27b`, `qwen3.6:35b`, or `qwen3.5:9b`), so the one-liner never ships custom model weights.
+The default Wizard installer downloads only official Qwen GGUF quants, so the one-liner never ships custom model weights. Bringing your own is easy on both local backends.
 
-If you need a different model (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the BYOM installer.
+## Any GGUF with llama.cpp (the default backend)
 
-## Install with BYOM
+With the llama.cpp default there is no special installer: `llama-server` loads any GGUF directly. Download one (Hugging Face hosts Q4_K_M-class quants of most open models) and point the provider at it in `~/.wizard/config.toml`:
+
+```toml
+[[providers]]
+name = "local"
+kind = "llamacpp"
+base_url = "http://127.0.0.1:8080"
+model = "my-coder-Q4_K_M"
+gguf_path = "/home/you/.wizard/models/my-coder-Q4_K_M.gguf"
+```
+
+Wizard starts `llama-server` with that file automatically (see [getting started](getting-started.md#first-run)). Alternatively:
+
+- Run `wizard --onboard` and pick "Type a custom GGUF path…" in the model step — it lists GGUFs already in `~/.wizard/models/` first.
+- Override per run with `WIZARD_GGUF_PATH=/path/to/model.gguf` (and `WIZARD_MODEL=<tag>` for the label).
+
+Prefer a model that supports tool calling; Wizard spawns the server with `--jinja` so OpenAI-style tool calls work, and falls back to a prompt-based JSON tool protocol for models without native support.
+
+## BYOM with Ollama
+
+If you run Ollama instead (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the Ollama BYOM installer.
+
+### Install with BYOM
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install-byom.sh | bash
@@ -18,7 +40,7 @@ This script:
 4. Walks you through model selection
 5. Writes your choice to `~/.wizard/config.toml`
 
-## Interactive flow
+### Interactive flow
 
 ```
 ==> Wizard BYOM Setup
@@ -37,7 +59,7 @@ Enter Ollama model tag (e.g. myuser/my-model:27b): myuser/coder-v2
 ==> Done. Run: wizard
 ```
 
-## Option 1: Ollama library model
+### Option 1: Ollama library model
 
 Pick any model from [ollama.com/library](https://ollama.com/library):
 
@@ -50,7 +72,7 @@ ollama pull deepseek-r1:32b
 
 The BYOM script runs `ollama pull` for you and sets `model` in config.
 
-## Option 2: Custom registry tag
+### Option 2: Custom registry tag
 
 For models published to Ollama Hub under a user or org namespace:
 
@@ -63,7 +85,7 @@ Requirements:
 - The model must support tool calling (required for Wizard's agent loop)
 - Chat template must be compatible with Ollama's `/api/chat` endpoint
 
-## Option 3: Local Modelfile
+### Option 3: Local Modelfile
 
 Create a `Modelfile` pointing at a GGUF on disk or HuggingFace:
 
@@ -91,13 +113,13 @@ PARAMETER temperature 0.6
 PARAMETER num_ctx 65536
 ```
 
-## Option 4: Already installed
+### Option 4: Already installed
 
 If `ollama list` shows your model, select it directly. No pull step.
 
-## Manual configuration
+### Manual configuration
 
-You can also edit config by hand:
+You can also edit config by hand — the legacy top-level keys still resolve to an Ollama provider:
 
 ```toml
 # ~/.wizard/config.toml
@@ -121,43 +143,45 @@ Wizard v0.1 expects models that support:
 | Capability | Required | Notes |
 |------------|----------|-------|
 | Tool calling | Recommended | Native preferred; Wizard falls back to a prompt-based JSON tool protocol when a model lacks native support |
-| Ollama `/api/chat` | Yes | Streaming responses |
+| Streaming chat | Yes | llama-server's `/v1/chat/completions` or Ollama's `/api/chat` |
 | Context ≥ 32K | Recommended | 128K+ preferred for large codebases |
 | Code quality | Recommended | Coding-oriented models perform best |
 
-Native tool calling through Ollama varies by model, so Wizard probes for it at startup: models that advertise tools support get native function calling, others fall back to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models, so prefer one with solid native tool calling.
+Native tool calling varies by model, so Wizard probes for it at startup: models that advertise tools support get native function calling, others fall back to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models, so prefer one with solid native tool calling.
 
-## Remote Ollama
+### Remote servers
 
-Point Wizard at a remote Ollama instance:
+Point Wizard at a model server on another machine — it connects instead of spawning (Wizard only starts `llama-server` for loopback URLs):
+
+```toml
+[[providers]]
+name = "gpu-box"
+kind = "llamacpp"
+base_url = "http://gpu-server.local:8080"
+model = "Qwen3.6-27B-Q4_K_M"
+```
+
+For a remote Ollama instance, the legacy keys work too:
 
 ```toml
 ollama_host = "http://gpu-server.local:11434"
 model = "qwen3.6:27b"
 ```
 
-Ensure the model is pulled on that server, not just locally.
+Ensure the model is loaded/pulled on that server, not just locally.
 
 ## Disclaimer
 
-The BYOM installer lets you choose any Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
+BYOM lets you choose any GGUF or Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
 
-The default `install.sh` one-liner uses only official Qwen models from the Ollama library.
+The default `install.sh` one-liner downloads only official Qwen quants.
 
 ## Switching back to official models
 
-```bash
-ollama pull qwen3.6:27b
-```
-
-Edit `~/.wizard/config.toml`:
-
-```toml
-model = "qwen3.6:27b"
-```
-
-Or re-run the standard installer:
+Re-run the standard installer — it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards (or run `wizard --onboard` and pick the recommended tier):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
+
+On Ollama: `ollama pull qwen3.6:27b` and set `model = "qwen3.6:27b"`.

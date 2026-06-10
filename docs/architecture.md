@@ -1,14 +1,14 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui front end on top of a local Ollama-backed agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension.
+Wizard is a single-binary Rust application: a Ratatui front end on top of a local llama.cpp-backed agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Wizard manages the `llama-server` lifecycle itself; Ollama, OpenAI-compatible, and Anthropic providers are supported alongside.
 
 ## High-level overview
 
 ```mermaid
 flowchart TB
     subgraph install [install.sh]
-        A[detect OS + VRAM] --> B[install Ollama]
-        B --> C["ollama pull qwen3.6:*"]
+        A[detect OS + VRAM] --> B[install llama-server]
+        B --> C["download Qwen3 GGUF"]
         C --> D[download wizard binary]
         D --> E["write ~/.wizard/config.toml"]
     end
@@ -19,7 +19,8 @@ flowchart TB
         Mode -->|sovereign| Headless[autonomous loop]
         TUI --> Agent[agent loop]
         Headless --> Agent
-        Agent --> LLM[Ollama /api/chat]
+        Agent --> LLM["llama-server /v1 (OpenAI-compatible)"]
+        Agent -.spawns when down.-> Server[llama-server lifecycle]
         Agent --> Tools[tool registry]
         Agent --> MCP[MCP client]
         Agent --> Sub[subagent spawner]
@@ -48,8 +49,13 @@ wizard/
 │   │   ├── prompts.rs   # genie vs sovereign system prompts
 │   │   ├── subagent.rs  # isolated sub-context spawner
 │   │   └── session.rs   # JSONL session persistence
+│   ├── server.rs        # llama-server lifecycle: spawn / health / stop
 │   ├── llm/
-│   │   └── ollama.rs    # streaming HTTP client
+│   │   ├── provider.rs  # LlmProvider trait
+│   │   ├── llamacpp.rs  # llama-server client (default; wraps the OpenAI client)
+│   │   ├── openai.rs    # OpenAI-compatible streaming client
+│   │   ├── ollama.rs    # Ollama native /api/chat client
+│   │   └── anthropic.rs # Anthropic client
 │   ├── mcp/
 │   │   └── mod.rs       # MCP client (stdio / HTTP tool servers)
 │   ├── tools/
@@ -83,24 +89,37 @@ Parses arguments and selects run mode:
 
 ### Config (`config.rs`)
 
-Loaded from `~/.wizard/config.toml` with optional env overrides:
+Loaded from `~/.wizard/config.toml` with optional env overrides (`WIZARD_MODEL`, `WIZARD_LLAMACPP_HOST`, `WIZARD_GGUF_PATH`, `WIZARD_OLLAMA_HOST`):
 
 ```toml
-model = "qwen3.6:27b"
-ollama_host = "http://127.0.0.1:11434"
+active_provider = "local"
 mode = "genie"
 auto_approve = true
 max_steps = 25
+
+[[providers]]
+name = "local"
+kind = "llamacpp"
+base_url = "http://127.0.0.1:8080"
+model = "Qwen3.6-27B-Q4_K_M"
+gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
-### LLM client (`llm/ollama.rs`)
+When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` — unless the file carries the legacy `model` / `ollama_host` keys, in which case it synthesizes an Ollama provider so pre-llama.cpp configs keep working unchanged.
 
-Thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the OpenAI-compatible `/v1/chat/completions` shim; the native endpoint exposes Ollama's streaming and `tool_calls` fields directly):
+### LLM clients (`llm/`)
+
+All providers implement the `LlmProvider` trait (health, model listing, streaming chat). The default, `llm/llamacpp.rs`, drives llama.cpp's `llama-server` through its OpenAI-compatible `/v1/chat/completions` endpoint (it composes the `llm/openai.rs` client rather than duplicating it) and probes the server's native `GET /health`:
 
 - Streaming token delivery to the TUI
 - Native tool-call round-trips, with a prompt-based JSON fallback when the model lacks native tool support
-- Health probe on startup (`GET /api/tags`)
-- No `ollama-rs` dependency — keeps the binary small
+- Actionable errors when the server is down (`llama-server -m <model.gguf> --port 8080`)
+
+`llm/ollama.rs` is a thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the `/v1` shim; the native endpoint exposes Ollama's streaming and `tool_calls` fields directly), with its own health probe (`GET /api/tags`) and no `ollama-rs` dependency. `llm/anthropic.rs` covers the Anthropic API.
+
+### llama-server lifecycle (`server.rs`)
+
+When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself — at TUI/headless/gateway startup and after `/provider use` switches to a llama.cpp provider. Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group (it survives Wizard's exit and Ctrl-C), logs to `~/.wizard/llama-server.log`, and its PID is recorded in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s (503 = model still loading). `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling, so a recycled PID can never kill an unrelated process.
 
 ### Agent loop (`agent/mod.rs`)
 
@@ -108,7 +127,7 @@ Thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the OpenAI-
 ┌─────────────────────────────────────────┐
 │  1. Build message list                  │
 │     system prompt + skills + history    │
-│  2. Stream completion from Ollama       │
+│  2. Stream completion from the provider │
 │  3. Parse tool calls from response      │
 │  4. Execute tools → append results        │
 │  5. Repeat until done or max_steps      │
@@ -195,6 +214,10 @@ Ratatui + crossterm terminal UI:
 | Path | Contents |
 |------|----------|
 | `~/.wizard/config.toml` | User configuration |
+| `~/.wizard/models/*.gguf` | Downloaded GGUF model files |
+| `~/.wizard/llama.cpp/` | llama.cpp release tree installed by `install.sh` |
+| `~/.wizard/llama-server.log` | Output of llama-servers Wizard spawned |
+| `~/.wizard/llama-server.pid` | PID of the llama-server Wizard spawned |
 | `~/.wizard/mcp.toml` | MCP server declarations |
 | `~/.wizard/tools/` | Agent-authored scripted tools |
 | `~/.wizard/src/` | Source checkout for deep evolve (created on demand) |
@@ -207,11 +230,11 @@ Ratatui + crossterm terminal UI:
 
 ### `install.sh` (default)
 
-Official models only. VRAM-aware tier selection. No custom Modelfiles. Installs the binary, Ollama, and the model, but no Rust toolchain, keeping the default footprint lean. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+VRAM-aware tier selection. Installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), and a Qwen 3 GGUF, but no Rust toolchain, keeping the default footprint lean. No server is started at install time — Wizard spawns it on first run. `WIZARD_USE_OLLAMA=1` selects the previous Ollama-based flow instead. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
 ### `install-byom.sh` (optional)
 
-Same binary install, but user selects any Ollama model. See [byom.md](byom.md).
+Same binary install, but user selects any Ollama model. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF — see [byom.md](byom.md).
 
 ## Dependencies
 
@@ -219,7 +242,7 @@ Same binary install, but user selects any Ollama model. See [byom.md](byom.md).
 |-------|------|
 | `ratatui` + `crossterm` | Terminal UI |
 | `tokio` | Async runtime |
-| `reqwest` | Ollama HTTP |
+| `reqwest` | Provider HTTP (llama-server, Ollama, cloud) |
 | `clap` | CLI parsing |
 | `serde` / `serde_json` | Serialization |
 | `toml` + `dirs` | Config |
@@ -229,8 +252,8 @@ Target release binary: **< 60 MB** (strip + LTO).
 
 ## Security model
 
-- All inference is local via Ollama; no model data leaves the machine
-- No outbound API calls from the core loop in v0.1 (except `ollama pull` during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
+- All inference is local by default (llama.cpp or Ollama); no model data leaves the machine until you add a cloud provider
+- No outbound API calls from the core loop in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
 - Both modes auto-approve tool calls (writes, shell, git, and `/evolve` changes) by default. An opt-in y/n confirmation gate is available via `auto_approve = false`. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run sovereign mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training

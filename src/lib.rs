@@ -16,6 +16,7 @@ pub mod hardware;
 pub mod llm;
 pub mod mcp;
 pub mod onboarding;
+pub mod server;
 pub mod skills;
 pub mod tools;
 pub mod ui;

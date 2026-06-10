@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::Cli;
-use crate::config::{Config, Mode};
+use crate::config::{Config, Mode, ProviderKind};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
@@ -907,6 +907,11 @@ pub async fn build_headless_agent(
     let client = active
         .build()
         .with_context(|| format!("building provider '{}'", active.name))?;
+    // llama.cpp gets a lifecycle hand: when nothing answers, Wizard starts
+    // the server itself, printing spawn/load progress to stdout.
+    if active.kind == ProviderKind::LlamaCpp {
+        crate::server::ensure_running(&active, &|line: &str| println!("{line}")).await?;
+    }
     client
         .health()
         .await
