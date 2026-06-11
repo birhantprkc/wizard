@@ -7,6 +7,7 @@ pub mod evolve;
 pub mod file;
 pub mod git;
 pub mod memory;
+pub mod plan;
 pub mod publish;
 pub mod registry;
 pub mod scripted;
@@ -53,6 +54,11 @@ pub struct ToolContext {
     pub tasks: Arc<tasks::TaskRegistry>,
     /// The agent's working todo list, shared by every call in the session.
     pub todos: Arc<Mutex<todo::TodoList>>,
+    /// Event channel of the turn currently dispatching, injected by the
+    /// dispatcher so tools that converse with the surface (`exit_plan`'s
+    /// approval round-trip) can reach it. `None` outside the dispatch
+    /// pipeline (subagents, direct registry execution).
+    pub events: Option<tokio::sync::mpsc::Sender<crate::agent::AgentEvent>>,
 }
 
 impl ToolContext {
@@ -61,6 +67,15 @@ impl ToolContext {
             cwd: cwd.into(),
             tasks: Arc::new(tasks::TaskRegistry::new()),
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
+            events: None,
+        }
+    }
+
+    /// A copy of this context carrying the turn's event channel.
+    pub fn with_events(&self, events: tokio::sync::mpsc::Sender<crate::agent::AgentEvent>) -> Self {
+        Self {
+            events: Some(events),
+            ..self.clone()
         }
     }
 }

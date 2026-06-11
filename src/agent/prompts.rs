@@ -38,6 +38,20 @@ repeat a failing action verbatim.
 - Keep edits minimal and consistent with the existing code style.
 - Commit when a coherent unit of work passes tests, with a clear message.";
 
+/// Appended to the system prompt while plan mode is active (the agent
+/// re-composes the prompt whenever the flag flips, so this block disappears
+/// once a plan is approved).
+pub const PLAN_MODE_PROMPT: &str = "\
+## Plan mode (active)
+
+You are in PLAN MODE. Investigate using read-only tools only (reading, \
+listing, and searching files; inspecting git state); every other tool is \
+blocked until your plan is approved. Do not attempt to make changes yet. \
+Once you understand the task, present your implementation plan by calling \
+the `exit_plan` tool with the complete plan as markdown. If the plan is \
+approved, plan mode ends and you carry it out; if it is rejected, refine \
+the plan using the feedback you receive and call `exit_plan` again.";
+
 /// Memory guidance injected when the project has saved memories; the index
 /// (MEMORY.md) follows it.
 const MEMORY_PROMPT_WITH_INDEX: &str = "\

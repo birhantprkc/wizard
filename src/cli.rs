@@ -39,6 +39,13 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub auto: bool,
 
+    /// Start in plan mode: the agent investigates with read-only tools and
+    /// presents a plan via the exit_plan tool before executing. The TUI asks
+    /// for approval; headless runs and the gateway auto-approve, giving a
+    /// natural plan-then-execute turn.
+    #[arg(long)]
+    pub plan: bool,
+
     /// Time limit in hours for a sovereign-mode run.
     #[arg(long)]
     pub max_hours: Option<f64>,
@@ -221,6 +228,7 @@ mod tests {
         assert!(!cli.evolve);
         assert!(!cli.deep);
         assert!(!cli.auto);
+        assert!(!cli.plan);
         assert_eq!(cli.max_hours, None);
         assert_eq!(cli.loop_limit, None);
         assert!(!cli.continuous);
@@ -249,6 +257,7 @@ mod tests {
             "-p",
             "add tests",
             "--auto",
+            "--plan",
             "--max-hours",
             "1.5",
             "--loop",
@@ -264,6 +273,7 @@ mod tests {
         assert_eq!(cli.mode, Some(Mode::Sovereign));
         assert_eq!(cli.prompt.as_deref(), Some("add tests"));
         assert!(cli.auto);
+        assert!(cli.plan);
         assert_eq!(cli.max_hours, Some(1.5));
         assert_eq!(cli.loop_limit, Some(10));
         assert!(cli.continuous);

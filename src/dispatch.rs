@@ -1,13 +1,14 @@
 //! Tool-call dispatch pipeline.
 //!
 //! Every tool call in every mode (TUI, headless, gateway) funnels through
-//! [`Dispatcher::dispatch`]. The pipeline runs in stages, in order: pre-tool
+//! [`Dispatcher::dispatch`]. The pipeline runs in stages, in order:
+//! plan-mode gate (blocks non-read-only tools while planning) → pre-tool
 //! hooks (may rewrite arguments or block) → execute → post-tool hooks (may
-//! append context) → failure bookkeeping. The remaining seams — the
-//! plan-mode gate before the pre-hooks and the checkpoint snapshot after
-//! them — slot in here when they land.
+//! append context) → failure bookkeeping. The remaining seam — the
+//! checkpoint snapshot after the pre-hooks — slots in here when it lands.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -16,7 +17,8 @@ use crate::agent::{AgentEvent, DoneReason, emit, normalize_args};
 use crate::config::Mode;
 use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::ToolCall;
-use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
+use crate::tools::plan::EXIT_PLAN_TOOL_NAME;
+use crate::tools::{ToolAccess, ToolContext, ToolOutput, registry::ToolRegistry};
 
 /// Consecutive identical failures that trip the sovereign circuit breaker.
 const CIRCUIT_BREAKER_LIMIT: u32 = 3;
@@ -36,6 +38,10 @@ pub struct Dispatcher {
     hooks: Arc<HookEngine>,
     /// Sovereign runs add the identical-failure circuit breaker.
     mode: Mode,
+    /// Plan-mode flag, shared with the agent (`/plan`, `--plan`) and the
+    /// `exit_plan` tool (cleared on approval). While set, only read-only
+    /// tools and `exit_plan` may run.
+    plan_mode: Arc<AtomicBool>,
     /// Signature of the last failing tool call and how many consecutive
     /// times it has failed identically (sovereign only).
     failure_streak: Option<(String, u32)>,
@@ -68,11 +74,17 @@ impl DispatchOutcome {
 }
 
 impl Dispatcher {
-    pub fn new(registry: ToolRegistry, mode: Mode, hooks: Arc<HookEngine>) -> Self {
+    pub fn new(
+        registry: ToolRegistry,
+        mode: Mode,
+        hooks: Arc<HookEngine>,
+        plan_mode: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             registry,
             hooks,
             mode,
+            plan_mode,
             failure_streak: None,
             tool_failures: ToolFailureCounter::default(),
         }
@@ -108,6 +120,41 @@ impl Dispatcher {
     ) -> DispatchOutcome {
         let name = call.function.name.clone();
         let mut args = normalize_args(&call.function.arguments);
+
+        // Plan-mode gate, first stage: while planning, only read-only tools
+        // and exit_plan may run. The block feeds back to the model as an
+        // ordinary tool error but is exempt from the failure breakers — a
+        // model probing for write access mid-plan must not end the turn.
+        // Unknown tools fall through so the real "unknown tool" error
+        // surfaces instead.
+        if self.plan_mode.load(Ordering::SeqCst)
+            && name != EXIT_PLAN_TOOL_NAME
+            && self
+                .registry
+                .get(&name)
+                .is_some_and(|tool| tool.access() != ToolAccess::ReadOnly)
+        {
+            let output = ToolOutput::error(
+                "blocked by plan mode: only read-only tools are allowed; finish your plan \
+                 and call exit_plan",
+            );
+            if !emit(
+                events,
+                AgentEvent::ToolFinished {
+                    name,
+                    output: output.clone(),
+                },
+            )
+            .await
+            {
+                return DispatchOutcome::stopped();
+            }
+            return DispatchOutcome {
+                output: Some(output),
+                nudge: None,
+                done: None,
+            };
+        }
 
         // Pre-tool hooks: may rewrite the arguments or veto the call. A veto
         // feeds back to the model as an ordinary tool error (not fatal), so
@@ -164,7 +211,11 @@ impl Dispatcher {
         {
             return None;
         }
-        Some(match self.registry.execute(name, args, ctx).await {
+        // Tools run with the turn's event channel in their context, so a
+        // tool that converses with the surface (exit_plan's approval
+        // round-trip) can reach it.
+        let ctx = ctx.with_events(events.clone());
+        Some(match self.registry.execute(name, args, &ctx).await {
             Ok(output) => output,
             Err(err) => ToolOutput::error(err.to_string()),
         })

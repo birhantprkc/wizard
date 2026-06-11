@@ -79,11 +79,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
         draw_picker(frame, app);
+    }
+    if app.plan_review.is_some() {
+        draw_plan_review(frame, app);
     }
 }
 
@@ -438,6 +441,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];
+    if app.plan_mode {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled("PLAN", accent().bold()));
+    }
     if let Some(label) = &app.rebuilding {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(format!("{spinner} "), accent()));
@@ -463,7 +470,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Contextual key hints, right-aligned in a sub-rect so the left side is
     // never overdrawn.
-    let hints = if app.picker.is_some() {
+    let hints = if let Some(review) = &app.plan_review {
+        if review.feedback.is_some() {
+            "type feedback · Enter reject · Esc back"
+        } else {
+            "y/Enter approve · n reject · ↑↓ scroll"
+        }
+    } else if app.picker.is_some() {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
@@ -556,7 +569,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    if app.picker.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() {
         frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
     }
 }
@@ -706,6 +719,95 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
         );
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// Plan-review modal (plan mode): the plan markdown with a verdict footer.
+/// The turn is paused inside `exit_plan` until the user answers, so this
+/// floats above everything else. While rejecting, a feedback line replaces
+/// the bottom edge of the body.
+fn draw_plan_review(frame: &mut Frame, app: &App) {
+    let Some(review) = &app.plan_review else {
+        return;
+    };
+
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(6).clamp(24, 100);
+    let height = frame_area.height.saturating_sub(2).max(5);
+    let area = Rect {
+        x: frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
+        y: frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+    .intersection(frame_area);
+    if area.height < 5 || area.width < 10 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    let hints = if review.feedback.is_some() {
+        " feedback · Enter reject · Esc back "
+    } else {
+        " y approve · n reject · ↑↓ scroll "
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦", accent()),
+            Span::styled(" plan review ", Style::default().fg(TEXT_DIM)),
+        ]))
+        .title_bottom(Line::from(Span::styled(hints, dim())).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Body: the plan, wrapped and scrolled; the bottom line is reserved for
+    // the feedback input while rejecting.
+    let body_area = if review.feedback.is_some() {
+        Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    if body_area.height > 0 {
+        let lines = wrap_lines(render_markdown(&review.plan), body_area.width as usize);
+        let max_scroll = lines.len().saturating_sub(body_area.height as usize);
+        let scroll = (review.scroll as usize).min(max_scroll);
+        let visible: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(scroll)
+            .take(body_area.height as usize)
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(visible)), body_area);
+    }
+
+    if let Some(feedback) = &review.feedback {
+        let feedback_area = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        let budget =
+            (feedback_area.width as usize).saturating_sub("rejection feedback ❯  ".width());
+        let shown: String = feedback
+            .chars()
+            .rev()
+            .take(budget)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("rejection feedback ❯ ", accent().bold()),
+                Span::raw(shown),
+                Span::styled("▍", dim()),
+            ])),
+            feedback_area,
+        );
+    }
 }
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs

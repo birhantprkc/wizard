@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentEvent, DoneReason, session::Session, subagent};
+use crate::agent::{Agent, AgentEvent, DoneReason, PlanVerdict, session::Session, subagent};
 use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
@@ -97,6 +97,9 @@ pub enum SlashCommand {
     },
     /// Reload skills, scripted tools, and MCP servers without restart.
     Reload,
+    /// Toggle plan mode (also Shift+Tab): read-only investigation until a
+    /// plan is approved via `exit_plan`.
+    Plan,
     /// Toggle the git diff sidebar.
     Diff,
     /// Show the saved project memories.
@@ -242,6 +245,7 @@ impl SlashCommand {
                 }
             }
             "reload" => Ok(Self::Reload),
+            "plan" => Ok(Self::Plan),
             "diff" => Ok(Self::Diff),
             "memory" => Ok(Self::Memory),
             "publish" => Ok(Self::Publish {
@@ -297,6 +301,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "sovereign",
         args: "",
         description: "switch to sovereign mode",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "plan",
+        args: "",
+        description: "toggle plan mode: read-only until a plan is approved",
         takes_args: false,
     },
     CommandSpec {
@@ -395,6 +405,21 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// In-flight plan review (plan mode): the model called `exit_plan` and the
+/// turn is paused inside the tool until a [`PlanVerdict`] is sent back.
+#[derive(Debug)]
+pub struct PlanReview {
+    /// The plan markdown, rendered in the review modal.
+    pub plan: String,
+    /// Verdict channel back into the paused `exit_plan` call; taken exactly
+    /// once when the review finishes.
+    respond: Option<tokio::sync::oneshot::Sender<PlanVerdict>>,
+    /// `Some` while collecting rejection feedback (the text typed so far).
+    pub feedback: Option<String>,
+    /// Scroll offset from the top of the plan.
+    pub scroll: u16,
+}
+
 /// Status bar contents.
 #[derive(Debug, Default)]
 pub struct StatusLine {
@@ -440,6 +465,12 @@ pub struct App {
     pub suggestion_index: usize,
     /// Open selection popup (model / mode picker), if any.
     pub picker: Option<Picker>,
+    /// Whether plan mode is active (mirrors the agent's flag for the status
+    /// bar; toggled by `/plan` and Shift+Tab).
+    pub plan_mode: bool,
+    /// Open plan-review modal (the turn is paused inside `exit_plan` until
+    /// it resolves), if any.
+    pub plan_review: Option<PlanReview>,
     /// Previously submitted inputs, oldest first (↑/↓ recall).
     pub history: Vec<String>,
     /// Position while browsing `history`; `None` when composing fresh input.
@@ -463,6 +494,7 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> Self {
         let mode = config.mode;
+        let plan_mode = config.plan_first;
         let spinner_verb = config.ui.spinner_verb(0).to_string();
         let status = StatusLine {
             model: config.active().model,
@@ -489,6 +521,8 @@ impl App {
             suggestions: Vec::new(),
             suggestion_index: 0,
             picker: None,
+            plan_mode,
+            plan_review: None,
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -803,6 +837,13 @@ impl App {
             }
         }
 
+        // An open plan review captures all keys: the turn is paused inside
+        // exit_plan until a verdict is sent.
+        if self.plan_review.is_some() {
+            self.handle_plan_review_key(key);
+            return Ok(None);
+        }
+
         // An open picker captures navigation keys.
         if let Some(picker) = self.picker.as_mut() {
             match key.code {
@@ -887,6 +928,8 @@ impl App {
                 }
                 None
             }
+            // Shift+Tab toggles plan mode (same as /plan).
+            KeyCode::BackTab => Some(AppAction::Command(SlashCommand::Plan)),
             KeyCode::Esc => {
                 if self.scroll > 0 {
                     self.scroll = 0;
@@ -1004,6 +1047,67 @@ impl App {
         }
     }
 
+    /// Keys while the plan-review modal is open. Review state: `y`/Enter
+    /// approves, `n` opens a feedback line, ↑/↓/PgUp/PgDn scroll the plan.
+    /// Feedback state: typing edits, Enter sends the rejection, Esc returns
+    /// to the review.
+    fn handle_plan_review_key(&mut self, key: KeyEvent) {
+        let Some(review) = self.plan_review.as_mut() else {
+            return;
+        };
+        if let Some(feedback) = review.feedback.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let feedback = review.feedback.take().unwrap_or_default();
+                    self.finish_plan_review(PlanVerdict::reject(feedback));
+                }
+                KeyCode::Esc => review.feedback = None,
+                KeyCode::Backspace => {
+                    feedback.pop();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    feedback.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.finish_plan_review(PlanVerdict::approve());
+            }
+            KeyCode::Char('n') => review.feedback = Some(String::new()),
+            KeyCode::Up => review.scroll = review.scroll.saturating_sub(1),
+            KeyCode::Down => review.scroll = review.scroll.saturating_add(1),
+            KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(10),
+            KeyCode::PageDown => review.scroll = review.scroll.saturating_add(10),
+            _ => {}
+        }
+    }
+
+    /// Close the plan review and send `verdict` back into the paused
+    /// `exit_plan` call. Approval mirrors the agent clearing its plan-mode
+    /// flag; rejection stays in plan mode.
+    fn finish_plan_review(&mut self, verdict: PlanVerdict) {
+        let Some(mut review) = self.plan_review.take() else {
+            return;
+        };
+        let approved = verdict.approved;
+        if let Some(respond) = review.respond.take() {
+            let _ = respond.send(verdict);
+        }
+        if approved {
+            self.plan_mode = false;
+            self.notice("plan approved — executing it");
+        } else {
+            self.notice("plan rejected — still in plan mode");
+        }
+    }
+
     /// Record a submitted input for ↑/↓ recall (skipping immediate repeats).
     fn push_history(&mut self, input: &str) {
         if self.history.last().map(String::as_str) != Some(input) {
@@ -1081,6 +1185,18 @@ impl App {
                 outcome,
             } => {
                 self.notice(format!("hook {event}: {outcome} ({command})"));
+            }
+            AgentEvent::PlanReady { plan, respond } => {
+                self.flush_streaming();
+                // A plan awaiting review implies plan mode is on, however
+                // the turn was started (e.g. `--plan`).
+                self.plan_mode = true;
+                self.plan_review = Some(PlanReview {
+                    plan,
+                    respond: Some(respond),
+                    feedback: None,
+                    scroll: 0,
+                });
             }
             AgentEvent::Done { reason } => {
                 self.flush_streaming();
@@ -1354,6 +1470,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /model [tag]                pick a model interactively, or switch directly\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
 /genie · /sovereign         switch mode directly\n  \
+/plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
@@ -1365,6 +1482,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /quit                       exit\n\
 keys:\n  \
 Tab / →                     accept command completion\n  \
+Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
 PgUp/PgDn · mouse wheel     scroll the transcript\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
@@ -1564,6 +1682,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
         )
         .await?,
     );
+    // `--plan` / `plan_first = true`: the session starts in plan mode (the
+    // App mirror is set from the same config in App::new below).
+    if config.plan_first
+        && let Some(agent) = agent_slot.as_mut()
+    {
+        agent.set_plan_mode(true);
+    }
     let mut agent_task: Option<JoinHandle<Agent>> = None;
 
     // Genie-mode max_steps as configured, used when switching back from
@@ -1609,7 +1734,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
                 app.config.model = model.clone();
                 app.status.model = model;
             }
-            if let Some(agent) = rebuild.agent {
+            if let Some(mut agent) = rebuild.agent {
+                // A rebuilt agent starts with plan mode off; restore the
+                // session's setting.
+                if app.plan_mode {
+                    agent.set_plan_mode(true);
+                }
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -1766,6 +1896,7 @@ impl CommandContext<'_> {
             SlashCommand::Model(Some(tag)) => self.switch_model(tag),
             SlashCommand::Mode(None) => self.open_mode_picker(),
             SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
+            SlashCommand::Plan => self.toggle_plan(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
@@ -1921,6 +2052,24 @@ impl CommandContext<'_> {
             title: " select mode ".to_string(),
             items,
             selected,
+        });
+    }
+
+    /// `/plan` (and Shift+Tab): toggle plan mode on the live agent.
+    fn toggle_plan(&mut self) {
+        if self.agent_unavailable("toggle plan mode") {
+            return;
+        }
+        let on = !self.app.plan_mode;
+        if let Some(agent) = self.agent_slot.as_mut() {
+            agent.set_plan_mode(on);
+        }
+        self.app.plan_mode = on;
+        self.app.notice(if on {
+            "plan mode on — the agent investigates read-only and presents a plan via \
+             exit_plan for approval (/plan or Shift+Tab to leave)"
+        } else {
+            "plan mode off"
         });
     }
 
@@ -2085,7 +2234,12 @@ impl CommandContext<'_> {
         )
         .await
         {
-            Ok(agent) => {
+            Ok(mut agent) => {
+                // A rebuilt agent starts with plan mode off; restore the
+                // session's setting.
+                if self.app.plan_mode {
+                    agent.set_plan_mode(true);
+                }
                 *self.agent_slot = Some(agent);
                 self.app.status.model = self.app.config.active().model;
                 self.app.notice(summary);
@@ -2669,6 +2823,120 @@ mod tests {
         let parsed = SlashCommand::parse("/login").expect("is a slash command");
         let message = parsed.expect_err("missing provider");
         assert!(message.contains("/login xai"), "got: {message}");
+    }
+
+    #[test]
+    fn plan_parses_as_a_toggle() {
+        assert_eq!(SlashCommand::parse("/plan"), Some(Ok(SlashCommand::Plan)));
+    }
+
+    #[test]
+    fn backtab_toggles_plan_mode() {
+        let mut app = app();
+        let action = press(&mut app, KeyCode::BackTab);
+        assert!(matches!(
+            action,
+            Some(AppAction::Command(SlashCommand::Plan))
+        ));
+    }
+
+    #[test]
+    fn backtab_in_a_picker_still_navigates() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Mode,
+            title: " select mode ".to_string(),
+            items: vec![
+                PickerItem {
+                    value: "genie".to_string(),
+                    detail: String::new(),
+                    current: true,
+                },
+                PickerItem {
+                    value: "sovereign".to_string(),
+                    detail: String::new(),
+                    current: false,
+                },
+            ],
+            selected: 0,
+        });
+        let action = press(&mut app, KeyCode::BackTab);
+        assert!(action.is_none(), "the picker captured the key");
+        assert_eq!(app.picker.as_ref().expect("open").selected, 1);
+    }
+
+    /// Open a plan review via the agent event, returning the verdict
+    /// receiver.
+    fn open_review(app: &mut App, plan: &str) -> tokio::sync::oneshot::Receiver<PlanVerdict> {
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        app.handle_agent_event(AgentEvent::PlanReady {
+            plan: plan.to_string(),
+            respond,
+        });
+        rx
+    }
+
+    #[test]
+    fn plan_ready_opens_a_review_and_y_approves() {
+        let mut app = app();
+        let mut rx = open_review(&mut app, "# the plan");
+        let review = app.plan_review.as_ref().expect("review open");
+        assert_eq!(review.plan, "# the plan");
+        assert!(app.plan_mode, "a pending plan implies plan mode");
+
+        // Review keys never leak into the input line.
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.input.is_empty());
+        assert!(app.plan_review.is_none(), "review closed");
+        assert!(!app.plan_mode, "approval clears the plan-mode mirror");
+        assert_eq!(rx.try_recv(), Ok(PlanVerdict::approve()));
+    }
+
+    #[test]
+    fn plan_review_enter_also_approves() {
+        let mut app = app();
+        let mut rx = open_review(&mut app, "# p");
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(action.is_none());
+        assert_eq!(rx.try_recv(), Ok(PlanVerdict::approve()));
+    }
+
+    #[test]
+    fn plan_review_rejection_collects_feedback() {
+        let mut app = app();
+        let mut rx = open_review(&mut app, "# p");
+
+        press(&mut app, KeyCode::Char('n'));
+        let review = app.plan_review.as_ref().expect("still open");
+        assert_eq!(review.feedback.as_deref(), Some(""));
+
+        type_str(&mut app, "add testz");
+        press(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "s first");
+        assert!(app.input.is_empty(), "feedback typing never hits the input");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.plan_review.is_none(), "review closed");
+        assert!(app.plan_mode, "rejection keeps plan mode on");
+        assert_eq!(rx.try_recv(), Ok(PlanVerdict::reject("add tests first")));
+    }
+
+    #[test]
+    fn plan_review_esc_leaves_feedback_entry() {
+        let mut app = app();
+        let mut rx = open_review(&mut app, "# p");
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "half a thought");
+        press(&mut app, KeyCode::Esc);
+        let review = app.plan_review.as_ref().expect("still open");
+        assert!(review.feedback.is_none(), "back to the review state");
+        assert!(rx.try_recv().is_err(), "no verdict sent yet");
+        // 'n' again starts fresh feedback.
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            app.plan_review.as_ref().expect("open").feedback.as_deref(),
+            Some("")
+        );
     }
 
     #[test]

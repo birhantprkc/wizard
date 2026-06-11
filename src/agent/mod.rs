@@ -47,6 +47,33 @@ pub enum DoneReason {
     CircuitBreaker,
 }
 
+/// Verdict on a plan presented via the `exit_plan` tool (plan mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanVerdict {
+    /// True when the plan was approved and execution may proceed.
+    pub approved: bool,
+    /// Reviewer feedback on rejection (empty = a generic rejection).
+    pub feedback: String,
+}
+
+impl PlanVerdict {
+    /// Approve the plan: plan mode ends and the model executes it.
+    pub fn approve() -> Self {
+        Self {
+            approved: true,
+            feedback: String::new(),
+        }
+    }
+
+    /// Reject the plan with `feedback`; plan mode stays on.
+    pub fn reject(feedback: impl Into<String>) -> Self {
+        Self {
+            approved: false,
+            feedback: feedback.into(),
+        }
+    }
+}
+
 /// Events emitted by the agent loop. The TUI renders them; the headless
 /// runner logs them.
 #[derive(Debug)]
@@ -74,6 +101,16 @@ pub enum AgentEvent {
         command: String,
         /// What the hook did.
         outcome: crate::hooks::HookOutcome,
+    },
+    /// Plan mode: the model presented a plan via `exit_plan` and the turn is
+    /// paused awaiting a verdict. The consumer must send exactly one
+    /// [`PlanVerdict`] on `respond` (the TUI renders a review; headless and
+    /// gateway auto-approve). Dropping the sender counts as no verdict and
+    /// keeps plan mode on.
+    PlanReady {
+        /// The plan markdown (also persisted to `.wizard/plan.md`).
+        plan: String,
+        respond: tokio::sync::oneshot::Sender<PlanVerdict>,
     },
     /// The turn is over.
     Done { reason: DoneReason },
@@ -221,6 +258,12 @@ pub struct Agent {
     /// Warning from session resume (corrupt/unreadable file), emitted on
     /// the next turn so the UI can surface it.
     load_warning: Option<String>,
+    /// Plan-mode flag, shared with the dispatcher (read-only gate) and the
+    /// `exit_plan` tool (cleared on approval).
+    plan_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the plan-mode instruction block is currently baked into the
+    /// system prompt; [`Agent::sync_plan_prompt`] refreshes on mismatch.
+    plan_prompt_on: bool,
 }
 
 /// Number of most-recent messages preserved verbatim when compacting history.
@@ -271,10 +314,23 @@ impl Agent {
             .filter(|message| message.role != Role::System)
             .collect::<Vec<_>>();
 
+        // Plan mode: one flag shared by the dispatcher (read-only gate) and
+        // the always-registered exit_plan tool (cleared on approval).
+        let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = registry;
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
+            &plan_mode,
+        ))));
+
         let mut agent = Self {
             client,
             model,
-            dispatcher: Dispatcher::new(registry, config.mode, Arc::clone(&hooks)),
+            dispatcher: Dispatcher::new(
+                registry,
+                config.mode,
+                Arc::clone(&hooks),
+                Arc::clone(&plan_mode),
+            ),
             hooks,
             mode: config.mode,
             config,
@@ -287,6 +343,8 @@ impl Agent {
             memory_index,
             deadline: None,
             load_warning,
+            plan_mode,
+            plan_prompt_on: false,
         };
         agent
             .history
@@ -356,11 +414,41 @@ impl Agent {
         self.hooks.session_end(self.mode, events).await;
     }
 
-    /// Swap the tool registry (after `/reload` or `/evolve`). Refreshes the
-    /// system prompt so the JSON tool protocol's tool list stays current.
-    pub fn set_registry(&mut self, registry: ToolRegistry) {
+    /// Swap the tool registry (after `/reload` or `/evolve`). Re-registers
+    /// the always-present `exit_plan` tool (sharing this agent's plan-mode
+    /// flag) and refreshes the system prompt so the JSON tool protocol's
+    /// tool list stays current.
+    pub fn set_registry(&mut self, mut registry: ToolRegistry) {
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
+            &self.plan_mode,
+        ))));
         self.dispatcher.set_registry(registry);
         self.refresh_system_prompt();
+    }
+
+    /// Whether plan mode is active.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Turn plan mode on or off (`/plan`, `--plan`, `plan_each_cycle`).
+    /// While on, the dispatcher blocks every non-read-only tool except
+    /// `exit_plan`, and the system prompt instructs the model to plan.
+    pub fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+        self.sync_plan_prompt();
+    }
+
+    /// Re-compose the system prompt when the plan-mode flag changed since it
+    /// was last baked in. The flag can flip mid-turn (exit_plan approval
+    /// clears it), so the turn loop calls this before every completion.
+    fn sync_plan_prompt(&mut self) {
+        let on = self.plan_mode();
+        if on != self.plan_prompt_on {
+            self.plan_prompt_on = on;
+            self.refresh_system_prompt();
+        }
     }
 
     /// Switch models mid-session (`/model`) without resetting conversation
@@ -393,6 +481,10 @@ impl Agent {
             prompt.push_str(&prompts::render_tool_protocol(
                 &self.dispatcher.registry().specs(),
             ));
+        }
+        if self.plan_mode() {
+            prompt.push_str("\n\n");
+            prompt.push_str(prompts::PLAN_MODE_PROMPT);
         }
         prompt
     }
@@ -491,6 +583,9 @@ impl Agent {
             {
                 return Ok(reason);
             }
+            // Plan mode can flip mid-turn (exit_plan approval): keep the
+            // system prompt's plan-mode block in step with the flag.
+            self.sync_plan_prompt();
 
             let (mut content, mut tool_calls) = self.stream_completion_with_retry(events).await?;
 
@@ -1015,6 +1110,13 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         cli.max_hours
             .map(|hours| Instant::now() + Duration::from_secs_f64(hours * 3600.0)),
     );
+    // `--plan` / `plan_first = true`: the first turn starts in plan mode.
+    // The model investigates read-only, presents a plan via exit_plan, the
+    // printer below auto-approves it, and the same turn proceeds to execute
+    // — a natural two-phase turn with no human in the loop.
+    if config.plan_first {
+        agent.set_plan_mode(true);
+    }
 
     // Busy spinner ("Conjuring…") shown while the model thinks or a tool
     // runs, hidden while output streams. Shared with the printer task; a
@@ -1061,6 +1163,14 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     outcome,
                 } => {
                     printer_spinner.println(&format!("~ hook {event}: {outcome} ({command})"));
+                }
+                AgentEvent::PlanReady { plan, respond } => {
+                    // Headless: print the plan and approve it, so the turn
+                    // moves from planning to execution on its own.
+                    printer_spinner
+                        .println(&format!("\n=== plan ===\n{plan}\n=== plan approved ==="));
+                    let _ = respond.send(PlanVerdict::approve());
+                    printer_spinner.show();
                 }
                 AgentEvent::Done { reason } => {
                     printer_spinner.hide();
@@ -1117,6 +1227,11 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         }
         if config.continuous {
             spinner.println(&format!("\n=== cycle {iteration} ==="));
+            // `plan_each_cycle = true`: every cycle starts by planning again
+            // (the previous cycle's exit_plan approval cleared the flag).
+            if config.plan_each_cycle {
+                agent.set_plan_mode(true);
+            }
         } else if max_iterations > 1 {
             spinner.println(&format!("\n=== iteration {iteration}/{max_iterations} ==="));
         }
@@ -1805,6 +1920,287 @@ mod tests {
             "hook context appended: {}",
             prompt.content
         );
+    }
+
+    /// Run a turn while a reviewer task answers every [`AgentEvent::PlanReady`]
+    /// with `verdict`. Returns (done reason, plans that were presented).
+    async fn run_turn_with_reviewer(
+        agent: &mut Agent,
+        input: &str,
+        verdict: PlanVerdict,
+    ) -> (DoneReason, Vec<String>) {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let reviewer = async move {
+            let mut plans = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let AgentEvent::PlanReady { plan, respond } = event {
+                    plans.push(plan);
+                    respond.send(verdict.clone()).expect("verdict delivered");
+                }
+            }
+            plans
+        };
+        let (reason, plans) = tokio::join!(agent.run_turn(input, tx), reviewer);
+        (reason.expect("turn ok"), plans)
+    }
+
+    /// Last tool-result message of request `index`, as fed to the model.
+    fn tool_feedback_of(provider: &ScriptedProvider, index: usize) -> String {
+        let requests = provider.requests.lock().unwrap();
+        requests[index]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message")
+            .content
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_non_read_only_tools_but_the_turn_continues() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "a.txt", "content": "x" }),
+                )],
+                vec![final_chunk("understood, planning instead")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert!(!tmp.0.join("a.txt").exists(), "the write never happened");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("blocked by plan mode"),
+            "block reason fed to the model: {feedback}"
+        );
+        assert!(feedback.contains("exit_plan"), "{feedback}");
+        assert!(agent.plan_mode(), "plan mode stays on");
+
+        // The system prompt carried the plan-mode instructions.
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].messages[0].content.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_read_only_tools() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("notes.txt"), "remember the milk\n").unwrap();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("read_file", json!({ "path": "notes.txt" }))],
+                vec![final_chunk("read it")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("remember the milk"),
+            "read-only tools run normally: {feedback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_are_exempt_from_the_identical_failure_breaker() {
+        // Sovereign's breaker trips after 3 identical failures; a planning
+        // model probing the same write repeatedly must not end the turn.
+        let tmp = TempDir::new();
+        let write = || {
+            vec![tool_call_chunk(
+                "write_file",
+                json!({ "path": "a", "content": "x" }),
+            )]
+        };
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                write(),
+                write(),
+                write(),
+                write(),
+                vec![final_chunk("fine, I will plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_mode(Mode::Sovereign);
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed, "no circuit breaker");
+    }
+
+    #[tokio::test]
+    async fn exit_plan_approval_writes_the_plan_and_clears_plan_mode() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "exit_plan",
+                    json!({ "plan": "# Plan\n1. do x" }),
+                )],
+                vec![final_chunk("executing the plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans, ["# Plan\n1. do x"]);
+        assert!(!agent.plan_mode(), "approval clears plan mode");
+
+        let saved =
+            std::fs::read_to_string(tmp.0.join(".wizard").join("plan.md")).expect("plan persisted");
+        assert_eq!(saved, "# Plan\n1. do x");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("Plan approved"),
+            "the model is told to execute: {feedback}"
+        );
+        // After approval, the system prompt no longer carries the plan block.
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].messages[0].content.contains("PLAN MODE"));
+        assert!(!requests[1].messages[0].content.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_rejection_keeps_plan_mode_and_feeds_back_the_feedback() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("exit_plan", json!({ "plan": "# v1" }))],
+                vec![final_chunk("revising the plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::reject("add tests first")).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans.len(), 1);
+        assert!(agent.plan_mode(), "rejection keeps plan mode on");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.starts_with("Error:"), "{feedback}");
+        assert!(feedback.contains("add tests first"), "{feedback}");
+        assert!(
+            feedback.contains("call exit_plan again"),
+            "the model is told to retry: {feedback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_outside_plan_mode_is_an_error() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("exit_plan", json!({ "plan": "# p" }))],
+                vec![final_chunk("ok")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.contains("not in plan mode"), "{feedback}");
+        assert!(
+            !tmp.0.join(".wizard").join("plan.md").exists(),
+            "no plan file written"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_two_phase_turn_blocks_then_plans_then_executes() {
+        // The --plan shape: write blocked while planning → exit_plan
+        // auto-approved → the same write succeeds in the same turn.
+        let tmp = TempDir::new();
+        let write_args = json!({ "path": "result.txt", "content": "done" });
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("write_file", write_args.clone())],
+                vec![tool_call_chunk(
+                    "exit_plan",
+                    json!({ "plan": "# write result.txt" }),
+                )],
+                vec![tool_call_chunk("write_file", write_args)],
+                vec![final_chunk("all done")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans, ["# write result.txt"]);
+        assert!(!agent.plan_mode());
+
+        // The phases happened in order: blocked, approved, executed.
+        assert!(
+            tool_feedback_of(&provider, 1).contains("blocked by plan mode"),
+            "phase 1: the write is blocked"
+        );
+        assert!(
+            tool_feedback_of(&provider, 2).contains("Plan approved"),
+            "phase 2: the plan is approved"
+        );
+        let executed = tool_feedback_of(&provider, 3);
+        assert!(
+            !executed.contains("blocked") && !executed.starts_with("Error:"),
+            "phase 3: the write succeeds: {executed}"
+        );
+        let written = std::fs::read_to_string(tmp.0.join("result.txt")).expect("file written");
+        assert_eq!(written, "done");
+    }
+
+    #[test]
+    fn exit_plan_is_always_registered() {
+        let tmp = TempDir::new();
+        let (mut agent, _provider) =
+            test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+        let has_exit_plan = |agent: &Agent| {
+            agent
+                .dispatcher
+                .registry()
+                .get(crate::tools::plan::EXIT_PLAN_TOOL_NAME)
+                .is_some()
+        };
+        assert!(has_exit_plan(&agent), "registered at construction");
+        // A registry swap (/reload, /evolve) re-registers it.
+        agent.set_registry(ToolRegistry::new());
+        assert!(has_exit_plan(&agent), "re-registered after set_registry");
     }
 
     #[tokio::test]

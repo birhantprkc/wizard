@@ -360,6 +360,13 @@ pub struct Config {
     /// Perpetual sovereign operation: keep working/self-directing/self-improving
     /// until stopped.
     pub continuous: bool,
+    /// Start every session in plan mode (the `--plan` flag sets this for one
+    /// run): the agent investigates with read-only tools and presents a plan
+    /// via `exit_plan` before executing. Headless runs auto-approve the plan.
+    pub plan_first: bool,
+    /// Continuous mode: re-enter plan mode at the top of every cycle, so each
+    /// cycle plans read-only before acting.
+    pub plan_each_cycle: bool,
     /// Base seconds for exponential backoff when the LLM server is unreachable
     /// or rate-limited.
     pub retry_base_secs: u64,
@@ -398,6 +405,8 @@ impl Default for Config {
             auto_approve: true,
             max_steps: 25,
             continuous: false,
+            plan_first: false,
+            plan_each_cycle: false,
             retry_base_secs: 5,
             retry_max_secs: 300,
             cycle_pause_secs: 0,
@@ -628,6 +637,9 @@ impl Config {
             self.mode = Mode::Sovereign;
             self.continuous = true;
         }
+        if cli.plan {
+            self.plan_first = true;
+        }
         if self.mode == Mode::Sovereign && self.max_steps < Mode::Sovereign.default_max_steps() {
             self.max_steps = Mode::Sovereign.default_max_steps();
         }
@@ -655,6 +667,8 @@ mod tests {
         assert_eq!(config.mode, Mode::Genie);
         assert_eq!(config.max_steps, 25);
         assert!(!config.continuous);
+        assert!(!config.plan_first);
+        assert!(!config.plan_each_cycle);
         assert_eq!(config.retry_base_secs, 5);
         assert_eq!(config.retry_max_secs, 300);
         assert_eq!(config.cycle_pause_secs, 0);
@@ -691,6 +705,8 @@ mod tests {
             auto_approve: true,
             max_steps: 200,
             continuous: true,
+            plan_first: true,
+            plan_each_cycle: true,
             retry_base_secs: 10,
             retry_max_secs: 600,
             cycle_pause_secs: 30,
@@ -722,6 +738,8 @@ mod tests {
         assert_eq!(parsed.mode, original.mode);
         assert_eq!(parsed.max_steps, original.max_steps);
         assert_eq!(parsed.continuous, original.continuous);
+        assert_eq!(parsed.plan_first, original.plan_first);
+        assert_eq!(parsed.plan_each_cycle, original.plan_each_cycle);
         assert_eq!(parsed.retry_base_secs, original.retry_base_secs);
         assert_eq!(parsed.retry_max_secs, original.retry_max_secs);
         assert_eq!(parsed.cycle_pause_secs, original.cycle_pause_secs);
@@ -1152,6 +1170,24 @@ mod tests {
         config.apply_cli(&cli(&["--mode", "sovereign"]));
         assert_eq!(config.mode, Mode::Sovereign);
         assert_eq!(config.max_steps, 100, "sovereign raises the step budget");
+    }
+
+    #[test]
+    fn plan_flag_sets_plan_first() {
+        let mut config = Config::default();
+        assert!(!config.plan_first);
+        assert!(!config.plan_each_cycle);
+        config.apply_cli(&cli(&["--plan"]));
+        assert!(config.plan_first);
+        assert!(!config.plan_each_cycle, "--plan never affects cycles");
+
+        // The flag only sets, never clears, the config value.
+        let mut config = Config {
+            plan_first: true,
+            ..Config::default()
+        };
+        config.apply_cli(&cli(&[]));
+        assert!(config.plan_first);
     }
 
     #[test]

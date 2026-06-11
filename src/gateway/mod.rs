@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent, build_headless_agent};
+use crate::agent::{Agent, AgentEvent, PlanVerdict, build_headless_agent};
 use crate::cli::Cli;
 use crate::config::{Config, GatewayKind, Mode};
 
@@ -129,6 +129,11 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
     let mut agent = build_headless_agent(&agent_config, project_root, false)
         .await
         .context("building gateway agent")?;
+    // `plan_first = true`: the first turn plans read-only; the collector in
+    // run_one_turn auto-approves the plan and includes it in the reply.
+    if config.plan_first {
+        agent.set_plan_mode(true);
+    }
 
     // session_start hooks fire once for the whole gateway session.
     fire_session_hooks(&mut agent, true).await;
@@ -174,6 +179,22 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                     .await
                 {
                     eprintln!("failed to send rejection: {err:#}");
+                }
+                continue;
+            }
+
+            // "/plan" toggles plan mode for subsequent messages, mirroring
+            // the TUI's slash command.
+            if message.text.trim() == "/plan" {
+                let on = !agent.plan_mode();
+                agent.set_plan_mode(on);
+                let confirmation = if on {
+                    "plan mode on — the next task is planned read-only first"
+                } else {
+                    "plan mode off"
+                };
+                if let Err(err) = gateway.send(message.chat_id, confirmation).await {
+                    eprintln!("failed to confirm /plan to {}: {err:#}", message.chat_id);
                 }
                 continue;
             }
@@ -233,6 +254,12 @@ async fn run_one_turn(agent: &mut Agent, text: &str) -> String {
                 AgentEvent::TextDelta(delta) => reply.push_str(&delta),
                 AgentEvent::ToolStarted { name, .. } => tools.push(name),
                 AgentEvent::Error(message) => error = Some(message),
+                AgentEvent::PlanReady { plan, respond } => {
+                    // No human reviews a gateway plan: include it in the
+                    // reply and approve so the turn proceeds to execute.
+                    reply.push_str(&format!("[plan]\n{plan}\n[plan auto-approved]\n\n"));
+                    let _ = respond.send(PlanVerdict::approve());
+                }
                 _ => {}
             }
         }
