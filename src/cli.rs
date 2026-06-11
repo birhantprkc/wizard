@@ -102,6 +102,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: BenchCmd,
     },
+
+    /// Diagnose the environment: config, providers, MCP servers, tools,
+    /// hooks, writable state dirs, checkpoints. Exits 0 when no check
+    /// failed.
+    Doctor,
 }
 
 /// `wizard bench` subcommands. Self-contained: no flag here depends on the
@@ -336,6 +341,12 @@ mod tests {
     fn rejects_unknown_mode() {
         let err = parse(&["--mode", "warlock"]).expect_err("unknown mode must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn doctor_parses_as_a_subcommand() {
+        let cli = parse(&["doctor"]).expect("doctor parses");
+        assert!(matches!(cli.command, Some(Command::Doctor)));
     }
 
     #[test]

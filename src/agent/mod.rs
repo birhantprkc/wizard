@@ -563,6 +563,17 @@ impl Agent {
         &self.usage
     }
 
+    /// Number of background tasks (`execute` with `run_in_background`)
+    /// still running, for `/status`.
+    pub fn running_tasks(&self) -> usize {
+        self.ctx
+            .tasks
+            .list()
+            .iter()
+            .filter(|task| !task.status.is_finished())
+            .count()
+    }
+
     /// Redirect (or disable) the per-turn usage JSONL log. Defaults to
     /// `~/.wizard/usage.jsonl`; tests point it into a temp dir.
     pub fn set_usage_log(&mut self, path: Option<PathBuf>) {

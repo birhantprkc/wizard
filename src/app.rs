@@ -113,6 +113,11 @@ pub enum SlashCommand {
     Cost,
     /// Show the saved project memories.
     Memory,
+    /// Run the environment diagnostics (same checks as `wizard doctor`).
+    Doctor,
+    /// Show the session status: model, provider, mode, session id, usage,
+    /// todo progress, background tasks, plan mode.
+    Status,
     /// `/publish [branch]` — fork Wizard and get a one-line installer.
     Publish {
         branch: Option<String>,
@@ -266,6 +271,8 @@ impl SlashCommand {
             "todos" => Ok(Self::Todos),
             "cost" => Ok(Self::Cost),
             "memory" => Ok(Self::Memory),
+            "doctor" => Ok(Self::Doctor),
+            "status" => Ok(Self::Status),
             "publish" => Ok(Self::Publish {
                 branch: args.first().map(|s| s.to_string()),
             }),
@@ -385,6 +392,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "memory",
         args: "",
         description: "show saved project memories",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "status",
+        args: "",
+        description: "show session status: model, usage, todos, tasks",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "doctor",
+        args: "",
+        description: "diagnose config, providers, MCP, hooks, state dirs",
         takes_args: false,
     },
     CommandSpec {
@@ -1731,6 +1750,8 @@ const HELP_TEXT: &str = "available commands:\n  \
 /todos                      toggle the todo side panel\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
+/status                     show session status (model, usage, todos, tasks)\n  \
+/doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
 /quit                       exit\n\
 keys:\n  \
 Tab / →                     accept command completion\n  \
@@ -2150,6 +2171,8 @@ impl CommandContext<'_> {
             SlashCommand::Todos => self.toggle_todos(),
             SlashCommand::Cost => self.cost(),
             SlashCommand::Memory => self.memory(),
+            SlashCommand::Doctor => self.doctor().await,
+            SlashCommand::Status => self.status(),
             SlashCommand::Clear => self.clear(),
             SlashCommand::Model(None) => self.open_model_picker().await,
             SlashCommand::Model(Some(tag)) => self.switch_model(tag),
@@ -2248,6 +2271,60 @@ impl CommandContext<'_> {
             }
             Err(err) => self.app.notice(format!("could not list memories: {err:#}")),
         }
+    }
+
+    /// `/doctor`: the same diagnostics as `wizard doctor`, in the
+    /// transcript. Network probes are capped at 5s each, but a slow
+    /// provider or MCP server still blocks the UI for that long.
+    async fn doctor(&mut self) {
+        let checks = crate::doctor::run_checks(self.project_root).await;
+        self.app
+            .notice(format!("doctor:\n{}", crate::doctor::render(&checks)));
+    }
+
+    /// `/status`: one snapshot of the session — model, provider, mode,
+    /// session id, usage, todo progress, background tasks, plan mode.
+    fn status(&mut self) {
+        let provider = self.app.config.active();
+        let mut text = format!(
+            "model: {}\nprovider: {} ({:?} @ {})\nmode: {}",
+            self.app.status.model, provider.name, provider.kind, provider.base_url, self.app.mode,
+        );
+        match self.agent_slot.as_ref() {
+            Some(agent) => {
+                let (prompt, completion) = agent.usage().session_totals();
+                text.push_str(&format!(
+                    "\nsession: {}\nusage: {prompt} prompt + {completion} completion tokens",
+                    agent.session().id,
+                ));
+                text.push_str(&format!(
+                    "\nbackground tasks: {} running",
+                    agent.running_tasks()
+                ));
+            }
+            None => {
+                // Mid-turn (or rebuilding): the status bar mirror is the
+                // best available source.
+                let (prompt, completion) = (
+                    self.app.status.prompt_tokens,
+                    self.app.status.completion_tokens,
+                );
+                text.push_str(&format!(
+                    "\nsession: (turn running)\nusage: {prompt} prompt + {completion} completion tokens",
+                ));
+            }
+        }
+        let (done, total) = crate::tools::todo::progress(&self.app.todos);
+        if total > 0 {
+            text.push_str(&format!("\ntodos: {done}/{total} done"));
+        } else {
+            text.push_str("\ntodos: none");
+        }
+        text.push_str(&format!(
+            "\nplan mode: {}",
+            if self.app.plan_mode { "on" } else { "off" }
+        ));
+        self.app.notice(text);
     }
 
     fn clear(&mut self) {

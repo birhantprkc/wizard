@@ -12,6 +12,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod dispatch;
+pub mod doctor;
 pub mod event;
 pub mod evolve;
 pub mod gateway;
@@ -52,6 +53,16 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return bench::run(cmd.clone()).await.map(|()| 0);
+    }
+
+    // Doctor diagnoses the environment — starting with "does the config
+    // parse?" — so it too dispatches before the config load and can never
+    // trigger onboarding. Exits 0 when no check failed, 1 otherwise.
+    if let Some(cli::Command::Doctor) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return doctor::run().await;
     }
 
     // `--login` is a one-shot credential flow: no config, no onboarding,
