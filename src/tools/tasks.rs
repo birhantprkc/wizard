@@ -211,7 +211,7 @@ impl TaskRegistry {
             let status = match waited {
                 // Kill requested (task_kill / kill_all).
                 None => {
-                    let _ = child.kill().await;
+                    kill_tree(&mut child).await;
                     TaskStatus::Killed
                 }
                 Some(Ok(Ok(exit))) => TaskStatus::Done(exit.code().unwrap_or(-1)),
@@ -221,7 +221,7 @@ impl TaskRegistry {
                 }
                 // Timeout elapsed.
                 Some(Err(_)) => {
-                    let _ = child.kill().await;
+                    kill_tree(&mut child).await;
                     TaskStatus::TimedOut
                 }
             };
@@ -317,6 +317,21 @@ impl TaskRegistry {
         finished.sort_unstable_by_key(|task| task.id);
         finished
     }
+}
+
+/// Kill a background task's whole process tree and reap the child.
+///
+/// Background children are spawned as their own process-group leaders, so on
+/// Unix the SIGKILL goes to the group: `sh -c` may fork the command rather
+/// than exec it (dash does), and killing only the shell would leave a
+/// grandchild running — and holding the output pipes open, which blocks the
+/// monitor until the orphan exits.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    let _ = child.kill().await;
 }
 
 /// Stream a child's stdout or stderr into the task's tail buffer.
@@ -459,7 +474,9 @@ mod tests {
 
     use super::*;
 
-    /// Spawn `sh -c <script>` with piped stdio, ready for the registry.
+    /// Spawn `sh -c <script>` with piped stdio, ready for the registry —
+    /// same configuration as the `execute` tool's background branch,
+    /// including the own process group that `kill_tree` targets.
     fn spawn_sh(script: &str) -> tokio::process::Child {
         let mut command = tokio::process::Command::new("sh");
         command
@@ -469,6 +486,8 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         command.spawn().expect("spawn test child")
     }
 

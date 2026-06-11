@@ -187,6 +187,11 @@ impl Tool for ExecuteTool {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            // Own process group so task_kill and the timeout reach the whole
+            // tree: `sh -c` may fork the command rather than exec it, and a
+            // surviving grandchild would hold the output pipes open.
+            #[cfg(unix)]
+            command.process_group(0);
             let child = command.spawn().map_err(|err| ToolError::Execution {
                 tool: self.name().to_string(),
                 source: anyhow::Error::new(err).context("failed to spawn background process"),
