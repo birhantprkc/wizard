@@ -1242,6 +1242,16 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
+            AgentEvent::TaskFinished {
+                id,
+                command,
+                status,
+            } => {
+                self.notice(format!(
+                    "background task #{id} finished ({}): {command}",
+                    status.describe()
+                ));
+            }
             AgentEvent::TodoUpdated(items) => {
                 self.todos = items;
                 // Auto-show the panel the first time the agent starts a

@@ -120,9 +120,14 @@ pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
 pub struct ExecuteArgs {
     /// Shell command line, run via `sh -c` in the project root.
     pub command: String,
-    /// Timeout in seconds (default 120, clamped to 600).
+    /// Timeout in seconds (default 120, clamped to 600). Ignored for
+    /// background tasks, which use the fixed background timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Run detached as a background task: returns immediately with a task
+    /// id; the agent is notified when the command finishes.
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 /// `execute` — run a shell command, capturing stdout, stderr, and exit code.
@@ -135,7 +140,10 @@ impl Tool for ExecuteTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the project root and return its stdout, stderr, and exit code. Killed on timeout."
+        "Run a shell command in the project root and return its stdout, stderr, and exit code. \
+         Killed on timeout. With run_in_background, the command is detached as a background \
+         task: the call returns a task id immediately, you are notified when it finishes, and \
+         task_output / task_kill manage it meanwhile."
     }
 
     fn parameters(&self) -> Value {
@@ -143,7 +151,8 @@ impl Tool for ExecuteTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command line (run via sh -c)" },
-                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120, max 600)" }
+                "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120, max 600); ignored for background tasks" },
+                "run_in_background": { "type": "boolean", "description": "Detach as a background task and return immediately (default false)" }
             },
             "required": ["command"]
         })
@@ -171,6 +180,24 @@ impl Tool for ExecuteTool {
 
         let mut command = Command::new("sh");
         command.arg("-c").arg(&args.command).current_dir(&ctx.cwd);
+
+        if args.run_in_background {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let child = command.spawn().map_err(|err| ToolError::Execution {
+                tool: self.name().to_string(),
+                source: anyhow::Error::new(err).context("failed to spawn background process"),
+            })?;
+            let id = ctx.tasks.spawn(&args.command, child);
+            return Ok(ToolOutput::ok(format!(
+                "Background task #{id} started: {}\nYou will be notified when it finishes; \
+                 use task_output to inspect it or task_kill to stop it.",
+                args.command
+            )));
+        }
 
         let result = run_command(self.name(), command, timeout).await?;
         Ok(render_command_result(&result))
@@ -297,6 +324,42 @@ mod tests {
             .await
             .expect_err("missing command must be rejected");
         assert!(matches!(err, ToolError::InvalidArgs { tool, .. } if tool == "execute"));
+    }
+
+    #[tokio::test]
+    async fn execute_run_in_background_registers_a_task_and_returns_immediately() {
+        let tmp = TempDir::new();
+        let ctx = tmp.ctx();
+        let out = ExecuteTool
+            .execute(
+                json!({ "command": "echo bg-marker", "run_in_background": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content
+                .contains("Background task #1 started: echo bg-marker"),
+            "{}",
+            out.content
+        );
+
+        // The task runs to completion in the registry and its output is
+        // captured for the finished-task notification.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = ctx.tasks.status(1).expect("task registered");
+            if status.is_finished() {
+                assert_eq!(status, crate::tools::tasks::TaskStatus::Done(0));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let drained = ctx.tasks.drain_completed();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].tail.contains("bg-marker"), "{}", drained[0].tail);
     }
 
     #[test]

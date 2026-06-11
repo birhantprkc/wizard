@@ -16,6 +16,7 @@ use super::file::{EditFileTool, ListFilesTool, ReadFileTool, SearchFilesTool, Wr
 use super::git::{GitDiffTool, GitStatusTool};
 use super::memory::MemoryTool;
 use super::shell::ExecuteTool;
+use super::tasks::{TaskKillTool, TaskOutputTool};
 use super::todo::TodoTool;
 use super::web::{WebFetchTool, WebSearchTool};
 
@@ -36,7 +37,7 @@ impl ToolRegistry {
     /// Registry pre-populated with all native tools
     /// (`read_file`, `write_file`, `edit_file`, `list_files`,
     /// `search_files`, `execute`, `git_status`, `git_diff`, `memory`,
-    /// `todo`, `web_fetch`, `web_search`).
+    /// `todo`, `web_fetch`, `web_search`, `task_output`, `task_kill`).
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
@@ -51,6 +52,8 @@ impl ToolRegistry {
         registry.register(Arc::new(TodoTool));
         registry.register(Arc::new(WebFetchTool));
         registry.register(Arc::new(WebSearchTool));
+        registry.register(Arc::new(TaskOutputTool));
+        registry.register(Arc::new(TaskKillTool));
         registry
     }
 
@@ -213,9 +216,11 @@ mod tests {
                 "todo",
                 "web_fetch",
                 "web_search",
+                "task_output",
+                "task_kill",
             ]
         );
-        assert_eq!(registry.len(), 12);
+        assert_eq!(registry.len(), 14);
         assert!(!registry.is_empty());
 
         for spec in registry.specs() {
@@ -242,14 +247,17 @@ mod tests {
             // The web tools only observe the outside world.
             "web_fetch",
             "web_search",
+            // `task_output` only reads buffered task state.
+            "task_output",
         ] {
             assert_eq!(access(read_only), ToolAccess::ReadOnly, "{read_only}");
         }
         for edit in ["write_file", "edit_file"] {
             assert_eq!(access(edit), ToolAccess::Edit, "{edit}");
         }
-        // `execute` runs arbitrary commands; `memory` mutates its store.
-        for side_effecting in ["execute", "memory"] {
+        // `execute` runs arbitrary commands; `memory` mutates its store;
+        // `task_kill` terminates processes.
+        for side_effecting in ["execute", "memory", "task_kill"] {
             assert_eq!(
                 access(side_effecting),
                 ToolAccess::Execute,

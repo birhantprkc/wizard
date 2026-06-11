@@ -122,6 +122,14 @@ pub enum AgentEvent {
     /// list; the TUI mirrors it in a side panel, headless prints a one-line
     /// summary, the gateway ignores it.
     TodoUpdated(Vec<crate::tools::todo::TodoItem>),
+    /// A background task (`execute` with `run_in_background`) finished; its
+    /// output tail was injected into history. The TUI and headless surfaces
+    /// print a one-liner, the gateway ignores it.
+    TaskFinished {
+        id: u32,
+        command: String,
+        status: crate::tools::tasks::TaskStatus,
+    },
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -644,6 +652,8 @@ impl Agent {
         let max_steps = self.config.max_steps.max(1);
 
         for step in 1..=max_steps {
+            // Surface background tasks that finished since the last step.
+            self.drain_background_tasks(events).await;
             if let Some(deadline) = self.deadline
                 && Instant::now() >= deadline
             {
@@ -1031,6 +1041,45 @@ impl Agent {
             }
         }
     }
+
+    /// Drain background tasks that finished since the last check (each
+    /// reported exactly once): inject a notification with the output tail
+    /// into history so the model sees it on its next completion, and emit
+    /// [`AgentEvent::TaskFinished`] for the surfaces. Called at the top of
+    /// every agent step and every perpetual cycle.
+    async fn drain_background_tasks(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        for task in self.ctx.tasks.drain_completed() {
+            let mut note = format!(
+                "[background task #{} finished ({})] {}",
+                task.id,
+                task.status.describe(),
+                task.command
+            );
+            let tail = task.tail.trim();
+            if !tail.is_empty() {
+                note.push('\n');
+                note.push_str(tail);
+            }
+            self.push(ChatMessage::system(note));
+            let _ = emit(
+                events,
+                AgentEvent::TaskFinished {
+                    id: task.id,
+                    command: task.command,
+                    status: task.status,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+impl Drop for Agent {
+    /// Kill any still-running background tasks. Their children also carry
+    /// `kill_on_drop`; this makes the teardown explicit and immediate.
+    fn drop(&mut self) {
+        self.ctx.tasks.kill_all();
+    }
 }
 
 /// Read the persistent memory index (MEMORY.md) for `project_root`, if any
@@ -1291,6 +1340,16 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                 AgentEvent::TodoUpdated(items) => {
                     printer_spinner.println(&crate::tools::todo::summary_line(&items));
                 }
+                AgentEvent::TaskFinished {
+                    id,
+                    command,
+                    status,
+                } => {
+                    printer_spinner.println(&format!(
+                        "⏺ background task #{id} finished ({}): {command}",
+                        status.describe()
+                    ));
+                }
                 AgentEvent::Done { reason } => {
                     printer_spinner.hide();
                     println!("\n[turn done: {reason:?}]");
@@ -1364,6 +1423,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             .wrapping_add(u64::from(iteration));
         spinner.set_verb(config.ui.spinner_verb(verb_seed));
         spinner.show();
+
+        // Surface background tasks that finished between cycles (the turn
+        // loop also drains at the top of every step).
+        agent.drain_background_tasks(&tx).await;
 
         let turn_started = Instant::now();
         let turn_prompt = input.clone();
@@ -2651,6 +2714,98 @@ mod tests {
         assert!(
             !agent.history[0].content.contains("## Working todo list"),
             "no instruction without the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_task_finish_is_injected_into_the_next_step() {
+        use crate::tools::tasks::TaskStatus;
+
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                // Turn 1: start a background task, then stop.
+                vec![tool_call_chunk(
+                    "execute",
+                    json!({ "command": "echo task-payload", "run_in_background": true }),
+                )],
+                vec![final_chunk("started it")],
+                // Turn 2: plain reply (the notification precedes it).
+                vec![final_chunk("noted the finish")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent
+            .run_turn("run it in the background", tx)
+            .await
+            .expect("turn ok");
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("Background task #1 started: echo task-payload"),
+            "spawn returns immediately with the id: {feedback}"
+        );
+
+        // Wait for the echo to actually finish in the registry.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.ctx.tasks.status(1) == Some(TaskStatus::Running) {
+            assert!(Instant::now() < deadline, "background task finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("anything new?", tx).await.expect("turn ok");
+
+        // The next step's request carried the finished-task notification
+        // (with the output tail) ahead of the model call.
+        {
+            let requests = provider.requests.lock().unwrap();
+            let request = requests.last().expect("turn 2 request");
+            let note = request
+                .messages
+                .iter()
+                .find(|m| {
+                    m.role == Role::System && m.content.contains("background task #1 finished")
+                })
+                .expect("notification in history");
+            assert!(note.content.contains("(exit 0)"), "{}", note.content);
+            assert!(
+                note.content.contains("task-payload"),
+                "output tail included: {}",
+                note.content
+            );
+        }
+
+        // The surfaces saw a TaskFinished event.
+        let mut finished = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::TaskFinished {
+                id,
+                command,
+                status,
+            } = event
+            {
+                finished.push((id, command, status));
+            }
+        }
+        assert_eq!(
+            finished,
+            [(1, "echo task-payload".to_string(), TaskStatus::Done(0))]
+        );
+
+        // Drained exactly once: nothing left for later steps.
+        assert!(agent.ctx.tasks.drain_completed().is_empty());
+        assert_eq!(
+            agent
+                .history()
+                .iter()
+                .filter(|m| m.content.contains("background task #1 finished"))
+                .count(),
+            1,
+            "the notification appears exactly once in history"
         );
     }
 

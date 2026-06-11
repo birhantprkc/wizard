@@ -146,9 +146,13 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `edit_file` | Search-and-replace edit |
 | `list_files` | Directory listing with glob filter |
 | `search_files` | Ripgrep/grep content search |
-| `execute` | Run shell command with timeout |
+| `execute` | Run shell command with timeout; `run_in_background` detaches it as a background task ([tasks.md](tasks.md)) |
 | `git_status` | Working tree status |
 | `git_diff` | Staged/unstaged diff |
+| `web_fetch` | Fetch a URL, HTML converted to markdown; SSRF-guarded ([web.md](web.md)) |
+| `web_search` | Web search via DuckDuckGo (default), Brave, or Tavily ([web.md](web.md)) |
+| `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
+| `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
 
 Both modes auto-approve tool calls by default. Genie is conversational and interactive; sovereign works continuously without human input.
 
