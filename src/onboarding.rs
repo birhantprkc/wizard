@@ -47,12 +47,12 @@ pub enum ProviderChoice {
     LlamaCpp,
     /// Local Ollama server.
     Ollama,
-    /// OpenRouter (OpenAI-compatible, one key for many models).
-    OpenRouter,
     /// OpenAI or any OpenAI-compatible endpoint.
     Openai,
     /// Anthropic Messages API.
     Anthropic,
+    /// OpenRouter with a plain API key.
+    OpenRouter,
     /// xAI (Grok) with a plain API key.
     Xai,
     /// xAI via account sign-in (OAuth, `wizard --login xai`).
@@ -164,9 +164,6 @@ const ANTHROPIC_MODELS: &[&str] = &[
 ];
 /// xAI (Grok) model options offered in the picker (first is the default).
 const XAI_MODELS: &[&str] = &["grok-4.3", "grok-code-fast-1"];
-/// OpenRouter model options offered in the picker (first is the default —
-/// `openrouter/auto` lets OpenRouter route to a suitable model).
-const OPENROUTER_MODELS: &[&str] = &["openrouter/auto", "x-ai/grok-4.3", "openai/gpt-4o"];
 /// Ollama tier options offered alongside the hardware-suggested default.
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
@@ -181,7 +178,7 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default base URL for the xAI API.
 const XAI_BASE_URL: &str = crate::llm::xai_oauth::DEFAULT_BASE_URL;
 /// Default base URL for the OpenRouter API.
-const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const OPENROUTER_BASE_URL: &str = crate::llm::openrouter::DEFAULT_BASE_URL;
 /// Default env var name for the OpenAI key.
 const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
 /// Default env var name for the Anthropic key.
@@ -189,7 +186,9 @@ const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Default env var name for the xAI key.
 const XAI_KEY_ENV: &str = crate::llm::xai_oauth::DEFAULT_KEY_ENV;
 /// Default env var name for the OpenRouter key.
-const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+const OPENROUTER_KEY_ENV: &str = crate::llm::openrouter::DEFAULT_KEY_ENV;
+/// Default OpenRouter model (the Auto Router).
+const OPENROUTER_MODEL: &str = crate::llm::openrouter::DEFAULT_MODEL;
 
 // ---------------------------------------------------------------------------
 // TUI entry point
@@ -242,7 +241,7 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             "one pick — llama.cpp & Ollama set up for you, model sized to this machine; \
              private, no API key",
         ),
-        Opt::new("OpenRouter", "one key, many models — OPENROUTER_API_KEY"),
+        Opt::new("OpenRouter", "hundreds of models via OPENROUTER_API_KEY"),
         Opt::new("xAI (Grok), API key", "grok-4.3 via XAI_API_KEY"),
         Opt::new("xAI account sign-in", "grok-4.3 via OAuth, no API key"),
         Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
@@ -574,45 +573,6 @@ fn collect_local_auto() -> ProviderAnswers {
     }
 }
 
-fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
-    let models: Vec<(String, String)> = OPENROUTER_MODELS
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            (
-                (*m).to_string(),
-                if i == 0 {
-                    "routes to a suitable model (default)".to_string()
-                } else {
-                    String::new()
-                },
-            )
-        })
-        .collect();
-    let model = match pick_model(terminal, "OpenRouter model.", &models, OPENROUTER_MODELS[0])? {
-        Some(model) => model,
-        None => return Ok(None),
-    };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        OPENROUTER_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::OpenRouter,
-        provider_name: "openrouter".to_string(),
-        kind: ProviderKind::Openai,
-        base_url: OPENROUTER_BASE_URL.to_string(),
-        model,
-        api_key_env: Some(api_key_env),
-        gguf_path: None,
-    }))
-}
-
 fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let (suggested, explanation) = hardware::suggest_gguf();
     let dir = models_dir();
@@ -823,6 +783,40 @@ fn collect_anthropic(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     }))
 }
 
+fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let models: Vec<(String, String)> = vec![(
+        OPENROUTER_MODEL.to_string(),
+        "Auto Router picks a model per prompt (default)".to_string(),
+    )];
+    let model = match pick_model(
+        terminal,
+        "OpenRouter model (any vendor/model tag from openrouter.ai/models).",
+        &models,
+        OPENROUTER_MODEL,
+    )? {
+        Some(model) => model,
+        None => return Ok(None),
+    };
+    let api_key_env = match text_input(
+        terminal,
+        "API key env var",
+        "Wizard reads your key from this env var (never stored on disk).",
+        OPENROUTER_KEY_ENV,
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    Ok(Some(ProviderAnswers {
+        provider: ProviderChoice::OpenRouter,
+        provider_name: "openrouter".to_string(),
+        kind: ProviderKind::OpenRouter,
+        base_url: OPENROUTER_BASE_URL.to_string(),
+        model,
+        api_key_env: Some(api_key_env),
+        gguf_path: None,
+    }))
+}
+
 fn collect_xai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let models: Vec<(String, String)> = XAI_MODELS
         .iter()
@@ -986,7 +980,10 @@ fn print_summary(config: &Config) {
         ProviderKind::Ollama => {
             println!("  • pull the model:  ollama pull {}", provider.model);
         }
-        ProviderKind::Openai | ProviderKind::Anthropic | ProviderKind::Xai => {
+        ProviderKind::Openai
+        | ProviderKind::Anthropic
+        | ProviderKind::OpenRouter
+        | ProviderKind::Xai => {
             if let Some(env) = provider.api_key_env.as_deref() {
                 println!("  • export your key: export {env}=...");
             }
@@ -1458,6 +1455,32 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_answers_build_the_expected_provider() {
+        let answers = Answers {
+            provider: ProviderChoice::OpenRouter,
+            provider_name: "openrouter".to_string(),
+            kind: ProviderKind::OpenRouter,
+            base_url: OPENROUTER_BASE_URL.to_string(),
+            model: OPENROUTER_MODEL.to_string(),
+            api_key_env: Some(OPENROUTER_KEY_ENV.to_string()),
+            ..base_answers()
+        };
+        let config = answers.into_config();
+        assert_eq!(config.active().name, "openrouter");
+        assert_eq!(config.active().kind, ProviderKind::OpenRouter);
+        assert_eq!(config.active().base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.active().model, "openrouter/auto");
+        assert_eq!(
+            config.active().api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        // Legacy Ollama fields stay untouched for cloud choices.
+        let defaults = Config::default();
+        assert_eq!(config.model, defaults.model);
+        assert_eq!(config.ollama_host, defaults.ollama_host);
+    }
+
+    #[test]
     fn telegram_gateway_persists_into_config() {
         let answers = Answers {
             gateway_kind: GatewayKind::Telegram,
@@ -1499,32 +1522,6 @@ mod tests {
     #[test]
     fn anthropic_default_model_is_latest_claude() {
         assert_eq!(ANTHROPIC_MODELS[0], "claude-fable-5");
-    }
-
-    #[test]
-    fn openrouter_answers_build_an_openai_compatible_provider() {
-        let answers = Answers {
-            provider: ProviderChoice::OpenRouter,
-            provider_name: "openrouter".to_string(),
-            kind: ProviderKind::Openai,
-            base_url: OPENROUTER_BASE_URL.to_string(),
-            model: OPENROUTER_MODELS[0].to_string(),
-            api_key_env: Some(OPENROUTER_KEY_ENV.to_string()),
-            ..base_answers()
-        };
-        let defaults = Config::default();
-        let config = answers.into_config();
-        assert_eq!(config.active().name, "openrouter");
-        assert_eq!(config.active().kind, ProviderKind::Openai);
-        assert_eq!(config.active().base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(config.active().model, "openrouter/auto");
-        assert_eq!(
-            config.active().api_key_env.as_deref(),
-            Some("OPENROUTER_API_KEY")
-        );
-        // Legacy local fields untouched.
-        assert_eq!(config.model, defaults.model);
-        assert_eq!(config.ollama_host, defaults.ollama_host);
     }
 
     fn tier(file: &'static str) -> GgufModel {

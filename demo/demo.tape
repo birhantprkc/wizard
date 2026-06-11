@@ -1,10 +1,11 @@
 # Wizard TUI demo — record with:
 #   nix shell nixpkgs#vhs nixpkgs#ttyd nixpkgs#ffmpeg -c vhs demo/demo.tape
-# (run from the repo root)
+# (run from the repo root, with a release binary at target/release/wizard)
 #
-# Model: qwen3:0.6b is the smallest model that fits this machine (14 GiB RAM).
-# For a launch-quality recording on a GPU box, change the Env line below to a
-# qwen3.6-tier model — nothing else in the tape needs to change.
+# The recording uses whatever provider ~/.wizard/config.toml activates —
+# auto-approve is the default, so the agent edits without a modal. Make sure
+# the active provider answers before recording (cloud account signed in, or a
+# local server running).
 
 Output demo/demo.gif
 
@@ -15,15 +16,17 @@ Set Height 680
 Set Padding 14
 Set Framerate 20
 Set TypingSpeed 40ms
-Set Theme { "name": "wizard-dark", "background": "#101014", "foreground": "#e8e6f0", "cursor": "#d36ee6", "black": "#16161c", "red": "#f25e74", "green": "#5fd6a0", "yellow": "#e6c36e", "blue": "#7aa5f0", "magenta": "#d36ee6", "cyan": "#6ed6e6", "white": "#d8d6e0", "brightBlack": "#4a4a56", "brightRed": "#ff7a8e", "brightGreen": "#7af0ba", "brightYellow": "#ffd98e", "brightBlue": "#9ec0ff", "brightMagenta": "#ea8ef5", "brightCyan": "#8ef0ff", "brightWhite": "#f4f2fa" }
-
-Env WIZARD_MODEL "qwen3:0.6b"
+# Palette mirrors the site's warm monochrome (bg #0b0b0a, cream #e9e6df,
+# dim #94908a, faint #55524b). Ratatui maps White -> brightWhite, Gray ->
+# white, DarkGray -> brightBlack, so those slots carry the bright/dim/faint
+# text tiers.
+Set Theme { "name": "wizard-warm", "background": "#0b0b0a", "foreground": "#e9e6df", "cursor": "#e9e6df", "black": "#11110f", "red": "#e06a55", "green": "#a3b285", "yellow": "#d6b36a", "blue": "#95a3b3", "magenta": "#b59a8e", "cyan": "#9cb3a8", "white": "#94908a", "brightBlack": "#55524b", "brightRed": "#f0836b", "brightGreen": "#b8c79a", "brightYellow": "#e8c98a", "brightBlue": "#aebccb", "brightMagenta": "#c9ada0", "brightCyan": "#b0c7bc", "brightWhite": "#f1eee6" }
 
 # --- hidden setup: throwaway copy of the sample repo --------------------------
 Hide
-Type "mkdir -p /tmp/wizard-demo-bin && ln -sf /home/gradient/projects/ai/wizard/target/release/wizard /tmp/wizard-demo-bin/wizard && export PATH=/tmp/wizard-demo-bin:$PATH"
+Type "mkdir -p /tmp/wizard-demo-bin && ln -sf ${WIZARD_DEMO_BIN:-$PWD/target/release/wizard} /tmp/wizard-demo-bin/wizard && export PATH=/tmp/wizard-demo-bin:$PATH"
 Enter
-Type "rm -rf /tmp/wizard-demo && cp -r /home/gradient/projects/ai/wizard/demo/sample-project /tmp/wizard-demo && cd /tmp/wizard-demo && git init -q && git add -A && git -c user.name=Demo -c user.email=demo@example.com commit -qm initial && clear"
+Type "rm -rf /tmp/wizard-demo && cp -r ${WIZARD_DEMO_SRC:-$PWD/demo}/sample-project /tmp/wizard-demo && cd /tmp/wizard-demo && git init -q && git add -A && git -c user.name=Demo -c user.email=demo@example.com commit -qm initial && clear"
 Enter
 Sleep 1s
 Show
@@ -32,32 +35,40 @@ Show
 Type "wizard"
 Sleep 800ms
 Enter
-Sleep 4.5s
+Sleep 4s
 Screenshot demo/frame-1.png
+Sleep 500ms
+
+# --- providers at a glance ----------------------------------------------------
+Type@60ms "/provider"
+Sleep 800ms
+Enter
+Sleep 2.5s
+Screenshot demo/frame-2.png
 Sleep 1s
 
 # --- ask for the fix ----------------------------------------------------------
-Type@45ms 'In main.py, replace "a - b" with "a + b" to fix the add() bug.'
+Type@45ms 'Read main.py and fix the add() bug: it subtracts instead of adding.'
 Sleep 1.2s
 Enter
 
-# wait for the approval modal (edit_file is gated in genie mode)
-Wait+Screen@90s /y approve/
-Screenshot demo/frame-2.png
-Sleep 4s
-Type "y"
-
-# let the agent finish its reply (streaming)
-Sleep 14s
+# spinner verb while the agent works (no approval modal — edits apply directly)
+Sleep 3s
 Screenshot demo/frame-3.png
+
+# let the agent edit and finish its reply; the idle footer ("history") only
+# returns once the turn is over
+Wait+Screen@120s /history/
+Sleep 2s
+Screenshot demo/frame-4.png
 Sleep 2s
 
 # --- show the diff sidebar ----------------------------------------------------
 Type@60ms "/diff"
-Sleep 800ms
+Sleep 1s
 Enter
-Sleep 3.5s
-Screenshot demo/frame-4.png
+Sleep 4s
+Screenshot demo/frame-5.png
 Sleep 4s
 
 # --- quit ---------------------------------------------------------------------

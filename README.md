@@ -4,7 +4,7 @@
 
 **One line. Your sovereign agent. Self-extending. Bring any model.**
 
-![Wizard fixing a bug: prompt, approval modal, tool call, diff](demo/demo.gif)
+![Wizard fixing a bug: provider list, prompt, live edit, diff](demo/demo.gif)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 ## Why Wizard
 
-**Any provider, switchable live.** The agent loop speaks the OpenAI-compatible chat API (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), so any compatible endpoint works: OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, plus Ollama (`kind = "ollama"`, native API), Anthropic, and xAI (`kind = "xai"` with an API key, or `kind = "xaioauth"` to sign in with your xAI account via `wizard --login xai`, no API key needed). `/provider add` registers a new endpoint, `/provider use` switches the live agent to it, and API keys are read from environment variables rather than stored on disk. Running a model locally is one fully-managed option: pick Local in onboarding (or preinstall it with `WIZARD_LOCAL=1` at install time) and Wizard downloads a GGUF sized to your hardware and manages `llama-server`'s lifecycle itself: when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit so the next launch is instant.
+**Any provider, switchable live.** The agent loop speaks the OpenAI-compatible chat API (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), so any compatible endpoint works: OpenAI, Groq, vLLM, LM Studio, llama.cpp, plus OpenRouter (`kind = "openrouter"`, hundreds of models behind one key, with attribution headers sent automatically), Ollama (`kind = "ollama"`, native API), Anthropic, and xAI (`kind = "xai"` with an API key, or `kind = "xaioauth"` to sign in with your xAI account via `wizard --login xai`, no API key needed). `/provider add` registers a new endpoint, `/provider use` switches the live agent to it, and API keys are read from environment variables rather than stored on disk. Running a model locally is one fully-managed option: pick Local in onboarding (or preinstall it with `WIZARD_LOCAL=1` at install time) and Wizard downloads a GGUF sized to your hardware and manages `llama-server`'s lifecycle itself: when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit so the next launch is instant.
 
 **Onboarding from scratch.** The first run (or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks which provider to use (Local is one pick — no model question), then messaging gateway and mode, and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
 
@@ -92,11 +92,12 @@ wizard --onboard
 wizard --gateway
 ```
 
-Add or switch model providers at any time from inside the TUI, with any OpenAI-compatible endpoint, Anthropic, or xAI:
+Add or switch model providers at any time from inside the TUI, with any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
 /provider add xai xai https://api.x.ai/v1 grok-4.3 XAI_API_KEY
+/provider add openrouter openrouter https://openrouter.ai/api/v1 openrouter/auto OPENROUTER_API_KEY
 /provider use openai          # switch the live agent to it
 /provider list                # show configured providers
 ```
@@ -124,7 +125,7 @@ Picking Local in onboarding (or installing with `WIZARD_LOCAL=1`) detects GPU VR
 
 Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or point `gguf_path` at any GGUF ([BYOM](docs/byom.md)). Prefer Ollama? `WIZARD_USE_OLLAMA=1` at install time sets up the same auto-tiered model on Ollama instead. Full details in [docs/getting-started.md](docs/getting-started.md).
 
-**Migrating from Ollama?** An explicit `[[providers]]` entry with `kind = "ollama"` keeps working exactly as before. The synthesized local default is llama.cpp: a legacy config that only sets top-level `model` / `ollama_host` now resolves to `llama-server` at `http://127.0.0.1:8080` (set `gguf_path` so Wizard can start it for you). To stay on Ollama, add the provider explicitly: `/provider add local ollama http://127.0.0.1:11434 <model>`. And if the local backend isn't installed or can't start, Wizard doesn't give up: it falls back to any configured cloud provider, then to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` from the environment, and finally opens setup so you can bring your own provider.
+**Migrating from Ollama?** An explicit `[[providers]]` entry with `kind = "ollama"` keeps working exactly as before. The synthesized local default is llama.cpp: a legacy config that only sets top-level `model` / `ollama_host` now resolves to `llama-server` at `http://127.0.0.1:8080` (set `gguf_path` so Wizard can start it for you). To stay on Ollama, add the provider explicitly: `/provider add local ollama http://127.0.0.1:11434 <model>`. And if the local backend isn't installed or can't start, Wizard doesn't give up: it falls back to any configured cloud provider, then to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` / `OPENROUTER_API_KEY` from the environment, and finally opens setup so you can bring your own provider.
 
 ---
 
@@ -134,7 +135,7 @@ Verified against each tool's documentation as of June 2026:
 
 | | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
 |---|---|---|---|---|
-| Providers | Any OpenAI-compatible endpoint + Anthropic + xAI (API key or account sign-in), switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
+| Providers | Any OpenAI-compatible endpoint + OpenRouter + Anthropic + xAI (API key or account sign-in), switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
 | MCP | Yes: stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes: one of the earliest and deepest integrations, 70+ documented extensions | Yes: local + remote servers, OAuth for remote |
 | Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | None | Extensions and recipes via MCP | TypeScript/JS plugin system |
 | Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |

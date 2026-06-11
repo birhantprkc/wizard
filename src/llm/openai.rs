@@ -115,6 +115,26 @@ impl OpenAiProvider {
         }
     }
 
+    /// Rebuild the inner HTTP client with `headers` sent on every request
+    /// (e.g. OpenRouter's attribution headers). Invalid header names or
+    /// values are skipped.
+    pub fn with_headers(mut self, headers: &[(&str, &str)]) -> Self {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        for &(name, value) in headers {
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::try_from(name), HeaderValue::try_from(value))
+            {
+                map.insert(name, value);
+            }
+        }
+        self.http = reqwest::Client::builder()
+            .default_headers(map)
+            .build()
+            .unwrap_or_default();
+        self
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -596,6 +616,26 @@ mod tests {
             "xai",
         );
         assert_eq!(provider.label(), "xai:grok-4.3");
+    }
+
+    #[test]
+    fn with_headers_keeps_url_and_label() {
+        let provider = provider().with_headers(&[
+            ("HTTP-Referer", "https://example.com"),
+            ("X-Title", "Wizard"),
+        ]);
+        assert_eq!(
+            provider.url("/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(provider.label(), "openai:gpt-4o");
+    }
+
+    #[test]
+    fn with_headers_skips_invalid_headers() {
+        // An invalid name/value must not panic or break the client.
+        let provider = provider().with_headers(&[("bad header", "x"), ("X-Ok", "bad\nvalue")]);
+        assert_eq!(provider.label(), "openai:gpt-4o");
     }
 
     #[tokio::test]

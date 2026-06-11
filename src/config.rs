@@ -14,6 +14,7 @@ use crate::llm::anthropic::AnthropicProvider;
 use crate::llm::llamacpp::LlamaCppProvider;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai::{OpenAiProvider, StaticToken};
+use crate::llm::openrouter;
 use crate::llm::provider::LlmProvider;
 use crate::llm::xai_oauth;
 
@@ -74,6 +75,9 @@ pub enum ProviderKind {
     Openai,
     /// Anthropic Messages API.
     Anthropic,
+    /// OpenRouter's OpenAI-compatible API at `https://openrouter.ai/api/v1`
+    /// with a plain API key (default env var `OPENROUTER_API_KEY`).
+    OpenRouter,
     /// xAI (Grok) Chat Completions at `https://api.x.ai/v1` with a plain API
     /// key (default env var `XAI_API_KEY`).
     Xai,
@@ -89,6 +93,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::Ollama => write!(f, "ollama"),
             ProviderKind::Openai => write!(f, "openai"),
             ProviderKind::Anthropic => write!(f, "anthropic"),
+            ProviderKind::OpenRouter => write!(f, "openrouter"),
             ProviderKind::Xai => write!(f, "xai"),
             ProviderKind::XaiOauth => write!(f, "xaioauth"),
         }
@@ -211,7 +216,8 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     /// Base URL: llamacpp `http://127.0.0.1:8080`; ollama
     /// `http://127.0.0.1:11434`; openai `https://api.openai.com/v1`;
-    /// anthropic `https://api.anthropic.com`; xai / xaioauth
+    /// anthropic `https://api.anthropic.com`; openrouter
+    /// `https://openrouter.ai/api/v1`; xai / xaioauth
     /// `https://api.x.ai/v1`.
     pub base_url: String,
     /// Model tag.
@@ -284,6 +290,16 @@ impl ProviderConfig {
                     );
                 }
                 Ok(Arc::new(AnthropicProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    key,
+                )))
+            }
+            // OpenRouter speaks the OpenAI-compatible Chat Completions API;
+            // the helper adds the attribution headers.
+            ProviderKind::OpenRouter => {
+                let key = self.cloud_key(openrouter::DEFAULT_KEY_ENV);
+                Ok(Arc::new(openrouter::provider(
                     self.base_url.clone(),
                     self.model.clone(),
                     key,
@@ -904,12 +920,39 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_kind_round_trips_through_toml() {
+        let original = Config {
+            providers: vec![ProviderConfig {
+                name: "openrouter".to_string(),
+                kind: ProviderKind::OpenRouter,
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                model: "openrouter/auto".to_string(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                gguf_path: None,
+            }],
+            active_provider: Some("openrouter".to_string()),
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&original).expect("serialize");
+        // The serde name is what the /provider parser and Display use.
+        assert!(raw.contains("kind = \"openrouter\""), "raw: {raw}");
+        let parsed: Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(parsed.providers[0].kind, ProviderKind::OpenRouter);
+        assert_eq!(
+            parsed.providers[0].api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(parsed.active().kind, ProviderKind::OpenRouter);
+    }
+
+    #[test]
     fn provider_kind_display_matches_serde_names() {
         for (kind, name) in [
             (ProviderKind::LlamaCpp, "llamacpp"),
             (ProviderKind::Ollama, "ollama"),
             (ProviderKind::Openai, "openai"),
             (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::OpenRouter, "openrouter"),
             (ProviderKind::Xai, "xai"),
             (ProviderKind::XaiOauth, "xaioauth"),
         ] {

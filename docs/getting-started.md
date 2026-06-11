@@ -157,7 +157,7 @@ The local default is llama.cpp; Ollama stays fully supported but is opt-in:
 
 - Explicit `[[providers]]` entries with `kind = "ollama"` behave exactly as before.
 - A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080`; add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
-- If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` from the environment, then interactive setup.
+- If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` / `OPENROUTER_API_KEY` from the environment, then interactive setup.
 
 To switch an existing install to llama.cpp, add a provider from the TUI and point it at a GGUF:
 
@@ -180,7 +180,7 @@ Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speak
 
 ## Using a cloud or remote provider
 
-Any OpenAI-compatible endpoint, Anthropic, or xAI works. Add one from the TUI and switch to it:
+Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. Add one from the TUI and switch to it:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
@@ -189,6 +189,17 @@ Any OpenAI-compatible endpoint, Anthropic, or xAI works. Add one from the TUI an
 ```
 
 The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding offers the same choices interactively — the default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
+
+### Using OpenRouter
+
+OpenRouter serves hundreds of hosted models behind one OpenAI-compatible endpoint and one API key:
+
+```
+/provider add openrouter openrouter https://openrouter.ai/api/v1 openrouter/auto OPENROUTER_API_KEY
+/provider use openrouter
+```
+
+`openrouter/auto` is OpenRouter's Auto Router, which picks a model per prompt; any `vendor/model` tag from openrouter.ai/models works instead. Wizard sends OpenRouter's recommended attribution headers (`HTTP-Referer`, `X-Title`) on every request.
 
 ### Signing in with an xAI account
 

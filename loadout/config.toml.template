@@ -1,35 +1,43 @@
 # Wizard multi-provider config template (reference) — lands at ~/.wizard/config.toml
 #
-# Not consumed by install.sh, which writes its own config; this template is the
-# fuller, annotated reference used by config distributions (e.g. the
-# teddytennant/wizard-arsenal fork) that substitute a model and ship it as-is.
+# Not consumed by install.sh, which writes its own config; this is the fuller,
+# annotated reference for hand-written configs and for installers that
+# substitute a model and ship it as-is.
 #
-# __MODEL__ is substituted by such an installer with the Ollama model tier it
-# selected for your hardware (largest single-GPU-fitting Qwen, or the smallest
-# tier on CPU-only / undetectable systems).
+# __MODEL__ is substituted by such an installer with the model tier it selected
+# for your hardware (largest single-GPU-fitting Qwen, or the smallest tier on
+# CPU-only / undetectable systems).
 
 mode = "genie"
 auto_approve = false
 max_steps = 25
 
-# Fallback for Wizard builds that predate multi-provider support: these
-# top-level keys are read by older binaries that don't understand [[providers]].
-model = "__MODEL__"
-ollama_host = "http://127.0.0.1:11434"
-
 # Which provider Wizard talks to. Switch live in the TUI with /provider, or
 # point this at one of the [[providers]] blocks below by name.
 active_provider = "local"
 
-# --- Local Ollama (default) --------------------------------------------------
-# Fully local, no API key. The installer pulled this model for you.
+# --- Local llama.cpp (default) -------------------------------------------------
+# Fully local, no API key. Wizard manages the llama-server lifecycle itself:
+# if nothing answers at base_url, it starts llama-server with gguf_path and
+# waits for the model to load.
 [[providers]]
 name = "local"
-kind = "ollama"
-base_url = "http://127.0.0.1:11434"
+kind = "llamacpp"
+base_url = "http://127.0.0.1:8080"
 model = "__MODEL__"
+# gguf_path = "/path/to/model.gguf"
 
-# --- Cloud providers (optional) ----------------------------------------------
+# --- Local Ollama (opt-in) -----------------------------------------------------
+# Uncomment to use Ollama's native /api/chat instead of llama.cpp, then set
+# active_provider = "ollama-local" (or switch with /provider).
+
+# [[providers]]
+# name = "ollama-local"
+# kind = "ollama"
+# base_url = "http://127.0.0.1:11434"
+# model = "__MODEL__"
+
+# --- Cloud providers (optional) ------------------------------------------------
 # Uncomment a block and set active_provider to its name (or use /provider) to
 # route through a hosted model. The API key is read from the named environment
 # variable at runtime and is never written to this file.
@@ -47,3 +55,10 @@ model = "__MODEL__"
 # base_url = "https://api.anthropic.com"
 # model = "claude-fable-5"
 # api_key_env = "ANTHROPIC_API_KEY"
+
+# [[providers]]
+# name = "xai"
+# kind = "xai"
+# base_url = "https://api.x.ai/v1"
+# model = "grok-4.3"
+# api_key_env = "XAI_API_KEY"
