@@ -1,15 +1,20 @@
 //! Tool-call dispatch pipeline.
 //!
 //! Every tool call in every mode (TUI, headless, gateway) funnels through
-//! [`Dispatcher::dispatch`]. The pipeline runs in stages so upcoming
-//! features slot in between them, in order: plan-mode gate → pre-tool hooks
-//! → checkpoint snapshot → execute → post-tool hooks → failure bookkeeping.
+//! [`Dispatcher::dispatch`]. The pipeline runs in stages, in order: pre-tool
+//! hooks (may rewrite arguments or block) → execute → post-tool hooks (may
+//! append context) → failure bookkeeping. The remaining seams — the
+//! plan-mode gate before the pre-hooks and the checkpoint snapshot after
+//! them — slot in here when they land.
+
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{AgentEvent, DoneReason, emit, normalize_args};
 use crate::config::Mode;
+use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::ToolCall;
 use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
 
@@ -27,6 +32,8 @@ const TOOL_FAILURE_TRIP: u32 = 8;
 /// registry and the failure counters feeding the circuit breakers.
 pub struct Dispatcher {
     registry: ToolRegistry,
+    /// Lifecycle hooks, shared with the agent and the subagent spawner.
+    hooks: Arc<HookEngine>,
     /// Sovereign runs add the identical-failure circuit breaker.
     mode: Mode,
     /// Signature of the last failing tool call and how many consecutive
@@ -61,9 +68,10 @@ impl DispatchOutcome {
 }
 
 impl Dispatcher {
-    pub fn new(registry: ToolRegistry, mode: Mode) -> Self {
+    pub fn new(registry: ToolRegistry, mode: Mode, hooks: Arc<HookEngine>) -> Self {
         Self {
             registry,
+            hooks,
             mode,
             failure_streak: None,
             tool_failures: ToolFailureCounter::default(),
@@ -99,11 +107,40 @@ impl Dispatcher {
         events: &mpsc::Sender<AgentEvent>,
     ) -> DispatchOutcome {
         let name = call.function.name.clone();
-        let args = normalize_args(&call.function.arguments);
+        let mut args = normalize_args(&call.function.arguments);
 
-        let Some(output) = self.execute(&name, args.clone(), ctx, events).await else {
+        // Pre-tool hooks: may rewrite the arguments or veto the call. A veto
+        // feeds back to the model as an ordinary tool error (not fatal), so
+        // the failure breakers cover repeated blocked calls too.
+        match self
+            .hooks
+            .pre_tool_use(&name, &args, self.mode, Some(events))
+            .await
+        {
+            PreToolUse::Continue(updated) => {
+                if let Some(updated) = updated {
+                    args = updated;
+                }
+            }
+            PreToolUse::Block(reason) => {
+                let output = ToolOutput::error(format!("blocked by pre_tool_use hook: {reason}"));
+                return self.bookkeep(&name, &args, output, events).await;
+            }
+        }
+
+        let Some(mut output) = self.execute(&name, args.clone(), ctx, events).await else {
             return DispatchOutcome::stopped();
         };
+
+        // Post-tool hooks: stdout becomes extra context on the tool result.
+        if let Some(extra) = self
+            .hooks
+            .post_tool_use(&name, &args, self.mode, Some(events))
+            .await
+        {
+            crate::hooks::append_context(&mut output.content, &extra);
+        }
+
         self.bookkeep(&name, &args, output, events).await
     }
 

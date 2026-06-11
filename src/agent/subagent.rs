@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{Config, Mode};
+use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role};
 use crate::tools::{Tool, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
@@ -141,12 +142,15 @@ pub fn scoped_registry(parent: &ToolRegistry, scope: Option<&[String]>) -> ToolR
 }
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
-/// scoped registry, own step budget.
+/// scoped registry, own step budget. The parent's lifecycle `hooks` apply to
+/// the subagent's tool calls too (their activity is not surfaced as events —
+/// the subagent reports back as one tool result).
 pub async fn spawn(
     config: &SubagentConfig,
     task: &str,
     client: &Arc<dyn LlmProvider>,
     registry: &ToolRegistry,
+    hooks: &HookEngine,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
     let model = Config::load()
@@ -238,10 +242,32 @@ pub async fn spawn(
 
         for call in tool_calls {
             let name = call.function.name.clone();
-            let args = normalize_args(&call.function.arguments);
-            let output = match scoped.execute(&name, args, ctx).await {
-                Ok(output) => output,
-                Err(err) => ToolOutput::error(err.to_string()),
+            let mut args = normalize_args(&call.function.arguments);
+            // Same hook pipeline as the parent's dispatcher: pre-hooks may
+            // rewrite the arguments or veto, post-hooks may append context.
+            let output = match hooks
+                .pre_tool_use(&name, &args, Mode::Sovereign, None)
+                .await
+            {
+                PreToolUse::Block(reason) => {
+                    ToolOutput::error(format!("blocked by pre_tool_use hook: {reason}"))
+                }
+                PreToolUse::Continue(updated) => {
+                    if let Some(updated) = updated {
+                        args = updated;
+                    }
+                    let mut output = match scoped.execute(&name, args.clone(), ctx).await {
+                        Ok(output) => output,
+                        Err(err) => ToolOutput::error(err.to_string()),
+                    };
+                    if let Some(extra) = hooks
+                        .post_tool_use(&name, &args, Mode::Sovereign, None)
+                        .await
+                    {
+                        crate::hooks::append_context(&mut output.content, &extra);
+                    }
+                    output
+                }
             };
             let body = if output.is_error {
                 format!("Error: {}", output.content)
@@ -277,6 +303,8 @@ pub struct SpawnSubagentTool {
     /// Parent tool set subagents scope down from. Built without the spawn
     /// tool itself, so subagents cannot recurse.
     registry: Arc<ToolRegistry>,
+    /// The parent's lifecycle hooks, applied to subagent tool calls too.
+    hooks: Arc<HookEngine>,
     /// Tool description, including the roster of available subagents.
     description: String,
 }
@@ -286,6 +314,7 @@ impl SpawnSubagentTool {
         configs: Vec<SubagentConfig>,
         client: Arc<dyn LlmProvider>,
         registry: Arc<ToolRegistry>,
+        hooks: Arc<HookEngine>,
     ) -> Self {
         let roster = configs
             .iter()
@@ -300,6 +329,7 @@ impl SpawnSubagentTool {
             configs,
             client,
             registry,
+            hooks,
             description,
         }
     }
@@ -354,12 +384,19 @@ impl Tool for SpawnSubagentTool {
                 ),
             })?;
 
-        let result = spawn(config, &args.task, &self.client, &self.registry, ctx)
-            .await
-            .map_err(|err| ToolError::Execution {
-                tool: "spawn_subagent".to_string(),
-                source: err,
-            })?;
+        let result = spawn(
+            config,
+            &args.task,
+            &self.client,
+            &self.registry,
+            &self.hooks,
+            ctx,
+        )
+        .await
+        .map_err(|err| ToolError::Execution {
+            tool: "spawn_subagent".to_string(),
+            source: err,
+        })?;
 
         let summary = format!(
             "Subagent '{}' {} after {} step(s).\n\n{}",

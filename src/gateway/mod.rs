@@ -130,6 +130,9 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
         .await
         .context("building gateway agent")?;
 
+    // session_start hooks fire once for the whole gateway session.
+    fire_session_hooks(&mut agent, true).await;
+
     let allowed = config.gateway.allowed_chat_ids.clone();
     println!(
         "wizard gateway ({}) — listening for messages (Ctrl-C to stop)",
@@ -142,7 +145,7 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
             biased;
             _ = tokio::signal::ctrl_c() => {
                 println!("\n[gateway stopped]");
-                return Ok(());
+                break;
             }
             result = gateway.poll() => match result {
                 Ok(messages) => {
@@ -183,6 +186,31 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                     break;
                 }
             }
+        }
+    }
+
+    fire_session_hooks(&mut agent, false).await;
+    Ok(())
+}
+
+/// Fire the `session_start` (`start = true`) or `session_end` hooks and
+/// print their activity — the gateway has no long-lived event channel.
+async fn fire_session_hooks(agent: &mut Agent, start: bool) {
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    if start {
+        agent.fire_session_start(&tx).await;
+    } else {
+        agent.fire_session_end(Some(&tx)).await;
+    }
+    drop(tx);
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::HookFired {
+            event,
+            command,
+            outcome,
+        } = event
+        {
+            println!("hook {event}: {outcome} ({command})");
         }
     }
 }

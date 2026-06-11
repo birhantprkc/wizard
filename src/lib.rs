@@ -14,6 +14,7 @@ pub mod event;
 pub mod evolve;
 pub mod gateway;
 pub mod hardware;
+pub mod hooks;
 pub mod llm;
 pub mod local_setup;
 pub mod mcp;

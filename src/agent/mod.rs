@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
 use crate::dispatch::Dispatcher;
+use crate::hooks::{HookEngine, PromptSubmit};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
@@ -63,6 +64,17 @@ pub enum AgentEvent {
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
     Error(String),
+    /// A lifecycle hook did something worth surfacing (rewrote arguments,
+    /// appended context, blocked, or failed). Plain successes are silent.
+    /// Rendered as a dim log line.
+    HookFired {
+        /// Lifecycle event name (e.g. `"pre_tool_use"`).
+        event: &'static str,
+        /// The hook's shell command.
+        command: String,
+        /// What the hook did.
+        outcome: crate::hooks::HookOutcome,
+    },
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -185,6 +197,8 @@ pub struct Agent {
     model: String,
     /// Tool-call pipeline; owns the registry and the failure breakers.
     dispatcher: Dispatcher,
+    /// Lifecycle hooks; the dispatcher and the subagent spawner share it.
+    hooks: Arc<HookEngine>,
     config: Config,
     mode: Mode,
     /// Full conversation including the system prompt at index 0.
@@ -226,7 +240,9 @@ impl Agent {
     /// Build an agent: compose the system prompt from `mode`, `skills`, and
     /// any project `AGENTS.md`; seed history from `session` (resumed
     /// sessions replay their persisted messages under a fresh system
-    /// prompt).
+    /// prompt). `hooks` is loaded by the builders (`crate::hooks::load`) and
+    /// injected so tests can supply their own definitions.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Arc<dyn LlmProvider>,
         registry: ToolRegistry,
@@ -235,6 +251,7 @@ impl Agent {
         project_root: PathBuf,
         session: Session,
         native_tools: bool,
+        hooks: Arc<HookEngine>,
     ) -> Result<Self> {
         let agents_md = read_project_instructions(&project_root);
         let memory_index = read_memory_index(&project_root);
@@ -257,7 +274,8 @@ impl Agent {
         let mut agent = Self {
             client,
             model,
-            dispatcher: Dispatcher::new(registry, config.mode),
+            dispatcher: Dispatcher::new(registry, config.mode, Arc::clone(&hooks)),
+            hooks,
             mode: config.mode,
             config,
             history: Vec::new(),
@@ -310,9 +328,32 @@ impl Agent {
     /// session file.
     pub fn clear(&mut self) -> Result<()> {
         self.session = Session::create(&Config::sessions_dir()?)?;
+        self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
         Ok(())
+    }
+
+    /// The lifecycle-hook engine this agent fires (shared for `/reload`
+    /// registry rebuilds).
+    pub fn hooks(&self) -> &Arc<HookEngine> {
+        &self.hooks
+    }
+
+    /// Fire the `session_start` hooks. Hook stdout is appended to the
+    /// session as system context, visible to the model on every turn.
+    pub async fn fire_session_start(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        if let Some(extra) = self.hooks.session_start(self.mode, Some(events)).await {
+            self.push(ChatMessage::system(format!(
+                "[session_start hook]\n{extra}"
+            )));
+        }
+    }
+
+    /// Fire the `session_end` hooks. `events` is `None` when the surface is
+    /// already torn down (e.g. the TUI terminal was restored).
+    pub async fn fire_session_end(&self, events: Option<&mpsc::Sender<AgentEvent>>) {
+        self.hooks.session_end(self.mode, events).await;
     }
 
     /// Swap the tool registry (after `/reload` or `/evolve`). Refreshes the
@@ -389,7 +430,7 @@ impl Agent {
         if let Some(warning) = self.load_warning.take() {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
-        match self.turn_inner(input, &events).await {
+        let result = match self.turn_inner(input, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
                 Ok(reason)
@@ -405,7 +446,10 @@ impl Agent {
                 .await;
                 Err(err)
             }
-        }
+        };
+        // turn_end hooks: observational, fired however the turn ended.
+        self.hooks.turn_end(self.mode, Some(&events)).await;
+        result
     }
 
     async fn turn_inner(
@@ -413,6 +457,25 @@ impl Agent {
         input: &str,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
+        // user_prompt_submit hooks: may veto the turn before the model sees
+        // the prompt (the message is never pushed to history), or append
+        // extra context to it.
+        let input = match self.hooks.user_prompt_submit(self.mode, Some(events)).await {
+            PromptSubmit::Block(reason) => {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!(
+                        "prompt blocked by user_prompt_submit hook: {reason}"
+                    )),
+                )
+                .await;
+                return Ok(DoneReason::Stopped);
+            }
+            PromptSubmit::Continue(Some(extra)) => {
+                format!("{input}\n\n[user_prompt_submit hook]\n{extra}")
+            }
+            PromptSubmit::Continue(None) => input.to_string(),
+        };
         self.push(ChatMessage::user(input));
         self.compact_if_needed(events).await;
         let max_steps = self.config.max_steps.max(1);
@@ -836,6 +899,25 @@ pub async fn build_headless_agent(
         println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
     }
 
+    // Session first: the hook engine carries its id in every payload.
+    let sessions_dir = Config::sessions_dir()?;
+    let session = if resume {
+        match Session::open_latest(&sessions_dir)? {
+            Some(session) => session,
+            None => Session::create(&sessions_dir)?,
+        }
+    } else {
+        Session::create(&sessions_dir)?
+    };
+
+    // Lifecycle hooks, shared by the agent's dispatcher and the subagent
+    // spawner so subagent tool calls fire the same hooks.
+    let hooks = Arc::new(HookEngine::new(
+        crate::hooks::load(project_root),
+        project_root.to_path_buf(),
+        session.id.clone(),
+    ));
+
     // Tools: natives + scripted + MCP, then the subagent spawner on top.
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
@@ -871,6 +953,7 @@ pub async fn build_headless_agent(
         subagent_configs,
         Arc::clone(&client),
         Arc::clone(&base),
+        Arc::clone(&hooks),
     )));
     registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
         config.clone(),
@@ -886,16 +969,6 @@ pub async fn build_headless_agent(
         Vec::new()
     });
 
-    let sessions_dir = Config::sessions_dir()?;
-    let session = if resume {
-        match Session::open_latest(&sessions_dir)? {
-            Some(session) => session,
-            None => Session::create(&sessions_dir)?,
-        }
-    } else {
-        Session::create(&sessions_dir)?
-    };
-
     Agent::new(
         client,
         registry,
@@ -904,6 +977,7 @@ pub async fn build_headless_agent(
         project_root.to_path_buf(),
         session,
         native_tools,
+        hooks,
     )
 }
 
@@ -981,6 +1055,13 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     printer_spinner.hide();
                     eprintln!("\nwizard error: {message}");
                 }
+                AgentEvent::HookFired {
+                    event,
+                    command,
+                    outcome,
+                } => {
+                    printer_spinner.println(&format!("~ hook {event}: {outcome} ({command})"));
+                }
                 AgentEvent::Done { reason } => {
                     printer_spinner.hide();
                     println!("\n[turn done: {reason:?}]");
@@ -993,6 +1074,9 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         "wizard {} — model {model} @ {endpoint} — task: {goal}",
         config.mode
     );
+
+    // session_start hooks fire once for the whole run.
+    agent.fire_session_start(&tx).await;
 
     // Continuous mode persists a long-lived mission so the loop survives
     // restarts and binary self-replacement (deep evolve re-exec).
@@ -1131,6 +1215,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         }
     }
 
+    // session_end hooks fire however the run ended (including just before a
+    // self-evolve re-exec replaces the process).
+    agent.fire_session_end(Some(&tx)).await;
+
     drop(tx);
     let _ = printer.await;
     spinner.finish();
@@ -1164,6 +1252,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::hooks::{HookDef, HookEvent};
     use crate::llm::{ChatChunk, ChatStream};
 
     /// Temp project dir removed on drop.
@@ -1247,19 +1336,37 @@ mod tests {
 
     fn test_agent(responses: Vec<Vec<ChatChunk>>) -> (Agent, Arc<ScriptedProvider>, TempDir) {
         let tmp = TempDir::new();
+        let (agent, provider) = test_agent_in(&tmp, responses, Vec::new(), ToolRegistry::new());
+        (agent, provider, tmp)
+    }
+
+    /// Build a test agent rooted in `tmp` with injected hook definitions and
+    /// a custom registry.
+    fn test_agent_in(
+        tmp: &TempDir,
+        responses: Vec<Vec<ChatChunk>>,
+        hook_defs: Vec<HookDef>,
+        registry: ToolRegistry,
+    ) -> (Agent, Arc<ScriptedProvider>) {
         let provider = ScriptedProvider::new(responses);
         let session = Session::create(&tmp.0).expect("create session");
+        let hooks = Arc::new(HookEngine::new(
+            hook_defs,
+            tmp.0.clone(),
+            session.id.clone(),
+        ));
         let agent = Agent::new(
             provider.clone(),
-            ToolRegistry::new(),
+            registry,
             Config::default(),
             Vec::new(),
             tmp.0.clone(),
             session,
             true,
+            hooks,
         )
         .expect("build agent");
-        (agent, provider, tmp)
+        (agent, provider)
     }
 
     /// Drain a finished turn's events into (text, errors).
@@ -1274,6 +1381,84 @@ mod tests {
             }
         }
         (text, errors)
+    }
+
+    /// Test tool that records the arguments of every call it receives.
+    struct RecordingTool {
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echo the arguments back (test tool)."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(ToolOutput::ok(format!("echoed {args}")))
+        }
+    }
+
+    /// Registry holding one [`RecordingTool`], plus the shared call log.
+    fn recording_registry() -> (ToolRegistry, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RecordingTool {
+            calls: Arc::clone(&calls),
+        }));
+        (registry, calls)
+    }
+
+    /// `done: true` chunk carrying one tool call.
+    fn tool_call_chunk(name: &str, arguments: Value) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                    },
+                }],
+                tool_name: None,
+            }),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// Write a hook script into `dir` and return the command that runs it
+    /// (via `sh`, so no exec bit is needed).
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write hook script");
+        format!("sh {}", path.display())
+    }
+
+    fn hook(event: HookEvent, matcher: Option<&str>, command: String) -> HookDef {
+        HookDef {
+            event,
+            matcher: matcher.map(str::to_string),
+            command,
+            timeout_secs: None,
+        }
     }
 
     #[test]
@@ -1457,5 +1642,200 @@ mod tests {
     fn loop_control_absent_file_is_none() {
         let tmp = TempDir::new();
         assert_eq!(read_loop_control(&tmp.0), None);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_block_feeds_reason_to_model_as_tool_error() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "block.sh",
+            "echo 'no echoing allowed' >&2\nexit 2\n",
+        );
+        let (registry, calls) = recording_registry();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![final_chunk("understood")],
+            ],
+            vec![hook(HookEvent::PreToolUse, Some("echo"), command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert!(calls.lock().unwrap().is_empty(), "blocked tool never ran");
+
+        // The block reason reached the model as an ordinary tool error.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let feedback = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message");
+        assert!(
+            feedback.content.contains("blocked by pre_tool_use hook"),
+            "{}",
+            feedback.content
+        );
+        assert!(feedback.content.contains("no echoing allowed"));
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_updated_args_rewrite_the_call() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "rewrite.sh",
+            "echo '{\"updated_args\": {\"text\": \"rewritten\"}}'\n",
+        );
+        let (registry, calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "original" }))],
+                vec![final_chunk("done")],
+            ],
+            vec![hook(HookEvent::PreToolUse, None, command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![json!({ "text": "rewritten" })],
+            "the tool ran with the hook's arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_stdout_is_appended_to_the_result() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "annotate.sh", "echo 'lint: all clean'\n");
+        let (registry, calls) = recording_registry();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![final_chunk("done")],
+            ],
+            vec![hook(HookEvent::PostToolUse, Some("echo"), command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(calls.lock().unwrap().len(), 1, "the tool ran normally");
+
+        let requests = provider.requests.lock().unwrap();
+        let feedback = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message");
+        assert!(feedback.content.contains("echoed"), "{}", feedback.content);
+        assert!(
+            feedback.content.contains("lint: all clean"),
+            "hook stdout appended: {}",
+            feedback.content
+        );
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_block_ends_the_turn() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "veto.sh",
+            "echo 'not during business hours' >&2\nexit 2\n",
+        );
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            Vec::new(), // the model must never be asked
+            vec![hook(HookEvent::UserPromptSubmit, None, command)],
+            ToolRegistry::new(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("do the thing", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Stopped);
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(agent.history().len(), 1, "the prompt never entered history");
+
+        let (_text, errors) = drain_events(&mut rx);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("blocked") && e.contains("not during business hours")),
+            "notice emitted: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_stdout_is_appended_to_the_message() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "context.sh", "echo 'remember: deploy is frozen'\n");
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![vec![final_chunk("noted")]],
+            vec![hook(HookEvent::UserPromptSubmit, None, command)],
+            ToolRegistry::new(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("do the thing", tx).await.expect("turn ok");
+
+        let requests = provider.requests.lock().unwrap();
+        let prompt = requests[0].messages.last().expect("user message");
+        assert_eq!(prompt.role, Role::User);
+        assert!(
+            prompt.content.contains("do the thing"),
+            "{}",
+            prompt.content
+        );
+        assert!(
+            prompt.content.contains("remember: deploy is frozen"),
+            "hook context appended: {}",
+            prompt.content
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_timeout_does_not_hang_the_turn() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "slow.sh", "sleep 5\n");
+        let (registry, calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({}))],
+                vec![final_chunk("done")],
+            ],
+            vec![HookDef {
+                event: HookEvent::PreToolUse,
+                matcher: None,
+                command,
+                timeout_secs: Some(1),
+            }],
+            registry,
+        );
+
+        let started = Instant::now();
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(calls.lock().unwrap().len(), 1, "the tool still ran");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the hook was killed at its 1s timeout (took {:?})",
+            started.elapsed()
+        );
     }
 }

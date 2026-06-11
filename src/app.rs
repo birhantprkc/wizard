@@ -20,6 +20,7 @@ use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
+use crate::hooks::HookEngine;
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::memory::MemoryStore;
@@ -1074,6 +1075,13 @@ impl App {
                 self.flush_streaming();
                 self.notice(format!("error: {message}"));
             }
+            AgentEvent::HookFired {
+                event,
+                command,
+                outcome,
+            } => {
+                self.notice(format!("hook {event}: {outcome} ({command})"));
+            }
             AgentEvent::Done { reason } => {
                 self.flush_streaming();
                 self.status.busy = false;
@@ -1173,10 +1181,12 @@ fn load_skill_roots() -> Vec<Skill> {
 
 /// Native + scripted + MCP tools, freshly composed, with the subagent
 /// spawner layered on top. The spawn tool captures the base registry
-/// (without itself) so subagents cannot recurse.
+/// (without itself) so subagents cannot recurse, plus the lifecycle `hooks`
+/// so subagent tool calls fire the same hooks as the parent's.
 async fn build_registry(
     manager: &McpManager,
     client: &Arc<dyn LlmProvider>,
+    hooks: &Arc<HookEngine>,
 ) -> Result<ToolRegistry> {
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
@@ -1199,6 +1209,7 @@ async fn build_registry(
         subagent_configs,
         Arc::clone(client),
         Arc::clone(&base),
+        Arc::clone(hooks),
     )));
     Ok(registry)
 }
@@ -1225,8 +1236,7 @@ async fn build_agent(
     manager: &McpManager,
     resume: bool,
 ) -> Result<Agent> {
-    let mut registry = build_registry(manager, client).await?;
-    attach_config_tools(&mut registry, config);
+    // Session first: the hook engine carries its id in every payload.
     let sessions_dir = Config::sessions_dir()?;
     let session = if resume {
         match Session::open_latest(&sessions_dir)? {
@@ -1236,6 +1246,13 @@ async fn build_agent(
     } else {
         Session::create(&sessions_dir)?
     };
+    let hooks = Arc::new(HookEngine::new(
+        crate::hooks::load(project_root),
+        project_root.to_path_buf(),
+        session.id.clone(),
+    ));
+    let mut registry = build_registry(manager, client, &hooks).await?;
+    attach_config_tools(&mut registry, config);
     let model = config.active().model;
     let native_tools = match client.supports_native_tools(&model).await {
         Ok(supported) => supported,
@@ -1252,6 +1269,7 @@ async fn build_agent(
         project_root.to_path_buf(),
         session,
         native_tools,
+        hooks,
     )
 }
 
@@ -1559,6 +1577,19 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
     // No startup notice: the welcome screen already shows the model, mode,
     // and help pointers until the first message arrives.
 
+    // session_start hooks fire before the first draw; their activity (and
+    // any failures) lands in the transcript as notices.
+    {
+        let (hook_tx, mut hook_rx) = mpsc::channel::<AgentEvent>(256);
+        if let Some(agent) = agent_slot.as_mut() {
+            agent.fire_session_start(&hook_tx).await;
+        }
+        drop(hook_tx);
+        while let Some(event) = hook_rx.recv().await {
+            app.handle_agent_event(event);
+        }
+    }
+
     let mut events = EventLoop::new(Duration::from_millis(100));
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
@@ -1695,6 +1726,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
         if app.should_quit {
             break;
         }
+    }
+
+    // session_end hooks: best-effort — skipped when quitting mid-turn took
+    // the agent — with no event surfacing (the TUI is going away).
+    if let Some(agent) = agent_slot.as_ref() {
+        agent.fire_session_end(None).await;
     }
 
     drop(_guard);
@@ -1929,7 +1966,15 @@ impl CommandContext<'_> {
                 .app
                 .notice(format!("could not reload MCP config: {err:#}")),
         }
-        match build_registry(&manager, self.client).await {
+        // The rebuilt registry's subagent spawner keeps the session's hooks.
+        let Some(hooks) = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| Arc::clone(agent.hooks()))
+        else {
+            return;
+        };
+        match build_registry(&manager, self.client, &hooks).await {
             Ok(registry) => {
                 let tool_count = registry.len();
                 if let Some(agent) = self.agent_slot.as_mut() {
