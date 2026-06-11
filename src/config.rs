@@ -785,7 +785,10 @@ mod tests {
         assert!(raw.contains("kind = \"xaioauth\""), "raw: {raw}");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
         assert_eq!(parsed.providers[0].kind, ProviderKind::Xai);
-        assert_eq!(parsed.providers[0].api_key_env.as_deref(), Some("XAI_API_KEY"));
+        assert_eq!(
+            parsed.providers[0].api_key_env.as_deref(),
+            Some("XAI_API_KEY")
+        );
         assert_eq!(parsed.providers[1].kind, ProviderKind::XaiOauth);
         assert!(parsed.providers[1].api_key_env.is_none());
         assert_eq!(parsed.active().kind, ProviderKind::XaiOauth);
@@ -803,7 +806,11 @@ mod tests {
         ] {
             assert_eq!(kind.to_string(), name);
             let json = serde_json::to_value(kind).expect("serialize kind");
-            assert_eq!(json, serde_json::json!(name), "Display and serde must agree");
+            assert_eq!(
+                json,
+                serde_json::json!(name),
+                "Display and serde must agree"
+            );
         }
     }
 

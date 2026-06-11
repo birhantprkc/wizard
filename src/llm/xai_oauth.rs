@@ -229,8 +229,7 @@ pub fn save_tokens(path: &Path, tokens: &StoredTokens) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("syncing {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("moving {} into place", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
     Ok(())
 }
 
@@ -284,7 +283,10 @@ where
     let nonce = random_hex(16)?;
 
     let listener = bind_callback_listener()?;
-    let port = listener.local_addr().context("reading listener port")?.port();
+    let port = listener
+        .local_addr()
+        .context("reading listener port")?
+        .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
     let mut authorize_url = reqwest::Url::parse(&discovery.authorization_endpoint)
@@ -315,7 +317,14 @@ where
         .context("callback listener task panicked")??;
 
     report("exchanging the authorization code for tokens...");
-    let token = exchange_code(&http, &discovery.token_endpoint, &code, &redirect_uri, &pkce).await?;
+    let token = exchange_code(
+        &http,
+        &discovery.token_endpoint,
+        &code,
+        &redirect_uri,
+        &pkce,
+    )
+    .await?;
 
     let stored = StoredTokens {
         access_token: token.access_token,
@@ -595,8 +604,7 @@ impl XaiTokenSource {
             .await
             .with_context(|| format!("refreshing the xAI access token at {token_endpoint}"))?;
         let status = response.status();
-        if status == reqwest::StatusCode::BAD_REQUEST
-            || status == reqwest::StatusCode::UNAUTHORIZED
+        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
         {
             let body = response.text().await.unwrap_or_default();
             let _ = clear_tokens(&self.path);
@@ -739,7 +747,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let file_mode = std::fs::metadata(&path).expect("file meta").permissions().mode();
+            let file_mode = std::fs::metadata(&path)
+                .expect("file meta")
+                .permissions()
+                .mode();
             assert_eq!(file_mode & 0o777, 0o600, "token file must be 0600");
             let dir_mode = std::fs::metadata(path.parent().expect("parent"))
                 .expect("dir meta")
@@ -764,8 +775,14 @@ mod tests {
     fn endpoint_pinning_rejects_non_xai_hosts() {
         validate_xai_https("https://auth.x.ai/oauth/token").expect("subdomain ok");
         validate_xai_https("https://x.ai/oauth/token").expect("apex ok");
-        assert!(validate_xai_https("http://auth.x.ai/oauth/token").is_err(), "plain http");
-        assert!(validate_xai_https("https://evil.example/token").is_err(), "other host");
+        assert!(
+            validate_xai_https("http://auth.x.ai/oauth/token").is_err(),
+            "plain http"
+        );
+        assert!(
+            validate_xai_https("https://evil.example/token").is_err(),
+            "other host"
+        );
         // String suffix is not enough: notx.ai is a different domain.
         assert!(validate_xai_https("https://notx.ai/token").is_err());
         assert!(validate_xai_https("https://x.ai.evil.example/token").is_err());
