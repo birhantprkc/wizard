@@ -54,12 +54,13 @@ fn help_prints_usage_and_documented_flags() {
     assert!(output.status.success(), "--help must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage:"), "help shows usage:\n{stdout}");
+    // `--auto` is deprecated (approval gating was removed): still parsed for
+    // compatibility but hidden from help.
     for flag in [
         "--mode",
         "--prompt",
         "--evolve",
         "--deep",
-        "--auto",
         "--max-hours",
         "--loop",
         "--cwd",

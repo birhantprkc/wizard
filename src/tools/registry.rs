@@ -104,8 +104,7 @@ impl ToolRegistry {
         Ok(count)
     }
 
-    /// Dispatch a tool call by name. Approval gating happens in the agent
-    /// loop before this is reached.
+    /// Dispatch a tool call by name.
     pub async fn execute(
         &self,
         name: &str,
@@ -137,6 +136,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::tools::ToolAccess;
 
     /// Temp project dir removed on drop.
     struct TempDir(PathBuf);
@@ -217,22 +217,29 @@ mod tests {
     }
 
     #[test]
-    fn risky_tools_require_approval_and_read_only_tools_do_not() {
+    fn native_tools_report_their_access_class() {
         let registry = ToolRegistry::with_native_tools();
-        let approval = |name: &str| registry.get(name).expect(name).requires_approval();
+        let access = |name: &str| registry.get(name).expect(name).access();
 
-        for risky in ["write_file", "edit_file", "execute"] {
-            assert!(approval(risky), "{risky} must be gated behind approval");
-        }
-        for safe in [
+        for read_only in [
             "read_file",
             "list_files",
             "search_files",
             "git_status",
             "git_diff",
-            "memory",
         ] {
-            assert!(!approval(safe), "{safe} must not require approval");
+            assert_eq!(access(read_only), ToolAccess::ReadOnly, "{read_only}");
+        }
+        for edit in ["write_file", "edit_file"] {
+            assert_eq!(access(edit), ToolAccess::Edit, "{edit}");
+        }
+        // `execute` runs arbitrary commands; `memory` mutates its store.
+        for side_effecting in ["execute", "memory"] {
+            assert_eq!(
+                access(side_effecting),
+                ToolAccess::Execute,
+                "{side_effecting}"
+            );
         }
     }
 
@@ -327,9 +334,10 @@ mod tests {
         assert_eq!(added, 1);
         let tool = registry.get("greet").expect("scripted tool registered");
         assert_eq!(tool.kind(), crate::tools::ToolKind::Scripted);
-        assert!(
-            tool.requires_approval(),
-            "scripted tools are risky by default"
+        assert_eq!(
+            tool.access(),
+            ToolAccess::Execute,
+            "scripted tools keep the Execute default"
         );
     }
 }

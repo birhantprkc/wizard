@@ -141,8 +141,7 @@ pub fn scoped_registry(parent: &ToolRegistry, scope: Option<&[String]>) -> ToolR
 }
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
-/// scoped registry, own step budget. Auto-approves tools (the parent already
-/// approved the spawn).
+/// scoped registry, own step budget.
 pub async fn spawn(
     config: &SubagentConfig,
     task: &str,
@@ -325,10 +324,6 @@ impl Tool for SpawnSubagentTool {
             },
             "required": ["subagent", "task"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

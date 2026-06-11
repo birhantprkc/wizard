@@ -34,9 +34,9 @@ pub struct Cli {
     #[arg(long)]
     pub publish: bool,
 
-    /// Force auto-approve for this run (already the default; useful when
-    /// config has `auto_approve = false` to restore bypass behavior).
-    #[arg(long)]
+    /// Deprecated: approval gating was removed and every tool call executes
+    /// directly. Accepted for compatibility and ignored.
+    #[arg(long, hide = true)]
     pub auto: bool,
 
     /// Time limit in hours for a sovereign-mode run.

@@ -1,9 +1,7 @@
 //! Native `execute` tool: run shell commands with a timeout.
 //!
 //! Security note (see `docs/architecture.md`): this is real shell access and
-//! cannot be confined to the working directory. Opts into the approval gate,
-//! which only fires when `auto_approve = false`; both modes auto-approve by
-//! default.
+//! cannot be confined to the working directory.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -149,10 +147,6 @@ impl Tool for ExecuteTool {
             },
             "required": ["command"]
         })
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

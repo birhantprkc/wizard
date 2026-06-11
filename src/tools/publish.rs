@@ -2,8 +2,7 @@
 //! installer for their variant.
 //!
 //! Mirrors [`crate::tools::evolve::EvolveTool`] in structure. Requires `gh`
-//! authenticated; opts into `requires_approval` so a y/n prompt fires when
-//! `auto_approve = false`; both modes auto-approve by default.
+//! authenticated (`gh auth login`).
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -62,18 +61,11 @@ impl Tool for PublishTool {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        true
-    }
-
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: PublishArgs = parse_args(self.name(), args)?;
 
         let req = PublishRequest {
             branch: args.branch,
-            // The tool-layer approval gate already governs whether
-            // execute() is reached, so the pipeline itself need not re-prompt.
-            auto_approve: true,
         };
 
         match publish(&self.config, req, false).await {

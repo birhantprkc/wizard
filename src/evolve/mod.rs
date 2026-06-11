@@ -80,8 +80,6 @@ pub struct EvolveRequest {
     /// Natural-language description of the capability to add.
     pub description: String,
     pub tier: EvolveTier,
-    /// Skip the approval step (sovereign mode / `--auto`).
-    pub auto_approve: bool,
 }
 
 /// What an evolution produced.
@@ -113,7 +111,8 @@ pub enum EvolveOutcome {
         reason: String,
         outcome: Box<EvolveOutcome>,
     },
-    /// The user denied the proposed change.
+    /// The user denied the proposed change. Historical: approval gating was
+    /// removed; kept so old `evolution.jsonl` records still deserialize.
     Denied,
 }
 
@@ -319,10 +318,6 @@ impl Evolver {
             proposal.channel().label(),
             proposal_summary(&proposal)
         ));
-
-        if !request.auto_approve && !confirm("Apply this change?")? {
-            return Ok(EvolveOutcome::Denied);
-        }
 
         let outcome = self.apply_proposal(proposal)?;
         self.status(
@@ -534,12 +529,6 @@ impl Evolver {
         let diff = self.propose_diff(&request.description, &source_dir).await?;
         if self.verbose {
             println!("\n{diff}");
-        }
-
-        if !request.auto_approve && !confirm("Apply this diff and rebuild Wizard?")? {
-            let outcome = EvolveOutcome::Denied;
-            self.log_event(request, EvolveTier::Deep, &outcome, Some(diff), None)?;
-            return Ok(outcome);
         }
 
         self.apply_diff(&source_dir, &diff)?;
@@ -947,10 +936,7 @@ pub async fn run_publish_cli(config: Config, cli: Cli) -> Result<()> {
         (!p.is_empty()).then_some(p)
     });
 
-    let req = PublishRequest {
-        branch,
-        auto_approve: config.auto_approve || cli.auto,
-    };
+    let req = PublishRequest { branch };
 
     let outcome = publish::publish(&config, req, true).await?;
     println!("Fork:    {}", outcome.fork_url);
@@ -974,13 +960,7 @@ pub async fn run_cli(config: Config, cli: Cli) -> Result<()> {
     } else {
         EvolveTier::Runtime
     };
-    let request = EvolveRequest {
-        description,
-        tier,
-        // `Config::apply_cli` already folded `--auto`/sovereign in, but the
-        // CLI flag is honored here too in case the caller skipped that.
-        auto_approve: config.auto_approve || cli.auto,
-    };
+    let request = EvolveRequest { description, tier };
 
     let mut evolver = Evolver::new(config).with_verbose(true);
     let outcome = evolver.run(request).await?;
@@ -1039,24 +1019,7 @@ fn print_outcome(outcome: &EvolveOutcome) {
     }
 }
 
-/// Blocking y/N confirmation on the terminal. Refuses (rather than hangs)
-/// when stdin is not a TTY — pass `--auto` for unattended runs.
-fn confirm(question: &str) -> Result<bool> {
-    let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        bail!(
-            "approval required but stdin is not a terminal; re-run with --auto to skip confirmation"
-        );
-    }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush().context("flushing stdout")?;
-    let mut line = String::new();
-    stdin.read_line(&mut line).context("reading confirmation")?;
-    let answer = line.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
-}
-
-/// Human-readable proposal preview for the approval gate.
+/// Human-readable proposal preview printed before the change is applied.
 fn proposal_summary(proposal: &ChannelProposal) -> String {
     match proposal {
         ChannelProposal::Skill(skill) => format!(

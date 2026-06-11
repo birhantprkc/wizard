@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
 //! line and a quiet status line. Floating layers: the command-suggestion
-//! popup, the model/mode picker, and the approval modal.
+//! popup and the model/mode picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -79,14 +79,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() && app.pending_approval.is_none() {
+    if app.picker.is_none() {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
         draw_picker(frame, app);
-    }
-    if app.pending_approval.is_some() {
-        draw_approval_modal(frame, app);
     }
 }
 
@@ -466,9 +463,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Contextual key hints, right-aligned in a sub-rect so the left side is
     // never overdrawn.
-    let hints = if app.pending_approval.is_some() {
-        "y approve · n deny"
-    } else if app.picker.is_some() {
+    let hints = if app.picker.is_some() {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
@@ -504,25 +499,6 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let budget = (area.width as usize)
         .saturating_sub(pad + prompt_width + 1)
         .max(1);
-
-    if app.input_mode == InputMode::Approval {
-        let placeholder = "awaiting approval — y approve · n deny";
-        let line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled("❯ ", dim().bold()),
-            Span::styled(placeholder, dim().italic()),
-        ]);
-        frame.render_widget(Paragraph::new(Text::from(vec![rule, line])), area);
-        // Input is disabled: park the cursor in the gap after the
-        // placeholder, never on top of it. Without this the cursor stays
-        // where the last editable frame left it — the placeholder's first
-        // cell — and terminals/recorders that ignore cursor-hide draw a
-        // block over the text ("❯ ▌waiting approval").
-        let after = (pad + prompt_width + placeholder.width() + 1) as u16;
-        let cursor_x = (area.x + after).min(area.right().saturating_sub(1));
-        frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
-        return;
-    }
 
     let chars: Vec<char> = app.input.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
@@ -729,70 +705,6 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         .title_bottom(
             Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
         );
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
-}
-
-/// Centered modal asking the user to approve a gated tool call.
-fn draw_approval_modal(frame: &mut Frame, app: &App) {
-    let Some(pending) = &app.pending_approval else {
-        return;
-    };
-    let frame_area = frame.area();
-
-    let args = serde_json::to_string_pretty(&pending.call.function.arguments)
-        .unwrap_or_else(|_| "{}".to_string());
-    let arg_lines: Vec<&str> = args.lines().collect();
-
-    // Size the modal to its content: tool line + blank + argument block
-    // (+ overflow ellipsis) + blank + buttons, plus the borders; capped so
-    // it always fits the frame.
-    let max_args = frame_area.height.saturating_sub(7).max(3) as usize;
-    let shown = arg_lines.len().min(max_args);
-    let truncated = arg_lines.len() > shown;
-    let height = (shown + truncated as usize + 6) as u16;
-    let width = (frame_area.width as u32 * 70 / 100).max(1) as u16;
-    let area = Rect {
-        x: frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
-        y: frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
-    .intersection(frame_area);
-    frame.render_widget(Clear, area);
-
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled("tool ", dim()),
-            Span::styled(pending.call.function.name.clone(), accent().bold()),
-        ]),
-        Line::raw(""),
-    ];
-
-    for line in arg_lines.iter().take(shown) {
-        lines.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(TEXT_DIM),
-        )));
-    }
-    if truncated {
-        lines.push(Line::from(Span::styled("…", dim())));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::White).bold()),
-        Span::styled(" approve", dim()),
-        Span::raw("    "),
-        Span::styled("n", Style::default().fg(Color::White).bold()),
-        Span::styled(" deny", dim()),
-    ]));
-
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(accent())
-        .title(Line::from(vec![
-            Span::styled(" ✦", accent()),
-            Span::styled(" approve tool call? ", Style::default().fg(TEXT_DIM)),
-        ]));
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 

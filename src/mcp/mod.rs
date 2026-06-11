@@ -972,10 +972,6 @@ impl Tool for McpTool {
         }
     }
 
-    fn requires_approval(&self) -> bool {
-        true
-    }
-
     fn kind(&self) -> ToolKind {
         ToolKind::Mcp
     }
@@ -1162,7 +1158,7 @@ done"#
             .iter()
             .find(|tool| tool.name() == "alpha__weather")
             .expect("alpha__weather should be registered");
-        assert!(tool.requires_approval());
+        assert_eq!(tool.access(), crate::tools::ToolAccess::Execute);
         assert_eq!(tool.kind(), ToolKind::Mcp);
         let output = tool
             .execute(json!({}), &ctx)

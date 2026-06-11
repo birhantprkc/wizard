@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, DoneReason, session::Session, subagent};
@@ -20,7 +20,6 @@ use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
-use crate::llm::ToolCall;
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::memory::MemoryStore;
@@ -71,14 +70,6 @@ impl std::fmt::Debug for AgentRebuild {
     }
 }
 
-/// A gated tool call waiting for the user's y/n.
-#[derive(Debug)]
-pub struct PendingApproval {
-    pub call: ToolCall,
-    /// Send `true` to approve, `false` to deny. Dropping denies.
-    pub respond: oneshot::Sender<bool>,
-}
-
 /// What the input line is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -87,8 +78,6 @@ pub enum InputMode {
     Chat,
     /// Composing a `/slash` command.
     Command,
-    /// Answering an approval prompt.
-    Approval,
 }
 
 /// Parsed `/slash` command (see the README table).
@@ -434,7 +423,6 @@ pub struct App {
     /// Partial model reasoning of the in-flight turn, rendered dimmed and
     /// flushed to the transcript alongside `streaming`.
     pub streaming_thinking: String,
-    pub pending_approval: Option<PendingApproval>,
     pub status: StatusLine,
     /// Git diff sidebar visibility and cached contents.
     pub show_diff: bool,
@@ -491,7 +479,6 @@ impl App {
             transcript: Vec::new(),
             streaming: String::new(),
             streaming_thinking: String::new(),
-            pending_approval: None,
             status,
             show_diff: false,
             diff_text: String::new(),
@@ -525,12 +512,10 @@ impl App {
             .push(TranscriptEntry::Notice(message.into()));
     }
 
-    /// Recompute [`InputMode`] from the pending approval and the input text,
-    /// then refresh the command suggestions.
+    /// Recompute [`InputMode`] from the input text, then refresh the command
+    /// suggestions.
     fn sync_input_mode(&mut self) {
-        self.input_mode = if self.pending_approval.is_some() {
-            InputMode::Approval
-        } else if self.input.trim_start().starts_with('/') {
+        self.input_mode = if self.input.trim_start().starts_with('/') {
             InputMode::Command
         } else {
             InputMode::Chat
@@ -719,18 +704,6 @@ impl App {
         }
     }
 
-    /// Answer the pending approval prompt, if any.
-    fn respond_approval(&mut self, approve: bool) {
-        if let Some(pending) = self.pending_approval.take() {
-            let name = pending.call.function.name.clone();
-            // The agent may have given up waiting; a closed channel is fine.
-            let _ = pending.respond.send(approve);
-            let verdict = if approve { "approved" } else { "denied" };
-            self.notice(format!("{verdict} tool call '{name}'"));
-        }
-        self.sync_input_mode();
-    }
-
     /// Dispatch one event from the merged stream. Returns the user action
     /// the main loop must perform (start a turn, run a slash command, ...).
     pub fn handle_event(&mut self, event: Event) -> Result<Option<AppAction>> {
@@ -749,10 +722,8 @@ impl App {
                 Ok(None)
             }
             Event::Paste(text) => {
-                if self.input_mode != InputMode::Approval {
-                    self.insert_str(&text);
-                    self.sync_input_mode();
-                }
+                self.insert_str(&text);
+                self.sync_input_mode();
                 Ok(None)
             }
             Event::Resize(_, _) => Ok(None),
@@ -775,7 +746,7 @@ impl App {
     }
 
     /// Keyboard handling for the current [`InputMode`]. Priority: global
-    /// chords, approval prompt, open picker, then line editing.
+    /// chords, open picker, then line editing.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<Option<AppAction>> {
         if key.kind == KeyEventKind::Release {
             return Ok(None);
@@ -821,27 +792,14 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     // Shortcut for the interactive model picker; ignored
-                    // while a turn runs or an approval prompt is up.
-                    if self.status.busy || self.pending_approval.is_some() {
+                    // while a turn runs.
+                    if self.status.busy {
                         return Ok(None);
                     }
                     return Ok(Some(AppAction::Command(SlashCommand::Model(None))));
                 }
                 _ => {}
             }
-        }
-
-        if self.input_mode == InputMode::Approval {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.respond_approval(true);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.respond_approval(false);
-                }
-                _ => {}
-            }
-            return Ok(None);
         }
 
         // An open picker captures navigation keys.
@@ -1061,14 +1019,6 @@ impl App {
             AgentEvent::ThinkingDelta(delta) => {
                 self.streaming_thinking.push_str(&delta);
             }
-            AgentEvent::ApprovalRequest { call, respond } => {
-                // The approval modal takes over; drop any open picker so it
-                // cannot linger stale underneath (or after) the prompt.
-                self.picker = None;
-                self.pending_approval = Some(PendingApproval { call, respond });
-                self.scroll = 0;
-                self.sync_input_mode();
-            }
             AgentEvent::ToolStarted { name, args } => {
                 self.flush_streaming();
                 self.transcript.push(TranscriptEntry::ToolCard {
@@ -1128,9 +1078,6 @@ impl App {
                 self.flush_streaming();
                 self.status.busy = false;
                 self.turn_started = None;
-                // Dropping an unanswered approval denies it agent-side.
-                self.pending_approval = None;
-                self.sync_input_mode();
                 match reason {
                     DoneReason::Completed => {}
                     DoneReason::MaxSteps => self.notice(format!(
@@ -1404,7 +1351,6 @@ Tab / →                     accept command completion\n  \
 PgUp/PgDn · mouse wheel     scroll the transcript\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
-y / n                       approve / deny a gated tool call\n  \
 Ctrl-C                      quit";
 
 // ---------------------------------------------------------------------------
@@ -1953,7 +1899,6 @@ impl CommandContext<'_> {
         self.app.status.mode = mode;
         match mode {
             Mode::Sovereign => {
-                self.app.config.auto_approve = true;
                 self.app.config.max_steps = self
                     .app
                     .config
@@ -1961,7 +1906,6 @@ impl CommandContext<'_> {
                     .max(Mode::Sovereign.default_max_steps());
             }
             Mode::Genie => {
-                self.app.config.auto_approve = true;
                 self.app.config.max_steps = self.genie_max_steps;
             }
         }
@@ -2011,15 +1955,9 @@ impl CommandContext<'_> {
             "evolving ({}): {description}",
             if deep { "deep" } else { "runtime" }
         ));
-        // The TUI cannot use the Evolver's stdin y/N gate (the terminal
-        // is in raw mode and owned by the event loop). The explicit
-        // `/evolve` command is treated as the user's approval; the
-        // outcome notice reports exactly what was added.
-        let request = EvolveRequest {
-            description,
-            tier,
-            auto_approve: true,
-        };
+        // The explicit `/evolve` command is the user's consent; the outcome
+        // notice reports exactly what was added.
+        let request = EvolveRequest { description, tier };
         let mut evolver = Evolver::new(self.app.config.clone());
         let notify = self.events.sender();
         tokio::spawn(async move {
@@ -2044,10 +1982,7 @@ impl CommandContext<'_> {
         let config = self.app.config.clone();
         let notify = self.events.sender();
         tokio::spawn(async move {
-            let req = PublishRequest {
-                branch,
-                auto_approve: true,
-            };
+            let req = PublishRequest { branch };
             let message = match publish(&config, req, false).await {
                 Ok(outcome) => format!(
                     "publish: forked to {}  (branch: {})\n\nInstall one-liner:\n{}",

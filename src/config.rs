@@ -349,9 +349,10 @@ pub struct Config {
     pub gguf_path: Option<String>,
     /// Default personality mode.
     pub mode: Mode,
-    /// Bypass per-action confirmation prompts. Default true: genie bypasses
-    /// permissions. Set false to restore the y/n gate for tools that request
-    /// approval.
+    /// Deprecated: approval gating was removed and every tool call executes
+    /// directly. Still parsed so old config files load; ignored (a startup
+    /// warning is printed when set to `false`) and never written back.
+    #[serde(skip_serializing)]
     pub auto_approve: bool,
     /// Agent loop limit per turn (genie). Sovereign uses its own default
     /// unless this is explicitly raised above it.
@@ -617,8 +618,8 @@ impl Config {
     }
 
     /// Apply CLI flag overrides on top of file/env config for this run.
-    /// CLI mode wins; `--auto` forces `auto_approve`; sovereign mode raises
-    /// `max_steps` to its default if the configured value is lower.
+    /// CLI mode wins; sovereign mode raises `max_steps` to its default if
+    /// the configured value is lower.
     pub fn apply_cli(&mut self, cli: &Cli) {
         if let Some(mode) = cli.mode {
             self.mode = mode;
@@ -626,9 +627,6 @@ impl Config {
         if cli.continuous {
             self.mode = Mode::Sovereign;
             self.continuous = true;
-        }
-        if cli.auto || self.mode == Mode::Sovereign {
-            self.auto_approve = true;
         }
         if self.mode == Mode::Sovereign && self.max_steps < Mode::Sovereign.default_max_steps() {
             self.max_steps = Mode::Sovereign.default_max_steps();
@@ -655,7 +653,6 @@ mod tests {
         assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
         assert!(config.gguf_path.is_none());
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
         assert!(!config.continuous);
         assert_eq!(config.retry_base_secs, 5);
@@ -723,7 +720,6 @@ mod tests {
         assert_eq!(parsed.llamacpp_host, original.llamacpp_host);
         assert_eq!(parsed.gguf_path, original.gguf_path);
         assert_eq!(parsed.mode, original.mode);
-        assert_eq!(parsed.auto_approve, original.auto_approve);
         assert_eq!(parsed.max_steps, original.max_steps);
         assert_eq!(parsed.continuous, original.continuous);
         assert_eq!(parsed.retry_base_secs, original.retry_base_secs);
@@ -1155,7 +1151,6 @@ mod tests {
         let mut config = Config::default();
         config.apply_cli(&cli(&["--mode", "sovereign"]));
         assert_eq!(config.mode, Mode::Sovereign);
-        assert!(config.auto_approve, "sovereign implies auto-approve");
         assert_eq!(config.max_steps, 100, "sovereign raises the step budget");
     }
 
@@ -1165,7 +1160,6 @@ mod tests {
         config.apply_cli(&cli(&["--continuous"]));
         assert_eq!(config.mode, Mode::Sovereign);
         assert!(config.continuous);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 100);
     }
 
@@ -1180,15 +1174,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_flag_forces_auto_approve_in_genie() {
-        let mut config = Config {
-            auto_approve: false, // start from the opt-in gated posture
-            ..Config::default()
-        };
+    fn deprecated_auto_flag_is_accepted_and_ignored() {
+        let mut config = Config::default();
         config.apply_cli(&cli(&["--auto"]));
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25, "genie keeps its budget");
+    }
+
+    #[test]
+    fn deprecated_auto_approve_key_still_parses_and_is_not_written_back() {
+        let config: Config = toml::from_str("auto_approve = false").expect("old key parses");
+        assert!(!config.auto_approve);
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("auto_approve"),
+            "deprecated key is not written back: {raw}"
+        );
     }
 
     #[test]
@@ -1196,18 +1197,16 @@ mod tests {
         let mut config = Config::default();
         config.apply_cli(&cli(&[]));
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
     }
 
     #[test]
-    fn config_sovereign_mode_implies_auto_approve_without_flags() {
+    fn config_sovereign_mode_raises_max_steps_without_flags() {
         let mut config = Config {
             mode: Mode::Sovereign,
             ..Config::default()
         };
         config.apply_cli(&cli(&[]));
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 100);
     }
 }

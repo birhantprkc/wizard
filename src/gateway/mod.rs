@@ -113,16 +113,15 @@ pub async fn run(config: Config, _cli: Cli) -> Result<()> {
     }
 }
 
-/// Drive a gateway: build one sovereign / auto-approve agent, then loop —
-/// poll for inbound messages (retrying network errors with backoff), enforce
-/// the allow-list, run one agent turn per message, and send the reply (split
-/// into platform-sized chunks). Runs until Ctrl-C.
+/// Drive a gateway: build one sovereign agent, then loop — poll for inbound
+/// messages (retrying network errors with backoff), enforce the allow-list,
+/// run one agent turn per message, and send the reply (split into
+/// platform-sized chunks). Runs until Ctrl-C.
 async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Path) -> Result<()> {
-    // The gateway is fully autonomous: there is no terminal to approve tool
-    // calls, so run in sovereign / auto-approve posture.
+    // The gateway is fully autonomous: there is no terminal, so run in
+    // sovereign posture.
     let mut agent_config = config.clone();
     agent_config.mode = Mode::Sovereign;
-    agent_config.auto_approve = true;
     if agent_config.max_steps < Mode::Sovereign.default_max_steps() {
         agent_config.max_steps = Mode::Sovereign.default_max_steps();
     }

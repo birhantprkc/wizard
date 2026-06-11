@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
+use crate::dispatch::Dispatcher;
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
@@ -54,13 +55,6 @@ pub enum AgentEvent {
     /// Streaming model reasoning ("thinking") delta. Rendered dimmed by the
     /// TUI; never part of the assistant message or the session history.
     ThinkingDelta(String),
-    /// A tool call is requesting approval via the opt-in y/n gate (only fires
-    /// when `auto_approve = false`). Send `true` on `respond` to run it,
-    /// `false` to deny.
-    ApprovalRequest {
-        call: ToolCall,
-        respond: oneshot::Sender<bool>,
-    },
     /// A tool call is being executed.
     ToolStarted { name: String, args: Value },
     /// A tool call finished.
@@ -178,18 +172,19 @@ pub(crate) fn normalize_args(args: &Value) -> Value {
 }
 
 /// Send an event, reporting whether the receiver is still listening.
-async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
+pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
     events.send(event).await.is_ok()
 }
 
 /// The tool-calling agent. Owns the conversation history, the model client,
-/// the tool registry, and session persistence.
+/// the tool dispatcher, and session persistence.
 pub struct Agent {
     client: Arc<dyn LlmProvider>,
     /// Active model tag (from `config.active().model`); switched by
     /// [`Agent::set_model`].
     model: String,
-    registry: ToolRegistry,
+    /// Tool-call pipeline; owns the registry and the failure breakers.
+    dispatcher: Dispatcher,
     config: Config,
     mode: Mode,
     /// Full conversation including the system prompt at index 0.
@@ -209,18 +204,10 @@ pub struct Agent {
     memory_index: Option<String>,
     /// Wall-clock deadline for sovereign runs (`--max-hours`).
     deadline: Option<Instant>,
-    /// Circuit breaker state: signature of the last failing tool call and
-    /// how many consecutive times it has failed identically.
-    failure_streak: Option<(String, u32)>,
-    /// Per-tool consecutive-failure counts (args ignored).
-    tool_failures: ToolFailureCounter,
     /// Warning from session resume (corrupt/unreadable file), emitted on
     /// the next turn so the UI can surface it.
     load_warning: Option<String>,
 }
-
-/// Consecutive identical failures that trip the sovereign circuit breaker.
-const CIRCUIT_BREAKER_LIMIT: u32 = 3;
 
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
@@ -233,52 +220,6 @@ const EMPTY_COMPLETION_NUDGE: &str = "(continue: reply to the user with your fin
 /// tool calls (e.g. a reasoning model that thought and then just stopped).
 pub(crate) fn completion_is_empty(content: &str, tool_calls: &[ToolCall]) -> bool {
     content.trim().is_empty() && tool_calls.is_empty()
-}
-
-/// Consecutive failures of one tool (any args) before the model is nudged
-/// to change approach.
-const TOOL_FAILURE_NUDGE: u32 = 5;
-/// Consecutive failures of one tool (any args) before the turn ends with
-/// [`DoneReason::CircuitBreaker`].
-const TOOL_FAILURE_TRIP: u32 = 8;
-
-/// What [`ToolFailureCounter::record`] says to do after a tool result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureAction {
-    Continue,
-    /// Inject a system nudge telling the model to stop retrying the tool.
-    Nudge,
-    /// End the turn via the circuit breaker.
-    Trip,
-}
-
-/// Per-tool-name consecutive-failure counter, independent of arguments
-/// (catches models that jitter args to dodge the identical-failure
-/// breaker). A success of a tool resets that tool's count.
-#[derive(Debug, Default)]
-struct ToolFailureCounter {
-    counts: std::collections::HashMap<String, u32>,
-}
-
-impl ToolFailureCounter {
-    /// Record one tool result and return the action it warrants.
-    fn record(&mut self, name: &str, failed: bool) -> FailureAction {
-        if !failed {
-            self.counts.remove(name);
-            return FailureAction::Continue;
-        }
-        let count = self.counts.entry(name.to_string()).or_insert(0);
-        *count += 1;
-        match *count {
-            TOOL_FAILURE_NUDGE => FailureAction::Nudge,
-            count if count >= TOOL_FAILURE_TRIP => FailureAction::Trip,
-            _ => FailureAction::Continue,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.counts.clear();
-    }
 }
 
 impl Agent {
@@ -316,7 +257,7 @@ impl Agent {
         let mut agent = Self {
             client,
             model,
-            registry,
+            dispatcher: Dispatcher::new(registry, config.mode),
             mode: config.mode,
             config,
             history: Vec::new(),
@@ -327,8 +268,6 @@ impl Agent {
             agents_md,
             memory_index,
             deadline: None,
-            failure_streak: None,
-            tool_failures: ToolFailureCounter::default(),
             load_warning,
         };
         agent
@@ -344,10 +283,11 @@ impl Agent {
     }
 
     /// Switch mode mid-session (`/mode`): swaps the system prompt and
-    /// approval behavior for subsequent turns.
+    /// circuit-breaker behavior for subsequent turns.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.config.mode = mode;
+        self.dispatcher.set_mode(mode);
         self.refresh_system_prompt();
     }
 
@@ -371,15 +311,14 @@ impl Agent {
     pub fn clear(&mut self) -> Result<()> {
         self.session = Session::create(&Config::sessions_dir()?)?;
         self.history.truncate(1);
-        self.failure_streak = None;
-        self.tool_failures.reset();
+        self.dispatcher.reset_failures();
         Ok(())
     }
 
     /// Swap the tool registry (after `/reload` or `/evolve`). Refreshes the
     /// system prompt so the JSON tool protocol's tool list stays current.
     pub fn set_registry(&mut self, registry: ToolRegistry) {
-        self.registry = registry;
+        self.dispatcher.set_registry(registry);
         self.refresh_system_prompt();
     }
 
@@ -410,7 +349,9 @@ impl Agent {
         );
         if !self.native_tools {
             prompt.push_str("\n\n");
-            prompt.push_str(&prompts::render_tool_protocol(&self.registry.specs()));
+            prompt.push_str(&prompts::render_tool_protocol(
+                &self.dispatcher.registry().specs(),
+            ));
         }
         prompt
     }
@@ -433,11 +374,6 @@ impl Agent {
             tracing::warn!("session append failed: {err}");
         }
         self.history.push(message);
-    }
-
-    /// Whether gated tools run without asking the user.
-    fn auto_approve(&self) -> bool {
-        self.mode == Mode::Sovereign || self.config.auto_approve
     }
 
     /// Run one user turn: append `input`, then loop
@@ -538,7 +474,7 @@ impl Agent {
             }
 
             for call in &tool_calls {
-                match self.dispatch_call(call, events).await? {
+                match self.dispatch_call(call, events).await {
                     None => {}
                     Some(reason) => return Ok(reason),
                 }
@@ -562,7 +498,7 @@ impl Agent {
             model: self.model.clone(),
             messages: self.history.clone(),
             tools: if self.native_tools {
-                self.registry.specs()
+                self.dispatcher.registry().specs()
             } else {
                 Vec::new()
             },
@@ -760,113 +696,22 @@ impl Agent {
         Ok(summary)
     }
 
-    /// Gate, execute, and feed back one tool call. Returns `Some(reason)`
-    /// when the turn must end early (UI gone, circuit breaker).
+    /// Run one tool call through the dispatcher and feed its results back to
+    /// the model. Returns `Some(reason)` when the turn must end early (UI
+    /// gone, circuit breaker).
     async fn dispatch_call(
         &mut self,
         call: &ToolCall,
         events: &mpsc::Sender<AgentEvent>,
-    ) -> Result<Option<DoneReason>> {
-        let name = call.function.name.clone();
-        let args = normalize_args(&call.function.arguments);
-
-        let needs_approval = self
-            .registry
-            .get(&name)
-            .map(|tool| tool.requires_approval())
-            .unwrap_or(false);
-
-        let approved = if needs_approval && !self.auto_approve() {
-            let (respond, response) = oneshot::channel();
-            if !emit(
-                events,
-                AgentEvent::ApprovalRequest {
-                    call: call.clone(),
-                    respond,
-                },
-            )
-            .await
-            {
-                return Ok(Some(DoneReason::Stopped));
-            }
-            match response.await {
-                Ok(approved) => approved,
-                // Sender dropped without answering: the UI is tearing down,
-                // so end the turn instead of feeding the model a denial.
-                Err(_) => return Ok(Some(DoneReason::Stopped)),
-            }
-        } else {
-            true
-        };
-
-        let output = if approved {
-            if !emit(
-                events,
-                AgentEvent::ToolStarted {
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-            )
-            .await
-            {
-                return Ok(Some(DoneReason::Stopped));
-            }
-            match self.registry.execute(&name, args.clone(), &self.ctx).await {
-                Ok(output) => output,
-                Err(err) => ToolOutput::error(err.to_string()),
-            }
-        } else {
-            ToolOutput::error(format!(
-                "User denied execution of '{name}'. Do not retry it verbatim; ask or adjust."
-            ))
-        };
-
-        if !emit(
-            events,
-            AgentEvent::ToolFinished {
-                name: name.clone(),
-                output: output.clone(),
-            },
-        )
-        .await
-        {
-            return Ok(Some(DoneReason::Stopped));
+    ) -> Option<DoneReason> {
+        let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
+        if let Some(output) = &outcome.output {
+            self.push(self.tool_feedback(&call.function.name, output));
         }
-
-        let breaker_tripped = self.track_failure(&name, &args, &output);
-        let failure_action = self.tool_failures.record(&name, output.is_error);
-        self.push(self.tool_feedback(&name, &output));
-
-        if breaker_tripped {
-            let _ = emit(
-                events,
-                AgentEvent::Error(format!(
-                    "circuit breaker: '{name}' failed identically {CIRCUIT_BREAKER_LIMIT} times in a row"
-                )),
-            )
-            .await;
-            return Ok(Some(DoneReason::CircuitBreaker));
+        if let Some(nudge) = outcome.nudge {
+            self.push(ChatMessage::system(nudge));
         }
-        match failure_action {
-            FailureAction::Continue => {}
-            FailureAction::Nudge => {
-                self.push(ChatMessage::system(format!(
-                    "Repeated failures with tool '{name}' ({TOOL_FAILURE_NUDGE} in a row) — \
-                     stop retrying it and change approach."
-                )));
-            }
-            FailureAction::Trip => {
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!(
-                        "circuit breaker: '{name}' failed {TOOL_FAILURE_TRIP} times in a row"
-                    )),
-                )
-                .await;
-                return Ok(Some(DoneReason::CircuitBreaker));
-            }
-        }
-        Ok(None)
+        outcome.done
     }
 
     /// Build the message that feeds a tool result back to the model.
@@ -881,25 +726,6 @@ impl Agent {
         } else {
             ChatMessage::user(format!("Tool result for `{name}`:\n{body}"))
         }
-    }
-
-    /// Update circuit-breaker state (sovereign only). Returns true when the
-    /// breaker trips.
-    fn track_failure(&mut self, name: &str, args: &Value, output: &ToolOutput) -> bool {
-        if self.mode != Mode::Sovereign {
-            return false;
-        }
-        if !output.is_error {
-            self.failure_streak = None;
-            return false;
-        }
-        let signature = format!("{name}\u{1}{args}\u{1}{}", output.content);
-        let count = match &self.failure_streak {
-            Some((last, count)) if *last == signature => count + 1,
-            _ => 1,
-        };
-        self.failure_streak = Some((signature, count));
-        count >= CIRCUIT_BREAKER_LIMIT
     }
 
     /// Honor `.wizard/loop-control` between steps: `stop` ends the turn,
@@ -1136,10 +962,6 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     printer_spinner.hide();
                     print!("\x1b[2m{delta}\x1b[0m");
                     let _ = std::io::stdout().flush();
-                }
-                AgentEvent::ApprovalRequest { respond, .. } => {
-                    // Both modes auto-approve by default; this is a safety net for the opt-in gating path.
-                    let _ = respond.send(true);
                 }
                 AgentEvent::ToolStarted { name, args } => {
                     printer_spinner.println(&format!("\n→ {name} {args}"));
@@ -1635,68 +1457,5 @@ mod tests {
     fn loop_control_absent_file_is_none() {
         let tmp = TempDir::new();
         assert_eq!(read_loop_control(&tmp.0), None);
-    }
-
-    #[test]
-    fn tool_failures_nudge_then_trip() {
-        let mut counter = ToolFailureCounter::default();
-        for i in 1..TOOL_FAILURE_NUDGE {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
-            );
-        }
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
-        for i in TOOL_FAILURE_NUDGE + 1..TOOL_FAILURE_TRIP {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
-            );
-        }
-        assert_eq!(counter.record("execute", true), FailureAction::Trip);
-    }
-
-    #[test]
-    fn tool_failures_reset_on_success_of_that_tool() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
-            counter.record("execute", true);
-        }
-        assert_eq!(counter.record("execute", false), FailureAction::Continue);
-        // The streak starts over after the success.
-        for i in 1..TOOL_FAILURE_NUDGE {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
-            );
-        }
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
-    }
-
-    #[test]
-    fn tool_failures_count_per_tool_name() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
-            counter.record("execute", true);
-            counter.record("write_file", true);
-        }
-        // Each tool reaches the nudge threshold independently; a success of
-        // one tool does not reset the other.
-        counter.record("write_file", false);
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
-        assert_eq!(counter.record("write_file", true), FailureAction::Continue);
-    }
-
-    #[test]
-    fn tool_failures_reset_clears_all_counts() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_TRIP {
-            counter.record("execute", true);
-        }
-        counter.reset();
-        assert_eq!(counter.record("execute", true), FailureAction::Continue);
     }
 }

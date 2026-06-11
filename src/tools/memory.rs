@@ -3,8 +3,7 @@
 //! Backed by `crate::memory::MemoryStore` (one markdown file per memory
 //! under `~/.wizard/memory/<project-slug>/`). The index of saved memories is
 //! injected into the system prompt at session start, so a save made now is
-//! recalled automatically next session. Confined to `~/.wizard/memory`, so
-//! it never opts into the approval gate.
+//! recalled automatically next session. Confined to `~/.wizard/memory`.
 
 use async_trait::async_trait;
 use serde::Deserialize;

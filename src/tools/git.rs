@@ -10,7 +10,8 @@ use tokio::process::Command;
 
 use super::shell::{CommandResult, run_command};
 use super::{
-    MAX_OUTPUT_BYTES, Tool, ToolContext, ToolError, ToolOutput, parse_args, truncate_output,
+    MAX_OUTPUT_BYTES, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args,
+    truncate_output,
 };
 
 /// Timeout for git subprocesses. Status and diff are local operations, so
@@ -50,6 +51,10 @@ impl Tool for GitStatusTool {
 
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -104,6 +109,10 @@ impl Tool for GitDiffTool {
                 "path": { "type": "string", "description": "Limit the diff to this path" }
             }
         })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

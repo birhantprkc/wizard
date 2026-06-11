@@ -9,6 +9,7 @@ pub mod app;
 pub mod bench;
 pub mod cli;
 pub mod config;
+pub mod dispatch;
 pub mod event;
 pub mod evolve;
 pub mod gateway;
@@ -65,6 +66,12 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
     } else {
         config::Config::load()?
     };
+    if !config.auto_approve {
+        eprintln!(
+            "warning: `auto_approve = false` in config.toml is no longer honored — \
+             approval gating was removed; every tool call executes directly"
+        );
+    }
     config.apply_cli(&cli);
 
     if let Some(dir) = &cli.cwd {
