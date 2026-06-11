@@ -26,7 +26,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::config::{Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind};
-use crate::hardware;
+use crate::hardware::{self, GgufModel};
 
 /// White accent, matching [`crate::ui`].
 const ACCENT: Color = Color::White;
@@ -42,10 +42,13 @@ const TEXT_DIM: Color = Color::Gray;
 /// Which provider family the user picked in step 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
-    /// Local llama.cpp `llama-server` (the recommended default).
+    /// Local llama.cpp `llama-server` — the one-click "Local" pick resolves
+    /// here too (Wizard downloads the model and installs llama-server itself).
     LlamaCpp,
     /// Local Ollama server.
     Ollama,
+    /// OpenRouter (OpenAI-compatible, one key for many models).
+    OpenRouter,
     /// OpenAI or any OpenAI-compatible endpoint.
     Openai,
     /// Anthropic Messages API.
@@ -161,6 +164,9 @@ const ANTHROPIC_MODELS: &[&str] = &[
 ];
 /// xAI (Grok) model options offered in the picker (first is the default).
 const XAI_MODELS: &[&str] = &["grok-4.3", "grok-code-fast-1"];
+/// OpenRouter model options offered in the picker (first is the default —
+/// `openrouter/auto` lets OpenRouter route to a suitable model).
+const OPENROUTER_MODELS: &[&str] = &["openrouter/auto", "x-ai/grok-4.3", "openai/gpt-4o"];
 /// Ollama tier options offered alongside the hardware-suggested default.
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
@@ -174,12 +180,16 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default base URL for the xAI API.
 const XAI_BASE_URL: &str = crate::llm::xai_oauth::DEFAULT_BASE_URL;
+/// Default base URL for the OpenRouter API.
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Default env var name for the OpenAI key.
 const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
 /// Default env var name for the Anthropic key.
 const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Default env var name for the xAI key.
 const XAI_KEY_ENV: &str = crate::llm::xai_oauth::DEFAULT_KEY_ENV;
+/// Default env var name for the OpenRouter key.
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 // ---------------------------------------------------------------------------
 // TUI entry point
@@ -222,15 +232,27 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// Drive the sequence of steps. Returns `Ok(None)` as soon as any step is
 /// cancelled.
 fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
-    // Step 1 — provider.
+    // Step 1 — provider. "Local" is one pick: no further model questions —
+    // Wizard self-configures llama.cpp (or an Ollama install that already has
+    // a model) and downloads a hardware-sized GGUF on first run. The manual
+    // local flavors sit at the bottom for people who want to pick the pieces.
     let provider_options = [
-        Opt::new("Local — llama.cpp (recommended)", "private, no API key"),
-        Opt::new("Local — Ollama", "private, no API key"),
-        Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
-        Opt::new("Anthropic (Claude)", "claude-fable-5"),
+        Opt::new(
+            "Local (recommended)",
+            "one pick — llama.cpp & Ollama set up for you, model sized to this machine; \
+             private, no API key",
+        ),
+        Opt::new("OpenRouter", "one key, many models — OPENROUTER_API_KEY"),
         Opt::new("xAI (Grok), API key", "grok-4.3 via XAI_API_KEY"),
         Opt::new("xAI account sign-in", "grok-4.3 via OAuth, no API key"),
+        Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
+        Opt::new("Anthropic (Claude)", "claude-fable-5"),
         Opt::new("Custom OpenAI-compatible endpoint", "any base URL"),
+        Opt::new(
+            "Local — llama.cpp, manual",
+            "pick a GGUF and server URL yourself",
+        ),
+        Opt::new("Local — Ollama, manual", "pick a model tag yourself"),
     ];
     let provider = match select(
         terminal,
@@ -243,33 +265,39 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    // Step 2 — model (+ key env / base url, depending on provider).
+    // Step 2 — model (+ key env / base url, depending on provider). The
+    // one-click local pick asks nothing further.
     let collected = match provider {
-        0 => match collect_llamacpp(terminal)? {
+        0 => collect_local_auto(),
+        1 => match collect_openrouter(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        1 => match collect_ollama(terminal)? {
+        2 => match collect_xai(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        2 => match collect_openai(terminal)? {
+        3 => match collect_xai_oauth(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        3 => match collect_anthropic(terminal)? {
+        4 => match collect_openai(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        4 => match collect_xai(terminal)? {
+        5 => match collect_anthropic(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        5 => match collect_xai_oauth(terminal)? {
+        6 => match collect_custom(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        _ => match collect_custom(terminal)? {
+        7 => match collect_llamacpp(terminal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+        _ => match collect_ollama(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
@@ -442,6 +470,147 @@ fn gguf_model_tag(path: &str) -> String {
         .filter(|stem| !stem.is_empty())
         .unwrap_or("default")
         .to_string()
+}
+
+/// What the one-click "Local" pick resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalPlan {
+    /// llama.cpp serving `gguf_path`; when the file is missing, Wizard
+    /// downloads it (and installs llama-server) on first run.
+    LlamaCpp { gguf_path: String },
+    /// An existing Ollama install that already has `model` pulled.
+    Ollama { model: String },
+}
+
+/// Decide the one-click local plan. Pure, so it is unit-tested:
+/// 1. A GGUF already in `~/.wizard/models` wins — nothing to download
+///    (preferring the hardware-suggested tier, else the first by name).
+/// 2. Otherwise an Ollama install with at least one model pulled is reused
+///    (the hardware-suggested tag when pulled, else the first listed).
+/// 3. Otherwise llama.cpp with the suggested tier: Wizard downloads the GGUF
+///    and installs llama-server itself on first run.
+pub fn plan_local_auto(
+    existing: &[PathBuf],
+    models_dir: &Path,
+    ollama_models: &[String],
+    suggested: &GgufModel,
+    suggested_tag: &str,
+) -> LocalPlan {
+    if !existing.is_empty() {
+        let chosen = existing
+            .iter()
+            .find(|path| path.file_name().is_some_and(|name| name == suggested.file))
+            .unwrap_or(&existing[0]);
+        return LocalPlan::LlamaCpp {
+            gguf_path: chosen.display().to_string(),
+        };
+    }
+    if !ollama_models.is_empty() {
+        let model = ollama_models
+            .iter()
+            .find(|model| model.as_str() == suggested_tag)
+            .unwrap_or(&ollama_models[0]);
+        return LocalPlan::Ollama {
+            model: model.clone(),
+        };
+    }
+    LocalPlan::LlamaCpp {
+        gguf_path: models_dir.join(suggested.file).display().to_string(),
+    }
+}
+
+/// Model tags an installed Ollama already has pulled (empty when Ollama is
+/// absent, its server is down, or the listing fails).
+fn installed_ollama_models() -> Vec<String> {
+    if !crate::server::on_path("ollama") {
+        return Vec::new();
+    }
+    let Ok(output) = std::process::Command::new("ollama").arg("list").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1) // header row
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The one-click "Local" pick: no questions. Resolve the plan from what is
+/// already on this machine and the hardware suggestion.
+fn collect_local_auto() -> ProviderAnswers {
+    let (suggested, _) = hardware::suggest_gguf();
+    let (suggested_tag, _) = hardware::suggest_model();
+    let dir = models_dir();
+    let existing = existing_ggufs(&dir);
+    match plan_local_auto(
+        &existing,
+        &dir,
+        &installed_ollama_models(),
+        suggested,
+        &suggested_tag,
+    ) {
+        LocalPlan::LlamaCpp { gguf_path } => ProviderAnswers {
+            provider: ProviderChoice::LlamaCpp,
+            provider_name: "local".to_string(),
+            kind: ProviderKind::LlamaCpp,
+            base_url: LLAMACPP_BASE_URL.to_string(),
+            model: gguf_model_tag(&gguf_path),
+            api_key_env: None,
+            gguf_path: Some(gguf_path),
+        },
+        LocalPlan::Ollama { model } => ProviderAnswers {
+            provider: ProviderChoice::Ollama,
+            provider_name: "local".to_string(),
+            kind: ProviderKind::Ollama,
+            base_url: OLLAMA_BASE_URL.to_string(),
+            model,
+            api_key_env: None,
+            gguf_path: None,
+        },
+    }
+}
+
+fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let models: Vec<(String, String)> = OPENROUTER_MODELS
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                (*m).to_string(),
+                if i == 0 {
+                    "routes to a suitable model (default)".to_string()
+                } else {
+                    String::new()
+                },
+            )
+        })
+        .collect();
+    let model = match pick_model(terminal, "OpenRouter model.", &models, OPENROUTER_MODELS[0])? {
+        Some(model) => model,
+        None => return Ok(None),
+    };
+    let api_key_env = match text_input(
+        terminal,
+        "API key env var",
+        "Wizard reads your key from this env var (never stored on disk).",
+        OPENROUTER_KEY_ENV,
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    Ok(Some(ProviderAnswers {
+        provider: ProviderChoice::OpenRouter,
+        provider_name: "openrouter".to_string(),
+        kind: ProviderKind::Openai,
+        base_url: OPENROUTER_BASE_URL.to_string(),
+        model,
+        api_key_env: Some(api_key_env),
+        gguf_path: None,
+    }))
 }
 
 fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
@@ -795,6 +964,16 @@ fn print_summary(config: &Config) {
         ProviderKind::LlamaCpp => match provider.gguf_path.as_deref() {
             Some(path) if Path::new(path).exists() => {
                 println!("  • llama-server starts automatically (model: {path})");
+            }
+            Some(path)
+                if Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(hardware::gguf_tier_for_file)
+                    .is_some() =>
+            {
+                println!("  • first run downloads the model and starts llama-server for you");
+                println!("    (model: {path})");
             }
             Some(path) => {
                 println!("  • download the model to: {path}");
@@ -1320,5 +1499,107 @@ mod tests {
     #[test]
     fn anthropic_default_model_is_latest_claude() {
         assert_eq!(ANTHROPIC_MODELS[0], "claude-fable-5");
+    }
+
+    #[test]
+    fn openrouter_answers_build_an_openai_compatible_provider() {
+        let answers = Answers {
+            provider: ProviderChoice::OpenRouter,
+            provider_name: "openrouter".to_string(),
+            kind: ProviderKind::Openai,
+            base_url: OPENROUTER_BASE_URL.to_string(),
+            model: OPENROUTER_MODELS[0].to_string(),
+            api_key_env: Some(OPENROUTER_KEY_ENV.to_string()),
+            ..base_answers()
+        };
+        let defaults = Config::default();
+        let config = answers.into_config();
+        assert_eq!(config.active().name, "openrouter");
+        assert_eq!(config.active().kind, ProviderKind::Openai);
+        assert_eq!(config.active().base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.active().model, "openrouter/auto");
+        assert_eq!(
+            config.active().api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        // Legacy local fields untouched.
+        assert_eq!(config.model, defaults.model);
+        assert_eq!(config.ollama_host, defaults.ollama_host);
+    }
+
+    fn tier(file: &'static str) -> GgufModel {
+        GgufModel {
+            name: "Test",
+            file,
+            url: "https://example.com/x.gguf",
+        }
+    }
+
+    #[test]
+    fn local_plan_prefers_a_downloaded_gguf() {
+        let dir = Path::new("/m");
+        let existing = vec![PathBuf::from("/m/a.gguf"), PathBuf::from("/m/big.gguf")];
+        // The suggested tier is on disk: it wins over the first-by-name file.
+        let plan = plan_local_auto(
+            &existing,
+            dir,
+            &["qwen3.5:9b".to_string()],
+            &tier("big.gguf"),
+            "qwen3.5:9b",
+        );
+        assert_eq!(
+            plan,
+            LocalPlan::LlamaCpp {
+                gguf_path: "/m/big.gguf".to_string()
+            }
+        );
+        // Suggested tier not on disk: first existing GGUF wins, still no
+        // download and still ahead of any Ollama install.
+        let plan = plan_local_auto(
+            &existing,
+            dir,
+            &["qwen3.5:9b".to_string()],
+            &tier("other.gguf"),
+            "qwen3.5:9b",
+        );
+        assert_eq!(
+            plan,
+            LocalPlan::LlamaCpp {
+                gguf_path: "/m/a.gguf".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn local_plan_reuses_an_ollama_install_with_models() {
+        let dir = Path::new("/m");
+        let pulled = vec!["llama3:8b".to_string(), "qwen3.5:9b".to_string()];
+        // The hardware-suggested tag is pulled: use it.
+        let plan = plan_local_auto(&[], dir, &pulled, &tier("x.gguf"), "qwen3.5:9b");
+        assert_eq!(
+            plan,
+            LocalPlan::Ollama {
+                model: "qwen3.5:9b".to_string()
+            }
+        );
+        // Suggested tag not pulled: first listed model.
+        let plan = plan_local_auto(&[], dir, &pulled, &tier("x.gguf"), "qwen3.6:27b");
+        assert_eq!(
+            plan,
+            LocalPlan::Ollama {
+                model: "llama3:8b".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn local_plan_falls_back_to_a_fresh_llamacpp_download() {
+        let plan = plan_local_auto(&[], Path::new("/m"), &[], &tier("big.gguf"), "qwen3.5:9b");
+        assert_eq!(
+            plan,
+            LocalPlan::LlamaCpp {
+                gguf_path: "/m/big.gguf".to_string()
+            }
+        );
     }
 }

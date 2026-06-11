@@ -1,6 +1,6 @@
 # Bring your own model (BYOM)
 
-Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default installer downloads only official Qwen GGUF quants, so the one-liner never ships custom weights; swapping in your own is easy on both local backends.
+Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default install ships no model at all, and Wizard's managed local option (onboarding's Local pick, or `WIZARD_LOCAL=1` at install) downloads only official Qwen GGUF quants — custom weights are always your call; swapping them in is easy on both local backends.
 
 ## Any GGUF with llama.cpp (the default local backend)
 
@@ -183,14 +183,14 @@ Ensure the model is loaded/pulled on that server, not just locally.
 
 BYOM lets you choose any GGUF or Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
 
-The default `install.sh` one-liner downloads only official Qwen quants.
+The default `install.sh` one-liner downloads no model weights; Wizard's managed local setup downloads only official Qwen quants.
 
 ## Switching back to official models
 
-Re-run the standard installer: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards (or run `wizard --onboard` and pick the recommended tier):
+Run `wizard --onboard` and pick the recommended tier, or re-run the installer with the local flavor: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_LOCAL=1 bash
 ```
 
 On Ollama: `ollama pull qwen3.6:27b` and set `model = "qwen3.6:27b"`.

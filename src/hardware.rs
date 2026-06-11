@@ -154,32 +154,44 @@ pub fn suggest_model() -> (String, String) {
     }
 }
 
-/// A GGUF model tier for llama.cpp: a display name plus the exact filename the
-/// installer downloads into `~/.wizard/models/`.
+/// A GGUF model tier for llama.cpp: a display name, the exact filename under
+/// `~/.wizard/models/`, and where to download it from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GgufModel {
     /// Human-facing name, e.g. `"Qwen3.6 27B"`.
     pub name: &'static str,
     /// Filename under `~/.wizard/models/`, e.g. `"Qwen3.6-27B-Q4_K_M.gguf"`.
     pub file: &'static str,
+    /// Hugging Face download URL for [`Self::file`].
+    pub url: &'static str,
 }
 
 /// GGUF tiers (largest first), the Q4_K_M counterparts of the Ollama tags in
-/// [`suggest_ollama_model`]. `install.sh` downloads these exact filenames.
+/// [`suggest_ollama_model`]. `install.sh` (WIZARD_LOCAL=1) and
+/// [`crate::local_setup`] download these exact files.
 pub const GGUF_TIERS: &[GgufModel] = &[
     GgufModel {
         name: "Qwen3.6 35B",
         file: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
     },
     GgufModel {
         name: "Qwen3.6 27B",
         file: "Qwen3.6-27B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
     },
     GgufModel {
         name: "Qwen3.5 9B",
         file: "Qwen3.5-9B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
     },
 ];
+
+/// The tier whose [`GgufModel::file`] matches `file_name`, if any. Used to
+/// decide whether a missing `gguf_path` is one Wizard knows how to download.
+pub fn gguf_tier_for_file(file_name: &str) -> Option<&'static GgufModel> {
+    GGUF_TIERS.iter().find(|tier| tier.file == file_name)
+}
 
 /// Suggest a GGUF tier for a given memory budget (GB). Same boundaries as
 /// [`suggest_ollama_model`].
@@ -262,6 +274,24 @@ mod tests {
                 gguf.name
             );
         }
+    }
+
+    #[test]
+    fn gguf_tier_urls_end_with_their_file_names() {
+        for tier in GGUF_TIERS {
+            assert!(
+                tier.url.ends_with(tier.file),
+                "URL/file mismatch for {}: {}",
+                tier.name,
+                tier.url
+            );
+            assert!(tier.url.starts_with("https://"));
+        }
+        assert_eq!(
+            gguf_tier_for_file("Qwen3.5-9B-Q4_K_M.gguf").map(|t| t.name),
+            Some("Qwen3.5 9B")
+        );
+        assert_eq!(gguf_tier_for_file("other.gguf"), None);
     }
 
     #[test]
