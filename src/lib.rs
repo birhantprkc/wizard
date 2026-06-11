@@ -14,6 +14,7 @@ pub mod evolve;
 pub mod gateway;
 pub mod hardware;
 pub mod llm;
+pub mod local_setup;
 pub mod mcp;
 pub mod memory;
 pub mod onboarding;

@@ -7,10 +7,8 @@ Wizard is a single-binary Rust application: a Ratatui front end on top of a prov
 ```mermaid
 flowchart TB
     subgraph install [install.sh]
-        A[detect OS + VRAM] --> B[install llama-server]
-        B --> C["download Qwen3 GGUF"]
-        C --> D[download wizard binary]
-        D --> E["write ~/.wizard/config.toml"]
+        A[detect OS + arch] --> D[download wizard binary]
+        D --> E["lay down ~/.wizard/ loadout"]
     end
 
     subgraph runtime [wizard binary]
@@ -69,7 +67,7 @@ wizard/
 │       └── mod.rs       # skills/*.md loader
 ├── skills/              # bundled skill definitions
 ├── loadout/             # canonical default loadout (mcp.toml, subagents/)
-├── install.sh           # the one installer (default / minimal / BYOM flavors)
+├── install.sh           # the one installer (default / local / BYOM / minimal flavors)
 └── install-byom.sh      # back-compat shim: install.sh with WIZARD_BYOM=1
 ```
 
@@ -234,7 +232,7 @@ Ratatui + crossterm terminal UI:
 
 ### `install.sh` (the one installer)
 
-VRAM-aware tier selection. By default it installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), a Qwen 3 GGUF, and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`), but no Rust toolchain, keeping the default footprint lean. No server is started at install time; Wizard spawns it on first run. Flavors: `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias), `WIZARD_BYOM=1` sets up Ollama with a model of your choice, and `WIZARD_USE_OLLAMA=1` swaps the default stack for Ollama. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+By default it installs the binary and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`) — no model, no config, no Rust toolchain; the first `wizard` run opens onboarding to pick a provider. Flavors: `WIZARD_LOCAL=1` preinstalls the local stack non-interactively (llama.cpp's `llama-server` from official ggml-org releases, a VRAM-tiered Qwen 3 GGUF, and `config.toml`; no server is started at install time — Wizard spawns it on first run), `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor and implies it, `WIZARD_BYOM=1` sets up Ollama with a model of your choice, and `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias). The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
 ### `install-byom.sh` (back-compat shim)
 
@@ -256,7 +254,7 @@ Target release binary: **< 60 MB** (strip + LTO).
 
 ## Security model
 
-- Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the default install, or the configured cloud API
+- Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the local option, or the configured cloud API
 - Beyond the active provider, the core loop makes no outbound API calls in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
 - Both modes auto-approve tool calls (writes, shell, git, and `/evolve` changes) by default. An opt-in y/n confirmation gate is available via `auto_approve = false`. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run sovereign mode only on tasks and repos where unattended local command execution is acceptable

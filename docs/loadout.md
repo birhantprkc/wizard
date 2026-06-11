@@ -1,8 +1,8 @@
 # The default loadout
 
-A fresh Wizard install is already equipped. Besides the binary, the model runtime, and `~/.wizard/config.toml`, the installer lays down a default loadout: a browser (Playwright MCP) and a roster of four subagents. The binary is unchanged; the loadout is *configuration*, plain TOML files under `~/.wizard/` that you can edit, extend, or delete. Everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
+A fresh Wizard install is already equipped. Besides the binary, the installer lays down a default loadout: a browser (Playwright MCP) and a roster of four subagents. The binary is unchanged; the loadout is *configuration*, plain TOML files under `~/.wizard/` that you can edit, extend, or delete. Everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
 
-The loadout is installed in the default, `WIZARD_USE_OLLAMA=1`, and `WIZARD_BYOM=1` flavors; only `WIZARD_MINIMAL=1` skips it. Each file is written only if it does not already exist: nothing under `~/.wizard/` that you already have is ever overwritten, so re-running the installer on an existing setup adds only what is missing.
+The loadout is installed in every flavor except `WIZARD_MINIMAL=1`, which skips it. Each file is written only if it does not already exist: nothing under `~/.wizard/` that you already have is ever overwritten, so re-running the installer on an existing setup adds only what is missing.
 
 > Historical note: this loadout used to ship as a separate distribution called Wizard Arsenal. It has been absorbed into Wizard's default install; there is nothing extra to add on.
 

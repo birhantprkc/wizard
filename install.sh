@@ -1,46 +1,62 @@
 #!/usr/bin/env bash
 #
-# Wizard installer — one script, three flavors.
+# Wizard installer — one script, four flavors.
 #
 #   curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 #
-# Default (no flags) is the batteries-included install:
+# Default (no flags):
 #   1. Detect OS and CPU architecture
-#   2. Install llama.cpp's `llama-server` from official GitHub releases if absent
-#   3. Select a model tier based on available VRAM (or system RAM on CPU-only)
-#   4. Download the matching Qwen3 GGUF (Q4_K_M) from Hugging Face
-#   5. Download the `wizard` binary from GitHub releases
-#   6. Write ~/.wizard/config.toml (never clobbers an existing one)
-#   7. Lay down the default loadout: ~/.wizard/mcp.toml (Playwright browser MCP)
+#   2. Download the `wizard` binary from GitHub releases
+#   3. Lay down the default loadout: ~/.wizard/mcp.toml (Playwright browser MCP)
 #      and ~/.wizard/subagents/*.toml (reviewer, researcher, tester, documenter)
 #      — each file only if absent, never overwriting
 #
-# No server is started here: wizard launches llama-server itself on first run.
-# Set WIZARD_USE_OLLAMA=1 for the previous Ollama-based flow.
+# No model, no model runtime, no config.toml: the first `wizard` run opens
+# onboarding, which asks which provider to use. Picking "Local" there is one
+# step — wizard detects your hardware, downloads a fitting GGUF, and installs
+# and manages llama-server itself (or reuses an existing Ollama install).
 #
 # Flavors (mutually exclusive):
-#   WIZARD_MINIMAL=1  binary only — skip the model runtime, the model download,
-#                     config.toml, and the loadout; the first `wizard` run
-#                     starts the interactive onboarding wizard
+#   WIZARD_LOCAL=1    preinstall the local stack non-interactively (headless
+#                     boxes, provisioning scripts; what the default used to do):
+#                       1. Install llama.cpp's `llama-server` from official
+#                          GitHub releases if absent
+#                       2. Select a model tier based on available VRAM (or
+#                          system RAM on CPU-only)
+#                       3. Download the matching Qwen3 GGUF (Q4_K_M) from
+#                          Hugging Face
+#                       4. Write ~/.wizard/config.toml (never clobbers an
+#                          existing one)
+#                     No server is started here: wizard launches llama-server
+#                     itself on first run. WIZARD_USE_OLLAMA=1 is the
+#                     Ollama-based variant (install Ollama, start it, pull the
+#                     auto-tiered model) and implies this flavor — no need to
+#                     also set WIZARD_LOCAL.
 #   WIZARD_BYOM=1     bring your own model — install Ollama if absent and pick
 #                     any Ollama-compatible model interactively (library tag,
 #                     custom registry tag, local Modelfile, or one already
 #                     installed), then write the config. You choose the model:
 #                     Wizard does not ship, endorse, or maintain third-party
 #                     model weights; you are responsible for their licenses.
+#   WIZARD_MINIMAL=1  binary only — like the default but also skips the
+#                     loadout; the first `wizard` run starts onboarding
 #
 # Environment variables:
 #   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin)
+#   WIZARD_LOCAL                 1 = preinstall the llama.cpp stack and a model
+#                                    (see above)               (default 0)
 #   WIZARD_MINIMAL               1 = minimal install (see above)        (default 0)
 #   WIZARD_BYOM                  1 = bring-your-own-model install (see above)
-#                                    (default 0; conflicts with WIZARD_MINIMAL)
+#                                    (default 0)
 #   WIZARD_BESPOKE               deprecated alias for WIZARD_MINIMAL
-#   WIZARD_MODEL                 force a specific model tier  (default auto-detected;
-#                                with WIZARD_BYOM=1: use this tag as-is and skip
-#                                the interactive prompts)
-#   WIZARD_SKIP_MODEL_PULL       1 = skip the model download  (default 0)
-#   WIZARD_SKIP_LLAMACPP_INSTALL 1 = llama-server managed elsewhere (default 0)
-#   WIZARD_USE_OLLAMA            1 = use Ollama instead of llama.cpp (default 0)
+#   WIZARD_MODEL                 local flavors: force a specific model tier
+#                                (default auto-detected; with WIZARD_BYOM=1:
+#                                use this tag as-is and skip the interactive
+#                                prompts)
+#   WIZARD_SKIP_MODEL_PULL       1 = local flavors: skip the model download (default 0)
+#   WIZARD_SKIP_LLAMACPP_INSTALL 1 = WIZARD_LOCAL: llama-server managed elsewhere (default 0)
+#   WIZARD_USE_OLLAMA            1 = local flavor on Ollama instead of llama.cpp
+#                                    (implies WIZARD_LOCAL)    (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
 #   WIZARD_REPO                  owner/repo to install from   (default teddytennant/wizard)
@@ -54,6 +70,7 @@ set -euo pipefail
 # --- defaults -----------------------------------------------------------
 
 WIZARD_INSTALL_DIR="${WIZARD_INSTALL_DIR:-/usr/local/bin}"
+WIZARD_LOCAL="${WIZARD_LOCAL:-0}"
 WIZARD_MINIMAL="${WIZARD_MINIMAL:-0}"
 WIZARD_BYOM="${WIZARD_BYOM:-0}"
 WIZARD_MODEL="${WIZARD_MODEL:-}"
@@ -811,12 +828,16 @@ build_from_source() {
 write_config() {
     local cfg="$HOME/.wizard/config.toml"
     mkdir -p "$HOME/.wizard"
-    if [ "$WIZARD_MINIMAL" = "1" ]; then
+    # Only the local and BYOM flavors write a config. The default and minimal
+    # flavors leave it to onboarding on the first `wizard` run.
+    if [ "$WIZARD_MINIMAL" = "1" ] \
+        || { [ "$WIZARD_LOCAL" != "1" ] && [ "$WIZARD_USE_OLLAMA" != "1" ] \
+            && [ "$WIZARD_BYOM" != "1" ]; }; then
         if [ -f "$cfg" ]; then
-            say "Minimal install requested, but a config already exists at ${cfg} — leaving it untouched"
+            say "A config already exists at ${cfg} — leaving it untouched"
             say "Run 'wizard --onboard' to reconfigure from scratch"
         else
-            say "Minimal install: no config written — the first 'wizard' run will start onboarding"
+            say "No config written — the first 'wizard' run starts onboarding"
         fi
         return
     fi
@@ -1094,6 +1115,12 @@ main() {
     if [ "$WIZARD_MINIMAL" = "1" ] && [ "$WIZARD_BYOM" = "1" ]; then
         die "WIZARD_MINIMAL=1 and WIZARD_BYOM=1 conflict — pick one: minimal installs the binary only (onboarding on first run), BYOM sets up Ollama with a model of your choice"
     fi
+    if [ "$WIZARD_LOCAL" = "1" ] && [ "$WIZARD_MINIMAL" = "1" ]; then
+        die "WIZARD_LOCAL=1 and WIZARD_MINIMAL=1 conflict — pick one: local preinstalls llama.cpp and an auto-tiered model, minimal installs the binary only (onboarding on first run)"
+    fi
+    if [ "$WIZARD_LOCAL" = "1" ] && [ "$WIZARD_BYOM" = "1" ]; then
+        die "WIZARD_LOCAL=1 and WIZARD_BYOM=1 conflict — pick one: local preinstalls llama.cpp with an auto-tiered model, BYOM sets up Ollama with a model of your choice"
+    fi
     require_curl
     detect_platform
 
@@ -1110,10 +1137,13 @@ main() {
         start_ollama
         select_model
         pull_model
-    else
+    elif [ "$WIZARD_LOCAL" = "1" ]; then
+        say "Local install (WIZARD_LOCAL=1): llama.cpp runtime + hardware-tiered model"
         install_llamacpp
         select_model
         download_gguf
+    else
+        say "Default install: binary + loadout — pick a provider in onboarding on first run"
     fi
 
     if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
@@ -1136,8 +1166,10 @@ main() {
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
         elif [ "$WIZARD_BYOM" = "1" ] || [ "$WIZARD_USE_OLLAMA" = "1" ]; then
             say "Done. Run: wizard"
-        else
+        elif [ "$WIZARD_LOCAL" = "1" ]; then
             say "Done. Run: wizard — it starts llama-server with your model automatically."
+        else
+            say "Done. Run 'wizard' — it asks which provider to use (Local is one pick: it downloads a model sized to your hardware and sets up llama.cpp for you)."
         fi
     else
         say "Setup finished, but the wizard binary was NOT installed — see the build-from-source steps above."

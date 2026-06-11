@@ -87,13 +87,6 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
              `base_url` in ~/.wizard/config.toml"
         );
     };
-    let Some(binary) = find_binary() else {
-        bail!(
-            "cannot reach llama-server at {base_url} and `llama-server` is not on PATH — \
-             install llama.cpp (https://github.com/ggml-org/llama.cpp), then start the server \
-             with {START_HINT}"
-        );
-    };
     let Some(gguf) = provider
         .gguf_path
         .as_deref()
@@ -105,12 +98,38 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
              in ~/.wizard/config.toml"
         );
     };
+    // A missing GGUF that names a known tier is downloaded into place (the
+    // one-click local onboarding writes exactly such a path); anything else
+    // stays an actionable error.
     if !Path::new(gguf).exists() {
-        bail!(
-            "cannot start llama-server: the model file {gguf} does not exist — fix `gguf_path` \
-             in ~/.wizard/config.toml"
-        );
+        let tier = Path::new(gguf)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::hardware::gguf_tier_for_file);
+        match tier {
+            Some(tier) => crate::local_setup::download_gguf(tier, Path::new(gguf), progress)
+                .await
+                .context("downloading the local model")?,
+            None => bail!(
+                "cannot start llama-server: the model file {gguf} does not exist — fix \
+                 `gguf_path` in ~/.wizard/config.toml"
+            ),
+        }
     }
+    let binary = match find_binary() {
+        Some(binary) => binary,
+        // Not installed anywhere Wizard looks: install it from the official
+        // llama.cpp releases, the same way `install.sh` does.
+        None => crate::local_setup::install_llama_server(progress)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot reach llama-server at {base_url} and installing llama.cpp failed — \
+                     install it yourself (https://github.com/ggml-org/llama.cpp), then start \
+                     the server with {START_HINT}"
+                )
+            })?,
+    };
 
     let pid = spawn(&binary, gguf, port)?;
     progress(&format!(
@@ -258,12 +277,31 @@ const BINARY_NAME: &str = "llama-server";
 /// The "start it yourself" command quoted by every unspawnable-server error.
 const START_HINT: &str = "`llama-server -m <model.gguf> --port 8080`";
 
-/// Find `llama-server` on `PATH`.
+/// Find `llama-server`: on `PATH`, then in the locations Wizard's own
+/// installer uses (`~/.wizard/bin`, `~/.wizard/llama.cpp`) — those are not
+/// usually on `PATH`.
 pub fn find_binary() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    if let Some(path) = std::env::var_os("PATH")
+        && let Some(found) = std::env::split_paths(&path)
+            .map(|dir| dir.join(BINARY_NAME))
+            .find(|candidate| is_executable(candidate))
+    {
+        return Some(found);
+    }
+    let wizard = Config::wizard_dir().ok()?;
+    [wizard.join("bin"), wizard.join("llama.cpp")]
+        .into_iter()
         .map(|dir| dir.join(BINARY_NAME))
         .find(|candidate| is_executable(candidate))
+}
+
+/// True when `name` resolves to an executable on `PATH`.
+pub fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .any(|candidate| is_executable(&candidate))
+    })
 }
 
 #[cfg(unix)]

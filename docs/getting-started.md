@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent. It works with any OpenAI-compatible endpoint (OpenAI, Groq, vLLM, LM Studio, llama.cpp, Ollama), OpenRouter, Anthropic, or xAI (API key or account sign-in); the default installer sets up a local stack ([llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a Qwen 3 GGUF), so the first run needs no API key. See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead) for the alternatives.
+Wizard installs in one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) — no model, no config — and the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
 
 ## Install
 
@@ -11,28 +11,40 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 The installer:
 
 1. Detects your OS and CPU architecture
-2. Installs `llama-server` from official llama.cpp GitHub releases if it is not already on your `PATH` (Vulkan build when a GPU and Vulkan loader are present, CPU build otherwise; the release tree lands in `~/.wizard/llama.cpp/` with a symlink at `~/.wizard/bin/llama-server`)
-3. Selects a model tier based on available VRAM
-4. Downloads the matching Qwen 3 GGUF (Q4_K_M) from Hugging Face into `~/.wizard/models/` (resumable; re-running picks up where it left off)
-5. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
-6. Writes `~/.wizard/config.toml` (an existing config is never touched)
-7. Lays down the [default loadout](loadout.md): `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/*.toml` (reviewer, researcher, tester, documenter), each file only if it is not already present
+2. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
+3. Lays down the [default loadout](loadout.md): `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/*.toml` (reviewer, researcher, tester, documenter), each file only if it is not already present
+
+It installs no model and writes no config; the first `wizard` run starts onboarding. To preinstall the local stack instead (non-interactive; what the default used to do), set `WIZARD_LOCAL=1`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_LOCAL=1 bash
+```
+
+With `WIZARD_LOCAL=1` the installer additionally:
+
+1. Installs `llama-server` from official llama.cpp GitHub releases if it is not already on your `PATH` (Vulkan build when a GPU and Vulkan loader are present, CPU build otherwise; the release tree lands in `~/.wizard/llama.cpp/` with a symlink at `~/.wizard/bin/llama-server`)
+2. Selects a model tier based on available VRAM
+3. Downloads the matching Qwen 3 GGUF (Q4_K_M) from Hugging Face into `~/.wizard/models/` (resumable; re-running picks up where it left off)
+4. Writes `~/.wizard/config.toml` (an existing config is never touched)
 
 The installer does **not** start a model server; Wizard starts `llama-server` itself on first run.
 
 ### Install flavors
 
-The same script has three mutually exclusive flavors:
+The same script has four mutually exclusive flavors:
 
 | Install | What you get |
 |---------|--------------|
-| (default) | llama.cpp runtime + VRAM-tiered Qwen GGUF + binary + `config.toml` + loadout |
-| `WIZARD_MINIMAL=1` | binary only: no model runtime, no model, no config, no loadout; the first `wizard` run starts [onboarding](#first-run) |
+| (default) | binary + loadout; no model, no config — the first `wizard` run starts [onboarding](#first-run) |
+| `WIZARD_LOCAL=1` | the default plus a preinstalled local stack: llama.cpp runtime + VRAM-tiered Qwen GGUF + `config.toml` |
+| `WIZARD_MINIMAL=1` | binary only: no loadout either; onboarding on first run as with the default |
 | `WIZARD_BYOM=1` | Ollama runtime + a model of your choice (interactive, or `WIZARD_MODEL=<tag>`) + binary + config + loadout; see [byom.md](byom.md) |
 
-Orthogonally, `WIZARD_USE_OLLAMA=1` swaps the default's llama.cpp stack for Ollama with the same auto-tiered model. Setting both `WIZARD_MINIMAL=1` and `WIZARD_BYOM=1` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; note it is stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
+`WIZARD_USE_OLLAMA=1` is the Ollama variant of the local flavor (installs Ollama, starts it, pulls the same auto-tiered model) and implies it — no need to also set `WIZARD_LOCAL`. Combining `WIZARD_LOCAL`, `WIZARD_MINIMAL`, or `WIZARD_BYOM` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; note it is stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
 
 ### Model tiers (automatic)
+
+Picking Local in onboarding and the `WIZARD_LOCAL=1` / `WIZARD_USE_OLLAMA=1` flavors size the model to your hardware:
 
 | Available VRAM | GGUF downloaded | Approx. size |
 |----------------|-----------------|--------------|
@@ -50,13 +62,14 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WIZARD_INSTALL_DIR` | `/usr/local/bin` | Where to place the `wizard` binary |
+| `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
 | `WIZARD_BYOM` | `0` | Set to `1` to bring your own Ollama model (conflicts with `WIZARD_MINIMAL`) |
 | `WIZARD_BESPOKE` | `0` | Deprecated alias for `WIZARD_MINIMAL` |
-| `WIZARD_MODEL` | auto-detected | Force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, use this tag as-is and skip the interactive prompts |
-| `WIZARD_SKIP_MODEL_PULL` | `0` | Set to `1` to skip the GGUF download |
-| `WIZARD_SKIP_LLAMACPP_INSTALL` | `0` | Set to `1` if `llama-server` is managed elsewhere |
-| `WIZARD_USE_OLLAMA` | `0` | Set to `1` to use Ollama instead of llama.cpp |
+| `WIZARD_MODEL` | auto-detected | Local flavors: force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, use this tag as-is and skip the interactive prompts |
+| `WIZARD_SKIP_MODEL_PULL` | `0` | Local flavors: set to `1` to skip the model download |
+| `WIZARD_SKIP_LLAMACPP_INSTALL` | `0` | With `WIZARD_LOCAL=1`: set to `1` if `llama-server` is managed elsewhere |
+| `WIZARD_USE_OLLAMA` | `0` | Set to `1` for the Ollama variant of the local flavor (implies `WIZARD_LOCAL`) |
 | `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With Ollama flavors: Ollama is already managed elsewhere |
 | `WIZARD_WITH_TOOLCHAIN` | `0` | Set to `1` to eagerly install a Rust toolchain for deep evolve |
 
@@ -77,7 +90,9 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-On first launch, Wizard:
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Re-run it any time with `wizard --onboard`.
+
+With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
 - Probes `llama-server`'s health endpoint (`GET http://127.0.0.1:8080/health`)
 - If nothing answers, starts `llama-server` itself with your GGUF and waits (up to 60 s) for the model to load
@@ -105,7 +120,7 @@ Wizard reads files, applies changes, runs tests, and shows git diffs.
 
 ## Configuration
 
-`~/.wizard/config.toml` written by the installer:
+`~/.wizard/config.toml` as written by onboarding's Local pick (or a `WIZARD_LOCAL=1` install):
 
 ```toml
 active_provider = "local"
@@ -173,7 +188,7 @@ Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. Add one fro
 /provider use openai
 ```
 
-The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_MINIMAL=1` to choose everything on first run).
+The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding offers the same choices interactively — the default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
 
 ### Using OpenRouter
 
@@ -264,11 +279,11 @@ Check the log first:
 tail -50 ~/.wizard/llama-server.log
 ```
 
-Common causes: the GGUF at `gguf_path` is missing or truncated (re-run the installer; the download resumes), or the model doesn't fit in memory (see below).
+Common causes: the GGUF at `gguf_path` is missing or truncated (re-run the installer with `WIZARD_LOCAL=1`; the download resumes), or the model doesn't fit in memory (see below).
 
 ### llama-server not found
 
-Wizard looks for `llama-server` on `PATH`. The installer links it into the install dir and `~/.wizard/bin/`; if neither is on your `PATH`, add one, or install llama.cpp yourself:
+Wizard looks for `llama-server` on `PATH`. The local setup (onboarding's Local pick, or a `WIZARD_LOCAL=1` install) links it into the install dir and `~/.wizard/bin/`; if neither is on your `PATH`, add one, or install llama.cpp yourself:
 
 ```bash
 brew install llama.cpp                  # Homebrew / Linuxbrew
