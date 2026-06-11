@@ -176,8 +176,9 @@ pub fn render_for_prompt(skills: &[Skill]) -> String {
 
 /// Split optional `---`-fenced frontmatter from the markdown body. When the
 /// file does not start with a `---` line (or the closing fence is missing),
-/// the whole content is the body.
-fn split_frontmatter(raw: &str) -> (SkillMeta, String) {
+/// the whole content is the body. Shared with the custom-command loader
+/// (`crate::commands`), which uses the same convention.
+pub(crate) fn split_frontmatter(raw: &str) -> (SkillMeta, String) {
     let lines: Vec<&str> = raw.lines().collect();
     if lines.first().map(|l| l.trim_end()) == Some("---")
         && let Some(end) = lines[1..].iter().position(|l| l.trim_end() == "---")

@@ -9,6 +9,7 @@ pub mod app;
 pub mod bench;
 pub mod checkpoint;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod dispatch;
 pub mod event;

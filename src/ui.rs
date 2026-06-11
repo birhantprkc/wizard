@@ -616,7 +616,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             let mut ghost = remainder.to_string();
             if !spec.args.is_empty() {
                 ghost.push(' ');
-                ghost.push_str(spec.args);
+                ghost.push_str(&spec.args);
             }
             let room = budget.saturating_sub(used_cols);
             if !ghost.is_empty() && room > 0 {
@@ -694,7 +694,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
                 Span::styled(marker, accent()),
                 Span::styled(format!("{usage:<usage_width$}"), name_style),
                 Span::styled(
-                    format!("  {}", truncate_width(spec.description, description_room)),
+                    format!("  {}", truncate_width(&spec.description, description_room)),
                     dim(),
                 ),
             ])

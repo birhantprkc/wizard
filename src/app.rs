@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, AgentEvent, DoneReason, PlanVerdict, session::Session, subagent};
 use crate::cli::Cli;
+use crate::commands::CustomCommand;
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
@@ -412,6 +413,56 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
+/// One row in the suggestion popup: a builtin [`CommandSpec`] or a custom
+/// command loaded from `~/.wizard/commands/` / `<project>/.wizard/commands/`.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub name: String,
+    /// Argument hint shown after the name.
+    pub args: String,
+    pub description: String,
+    /// Completion appends a trailing space and waits for arguments instead
+    /// of submitting immediately.
+    pub takes_args: bool,
+}
+
+impl From<&CommandSpec> for Suggestion {
+    fn from(spec: &CommandSpec) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            args: spec.args.to_string(),
+            description: spec.description.to_string(),
+            takes_args: spec.takes_args,
+        }
+    }
+}
+
+impl From<&CustomCommand> for Suggestion {
+    fn from(command: &CustomCommand) -> Self {
+        let takes_args = command.expects_args();
+        Self {
+            name: command.name.clone(),
+            args: if takes_args {
+                "[args]".to_string()
+            } else {
+                String::new()
+            },
+            description: command
+                .description
+                .clone()
+                .unwrap_or_else(|| "custom command".to_string()),
+            takes_args,
+        }
+    }
+}
+
+/// True when `name` is a builtin command word ([`COMMANDS`] plus the parse
+/// aliases that have no table entry). Unknown words fall through to the
+/// model as a normal prompt.
+fn is_builtin_command(name: &str) -> bool {
+    COMMANDS.iter().any(|spec| spec.name == name) || matches!(name, "q" | "exit")
+}
+
 /// What an open [`Picker`] selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -508,11 +559,17 @@ pub struct App {
     pub should_quit: bool,
     /// Tick counter driving the busy spinner.
     pub tick: u64,
-    /// Matching [`COMMANDS`] entries for the current `/input`, shown as the
-    /// suggestion popup.
-    pub suggestions: Vec<&'static CommandSpec>,
+    /// Matching commands (builtin [`COMMANDS`] plus custom commands) for the
+    /// current `/input`, shown as the suggestion popup.
+    pub suggestions: Vec<Suggestion>,
     /// Highlighted row in `suggestions`.
     pub suggestion_index: usize,
+    /// Custom commands loaded from `~/.wizard/commands/` and
+    /// `<project>/.wizard/commands/` (set by `run_tui`, refreshed by
+    /// `/reload`).
+    pub custom_commands: Vec<CustomCommand>,
+    /// Project root `@file` references resolve against.
+    pub project_root: PathBuf,
     /// Open selection popup (model / mode / rewind picker), if any.
     pub picker: Option<Picker>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
@@ -575,6 +632,8 @@ impl App {
             tick: 0,
             suggestions: Vec::new(),
             suggestion_index: 0,
+            custom_commands: Vec::new(),
+            project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker: None,
             plan_mode,
             plan_review: None,
@@ -623,7 +682,7 @@ impl App {
         let previous = if self.suggestion_index > 0 {
             self.suggestions
                 .get(self.suggestion_index)
-                .map(|spec| spec.name)
+                .map(|spec| spec.name.clone())
         } else {
             None
         };
@@ -640,18 +699,26 @@ impl App {
             self.suggestion_index = 0;
             return;
         }
+        // Builtins in display order, then custom commands (already sorted).
+        let candidates: Vec<Suggestion> = COMMANDS
+            .iter()
+            .map(Suggestion::from)
+            .chain(self.custom_commands.iter().map(Suggestion::from))
+            .collect();
         // Rank: exact match, then prefix matches, then substring matches.
         self.suggestions
-            .extend(COMMANDS.iter().filter(|spec| spec.name == token));
+            .extend(candidates.iter().filter(|spec| spec.name == token).cloned());
         self.suggestions.extend(
-            COMMANDS
+            candidates
                 .iter()
-                .filter(|spec| spec.name != token && spec.name.starts_with(token)),
+                .filter(|spec| spec.name != token && spec.name.starts_with(token))
+                .cloned(),
         );
         self.suggestions.extend(
-            COMMANDS
+            candidates
                 .iter()
-                .filter(|spec| !spec.name.starts_with(token) && spec.name.contains(token)),
+                .filter(|spec| !spec.name.starts_with(token) && spec.name.contains(token))
+                .cloned(),
         );
         self.suggestion_index = previous
             .and_then(|name| self.suggestions.iter().position(|spec| spec.name == name))
@@ -659,9 +726,9 @@ impl App {
     }
 
     /// Replace the input with the highlighted suggestion. Returns the
-    /// completed spec, or `None` when nothing is highlighted.
-    fn accept_suggestion(&mut self) -> Option<&'static CommandSpec> {
-        let spec = *self.suggestions.get(self.suggestion_index)?;
+    /// completed suggestion, or `None` when nothing is highlighted.
+    fn accept_suggestion(&mut self) -> Option<Suggestion> {
+        let spec = self.suggestions.get(self.suggestion_index)?.clone();
         let mut text = format!("/{}", spec.name);
         if spec.takes_args {
             text.push(' ');
@@ -987,6 +1054,8 @@ impl App {
             KeyCode::Tab => {
                 if suggesting {
                     self.accept_suggestion();
+                } else {
+                    self.complete_at_path();
                 }
                 None
             }
@@ -1060,10 +1129,12 @@ impl App {
                 .strip_prefix('/')
                 .unwrap_or_default()
                 .to_string();
-            let spec = self.suggestions[self.suggestion_index.min(self.suggestions.len() - 1)];
+            let spec =
+                self.suggestions[self.suggestion_index.min(self.suggestions.len() - 1)].clone();
             // An exactly-typed command always runs as typed; otherwise Enter
             // completes the highlighted suggestion first.
-            let exact = COMMANDS.iter().any(|command| command.name == typed);
+            let exact = COMMANDS.iter().any(|command| command.name == typed)
+                || self.custom_commands.iter().any(|c| c.name == typed);
             if !exact && typed != spec.name {
                 let takes_args = spec.takes_args;
                 self.accept_suggestion();
@@ -1085,28 +1156,118 @@ impl App {
                 Some(AppAction::Command(command))
             }
             Some(Err(message)) => {
-                self.push_history(&input);
-                self.clear_input();
-                self.notice(message);
-                None
-            }
-            None => {
-                if self.status.busy {
-                    // Rejected input never ran; do not record it in history.
-                    self.notice("the agent is busy — wait for the current turn to finish");
-                    return None;
+                let word = input
+                    .trim_start()
+                    .strip_prefix('/')
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                // A known builtin with bad arguments keeps its usage notice;
+                // custom commands and unknown `/words` go to the model (the
+                // custom expansion happens in `submit_prompt`).
+                if is_builtin_command(word) {
+                    self.push_history(&input);
+                    self.clear_input();
+                    self.notice(message);
+                    None
+                } else {
+                    self.submit_prompt(input)
                 }
-                if self.rebuilding.is_some() {
-                    self.notice("the agent is rebuilding — try again in a moment");
-                    return None;
-                }
-                self.push_history(&input);
-                self.clear_input();
-                self.transcript.push(TranscriptEntry::User(input.clone()));
-                self.scroll = 0;
-                Some(AppAction::Submit(input))
             }
+            None => self.submit_prompt(input),
         }
+    }
+
+    /// Submit `input` as a user prompt: record it verbatim in history and
+    /// the transcript, hand the preprocessed form (custom-command and `@file`
+    /// expansion) to the agent.
+    fn submit_prompt(&mut self, input: String) -> Option<AppAction> {
+        if self.status.busy {
+            // Rejected input never ran; do not record it in history.
+            self.notice("the agent is busy — wait for the current turn to finish");
+            return None;
+        }
+        if self.rebuilding.is_some() {
+            self.notice("the agent is rebuilding — try again in a moment");
+            return None;
+        }
+        let expanded =
+            crate::commands::preprocess(&input, &self.custom_commands, &self.project_root);
+        self.push_history(&input);
+        self.clear_input();
+        self.transcript.push(TranscriptEntry::User(input));
+        self.scroll = 0;
+        Some(AppAction::Submit(expanded))
+    }
+
+    /// Minimal Tab path-completion for `@path` tokens: complete the token
+    /// under the cursor from its directory listing (longest common prefix;
+    /// a unique directory match gains a trailing `/`).
+    fn complete_at_path(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut start = self.cursor.min(chars.len());
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let token: String = chars[start..self.cursor.min(chars.len())].iter().collect();
+        let Some(partial) = token.strip_prefix('@') else {
+            return;
+        };
+        if partial.starts_with('@') {
+            return;
+        }
+        // Split the partial path into the directory to list and the name
+        // prefix to match.
+        let (dir_part, prefix) = match partial.rfind('/') {
+            Some(slash) => (&partial[..=slash], &partial[slash + 1..]),
+            None => ("", partial),
+        };
+        let expanded = shellexpand::tilde(dir_part);
+        let dir_path = Path::new(expanded.as_ref());
+        let dir = if dir_path.is_absolute() {
+            dir_path.to_path_buf()
+        } else {
+            self.project_root.join(dir_path)
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut matches: Vec<(String, bool)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                let is_dir = entry.file_type().ok()?.is_dir();
+                name.starts_with(prefix).then_some((name, is_dir))
+            })
+            .collect();
+        matches.sort();
+        let completion = match matches.as_slice() {
+            [] => return,
+            [(name, is_dir)] => {
+                let mut full = name.clone();
+                if *is_dir {
+                    full.push('/');
+                }
+                full
+            }
+            many => {
+                let mut common = many[0].0.clone();
+                for (name, _) in &many[1..] {
+                    let shared = common
+                        .char_indices()
+                        .zip(name.chars())
+                        .take_while(|((_, a), b)| a == b)
+                        .count();
+                    common = common.chars().take(shared).collect();
+                }
+                common
+            }
+        };
+        if completion.len() <= prefix.len() {
+            return;
+        }
+        self.insert_str(&completion[prefix.len()..]);
     }
 
     /// Keys while the plan-review modal is open. Review state: `y`/Enter
@@ -1789,6 +1950,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
     let genie_max_steps = config.max_steps;
 
     let mut app = App::new(config);
+    app.project_root = project_root.clone();
+    app.custom_commands = crate::commands::load(&project_root);
     if let Some(prompt) = cli.prompt.clone() {
         app.set_input(prompt);
     }
@@ -2321,6 +2484,7 @@ impl CommandContext<'_> {
             return;
         }
         *self.skills = load_skill_roots();
+        self.app.custom_commands = crate::commands::load(self.project_root);
         let mut manager = self.manager.lock().await;
         match McpConfig::load(self.mcp_path) {
             Ok(mcp_config) => {
@@ -2854,7 +3018,7 @@ mod tests {
     fn slash_filters_suggestions_by_prefix() {
         let mut app = app();
         type_str(&mut app, "/mo");
-        let names: Vec<&str> = app.suggestions.iter().map(|s| s.name).collect();
+        let names: Vec<&str> = app.suggestions.iter().map(|s| s.name.as_str()).collect();
         // Prefix matches first, then substring matches ("me*mo*ry").
         assert_eq!(names, ["model", "mode", "memory"]);
         assert_eq!(app.input_mode, InputMode::Command);
@@ -2933,6 +3097,124 @@ mod tests {
             action,
             Some(AppAction::Command(SlashCommand::Mode(None)))
         ));
+    }
+
+    fn custom(name: &str, template: &str, description: Option<&str>) -> CustomCommand {
+        CustomCommand {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            template: template.to_string(),
+            path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn custom_commands_appear_in_suggestions_after_builtins() {
+        let mut app = app();
+        app.custom_commands = vec![custom(
+            "models-report",
+            "Report on $ARGUMENTS",
+            Some("report"),
+        )];
+        type_str(&mut app, "/mo");
+        let names: Vec<&str> = app.suggestions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["model", "mode", "models-report", "memory"]);
+        let spec = &app.suggestions[2];
+        assert_eq!(spec.description, "report");
+        assert!(spec.takes_args);
+    }
+
+    #[test]
+    fn typed_custom_command_submits_the_expanded_prompt() {
+        let mut app = app();
+        app.custom_commands = vec![custom("review", "Review $1 with care.", None)];
+        type_str(&mut app, "/review src/app.rs");
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Submit(prompt)) = action else {
+            panic!("expected a submit, got {action:?}");
+        };
+        assert_eq!(prompt, "Review src/app.rs with care.");
+        // The transcript shows what the user actually typed.
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::User(text)) if text == "/review src/app.rs"
+        ));
+    }
+
+    #[test]
+    fn unknown_slash_command_passes_through_as_a_prompt() {
+        let mut app = app();
+        type_str(&mut app, "/frobnicate the build");
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            action,
+            Some(AppAction::Submit(prompt)) if prompt == "/frobnicate the build"
+        ));
+    }
+
+    #[test]
+    fn builtin_command_with_bad_args_keeps_its_usage_notice() {
+        let mut app = app();
+        type_str(&mut app, "/mode warlock");
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(action.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Notice(text)) if text.contains("unknown mode")
+        ));
+    }
+
+    #[test]
+    fn submit_expands_at_file_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ctx.txt"), "the context\n").unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+        type_str(&mut app, "use @ctx.txt here");
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Submit(prompt)) = action else {
+            panic!("expected a submit, got {action:?}");
+        };
+        assert!(prompt.contains("the context"), "got: {prompt}");
+        // The transcript keeps the compact form.
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::User(text)) if text == "use @ctx.txt here"
+        ));
+    }
+
+    #[test]
+    fn tab_completes_at_paths_from_the_directory_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("readme.md"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("reach")).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+
+        // Common prefix of readme.md / reach.
+        type_str(&mut app, "see @re");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "see @rea");
+
+        // Unique file completes fully.
+        type_str(&mut app, "d");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "see @readme.md");
+    }
+
+    #[test]
+    fn tab_completes_unique_directory_with_a_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sources")).unwrap();
+        std::fs::write(tmp.path().join("sources").join("inner.rs"), "x").unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+        type_str(&mut app, "@so");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "@sources/");
+        type_str(&mut app, "in");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "@sources/inner.rs");
     }
 
     #[test]

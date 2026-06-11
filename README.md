@@ -162,6 +162,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 - [Getting started](docs/getting-started.md): install, tiers, first run, troubleshooting
 - [Modes](docs/modes.md): genie vs sovereign
 - [Checkpoints](docs/checkpoints.md): per-file snapshots, `/rewind`, perpetual rollback
+- [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
 - [Fork and distribute](docs/market.md): publish your evolved Wizard; one-line installer for your fork
 - [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster

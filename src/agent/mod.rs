@@ -1400,6 +1400,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             "headless mode needs a task: pass -p \"<task>\""
         ));
     };
+    // The same preprocessing the TUI applies on submit: custom `/command`
+    // expansion and `@file` references.
+    let custom_commands = crate::commands::load(&project_root);
+    let goal = crate::commands::preprocess(&goal, &custom_commands, &project_root);
 
     let active = config.active();
     let model = active.model.clone();
