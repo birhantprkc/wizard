@@ -257,6 +257,29 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// Fleet-mode settings (`[fleet]` in `config.toml`); see `wizard fleet`
+/// and docs/fleet.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Per-worker wall-clock cap in minutes; the coordinator kills a child
+    /// past this (default 30).
+    pub max_minutes: u64,
+    /// Run the synthesis turn (an in-process agent merges the fleet
+    /// branches) once all workers finish. `false` skips the merge and just
+    /// prints the branch list and results table (default true).
+    pub synthesize: bool,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            max_minutes: 30,
+            synthesize: true,
+        }
+    }
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,6 +483,9 @@ pub struct Config {
     /// Per-file checkpoint settings (snapshots powering `/rewind`).
     #[serde(default)]
     pub checkpoints: CheckpointConfig,
+    /// Fleet-mode settings (`wizard fleet`).
+    #[serde(default)]
+    pub fleet: FleetConfig,
 }
 
 impl Default for Config {
@@ -486,6 +512,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             web: WebConfig::default(),
             checkpoints: CheckpointConfig::default(),
+            fleet: FleetConfig::default(),
         }
     }
 }
@@ -754,6 +781,8 @@ mod tests {
         assert_eq!(config.compact_threshold_bytes, 48_000);
         assert!(!config.rollback_failed_cycles);
         assert_eq!(config.checkpoints.keep_turns, 50);
+        assert_eq!(config.fleet.max_minutes, 30);
+        assert!(config.fleet.synthesize);
     }
 
     #[test]
@@ -762,6 +791,18 @@ mod tests {
         assert_eq!(config.checkpoints.keep_turns, 7);
         let config: Config = toml::from_str("rollback_failed_cycles = true").expect("valid toml");
         assert!(config.rollback_failed_cycles);
+    }
+
+    #[test]
+    fn fleet_section_parses_with_partial_keys() {
+        let config: Config =
+            toml::from_str("[fleet]\nmax_minutes = 10\nsynthesize = false").expect("valid toml");
+        assert_eq!(config.fleet.max_minutes, 10);
+        assert!(!config.fleet.synthesize);
+
+        let config: Config = toml::from_str("[fleet]\nmax_minutes = 90").expect("valid toml");
+        assert_eq!(config.fleet.max_minutes, 90);
+        assert!(config.fleet.synthesize, "missing key takes the default");
     }
 
     #[test]
@@ -827,6 +868,10 @@ mod tests {
                 search_api_key_env: Some("BRAVE_API_KEY".to_string()),
             },
             checkpoints: CheckpointConfig { keep_turns: 12 },
+            fleet: FleetConfig {
+                max_minutes: 45,
+                synthesize: false,
+            },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -864,6 +909,7 @@ mod tests {
             original.rollback_failed_cycles
         );
         assert_eq!(parsed.checkpoints, original.checkpoints);
+        assert_eq!(parsed.fleet, original.fleet);
     }
 
     #[test]

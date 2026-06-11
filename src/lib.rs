@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod event;
 pub mod evolve;
+pub mod fleet;
 pub mod gateway;
 pub mod hardware;
 pub mod hooks;
@@ -81,6 +82,17 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return schedule::run_daemon().await;
+    }
+
+    // Fleet dispatches before the normal flow too, but `fleet run` loads
+    // config itself (its planning and synthesis turns drive a real
+    // in-process agent); `fleet status` / `fleet stop` only touch the
+    // project's `.wizard/fleet/` directory.
+    if let Some(cli::Command::Fleet { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return fleet::run(cmd.clone()).await;
     }
 
     // `--login` is a one-shot credential flow: no config, no onboarding,

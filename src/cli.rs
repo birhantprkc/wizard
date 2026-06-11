@@ -120,6 +120,40 @@ pub enum Command {
     /// wizard child processes. Daemonize externally (e.g. systemd); see
     /// docs/scheduler.md.
     Scheduler,
+
+    /// Fleet mode: decompose a mission into independent tasks and run them
+    /// as parallel headless workers, each in its own git worktree, then
+    /// merge the fleet branches back. See docs/fleet.md.
+    Fleet {
+        #[command(subcommand)]
+        cmd: FleetCmd,
+    },
+}
+
+/// `wizard fleet` subcommands. `run` loads config (the coordinator drives a
+/// real agent for planning and synthesis); `status` and `stop` only touch
+/// the project's `.wizard/fleet/` directory.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum FleetCmd {
+    /// Plan the mission, spawn up to N parallel workers over git worktrees,
+    /// supervise them, then synthesize (merge the fleet branches).
+    Run {
+        /// Number of parallel workers.
+        #[arg(short = 'n', long = "workers", value_name = "N")]
+        n: usize,
+
+        /// Mission prompt, decomposed into independent tasks by a planning
+        /// turn.
+        #[arg(short, long)]
+        prompt: String,
+    },
+
+    /// Show the fleet state: mission, status, and a per-task table.
+    Status,
+
+    /// Ask a running fleet to wind down (writes the stop sentinel; the
+    /// coordinator kills its workers on the next supervision tick).
+    Stop,
 }
 
 /// `wizard schedule` subcommands. Like bench, these are self-contained:
@@ -487,6 +521,55 @@ mod tests {
             panic!("expected schedule run");
         };
         assert_eq!(name, "nightly");
+    }
+
+    #[test]
+    fn fleet_run_parses_workers_and_prompt() {
+        let cli = parse(&["fleet", "run", "-n", "3", "-p", "improve coverage"])
+            .expect("fleet run parses");
+        let Some(Command::Fleet {
+            cmd: FleetCmd::Run { n, prompt },
+        }) = cli.command
+        else {
+            panic!("expected fleet run");
+        };
+        assert_eq!(n, 3);
+        assert_eq!(prompt, "improve coverage");
+
+        let cli =
+            parse(&["fleet", "run", "--workers", "2", "--prompt", "x"]).expect("long forms parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Run { n: 2, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn fleet_run_requires_workers_and_prompt() {
+        let err = parse(&["fleet", "run", "-p", "x"]).expect_err("missing -n rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = parse(&["fleet", "run", "-n", "2"]).expect_err("missing -p rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn fleet_status_and_stop_parse() {
+        let cli = parse(&["fleet", "status"]).expect("fleet status parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Status
+            })
+        ));
+        let cli = parse(&["fleet", "stop"]).expect("fleet stop parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Stop
+            })
+        ));
     }
 
     #[test]
