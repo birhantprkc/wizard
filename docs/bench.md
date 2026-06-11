@@ -97,6 +97,8 @@ The harness's exit code is recorded but does not decide the outcome; only
 the check command does (some harnesses exit nonzero on benign conditions).
 A harness that overruns `timeout_secs` is killed and scored `timeout`;
 infrastructure failures (missing ref, worktree errors) score `error`.
+On a terminal, a progress bar on stderr tracks the case being replayed and
+elapsed time; per-case lines and the summary still go to stdout as before.
 Pass `--keep-worktrees` to inspect the replayed trees afterwards.
 
 ## Results and compare output

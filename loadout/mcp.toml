@@ -1,4 +1,8 @@
-# Wizard Arsenal — MCP server declarations (~/.wizard/mcp.toml)
+# Wizard MCP server declarations — installed to ~/.wizard/mcp.toml
+#
+# Part of Wizard's default loadout. This directory (loadout/) is the canonical
+# source; install.sh embeds a verbatim copy as a heredoc so the curl|bash
+# one-liner works without a repo checkout — keep the two in sync.
 #
 # Each [[server]] is a Model Context Protocol server whose tools merge into
 # Wizard's tool registry. New servers (or edits here) become active the next

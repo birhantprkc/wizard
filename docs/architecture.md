@@ -68,8 +68,9 @@ wizard/
 │   └── skills/
 │       └── mod.rs       # skills/*.md loader
 ├── skills/              # bundled skill definitions
-├── install.sh           # official model one-liner
-└── install-byom.sh      # bring-your-own-model installer
+├── loadout/             # canonical default loadout (mcp.toml, subagents/)
+├── install.sh           # the one installer (default / minimal / BYOM flavors)
+└── install-byom.sh      # back-compat shim: install.sh with WIZARD_BYOM=1
 ```
 
 ## Components
@@ -220,7 +221,8 @@ Ratatui + crossterm terminal UI:
 | `~/.wizard/llama.cpp/` | llama.cpp release tree installed by `install.sh` |
 | `~/.wizard/llama-server.log` | Output of llama-servers Wizard spawned |
 | `~/.wizard/llama-server.pid` | PID of the llama-server Wizard spawned |
-| `~/.wizard/mcp.toml` | MCP server declarations |
+| `~/.wizard/mcp.toml` | MCP server declarations (Playwright browser by default) |
+| `~/.wizard/subagents/*.toml` | Subagent definitions (default roster: reviewer, researcher, tester, documenter) |
 | `~/.wizard/tools/` | Agent-authored scripted tools |
 | `~/.wizard/src/` | Source checkout for deep evolve (created on demand) |
 | `~/.wizard/sessions/*.jsonl` | Chat history |
@@ -230,13 +232,13 @@ Ratatui + crossterm terminal UI:
 
 ## Install scripts
 
-### `install.sh` (default)
+### `install.sh` (the one installer)
 
-VRAM-aware tier selection. Installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), and a Qwen 3 GGUF, but no Rust toolchain, keeping the default footprint lean. No server is started at install time; Wizard spawns it on first run. `WIZARD_USE_OLLAMA=1` selects the previous Ollama-based flow instead. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+VRAM-aware tier selection. By default it installs the binary, llama.cpp's `llama-server` (from official ggml-org releases), a Qwen 3 GGUF, and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`), but no Rust toolchain, keeping the default footprint lean. No server is started at install time; Wizard spawns it on first run. Flavors: `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias), `WIZARD_BYOM=1` sets up Ollama with a model of your choice, and `WIZARD_USE_OLLAMA=1` swaps the default stack for Ollama. The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
-### `install-byom.sh` (optional)
+### `install-byom.sh` (back-compat shim)
 
-Same binary install, but user selects any Ollama model. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF; see [byom.md](byom.md).
+Kept so the old BYOM one-liner URL still works: it downloads `install.sh` and runs it with `WIZARD_BYOM=1`. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF; see [byom.md](byom.md).
 
 ## Dependencies
 

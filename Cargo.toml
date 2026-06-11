@@ -43,6 +43,10 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
 
+# Plain-terminal progress (bench runs, headless turns, llama-server waits).
+# Defaults are minimal (just unicode-width, which the braille frames need).
+indicatif = "0.17"
+
 # IDs / timestamps (sessions, evolution log)
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

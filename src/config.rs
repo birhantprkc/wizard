@@ -144,6 +144,63 @@ impl GatewayConfig {
     }
 }
 
+/// Cosmetic TUI settings (`[ui]` in `config.toml`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Gerund verbs shown next to the busy spinner ("Conjuring…"). A
+    /// non-empty list replaces [`UiConfig::DEFAULT_SPINNER_VERBS`]; missing
+    /// or empty keeps the defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spinner_verbs: Vec<String>,
+}
+
+impl UiConfig {
+    /// Baked-in wizard-flavored spinner verbs, used when `spinner_verbs`
+    /// is unset or empty.
+    pub const DEFAULT_SPINNER_VERBS: [&'static str; 20] = [
+        "Conjuring",
+        "Scrying",
+        "Brewing",
+        "Transmuting",
+        "Enchanting",
+        "Divining",
+        "Summoning",
+        "Incanting",
+        "Channeling",
+        "Bewitching",
+        "Alchemizing",
+        "Spellweaving",
+        "Polymorphing",
+        "Wandwaving",
+        "Hexing",
+        "Levitating",
+        "Crystal-gazing",
+        "Runereading",
+        "Familiar-consulting",
+        "Grimoire-flipping",
+    ];
+
+    /// Pick a spinner verb for the given seed: deterministic per seed, spread
+    /// across the active list (custom when non-empty, defaults otherwise).
+    pub fn spinner_verb(&self, seed: u64) -> &str {
+        let roll = splitmix64(seed);
+        if self.spinner_verbs.is_empty() {
+            Self::DEFAULT_SPINNER_VERBS[(roll % Self::DEFAULT_SPINNER_VERBS.len() as u64) as usize]
+        } else {
+            &self.spinner_verbs[(roll % self.spinner_verbs.len() as u64) as usize]
+        }
+    }
+}
+
+/// SplitMix64: a tiny, well-mixed hash so consecutive seeds do not walk the
+/// verb list in order. Not cryptographic — purely cosmetic.
+fn splitmix64(seed: u64) -> u64 {
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +365,9 @@ pub struct Config {
     /// [`GatewayKind::None`] — terminal only.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// Cosmetic TUI settings (spinner verbs).
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 impl Default for Config {
@@ -328,6 +388,7 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             gateway: GatewayConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -635,6 +696,9 @@ mod tests {
                 token_env: Some("MY_BOT_TOKEN".to_string()),
                 allowed_chat_ids: vec![42, -100123],
             },
+            ui: UiConfig {
+                spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
+            },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -664,6 +728,44 @@ mod tests {
         assert_eq!(parsed.gateway.kind, GatewayKind::Telegram);
         assert_eq!(parsed.gateway.token_env.as_deref(), Some("MY_BOT_TOKEN"));
         assert_eq!(parsed.gateway.allowed_chat_ids, vec![42, -100123]);
+        assert_eq!(parsed.ui, original.ui);
+    }
+
+    #[test]
+    fn spinner_verbs_default_when_section_missing() {
+        let config: Config = toml::from_str("model = \"qwen3.5:9b\"").expect("valid toml");
+        assert!(config.ui.spinner_verbs.is_empty());
+        for seed in 0..64 {
+            let verb = config.ui.spinner_verb(seed);
+            assert!(UiConfig::DEFAULT_SPINNER_VERBS.contains(&verb));
+        }
+    }
+
+    #[test]
+    fn spinner_verbs_default_when_list_empty() {
+        let config: Config = toml::from_str("[ui]\nspinner_verbs = []").expect("valid toml");
+        assert!(config.ui.spinner_verbs.is_empty());
+        assert!(UiConfig::DEFAULT_SPINNER_VERBS.contains(&config.ui.spinner_verb(7)));
+    }
+
+    #[test]
+    fn spinner_verbs_custom_list_replaces_defaults() {
+        let config: Config = toml::from_str("[ui]\nspinner_verbs = [\"Pondering\", \"Musing\"]")
+            .expect("valid toml");
+        assert_eq!(config.ui.spinner_verbs, vec!["Pondering", "Musing"]);
+        for seed in 0..64 {
+            let verb = config.ui.spinner_verb(seed);
+            assert!(verb == "Pondering" || verb == "Musing");
+        }
+    }
+
+    #[test]
+    fn spinner_verb_is_deterministic_per_seed_and_varies_across_seeds() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.spinner_verb(42), ui.spinner_verb(42));
+        // The hash must not collapse every seed onto one verb.
+        let first = ui.spinner_verb(0);
+        assert!((1..64).any(|seed| ui.spinner_verb(seed) != first));
     }
 
     #[test]

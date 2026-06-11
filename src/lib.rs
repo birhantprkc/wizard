@@ -17,6 +17,7 @@ pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod onboarding;
+pub mod progress;
 pub mod server;
 pub mod skills;
 pub mod tools;

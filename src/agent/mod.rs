@@ -984,9 +984,13 @@ pub async fn build_headless_agent(
         .build()
         .with_context(|| format!("building provider '{}'", active.name))?;
     // llama.cpp gets a lifecycle hand: when nothing answers, Wizard starts
-    // the server itself, printing spawn/load progress to stdout.
+    // the server itself, showing spawn/load progress on a spinner (plain
+    // stdout lines when stderr is not a terminal).
     if active.kind == ProviderKind::LlamaCpp {
-        crate::server::ensure_running(&active, &|line: &str| println!("{line}")).await?;
+        let wait = crate::progress::ServerSpinner::start();
+        let outcome = crate::server::ensure_running(&active, &|line: &str| wait.update(line)).await;
+        wait.finish(outcome.is_ok());
+        outcome?;
     }
     client
         .health()
@@ -1112,16 +1116,24 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             .map(|hours| Instant::now() + Duration::from_secs_f64(hours * 3600.0)),
     );
 
+    // Busy spinner ("Conjuring…") shown while the model thinks or a tool
+    // runs, hidden while output streams. Shared with the printer task; a
+    // no-op when stderr is not a terminal.
+    let spinner = Arc::new(crate::progress::TurnSpinner::new());
+
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let printer_spinner = Arc::clone(&spinner);
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::TextDelta(delta) => {
+                    printer_spinner.hide();
                     print!("{delta}");
                     let _ = std::io::stdout().flush();
                 }
                 AgentEvent::ThinkingDelta(delta) => {
                     // ANSI faint so reasoning reads as background noise.
+                    printer_spinner.hide();
                     print!("\x1b[2m{delta}\x1b[0m");
                     let _ = std::io::stdout().flush();
                 }
@@ -1130,19 +1142,25 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     let _ = respond.send(true);
                 }
                 AgentEvent::ToolStarted { name, args } => {
-                    println!("\n→ {name} {args}");
+                    printer_spinner.println(&format!("\n→ {name} {args}"));
+                    // The tool may run for a while: keep the verb spinning.
+                    printer_spinner.show();
                 }
                 AgentEvent::ToolFinished { name, output } => {
                     let status = if output.is_error { "error" } else { "ok" };
-                    println!("← {name} [{status}]");
+                    printer_spinner.println(&format!("← {name} [{status}]"));
+                    // Back to the model: it is thinking about the result.
+                    printer_spinner.show();
                 }
                 AgentEvent::StepCompleted { step } => {
                     tracing::debug!("step {step} completed");
                 }
                 AgentEvent::Error(message) => {
+                    printer_spinner.hide();
                     eprintln!("\nwizard error: {message}");
                 }
                 AgentEvent::Done { reason } => {
+                    printer_spinner.hide();
                     println!("\n[turn done: {reason:?}]");
                 }
             }
@@ -1192,10 +1210,19 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             break;
         }
         if config.continuous {
-            println!("\n=== cycle {iteration} ===");
+            spinner.println(&format!("\n=== cycle {iteration} ==="));
         } else if max_iterations > 1 {
-            println!("\n=== iteration {iteration}/{max_iterations} ===");
+            spinner.println(&format!("\n=== iteration {iteration}/{max_iterations} ==="));
         }
+
+        // Fresh verb per turn (same mechanism as the TUI's busy spinner), so
+        // one turn reads as one activity.
+        let verb_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
+            .wrapping_add(u64::from(iteration));
+        spinner.set_verb(config.ui.spinner_verb(verb_seed));
+        spinner.show();
 
         let turn_started = Instant::now();
         let turn_prompt = input.clone();
@@ -1284,6 +1311,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
 
     drop(tx);
     let _ = printer.await;
+    spinner.finish();
 
     if reexec_after {
         use std::os::unix::process::CommandExt;

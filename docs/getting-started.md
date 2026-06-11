@@ -16,8 +16,21 @@ The installer:
 4. Downloads the matching Qwen 3 GGUF (Q4_K_M) from Hugging Face into `~/.wizard/models/` (resumable; re-running picks up where it left off)
 5. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
 6. Writes `~/.wizard/config.toml` (an existing config is never touched)
+7. Lays down the [default loadout](loadout.md): `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/*.toml` (reviewer, researcher, tester, documenter), each file only if it is not already present
 
 The installer does **not** start a model server; Wizard starts `llama-server` itself on first run.
+
+### Install flavors
+
+The same script has three mutually exclusive flavors:
+
+| Install | What you get |
+|---------|--------------|
+| (default) | llama.cpp runtime + VRAM-tiered Qwen GGUF + binary + `config.toml` + loadout |
+| `WIZARD_MINIMAL=1` | binary only: no model runtime, no model, no config, no loadout; the first `wizard` run starts [onboarding](#first-run) |
+| `WIZARD_BYOM=1` | Ollama runtime + a model of your choice (interactive, or `WIZARD_MODEL=<tag>`) + binary + config + loadout; see [byom.md](byom.md) |
+
+Orthogonally, `WIZARD_USE_OLLAMA=1` swaps the default's llama.cpp stack for Ollama with the same auto-tiered model. Setting both `WIZARD_MINIMAL=1` and `WIZARD_BYOM=1` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; note it is stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
 
 ### Model tiers (automatic)
 
@@ -37,13 +50,15 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WIZARD_INSTALL_DIR` | `/usr/local/bin` | Where to place the `wizard` binary |
-| `WIZARD_MODEL` | auto-detected | Force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`) |
+| `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
+| `WIZARD_BYOM` | `0` | Set to `1` to bring your own Ollama model (conflicts with `WIZARD_MINIMAL`) |
+| `WIZARD_BESPOKE` | `0` | Deprecated alias for `WIZARD_MINIMAL` |
+| `WIZARD_MODEL` | auto-detected | Force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, use this tag as-is and skip the interactive prompts |
 | `WIZARD_SKIP_MODEL_PULL` | `0` | Set to `1` to skip the GGUF download |
 | `WIZARD_SKIP_LLAMACPP_INSTALL` | `0` | Set to `1` if `llama-server` is managed elsewhere |
-| `WIZARD_USE_OLLAMA` | `0` | Set to `1` for the previous Ollama-based flow |
-| `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With `WIZARD_USE_OLLAMA=1`: Ollama is already managed elsewhere |
+| `WIZARD_USE_OLLAMA` | `0` | Set to `1` to use Ollama instead of llama.cpp |
+| `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With Ollama flavors: Ollama is already managed elsewhere |
 | `WIZARD_WITH_TOOLCHAIN` | `0` | Set to `1` to eagerly install a Rust toolchain for deep evolve |
-| `WIZARD_BESPOKE` | `0` | Set to `1` to skip config and model download; first run launches onboarding |
 
 ### Runtime environment variables
 
@@ -108,6 +123,19 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 
 `gguf_path` is what lets Wizard start `llama-server` for you; without it (e.g. a server you run yourself, or on another machine) Wizard just connects to `base_url`. `gguf_path` only applies to `kind = "llamacpp"` providers, which never use an API key.
 
+The installer also lays down `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/` (a four-subagent roster), each file only if absent; see [the default loadout](loadout.md).
+
+### Spinner verbs (`[ui]`)
+
+While Wizard works, the chat-area spinner shows a wizard-flavored verb ("Conjuring…", "Scrying…", "Brewing…"): one is picked pseudo-randomly per busy period and held until the turn finishes, and the next turn draws a new one. Customize the list with an optional `[ui]` section:
+
+```toml
+[ui]
+spinner_verbs = ["Pondering", "Musing", "Noodling"]
+```
+
+A non-empty list fully replaces the defaults; omitting the section or setting `spinner_verbs = []` keeps the built-in wizard verbs. The status bar (`step x/y · Ns`) and tool spinners are unaffected.
+
 ## Migrating from Ollama
 
 The local default is llama.cpp; Ollama stays fully supported but is opt-in:
@@ -127,7 +155,7 @@ Then set `gguf_path` on that provider in `~/.wizard/config.toml` so Wizard can s
 
 ## Using Ollama instead
 
-Install with the previous flow (installs Ollama, starts it, pulls the model):
+Install with the Ollama flavor (installs Ollama, starts it, pulls the auto-tiered model):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_USE_OLLAMA=1 bash
@@ -145,7 +173,7 @@ Any OpenAI-compatible endpoint, Anthropic, or xAI works. Add one from the TUI an
 /provider use openai
 ```
 
-The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_BESPOKE=1` to choose everything on first run).
+The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding (`wizard --onboard`) offers the same choices interactively. To skip the local stack at install time, set `WIZARD_SKIP_MODEL_PULL=1 WIZARD_SKIP_LLAMACPP_INSTALL=1` (or `WIZARD_MINIMAL=1` to choose everything on first run).
 
 ### Signing in with an xAI account
 
@@ -271,6 +299,7 @@ RUST_LOG=wizard=debug wizard
 
 ## Next steps
 
+- [The default loadout](loadout.md): the preconfigured browser MCP and subagent roster
 - [Personality modes](modes.md): genie vs sovereign
 - [Self-extension](evolve.md): how `/evolve` adds capabilities
 - [Bring your own model](byom.md): any GGUF, or custom Ollama models

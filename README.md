@@ -10,16 +10,20 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One link, and you have a ready-to-go setup: the `wizard` binary installed and working out of the box. It's a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (bring an API key, or sign in with your xAI account via `wizard --login xai`), and switches providers live with `/provider`. By default the installer also sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with a Qwen 3 GGUF sized to your hardware, so it runs without an API key; bring a cloud key instead if you prefer.
+One link, and you have a ready-to-go setup: the `wizard` binary installed and working out of the box. It's a Ratatui TUI agent with tool calling, git integration, skills, MCP, and `/evolve` self-extension. It works with any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (bring an API key, or sign in with your xAI account via `wizard --login xai`), and switches providers live with `/provider`. By default the installer also sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with a Qwen 3 GGUF sized to your hardware, so it runs without an API key (bring a cloud key instead if you prefer), and lays down the default loadout: a Playwright browser (MCP) and a roster of four subagents (reviewer, researcher, tester, documenter). Still one fast Rust binary; the loadout is plain TOML under `~/.wizard/` that you can edit or delete ([details](docs/loadout.md)).
 
-**Two ways in.** Take the batteries-included one-liner above and start working immediately, or take the **bespoke** path: a clean first-run onboarding wizard that starts from scratch and asks what you actually want (provider, model, messaging gateway, mode):
+**One installer, three flavors.** The default above is the full loadout. Prefer to start lean? `WIZARD_MINIMAL=1` installs just the binary, and the first run opens a clean onboarding wizard that asks what you actually want (provider, model, messaging gateway, mode):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BESPOKE=1 bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_MINIMAL=1 bash
 wizard   # launches onboarding on first run
 ```
 
-Want a richer default loadout instead? Install [**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal): the same Wizard preconfigured with a browser, a roster of subagents, and hardware-sized model selection, in one line.
+Running your own Ollama model (a fine-tune, a private registry tag, a local GGUF via Modelfile)? `WIZARD_BYOM=1` walks you through bringing it ([details](docs/byom.md)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
+```
 
 ---
 
@@ -27,7 +31,7 @@ Want a richer default loadout instead? Install [**Wizard Arsenal**](https://gith
 
 **Any provider, switchable live.** The agent loop speaks the OpenAI-compatible chat API (streaming and native `tool_calls`, with a prompt-based JSON fallback for models without native tool support), so any compatible endpoint works: OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, plus Ollama (`kind = "ollama"`, native API), Anthropic, and xAI (`kind = "xai"` with an API key, or `kind = "xaioauth"` to sign in with your xAI account via `wizard --login xai`, no API key needed). `/provider add` registers a new endpoint, `/provider use` switches the live agent to it, and API keys are read from environment variables rather than stored on disk. Running a model locally is one fully-managed option: the default install ships `llama-server` with a GGUF tier picked for your VRAM, and Wizard handles the server's lifecycle itself: when nothing answers at the configured port, it starts `llama-server` with your model, waits for it to load, and leaves it serving after you exit so the next launch is instant.
 
-**Onboarding from scratch.** The bespoke path (`WIZARD_BESPOKE=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions (provider, model with a VRAM-aware suggestion for local models, messaging gateway, and mode) and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
+**Onboarding from scratch.** The minimal path (`WIZARD_MINIMAL=1` at install, or `wizard --onboard` any time) opens a clean Ratatui onboarding wizard that asks four questions (provider, model with a VRAM-aware suggestion for local models, messaging gateway, and mode) and writes your `~/.wizard/config.toml`. No editing TOML by hand; no defaults you didn't choose.
 
 **Messaging gateway.** Run Wizard headless as a bot you can talk to from your phone. `wizard --gateway` connects the configured gateway (Telegram, or `none` for terminal-only), runs each inbound message as a sovereign agent turn in your project, and replies with the result; chat-ID allow-list and env-var token included. Configure it in onboarding or `[gateway]` in config.toml.
 
@@ -51,14 +55,12 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/wizard/<ref>/install.sh | W
 
 Anyone who runs it gets your Wizard, built from your source on their machine and carrying your behavioral charter ([WIZARD.md](WIZARD.md)) in the binary. Publish is approval-gated and logged, and requires an authenticated `gh` (`gh auth login`). Forks install from source because they don't ship prebuilt release binaries by default. See [docs/market.md](docs/market.md).
 
-[**Wizard Arsenal**](https://github.com/teddytennant/wizard-arsenal) is the reference example of this: a configured distribution of Wizard with a preconfigured Playwright browser, a roster of ready subagents (reviewer, researcher, tester, documenter), and VRAM-based model selection baked into the defaults. See [docs/arsenal.md](docs/arsenal.md).
-
 ---
 
 ## Quick start
 
 ```bash
-# Install (binary + a default local model setup)
+# Install (binary, hardware-sized local model, default loadout)
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 
 # Launch the interactive TUI (genie mode, the default)
@@ -113,7 +115,7 @@ The installer detects GPU VRAM (NVIDIA via `nvidia-smi`, AMD via `rocm-smi` or a
 | 8–18 GB | `Qwen3.5-9B-Q4_K_M.gguf` | ~6 GB |
 | < 8 GB / undetectable | `Qwen3.5-9B-Q4_K_M.gguf` (CPU / partial offload) | ~6 GB |
 
-Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or point `gguf_path` at any GGUF ([BYOM](docs/byom.md)). Prefer Ollama? `WIZARD_USE_OLLAMA=1` at install time keeps the previous Ollama-based flow. Full details in [docs/getting-started.md](docs/getting-started.md).
+Release tarballs are verified against the release's `checksums.txt` before install. To use a different model, set `WIZARD_MODEL=<tag>` or point `gguf_path` at any GGUF ([BYOM](docs/byom.md)). Prefer Ollama? `WIZARD_USE_OLLAMA=1` at install time sets up the same auto-tiered model on Ollama instead. Full details in [docs/getting-started.md](docs/getting-started.md).
 
 **Migrating from Ollama?** An explicit `[[providers]]` entry with `kind = "ollama"` keeps working exactly as before. The synthesized local default is llama.cpp: a legacy config that only sets top-level `model` / `ollama_host` now resolves to `llama-server` at `http://127.0.0.1:8080` (set `gguf_path` so Wizard can start it for you). To stay on Ollama, add the provider explicitly: `/provider add local ollama http://127.0.0.1:11434 <model>`. And if the local backend isn't installed or can't start, Wizard doesn't give up: it falls back to any configured cloud provider, then to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` from the environment, and finally opens setup so you can bring your own provider.
 
@@ -153,7 +155,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 - [Modes](docs/modes.md): genie vs sovereign
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
 - [Fork and distribute](docs/market.md): publish your evolved Wizard; one-line installer for your fork
-- [Wizard Arsenal](docs/arsenal.md): the configured fork with preconfigured browser, subagents, and model selection
+- [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Architecture](docs/architecture.md): how it's built
 - [Security](SECURITY.md): threat model

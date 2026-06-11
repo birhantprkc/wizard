@@ -1,23 +1,43 @@
 #!/usr/bin/env bash
 #
-# Wizard installer (llama.cpp-powered local models).
+# Wizard installer — one script, three flavors.
 #
 #   curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 #
-# Steps:
+# Default (no flags) is the batteries-included install:
 #   1. Detect OS and CPU architecture
 #   2. Install llama.cpp's `llama-server` from official GitHub releases if absent
 #   3. Select a model tier based on available VRAM (or system RAM on CPU-only)
 #   4. Download the matching Qwen3 GGUF (Q4_K_M) from Hugging Face
 #   5. Download the `wizard` binary from GitHub releases
 #   6. Write ~/.wizard/config.toml (never clobbers an existing one)
+#   7. Lay down the default loadout: ~/.wizard/mcp.toml (Playwright browser MCP)
+#      and ~/.wizard/subagents/*.toml (reviewer, researcher, tester, documenter)
+#      — each file only if absent, never overwriting
 #
 # No server is started here: wizard launches llama-server itself on first run.
 # Set WIZARD_USE_OLLAMA=1 for the previous Ollama-based flow.
 #
+# Flavors (mutually exclusive):
+#   WIZARD_MINIMAL=1  binary only — skip the model runtime, the model download,
+#                     config.toml, and the loadout; the first `wizard` run
+#                     starts the interactive onboarding wizard
+#   WIZARD_BYOM=1     bring your own model — install Ollama if absent and pick
+#                     any Ollama-compatible model interactively (library tag,
+#                     custom registry tag, local Modelfile, or one already
+#                     installed), then write the config. You choose the model:
+#                     Wizard does not ship, endorse, or maintain third-party
+#                     model weights; you are responsible for their licenses.
+#
 # Environment variables:
 #   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin)
-#   WIZARD_MODEL                 force a specific model tier  (default auto-detected)
+#   WIZARD_MINIMAL               1 = minimal install (see above)        (default 0)
+#   WIZARD_BYOM                  1 = bring-your-own-model install (see above)
+#                                    (default 0; conflicts with WIZARD_MINIMAL)
+#   WIZARD_BESPOKE               deprecated alias for WIZARD_MINIMAL
+#   WIZARD_MODEL                 force a specific model tier  (default auto-detected;
+#                                with WIZARD_BYOM=1: use this tag as-is and skip
+#                                the interactive prompts)
 #   WIZARD_SKIP_MODEL_PULL       1 = skip the model download  (default 0)
 #   WIZARD_SKIP_LLAMACPP_INSTALL 1 = llama-server managed elsewhere (default 0)
 #   WIZARD_USE_OLLAMA            1 = use Ollama instead of llama.cpp (default 0)
@@ -28,15 +48,14 @@
 #                                (default: latest release tag, falling back to
 #                                main only when the repo has no release)
 #   WIZARD_BUILD_FROM_SOURCE     1 = build from source instead of downloading a release (default 0)
-#   WIZARD_BESPOKE               1 = start from scratch: skip writing config.toml and the
-#                                    model download, so the first `wizard` run launches the
-#                                    interactive onboarding wizard            (default 0)
 
 set -euo pipefail
 
 # --- defaults -----------------------------------------------------------
 
 WIZARD_INSTALL_DIR="${WIZARD_INSTALL_DIR:-/usr/local/bin}"
+WIZARD_MINIMAL="${WIZARD_MINIMAL:-0}"
+WIZARD_BYOM="${WIZARD_BYOM:-0}"
 WIZARD_MODEL="${WIZARD_MODEL:-}"
 WIZARD_SKIP_MODEL_PULL="${WIZARD_SKIP_MODEL_PULL:-0}"
 WIZARD_SKIP_LLAMACPP_INSTALL="${WIZARD_SKIP_LLAMACPP_INSTALL:-0}"
@@ -46,7 +65,9 @@ WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
-WIZARD_BESPOKE="${WIZARD_BESPOKE:-0}"
+
+# WIZARD_BESPOKE is the old name for the minimal install; honored as a deprecated alias.
+if [ "${WIZARD_BESPOKE:-0}" = "1" ]; then WIZARD_MINIMAL=1; fi
 
 REPO="${WIZARD_REPO}"
 RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
@@ -75,6 +96,22 @@ trap cleanup EXIT
 say()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Interactive prompt that works under `curl | bash` (stdin is the script,
+# so read from the controlling terminal instead).
+ask() {
+    # $1 = variable name, $2 = prompt text
+    local _var="$1" _msg="$2" _reply
+    printf '%s' "$_msg" >/dev/tty
+    IFS= read -r _reply </dev/tty
+    eval "$_var=\$_reply"
+}
+
+require_tty() {
+    if [ ! -e /dev/tty ] || ! { true </dev/tty; } 2>/dev/null; then
+        die "BYOM setup is interactive and needs a terminal. Either run it from an interactive shell, or set WIZARD_MODEL=<tag> to skip the prompts."
+    fi
+}
 
 # --- platform detection -------------------------------------------------
 
@@ -249,7 +286,7 @@ install_llamacpp() {
     printf '\n' >&2
 }
 
-# --- ollama (WIZARD_USE_OLLAMA=1) ---------------------------------------
+# --- ollama (WIZARD_USE_OLLAMA=1 or WIZARD_BYOM=1) ------------------------
 
 ollama_running() {
     curl -fsS --max-time 3 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1
@@ -428,10 +465,6 @@ gguf_for_model() {
 }
 
 download_gguf() {
-    if [ "$WIZARD_BESPOKE" = "1" ]; then
-        say "Bespoke install: skipping model download — onboarding will pick your model on first run"
-        return
-    fi
     gguf_for_model "$MODEL"
     if [ -z "$GGUF_FILE" ]; then
         warn "no known GGUF download for '${MODEL}' — set gguf_path in ~/.wizard/config.toml to your own .gguf file"
@@ -457,10 +490,6 @@ download_gguf() {
 }
 
 pull_model() {
-    if [ "$WIZARD_BESPOKE" = "1" ]; then
-        say "Bespoke install: skipping model pull — onboarding will pick your model on first run"
-        return
-    fi
     if [ "$WIZARD_SKIP_MODEL_PULL" = "1" ]; then
         say "Skipping model pull (WIZARD_SKIP_MODEL_PULL=1)"
         return
@@ -472,6 +501,112 @@ pull_model() {
     say "Pulling ${MODEL} from the Ollama library (this can take a while) ..."
     ollama pull "$MODEL" \
         || die "failed to pull ${MODEL} — check connectivity, then run 'ollama pull ${MODEL}' manually"
+}
+
+# --- BYOM model selection (WIZARD_BYOM=1, interactive) --------------------
+
+pull_model_tag() {
+    # $1 = tag to pull
+    command -v ollama >/dev/null 2>&1 \
+        || die "ollama binary not found — cannot pull '$1'"
+    say "Pulling $1 ..."
+    ollama pull "$1" \
+        || die "failed to pull '$1' — check the tag and your connectivity, then re-run"
+}
+
+choose_byom_model() {
+    if [ -n "$WIZARD_MODEL" ]; then
+        MODEL="$WIZARD_MODEL"
+        say "Model set via WIZARD_MODEL: ${MODEL} (no pull — make sure it is available in Ollama)"
+        return
+    fi
+
+    require_tty
+
+    printf '\n==> Wizard BYOM Setup\n\n' >/dev/tty
+    printf 'Choose how to configure your model:\n\n' >/dev/tty
+    printf '  1) Pull an existing Ollama library model\n' >/dev/tty
+    printf '  2) Pull a custom Ollama registry tag\n' >/dev/tty
+    printf '  3) Create from a local Modelfile\n' >/dev/tty
+    printf '  4) Use a model already installed (skip pull)\n' >/dev/tty
+    printf '\n' >/dev/tty
+
+    local choice
+    while true; do
+        ask choice "Selection [1-4]: "
+        case "$choice" in
+            1 | 2 | 3 | 4) break ;;
+            *) printf 'Please enter 1, 2, 3, or 4.\n' >/dev/tty ;;
+        esac
+    done
+
+    case "$choice" in
+        1)
+            local tag
+            while true; do
+                ask tag "Enter Ollama library model (e.g. qwen3.6:27b, qwen3-coder:30b, deepseek-r1:32b): "
+                [ -n "$tag" ] && break
+            done
+            pull_model_tag "$tag"
+            MODEL="$tag"
+            ;;
+        2)
+            local tag
+            while true; do
+                ask tag "Enter Ollama model tag (e.g. myuser/my-model:27b): "
+                [ -n "$tag" ] && break
+            done
+            pull_model_tag "$tag"
+            MODEL="$tag"
+            say "Note: Wizard's agent loop works best with models that support tool calling."
+            ;;
+        3)
+            command -v ollama >/dev/null 2>&1 \
+                || die "ollama binary not found — cannot create a model from a Modelfile"
+            local mf name
+            while true; do
+                ask mf "Path to Modelfile: "
+                [ -z "$mf" ] && continue
+                # Expand a leading ~ since the answer is not shell-expanded
+                # (the literal ~ in the patterns is intentional: it is what
+                # the user typed, not a path we expect the shell to expand).
+                # shellcheck disable=SC2088
+                case "$mf" in
+                    "~/"*) mf="$HOME/${mf#\~/}" ;;
+                    "~")   mf="$HOME" ;;
+                esac
+                if [ -f "$mf" ]; then
+                    break
+                fi
+                printf 'No such file: %s\n' "$mf" >/dev/tty
+            done
+            while true; do
+                ask name "Name for the new model (e.g. my-coder): "
+                [ -n "$name" ] && break
+            done
+            say "Creating ${name} from ${mf} ..."
+            ollama create "$name" -f "$mf" \
+                || die "ollama create failed — check the Modelfile and try again"
+            MODEL="$name"
+            ;;
+        4)
+            if command -v ollama >/dev/null 2>&1; then
+                printf '\nInstalled models:\n\n' >/dev/tty
+                ollama list >/dev/tty 2>/dev/null || true
+                printf '\n' >/dev/tty
+            fi
+            local name
+            while true; do
+                ask name "Model name to use: "
+                [ -n "$name" ] && break
+            done
+            if command -v ollama >/dev/null 2>&1 \
+                && ! ollama list 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq "$name"; then
+                warn "'$name' does not appear in 'ollama list' — Wizard will fail at startup if it is missing"
+            fi
+            MODEL="$name"
+            ;;
+    esac
 }
 
 # --- wizard binary ------------------------------------------------------
@@ -676,22 +811,33 @@ build_from_source() {
 write_config() {
     local cfg="$HOME/.wizard/config.toml"
     mkdir -p "$HOME/.wizard"
-    if [ "$WIZARD_BESPOKE" = "1" ]; then
+    if [ "$WIZARD_MINIMAL" = "1" ]; then
         if [ -f "$cfg" ]; then
-            say "Bespoke install requested, but a config already exists at ${cfg} — leaving it untouched"
+            say "Minimal install requested, but a config already exists at ${cfg} — leaving it untouched"
             say "Run 'wizard --onboard' to reconfigure from scratch"
         else
-            say "Bespoke install: no config written — the first 'wizard' run will start onboarding"
+            say "Minimal install: no config written — the first 'wizard' run will start onboarding"
         fi
         return
     fi
     if [ -f "$cfg" ]; then
+        if [ "$WIZARD_BYOM" = "1" ]; then
+            # Don't clobber an existing config — only record the chosen model.
+            if grep -qE '^[[:space:]]*model[[:space:]]*=' "$cfg"; then
+                sed -i.wizard-bak -E "s|^[[:space:]]*model[[:space:]]*=.*|model = \"${MODEL}\"|" "$cfg"
+                rm -f "${cfg}.wizard-bak"
+            else
+                printf 'model = "%s"\n' "$MODEL" >>"$cfg"
+            fi
+            say "Updated model = \"${MODEL}\" in existing config (other settings preserved)"
+            return
+        fi
         say "Existing config found at ${cfg} — leaving it untouched"
         say "To switch models or providers, edit it or use /provider inside wizard"
         return
     fi
     say "Writing ${cfg}"
-    if [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+    if [ "$WIZARD_USE_OLLAMA" = "1" ] || [ "$WIZARD_BYOM" = "1" ]; then
         cat >"$cfg" <<EOF
 # Wizard configuration — see https://github.com/${REPO}
 active_provider = "local"
@@ -731,14 +877,234 @@ EOF
     fi
 }
 
+# --- default loadout ------------------------------------------------------
+# Browser MCP + subagent roster, written into ~/.wizard/. The canonical
+# source for these files is the repo's loadout/ directory (loadout/mcp.toml,
+# loadout/subagents/*.toml); they are embedded here as verbatim heredocs so
+# the curl|bash one-liner works without a repo checkout. When you change one
+# side, change the other — keep the two in sync.
+
+loadout_file() {
+    # $1 = destination path, $2 = short label; the file body arrives on
+    # stdin (heredoc). Never overwrites: an existing file always wins.
+    local dest="$1" label="$2"
+    if [ -f "$dest" ]; then
+        say "Existing ${dest} — leaving it untouched"
+        return
+    fi
+    cat >"$dest"
+    say "Installed ${label} (${dest})"
+}
+
+install_loadout() {
+    if [ "$WIZARD_MINIMAL" = "1" ]; then
+        say "Minimal install: skipping the default loadout (browser MCP, subagents)"
+        return
+    fi
+    say "Laying down the default loadout (browser MCP + subagents) ..."
+    mkdir -p "$HOME/.wizard/subagents"
+
+    loadout_file "$HOME/.wizard/mcp.toml" "MCP servers: Playwright browser" <<'EOF'
+# Wizard MCP server declarations — installed to ~/.wizard/mcp.toml
+#
+# Part of Wizard's default loadout. This directory (loadout/) is the canonical
+# source; install.sh embeds a verbatim copy as a heredoc so the curl|bash
+# one-liner works without a repo checkout — keep the two in sync.
+#
+# Each [[server]] is a Model Context Protocol server whose tools merge into
+# Wizard's tool registry. New servers (or edits here) become active the next
+# time Wizard starts, or immediately when you run /reload in the TUI.
+#
+# The Playwright MCP server below gives Wizard a real browser: navigate, click,
+# type, and snapshot tools for reading pages, filling forms, and computer-use
+# style tasks. It is spawned over stdio as `npx -y @playwright/mcp@latest`, so
+# it requires Node and `npx` on your PATH. If Node is missing, this server is
+# skipped with a warning at startup and the rest of Wizard works normally —
+# install Node, then `/reload`.
+
+[[server]]
+name = "playwright"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+EOF
+
+    loadout_file "$HOME/.wizard/subagents/reviewer.toml" "subagent: reviewer" <<'EOF'
+name = "reviewer"
+description = "Code-review specialist. Reads a diff or set of files and reports correctness bugs, security issues, and style problems. Read-only: never edits, runs, or commits anything."
+
+# Read/search/git tools only — the reviewer inspects, it does not change code.
+tool_scope = ["read_file", "list_files", "search_files", "git_status", "git_diff"]
+
+max_steps = 20
+
+system_prompt = """
+You are the reviewer subagent of Wizard, a local agent. Your one job is
+to review code and report findings. You cannot and must not edit, run, or
+commit anything — you only have read, search, and git-inspection tools.
+
+Method:
+1. Establish scope. If reviewing changes, run `git_diff` (and `git_status` for
+   untracked files) to see exactly what changed. If reviewing specific files,
+   read them. Read enough surrounding context to judge each change correctly —
+   a diff hunk in isolation lies.
+2. Look, in priority order, for:
+   - Correctness bugs: wrong logic, off-by-one, unhandled error/None/null
+     paths, race conditions, resource leaks, broken invariants.
+   - Security issues: injection, unvalidated input, secrets in code, unsafe
+     deserialization, path traversal, missing authz checks.
+   - API/contract breaks: changed signatures, behavior that callers depend on.
+   - Tests: are the changes covered? Do existing tests still hold?
+   - Clarity and style: naming, dead code, duplication, missing error context —
+     reported last and clearly marked as lower priority.
+3. For each finding give: file and line, severity (blocker / should-fix /
+   nit), what is wrong, and a concrete suggested fix.
+
+Be specific and honest. Do not invent problems to seem thorough; if the change
+is clean, say so. Do not rubber-stamp; if you are unsure whether something is a
+bug, say what would confirm it. End with a short verdict: APPROVE,
+APPROVE-WITH-NITS, or REQUEST-CHANGES, followed by the findings list.
+"""
+EOF
+
+    loadout_file "$HOME/.wizard/subagents/researcher.toml" "subagent: researcher" <<'EOF'
+name = "researcher"
+description = "Web research specialist. Uses the Playwright browser (MCP) to read pages, follow links, and gather facts, then reports a concise sourced summary. Use for questions that need current, external information."
+
+# No tool_scope: the researcher gets the parent's full tool set, which includes
+# the Playwright browser MCP tools (navigate / click / type / snapshot) shipped
+# in mcp.toml. Without scope it can reach those browser tools.
+
+max_steps = 25
+
+system_prompt = """
+You are the researcher subagent of Wizard, a local agent. Your job is to
+answer a question using information from the web and report back. You have a
+real browser available through the Playwright MCP tools (navigate, click, type,
+snapshot, and related). Use them — do not claim you cannot browse.
+
+Method:
+1. Plan a couple of search angles for the question. Navigate to a search engine
+   or directly to a likely-authoritative source (official docs, release notes,
+   the project's own repo) and read the page via a snapshot.
+2. Follow links and open additional pages as needed. Prefer primary sources
+   (official documentation, source repositories, standards) over blog
+   recaps. Cross-check anything surprising against a second source.
+3. Extract the specific facts that answer the question. Note version numbers,
+   dates, and exact quotes where precision matters.
+
+If the browser tools are unavailable (Node/npx not installed, server failed to
+start), say so plainly and report whatever you could determine from your own
+knowledge, clearly labeled as un-verified — do not fabricate page contents or
+citations.
+
+Report concisely: lead with the direct answer, then the supporting findings,
+then the URLs you actually visited as sources. Distinguish what you confirmed
+from a source versus what you inferred. Never invent a source or a quote.
+"""
+EOF
+
+    loadout_file "$HOME/.wizard/subagents/tester.toml" "subagent: tester" <<'EOF'
+name = "tester"
+description = "Test specialist. Runs the project's test suite, diagnoses failures, and fixes them — editing code or tests as appropriate — until the suite passes or the failure is clearly explained."
+
+# Can read, search, edit/write, and run commands. No git tools: the tester
+# fixes and verifies; committing is the parent's decision.
+tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files", "execute"]
+
+max_steps = 30
+
+system_prompt = """
+You are the tester subagent of Wizard, a local agent. Your job is to get
+the project's tests passing — or to explain precisely why they cannot pass.
+
+Method:
+1. Discover how this project is tested. Look for the build/test commands in
+   AGENTS.md, WIZARD.md, README, or the manifest (Cargo.toml, package.json,
+   pyproject.toml, Makefile, etc.). Common commands: `cargo test`, `npm test`,
+   `pytest`, `go test ./...`, `make test`.
+2. Run the suite with `execute` and read the full output. Identify the first
+   real failure (compile/lint errors before test assertions).
+3. Diagnose the root cause by reading the failing test and the code under test.
+   Decide whether the bug is in the implementation or in the test itself, and
+   fix the correct one. Do not delete or weaken a test to make it pass, and do
+   not assert behavior the code never promised — fix the real defect.
+4. Re-run the suite after each change. Iterate until it is green.
+
+Rules:
+- Make the smallest change that correctly fixes the failure.
+- Never fabricate a passing result. If the suite still fails, report the exact
+  failing tests and error output, your diagnosis, and what you changed.
+- If a failure is environmental (missing dependency, no network, missing
+  toolchain) and you cannot resolve it, say so explicitly rather than masking it.
+
+Report: the command you ran, the final pass/fail state with counts, what you
+changed and why, and any failures left unresolved with their cause.
+"""
+EOF
+
+    loadout_file "$HOME/.wizard/subagents/documenter.toml" "subagent: documenter" <<'EOF'
+name = "documenter"
+description = "Documentation specialist. Writes and updates READMEs, docs pages, and code comments so they accurately match the code. Edits prose and docs, never application logic."
+
+# Read/search to understand the code, edit/write to produce docs. No execute or
+# git: the documenter writes documentation, it does not run or commit code.
+tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files"]
+
+max_steps = 25
+
+system_prompt = """
+You are the documenter subagent of Wizard, a local agent. Your job is to
+produce documentation that is accurate, clear, and matched to the actual code —
+READMEs, docs pages, usage examples, and doc comments.
+
+Method:
+1. Read the relevant code and any existing docs before writing a word. Your
+   documentation must describe what the code actually does, not what it ought
+   to do. Trace function signatures, public APIs, config keys, CLI flags, and
+   defaults to their source.
+2. Match the existing documentation's voice, structure, and formatting. Reuse
+   established headings and conventions; do not invent a new style.
+3. Write for the reader: lead with what the thing is and how to use it, then
+   details. Prefer concrete, runnable examples over abstract description.
+
+Rules:
+- Never document behavior you have not verified in the source. Do not invent
+  flags, options, return values, or benchmarks. If something is ambiguous, note
+  the ambiguity rather than guessing.
+- Keep examples correct and minimal — every command or snippet you show should
+  actually work as written.
+- Edit only documentation and comments. Do not change application logic; if you
+  notice a code bug while documenting, report it rather than fixing it.
+
+Report: which files you wrote or updated, and a one-line summary of each change.
+"""
+EOF
+
+    if ! command -v npx >/dev/null 2>&1; then
+        warn "Node/npx not found on PATH — the Playwright browser server will be skipped at startup."
+        warn "Install Node (https://nodejs.org), then run /reload in Wizard to activate the browser."
+    fi
+}
+
 # --- main ---------------------------------------------------------------
 
 main() {
     say "Wizard installer"
+    if [ "$WIZARD_MINIMAL" = "1" ] && [ "$WIZARD_BYOM" = "1" ]; then
+        die "WIZARD_MINIMAL=1 and WIZARD_BYOM=1 conflict — pick one: minimal installs the binary only (onboarding on first run), BYOM sets up Ollama with a model of your choice"
+    fi
     require_curl
     detect_platform
 
-    if [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+    if [ "$WIZARD_MINIMAL" = "1" ]; then
+        say "Minimal install (WIZARD_MINIMAL=1): binary only — no model runtime, model, config, or loadout"
+    elif [ "$WIZARD_BYOM" = "1" ]; then
+        say "BYOM install (WIZARD_BYOM=1): bring your own Ollama model"
+        install_ollama
+        start_ollama
+        choose_byom_model
+    elif [ "$WIZARD_USE_OLLAMA" = "1" ]; then
         say "Using Ollama as the local provider (WIZARD_USE_OLLAMA=1)"
         install_ollama
         start_ollama
@@ -762,12 +1128,13 @@ main() {
 
     install_toolchain
     write_config
+    install_loadout
 
     printf '\n'
     if [ "$BINARY_INSTALLED" = "1" ]; then
-        if [ "$WIZARD_BESPOKE" = "1" ]; then
+        if [ "$WIZARD_MINIMAL" = "1" ]; then
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
-        elif [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+        elif [ "$WIZARD_BYOM" = "1" ] || [ "$WIZARD_USE_OLLAMA" = "1" ]; then
             say "Done. Run: wizard"
         else
             say "Done. Run: wizard — it starts llama-server with your model automatically."

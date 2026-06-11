@@ -347,7 +347,7 @@ fn transcript_text(app: &App) -> Text<'static> {
         let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
         lines.push(Line::from(vec![
             Span::styled(format!("{spinner} "), accent()),
-            Span::styled("thinking…", dim().italic()),
+            Span::styled(format!("{}…", app.spinner_verb), dim().italic()),
         ]));
     }
 

@@ -462,11 +462,18 @@ pub struct App {
     /// crash recovery); rendered as a spinner in the status bar. Input that
     /// needs the agent is rejected with a notice while this is `Some`.
     pub rebuilding: Option<String>,
+    /// Verb shown next to the busy spinner ("Conjuring…"); re-rolled at the
+    /// start of each busy period by [`App::roll_spinner_verb`].
+    pub spinner_verb: String,
+    /// Number of verb rolls so far, mixed into the roll seed so back-to-back
+    /// turns starting on the same tick still draw fresh verbs.
+    verb_rolls: u64,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let mode = config.mode;
+        let spinner_verb = config.ui.spinner_verb(0).to_string();
         let status = StatusLine {
             model: config.active().model,
             mode,
@@ -498,7 +505,17 @@ impl App {
             history_draft: String::new(),
             turn_started: None,
             rebuilding: None,
+            spinner_verb,
+            verb_rolls: 0,
         }
+    }
+
+    /// Pick a fresh spinner verb for a new busy period. The verb stays fixed
+    /// until the next roll, so one turn reads as one activity.
+    pub fn roll_spinner_verb(&mut self) {
+        self.verb_rolls = self.verb_rolls.wrapping_add(1);
+        let seed = self.tick.wrapping_add(self.verb_rolls);
+        self.spinner_verb = self.config.ui.spinner_verb(seed).to_string();
     }
 
     /// Append a system notice to the transcript.
@@ -1400,14 +1417,17 @@ fn is_local_kind(kind: ProviderKind) -> bool {
 
 /// Build `provider`'s client and prove it usable: for local llama.cpp this
 /// spawns `llama-server` when possible (the terminal is still in normal mode
-/// at startup, so spawn/load progress prints straight to stdout), then runs
-/// the provider's health probe.
+/// at startup, so spawn/load progress shows on a plain-terminal spinner),
+/// then runs the provider's health probe.
 async fn try_provider(provider: &ProviderConfig) -> Result<Arc<dyn LlmProvider>> {
     let client = provider
         .build()
         .with_context(|| format!("building provider '{}'", provider.name))?;
     if provider.kind == ProviderKind::LlamaCpp {
-        server::ensure_running(provider, &|line: &str| println!("{line}")).await?;
+        let wait = crate::progress::ServerSpinner::start();
+        let outcome = server::ensure_running(provider, &|line: &str| wait.update(line)).await;
+        wait.finish(outcome.is_ok());
+        outcome?;
     }
     client
         .health()
@@ -1623,6 +1643,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
                         app.streaming.clear();
                         app.streaming_thinking.clear();
                         app.turn_started = Some(Instant::now());
+                        app.roll_spinner_verb();
 
                         // Bridge AgentEvent -> Event::Agent for the UI loop.
                         let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
@@ -2420,6 +2441,52 @@ mod tests {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    #[test]
+    fn spinner_verb_starts_from_the_default_list() {
+        let app = app();
+        assert!(
+            crate::config::UiConfig::DEFAULT_SPINNER_VERBS.contains(&app.spinner_verb.as_str())
+        );
+    }
+
+    #[test]
+    fn spinner_verb_is_deterministic_and_stable_within_a_busy_period() {
+        let config = Config {
+            ui: crate::config::UiConfig {
+                spinner_verbs: vec![
+                    "Pondering".to_string(),
+                    "Musing".to_string(),
+                    "Noodling".to_string(),
+                ],
+            },
+            ..Config::default()
+        };
+        let mut a = App::new(config.clone());
+        let mut b = App::new(config);
+        a.tick = 17;
+        b.tick = 17;
+        a.roll_spinner_verb();
+        b.roll_spinner_verb();
+        // Same tick and roll count -> same verb.
+        assert_eq!(a.spinner_verb, b.spinner_verb);
+        // Ticks advancing mid-turn must not change the verb until a re-roll.
+        let during = a.spinner_verb.clone();
+        a.tick += 5;
+        assert_eq!(a.spinner_verb, during);
+    }
+
+    #[test]
+    fn spinner_verb_rerolls_across_busy_periods() {
+        let mut app = app();
+        let mut seen = std::collections::HashSet::new();
+        for turn in 0..40u64 {
+            app.tick = turn * 13;
+            app.roll_spinner_verb();
+            seen.insert(app.spinner_verb.clone());
+        }
+        assert!(seen.len() > 1, "verb never varied across busy periods");
     }
 
     #[test]

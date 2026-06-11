@@ -45,21 +45,32 @@ pub async fn run_cases(
         .with_context(|| format!("creating worktree parent {}", parent.display()))?;
 
     let id_width = cases.iter().map(|case| case.id.len()).max().unwrap_or(0);
+    // Hidden automatically when stderr is not a terminal; the per-case lines
+    // below go to stdout either way.
+    let bar = crate::progress::bar(cases.len() as u64);
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
+        bar.set_message(case.id.clone());
         let result = run_case(&root, case, &template, &parent, keep_worktrees).await;
-        println!(
-            "{:<id_width$}  {:<7}  harness {:.1}s  check {:.1}s",
-            result.id,
-            result.status.to_uppercase(),
-            result.harness_secs,
-            result.check_secs
-        );
-        if let Some(error) = &result.error {
-            println!("{:id_width$}  ({error})", "");
-        }
+        bar.suspend(|| {
+            println!(
+                "{:<id_width$}  {:<7}  harness {:.1}s  check {:.1}s",
+                result.id,
+                result.status.to_uppercase(),
+                result.harness_secs,
+                result.check_secs
+            );
+            if let Some(error) = &result.error {
+                println!("{:id_width$}  ({error})", "");
+            }
+            if keep_worktrees {
+                println!("kept worktree: {}", parent.join(&case.id).display());
+            }
+        });
+        bar.inc(1);
         results.push(result);
     }
+    bar.finish_and_clear();
 
     if !keep_worktrees {
         // Best-effort: worktrees themselves were already removed per case.
@@ -152,9 +163,8 @@ async fn run_case(
         }
     }
 
-    if keep_worktree {
-        println!("kept worktree: {}", worktree.display());
-    } else {
+    // Kept worktrees are reported by the caller (under the progress bar).
+    if !keep_worktree {
         git::worktree_remove(root, &worktree).await;
     }
     result

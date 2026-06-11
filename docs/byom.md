@@ -24,21 +24,23 @@ Prefer a model that supports tool calling; Wizard spawns the server with `--jinj
 
 ## BYOM with Ollama
 
-If you run Ollama instead (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the Ollama BYOM installer.
+If you run Ollama instead (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the main installer's BYOM flavor.
 
 ### Install with BYOM
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install-byom.sh | bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
 ```
 
-This script:
+With `WIZARD_BYOM=1`, the installer:
 
-1. Installs the `wizard` binary (same as the main installer)
-2. Installs Ollama if needed
-3. Does not pull any model automatically
-4. Walks you through model selection
-5. Writes your choice to `~/.wizard/config.toml`
+1. Installs Ollama if needed and starts it
+2. Does not pull any model automatically: it walks you through model selection first (set `WIZARD_MODEL=<tag>` to skip the prompts, e.g. for non-interactive installs)
+3. Installs the `wizard` binary (same as the default flavor)
+4. Writes your choice to `~/.wizard/config.toml`: a fresh config gets a full `[[providers]]` Ollama entry; an existing config keeps everything else and only has its `model =` line(s) updated
+5. Lays down the [default loadout](loadout.md) (browser MCP + subagents), each file only if absent
+
+The old `install-byom.sh` URL still works: it is now a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`).
 
 ### Interactive flow
 
@@ -55,9 +57,9 @@ Choose how to configure your model:
 Selection [1-4]: 2
 Enter Ollama model tag (e.g. myuser/my-model:27b): myuser/coder-v2
 ==> Pulling myuser/coder-v2 ...
-==> Writing ~/.wizard/config.toml
-==> Done. Run: wizard
 ```
+
+The rest of the install (binary, config, loadout) then proceeds and ends with `==> Done. Run: wizard`.
 
 ### Option 1: Ollama library model
 
@@ -70,7 +72,7 @@ ollama pull qwen3-coder:30b
 ollama pull deepseek-r1:32b
 ```
 
-The BYOM script runs `ollama pull` for you and sets `model` in config.
+The BYOM install runs `ollama pull` for you and sets `model` in config.
 
 ### Option 2: Custom registry tag
 
@@ -103,7 +105,7 @@ Then:
 ollama create my-coder -f Modelfile.example
 ```
 
-The BYOM script sets `model = "my-coder"` in config.
+The BYOM install sets `model = "my-coder"` in config.
 
 ### HuggingFace GGUF via URL
 

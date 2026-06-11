@@ -52,7 +52,9 @@ Sovereign mode is the autonomous, proactive agent. It runs with minimal human in
 
 ### Behavior
 
-- Can run headless (no TUI) or with a minimal status display
+- Can run headless (no TUI) or with a minimal status display; on a terminal,
+  a busy spinner (same configurable verbs as the TUI's `[ui] spinner_verbs`)
+  shows while the model thinks or a tool runs
 - Auto-approves all tool calls
 - Temperature: 0.6 (tighter tool-call formatting)
 - Default loop limit: 100 steps
