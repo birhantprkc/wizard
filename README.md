@@ -4,7 +4,7 @@
 
 **One line. Your sovereign agent. Self-extending. Bring any model.**
 
-![Wizard fixing a bug: prompt, approval modal, tool call, diff](demo/demo.gif)
+![Wizard fixing a bug: provider list, prompt, live edit, diff](demo/demo.gif)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
