@@ -21,8 +21,6 @@ const UPSTREAM_SLUG: &str = "teddytennant/wizard";
 pub struct PublishRequest {
     /// Branch to push to on the fork (default `"main"` when `None`).
     pub branch: Option<String>,
-    /// Skip the approval prompt (sovereign / `--auto`).
-    pub auto_approve: bool,
 }
 
 /// Result of a successful publish.

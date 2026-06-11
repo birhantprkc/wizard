@@ -7,10 +7,12 @@
 //! (which distinguishes "still loading the model" from "down"), and
 //! connection failures tell the user how to start the server.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 
 use super::openai::OpenAiProvider;
 use super::provider::LlmProvider;
@@ -32,6 +34,9 @@ pub struct LlamaCppProvider {
     /// OpenAI-compatible client bound to `{base_url}/v1`, handling chat
     /// streaming and `/v1/models`. Keyless — llama-server needs no auth.
     inner: OpenAiProvider,
+    /// Cached result of the `GET /props` context-window probe (`n_ctx`).
+    /// Probed once per provider instance; a failed probe caches `None`.
+    ctx_window: Arc<OnceCell<Option<u32>>>,
 }
 
 impl LlamaCppProvider {
@@ -52,7 +57,28 @@ impl LlamaCppProvider {
             base_url,
             model,
             inner,
+            ctx_window: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Probe llama-server's `GET /props` for the loaded model's context size
+    /// (`default_generation_settings.n_ctx`). Any failure — server down,
+    /// older server without the endpoint, unexpected shape — yields `None`.
+    async fn fetch_n_ctx(&self) -> Option<u32> {
+        let response = self
+            .http
+            .get(format!("{}/props", self.base_url))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = response.json().await.ok()?;
+        body.get("default_generation_settings")?
+            .get("n_ctx")?
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
     }
 
     /// Actionable error for a server that cannot be reached at all.
@@ -133,6 +159,12 @@ impl LlmProvider for LlamaCppProvider {
             .map_err(|err| self.reframe(err))
     }
 
+    /// llama-server serves whatever GGUF it was started with, so the live
+    /// `/props` probe beats any static table. Cached after the first call.
+    async fn context_window(&self, _model: &str) -> Option<u32> {
+        *self.ctx_window.get_or_init(|| self.fetch_n_ctx()).await
+    }
+
     fn label(&self) -> String {
         format!("llama.cpp:{}", self.model)
     }
@@ -156,6 +188,15 @@ mod tests {
         // The unreachable hint names the server root, not the /v1 endpoint.
         let hint = provider.reframe(anyhow!("plain error"));
         assert_eq!(hint.to_string(), "plain error", "non-connect passthrough");
+    }
+
+    #[tokio::test]
+    async fn context_window_probe_failure_degrades_to_none() {
+        // Port 1 on localhost: connection refused immediately, no server
+        // needed. The failed probe caches None instead of erroring.
+        let provider = LlamaCppProvider::new("http://127.0.0.1:1", "m");
+        assert_eq!(provider.context_window("m").await, None);
+        assert_eq!(provider.context_window("m").await, None, "cached");
     }
 
     #[tokio::test]

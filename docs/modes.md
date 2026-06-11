@@ -138,10 +138,45 @@ appended to `~/.wizard/evolution.jsonl`.
 | `retry_max_secs` | `300` | Cap on backoff between retries |
 | `cycle_pause_secs` | `0` | Pause between continuous cycles |
 | `compact_threshold_bytes` | `48000` | History size that triggers compaction |
+| `rollback_failed_cycles` | `false` | Restore a failed cycle's file checkpoints (see [checkpoints.md](checkpoints.md)) |
 
 > **Run it in a container or VM.** Continuous mode auto-approves every tool call with no
 > human in the loop and can rewrite its own binary. Point it only at work you're willing
 > to let it touch unattended, and read [SECURITY.md](../SECURITY.md) first.
+
+## Plan mode
+
+Plan mode is an overlay that works in every mode (genie, sovereign, continuous, gateway): the agent first investigates with read-only tools, presents a plan, and only executes once the plan is approved.
+
+While plan mode is on:
+
+- Only read-only tools run (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, ...). Every other tool — including `execute`, file writes, scripted/MCP tools, and `spawn_subagent` — returns a "blocked by plan mode" error to the model. These blocks are fed back as ordinary tool errors (not fatal) and are exempt from the circuit breakers.
+- The one way out is the `exit_plan` tool: the model calls it with the finished plan as markdown. The plan is saved to `<project>/.wizard/plan.md` and presented for a verdict.
+- Approval ends plan mode and the model executes the plan in the same turn. Rejection (with optional feedback) keeps plan mode on; the feedback is fed back so the model can revise and call `exit_plan` again.
+
+### TUI (genie)
+
+```
+/plan          # toggle plan mode (Shift+Tab does the same)
+```
+
+The status bar shows `PLAN` while active. When the model presents a plan, a review modal opens: `y`/Enter approves, `n` opens a feedback line (type the reason, Enter sends the rejection, Esc goes back), ↑/↓ scroll the plan.
+
+### Headless (sovereign / continuous / gateway)
+
+```bash
+wizard --mode sovereign --plan -p "refactor the config loader"
+```
+
+| Knob | Effect |
+|------|--------|
+| `--plan` (flag) | This run starts in plan mode |
+| `plan_first = true` (config) | Every session starts in plan mode |
+| `plan_each_cycle = true` (config) | Continuous mode re-enters plan mode at the top of every cycle |
+
+With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute — a natural two-phase plan-then-execute turn. The gateway also accepts a `/plan` chat message to toggle plan mode for subsequent messages.
+
+The last presented plan is always available at `<project>/.wizard/plan.md`.
 
 ## Switching modes in the TUI
 

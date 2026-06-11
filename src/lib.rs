@@ -7,22 +7,32 @@
 pub mod agent;
 pub mod app;
 pub mod bench;
+pub mod checkpoint;
 pub mod cli;
+pub mod commands;
 pub mod config;
+pub mod dispatch;
+pub mod doctor;
 pub mod event;
 pub mod evolve;
+pub mod fleet;
 pub mod gateway;
 pub mod hardware;
+pub mod hooks;
+pub mod instructions;
 pub mod llm;
 pub mod local_setup;
 pub mod mcp;
 pub mod memory;
 pub mod onboarding;
+pub mod output;
 pub mod progress;
+pub mod schedule;
 pub mod server;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+pub mod usage;
 
 use std::io::IsTerminal;
 
@@ -32,21 +42,66 @@ use crate::config::Mode;
 
 /// Top-level entry point: load config, apply CLI overrides, and dispatch to
 /// the selected run mode (genie TUI, sovereign headless loop, or `--evolve`).
-pub async fn run(cli: cli::Cli) -> Result<()> {
+///
+/// Returns the process exit code: headless runs map their outcome through
+/// [`output::exit_code`] (0 completed, 2 max-steps, 3 circuit breaker, 4 time
+/// limit); every other mode exits 0 on success. Hard errors surface as `Err`
+/// and exit 1 from `main`.
+pub async fn run(cli: cli::Cli) -> Result<i32> {
     // Bench is self-contained tooling: it must work with no config and no
     // LLM, so dispatch before onboarding and before the config load.
     if let Some(cli::Command::Bench { cmd }) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        return bench::run(cmd.clone()).await;
+        return bench::run(cmd.clone()).await.map(|()| 0);
+    }
+
+    // Doctor diagnoses the environment — starting with "does the config
+    // parse?" — so it too dispatches before the config load and can never
+    // trigger onboarding. Exits 0 when no check failed, 1 otherwise.
+    if let Some(cli::Command::Doctor) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return doctor::run().await;
+    }
+
+    // Schedule CRUD and the scheduler daemon are config-independent too:
+    // they only touch ~/.wizard/schedule.toml, and the jobs they spawn are
+    // wizard child processes that load config themselves. `schedule run`
+    // propagates the child's exit code.
+    if let Some(cli::Command::Schedule { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return schedule::run(cmd.clone()).await;
+    }
+    if let Some(cli::Command::Scheduler) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return schedule::run_daemon().await;
+    }
+
+    // Fleet dispatches before the normal flow too, but `fleet run` loads
+    // config itself (its planning and synthesis turns drive a real
+    // in-process agent); `fleet status` / `fleet stop` only touch the
+    // project's `.wizard/fleet/` directory.
+    if let Some(cli::Command::Fleet { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return fleet::run(cmd.clone()).await;
     }
 
     // `--login` is a one-shot credential flow: no config, no onboarding,
     // no TUI. Tokens land in a dedicated file under ~/.wizard/.
     if let Some(provider) = &cli.login {
         return match provider.as_str() {
-            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}")).await,
+            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"))
+                .await
+                .map(|()| 0),
             other => anyhow::bail!("unknown login provider '{other}' (supported: xai)"),
         };
     }
@@ -59,12 +114,18 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
             Some(config) => config,
             None => {
                 println!("onboarding cancelled — run `wizard --onboard` any time.");
-                return Ok(());
+                return Ok(0);
             }
         }
     } else {
         config::Config::load()?
     };
+    if !config.auto_approve {
+        eprintln!(
+            "warning: `auto_approve = false` in config.toml is no longer honored — \
+             approval gating was removed; every tool call executes directly"
+        );
+    }
     config.apply_cli(&cli);
 
     if let Some(dir) = &cli.cwd {
@@ -72,15 +133,15 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
     }
 
     if cli.publish {
-        return evolve::run_publish_cli(config, cli).await;
+        return evolve::run_publish_cli(config, cli).await.map(|()| 0);
     }
 
     if cli.evolve {
-        return evolve::run_cli(config, cli).await;
+        return evolve::run_cli(config, cli).await.map(|()| 0);
     }
 
     if cli.gateway {
-        return gateway::run(config, cli).await;
+        return gateway::run(config, cli).await.map(|()| 0);
     }
 
     match config.mode {

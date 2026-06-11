@@ -347,9 +347,42 @@ impl LlmProvider for OpenAiProvider {
         Ok(decode_sse(bytes))
     }
 
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        context_window(model)
+    }
+
     fn label(&self) -> String {
         format!("{}:{}", self.vendor, self.model)
     }
+}
+
+/// Context-window table for OpenAI-compatible endpoints (OpenAI and xAI
+/// model families; llama.cpp overrides this with a live `/props` probe).
+/// Unknown tags report `None` so compaction falls back to the byte
+/// threshold.
+pub(crate) fn context_window(model: &str) -> Option<u32> {
+    let model = model.to_ascii_lowercase();
+    // xAI Grok (served through this provider with vendor "xai").
+    if model.starts_with("grok-4") {
+        return Some(256_000);
+    }
+    if model.starts_with("grok") {
+        return Some(131_072);
+    }
+    // OpenAI.
+    if model.starts_with("gpt-5") {
+        return Some(400_000);
+    }
+    if model.starts_with("gpt-4.1") {
+        return Some(1_047_576);
+    }
+    if model.starts_with("gpt-4o") || model.starts_with("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        return Some(200_000);
+    }
+    None
 }
 
 /// `GET /models` response (subset).
@@ -823,5 +856,18 @@ mod tests {
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
         assert!(chunks.next().await.is_none());
+    }
+
+    #[test]
+    fn context_window_table_covers_openai_xai_and_unknowns() {
+        assert_eq!(context_window("gpt-4o"), Some(128_000));
+        assert_eq!(context_window("gpt-4o-mini"), Some(128_000));
+        assert_eq!(context_window("gpt-4.1"), Some(1_047_576));
+        assert_eq!(context_window("gpt-5"), Some(400_000));
+        assert_eq!(context_window("o3-mini"), Some(200_000));
+        assert_eq!(context_window("grok-3"), Some(131_072));
+        assert_eq!(context_window("grok-4.3"), Some(256_000));
+        assert_eq!(context_window("qwen3-8b"), None, "local tags stay unknown");
+        assert_eq!(context_window(""), None);
     }
 }

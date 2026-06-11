@@ -161,10 +161,16 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 - [Getting started](docs/getting-started.md): install, tiers, first run, troubleshooting
 - [Modes](docs/modes.md): genie vs sovereign
+- [Headless output](docs/headless.md): `--output-format text|json|stream-json`, exit codes
+- [Checkpoints](docs/checkpoints.md): per-file snapshots, `/rewind`, perpetual rollback
+- [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
 - [Fork and distribute](docs/market.md): publish your evolved Wizard; one-line installer for your fork
 - [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
+- [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
+- [Scheduler](docs/scheduler.md): cron-scheduled headless runs; `wizard schedule`, `wizard scheduler`
+- [Fleet](docs/fleet.md): parallel workers over git worktrees; `wizard fleet run -n N -p "<mission>"`
 - [Architecture](docs/architecture.md): how it's built
 - [Security](SECURITY.md): threat model
 - [WIZARD.md](WIZARD.md): the agent's bundled behavioral charter; inherited and editable by every fork

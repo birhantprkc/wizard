@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
 //! line and a quiet status line. Floating layers: the command-suggestion
-//! popup, the model/mode picker, and the approval modal.
+//! popup and the model/mode/rewind picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -65,12 +65,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    if app.show_diff {
-        let [chat_area, diff_area] =
+    if app.show_diff || app.show_todos {
+        let [chat_area, side_area] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(main_area);
         draw_transcript(frame, app, chat_area);
-        draw_diff_sidebar(frame, app, diff_area);
+        match (app.show_todos, app.show_diff) {
+            (true, true) => {
+                // Both panels share the sidebar: todos on top (sized to the
+                // list), the diff below.
+                let todo_height = (app.todos.len() as u16 + 1).clamp(2, side_area.height / 2);
+                let [todo_area, diff_area] =
+                    Layout::vertical([Constraint::Length(todo_height), Constraint::Min(1)])
+                        .areas(side_area);
+                draw_todo_sidebar(frame, app, todo_area);
+                draw_diff_sidebar(frame, app, diff_area);
+            }
+            (true, false) => draw_todo_sidebar(frame, app, side_area),
+            _ => draw_diff_sidebar(frame, app, side_area),
+        }
     } else {
         draw_transcript(frame, app, main_area);
     }
@@ -79,14 +92,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() && app.pending_approval.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
         draw_picker(frame, app);
     }
-    if app.pending_approval.is_some() {
-        draw_approval_modal(frame, app);
+    if app.plan_review.is_some() {
+        draw_plan_review(frame, app);
     }
 }
 
@@ -411,6 +424,47 @@ fn tool_card_lines(
     }
 }
 
+/// Todo side panel (`/todos`, auto-shown on the first todo update): the
+/// agent's working list with status glyphs — ✓ completed (dim,
+/// struck-through), ▸ in progress (accent), ☐ pending.
+fn draw_todo_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let (done, total) = crate::tools::todo::progress(&app.todos);
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ≡ ", accent()),
+            Span::styled(
+                format!("todos {done}/{total}"),
+                Style::default().fg(TEXT_DIM),
+            ),
+        ]));
+    let inner_width = block.inner(area).width as usize;
+    let lines: Vec<Line<'static>> = if app.todos.is_empty() {
+        vec![Line::from(Span::styled("(empty)", dim().italic()))]
+    } else {
+        app.todos
+            .iter()
+            .map(|item| {
+                use crate::tools::todo::TodoStatus;
+                let (glyph_style, text_style) = match item.status {
+                    TodoStatus::Completed => (dim(), dim().add_modifier(Modifier::CROSSED_OUT)),
+                    TodoStatus::InProgress => (accent(), accent().bold()),
+                    TodoStatus::Pending => (dim(), Style::default().fg(TEXT_DIM)),
+                };
+                truncate_line(
+                    Line::from(vec![
+                        Span::styled(format!("{} ", item.status.glyph()), glyph_style),
+                        Span::styled(item.content.clone(), text_style),
+                    ]),
+                    inner_width,
+                )
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
 /// Git diff sidebar (`/diff`): separated from the chat by a single dim
 /// rule, syntax-highlighted (foreground colors only). Lines wider than
 /// the sidebar are cut with a dim `…` instead of clipping silently.
@@ -441,6 +495,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];
+    if app.plan_mode {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled("PLAN", accent().bold()));
+    }
+    let token_total = app.status.prompt_tokens + app.status.completion_tokens;
+    if token_total > 0 {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            crate::usage::format_tokens(token_total),
+            dim(),
+        ));
+    }
     if let Some(label) = &app.rebuilding {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(format!("{spinner} "), accent()));
@@ -466,8 +532,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     // Contextual key hints, right-aligned in a sub-rect so the left side is
     // never overdrawn.
-    let hints = if app.pending_approval.is_some() {
-        "y approve · n deny"
+    let hints = if let Some(review) = &app.plan_review {
+        if review.feedback.is_some() {
+            "type feedback · Enter reject · Esc back"
+        } else {
+            "y/Enter approve · n reject · ↑↓ scroll"
+        }
     } else if app.picker.is_some() {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
@@ -504,25 +574,6 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let budget = (area.width as usize)
         .saturating_sub(pad + prompt_width + 1)
         .max(1);
-
-    if app.input_mode == InputMode::Approval {
-        let placeholder = "awaiting approval — y approve · n deny";
-        let line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled("❯ ", dim().bold()),
-            Span::styled(placeholder, dim().italic()),
-        ]);
-        frame.render_widget(Paragraph::new(Text::from(vec![rule, line])), area);
-        // Input is disabled: park the cursor in the gap after the
-        // placeholder, never on top of it. Without this the cursor stays
-        // where the last editable frame left it — the placeholder's first
-        // cell — and terminals/recorders that ignore cursor-hide draw a
-        // block over the text ("❯ ▌waiting approval").
-        let after = (pad + prompt_width + placeholder.width() + 1) as u16;
-        let cursor_x = (area.x + after).min(area.right().saturating_sub(1));
-        frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
-        return;
-    }
 
     let chars: Vec<char> = app.input.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
@@ -565,7 +616,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             let mut ghost = remainder.to_string();
             if !spec.args.is_empty() {
                 ghost.push(' ');
-                ghost.push_str(spec.args);
+                ghost.push_str(&spec.args);
             }
             let room = budget.saturating_sub(used_cols);
             if !ghost.is_empty() && room > 0 {
@@ -580,7 +631,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    if app.picker.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() {
         frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
     }
 }
@@ -643,7 +694,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
                 Span::styled(marker, accent()),
                 Span::styled(format!("{usage:<usage_width$}"), name_style),
                 Span::styled(
-                    format!("  {}", truncate_width(spec.description, description_room)),
+                    format!("  {}", truncate_width(&spec.description, description_room)),
                     dim(),
                 ),
             ])
@@ -656,7 +707,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// Centered modal for the model / mode picker.
+/// Centered modal for the model / mode / rewind picker.
 fn draw_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = &app.picker else {
         return;
@@ -732,25 +783,18 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// Centered modal asking the user to approve a gated tool call.
-fn draw_approval_modal(frame: &mut Frame, app: &App) {
-    let Some(pending) = &app.pending_approval else {
+/// Plan-review modal (plan mode): the plan markdown with a verdict footer.
+/// The turn is paused inside `exit_plan` until the user answers, so this
+/// floats above everything else. While rejecting, a feedback line replaces
+/// the bottom edge of the body.
+fn draw_plan_review(frame: &mut Frame, app: &App) {
+    let Some(review) = &app.plan_review else {
         return;
     };
+
     let frame_area = frame.area();
-
-    let args = serde_json::to_string_pretty(&pending.call.function.arguments)
-        .unwrap_or_else(|_| "{}".to_string());
-    let arg_lines: Vec<&str> = args.lines().collect();
-
-    // Size the modal to its content: tool line + blank + argument block
-    // (+ overflow ellipsis) + blank + buttons, plus the borders; capped so
-    // it always fits the frame.
-    let max_args = frame_area.height.saturating_sub(7).max(3) as usize;
-    let shown = arg_lines.len().min(max_args);
-    let truncated = arg_lines.len() > shown;
-    let height = (shown + truncated as usize + 6) as u16;
-    let width = (frame_area.width as u32 * 70 / 100).max(1) as u16;
+    let width = frame_area.width.saturating_sub(6).clamp(24, 100);
+    let height = frame_area.height.saturating_sub(2).max(5);
     let area = Rect {
         x: frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
         y: frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
@@ -758,42 +802,74 @@ fn draw_approval_modal(frame: &mut Frame, app: &App) {
         height,
     }
     .intersection(frame_area);
+    if area.height < 5 || area.width < 10 {
+        return;
+    }
     frame.render_widget(Clear, area);
 
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled("tool ", dim()),
-            Span::styled(pending.call.function.name.clone(), accent().bold()),
-        ]),
-        Line::raw(""),
-    ];
-
-    for line in arg_lines.iter().take(shown) {
-        lines.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(TEXT_DIM),
-        )));
-    }
-    if truncated {
-        lines.push(Line::from(Span::styled("…", dim())));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(Color::White).bold()),
-        Span::styled(" approve", dim()),
-        Span::raw("    "),
-        Span::styled("n", Style::default().fg(Color::White).bold()),
-        Span::styled(" deny", dim()),
-    ]));
-
+    let hints = if review.feedback.is_some() {
+        " feedback · Enter reject · Esc back "
+    } else {
+        " y approve · n reject · ↑↓ scroll "
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(accent())
+        .border_style(dim())
         .title(Line::from(vec![
             Span::styled(" ✦", accent()),
-            Span::styled(" approve tool call? ", Style::default().fg(TEXT_DIM)),
-        ]));
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+            Span::styled(" plan review ", Style::default().fg(TEXT_DIM)),
+        ]))
+        .title_bottom(Line::from(Span::styled(hints, dim())).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Body: the plan, wrapped and scrolled; the bottom line is reserved for
+    // the feedback input while rejecting.
+    let body_area = if review.feedback.is_some() {
+        Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    if body_area.height > 0 {
+        let lines = wrap_lines(render_markdown(&review.plan), body_area.width as usize);
+        let max_scroll = lines.len().saturating_sub(body_area.height as usize);
+        let scroll = (review.scroll as usize).min(max_scroll);
+        let visible: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(scroll)
+            .take(body_area.height as usize)
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(visible)), body_area);
+    }
+
+    if let Some(feedback) = &review.feedback {
+        let feedback_area = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        let budget =
+            (feedback_area.width as usize).saturating_sub("rejection feedback ❯  ".width());
+        let shown: String = feedback
+            .chars()
+            .rev()
+            .take(budget)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("rejection feedback ❯ ", accent().bold()),
+                Span::raw(shown),
+                Span::styled("▍", dim()),
+            ])),
+            feedback_area,
+        );
+    }
 }
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs

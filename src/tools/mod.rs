@@ -7,18 +7,23 @@ pub mod evolve;
 pub mod file;
 pub mod git;
 pub mod memory;
+pub mod plan;
 pub mod publish;
 pub mod registry;
 pub mod scripted;
 pub mod shell;
+pub mod tasks;
+pub mod todo;
+pub mod web;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use crate::llm::ToolSpec;
 
-/// Where a tool comes from. Affects display and default approval policy.
+/// Where a tool comes from. Affects display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     /// Compiled into the binary.
@@ -29,16 +34,72 @@ pub enum ToolKind {
     Mcp,
 }
 
+/// How a tool touches the world. Drives the plan-mode read-only gate and
+/// checkpoint snapshots of `Edit`-class targets — never prompting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolAccess {
+    /// Observes only (reads files, queries state).
+    ReadOnly,
+    /// Modifies a file at a resolvable path.
+    Edit,
+    /// Runs commands or has other side effects.
+    Execute,
+}
+
 /// Per-call execution context.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     /// Project root all relative paths resolve against.
     pub cwd: PathBuf,
+    /// Session-wide registry of background shell tasks.
+    pub tasks: Arc<tasks::TaskRegistry>,
+    /// The agent's working todo list, shared by every call in the session.
+    pub todos: Arc<Mutex<todo::TodoList>>,
+    /// Event channel of the turn currently dispatching, injected by the
+    /// dispatcher so tools that converse with the surface (`exit_plan`'s
+    /// approval round-trip) can reach it. `None` outside the dispatch
+    /// pipeline (subagents, direct registry execution).
+    pub events: Option<tokio::sync::mpsc::Sender<crate::agent::AgentEvent>>,
+    /// Settings for the native web tools (`[web]` in `config.toml`), set by
+    /// the agent at construction; defaults elsewhere.
+    pub web: Arc<crate::config::WebConfig>,
+    /// Per-file checkpoint store, set by the agent at construction. The
+    /// dispatcher and the subagent loop snapshot `Edit`-class targets into
+    /// it before execution. `None` outside an agent (direct registry
+    /// execution in tests).
+    pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
 }
 
 impl ToolContext {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            tasks: Arc::new(tasks::TaskRegistry::new()),
+            todos: Arc::new(Mutex::new(todo::TodoList::new())),
+            events: None,
+            web: Arc::new(crate::config::WebConfig::default()),
+            checkpoints: None,
+        }
+    }
+
+    /// This context with `web` tool settings applied (agent construction).
+    pub fn with_web(mut self, web: crate::config::WebConfig) -> Self {
+        self.web = Arc::new(web);
+        self
+    }
+
+    /// This context with the checkpoint store attached (agent construction).
+    pub fn with_checkpoints(mut self, store: Arc<crate::checkpoint::CheckpointStore>) -> Self {
+        self.checkpoints = Some(store);
+        self
+    }
+
+    /// A copy of this context carrying the turn's event channel.
+    pub fn with_events(&self, events: tokio::sync::mpsc::Sender<crate::agent::AgentEvent>) -> Self {
+        Self {
+            events: Some(events),
+            ..self.clone()
+        }
     }
 }
 
@@ -77,8 +138,6 @@ pub enum ToolError {
     UnknownTool(String),
     #[error("invalid arguments for '{tool}': {message}")]
     InvalidArgs { tool: String, message: String },
-    #[error("user denied execution of '{0}'")]
-    Denied(String),
     #[error("tool '{tool}' timed out after {seconds}s")]
     Timeout { tool: String, seconds: u64 },
     #[error("tool '{tool}' failed")]
@@ -146,9 +205,8 @@ pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
 /// - `parameters` returns a JSON Schema object; `execute` receives arguments
 ///   already validated against nothing — implementations must deserialize
 ///   defensively and return [`ToolError::InvalidArgs`] on shape mismatch.
-/// - `requires_approval` marks tools that CAN trigger the y/n gate; the gate
-///   only fires when per-action confirmation is enabled (`auto_approve = false`
-///   in config). Both modes auto-approve by default.
+/// - `access` classifies side effects conservatively: anything not provably
+///   read-only or a path-addressed edit stays [`ToolAccess::Execute`].
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique tool name as advertised to the model (snake_case).
@@ -160,9 +218,10 @@ pub trait Tool: Send + Sync {
     /// JSON Schema describing the arguments object.
     fn parameters(&self) -> serde_json::Value;
 
-    /// Whether this tool opts into the y/n gate when `auto_approve` is false.
-    fn requires_approval(&self) -> bool {
-        false
+    /// How this tool touches the world. Drives the plan-mode read-only gate
+    /// and checkpoint snapshots — never prompting.
+    fn access(&self) -> ToolAccess {
+        ToolAccess::Execute
     }
 
     /// Origin of this tool.

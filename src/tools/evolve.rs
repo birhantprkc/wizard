@@ -1,9 +1,7 @@
 //! `evolve` tool: lets the agent extend or rebuild ITSELF at runtime.
-//! Wraps the tiered self-extension pipeline (`crate::evolve`). Auto-approved
-//! by default in both modes (genie bypasses permissions, sovereign is
-//! autonomous); subject to the y/n gate only when auto-approve is disabled
-//! (`requires_approval` = true). A successful deep rebuild drops a re-exec
-//! marker so the continuous loop relaunches into the new binary.
+//! Wraps the tiered self-extension pipeline (`crate::evolve`). A successful
+//! deep rebuild drops a re-exec marker so the continuous loop relaunches
+//! into the new binary.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -72,10 +70,6 @@ impl Tool for EvolveTool {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        true
-    }
-
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: EvolveArgs = parse_args(self.name(), args)?;
 
@@ -86,9 +80,6 @@ impl Tool for EvolveTool {
             } else {
                 EvolveTier::Runtime
             },
-            // The tool-layer approval gate already governs whether this
-            // `execute` is reached, so the pipeline itself need not re-prompt.
-            auto_approve: true,
         };
 
         let outcome = match Evolver::new(self.config.clone()).run(request).await {

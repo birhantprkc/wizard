@@ -54,7 +54,6 @@ impl ScriptManifest {
 }
 
 /// A loaded scripted tool: manifest plus resolved script path.
-/// Runs through the same approval gate as `execute`.
 #[derive(Debug, Clone)]
 pub struct ScriptedTool {
     pub manifest: ScriptManifest,
@@ -153,10 +152,6 @@ impl Tool for ScriptedTool {
 
     fn parameters(&self) -> Value {
         self.manifest.parameters.clone()
-    }
-
-    fn requires_approval(&self) -> bool {
-        true
     }
 
     fn kind(&self) -> ToolKind {

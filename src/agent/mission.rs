@@ -96,11 +96,19 @@ impl Mission {
         self.cycles += 1;
         self.updated = Utc::now();
         if let Some(n) = note {
-            self.notes.push(n);
-            if self.notes.len() > MAX_NOTES {
-                let excess = self.notes.len() - MAX_NOTES;
-                self.notes.drain(0..excess);
-            }
+            self.note(n);
+        }
+    }
+
+    /// Append a progress note (bumping `updated`) without counting a cycle —
+    /// e.g. a checkpoint rollback after a failed cycle. The log stays capped
+    /// at [`MAX_NOTES`].
+    pub fn note(&mut self, note: impl Into<String>) {
+        self.updated = Utc::now();
+        self.notes.push(note.into());
+        if self.notes.len() > MAX_NOTES {
+            let excess = self.notes.len() - MAX_NOTES;
+            self.notes.drain(0..excess);
         }
     }
 }

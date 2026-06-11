@@ -34,10 +34,17 @@ pub struct Cli {
     #[arg(long)]
     pub publish: bool,
 
-    /// Force auto-approve for this run (already the default; useful when
-    /// config has `auto_approve = false` to restore bypass behavior).
-    #[arg(long)]
+    /// Deprecated: approval gating was removed and every tool call executes
+    /// directly. Accepted for compatibility and ignored.
+    #[arg(long, hide = true)]
     pub auto: bool,
+
+    /// Start in plan mode: the agent investigates with read-only tools and
+    /// presents a plan via the exit_plan tool before executing. The TUI asks
+    /// for approval; headless runs and the gateway auto-approve, giving a
+    /// natural plan-then-execute turn.
+    #[arg(long)]
+    pub plan: bool,
 
     /// Time limit in hours for a sovereign-mode run.
     #[arg(long)]
@@ -52,6 +59,13 @@ pub struct Cli {
     /// `stop` or --max-hours). Implies --mode sovereign.
     #[arg(long)]
     pub continuous: bool,
+
+    /// Output format for headless (sovereign `-p`) runs: `text` streams
+    /// human-readable output (default), `json` emits one final JSON summary
+    /// object, `stream-json` emits one JSON object per line as events
+    /// arrive. Ignored by the TUI and the gateway.
+    #[arg(long, value_enum, default_value_t)]
+    pub output_format: crate::output::OutputFormat,
 
     /// Project root override (defaults to the current directory).
     #[arg(long)]
@@ -87,6 +101,108 @@ pub enum Command {
     Bench {
         #[command(subcommand)]
         cmd: BenchCmd,
+    },
+
+    /// Diagnose the environment: config, providers, MCP servers, tools,
+    /// hooks, writable state dirs, checkpoints. Exits 0 when no check
+    /// failed.
+    Doctor,
+
+    /// Manage scheduled runs (~/.wizard/schedule.toml): cron entries the
+    /// `wizard scheduler` daemon fires as headless wizard runs.
+    Schedule {
+        #[command(subcommand)]
+        cmd: ScheduleCmd,
+    },
+
+    /// Run the scheduler daemon in the foreground: reload
+    /// ~/.wizard/schedule.toml each pass and fire due entries as headless
+    /// wizard child processes. Daemonize externally (e.g. systemd); see
+    /// docs/scheduler.md.
+    Scheduler,
+
+    /// Fleet mode: decompose a mission into independent tasks and run them
+    /// as parallel headless workers, each in its own git worktree, then
+    /// merge the fleet branches back. See docs/fleet.md.
+    Fleet {
+        #[command(subcommand)]
+        cmd: FleetCmd,
+    },
+}
+
+/// `wizard fleet` subcommands. `run` loads config (the coordinator drives a
+/// real agent for planning and synthesis); `status` and `stop` only touch
+/// the project's `.wizard/fleet/` directory.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum FleetCmd {
+    /// Plan the mission, spawn up to N parallel workers over git worktrees,
+    /// supervise them, then synthesize (merge the fleet branches).
+    Run {
+        /// Number of parallel workers.
+        #[arg(short = 'n', long = "workers", value_name = "N")]
+        n: usize,
+
+        /// Mission prompt, decomposed into independent tasks by a planning
+        /// turn.
+        #[arg(short, long)]
+        prompt: String,
+    },
+
+    /// Show the fleet state: mission, status, and a per-task table.
+    Status,
+
+    /// Ask a running fleet to wind down (writes the stop sentinel; the
+    /// coordinator kills its workers on the next supervision tick).
+    Stop,
+}
+
+/// `wizard schedule` subcommands. Like bench, these are self-contained:
+/// they edit `~/.wizard/schedule.toml` directly and never load
+/// `~/.wizard/config.toml` or trigger onboarding.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ScheduleCmd {
+    /// Add an entry; validates the cron expression and prints the next
+    /// fire time.
+    Add {
+        /// Unique entry name; `[a-zA-Z0-9_-]+` only.
+        name: String,
+
+        /// Standard 5-field cron expression (minute hour day month weekday),
+        /// evaluated in local time.
+        #[arg(long)]
+        cron: String,
+
+        /// Task prompt handed to the spawned headless wizard run.
+        #[arg(long)]
+        prompt: String,
+
+        /// Directory the run executes in (must exist).
+        #[arg(long)]
+        cwd: PathBuf,
+
+        /// Wall-clock cap in hours for the spawned run.
+        #[arg(long)]
+        max_hours: Option<f64>,
+
+        /// Run mode for the job: `sovereign` (default) or `continuous`.
+        #[arg(long, default_value = "sovereign")]
+        mode: String,
+    },
+
+    /// List entries with their next fire times.
+    List,
+
+    /// Remove an entry by name.
+    Remove {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
+    },
+
+    /// Run one entry's job immediately in the foreground (same child
+    /// command the daemon would spawn); exits with the child's exit code.
+    Run {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
     },
 }
 
@@ -221,9 +337,11 @@ mod tests {
         assert!(!cli.evolve);
         assert!(!cli.deep);
         assert!(!cli.auto);
+        assert!(!cli.plan);
         assert_eq!(cli.max_hours, None);
         assert_eq!(cli.loop_limit, None);
         assert!(!cli.continuous);
+        assert_eq!(cli.output_format, crate::output::OutputFormat::Text);
         assert_eq!(cli.cwd, None);
         assert!(!cli.resume);
         assert!(!cli.onboard);
@@ -249,6 +367,7 @@ mod tests {
             "-p",
             "add tests",
             "--auto",
+            "--plan",
             "--max-hours",
             "1.5",
             "--loop",
@@ -264,6 +383,7 @@ mod tests {
         assert_eq!(cli.mode, Some(Mode::Sovereign));
         assert_eq!(cli.prompt.as_deref(), Some("add tests"));
         assert!(cli.auto);
+        assert!(cli.plan);
         assert_eq!(cli.max_hours, Some(1.5));
         assert_eq!(cli.loop_limit, Some(10));
         assert!(cli.continuous);
@@ -300,9 +420,156 @@ mod tests {
     }
 
     #[test]
+    fn output_format_parses_all_values() {
+        use crate::output::OutputFormat;
+        for (raw, expected) in [
+            ("text", OutputFormat::Text),
+            ("json", OutputFormat::Json),
+            ("stream-json", OutputFormat::StreamJson),
+        ] {
+            let cli = parse(&["--output-format", raw]).expect("format parses");
+            assert_eq!(cli.output_format, expected);
+        }
+        let err = parse(&["--output-format", "yaml"]).expect_err("unknown format rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn rejects_unknown_mode() {
         let err = parse(&["--mode", "warlock"]).expect_err("unknown mode must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn doctor_parses_as_a_subcommand() {
+        let cli = parse(&["doctor"]).expect("doctor parses");
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn scheduler_parses_as_a_subcommand() {
+        let cli = parse(&["scheduler"]).expect("scheduler parses");
+        assert!(matches!(cli.command, Some(Command::Scheduler)));
+    }
+
+    #[test]
+    fn schedule_add_parses_with_defaults() {
+        let cli = parse(&[
+            "schedule",
+            "add",
+            "nightly",
+            "--cron",
+            "0 3 * * *",
+            "--prompt",
+            "tidy up",
+            "--cwd",
+            "/tmp/proj",
+        ])
+        .expect("schedule add parses");
+        let Some(Command::Schedule {
+            cmd:
+                ScheduleCmd::Add {
+                    name,
+                    cron,
+                    prompt,
+                    cwd,
+                    max_hours,
+                    mode,
+                },
+        }) = cli.command
+        else {
+            panic!("expected schedule add");
+        };
+        assert_eq!(name, "nightly");
+        assert_eq!(cron, "0 3 * * *");
+        assert_eq!(prompt, "tidy up");
+        assert_eq!(cwd, PathBuf::from("/tmp/proj"));
+        assert_eq!(max_hours, None);
+        assert_eq!(mode, "sovereign");
+    }
+
+    #[test]
+    fn schedule_add_requires_cron_prompt_and_cwd() {
+        let err = parse(&["schedule", "add", "nightly"]).expect_err("missing args rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn schedule_list_remove_and_run_parse() {
+        let cli = parse(&["schedule", "list"]).expect("schedule list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Schedule {
+                cmd: ScheduleCmd::List
+            })
+        ));
+
+        let cli = parse(&["schedule", "remove", "nightly"]).expect("schedule remove parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Remove { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule remove");
+        };
+        assert_eq!(name, "nightly");
+
+        let cli = parse(&["schedule", "run", "nightly"]).expect("schedule run parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Run { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule run");
+        };
+        assert_eq!(name, "nightly");
+    }
+
+    #[test]
+    fn fleet_run_parses_workers_and_prompt() {
+        let cli = parse(&["fleet", "run", "-n", "3", "-p", "improve coverage"])
+            .expect("fleet run parses");
+        let Some(Command::Fleet {
+            cmd: FleetCmd::Run { n, prompt },
+        }) = cli.command
+        else {
+            panic!("expected fleet run");
+        };
+        assert_eq!(n, 3);
+        assert_eq!(prompt, "improve coverage");
+
+        let cli =
+            parse(&["fleet", "run", "--workers", "2", "--prompt", "x"]).expect("long forms parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Run { n: 2, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn fleet_run_requires_workers_and_prompt() {
+        let err = parse(&["fleet", "run", "-p", "x"]).expect_err("missing -n rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = parse(&["fleet", "run", "-n", "2"]).expect_err("missing -p rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn fleet_status_and_stop_parse() {
+        let cli = parse(&["fleet", "status"]).expect("fleet status parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Status
+            })
+        ));
+        let cli = parse(&["fleet", "stop"]).expect("fleet stop parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Fleet {
+                cmd: FleetCmd::Stop
+            })
+        ));
     }
 
     #[test]

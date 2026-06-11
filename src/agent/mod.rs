@@ -9,7 +9,6 @@ pub mod prompts;
 pub mod session;
 pub mod subagent;
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,10 +16,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
+use crate::dispatch::Dispatcher;
+use crate::hooks::{HookEngine, PromptSubmit};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
@@ -45,6 +46,33 @@ pub enum DoneReason {
     CircuitBreaker,
 }
 
+/// Verdict on a plan presented via the `exit_plan` tool (plan mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanVerdict {
+    /// True when the plan was approved and execution may proceed.
+    pub approved: bool,
+    /// Reviewer feedback on rejection (empty = a generic rejection).
+    pub feedback: String,
+}
+
+impl PlanVerdict {
+    /// Approve the plan: plan mode ends and the model executes it.
+    pub fn approve() -> Self {
+        Self {
+            approved: true,
+            feedback: String::new(),
+        }
+    }
+
+    /// Reject the plan with `feedback`; plan mode stays on.
+    pub fn reject(feedback: impl Into<String>) -> Self {
+        Self {
+            approved: false,
+            feedback: feedback.into(),
+        }
+    }
+}
+
 /// Events emitted by the agent loop. The TUI renders them; the headless
 /// runner logs them.
 #[derive(Debug)]
@@ -54,13 +82,6 @@ pub enum AgentEvent {
     /// Streaming model reasoning ("thinking") delta. Rendered dimmed by the
     /// TUI; never part of the assistant message or the session history.
     ThinkingDelta(String),
-    /// A tool call is requesting approval via the opt-in y/n gate (only fires
-    /// when `auto_approve = false`). Send `true` on `respond` to run it,
-    /// `false` to deny.
-    ApprovalRequest {
-        call: ToolCall,
-        respond: oneshot::Sender<bool>,
-    },
     /// A tool call is being executed.
     ToolStarted { name: String, args: Value },
     /// A tool call finished.
@@ -69,6 +90,45 @@ pub enum AgentEvent {
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
     Error(String),
+    /// A lifecycle hook did something worth surfacing (rewrote arguments,
+    /// appended context, blocked, or failed). Plain successes are silent.
+    /// Rendered as a dim log line.
+    HookFired {
+        /// Lifecycle event name (e.g. `"pre_tool_use"`).
+        event: &'static str,
+        /// The hook's shell command.
+        command: String,
+        /// What the hook did.
+        outcome: crate::hooks::HookOutcome,
+    },
+    /// Plan mode: the model presented a plan via `exit_plan` and the turn is
+    /// paused awaiting a verdict. The consumer must send exactly one
+    /// [`PlanVerdict`] on `respond` (the TUI renders a review; headless and
+    /// gateway auto-approve). Dropping the sender counts as no verdict and
+    /// keeps plan mode on.
+    PlanReady {
+        /// The plan markdown (also persisted to `.wizard/plan.md`).
+        plan: String,
+        respond: tokio::sync::oneshot::Sender<PlanVerdict>,
+    },
+    /// Token usage of one completed model call, when the backend reported
+    /// counts. Surfaces accumulate these (status bar, headless summary).
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+    /// The todo list was replaced via the `todo` tool. Carries the full new
+    /// list; the TUI mirrors it in a side panel, headless prints a one-line
+    /// summary, the gateway ignores it.
+    TodoUpdated(Vec<crate::tools::todo::TodoItem>),
+    /// A background task (`execute` with `run_in_background`) finished; its
+    /// output tail was injected into history. The TUI and headless surfaces
+    /// print a one-liner, the gateway ignores it.
+    TaskFinished {
+        id: u32,
+        command: String,
+        status: crate::tools::tasks::TaskStatus,
+    },
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -178,18 +238,21 @@ pub(crate) fn normalize_args(args: &Value) -> Value {
 }
 
 /// Send an event, reporting whether the receiver is still listening.
-async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
+pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
     events.send(event).await.is_ok()
 }
 
 /// The tool-calling agent. Owns the conversation history, the model client,
-/// the tool registry, and session persistence.
+/// the tool dispatcher, and session persistence.
 pub struct Agent {
     client: Arc<dyn LlmProvider>,
     /// Active model tag (from `config.active().model`); switched by
     /// [`Agent::set_model`].
     model: String,
-    registry: ToolRegistry,
+    /// Tool-call pipeline; owns the registry and the failure breakers.
+    dispatcher: Dispatcher,
+    /// Lifecycle hooks; the dispatcher and the subagent spawner share it.
+    hooks: Arc<HookEngine>,
     config: Config,
     mode: Mode,
     /// Full conversation including the system prompt at index 0.
@@ -201,7 +264,9 @@ pub struct Agent {
     native_tools: bool,
     /// Skills baked into the system prompt (kept for `/mode` rebuilds).
     skills: Vec<Skill>,
-    /// Project `AGENTS.md` / `WIZARD.md` contents, if present.
+    /// Assembled instruction hierarchy (`WIZARD.md` / `AGENTS.md` /
+    /// `CLAUDE.md` from the project root up, plus `~/.wizard/WIZARD.md` —
+    /// see [`crate::instructions`]), if any file exists.
     agents_md: Option<String>,
     /// Persistent memory index (MEMORY.md) for this project, if any
     /// memories are saved. Re-read on every system prompt refresh so
@@ -209,21 +274,44 @@ pub struct Agent {
     memory_index: Option<String>,
     /// Wall-clock deadline for sovereign runs (`--max-hours`).
     deadline: Option<Instant>,
-    /// Circuit breaker state: signature of the last failing tool call and
-    /// how many consecutive times it has failed identically.
-    failure_streak: Option<(String, u32)>,
-    /// Per-tool consecutive-failure counts (args ignored).
-    tool_failures: ToolFailureCounter,
     /// Warning from session resume (corrupt/unreadable file), emitted on
     /// the next turn so the UI can surface it.
     load_warning: Option<String>,
+    /// Plan-mode flag, shared with the dispatcher (read-only gate) and the
+    /// `exit_plan` tool (cleared on approval).
+    plan_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the plan-mode instruction block is currently baked into the
+    /// system prompt; [`Agent::sync_plan_prompt`] refreshes on mismatch.
+    plan_prompt_on: bool,
+    /// Token counters fed from `ChatChunk` eval counts during streaming.
+    usage: crate::usage::UsageTracker,
+    /// Where per-turn usage records are appended
+    /// (`~/.wizard/usage.jsonl`); `None` disables the log.
+    usage_log: Option<PathBuf>,
+    /// Per-file checkpoint store (`.wizard/checkpoints/` in the project).
+    /// Shared with the tool context so the dispatcher and subagents snapshot
+    /// `Edit`-class targets into it; `/rewind` and perpetual rollback
+    /// restore from it.
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
 }
 
-/// Consecutive identical failures that trip the sovereign circuit breaker.
-const CIRCUIT_BREAKER_LIMIT: u32 = 3;
+/// One row of the `/rewind` picker: a turn, the prompt that started it, and
+/// the files its tool calls snapshotted.
+#[derive(Debug, Clone)]
+pub struct RewindCandidate {
+    pub turn: u64,
+    /// First line of the turn's user prompt (empty when unknown).
+    pub prompt: String,
+    /// Files the turn snapshotted before editing.
+    pub files: Vec<PathBuf>,
+}
 
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
+
+/// Fraction of the provider's context window the last prompt may fill before
+/// token-aware compaction kicks in.
+const COMPACT_WINDOW_FRACTION: f64 = 0.8;
 
 /// User-role nudge injected (in memory only) when a completion comes back
 /// with no visible text and no tool calls.
@@ -235,57 +323,13 @@ pub(crate) fn completion_is_empty(content: &str, tool_calls: &[ToolCall]) -> boo
     content.trim().is_empty() && tool_calls.is_empty()
 }
 
-/// Consecutive failures of one tool (any args) before the model is nudged
-/// to change approach.
-const TOOL_FAILURE_NUDGE: u32 = 5;
-/// Consecutive failures of one tool (any args) before the turn ends with
-/// [`DoneReason::CircuitBreaker`].
-const TOOL_FAILURE_TRIP: u32 = 8;
-
-/// What [`ToolFailureCounter::record`] says to do after a tool result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureAction {
-    Continue,
-    /// Inject a system nudge telling the model to stop retrying the tool.
-    Nudge,
-    /// End the turn via the circuit breaker.
-    Trip,
-}
-
-/// Per-tool-name consecutive-failure counter, independent of arguments
-/// (catches models that jitter args to dodge the identical-failure
-/// breaker). A success of a tool resets that tool's count.
-#[derive(Debug, Default)]
-struct ToolFailureCounter {
-    counts: std::collections::HashMap<String, u32>,
-}
-
-impl ToolFailureCounter {
-    /// Record one tool result and return the action it warrants.
-    fn record(&mut self, name: &str, failed: bool) -> FailureAction {
-        if !failed {
-            self.counts.remove(name);
-            return FailureAction::Continue;
-        }
-        let count = self.counts.entry(name.to_string()).or_insert(0);
-        *count += 1;
-        match *count {
-            TOOL_FAILURE_NUDGE => FailureAction::Nudge,
-            count if count >= TOOL_FAILURE_TRIP => FailureAction::Trip,
-            _ => FailureAction::Continue,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.counts.clear();
-    }
-}
-
 impl Agent {
     /// Build an agent: compose the system prompt from `mode`, `skills`, and
     /// any project `AGENTS.md`; seed history from `session` (resumed
     /// sessions replay their persisted messages under a fresh system
-    /// prompt).
+    /// prompt). `hooks` is loaded by the builders (`crate::hooks::load`) and
+    /// injected so tests can supply their own definitions.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Arc<dyn LlmProvider>,
         registry: ToolRegistry,
@@ -294,8 +338,9 @@ impl Agent {
         project_root: PathBuf,
         session: Session,
         native_tools: bool,
+        hooks: Arc<HookEngine>,
     ) -> Result<Self> {
-        let agents_md = read_project_instructions(&project_root);
+        let agents_md = crate::instructions::load(&project_root);
         let memory_index = read_memory_index(&project_root);
         let model = config.active().model;
         let mut load_warning = None;
@@ -313,23 +358,58 @@ impl Agent {
             .filter(|message| message.role != Role::System)
             .collect::<Vec<_>>();
 
+        // Plan mode: one flag shared by the dispatcher (read-only gate) and
+        // the always-registered exit_plan tool (cleared on approval).
+        let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let web = config.web.clone();
+
+        // Checkpoints: per-file snapshots of everything this agent edits.
+        // Old turns are garbage-collected once per session, here.
+        let checkpoints = Arc::new(crate::checkpoint::CheckpointStore::open(
+            &project_root,
+            config.checkpoints.keep_turns,
+        ));
+        match checkpoints.gc() {
+            Ok(dropped) if dropped > 0 => {
+                tracing::debug!("checkpoint gc dropped {dropped} old turn(s)");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("checkpoint gc failed: {err:#}"),
+        }
+
+        let mut registry = registry;
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
+            &plan_mode,
+        ))));
+
         let mut agent = Self {
             client,
             model,
-            registry,
+            dispatcher: Dispatcher::new(
+                registry,
+                config.mode,
+                Arc::clone(&hooks),
+                Arc::clone(&plan_mode),
+            ),
+            hooks,
             mode: config.mode,
             config,
             history: Vec::new(),
             session,
-            ctx: ToolContext::new(project_root),
+            ctx: ToolContext::new(project_root)
+                .with_web(web)
+                .with_checkpoints(Arc::clone(&checkpoints)),
             native_tools,
             skills,
             agents_md,
             memory_index,
             deadline: None,
-            failure_streak: None,
-            tool_failures: ToolFailureCounter::default(),
             load_warning,
+            plan_mode,
+            plan_prompt_on: false,
+            usage: crate::usage::UsageTracker::new(),
+            usage_log: crate::usage::default_log_path(),
+            checkpoints,
         };
         agent
             .history
@@ -344,10 +424,11 @@ impl Agent {
     }
 
     /// Switch mode mid-session (`/mode`): swaps the system prompt and
-    /// approval behavior for subsequent turns.
+    /// circuit-breaker behavior for subsequent turns.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.config.mode = mode;
+        self.dispatcher.set_mode(mode);
         self.refresh_system_prompt();
     }
 
@@ -361,6 +442,73 @@ impl Agent {
         &self.session
     }
 
+    /// The per-file checkpoint store (snapshots powering `/rewind` and
+    /// perpetual rollback).
+    pub fn checkpoints(&self) -> &Arc<crate::checkpoint::CheckpointStore> {
+        &self.checkpoints
+    }
+
+    /// Recent turns `/rewind` can return to, newest first: this session's
+    /// turn markers (prompt snippets) joined with the checkpoint store's
+    /// per-turn file lists. Turns from before this session are listed only
+    /// when the session has no markers at all (old-format resume), since
+    /// only marked turns can also truncate the conversation.
+    pub fn rewind_candidates(&self, limit: usize) -> Vec<RewindCandidate> {
+        let markers = self.session.turn_markers().unwrap_or_default();
+        let first_marked = markers.first().map(|marker| marker.turn);
+        let mut by_turn: std::collections::BTreeMap<u64, RewindCandidate> = markers
+            .into_iter()
+            .map(|marker| {
+                (
+                    marker.turn,
+                    RewindCandidate {
+                        turn: marker.turn,
+                        prompt: marker.prompt,
+                        files: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        for turn_files in self.checkpoints.recent_turns(usize::MAX) {
+            if first_marked.is_some_and(|first| turn_files.turn < first) {
+                continue;
+            }
+            by_turn
+                .entry(turn_files.turn)
+                .or_insert_with(|| RewindCandidate {
+                    turn: turn_files.turn,
+                    prompt: String::new(),
+                    files: Vec::new(),
+                })
+                .files = turn_files.files;
+        }
+        by_turn.into_values().rev().take(limit).collect()
+    }
+
+    /// `/rewind`: restore every file snapshot from `turn` onward, drop the
+    /// rewound turns from the session file, and reload the in-memory
+    /// conversation to match. Returns the restored file paths.
+    pub fn rewind_to(&mut self, turn: u64) -> Result<Vec<PathBuf>> {
+        let restored = self
+            .checkpoints
+            .restore_turns_from(turn)
+            .context("restoring checkpoints")?;
+        self.session
+            .truncate_after(turn)
+            .context("truncating session history")?;
+        let prior: Vec<ChatMessage> = self
+            .session
+            .load_messages()
+            .context("reloading session history")?
+            .into_iter()
+            .filter(|message| message.role != Role::System)
+            .collect();
+        self.history.truncate(1);
+        self.history.extend(prior);
+        self.dispatcher.reset_failures();
+        Ok(restored)
+    }
+
     /// Set (or clear) the wall-clock deadline for this run (`--max-hours`).
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
@@ -370,17 +518,91 @@ impl Agent {
     /// session file.
     pub fn clear(&mut self) -> Result<()> {
         self.session = Session::create(&Config::sessions_dir()?)?;
+        self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
-        self.failure_streak = None;
-        self.tool_failures.reset();
+        self.dispatcher.reset_failures();
         Ok(())
     }
 
-    /// Swap the tool registry (after `/reload` or `/evolve`). Refreshes the
-    /// system prompt so the JSON tool protocol's tool list stays current.
-    pub fn set_registry(&mut self, registry: ToolRegistry) {
-        self.registry = registry;
+    /// The lifecycle-hook engine this agent fires (shared for `/reload`
+    /// registry rebuilds).
+    pub fn hooks(&self) -> &Arc<HookEngine> {
+        &self.hooks
+    }
+
+    /// Fire the `session_start` hooks. Hook stdout is appended to the
+    /// session as system context, visible to the model on every turn.
+    pub async fn fire_session_start(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        if let Some(extra) = self.hooks.session_start(self.mode, Some(events)).await {
+            self.push(ChatMessage::system(format!(
+                "[session_start hook]\n{extra}"
+            )));
+        }
+    }
+
+    /// Fire the `session_end` hooks. `events` is `None` when the surface is
+    /// already torn down (e.g. the TUI terminal was restored).
+    pub async fn fire_session_end(&self, events: Option<&mpsc::Sender<AgentEvent>>) {
+        self.hooks.session_end(self.mode, events).await;
+    }
+
+    /// Swap the tool registry (after `/reload` or `/evolve`). Re-registers
+    /// the always-present `exit_plan` tool (sharing this agent's plan-mode
+    /// flag) and refreshes the system prompt so the JSON tool protocol's
+    /// tool list stays current.
+    pub fn set_registry(&mut self, mut registry: ToolRegistry) {
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
+            &self.plan_mode,
+        ))));
+        self.dispatcher.set_registry(registry);
         self.refresh_system_prompt();
+    }
+
+    /// Session token counters (prompt/completion totals, last prompt size).
+    pub fn usage(&self) -> &crate::usage::UsageTracker {
+        &self.usage
+    }
+
+    /// Number of background tasks (`execute` with `run_in_background`)
+    /// still running, for `/status`.
+    pub fn running_tasks(&self) -> usize {
+        self.ctx
+            .tasks
+            .list()
+            .iter()
+            .filter(|task| !task.status.is_finished())
+            .count()
+    }
+
+    /// Redirect (or disable) the per-turn usage JSONL log. Defaults to
+    /// `~/.wizard/usage.jsonl`; tests point it into a temp dir.
+    pub fn set_usage_log(&mut self, path: Option<PathBuf>) {
+        self.usage_log = path;
+    }
+
+    /// Whether plan mode is active.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Turn plan mode on or off (`/plan`, `--plan`, `plan_each_cycle`).
+    /// While on, the dispatcher blocks every non-read-only tool except
+    /// `exit_plan`, and the system prompt instructs the model to plan.
+    pub fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+        self.sync_plan_prompt();
+    }
+
+    /// Re-compose the system prompt when the plan-mode flag changed since it
+    /// was last baked in. The flag can flip mid-turn (exit_plan approval
+    /// clears it), so the turn loop calls this before every completion.
+    fn sync_plan_prompt(&mut self) {
+        let on = self.plan_mode();
+        if on != self.plan_prompt_on {
+            self.plan_prompt_on = on;
+            self.refresh_system_prompt();
+        }
     }
 
     /// Switch models mid-session (`/model`) without resetting conversation
@@ -410,7 +632,22 @@ impl Agent {
         );
         if !self.native_tools {
             prompt.push_str("\n\n");
-            prompt.push_str(&prompts::render_tool_protocol(&self.registry.specs()));
+            prompt.push_str(&prompts::render_tool_protocol(
+                &self.dispatcher.registry().specs(),
+            ));
+        }
+        if self
+            .dispatcher
+            .registry()
+            .get(crate::tools::todo::TODO_TOOL_NAME)
+            .is_some()
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(prompts::TODO_PROMPT);
+        }
+        if self.plan_mode() {
+            prompt.push_str("\n\n");
+            prompt.push_str(prompts::PLAN_MODE_PROMPT);
         }
         prompt
     }
@@ -435,11 +672,6 @@ impl Agent {
         self.history.push(message);
     }
 
-    /// Whether gated tools run without asking the user.
-    fn auto_approve(&self) -> bool {
-        self.mode == Mode::Sovereign || self.config.auto_approve
-    }
-
     /// Run one user turn: append `input`, then loop
     /// (stream completion → emit deltas → execute tool calls → feed results
     /// back) until the model stops calling tools or `max_steps` is reached.
@@ -453,7 +685,8 @@ impl Agent {
         if let Some(warning) = self.load_warning.take() {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
-        match self.turn_inner(input, &events).await {
+        self.usage.begin_turn();
+        let result = match self.turn_inner(input, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
                 Ok(reason)
@@ -469,6 +702,35 @@ impl Agent {
                 .await;
                 Err(err)
             }
+        };
+        // turn_end hooks: observational, fired however the turn ended.
+        self.hooks.turn_end(self.mode, Some(&events)).await;
+        self.record_turn_usage();
+        result
+    }
+
+    /// Append this turn's token usage to the JSONL log (when the backend
+    /// reported counts and the log is enabled). Best-effort: failures are
+    /// logged, never surfaced.
+    fn record_turn_usage(&self) {
+        let (prompt_tokens, completion_tokens) = self.usage.turn_totals();
+        if prompt_tokens == 0 && completion_tokens == 0 {
+            return;
+        }
+        let Some(path) = &self.usage_log else {
+            return;
+        };
+        let record = crate::usage::UsageRecord {
+            ts: crate::usage::unix_now(),
+            project: self.ctx.cwd.display().to_string(),
+            model: self.model.clone(),
+            provider: self.config.active().name,
+            prompt_tokens,
+            completion_tokens,
+            mode: self.mode.to_string(),
+        };
+        if let Err(err) = crate::usage::append(path, &record) {
+            tracing::warn!("could not append usage record: {err:#}");
         }
     }
 
@@ -477,11 +739,39 @@ impl Agent {
         input: &str,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
+        // user_prompt_submit hooks: may veto the turn before the model sees
+        // the prompt (the message is never pushed to history), or append
+        // extra context to it.
+        let input = match self.hooks.user_prompt_submit(self.mode, Some(events)).await {
+            PromptSubmit::Block(reason) => {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!(
+                        "prompt blocked by user_prompt_submit hook: {reason}"
+                    )),
+                )
+                .await;
+                return Ok(DoneReason::Stopped);
+            }
+            PromptSubmit::Continue(Some(extra)) => {
+                format!("{input}\n\n[user_prompt_submit hook]\n{extra}")
+            }
+            PromptSubmit::Continue(None) => input.to_string(),
+        };
+        // Turn boundary: a fresh checkpoint turn for the dispatcher's
+        // snapshots, anchored in the session file so /rewind can truncate
+        // here. Best-effort — a marker failure never blocks the turn.
+        let turn = self.checkpoints.begin_turn();
+        if let Err(err) = self.session.append_marker(turn, &input) {
+            tracing::warn!("could not append turn marker: {err}");
+        }
         self.push(ChatMessage::user(input));
         self.compact_if_needed(events).await;
         let max_steps = self.config.max_steps.max(1);
 
         for step in 1..=max_steps {
+            // Surface background tasks that finished since the last step.
+            self.drain_background_tasks(events).await;
             if let Some(deadline) = self.deadline
                 && Instant::now() >= deadline
             {
@@ -492,6 +782,9 @@ impl Agent {
             {
                 return Ok(reason);
             }
+            // Plan mode can flip mid-turn (exit_plan approval): keep the
+            // system prompt's plan-mode block in step with the flag.
+            self.sync_plan_prompt();
 
             let (mut content, mut tool_calls) = self.stream_completion_with_retry(events).await?;
 
@@ -538,11 +831,18 @@ impl Agent {
             }
 
             for call in &tool_calls {
-                match self.dispatch_call(call, events).await? {
+                match self.dispatch_call(call, events).await {
                     None => {}
                     Some(reason) => return Ok(reason),
                 }
             }
+
+            // Compact between steps too, so a long tool loop cannot outgrow
+            // the context window mid-turn. The compactor always keeps the
+            // most recent messages verbatim, so the in-flight turn's tail —
+            // the tool calls and results the model is reasoning about —
+            // stays intact.
+            self.compact_if_needed(events).await;
 
             if !emit(events, AgentEvent::StepCompleted { step }).await {
                 return Ok(DoneReason::Stopped);
@@ -562,7 +862,7 @@ impl Agent {
             model: self.model.clone(),
             messages: self.history.clone(),
             tools: if self.native_tools {
-                self.registry.specs()
+                self.dispatcher.registry().specs()
             } else {
                 Vec::new()
             },
@@ -581,6 +881,8 @@ impl Agent {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut prompt_tokens = None;
+        let mut completion_tokens = None;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading chat stream")?;
             if let Some(message) = chunk.message {
@@ -596,9 +898,26 @@ impl Agent {
                 }
                 tool_calls.extend(message.tool_calls);
             }
+            if chunk.prompt_eval_count.is_some() {
+                prompt_tokens = chunk.prompt_eval_count;
+            }
+            if chunk.eval_count.is_some() {
+                completion_tokens = chunk.eval_count;
+            }
             if chunk.done {
                 break;
             }
+        }
+        if prompt_tokens.is_some() || completion_tokens.is_some() {
+            self.usage.record(prompt_tokens, completion_tokens);
+            let _ = emit(
+                events,
+                AgentEvent::Usage {
+                    prompt_tokens: prompt_tokens.unwrap_or(0),
+                    completion_tokens: completion_tokens.unwrap_or(0),
+                },
+            )
+            .await;
         }
         Ok((content, tool_calls))
     }
@@ -649,15 +968,32 @@ impl Agent {
         }
     }
 
-    /// Keep history bounded so the agent can run indefinitely. When the
-    /// serialized history exceeds `compact_threshold_bytes`, summarize the
-    /// middle span (everything between the system prompt and the last
-    /// [`KEEP_RECENT`] messages) into a single progress note. Best-effort:
-    /// a summarization failure falls back to dropping the middle span. Never
-    /// aborts the turn.
-    async fn compact_if_needed(&mut self, events: &mpsc::Sender<AgentEvent>) {
+    /// Whether the history is close enough to overflowing to warrant
+    /// compaction: either the serialized history exceeds the byte threshold,
+    /// or the last model call's reported prompt size exceeds
+    /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window.
+    async fn should_compact(&self) -> bool {
         let total: usize = self.history.iter().map(|msg| msg.content.len()).sum();
-        if total <= self.config.compact_threshold_bytes {
+        if total > self.config.compact_threshold_bytes {
+            return true;
+        }
+        let Some(last_prompt) = self.usage.last_prompt_tokens() else {
+            return false;
+        };
+        let Some(window) = self.client.context_window(&self.model).await else {
+            return false;
+        };
+        last_prompt as f64 > f64::from(window) * COMPACT_WINDOW_FRACTION
+    }
+
+    /// Keep history bounded so the agent can run indefinitely. When
+    /// [`Self::should_compact`] fires (byte threshold, or the last prompt
+    /// nearing the provider's context window), summarize the middle span
+    /// (everything between the system prompt and the last [`KEEP_RECENT`]
+    /// messages) into a single progress note. Best-effort: a summarization
+    /// failure falls back to dropping the middle span. Never aborts the turn.
+    async fn compact_if_needed(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        if !self.should_compact().await {
             return;
         }
         // Need history[0] (system prompt) + a non-empty middle + the recent tail.
@@ -714,6 +1050,9 @@ impl Agent {
                 .await;
             }
         }
+        // The history just shrank: the last reported prompt size is stale
+        // and must not re-trigger compaction on the next step.
+        self.usage.clear_last_prompt();
     }
 
     /// Summarize a transcript blob into a terse progress note via the model.
@@ -725,7 +1064,10 @@ impl Agent {
                 ChatMessage::system(
                     "Summarize the following Wizard agent transcript into a compact progress \
                      note. Preserve: the mission/goal, decisions made, files changed, commands \
-                     run, what worked/failed, and open next steps. Be terse and factual.",
+                     run, what worked/failed, and open next steps. Preserve the current todo \
+                     list state verbatim (every item and its status) if one was maintained, \
+                     and mention the plan file path (.wizard/plan.md) if a plan was written. \
+                     Be terse and factual.",
                 ),
                 ChatMessage::user(blob.to_string()),
             ],
@@ -760,113 +1102,22 @@ impl Agent {
         Ok(summary)
     }
 
-    /// Gate, execute, and feed back one tool call. Returns `Some(reason)`
-    /// when the turn must end early (UI gone, circuit breaker).
+    /// Run one tool call through the dispatcher and feed its results back to
+    /// the model. Returns `Some(reason)` when the turn must end early (UI
+    /// gone, circuit breaker).
     async fn dispatch_call(
         &mut self,
         call: &ToolCall,
         events: &mpsc::Sender<AgentEvent>,
-    ) -> Result<Option<DoneReason>> {
-        let name = call.function.name.clone();
-        let args = normalize_args(&call.function.arguments);
-
-        let needs_approval = self
-            .registry
-            .get(&name)
-            .map(|tool| tool.requires_approval())
-            .unwrap_or(false);
-
-        let approved = if needs_approval && !self.auto_approve() {
-            let (respond, response) = oneshot::channel();
-            if !emit(
-                events,
-                AgentEvent::ApprovalRequest {
-                    call: call.clone(),
-                    respond,
-                },
-            )
-            .await
-            {
-                return Ok(Some(DoneReason::Stopped));
-            }
-            match response.await {
-                Ok(approved) => approved,
-                // Sender dropped without answering: the UI is tearing down,
-                // so end the turn instead of feeding the model a denial.
-                Err(_) => return Ok(Some(DoneReason::Stopped)),
-            }
-        } else {
-            true
-        };
-
-        let output = if approved {
-            if !emit(
-                events,
-                AgentEvent::ToolStarted {
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-            )
-            .await
-            {
-                return Ok(Some(DoneReason::Stopped));
-            }
-            match self.registry.execute(&name, args.clone(), &self.ctx).await {
-                Ok(output) => output,
-                Err(err) => ToolOutput::error(err.to_string()),
-            }
-        } else {
-            ToolOutput::error(format!(
-                "User denied execution of '{name}'. Do not retry it verbatim; ask or adjust."
-            ))
-        };
-
-        if !emit(
-            events,
-            AgentEvent::ToolFinished {
-                name: name.clone(),
-                output: output.clone(),
-            },
-        )
-        .await
-        {
-            return Ok(Some(DoneReason::Stopped));
+    ) -> Option<DoneReason> {
+        let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
+        if let Some(output) = &outcome.output {
+            self.push(self.tool_feedback(&call.function.name, output));
         }
-
-        let breaker_tripped = self.track_failure(&name, &args, &output);
-        let failure_action = self.tool_failures.record(&name, output.is_error);
-        self.push(self.tool_feedback(&name, &output));
-
-        if breaker_tripped {
-            let _ = emit(
-                events,
-                AgentEvent::Error(format!(
-                    "circuit breaker: '{name}' failed identically {CIRCUIT_BREAKER_LIMIT} times in a row"
-                )),
-            )
-            .await;
-            return Ok(Some(DoneReason::CircuitBreaker));
+        if let Some(nudge) = outcome.nudge {
+            self.push(ChatMessage::system(nudge));
         }
-        match failure_action {
-            FailureAction::Continue => {}
-            FailureAction::Nudge => {
-                self.push(ChatMessage::system(format!(
-                    "Repeated failures with tool '{name}' ({TOOL_FAILURE_NUDGE} in a row) — \
-                     stop retrying it and change approach."
-                )));
-            }
-            FailureAction::Trip => {
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!(
-                        "circuit breaker: '{name}' failed {TOOL_FAILURE_TRIP} times in a row"
-                    )),
-                )
-                .await;
-                return Ok(Some(DoneReason::CircuitBreaker));
-            }
-        }
-        Ok(None)
+        outcome.done
     }
 
     /// Build the message that feeds a tool result back to the model.
@@ -881,25 +1132,6 @@ impl Agent {
         } else {
             ChatMessage::user(format!("Tool result for `{name}`:\n{body}"))
         }
-    }
-
-    /// Update circuit-breaker state (sovereign only). Returns true when the
-    /// breaker trips.
-    fn track_failure(&mut self, name: &str, args: &Value, output: &ToolOutput) -> bool {
-        if self.mode != Mode::Sovereign {
-            return false;
-        }
-        if !output.is_error {
-            self.failure_streak = None;
-            return false;
-        }
-        let signature = format!("{name}\u{1}{args}\u{1}{}", output.content);
-        let count = match &self.failure_streak {
-            Some((last, count)) if *last == signature => count + 1,
-            _ => 1,
-        };
-        self.failure_streak = Some((signature, count));
-        count >= CIRCUIT_BREAKER_LIMIT
     }
 
     /// Honor `.wizard/loop-control` between steps: `stop` ends the turn,
@@ -927,21 +1159,45 @@ impl Agent {
             }
         }
     }
-}
 
-/// Read project-level instructions: `AGENTS.md`, falling back to
-/// `WIZARD.md`.
-fn read_project_instructions(project_root: &Path) -> Option<String> {
-    for name in ["AGENTS.md", "WIZARD.md"] {
-        let path = project_root.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(contents) if !contents.trim().is_empty() => return Some(contents),
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!("could not read {}: {err}", path.display()),
+    /// Drain background tasks that finished since the last check (each
+    /// reported exactly once): inject a notification with the output tail
+    /// into history so the model sees it on its next completion, and emit
+    /// [`AgentEvent::TaskFinished`] for the surfaces. Called at the top of
+    /// every agent step and every perpetual cycle.
+    async fn drain_background_tasks(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        for task in self.ctx.tasks.drain_completed() {
+            let mut note = format!(
+                "[background task #{} finished ({})] {}",
+                task.id,
+                task.status.describe(),
+                task.command
+            );
+            let tail = task.tail.trim();
+            if !tail.is_empty() {
+                note.push('\n');
+                note.push_str(tail);
+            }
+            self.push(ChatMessage::system(note));
+            let _ = emit(
+                events,
+                AgentEvent::TaskFinished {
+                    id: task.id,
+                    command: task.command,
+                    status: task.status,
+                },
+            )
+            .await;
         }
     }
-    None
+}
+
+impl Drop for Agent {
+    /// Kill any still-running background tasks. Their children also carry
+    /// `kill_on_drop`; this makes the teardown explicit and immediate.
+    fn drop(&mut self) {
+        self.ctx.tasks.kill_all();
+    }
 }
 
 /// Read the persistent memory index (MEMORY.md) for `project_root`, if any
@@ -1010,6 +1266,25 @@ pub async fn build_headless_agent(
         println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
     }
 
+    // Session first: the hook engine carries its id in every payload.
+    let sessions_dir = Config::sessions_dir()?;
+    let session = if resume {
+        match Session::open_latest(&sessions_dir)? {
+            Some(session) => session,
+            None => Session::create(&sessions_dir)?,
+        }
+    } else {
+        Session::create(&sessions_dir)?
+    };
+
+    // Lifecycle hooks, shared by the agent's dispatcher and the subagent
+    // spawner so subagent tool calls fire the same hooks.
+    let hooks = Arc::new(HookEngine::new(
+        crate::hooks::load(project_root),
+        project_root.to_path_buf(),
+        session.id.clone(),
+    ));
+
     // Tools: natives + scripted + MCP, then the subagent spawner on top.
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
@@ -1045,6 +1320,7 @@ pub async fn build_headless_agent(
         subagent_configs,
         Arc::clone(&client),
         Arc::clone(&base),
+        Arc::clone(&hooks),
     )));
     registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
         config.clone(),
@@ -1060,16 +1336,6 @@ pub async fn build_headless_agent(
         Vec::new()
     });
 
-    let sessions_dir = Config::sessions_dir()?;
-    let session = if resume {
-        match Session::open_latest(&sessions_dir)? {
-            Some(session) => session,
-            None => Session::create(&sessions_dir)?,
-        }
-    } else {
-        Session::create(&sessions_dir)?
-    };
-
     Agent::new(
         client,
         registry,
@@ -1078,7 +1344,49 @@ pub async fn build_headless_agent(
         project_root.to_path_buf(),
         session,
         native_tools,
+        hooks,
     )
+}
+
+/// `rollback_failed_cycles`: restore every checkpoint from the failed
+/// cycle's first turn onward and note the rollback in the persisted mission.
+/// Best-effort — failures are logged and the run proceeds to its normal end.
+fn rollback_failed_cycle(
+    config: &Config,
+    agent: &Agent,
+    mission: Option<&mut mission::Mission>,
+    project_root: &Path,
+    first_turn: u64,
+    why: &str,
+    // `None` in the structured output formats, where stdout is JSON-only.
+    spinner: Option<&crate::progress::TurnSpinner>,
+) {
+    if !config.rollback_failed_cycles {
+        return;
+    }
+    match agent.checkpoints().restore_turns_from(first_turn) {
+        Ok(restored) => {
+            if restored.is_empty() {
+                return;
+            }
+            if let Some(spinner) = spinner {
+                spinner.println(&format!(
+                    "[rolled back {} file(s) after {why}]",
+                    restored.len()
+                ));
+            }
+            if let Some(mission) = mission {
+                mission.note(format!(
+                    "rolled back {} file(s) after {why} (cycle starting at turn {first_turn})",
+                    restored.len()
+                ));
+                if let Err(err) = mission.save(project_root) {
+                    tracing::warn!("could not record rollback in mission.toml: {err:#}");
+                }
+            }
+        }
+        Err(err) => tracing::warn!("cycle rollback failed: {err:#}"),
+    }
 }
 
 /// Sovereign-mode headless runner: builds an [`Agent`] and drives it in an
@@ -1089,8 +1397,10 @@ pub async fn build_headless_agent(
 /// outages, compacting context, and re-exec'ing itself after a self-evolve —
 /// until stopped via `.wizard/loop-control`, `--max-hours`, or the circuit
 /// breaker. Otherwise it honors the `--loop N` bound. Prints progress to
-/// stdout instead of the TUI.
-pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
+/// stdout instead of the TUI (`--output-format` selects the
+/// [`crate::output::EventSink`]); the returned exit code encodes the
+/// outcome (see [`crate::output::exit_code`]).
+pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
     let project_root = std::env::current_dir().context("determining project root")?;
 
     // Goal resolution: an explicit `-p` wins; otherwise resume the standing
@@ -1105,6 +1415,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             "headless mode needs a task: pass -p \"<task>\""
         ));
     };
+    // The same preprocessing the TUI applies on submit: custom `/command`
+    // expansion and `@file` references.
+    let custom_commands = crate::commands::load(&project_root);
+    let goal = crate::commands::preprocess(&goal, &custom_commands, &project_root);
 
     let active = config.active();
     let model = active.model.clone();
@@ -1115,62 +1429,50 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         cli.max_hours
             .map(|hours| Instant::now() + Duration::from_secs_f64(hours * 3600.0)),
     );
+    // `--plan` / `plan_first = true`: the first turn starts in plan mode.
+    // The model investigates read-only, presents a plan via exit_plan, the
+    // printer below auto-approves it, and the same turn proceeds to execute
+    // — a natural two-phase turn with no human in the loop.
+    if config.plan_first {
+        agent.set_plan_mode(true);
+    }
 
     // Busy spinner ("Conjuring…") shown while the model thinks or a tool
-    // runs, hidden while output streams. Shared with the printer task; a
-    // no-op when stderr is not a terminal.
+    // runs, hidden while output streams. Shared with the text sink; a
+    // no-op when stderr is not a terminal. The structured formats never
+    // show it and keep stdout pure JSON (`text_mode` gates every plain
+    // stdout line below).
     let spinner = Arc::new(crate::progress::TurnSpinner::new());
+    let text_mode = cli.output_format == crate::output::OutputFormat::Text;
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-    let printer_spinner = Arc::clone(&spinner);
+    // The sink consumes every agent event off the run loop; it is returned
+    // so `finish` can emit the run summary once the outcome is known.
+    let mut sink: Box<dyn crate::output::EventSink> = match cli.output_format {
+        crate::output::OutputFormat::Text => {
+            Box::new(crate::output::TextSink::new(Arc::clone(&spinner)))
+        }
+        crate::output::OutputFormat::Json => Box::new(crate::output::JsonSink::stdout()),
+        crate::output::OutputFormat::StreamJson => {
+            Box::new(crate::output::StreamJsonSink::stdout())
+        }
+    };
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            match event {
-                AgentEvent::TextDelta(delta) => {
-                    printer_spinner.hide();
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                }
-                AgentEvent::ThinkingDelta(delta) => {
-                    // ANSI faint so reasoning reads as background noise.
-                    printer_spinner.hide();
-                    print!("\x1b[2m{delta}\x1b[0m");
-                    let _ = std::io::stdout().flush();
-                }
-                AgentEvent::ApprovalRequest { respond, .. } => {
-                    // Both modes auto-approve by default; this is a safety net for the opt-in gating path.
-                    let _ = respond.send(true);
-                }
-                AgentEvent::ToolStarted { name, args } => {
-                    printer_spinner.println(&format!("\n→ {name} {args}"));
-                    // The tool may run for a while: keep the verb spinning.
-                    printer_spinner.show();
-                }
-                AgentEvent::ToolFinished { name, output } => {
-                    let status = if output.is_error { "error" } else { "ok" };
-                    printer_spinner.println(&format!("← {name} [{status}]"));
-                    // Back to the model: it is thinking about the result.
-                    printer_spinner.show();
-                }
-                AgentEvent::StepCompleted { step } => {
-                    tracing::debug!("step {step} completed");
-                }
-                AgentEvent::Error(message) => {
-                    printer_spinner.hide();
-                    eprintln!("\nwizard error: {message}");
-                }
-                AgentEvent::Done { reason } => {
-                    printer_spinner.hide();
-                    println!("\n[turn done: {reason:?}]");
-                }
-            }
+            sink.event(event);
         }
+        sink
     });
 
-    println!(
-        "wizard {} — model {model} @ {endpoint} — task: {goal}",
-        config.mode
-    );
+    if text_mode {
+        println!(
+            "wizard {} — model {model} @ {endpoint} — task: {goal}",
+            config.mode
+        );
+    }
+
+    // session_start hooks fire once for the whole run.
+    agent.fire_session_start(&tx).await;
 
     // Continuous mode persists a long-lived mission so the loop survives
     // restarts and binary self-replacement (deep evolve re-exec).
@@ -1210,22 +1512,38 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             break;
         }
         if config.continuous {
-            spinner.println(&format!("\n=== cycle {iteration} ==="));
-        } else if max_iterations > 1 {
+            if text_mode {
+                spinner.println(&format!("\n=== cycle {iteration} ==="));
+            }
+            // `plan_each_cycle = true`: every cycle starts by planning again
+            // (the previous cycle's exit_plan approval cleared the flag).
+            if config.plan_each_cycle {
+                agent.set_plan_mode(true);
+            }
+        } else if max_iterations > 1 && text_mode {
             spinner.println(&format!("\n=== iteration {iteration}/{max_iterations} ==="));
         }
 
         // Fresh verb per turn (same mechanism as the TUI's busy spinner), so
-        // one turn reads as one activity.
-        let verb_seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
-            .wrapping_add(u64::from(iteration));
-        spinner.set_verb(config.ui.spinner_verb(verb_seed));
-        spinner.show();
+        // one turn reads as one activity. Structured formats never spin.
+        if text_mode {
+            let verb_seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos() as u64)
+                .wrapping_add(u64::from(iteration));
+            spinner.set_verb(config.ui.spinner_verb(verb_seed));
+            spinner.show();
+        }
+
+        // Surface background tasks that finished between cycles (the turn
+        // loop also drains at the top of every step).
+        agent.drain_background_tasks(&tx).await;
 
         let turn_started = Instant::now();
         let turn_prompt = input.clone();
+        // First checkpoint turn of this cycle, for rollback_failed_cycles
+        // (run_turn assigns the next id via begin_turn).
+        let cycle_first_turn = agent.checkpoints().current_turn() + 1;
         match agent.run_turn(&input, tx.clone()).await {
             Ok(reason) => {
                 final_reason = reason;
@@ -1275,12 +1593,33 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                             break;
                         }
                     }
-                    DoneReason::Stopped | DoneReason::TimeLimit | DoneReason::CircuitBreaker => {
+                    DoneReason::Stopped | DoneReason::TimeLimit => {
+                        break;
+                    }
+                    DoneReason::CircuitBreaker => {
+                        rollback_failed_cycle(
+                            &config,
+                            &agent,
+                            mission_state.as_mut(),
+                            &project_root,
+                            cycle_first_turn,
+                            "circuit breaker",
+                            text_mode.then_some(&*spinner),
+                        );
                         break;
                     }
                 }
             }
             Err(err) => {
+                rollback_failed_cycle(
+                    &config,
+                    &agent,
+                    mission_state.as_mut(),
+                    &project_root,
+                    cycle_first_turn,
+                    "hard error",
+                    text_mode.then_some(&*spinner),
+                );
                 run_error = Some(err);
                 break;
             }
@@ -1309,14 +1648,23 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
         }
     }
 
+    // session_end hooks fire however the run ended (including just before a
+    // self-evolve re-exec replaces the process).
+    agent.fire_session_end(Some(&tx)).await;
+
     drop(tx);
-    let _ = printer.await;
+    let mut sink = match printer.await {
+        Ok(sink) => sink,
+        Err(err) => return Err(anyhow::anyhow!("output task panicked: {err}")),
+    };
     spinner.finish();
 
     if reexec_after {
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().context("locating current executable for re-exec")?;
-        println!("[re-exec into evolved binary {}]", exe.display());
+        if text_mode {
+            println!("[re-exec into evolved binary {}]", exe.display());
+        }
         let err = std::process::Command::new(exe)
             .arg("--mode")
             .arg("sovereign")
@@ -1330,8 +1678,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     if let Some(err) = run_error {
         return Err(err);
     }
-    println!("[run finished: {final_reason:?}]");
-    Ok(())
+    // The sink emits the run summary (the text trailer line, or the final
+    // JSON object / `done` JSONL line) and leaves stdout flushed.
+    sink.finish(final_reason);
+    Ok(crate::output::exit_code(final_reason))
 }
 
 #[cfg(test)]
@@ -1342,6 +1692,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::hooks::{HookDef, HookEvent};
     use crate::llm::{ChatChunk, ChatStream};
 
     /// Temp project dir removed on drop.
@@ -1367,6 +1718,8 @@ mod tests {
     struct ScriptedProvider {
         responses: Mutex<VecDeque<Vec<ChatChunk>>>,
         requests: Mutex<Vec<ChatRequest>>,
+        /// Reported context window (None = unknown, like a local model).
+        context_window: Option<u32>,
     }
 
     impl ScriptedProvider {
@@ -1374,6 +1727,15 @@ mod tests {
             Arc::new(Self {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
+                context_window: None,
+            })
+        }
+
+        fn with_context_window(responses: Vec<Vec<ChatChunk>>, window: u32) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+                context_window: Some(window),
             })
         }
     }
@@ -1405,6 +1767,10 @@ mod tests {
             )))
         }
 
+        async fn context_window(&self, _model: &str) -> Option<u32> {
+            self.context_window
+        }
+
         fn label(&self) -> String {
             "scripted:test".to_string()
         }
@@ -1423,21 +1789,61 @@ mod tests {
         }
     }
 
+    /// `done: true` chunk carrying token counts alongside `content`.
+    fn usage_chunk(content: &str, prompt_tokens: u64, completion_tokens: u64) -> ChatChunk {
+        ChatChunk {
+            eval_count: Some(completion_tokens),
+            prompt_eval_count: Some(prompt_tokens),
+            ..final_chunk(content)
+        }
+    }
+
     fn test_agent(responses: Vec<Vec<ChatChunk>>) -> (Agent, Arc<ScriptedProvider>, TempDir) {
         let tmp = TempDir::new();
+        let (agent, provider) = test_agent_in(&tmp, responses, Vec::new(), ToolRegistry::new());
+        (agent, provider, tmp)
+    }
+
+    /// Build a test agent rooted in `tmp` with injected hook definitions and
+    /// a custom registry.
+    fn test_agent_in(
+        tmp: &TempDir,
+        responses: Vec<Vec<ChatChunk>>,
+        hook_defs: Vec<HookDef>,
+        registry: ToolRegistry,
+    ) -> (Agent, Arc<ScriptedProvider>) {
         let provider = ScriptedProvider::new(responses);
+        let agent = test_agent_with(tmp, Arc::clone(&provider), hook_defs, registry);
+        (agent, provider)
+    }
+
+    /// Build a test agent around an existing provider. The usage log is
+    /// redirected into the temp dir so tests never touch ~/.wizard.
+    fn test_agent_with(
+        tmp: &TempDir,
+        provider: Arc<ScriptedProvider>,
+        hook_defs: Vec<HookDef>,
+        registry: ToolRegistry,
+    ) -> Agent {
         let session = Session::create(&tmp.0).expect("create session");
-        let agent = Agent::new(
-            provider.clone(),
-            ToolRegistry::new(),
+        let hooks = Arc::new(HookEngine::new(
+            hook_defs,
+            tmp.0.clone(),
+            session.id.clone(),
+        ));
+        let mut agent = Agent::new(
+            provider,
+            registry,
             Config::default(),
             Vec::new(),
             tmp.0.clone(),
             session,
             true,
+            hooks,
         )
         .expect("build agent");
-        (agent, provider, tmp)
+        agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+        agent
     }
 
     /// Drain a finished turn's events into (text, errors).
@@ -1452,6 +1858,84 @@ mod tests {
             }
         }
         (text, errors)
+    }
+
+    /// Test tool that records the arguments of every call it receives.
+    struct RecordingTool {
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Echo the arguments back (test tool)."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            self.calls.lock().unwrap().push(args.clone());
+            Ok(ToolOutput::ok(format!("echoed {args}")))
+        }
+    }
+
+    /// Registry holding one [`RecordingTool`], plus the shared call log.
+    fn recording_registry() -> (ToolRegistry, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RecordingTool {
+            calls: Arc::clone(&calls),
+        }));
+        (registry, calls)
+    }
+
+    /// `done: true` chunk carrying one tool call.
+    fn tool_call_chunk(name: &str, arguments: Value) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                    },
+                }],
+                tool_name: None,
+            }),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// Write a hook script into `dir` and return the command that runs it
+    /// (via `sh`, so no exec bit is needed).
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write hook script");
+        format!("sh {}", path.display())
+    }
+
+    fn hook(event: HookEvent, matcher: Option<&str>, command: String) -> HookDef {
+        HookDef {
+            event,
+            matcher: matcher.map(str::to_string),
+            command,
+            timeout_secs: None,
+        }
     }
 
     #[test]
@@ -1637,66 +2121,1097 @@ mod tests {
         assert_eq!(read_loop_control(&tmp.0), None);
     }
 
-    #[test]
-    fn tool_failures_nudge_then_trip() {
-        let mut counter = ToolFailureCounter::default();
-        for i in 1..TOOL_FAILURE_NUDGE {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
-            );
-        }
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
-        for i in TOOL_FAILURE_NUDGE + 1..TOOL_FAILURE_TRIP {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
-            );
-        }
-        assert_eq!(counter.record("execute", true), FailureAction::Trip);
+    #[tokio::test]
+    async fn pre_tool_use_block_feeds_reason_to_model_as_tool_error() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "block.sh",
+            "echo 'no echoing allowed' >&2\nexit 2\n",
+        );
+        let (registry, calls) = recording_registry();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![final_chunk("understood")],
+            ],
+            vec![hook(HookEvent::PreToolUse, Some("echo"), command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert!(calls.lock().unwrap().is_empty(), "blocked tool never ran");
+
+        // The block reason reached the model as an ordinary tool error.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let feedback = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message");
+        assert!(
+            feedback.content.contains("blocked by pre_tool_use hook"),
+            "{}",
+            feedback.content
+        );
+        assert!(feedback.content.contains("no echoing allowed"));
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_updated_args_rewrite_the_call() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "rewrite.sh",
+            "echo '{\"updated_args\": {\"text\": \"rewritten\"}}'\n",
+        );
+        let (registry, calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "original" }))],
+                vec![final_chunk("done")],
+            ],
+            vec![hook(HookEvent::PreToolUse, None, command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![json!({ "text": "rewritten" })],
+            "the tool ran with the hook's arguments"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_stdout_is_appended_to_the_result() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "annotate.sh", "echo 'lint: all clean'\n");
+        let (registry, calls) = recording_registry();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![final_chunk("done")],
+            ],
+            vec![hook(HookEvent::PostToolUse, Some("echo"), command)],
+            registry,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(calls.lock().unwrap().len(), 1, "the tool ran normally");
+
+        let requests = provider.requests.lock().unwrap();
+        let feedback = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message");
+        assert!(feedback.content.contains("echoed"), "{}", feedback.content);
+        assert!(
+            feedback.content.contains("lint: all clean"),
+            "hook stdout appended: {}",
+            feedback.content
+        );
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_block_ends_the_turn() {
+        let tmp = TempDir::new();
+        let command = write_script(
+            &tmp.0,
+            "veto.sh",
+            "echo 'not during business hours' >&2\nexit 2\n",
+        );
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            Vec::new(), // the model must never be asked
+            vec![hook(HookEvent::UserPromptSubmit, None, command)],
+            ToolRegistry::new(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("do the thing", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Stopped);
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(agent.history().len(), 1, "the prompt never entered history");
+
+        let (_text, errors) = drain_events(&mut rx);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("blocked") && e.contains("not during business hours")),
+            "notice emitted: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_stdout_is_appended_to_the_message() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "context.sh", "echo 'remember: deploy is frozen'\n");
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![vec![final_chunk("noted")]],
+            vec![hook(HookEvent::UserPromptSubmit, None, command)],
+            ToolRegistry::new(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("do the thing", tx).await.expect("turn ok");
+
+        let requests = provider.requests.lock().unwrap();
+        let prompt = requests[0].messages.last().expect("user message");
+        assert_eq!(prompt.role, Role::User);
+        assert!(
+            prompt.content.contains("do the thing"),
+            "{}",
+            prompt.content
+        );
+        assert!(
+            prompt.content.contains("remember: deploy is frozen"),
+            "hook context appended: {}",
+            prompt.content
+        );
+    }
+
+    /// Run a turn while a reviewer task answers every [`AgentEvent::PlanReady`]
+    /// with `verdict`. Returns (done reason, plans that were presented).
+    async fn run_turn_with_reviewer(
+        agent: &mut Agent,
+        input: &str,
+        verdict: PlanVerdict,
+    ) -> (DoneReason, Vec<String>) {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let reviewer = async move {
+            let mut plans = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let AgentEvent::PlanReady { plan, respond } = event {
+                    plans.push(plan);
+                    respond.send(verdict.clone()).expect("verdict delivered");
+                }
+            }
+            plans
+        };
+        let (reason, plans) = tokio::join!(agent.run_turn(input, tx), reviewer);
+        (reason.expect("turn ok"), plans)
+    }
+
+    /// Last tool-result message of request `index`, as fed to the model.
+    fn tool_feedback_of(provider: &ScriptedProvider, index: usize) -> String {
+        let requests = provider.requests.lock().unwrap();
+        requests[index]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback message")
+            .content
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_non_read_only_tools_but_the_turn_continues() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "a.txt", "content": "x" }),
+                )],
+                vec![final_chunk("understood, planning instead")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert!(!tmp.0.join("a.txt").exists(), "the write never happened");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("blocked by plan mode"),
+            "block reason fed to the model: {feedback}"
+        );
+        assert!(feedback.contains("exit_plan"), "{feedback}");
+        assert!(agent.plan_mode(), "plan mode stays on");
+
+        // The system prompt carried the plan-mode instructions.
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].messages[0].content.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_read_only_tools() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("notes.txt"), "remember the milk\n").unwrap();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("read_file", json!({ "path": "notes.txt" }))],
+                vec![final_chunk("read it")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("remember the milk"),
+            "read-only tools run normally: {feedback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_are_exempt_from_the_identical_failure_breaker() {
+        // Sovereign's breaker trips after 3 identical failures; a planning
+        // model probing the same write repeatedly must not end the turn.
+        let tmp = TempDir::new();
+        let write = || {
+            vec![tool_call_chunk(
+                "write_file",
+                json!({ "path": "a", "content": "x" }),
+            )]
+        };
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                write(),
+                write(),
+                write(),
+                write(),
+                vec![final_chunk("fine, I will plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_mode(Mode::Sovereign);
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed, "no circuit breaker");
+    }
+
+    #[tokio::test]
+    async fn exit_plan_approval_writes_the_plan_and_clears_plan_mode() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "exit_plan",
+                    json!({ "plan": "# Plan\n1. do x" }),
+                )],
+                vec![final_chunk("executing the plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans, ["# Plan\n1. do x"]);
+        assert!(!agent.plan_mode(), "approval clears plan mode");
+
+        let saved =
+            std::fs::read_to_string(tmp.0.join(".wizard").join("plan.md")).expect("plan persisted");
+        assert_eq!(saved, "# Plan\n1. do x");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("Plan approved"),
+            "the model is told to execute: {feedback}"
+        );
+        // After approval, the system prompt no longer carries the plan block.
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].messages[0].content.contains("PLAN MODE"));
+        assert!(!requests[1].messages[0].content.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_rejection_keeps_plan_mode_and_feeds_back_the_feedback() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("exit_plan", json!({ "plan": "# v1" }))],
+                vec![final_chunk("revising the plan")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::reject("add tests first")).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans.len(), 1);
+        assert!(agent.plan_mode(), "rejection keeps plan mode on");
+
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.starts_with("Error:"), "{feedback}");
+        assert!(feedback.contains("add tests first"), "{feedback}");
+        assert!(
+            feedback.contains("call exit_plan again"),
+            "the model is told to retry: {feedback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_outside_plan_mode_is_an_error() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("exit_plan", json!({ "plan": "# p" }))],
+                vec![final_chunk("ok")],
+            ],
+            Vec::new(),
+            ToolRegistry::new(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.contains("not in plan mode"), "{feedback}");
+        assert!(
+            !tmp.0.join(".wizard").join("plan.md").exists(),
+            "no plan file written"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_two_phase_turn_blocks_then_plans_then_executes() {
+        // The --plan shape: write blocked while planning → exit_plan
+        // auto-approved → the same write succeeds in the same turn.
+        let tmp = TempDir::new();
+        let write_args = json!({ "path": "result.txt", "content": "done" });
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("write_file", write_args.clone())],
+                vec![tool_call_chunk(
+                    "exit_plan",
+                    json!({ "plan": "# write result.txt" }),
+                )],
+                vec![tool_call_chunk("write_file", write_args)],
+                vec![final_chunk("all done")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (reason, plans) =
+            run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(plans, ["# write result.txt"]);
+        assert!(!agent.plan_mode());
+
+        // The phases happened in order: blocked, approved, executed.
+        assert!(
+            tool_feedback_of(&provider, 1).contains("blocked by plan mode"),
+            "phase 1: the write is blocked"
+        );
+        assert!(
+            tool_feedback_of(&provider, 2).contains("Plan approved"),
+            "phase 2: the plan is approved"
+        );
+        let executed = tool_feedback_of(&provider, 3);
+        assert!(
+            !executed.contains("blocked") && !executed.starts_with("Error:"),
+            "phase 3: the write succeeds: {executed}"
+        );
+        let written = std::fs::read_to_string(tmp.0.join("result.txt")).expect("file written");
+        assert_eq!(written, "done");
     }
 
     #[test]
-    fn tool_failures_reset_on_success_of_that_tool() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
-            counter.record("execute", true);
+    fn exit_plan_is_always_registered() {
+        let tmp = TempDir::new();
+        let (mut agent, _provider) =
+            test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+        let has_exit_plan = |agent: &Agent| {
+            agent
+                .dispatcher
+                .registry()
+                .get(crate::tools::plan::EXIT_PLAN_TOOL_NAME)
+                .is_some()
+        };
+        assert!(has_exit_plan(&agent), "registered at construction");
+        // A registry swap (/reload, /evolve) re-registers it.
+        agent.set_registry(ToolRegistry::new());
+        assert!(has_exit_plan(&agent), "re-registered after set_registry");
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_an_overwritten_file_and_truncates_history() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("notes.txt");
+        std::fs::write(&file, "before").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "after" }),
+                )],
+                vec![final_chunk("overwritten")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let reason = agent.run_turn("overwrite notes.txt", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after");
+        assert!(agent.history().len() > 1);
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].prompt, "overwrite notes.txt");
+        assert_eq!(candidates[0].files, vec![file.clone()]);
+
+        let restored = agent.rewind_to(candidates[0].turn).unwrap();
+        assert_eq!(restored, vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+        assert_eq!(
+            agent.history().len(),
+            1,
+            "only the system prompt survives a full rewind"
+        );
+        assert!(
+            agent.session().load_messages().unwrap().is_empty(),
+            "the session file was truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_deletes_a_file_the_turn_created() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("created.txt");
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "created.txt", "content": "fresh" }),
+                )],
+                vec![final_chunk("created")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("create created.txt", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fresh");
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 1);
+        agent.rewind_to(candidates[0].turn).unwrap();
+        assert!(!file.exists(), "rewind deletes a file that did not exist");
+    }
+
+    #[tokio::test]
+    async fn rewind_to_a_later_turn_keeps_earlier_turns() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("notes.txt");
+        std::fs::write(&file, "v0").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "v1" }),
+                )],
+                vec![final_chunk("first done")],
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "v2" }),
+                )],
+                vec![final_chunk("second done")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("write v1", tx.clone()).await.unwrap();
+        agent.run_turn("write v2", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 2, "newest first");
+        assert!(candidates[0].turn > candidates[1].turn);
+
+        agent.rewind_to(candidates[0].turn).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
+        let messages = agent.session().load_messages().unwrap();
+        assert_eq!(
+            messages.first().map(|m| m.content.as_str()),
+            Some("write v1"),
+            "the first turn's history survives"
+        );
+        assert!(
+            messages.iter().all(|m| m.content != "write v2"),
+            "the second turn's history is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_failed_cycle_restores_files_and_notes_the_mission() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("data.txt");
+        std::fs::write(&file, "good").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "data.txt", "content": "broken" }),
+                )],
+                vec![final_chunk("changed it")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let cycle_first_turn = agent.checkpoints().current_turn() + 1;
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("break the data", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken");
+
+        let spinner = crate::progress::TurnSpinner::new();
+        let mut mission = mission::Mission::new("keep the data good");
+
+        // Disabled: a no-op.
+        let config = Config::default();
+        rollback_failed_cycle(
+            &config,
+            &agent,
+            Some(&mut mission),
+            &tmp.0,
+            cycle_first_turn,
+            "circuit breaker",
+            Some(&spinner),
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken");
+        assert!(mission.notes.is_empty());
+
+        // Enabled: the cycle's edits are restored and the mission notes it.
+        let config = Config {
+            rollback_failed_cycles: true,
+            ..Config::default()
+        };
+        rollback_failed_cycle(
+            &config,
+            &agent,
+            Some(&mut mission),
+            &tmp.0,
+            cycle_first_turn,
+            "circuit breaker",
+            Some(&spinner),
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "good");
+        assert!(
+            mission
+                .notes
+                .last()
+                .is_some_and(|note| note.contains("rolled back 1 file(s)")
+                    && note.contains("circuit breaker")),
+            "rollback noted in the mission: {:?}",
+            mission.notes
+        );
+        // The note was persisted to mission.toml.
+        let loaded = mission::Mission::load(&tmp.0).unwrap().expect("saved");
+        assert_eq!(loaded.notes, mission.notes);
+    }
+
+    #[tokio::test]
+    async fn usage_counts_accumulate_emit_events_and_land_in_the_jsonl_log() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![usage_chunk("first", 100, 20)],
+            vec![usage_chunk("second", 150, 30)],
+        ]);
+        let mut agent =
+            test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("one", tx).await.expect("turn ok");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } = event
+            {
+                usage_events.push((prompt_tokens, completion_tokens));
+            }
         }
-        assert_eq!(counter.record("execute", false), FailureAction::Continue);
-        // The streak starts over after the success.
-        for i in 1..TOOL_FAILURE_NUDGE {
-            assert_eq!(
-                counter.record("execute", true),
-                FailureAction::Continue,
-                "failure {i}"
+        assert_eq!(usage_events, [(100, 20)], "one Usage event per model call");
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("two", tx).await.expect("turn ok");
+
+        assert_eq!(agent.usage().session_totals(), (250, 50));
+        assert_eq!(agent.usage().turn_totals(), (150, 30), "last turn only");
+        assert_eq!(agent.usage().last_prompt_tokens(), Some(150));
+
+        // One JSONL record per turn, in order.
+        let raw = std::fs::read_to_string(tmp.0.join("usage.jsonl")).expect("log written");
+        let records: Vec<crate::usage::UsageRecord> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid json"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].prompt_tokens, 100);
+        assert_eq!(records[0].completion_tokens, 20);
+        assert_eq!(records[1].prompt_tokens, 150);
+        assert_eq!(records[1].completion_tokens, 30);
+        assert_eq!(records[0].mode, "genie");
+        assert!(records[0].ts > 0);
+        assert_eq!(records[0].project, tmp.0.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn turns_without_reported_counts_write_no_usage_records() {
+        let (mut agent, _provider, tmp) = test_agent(vec![vec![final_chunk("plain")]]);
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(agent.usage().session_totals(), (0, 0));
+        assert!(!tmp.0.join("usage.jsonl").exists(), "no counts, no log");
+    }
+
+    #[tokio::test]
+    async fn prompt_tokens_near_the_context_window_trigger_compaction() {
+        let tmp = TempDir::new();
+        // Window 1000 → compaction at >800 prompt tokens. The byte threshold
+        // (48k) is never reached: the messages are tiny.
+        let provider = ScriptedProvider::with_context_window(
+            vec![
+                // Turn 1: reports a prompt size of 900 tokens.
+                vec![usage_chunk("ok", 900, 10)],
+                // Turn 2: the compaction summary, then the actual reply.
+                vec![final_chunk("progress so far")],
+                vec![final_chunk("done")],
+            ],
+            1000,
+        );
+        let mut agent =
+            test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+        for i in 0..14 {
+            agent.history.push(ChatMessage::user(format!("filler {i}")));
+        }
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("one", tx).await.expect("turn ok");
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "no compaction before a token count arrives"
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("two", tx).await.expect("turn ok");
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "token threshold compacted the history"
+        );
+        let (_text, errors) = drain_events(&mut rx);
+        assert!(
+            errors.iter().any(|e| e.contains("compacted")),
+            "compaction surfaced: {errors:?}"
+        );
+        assert_eq!(
+            agent.usage().last_prompt_tokens(),
+            None,
+            "stale prompt size cleared so compaction does not re-trigger"
+        );
+
+        // The summarization request carried the extended preservation
+        // instructions (todo list + plan file).
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let summarize_prompt = &requests[1].messages[0].content;
+        assert!(summarize_prompt.contains("todo"), "{summarize_prompt}");
+        assert!(
+            summarize_prompt.contains(".wizard/plan.md"),
+            "{summarize_prompt}"
+        );
+    }
+
+    /// Test tool returning a large fixed blob, to cross the byte threshold
+    /// mid-turn.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for BigOutputTool {
+        fn name(&self) -> &str {
+            "big"
+        }
+
+        fn description(&self) -> &str {
+            "Return a large blob (test tool)."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::ok("B".repeat(5_000)))
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("big", json!({}))],
+            vec![final_chunk("progress so far")], // compaction summary
+            vec![final_chunk("done")],
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigOutputTool));
+        let mut agent = test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), registry);
+        for i in 0..13 {
+            agent.history.push(ChatMessage::user(format!("filler {i}")));
+        }
+        // Threshold just above the current size: crossed only once the 5k
+        // tool result lands, so the compaction must happen mid-turn.
+        let base: usize = agent.history.iter().map(|m| m.content.len()).sum();
+        agent.config.compact_threshold_bytes = base + 1_000;
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "mid-turn compaction happened"
+        );
+        // The in-flight turn's tail — the big tool result the model is
+        // reasoning about — survived verbatim.
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("BBBB")),
+            "tool feedback preserved through compaction"
+        );
+        // The final completion saw the compacted history.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]"))
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_writes_update_shared_state_and_emit_events() {
+        let tmp = TempDir::new();
+        let items = json!([
+            { "content": "investigate", "status": "completed" },
+            { "content": "implement", "status": "in_progress" },
+            { "content": "test", "status": "pending" }
+        ]);
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "todo",
+                    json!({ "action": "write", "items": items }),
+                )],
+                vec![final_chunk("noted")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+
+        let mut updates = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::TodoUpdated(items) = event {
+                updates.push(items);
+            }
+        }
+        assert_eq!(updates.len(), 1, "one TodoUpdated per write");
+        assert_eq!(updates[0].len(), 3);
+        assert_eq!(updates[0][1].content, "implement");
+        assert_eq!(
+            updates[0][1].status,
+            crate::tools::todo::TodoStatus::InProgress
+        );
+
+        // The shared state holds the list for later read calls.
+        assert_eq!(agent.ctx.todos.lock().unwrap().len(), 3);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.contains("1/3 done"), "{feedback}");
+    }
+
+    #[tokio::test]
+    async fn todo_tool_stays_usable_in_plan_mode() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "todo",
+                    json!({ "action": "write", "items": [
+                        { "content": "draft plan", "status": "in_progress" }
+                    ] }),
+                )],
+                vec![final_chunk("planning")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("todo list updated"),
+            "todo runs under the plan gate: {feedback}"
+        );
+        assert!(agent.plan_mode(), "plan mode untouched");
+    }
+
+    #[test]
+    fn todo_instruction_appears_only_when_the_tool_is_registered() {
+        let tmp = TempDir::new();
+        let (agent, _provider) = test_agent_in(
+            &tmp,
+            Vec::new(),
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        assert!(agent.history[0].content.contains("## Working todo list"));
+
+        let (agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+        assert!(
+            !agent.history[0].content.contains("## Working todo list"),
+            "no instruction without the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_task_finish_is_injected_into_the_next_step() {
+        use crate::tools::tasks::TaskStatus;
+
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                // Turn 1: start a background task, then stop.
+                vec![tool_call_chunk(
+                    "execute",
+                    json!({ "command": "echo task-payload", "run_in_background": true }),
+                )],
+                vec![final_chunk("started it")],
+                // Turn 2: plain reply (the notification precedes it).
+                vec![final_chunk("noted the finish")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent
+            .run_turn("run it in the background", tx)
+            .await
+            .expect("turn ok");
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("Background task #1 started: echo task-payload"),
+            "spawn returns immediately with the id: {feedback}"
+        );
+
+        // Wait for the echo to actually finish in the registry.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.ctx.tasks.status(1) == Some(TaskStatus::Running) {
+            assert!(Instant::now() < deadline, "background task finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("anything new?", tx).await.expect("turn ok");
+
+        // The next step's request carried the finished-task notification
+        // (with the output tail) ahead of the model call.
+        {
+            let requests = provider.requests.lock().unwrap();
+            let request = requests.last().expect("turn 2 request");
+            let note = request
+                .messages
+                .iter()
+                .find(|m| {
+                    m.role == Role::System && m.content.contains("background task #1 finished")
+                })
+                .expect("notification in history");
+            assert!(note.content.contains("(exit 0)"), "{}", note.content);
+            assert!(
+                note.content.contains("task-payload"),
+                "output tail included: {}",
+                note.content
             );
         }
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
+
+        // The surfaces saw a TaskFinished event.
+        let mut finished = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::TaskFinished {
+                id,
+                command,
+                status,
+            } = event
+            {
+                finished.push((id, command, status));
+            }
+        }
+        assert_eq!(
+            finished,
+            [(1, "echo task-payload".to_string(), TaskStatus::Done(0))]
+        );
+
+        // Drained exactly once: nothing left for later steps.
+        assert!(agent.ctx.tasks.drain_completed().is_empty());
+        assert_eq!(
+            agent
+                .history()
+                .iter()
+                .filter(|m| m.content.contains("background task #1 finished"))
+                .count(),
+            1,
+            "the notification appears exactly once in history"
+        );
     }
 
-    #[test]
-    fn tool_failures_count_per_tool_name() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_NUDGE - 1 {
-            counter.record("execute", true);
-            counter.record("write_file", true);
-        }
-        // Each tool reaches the nudge threshold independently; a success of
-        // one tool does not reset the other.
-        counter.record("write_file", false);
-        assert_eq!(counter.record("execute", true), FailureAction::Nudge);
-        assert_eq!(counter.record("write_file", true), FailureAction::Continue);
+    #[tokio::test]
+    async fn hook_timeout_does_not_hang_the_turn() {
+        let tmp = TempDir::new();
+        let command = write_script(&tmp.0, "slow.sh", "sleep 5\n");
+        let (registry, calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({}))],
+                vec![final_chunk("done")],
+            ],
+            vec![HookDef {
+                event: HookEvent::PreToolUse,
+                matcher: None,
+                command,
+                timeout_secs: Some(1),
+            }],
+            registry,
+        );
+
+        let started = Instant::now();
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(calls.lock().unwrap().len(), 1, "the tool still ran");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the hook was killed at its 1s timeout (took {:?})",
+            started.elapsed()
+        );
     }
 
-    #[test]
-    fn tool_failures_reset_clears_all_counts() {
-        let mut counter = ToolFailureCounter::default();
-        for _ in 0..TOOL_FAILURE_TRIP {
-            counter.record("execute", true);
+    #[tokio::test]
+    async fn stream_json_sink_renders_a_scripted_run_as_jsonl_ending_in_done() {
+        use crate::output::{EventSink, StreamJsonSink, tests::SharedBuf};
+
+        let tmp = TempDir::new();
+        let (registry, _calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![usage_chunk("all wrapped up", 42, 7)],
+            ],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        // Feed the turn's real event stream through the stream-json sink,
+        // exactly as run_headless wires it.
+        let buf = SharedBuf::default();
+        let mut sink = StreamJsonSink::new(buf.clone());
+        while let Ok(event) = rx.try_recv() {
+            sink.event(event);
         }
-        counter.reset();
-        assert_eq!(counter.record("execute", true), FailureAction::Continue);
+        sink.finish(reason);
+
+        let out = buf.contents();
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is valid JSON"))
+            .collect();
+        assert!(values.len() >= 4, "got: {out}");
+        let types: Vec<&str> = values
+            .iter()
+            .filter_map(|value| value["type"].as_str())
+            .collect();
+        assert!(types.contains(&"tool_call"), "got: {types:?}");
+        assert!(types.contains(&"tool_result"), "got: {types:?}");
+        assert!(types.contains(&"text_delta"), "got: {types:?}");
+        assert!(types.contains(&"usage"), "got: {types:?}");
+        let done = values.last().expect("at least the done line");
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["reason"], "completed");
+        assert_eq!(done["usage"]["prompt_tokens"], 42);
+        assert_eq!(done["usage"]["completion_tokens"], 7);
     }
 }

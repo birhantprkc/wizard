@@ -105,6 +105,8 @@ impl Answers {
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
             gguf_path: self.gguf_path.clone(),
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
         };
 
         // Mirror an Ollama choice into the legacy fields so config files remain

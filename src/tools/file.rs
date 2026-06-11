@@ -12,8 +12,8 @@ use tokio::process::Command;
 
 use super::shell::run_command;
 use super::{
-    MAX_OUTPUT_BYTES, Tool, ToolContext, ToolError, ToolOutput, parse_args, resolve_path,
-    truncate_output,
+    MAX_OUTPUT_BYTES, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args,
+    resolve_path, truncate_output,
 };
 
 /// Maximum number of lines a single `read_file` call returns.
@@ -65,6 +65,10 @@ impl Tool for ReadFileTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -141,8 +145,7 @@ pub struct WriteFileArgs {
     pub content: String,
 }
 
-/// `write_file` — create or overwrite a file. Opts into the approval gate
-/// (only active when `auto_approve = false`).
+/// `write_file` — create or overwrite a file.
 pub struct WriteFileTool;
 
 #[async_trait]
@@ -166,8 +169,8 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        true
+    fn access(&self) -> ToolAccess {
+        ToolAccess::Edit
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -214,8 +217,7 @@ pub struct EditFileArgs {
     pub replace_all: bool,
 }
 
-/// `edit_file` — exact search-and-replace edit. Opts into the approval gate
-/// (only active when `auto_approve = false`).
+/// `edit_file` — exact search-and-replace edit.
 pub struct EditFileTool;
 
 #[async_trait]
@@ -241,8 +243,8 @@ impl Tool for EditFileTool {
         })
     }
 
-    fn requires_approval(&self) -> bool {
-        true
+    fn access(&self) -> ToolAccess {
+        ToolAccess::Edit
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -351,6 +353,10 @@ impl Tool for ListFilesTool {
                 "glob": { "type": "string", "description": "Glob filter, e.g. **/*.rs" }
             }
         })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -544,6 +550,10 @@ impl Tool for SearchFilesTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

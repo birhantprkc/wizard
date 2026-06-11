@@ -227,6 +227,10 @@ impl LlmProvider for AnthropicProvider {
         }
     }
 
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        context_window(model)
+    }
+
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         let body = self.build_request_body(&request);
         let response = self
@@ -252,6 +256,21 @@ impl LlmProvider for AnthropicProvider {
 
     fn label(&self) -> String {
         format!("anthropic:{}", self.model)
+    }
+}
+
+/// Context-window table for Anthropic models: every `claude-*` model has a
+/// 200k window, with 1M-context variants flagged in the model name. Unknown
+/// (non-claude) tags report `None`.
+fn context_window(model: &str) -> Option<u32> {
+    let model = model.to_ascii_lowercase();
+    if !model.starts_with("claude") {
+        return None;
+    }
+    if model.contains("1m") {
+        Some(1_000_000)
+    } else {
+        Some(200_000)
     }
 }
 
@@ -648,5 +667,14 @@ mod tests {
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
         assert!(chunks.next().await.is_none());
+    }
+
+    #[test]
+    fn context_window_table_covers_claude_and_unknowns() {
+        assert_eq!(context_window("claude-fable-5"), Some(200_000));
+        assert_eq!(context_window("Claude-Opus-4"), Some(200_000));
+        assert_eq!(context_window("claude-sonnet-4-5[1m]"), Some(1_000_000));
+        assert_eq!(context_window("gpt-4o"), None);
+        assert_eq!(context_window(""), None);
     }
 }

@@ -38,6 +38,31 @@ repeat a failing action verbatim.
 - Keep edits minimal and consistent with the existing code style.
 - Commit when a coherent unit of work passes tests, with a clear message.";
 
+/// Appended to the system prompt while plan mode is active (the agent
+/// re-composes the prompt whenever the flag flips, so this block disappears
+/// once a plan is approved).
+pub const PLAN_MODE_PROMPT: &str = "\
+## Plan mode (active)
+
+You are in PLAN MODE. Investigate using read-only tools only (reading, \
+listing, and searching files; inspecting git state); every other tool is \
+blocked until your plan is approved. Do not attempt to make changes yet. \
+Once you understand the task, present your implementation plan by calling \
+the `exit_plan` tool with the complete plan as markdown. If the plan is \
+approved, plan mode ends and you carry it out; if it is rejected, refine \
+the plan using the feedback you receive and call `exit_plan` again.";
+
+/// Appended to the system prompt when the `todo` tool is registered: keep a
+/// working todo list for multi-step tasks so every surface can mirror
+/// progress.
+pub const TODO_PROMPT: &str = "\
+## Working todo list
+
+For multi-step work, maintain a todo list with the `todo` tool: write the \
+full list up front (action \"write\" replaces the entire list), keep exactly \
+one item in_progress while you work on it, and mark items completed as soon \
+as they are done. Skip the list for trivial single-step tasks.";
+
 /// Memory guidance injected when the project has saved memories; the index
 /// (MEMORY.md) follows it.
 const MEMORY_PROMPT_WITH_INDEX: &str = "\
@@ -60,7 +85,8 @@ already records.";
 
 /// Compose the full system prompt for `mode`: personality prompt, then the
 /// bundled `WIZARD.md` charter, then a rendered skills section, then the
-/// project's `AGENTS.md` contents (if present at the project root), then
+/// project's instruction hierarchy (`agents_md`, assembled by
+/// [`crate::instructions`] from WIZARD.md/AGENTS.md/CLAUDE.md files), then
 /// the persistent memory section (`memory_index` is the project's
 /// MEMORY.md, when any memories are saved).
 pub fn build_system_prompt(
@@ -88,7 +114,7 @@ pub fn build_system_prompt(
     }
 
     if let Some(agents_md) = agents_md {
-        prompt.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
+        prompt.push_str("\n\n## Project instructions\n\n");
         prompt.push_str(agents_md);
     }
 
@@ -167,8 +193,8 @@ mod tests {
             .find("## Wizard charter (WIZARD.md)")
             .expect("charter present");
         let agents_pos = prompt
-            .find("## Project instructions (AGENTS.md)")
-            .expect("AGENTS.md section present");
+            .find("## Project instructions")
+            .expect("project instructions section present");
         assert!(
             charter_pos < agents_pos,
             "charter must appear before project instructions"

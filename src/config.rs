@@ -206,6 +206,80 @@ fn splitmix64(seed: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Settings for the native web tools (`[web]` in `config.toml`): `web_fetch`
+/// response caps, the SSRF guard escape hatch, and `web_search` backend
+/// selection. Search API keys are never stored here — only the name of the
+/// environment variable holding the key (`search_api_key_env`), read at call
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Byte cap on a `web_fetch` response body (default 100_000).
+    pub fetch_max_bytes: usize,
+    /// Allow fetches that resolve to localhost / private address ranges
+    /// (default false). The SSRF guard is on unless this is set.
+    pub allow_local: bool,
+    /// `web_search` backend: `"duckduckgo"` (default, no key),
+    /// `"brave"`, or `"tavily"`.
+    pub search_backend: String,
+    /// Name of the env var holding the search API key (brave/tavily); the
+    /// key itself is never persisted and is read at call time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_api_key_env: Option<String>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            fetch_max_bytes: 100_000,
+            allow_local: false,
+            search_backend: "duckduckgo".to_string(),
+            search_api_key_env: None,
+        }
+    }
+}
+
+/// Per-file checkpoint settings (`[checkpoints]` in `config.toml`).
+/// Snapshots of files edited by Wizard land under
+/// `<project>/.wizard/checkpoints/` and power `/rewind` and the perpetual
+/// `rollback_failed_cycles` option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckpointConfig {
+    /// Number of most recent turns whose snapshots are kept; older turns are
+    /// garbage-collected at session start (default 50).
+    pub keep_turns: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self { keep_turns: 50 }
+    }
+}
+
+/// Fleet-mode settings (`[fleet]` in `config.toml`); see `wizard fleet`
+/// and docs/fleet.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Per-worker wall-clock cap in minutes; the coordinator kills a child
+    /// past this (default 30).
+    pub max_minutes: u64,
+    /// Run the synthesis turn (an in-process agent merges the fleet
+    /// branches) once all workers finish. `false` skips the merge and just
+    /// prints the branch list and results table (default true).
+    pub synthesize: bool,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            max_minutes: 30,
+            synthesize: true,
+        }
+    }
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +304,13 @@ pub struct ProviderConfig {
     /// `llama-server` itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gguf_path: Option<String>,
+    /// Optional input-token price in USD per million tokens, for `/cost`
+    /// estimates. Unset = no cost computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_per_mtok_in: Option<f64>,
+    /// Optional output-token price in USD per million tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_per_mtok_out: Option<f64>,
 }
 
 impl ProviderConfig {
@@ -349,9 +430,10 @@ pub struct Config {
     pub gguf_path: Option<String>,
     /// Default personality mode.
     pub mode: Mode,
-    /// Bypass per-action confirmation prompts. Default true: genie bypasses
-    /// permissions. Set false to restore the y/n gate for tools that request
-    /// approval.
+    /// Deprecated: approval gating was removed and every tool call executes
+    /// directly. Still parsed so old config files load; ignored (a startup
+    /// warning is printed when set to `false`) and never written back.
+    #[serde(skip_serializing)]
     pub auto_approve: bool,
     /// Agent loop limit per turn (genie). Sovereign uses its own default
     /// unless this is explicitly raised above it.
@@ -359,6 +441,17 @@ pub struct Config {
     /// Perpetual sovereign operation: keep working/self-directing/self-improving
     /// until stopped.
     pub continuous: bool,
+    /// Start every session in plan mode (the `--plan` flag sets this for one
+    /// run): the agent investigates with read-only tools and presents a plan
+    /// via `exit_plan` before executing. Headless runs auto-approve the plan.
+    pub plan_first: bool,
+    /// Continuous mode: re-enter plan mode at the top of every cycle, so each
+    /// cycle plans read-only before acting.
+    pub plan_each_cycle: bool,
+    /// Continuous mode: when a cycle ends in a circuit breaker or a hard
+    /// error, restore that cycle's file checkpoints before moving on (the
+    /// rollback is noted in `mission.toml`). Default false.
+    pub rollback_failed_cycles: bool,
     /// Base seconds for exponential backoff when the LLM server is unreachable
     /// or rate-limited.
     pub retry_base_secs: u64,
@@ -384,6 +477,15 @@ pub struct Config {
     /// Cosmetic TUI settings (spinner verbs).
     #[serde(default)]
     pub ui: UiConfig,
+    /// Native web tool settings (`web_fetch` / `web_search`).
+    #[serde(default)]
+    pub web: WebConfig,
+    /// Per-file checkpoint settings (snapshots powering `/rewind`).
+    #[serde(default)]
+    pub checkpoints: CheckpointConfig,
+    /// Fleet-mode settings (`wizard fleet`).
+    #[serde(default)]
+    pub fleet: FleetConfig,
 }
 
 impl Default for Config {
@@ -397,6 +499,9 @@ impl Default for Config {
             auto_approve: true,
             max_steps: 25,
             continuous: false,
+            plan_first: false,
+            plan_each_cycle: false,
+            rollback_failed_cycles: false,
             retry_base_secs: 5,
             retry_max_secs: 300,
             cycle_pause_secs: 0,
@@ -405,6 +510,9 @@ impl Default for Config {
             active_provider: None,
             gateway: GatewayConfig::default(),
             ui: UiConfig::default(),
+            web: WebConfig::default(),
+            checkpoints: CheckpointConfig::default(),
+            fleet: FleetConfig::default(),
         }
     }
 }
@@ -465,6 +573,12 @@ impl Config {
     /// `~/.wizard/logs/` — debug traces.
     pub fn logs_dir() -> Result<PathBuf> {
         Ok(Self::wizard_dir()?.join("logs"))
+    }
+
+    /// `~/.wizard/schedule.toml` — cron schedule entries
+    /// (`crate::schedule`).
+    pub fn schedule_path() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("schedule.toml"))
     }
 
     /// Create the `~/.wizard` directory tree (sessions, tools, skills, logs)
@@ -536,6 +650,8 @@ impl Config {
             model: self.model.clone(),
             api_key_env: None,
             gguf_path: self.gguf_path.clone(),
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
         }
     }
 
@@ -617,8 +733,8 @@ impl Config {
     }
 
     /// Apply CLI flag overrides on top of file/env config for this run.
-    /// CLI mode wins; `--auto` forces `auto_approve`; sovereign mode raises
-    /// `max_steps` to its default if the configured value is lower.
+    /// CLI mode wins; sovereign mode raises `max_steps` to its default if
+    /// the configured value is lower.
     pub fn apply_cli(&mut self, cli: &Cli) {
         if let Some(mode) = cli.mode {
             self.mode = mode;
@@ -627,8 +743,8 @@ impl Config {
             self.mode = Mode::Sovereign;
             self.continuous = true;
         }
-        if cli.auto || self.mode == Mode::Sovereign {
-            self.auto_approve = true;
+        if cli.plan {
+            self.plan_first = true;
         }
         if self.mode == Mode::Sovereign && self.max_steps < Mode::Sovereign.default_max_steps() {
             self.max_steps = Mode::Sovereign.default_max_steps();
@@ -655,13 +771,38 @@ mod tests {
         assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
         assert!(config.gguf_path.is_none());
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
         assert!(!config.continuous);
+        assert!(!config.plan_first);
+        assert!(!config.plan_each_cycle);
         assert_eq!(config.retry_base_secs, 5);
         assert_eq!(config.retry_max_secs, 300);
         assert_eq!(config.cycle_pause_secs, 0);
         assert_eq!(config.compact_threshold_bytes, 48_000);
+        assert!(!config.rollback_failed_cycles);
+        assert_eq!(config.checkpoints.keep_turns, 50);
+        assert_eq!(config.fleet.max_minutes, 30);
+        assert!(config.fleet.synthesize);
+    }
+
+    #[test]
+    fn checkpoints_section_parses() {
+        let config: Config = toml::from_str("[checkpoints]\nkeep_turns = 7").expect("valid toml");
+        assert_eq!(config.checkpoints.keep_turns, 7);
+        let config: Config = toml::from_str("rollback_failed_cycles = true").expect("valid toml");
+        assert!(config.rollback_failed_cycles);
+    }
+
+    #[test]
+    fn fleet_section_parses_with_partial_keys() {
+        let config: Config =
+            toml::from_str("[fleet]\nmax_minutes = 10\nsynthesize = false").expect("valid toml");
+        assert_eq!(config.fleet.max_minutes, 10);
+        assert!(!config.fleet.synthesize);
+
+        let config: Config = toml::from_str("[fleet]\nmax_minutes = 90").expect("valid toml");
+        assert_eq!(config.fleet.max_minutes, 90);
+        assert!(config.fleet.synthesize, "missing key takes the default");
     }
 
     #[test]
@@ -694,6 +835,9 @@ mod tests {
             auto_approve: true,
             max_steps: 200,
             continuous: true,
+            plan_first: true,
+            plan_each_cycle: true,
+            rollback_failed_cycles: true,
             retry_base_secs: 10,
             retry_max_secs: 600,
             cycle_pause_secs: 30,
@@ -705,6 +849,8 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openai".to_string()),
             gateway: GatewayConfig {
@@ -715,6 +861,17 @@ mod tests {
             ui: UiConfig {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
             },
+            web: WebConfig {
+                fetch_max_bytes: 250_000,
+                allow_local: true,
+                search_backend: "brave".to_string(),
+                search_api_key_env: Some("BRAVE_API_KEY".to_string()),
+            },
+            checkpoints: CheckpointConfig { keep_turns: 12 },
+            fleet: FleetConfig {
+                max_minutes: 45,
+                synthesize: false,
+            },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -723,9 +880,10 @@ mod tests {
         assert_eq!(parsed.llamacpp_host, original.llamacpp_host);
         assert_eq!(parsed.gguf_path, original.gguf_path);
         assert_eq!(parsed.mode, original.mode);
-        assert_eq!(parsed.auto_approve, original.auto_approve);
         assert_eq!(parsed.max_steps, original.max_steps);
         assert_eq!(parsed.continuous, original.continuous);
+        assert_eq!(parsed.plan_first, original.plan_first);
+        assert_eq!(parsed.plan_each_cycle, original.plan_each_cycle);
         assert_eq!(parsed.retry_base_secs, original.retry_base_secs);
         assert_eq!(parsed.retry_max_secs, original.retry_max_secs);
         assert_eq!(parsed.cycle_pause_secs, original.cycle_pause_secs);
@@ -745,6 +903,37 @@ mod tests {
         assert_eq!(parsed.gateway.token_env.as_deref(), Some("MY_BOT_TOKEN"));
         assert_eq!(parsed.gateway.allowed_chat_ids, vec![42, -100123]);
         assert_eq!(parsed.ui, original.ui);
+        assert_eq!(parsed.web, original.web);
+        assert_eq!(
+            parsed.rollback_failed_cycles,
+            original.rollback_failed_cycles
+        );
+        assert_eq!(parsed.checkpoints, original.checkpoints);
+        assert_eq!(parsed.fleet, original.fleet);
+    }
+
+    #[test]
+    fn web_defaults_when_section_missing() {
+        let config: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(config.web, WebConfig::default());
+        assert_eq!(config.web.fetch_max_bytes, 100_000);
+        assert!(!config.web.allow_local);
+        assert_eq!(config.web.search_backend, "duckduckgo");
+        assert!(config.web.search_api_key_env.is_none());
+    }
+
+    #[test]
+    fn web_section_parses_partial_keys() {
+        let config: Config = toml::from_str(
+            "[web]\nsearch_backend = \"tavily\"\nsearch_api_key_env = \"TAVILY_API_KEY\"",
+        )
+        .expect("valid toml");
+        assert_eq!(config.web.search_backend, "tavily");
+        assert_eq!(
+            config.web.search_api_key_env.as_deref(),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(config.web.fetch_max_bytes, 100_000, "missing keys default");
     }
 
     #[test]
@@ -863,6 +1052,8 @@ mod tests {
                 model: "qwen3-8b".to_string(),
                 api_key_env: None,
                 gguf_path: Some("/home/u/.wizard/models/qwen3-8b-q4_k_m.gguf".to_string()),
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("local".to_string()),
             ..Config::default()
@@ -891,6 +1082,8 @@ mod tests {
                     model: "grok-4.3".to_string(),
                     api_key_env: Some("XAI_API_KEY".to_string()),
                     gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
                 },
                 ProviderConfig {
                     name: "xai-account".to_string(),
@@ -899,6 +1092,8 @@ mod tests {
                     model: "grok-4.3".to_string(),
                     api_key_env: None,
                     gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
                 },
             ],
             active_provider: Some("xai-account".to_string()),
@@ -929,6 +1124,8 @@ mod tests {
                 model: "openrouter/auto".to_string(),
                 api_key_env: Some("OPENROUTER_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openrouter".to_string()),
             ..Config::default()
@@ -943,6 +1140,35 @@ mod tests {
             Some("OPENROUTER_API_KEY")
         );
         assert_eq!(parsed.active().kind, ProviderKind::OpenRouter);
+    }
+
+    #[test]
+    fn provider_cost_rates_parse_and_round_trip() {
+        let raw = "\
+[[providers]]
+name = \"claude\"
+kind = \"anthropic\"
+base_url = \"https://api.anthropic.com\"
+model = \"claude-fable-5\"
+api_key_env = \"ANTHROPIC_API_KEY\"
+usd_per_mtok_in = 3.0
+usd_per_mtok_out = 15.0
+";
+        let config: Config = toml::from_str(raw).expect("valid toml");
+        let provider = &config.providers[0];
+        assert_eq!(provider.usd_per_mtok_in, Some(3.0));
+        assert_eq!(provider.usd_per_mtok_out, Some(15.0));
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&serialized).expect("parse back");
+        assert_eq!(parsed.providers[0].usd_per_mtok_in, Some(3.0));
+        assert_eq!(parsed.providers[0].usd_per_mtok_out, Some(15.0));
+
+        // Unset rates stay absent on the wire.
+        let bare: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(bare.active().usd_per_mtok_in, None);
+        let serialized = toml::to_string_pretty(&bare).expect("serialize");
+        assert!(!serialized.contains("usd_per_mtok"), "{serialized}");
     }
 
     #[test]
@@ -976,6 +1202,8 @@ mod tests {
                 model: "qwen3.6:27b".to_string(),
                 api_key_env: None,
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             },
             ProviderConfig {
                 name: "claude".to_string(),
@@ -984,6 +1212,8 @@ mod tests {
                 model: "claude-fable-5".to_string(),
                 api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             },
         ];
 
@@ -1023,6 +1253,8 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openai".to_string()),
             ..Config::default()
@@ -1108,6 +1340,8 @@ mod tests {
                 model: "qwen3-8b".to_string(),
                 api_key_env: None,
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("local".to_string()),
             ..Config::default()
@@ -1155,8 +1389,25 @@ mod tests {
         let mut config = Config::default();
         config.apply_cli(&cli(&["--mode", "sovereign"]));
         assert_eq!(config.mode, Mode::Sovereign);
-        assert!(config.auto_approve, "sovereign implies auto-approve");
         assert_eq!(config.max_steps, 100, "sovereign raises the step budget");
+    }
+
+    #[test]
+    fn plan_flag_sets_plan_first() {
+        let mut config = Config::default();
+        assert!(!config.plan_first);
+        assert!(!config.plan_each_cycle);
+        config.apply_cli(&cli(&["--plan"]));
+        assert!(config.plan_first);
+        assert!(!config.plan_each_cycle, "--plan never affects cycles");
+
+        // The flag only sets, never clears, the config value.
+        let mut config = Config {
+            plan_first: true,
+            ..Config::default()
+        };
+        config.apply_cli(&cli(&[]));
+        assert!(config.plan_first);
     }
 
     #[test]
@@ -1165,7 +1416,6 @@ mod tests {
         config.apply_cli(&cli(&["--continuous"]));
         assert_eq!(config.mode, Mode::Sovereign);
         assert!(config.continuous);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 100);
     }
 
@@ -1180,15 +1430,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_flag_forces_auto_approve_in_genie() {
-        let mut config = Config {
-            auto_approve: false, // start from the opt-in gated posture
-            ..Config::default()
-        };
+    fn deprecated_auto_flag_is_accepted_and_ignored() {
+        let mut config = Config::default();
         config.apply_cli(&cli(&["--auto"]));
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25, "genie keeps its budget");
+    }
+
+    #[test]
+    fn deprecated_auto_approve_key_still_parses_and_is_not_written_back() {
+        let config: Config = toml::from_str("auto_approve = false").expect("old key parses");
+        assert!(!config.auto_approve);
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("auto_approve"),
+            "deprecated key is not written back: {raw}"
+        );
     }
 
     #[test]
@@ -1196,18 +1453,16 @@ mod tests {
         let mut config = Config::default();
         config.apply_cli(&cli(&[]));
         assert_eq!(config.mode, Mode::Genie);
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 25);
     }
 
     #[test]
-    fn config_sovereign_mode_implies_auto_approve_without_flags() {
+    fn config_sovereign_mode_raises_max_steps_without_flags() {
         let mut config = Config {
             mode: Mode::Sovereign,
             ..Config::default()
         };
         config.apply_cli(&cli(&[]));
-        assert!(config.auto_approve);
         assert_eq!(config.max_steps, 100);
     }
 }

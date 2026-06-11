@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent, build_headless_agent};
+use crate::agent::{Agent, AgentEvent, PlanVerdict, build_headless_agent};
 use crate::cli::Cli;
 use crate::config::{Config, GatewayKind, Mode};
 
@@ -113,16 +113,15 @@ pub async fn run(config: Config, _cli: Cli) -> Result<()> {
     }
 }
 
-/// Drive a gateway: build one sovereign / auto-approve agent, then loop —
-/// poll for inbound messages (retrying network errors with backoff), enforce
-/// the allow-list, run one agent turn per message, and send the reply (split
-/// into platform-sized chunks). Runs until Ctrl-C.
+/// Drive a gateway: build one sovereign agent, then loop — poll for inbound
+/// messages (retrying network errors with backoff), enforce the allow-list,
+/// run one agent turn per message, and send the reply (split into
+/// platform-sized chunks). Runs until Ctrl-C.
 async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Path) -> Result<()> {
-    // The gateway is fully autonomous: there is no terminal to approve tool
-    // calls, so run in sovereign / auto-approve posture.
+    // The gateway is fully autonomous: there is no terminal, so run in
+    // sovereign posture.
     let mut agent_config = config.clone();
     agent_config.mode = Mode::Sovereign;
-    agent_config.auto_approve = true;
     if agent_config.max_steps < Mode::Sovereign.default_max_steps() {
         agent_config.max_steps = Mode::Sovereign.default_max_steps();
     }
@@ -130,6 +129,14 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
     let mut agent = build_headless_agent(&agent_config, project_root, false)
         .await
         .context("building gateway agent")?;
+    // `plan_first = true`: the first turn plans read-only; the collector in
+    // run_one_turn auto-approves the plan and includes it in the reply.
+    if config.plan_first {
+        agent.set_plan_mode(true);
+    }
+
+    // session_start hooks fire once for the whole gateway session.
+    fire_session_hooks(&mut agent, true).await;
 
     let allowed = config.gateway.allowed_chat_ids.clone();
     println!(
@@ -143,7 +150,7 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
             biased;
             _ = tokio::signal::ctrl_c() => {
                 println!("\n[gateway stopped]");
-                return Ok(());
+                break;
             }
             result = gateway.poll() => match result {
                 Ok(messages) => {
@@ -176,6 +183,22 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                 continue;
             }
 
+            // "/plan" toggles plan mode for subsequent messages, mirroring
+            // the TUI's slash command.
+            if message.text.trim() == "/plan" {
+                let on = !agent.plan_mode();
+                agent.set_plan_mode(on);
+                let confirmation = if on {
+                    "plan mode on — the next task is planned read-only first"
+                } else {
+                    "plan mode off"
+                };
+                if let Err(err) = gateway.send(message.chat_id, confirmation).await {
+                    eprintln!("failed to confirm /plan to {}: {err:#}", message.chat_id);
+                }
+                continue;
+            }
+
             println!("← [{}] {}", message.chat_id, first_line(&message.text));
             let reply = run_one_turn(&mut agent, &message.text).await;
             for chunk in split_message(&reply, MAX_MESSAGE_CHARS) {
@@ -184,6 +207,31 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                     break;
                 }
             }
+        }
+    }
+
+    fire_session_hooks(&mut agent, false).await;
+    Ok(())
+}
+
+/// Fire the `session_start` (`start = true`) or `session_end` hooks and
+/// print their activity — the gateway has no long-lived event channel.
+async fn fire_session_hooks(agent: &mut Agent, start: bool) {
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    if start {
+        agent.fire_session_start(&tx).await;
+    } else {
+        agent.fire_session_end(Some(&tx)).await;
+    }
+    drop(tx);
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::HookFired {
+            event,
+            command,
+            outcome,
+        } = event
+        {
+            println!("hook {event}: {outcome} ({command})");
         }
     }
 }
@@ -206,6 +254,12 @@ async fn run_one_turn(agent: &mut Agent, text: &str) -> String {
                 AgentEvent::TextDelta(delta) => reply.push_str(&delta),
                 AgentEvent::ToolStarted { name, .. } => tools.push(name),
                 AgentEvent::Error(message) => error = Some(message),
+                AgentEvent::PlanReady { plan, respond } => {
+                    // No human reviews a gateway plan: include it in the
+                    // reply and approve so the turn proceeds to execute.
+                    reply.push_str(&format!("[plan]\n{plan}\n[plan auto-approved]\n\n"));
+                    let _ = respond.send(PlanVerdict::approve());
+                }
                 _ => {}
             }
         }
