@@ -63,6 +63,11 @@ pub struct ToolContext {
     /// Settings for the native web tools (`[web]` in `config.toml`), set by
     /// the agent at construction; defaults elsewhere.
     pub web: Arc<crate::config::WebConfig>,
+    /// Per-file checkpoint store, set by the agent at construction. The
+    /// dispatcher and the subagent loop snapshot `Edit`-class targets into
+    /// it before execution. `None` outside an agent (direct registry
+    /// execution in tests).
+    pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
 }
 
 impl ToolContext {
@@ -73,12 +78,19 @@ impl ToolContext {
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),
+            checkpoints: None,
         }
     }
 
     /// This context with `web` tool settings applied (agent construction).
     pub fn with_web(mut self, web: crate::config::WebConfig) -> Self {
         self.web = Arc::new(web);
+        self
+    }
+
+    /// This context with the checkpoint store attached (agent construction).
+    pub fn with_checkpoints(mut self, store: Arc<crate::checkpoint::CheckpointStore>) -> Self {
+        self.checkpoints = Some(store);
         self
     }
 

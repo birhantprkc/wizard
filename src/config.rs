@@ -239,6 +239,24 @@ impl Default for WebConfig {
     }
 }
 
+/// Per-file checkpoint settings (`[checkpoints]` in `config.toml`).
+/// Snapshots of files edited by Wizard land under
+/// `<project>/.wizard/checkpoints/` and power `/rewind` and the perpetual
+/// `rollback_failed_cycles` option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckpointConfig {
+    /// Number of most recent turns whose snapshots are kept; older turns are
+    /// garbage-collected at session start (default 50).
+    pub keep_turns: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self { keep_turns: 50 }
+    }
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +425,10 @@ pub struct Config {
     /// Continuous mode: re-enter plan mode at the top of every cycle, so each
     /// cycle plans read-only before acting.
     pub plan_each_cycle: bool,
+    /// Continuous mode: when a cycle ends in a circuit breaker or a hard
+    /// error, restore that cycle's file checkpoints before moving on (the
+    /// rollback is noted in `mission.toml`). Default false.
+    pub rollback_failed_cycles: bool,
     /// Base seconds for exponential backoff when the LLM server is unreachable
     /// or rate-limited.
     pub retry_base_secs: u64,
@@ -435,6 +457,9 @@ pub struct Config {
     /// Native web tool settings (`web_fetch` / `web_search`).
     #[serde(default)]
     pub web: WebConfig,
+    /// Per-file checkpoint settings (snapshots powering `/rewind`).
+    #[serde(default)]
+    pub checkpoints: CheckpointConfig,
 }
 
 impl Default for Config {
@@ -450,6 +475,7 @@ impl Default for Config {
             continuous: false,
             plan_first: false,
             plan_each_cycle: false,
+            rollback_failed_cycles: false,
             retry_base_secs: 5,
             retry_max_secs: 300,
             cycle_pause_secs: 0,
@@ -459,6 +485,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             ui: UiConfig::default(),
             web: WebConfig::default(),
+            checkpoints: CheckpointConfig::default(),
         }
     }
 }
@@ -719,6 +746,16 @@ mod tests {
         assert_eq!(config.retry_max_secs, 300);
         assert_eq!(config.cycle_pause_secs, 0);
         assert_eq!(config.compact_threshold_bytes, 48_000);
+        assert!(!config.rollback_failed_cycles);
+        assert_eq!(config.checkpoints.keep_turns, 50);
+    }
+
+    #[test]
+    fn checkpoints_section_parses() {
+        let config: Config = toml::from_str("[checkpoints]\nkeep_turns = 7").expect("valid toml");
+        assert_eq!(config.checkpoints.keep_turns, 7);
+        let config: Config = toml::from_str("rollback_failed_cycles = true").expect("valid toml");
+        assert!(config.rollback_failed_cycles);
     }
 
     #[test]
@@ -753,6 +790,7 @@ mod tests {
             continuous: true,
             plan_first: true,
             plan_each_cycle: true,
+            rollback_failed_cycles: true,
             retry_base_secs: 10,
             retry_max_secs: 600,
             cycle_pause_secs: 30,
@@ -782,6 +820,7 @@ mod tests {
                 search_backend: "brave".to_string(),
                 search_api_key_env: Some("BRAVE_API_KEY".to_string()),
             },
+            checkpoints: CheckpointConfig { keep_turns: 12 },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -814,6 +853,11 @@ mod tests {
         assert_eq!(parsed.gateway.allowed_chat_ids, vec![42, -100123]);
         assert_eq!(parsed.ui, original.ui);
         assert_eq!(parsed.web, original.web);
+        assert_eq!(
+            parsed.rollback_failed_cycles,
+            original.rollback_failed_cycles
+        );
+        assert_eq!(parsed.checkpoints, original.checkpoints);
     }
 
     #[test]

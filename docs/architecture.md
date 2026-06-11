@@ -231,6 +231,7 @@ Ratatui + crossterm terminal UI:
 | `~/.wizard/evolution.jsonl` | Self-extension log |
 | `~/.wizard/logs/` | Debug traces |
 | `.wizard/loop-control` | Sovereign-mode run control (per project) |
+| `.wizard/checkpoints/` | Per-file edit snapshots powering `/rewind` (per project; see [checkpoints.md](checkpoints.md)) |
 
 ## Install scripts
 

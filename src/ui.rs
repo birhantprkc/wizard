@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
 //! line and a quiet status line. Floating layers: the command-suggestion
-//! popup and the model/mode picker.
+//! popup and the model/mode/rewind picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -707,7 +707,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// Centered modal for the model / mode picker.
+/// Centered modal for the model / mode / rewind picker.
 fn draw_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = &app.picker else {
         return;

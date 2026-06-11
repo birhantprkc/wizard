@@ -3,9 +3,9 @@
 //! Every tool call in every mode (TUI, headless, gateway) funnels through
 //! [`Dispatcher::dispatch`]. The pipeline runs in stages, in order:
 //! plan-mode gate (blocks non-read-only tools while planning) → pre-tool
-//! hooks (may rewrite arguments or block) → execute → post-tool hooks (may
-//! append context) → failure bookkeeping. The remaining seam — the
-//! checkpoint snapshot after the pre-hooks — slots in here when it lands.
+//! hooks (may rewrite arguments or block) → checkpoint snapshot of
+//! `Edit`-class targets (best-effort, never blocks the call) → execute →
+//! post-tool hooks (may append context) → failure bookkeeping.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,6 +174,11 @@ impl Dispatcher {
                 return self.bookkeep(&name, &args, output, events).await;
             }
         }
+
+        // Checkpoint stage: snapshot the target of an Edit-class tool so the
+        // turn can be rewound. Runs after the pre-hooks (which may have
+        // rewritten the path) and never fails the call.
+        crate::checkpoint::snapshot_edit_target(&self.registry, &name, &args, ctx);
 
         let Some(mut output) = self.execute(&name, args.clone(), ctx, events).await else {
             return DispatchOutcome::stopped();

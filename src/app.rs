@@ -101,6 +101,9 @@ pub enum SlashCommand {
     /// Toggle plan mode (also Shift+Tab): read-only investigation until a
     /// plan is approved via `exit_plan`.
     Plan,
+    /// `/rewind [turn]` — restore file checkpoints and truncate history.
+    /// `None` opens the turn picker; `Some` rewinds to before that turn.
+    Rewind(Option<u64>),
     /// Toggle the git diff sidebar.
     Diff,
     /// Toggle the todo side panel.
@@ -251,6 +254,13 @@ impl SlashCommand {
             }
             "reload" => Ok(Self::Reload),
             "plan" => Ok(Self::Plan),
+            "rewind" => match args.first() {
+                None => Ok(Self::Rewind(None)),
+                Some(arg) => arg
+                    .parse::<u64>()
+                    .map(|turn| Self::Rewind(Some(turn)))
+                    .map_err(|_| "usage: /rewind [turn]".to_string()),
+            },
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
             "cost" => Ok(Self::Cost),
@@ -314,6 +324,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "plan",
         args: "",
         description: "toggle plan mode: read-only until a plan is approved",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "rewind",
+        args: "[turn]",
+        description: "rewind files and conversation to before a turn",
         takes_args: false,
     },
     CommandSpec {
@@ -401,6 +417,8 @@ pub const COMMANDS: &[CommandSpec] = &[
 pub enum PickerKind {
     Model,
     Mode,
+    /// A turn to rewind to (item values are turn ids).
+    Rewind,
 }
 
 /// One selectable row in a picker popup.
@@ -495,7 +513,7 @@ pub struct App {
     pub suggestions: Vec<&'static CommandSpec>,
     /// Highlighted row in `suggestions`.
     pub suggestion_index: usize,
-    /// Open selection popup (model / mode picker), if any.
+    /// Open selection popup (model / mode / rewind picker), if any.
     pub picker: Option<Picker>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
@@ -917,6 +935,13 @@ impl App {
                                 Mode::Genie
                             };
                             AppAction::Command(SlashCommand::Mode(Some(mode)))
+                        }
+                        PickerKind::Rewind => {
+                            // Item values are always turn ids we formatted.
+                            let Ok(turn) = item.value.parse::<u64>() else {
+                                return Ok(None);
+                            };
+                            AppAction::Command(SlashCommand::Rewind(Some(turn)))
                         }
                     };
                     return Ok(Some(action));
@@ -1534,6 +1559,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
 /genie · /sovereign         switch mode directly\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
+/rewind [turn]              rewind files and conversation to before a turn\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
@@ -1966,6 +1992,8 @@ impl CommandContext<'_> {
             SlashCommand::Mode(None) => self.open_mode_picker(),
             SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
             SlashCommand::Plan => self.toggle_plan(),
+            SlashCommand::Rewind(None) => self.open_rewind_picker(),
+            SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
@@ -2172,6 +2200,94 @@ impl CommandContext<'_> {
         } else {
             "plan mode off"
         });
+    }
+
+    /// `/rewind`: open the turn picker (newest first). Each row shows the
+    /// turn number, the files its edits snapshotted, and the first line of
+    /// the prompt that started it. Esc cancels.
+    fn open_rewind_picker(&mut self) {
+        if self.agent_unavailable("rewind") {
+            return;
+        }
+        let Some(agent) = self.agent_slot.as_ref() else {
+            self.app.notice("the agent is busy — try again in a moment");
+            return;
+        };
+        let candidates = agent.rewind_candidates(20);
+        if candidates.is_empty() {
+            self.app.notice("nothing to rewind yet");
+            return;
+        }
+        let items: Vec<PickerItem> = candidates
+            .iter()
+            .map(|candidate| {
+                let files = candidate
+                    .files
+                    .iter()
+                    .map(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let detail = match (candidate.prompt.is_empty(), files.is_empty()) {
+                    (false, false) => format!("{} · {files}", candidate.prompt),
+                    (false, true) => candidate.prompt.clone(),
+                    (true, false) => files,
+                    (true, true) => String::new(),
+                };
+                PickerItem {
+                    value: candidate.turn.to_string(),
+                    detail,
+                    current: false,
+                }
+            })
+            .collect();
+        self.app.picker = Some(Picker {
+            kind: PickerKind::Rewind,
+            title: " rewind to before turn ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// `/rewind <turn>` (or a picker selection): restore the files and drop
+    /// the rewound turns from the session and the transcript.
+    fn rewind(&mut self, turn: u64) {
+        if self.agent_unavailable("rewind") {
+            return;
+        }
+        let Some(agent) = self.agent_slot.as_mut() else {
+            self.app.notice("the agent is busy — try again in a moment");
+            return;
+        };
+        match agent.rewind_to(turn) {
+            Ok(restored) => {
+                // The rewound turns no longer exist: reset the transcript
+                // view to match the truncated conversation.
+                self.app.transcript.clear();
+                self.app.streaming.clear();
+                self.app.streaming_thinking.clear();
+                self.app.scroll = 0;
+                let files = if restored.is_empty() {
+                    "no files needed restoring".to_string()
+                } else {
+                    format!(
+                        "restored {}",
+                        restored
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                self.app.notice(format!(
+                    "rewound to before turn {turn} — {files}; conversation truncated"
+                ));
+            }
+            Err(err) => self.app.notice(format!("rewind failed: {err:#}")),
+        }
     }
 
     fn switch_mode(&mut self, mode: Mode) {
@@ -2769,7 +2885,8 @@ mod tests {
     #[test]
     fn tab_completes_the_selected_suggestion() {
         let mut app = app();
-        type_str(&mut app, "/re");
+        // "/re" would be ambiguous between /rewind and /reload.
+        type_str(&mut app, "/rel");
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.input, "/reload");
         assert_eq!(app.cursor, "/reload".chars().count());
@@ -2937,6 +3054,68 @@ mod tests {
     fn todos_and_cost_parse() {
         assert_eq!(SlashCommand::parse("/todos"), Some(Ok(SlashCommand::Todos)));
         assert_eq!(SlashCommand::parse("/cost"), Some(Ok(SlashCommand::Cost)));
+    }
+
+    #[test]
+    fn rewind_parses_with_and_without_a_turn() {
+        assert_eq!(
+            SlashCommand::parse("/rewind"),
+            Some(Ok(SlashCommand::Rewind(None)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/rewind 7"),
+            Some(Ok(SlashCommand::Rewind(Some(7))))
+        );
+        let parsed = SlashCommand::parse("/rewind soon").expect("is a slash command");
+        let message = parsed.expect_err("non-numeric turn");
+        assert!(message.contains("/rewind [turn]"), "got: {message}");
+    }
+
+    #[test]
+    fn rewind_picker_selection_becomes_a_rewind_command() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Rewind,
+            title: " rewind to before turn ".to_string(),
+            items: vec![
+                PickerItem {
+                    value: "9".to_string(),
+                    detail: "fix tests · notes.txt".to_string(),
+                    current: false,
+                },
+                PickerItem {
+                    value: "8".to_string(),
+                    detail: String::new(),
+                    current: false,
+                },
+            ],
+            selected: 0,
+        });
+        press(&mut app, KeyCode::Down);
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            action,
+            Some(AppAction::Command(SlashCommand::Rewind(Some(8))))
+        ));
+        assert!(app.picker.is_none(), "the picker closed");
+    }
+
+    #[test]
+    fn rewind_picker_esc_cancels() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Rewind,
+            title: " rewind to before turn ".to_string(),
+            items: vec![PickerItem {
+                value: "3".to_string(),
+                detail: String::new(),
+                current: false,
+            }],
+            selected: 0,
+        });
+        let action = press(&mut app, KeyCode::Esc);
+        assert!(action.is_none());
+        assert!(app.picker.is_none(), "Esc closed the picker");
     }
 
     #[test]

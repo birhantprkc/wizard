@@ -289,6 +289,22 @@ pub struct Agent {
     /// Where per-turn usage records are appended
     /// (`~/.wizard/usage.jsonl`); `None` disables the log.
     usage_log: Option<PathBuf>,
+    /// Per-file checkpoint store (`.wizard/checkpoints/` in the project).
+    /// Shared with the tool context so the dispatcher and subagents snapshot
+    /// `Edit`-class targets into it; `/rewind` and perpetual rollback
+    /// restore from it.
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+}
+
+/// One row of the `/rewind` picker: a turn, the prompt that started it, and
+/// the files its tool calls snapshotted.
+#[derive(Debug, Clone)]
+pub struct RewindCandidate {
+    pub turn: u64,
+    /// First line of the turn's user prompt (empty when unknown).
+    pub prompt: String,
+    /// Files the turn snapshotted before editing.
+    pub files: Vec<PathBuf>,
 }
 
 /// Number of most-recent messages preserved verbatim when compacting history.
@@ -347,6 +363,21 @@ impl Agent {
         // the always-registered exit_plan tool (cleared on approval).
         let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let web = config.web.clone();
+
+        // Checkpoints: per-file snapshots of everything this agent edits.
+        // Old turns are garbage-collected once per session, here.
+        let checkpoints = Arc::new(crate::checkpoint::CheckpointStore::open(
+            &project_root,
+            config.checkpoints.keep_turns,
+        ));
+        match checkpoints.gc() {
+            Ok(dropped) if dropped > 0 => {
+                tracing::debug!("checkpoint gc dropped {dropped} old turn(s)");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("checkpoint gc failed: {err:#}"),
+        }
+
         let mut registry = registry;
         registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
             &plan_mode,
@@ -366,7 +397,9 @@ impl Agent {
             config,
             history: Vec::new(),
             session,
-            ctx: ToolContext::new(project_root).with_web(web),
+            ctx: ToolContext::new(project_root)
+                .with_web(web)
+                .with_checkpoints(Arc::clone(&checkpoints)),
             native_tools,
             skills,
             agents_md,
@@ -377,6 +410,7 @@ impl Agent {
             plan_prompt_on: false,
             usage: crate::usage::UsageTracker::new(),
             usage_log: crate::usage::default_log_path(),
+            checkpoints,
         };
         agent
             .history
@@ -407,6 +441,73 @@ impl Agent {
     /// Session this agent persists to.
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The per-file checkpoint store (snapshots powering `/rewind` and
+    /// perpetual rollback).
+    pub fn checkpoints(&self) -> &Arc<crate::checkpoint::CheckpointStore> {
+        &self.checkpoints
+    }
+
+    /// Recent turns `/rewind` can return to, newest first: this session's
+    /// turn markers (prompt snippets) joined with the checkpoint store's
+    /// per-turn file lists. Turns from before this session are listed only
+    /// when the session has no markers at all (old-format resume), since
+    /// only marked turns can also truncate the conversation.
+    pub fn rewind_candidates(&self, limit: usize) -> Vec<RewindCandidate> {
+        let markers = self.session.turn_markers().unwrap_or_default();
+        let first_marked = markers.first().map(|marker| marker.turn);
+        let mut by_turn: std::collections::BTreeMap<u64, RewindCandidate> = markers
+            .into_iter()
+            .map(|marker| {
+                (
+                    marker.turn,
+                    RewindCandidate {
+                        turn: marker.turn,
+                        prompt: marker.prompt,
+                        files: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        for turn_files in self.checkpoints.recent_turns(usize::MAX) {
+            if first_marked.is_some_and(|first| turn_files.turn < first) {
+                continue;
+            }
+            by_turn
+                .entry(turn_files.turn)
+                .or_insert_with(|| RewindCandidate {
+                    turn: turn_files.turn,
+                    prompt: String::new(),
+                    files: Vec::new(),
+                })
+                .files = turn_files.files;
+        }
+        by_turn.into_values().rev().take(limit).collect()
+    }
+
+    /// `/rewind`: restore every file snapshot from `turn` onward, drop the
+    /// rewound turns from the session file, and reload the in-memory
+    /// conversation to match. Returns the restored file paths.
+    pub fn rewind_to(&mut self, turn: u64) -> Result<Vec<PathBuf>> {
+        let restored = self
+            .checkpoints
+            .restore_turns_from(turn)
+            .context("restoring checkpoints")?;
+        self.session
+            .truncate_after(turn)
+            .context("truncating session history")?;
+        let prior: Vec<ChatMessage> = self
+            .session
+            .load_messages()
+            .context("reloading session history")?
+            .into_iter()
+            .filter(|message| message.role != Role::System)
+            .collect();
+        self.history.truncate(1);
+        self.history.extend(prior);
+        self.dispatcher.reset_failures();
+        Ok(restored)
     }
 
     /// Set (or clear) the wall-clock deadline for this run (`--max-hours`).
@@ -647,6 +748,13 @@ impl Agent {
             }
             PromptSubmit::Continue(None) => input.to_string(),
         };
+        // Turn boundary: a fresh checkpoint turn for the dispatcher's
+        // snapshots, anchored in the session file so /rewind can truncate
+        // here. Best-effort — a marker failure never blocks the turn.
+        let turn = self.checkpoints.begin_turn();
+        if let Err(err) = self.session.append_marker(turn, &input) {
+            tracing::warn!("could not append turn marker: {err}");
+        }
         self.push(ChatMessage::user(input));
         self.compact_if_needed(events).await;
         let max_steps = self.config.max_steps.max(1);
@@ -1230,6 +1338,44 @@ pub async fn build_headless_agent(
     )
 }
 
+/// `rollback_failed_cycles`: restore every checkpoint from the failed
+/// cycle's first turn onward and note the rollback in the persisted mission.
+/// Best-effort — failures are logged and the run proceeds to its normal end.
+fn rollback_failed_cycle(
+    config: &Config,
+    agent: &Agent,
+    mission: Option<&mut mission::Mission>,
+    project_root: &Path,
+    first_turn: u64,
+    why: &str,
+    spinner: &crate::progress::TurnSpinner,
+) {
+    if !config.rollback_failed_cycles {
+        return;
+    }
+    match agent.checkpoints().restore_turns_from(first_turn) {
+        Ok(restored) => {
+            if restored.is_empty() {
+                return;
+            }
+            spinner.println(&format!(
+                "[rolled back {} file(s) after {why}]",
+                restored.len()
+            ));
+            if let Some(mission) = mission {
+                mission.note(format!(
+                    "rolled back {} file(s) after {why} (cycle starting at turn {first_turn})",
+                    restored.len()
+                ));
+                if let Err(err) = mission.save(project_root) {
+                    tracing::warn!("could not record rollback in mission.toml: {err:#}");
+                }
+            }
+        }
+        Err(err) => tracing::warn!("cycle rollback failed: {err:#}"),
+    }
+}
+
 /// Sovereign-mode headless runner: builds an [`Agent`] and drives it in an
 /// outer loop. The goal comes from `cli.prompt`, or (on a self-evolve
 /// re-exec) from the persisted [`mission::Mission`]. With `--continuous` it
@@ -1430,6 +1576,9 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
 
         let turn_started = Instant::now();
         let turn_prompt = input.clone();
+        // First checkpoint turn of this cycle, for rollback_failed_cycles
+        // (run_turn assigns the next id via begin_turn).
+        let cycle_first_turn = agent.checkpoints().current_turn() + 1;
         match agent.run_turn(&input, tx.clone()).await {
             Ok(reason) => {
                 final_reason = reason;
@@ -1479,12 +1628,33 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                             break;
                         }
                     }
-                    DoneReason::Stopped | DoneReason::TimeLimit | DoneReason::CircuitBreaker => {
+                    DoneReason::Stopped | DoneReason::TimeLimit => {
+                        break;
+                    }
+                    DoneReason::CircuitBreaker => {
+                        rollback_failed_cycle(
+                            &config,
+                            &agent,
+                            mission_state.as_mut(),
+                            &project_root,
+                            cycle_first_turn,
+                            "circuit breaker",
+                            &spinner,
+                        );
                         break;
                     }
                 }
             }
             Err(err) => {
+                rollback_failed_cycle(
+                    &config,
+                    &agent,
+                    mission_state.as_mut(),
+                    &project_root,
+                    cycle_first_turn,
+                    "hard error",
+                    &spinner,
+                );
                 run_error = Some(err);
                 break;
             }
@@ -2428,6 +2598,195 @@ mod tests {
         // A registry swap (/reload, /evolve) re-registers it.
         agent.set_registry(ToolRegistry::new());
         assert!(has_exit_plan(&agent), "re-registered after set_registry");
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_an_overwritten_file_and_truncates_history() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("notes.txt");
+        std::fs::write(&file, "before").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "after" }),
+                )],
+                vec![final_chunk("overwritten")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let reason = agent.run_turn("overwrite notes.txt", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after");
+        assert!(agent.history().len() > 1);
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].prompt, "overwrite notes.txt");
+        assert_eq!(candidates[0].files, vec![file.clone()]);
+
+        let restored = agent.rewind_to(candidates[0].turn).unwrap();
+        assert_eq!(restored, vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+        assert_eq!(
+            agent.history().len(),
+            1,
+            "only the system prompt survives a full rewind"
+        );
+        assert!(
+            agent.session().load_messages().unwrap().is_empty(),
+            "the session file was truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_deletes_a_file_the_turn_created() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("created.txt");
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "created.txt", "content": "fresh" }),
+                )],
+                vec![final_chunk("created")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("create created.txt", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fresh");
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 1);
+        agent.rewind_to(candidates[0].turn).unwrap();
+        assert!(!file.exists(), "rewind deletes a file that did not exist");
+    }
+
+    #[tokio::test]
+    async fn rewind_to_a_later_turn_keeps_earlier_turns() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("notes.txt");
+        std::fs::write(&file, "v0").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "v1" }),
+                )],
+                vec![final_chunk("first done")],
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "v2" }),
+                )],
+                vec![final_chunk("second done")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("write v1", tx.clone()).await.unwrap();
+        agent.run_turn("write v2", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+
+        let candidates = agent.rewind_candidates(10);
+        assert_eq!(candidates.len(), 2, "newest first");
+        assert!(candidates[0].turn > candidates[1].turn);
+
+        agent.rewind_to(candidates[0].turn).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
+        let messages = agent.session().load_messages().unwrap();
+        assert_eq!(
+            messages.first().map(|m| m.content.as_str()),
+            Some("write v1"),
+            "the first turn's history survives"
+        );
+        assert!(
+            messages.iter().all(|m| m.content != "write v2"),
+            "the second turn's history is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_failed_cycle_restores_files_and_notes_the_mission() {
+        let tmp = TempDir::new();
+        let file = tmp.0.join("data.txt");
+        std::fs::write(&file, "good").unwrap();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "write_file",
+                    json!({ "path": "data.txt", "content": "broken" }),
+                )],
+                vec![final_chunk("changed it")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let cycle_first_turn = agent.checkpoints().current_turn() + 1;
+        let (tx, mut rx) = mpsc::channel(256);
+        agent.run_turn("break the data", tx).await.unwrap();
+        drain_events(&mut rx);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken");
+
+        let spinner = crate::progress::TurnSpinner::new();
+        let mut mission = mission::Mission::new("keep the data good");
+
+        // Disabled: a no-op.
+        let config = Config::default();
+        rollback_failed_cycle(
+            &config,
+            &agent,
+            Some(&mut mission),
+            &tmp.0,
+            cycle_first_turn,
+            "circuit breaker",
+            &spinner,
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken");
+        assert!(mission.notes.is_empty());
+
+        // Enabled: the cycle's edits are restored and the mission notes it.
+        let config = Config {
+            rollback_failed_cycles: true,
+            ..Config::default()
+        };
+        rollback_failed_cycle(
+            &config,
+            &agent,
+            Some(&mut mission),
+            &tmp.0,
+            cycle_first_turn,
+            "circuit breaker",
+            &spinner,
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "good");
+        assert!(
+            mission
+                .notes
+                .last()
+                .is_some_and(|note| note.contains("rolled back 1 file(s)")
+                    && note.contains("circuit breaker")),
+            "rollback noted in the mission: {:?}",
+            mission.notes
+        );
+        // The note was persisted to mission.toml.
+        let loaded = mission::Mission::load(&tmp.0).unwrap().expect("saved");
+        assert_eq!(loaded.notes, mission.notes);
     }
 
     #[tokio::test]

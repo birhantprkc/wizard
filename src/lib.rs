@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod app;
 pub mod bench;
+pub mod checkpoint;
 pub mod cli;
 pub mod config;
 pub mod dispatch;

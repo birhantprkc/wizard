@@ -138,6 +138,7 @@ appended to `~/.wizard/evolution.jsonl`.
 | `retry_max_secs` | `300` | Cap on backoff between retries |
 | `cycle_pause_secs` | `0` | Pause between continuous cycles |
 | `compact_threshold_bytes` | `48000` | History size that triggers compaction |
+| `rollback_failed_cycles` | `false` | Restore a failed cycle's file checkpoints (see [checkpoints.md](checkpoints.md)) |
 
 > **Run it in a container or VM.** Continuous mode auto-approves every tool call with no
 > human in the loop and can rewrite its own binary. Point it only at work you're willing

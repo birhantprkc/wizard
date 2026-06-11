@@ -1,5 +1,8 @@
 //! JSONL session persistence under `~/.wizard/sessions/<timestamp>.jsonl`.
 //! One [`SessionRecord`] per line, appended after each message lands.
+//! Turn boundaries are marked by interleaved [`TurnMarker`] lines so
+//! `/rewind` can truncate history at a turn; files without markers (older
+//! sessions) still load.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -17,6 +20,31 @@ pub struct SessionRecord {
     pub timestamp: DateTime<Utc>,
     pub message: ChatMessage,
 }
+
+/// A turn-boundary line, written just before the turn's user message. Anchors
+/// [`Session::truncate_after`] and labels the `/rewind` picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnMarker {
+    pub timestamp: DateTime<Utc>,
+    /// Checkpoint turn id (monotonic per project — see
+    /// [`crate::checkpoint::CheckpointStore::begin_turn`]).
+    pub turn: u64,
+    /// First line of the user prompt that started the turn (truncated).
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// Either kind of session line. Untagged: a marker has a `turn` field, a
+/// message record has `message` — old files (messages only) parse unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SessionLine {
+    Marker(TurnMarker),
+    Message(SessionRecord),
+}
+
+/// Cap on the prompt snippet stored in a [`TurnMarker`].
+const MARKER_PROMPT_CHARS: usize = 120;
 
 /// Handle to one session file. Append-only; cheap to clone the path out of.
 #[derive(Debug, Clone)]
@@ -82,7 +110,33 @@ impl Session {
         Ok(())
     }
 
-    /// Load all messages back (for `--resume`). Corrupt lines are skipped.
+    /// Append a turn-boundary marker. `prompt` is reduced to its first line,
+    /// capped at [`MARKER_PROMPT_CHARS`] characters.
+    pub fn append_marker(&self, turn: u64, prompt: &str) -> Result<()> {
+        let snippet: String = prompt
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(MARKER_PROMPT_CHARS)
+            .collect();
+        let marker = TurnMarker {
+            timestamp: Utc::now(),
+            turn,
+            prompt: snippet,
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let line = serde_json::to_string(&marker).context("serializing turn marker")?;
+        writeln!(file, "{line}").with_context(|| format!("writing {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Load all messages back (for `--resume`). Turn markers and corrupt
+    /// lines are skipped.
     pub fn load_messages(&self) -> Result<Vec<ChatMessage>> {
         let file = std::fs::File::open(&self.path)
             .with_context(|| format!("opening {}", self.path.display()))?;
@@ -92,12 +146,57 @@ impl Session {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<SessionRecord>(&line) {
-                Ok(record) => messages.push(record.message),
+            match serde_json::from_str::<SessionLine>(&line) {
+                Ok(SessionLine::Message(record)) => messages.push(record.message),
+                Ok(SessionLine::Marker(_)) => {}
                 Err(err) => tracing::warn!("skipping corrupt session line: {err}"),
             }
         }
         Ok(messages)
+    }
+
+    /// All turn markers in this session, in file order. Old-format files
+    /// (no markers) yield an empty vec.
+    pub fn turn_markers(&self) -> Result<Vec<TurnMarker>> {
+        let file = std::fs::File::open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut markers = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(SessionLine::Marker(marker)) = serde_json::from_str::<SessionLine>(&line) {
+                markers.push(marker);
+            }
+        }
+        Ok(markers)
+    }
+
+    /// Drop turn `turn_id` and everything after it: the file is cut at the
+    /// first marker with `turn >= turn_id` (`>=` so a rewind survives gaps
+    /// in the marker sequence). Old-format files without markers are left
+    /// unchanged. Returns true when the file was truncated.
+    pub fn truncate_after(&self, turn_id: u64) -> Result<bool> {
+        let raw = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let lines: Vec<&str> = raw.lines().collect();
+        let cut = lines.iter().position(|line| {
+            matches!(
+                serde_json::from_str::<SessionLine>(line),
+                Ok(SessionLine::Marker(marker)) if marker.turn >= turn_id
+            )
+        });
+        let Some(cut) = cut else {
+            return Ok(false);
+        };
+        let mut kept = lines[..cut].join("\n");
+        if !kept.is_empty() {
+            kept.push('\n');
+        }
+        std::fs::write(&self.path, kept)
+            .with_context(|| format!("rewriting {}", self.path.display()))?;
+        Ok(true)
     }
 }
 
@@ -237,6 +336,85 @@ mod tests {
             .unwrap()
             .expect("a session exists");
         assert_eq!(latest.id, "2026-06-09T09-30-00");
+    }
+
+    #[test]
+    fn turn_markers_are_skipped_by_load_and_listed_separately() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        session
+            .append_marker(1, "first prompt\nsecond line ignored")
+            .unwrap();
+        session.append(&ChatMessage::user("first prompt")).unwrap();
+        session.append(&ChatMessage::assistant("reply")).unwrap();
+        session.append_marker(2, "second prompt").unwrap();
+        session.append(&ChatMessage::user("second prompt")).unwrap();
+
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 3, "markers are not messages");
+        let markers = session.turn_markers().unwrap();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].turn, 1);
+        assert_eq!(markers[0].prompt, "first prompt");
+        assert_eq!(markers[1].turn, 2);
+    }
+
+    #[test]
+    fn truncate_after_drops_the_turn_and_its_tail() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        session.append_marker(1, "one").unwrap();
+        session.append(&ChatMessage::user("one")).unwrap();
+        session.append(&ChatMessage::assistant("ack one")).unwrap();
+        session.append_marker(2, "two").unwrap();
+        session.append(&ChatMessage::user("two")).unwrap();
+        session.append(&ChatMessage::assistant("ack two")).unwrap();
+
+        assert!(session.truncate_after(2).unwrap());
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "one");
+        assert_eq!(messages[1].content, "ack one");
+        assert_eq!(session.turn_markers().unwrap().len(), 1);
+
+        // Appending continues to work after the rewrite.
+        session.append_marker(3, "three").unwrap();
+        session.append(&ChatMessage::user("three")).unwrap();
+        assert_eq!(session.load_messages().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn truncate_after_matches_the_next_marker_across_gaps() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        session.append_marker(1, "one").unwrap();
+        session.append(&ChatMessage::user("one")).unwrap();
+        session.append_marker(5, "five").unwrap();
+        session.append(&ChatMessage::user("five")).unwrap();
+
+        // Turn 3 has no marker: the cut lands on the next marker (5).
+        assert!(session.truncate_after(3).unwrap());
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "one");
+    }
+
+    #[test]
+    fn old_format_files_without_markers_load_and_survive_truncate() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        // Old format: message records only.
+        session.append(&ChatMessage::user("hello")).unwrap();
+        session.append(&ChatMessage::assistant("hi")).unwrap();
+
+        assert!(session.turn_markers().unwrap().is_empty());
+        assert!(
+            !session.truncate_after(1).unwrap(),
+            "no marker to anchor on: the file is left unchanged"
+        );
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "hello");
     }
 
     #[test]

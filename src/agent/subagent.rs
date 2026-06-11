@@ -265,6 +265,10 @@ pub async fn spawn(
                     if let Some(updated) = updated {
                         args = updated;
                     }
+                    // Same checkpoint seam as the parent's dispatcher: the
+                    // subagent's edits are snapshotted under the parent's
+                    // current turn (the context carries the parent's store).
+                    crate::checkpoint::snapshot_edit_target(&scoped, &name, &args, &ctx);
                     let mut output = match scoped.execute(&name, args.clone(), &ctx).await {
                         Ok(output) => output,
                         Err(err) => ToolOutput::error(err.to_string()),
