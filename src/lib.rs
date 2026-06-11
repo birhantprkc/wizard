@@ -118,6 +118,21 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             }
         }
     } else {
+        let config_path = config::Config::path()?;
+        if !config_path.exists() {
+            // Non-interactive first runs (piped stdout, CI, cron) must not
+            // silently fall back to a baked-in local provider — there is no
+            // config yet and onboarding needs a TTY.
+            let headless_with_prompt = cli.prompt.is_some()
+                && (cli.mode == Some(Mode::Sovereign) || cli.continuous);
+            if !headless_with_prompt {
+                anyhow::bail!(
+                    "no config at {} — run `wizard` in an interactive terminal \
+                     (or `wizard --onboard`) to pick a provider",
+                    config_path.display()
+                );
+            }
+        }
         config::Config::load()?
     };
     if !config.auto_approve {

@@ -235,12 +235,37 @@ fn legacy_ollama_config_resolves_to_llamacpp() {
 }
 
 #[test]
+fn missing_config_without_a_tty_points_at_onboarding() {
+    let home = TempDir::new();
+    // `Command::output` pipes stdout/stderr, so this is non-interactive: no
+    // config must not fall through to a local provider probe (Ollama or
+    // llama.cpp).
+    let output = run_wizard(&home.0, &[], &[]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("onboard") || stderr.contains("config"),
+        "error must point at setup:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("ollama serve"),
+        "a fresh install must not require Ollama:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("llama-server"),
+        "a fresh install must not probe llama-server before setup:\n{stderr}"
+    );
+}
+
+#[test]
 fn headless_mode_without_a_prompt_is_an_actionable_error() {
     let home = TempDir::new();
+    write_config(&home.0, "llamacpp_host = \"http://127.0.0.1:1\"\n");
     let output = run_wizard(
         &home.0,
         &["--mode", "sovereign"],
-        &[("WIZARD_OLLAMA_HOST", "http://127.0.0.1:1")],
+        &[("PATH", "/nonexistent")],
     );
 
     assert!(!output.status.success());
