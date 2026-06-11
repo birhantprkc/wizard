@@ -16,7 +16,11 @@ Set Height 680
 Set Padding 14
 Set Framerate 20
 Set TypingSpeed 40ms
-Set Theme { "name": "wizard-dark", "background": "#101014", "foreground": "#e8e6f0", "cursor": "#d36ee6", "black": "#16161c", "red": "#f25e74", "green": "#5fd6a0", "yellow": "#e6c36e", "blue": "#7aa5f0", "magenta": "#d36ee6", "cyan": "#6ed6e6", "white": "#d8d6e0", "brightBlack": "#4a4a56", "brightRed": "#ff7a8e", "brightGreen": "#7af0ba", "brightYellow": "#ffd98e", "brightBlue": "#9ec0ff", "brightMagenta": "#ea8ef5", "brightCyan": "#8ef0ff", "brightWhite": "#f4f2fa" }
+# Palette mirrors the site's warm monochrome (bg #0b0b0a, cream #e9e6df,
+# dim #94908a, faint #55524b). Ratatui maps White -> brightWhite, Gray ->
+# white, DarkGray -> brightBlack, so those slots carry the bright/dim/faint
+# text tiers.
+Set Theme { "name": "wizard-warm", "background": "#0b0b0a", "foreground": "#e9e6df", "cursor": "#e9e6df", "black": "#11110f", "red": "#e06a55", "green": "#a3b285", "yellow": "#d6b36a", "blue": "#95a3b3", "magenta": "#b59a8e", "cyan": "#9cb3a8", "white": "#94908a", "brightBlack": "#55524b", "brightRed": "#f0836b", "brightGreen": "#b8c79a", "brightYellow": "#e8c98a", "brightBlue": "#aebccb", "brightMagenta": "#c9ada0", "brightCyan": "#b0c7bc", "brightWhite": "#f1eee6" }
 
 # --- hidden setup: throwaway copy of the sample repo --------------------------
 Hide
