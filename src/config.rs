@@ -230,6 +230,13 @@ pub struct ProviderConfig {
     /// `llama-server` itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gguf_path: Option<String>,
+    /// Optional input-token price in USD per million tokens, for `/cost`
+    /// estimates. Unset = no cost computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_per_mtok_in: Option<f64>,
+    /// Optional output-token price in USD per million tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_per_mtok_out: Option<f64>,
 }
 
 impl ProviderConfig {
@@ -546,6 +553,8 @@ impl Config {
             model: self.model.clone(),
             api_key_env: None,
             gguf_path: self.gguf_path.clone(),
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
         }
     }
 
@@ -718,6 +727,8 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openai".to_string()),
             gateway: GatewayConfig {
@@ -877,6 +888,8 @@ mod tests {
                 model: "qwen3-8b".to_string(),
                 api_key_env: None,
                 gguf_path: Some("/home/u/.wizard/models/qwen3-8b-q4_k_m.gguf".to_string()),
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("local".to_string()),
             ..Config::default()
@@ -905,6 +918,8 @@ mod tests {
                     model: "grok-4.3".to_string(),
                     api_key_env: Some("XAI_API_KEY".to_string()),
                     gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
                 },
                 ProviderConfig {
                     name: "xai-account".to_string(),
@@ -913,6 +928,8 @@ mod tests {
                     model: "grok-4.3".to_string(),
                     api_key_env: None,
                     gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
                 },
             ],
             active_provider: Some("xai-account".to_string()),
@@ -943,6 +960,8 @@ mod tests {
                 model: "openrouter/auto".to_string(),
                 api_key_env: Some("OPENROUTER_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openrouter".to_string()),
             ..Config::default()
@@ -957,6 +976,35 @@ mod tests {
             Some("OPENROUTER_API_KEY")
         );
         assert_eq!(parsed.active().kind, ProviderKind::OpenRouter);
+    }
+
+    #[test]
+    fn provider_cost_rates_parse_and_round_trip() {
+        let raw = "\
+[[providers]]
+name = \"claude\"
+kind = \"anthropic\"
+base_url = \"https://api.anthropic.com\"
+model = \"claude-fable-5\"
+api_key_env = \"ANTHROPIC_API_KEY\"
+usd_per_mtok_in = 3.0
+usd_per_mtok_out = 15.0
+";
+        let config: Config = toml::from_str(raw).expect("valid toml");
+        let provider = &config.providers[0];
+        assert_eq!(provider.usd_per_mtok_in, Some(3.0));
+        assert_eq!(provider.usd_per_mtok_out, Some(15.0));
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&serialized).expect("parse back");
+        assert_eq!(parsed.providers[0].usd_per_mtok_in, Some(3.0));
+        assert_eq!(parsed.providers[0].usd_per_mtok_out, Some(15.0));
+
+        // Unset rates stay absent on the wire.
+        let bare: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(bare.active().usd_per_mtok_in, None);
+        let serialized = toml::to_string_pretty(&bare).expect("serialize");
+        assert!(!serialized.contains("usd_per_mtok"), "{serialized}");
     }
 
     #[test]
@@ -990,6 +1038,8 @@ mod tests {
                 model: "qwen3.6:27b".to_string(),
                 api_key_env: None,
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             },
             ProviderConfig {
                 name: "claude".to_string(),
@@ -998,6 +1048,8 @@ mod tests {
                 model: "claude-fable-5".to_string(),
                 api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             },
         ];
 
@@ -1037,6 +1089,8 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("openai".to_string()),
             ..Config::default()
@@ -1122,6 +1176,8 @@ mod tests {
                 model: "qwen3-8b".to_string(),
                 api_key_env: None,
                 gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
             }],
             active_provider: Some("local".to_string()),
             ..Config::default()

@@ -15,6 +15,7 @@ pub mod evolve;
 pub mod gateway;
 pub mod hardware;
 pub mod hooks;
+pub mod instructions;
 pub mod llm;
 pub mod local_setup;
 pub mod mcp;
@@ -25,6 +26,7 @@ pub mod server;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+pub mod usage;
 
 use std::io::IsTerminal;
 

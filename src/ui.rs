@@ -65,12 +65,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    if app.show_diff {
-        let [chat_area, diff_area] =
+    if app.show_diff || app.show_todos {
+        let [chat_area, side_area] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(main_area);
         draw_transcript(frame, app, chat_area);
-        draw_diff_sidebar(frame, app, diff_area);
+        match (app.show_todos, app.show_diff) {
+            (true, true) => {
+                // Both panels share the sidebar: todos on top (sized to the
+                // list), the diff below.
+                let todo_height = (app.todos.len() as u16 + 1).clamp(2, side_area.height / 2);
+                let [todo_area, diff_area] =
+                    Layout::vertical([Constraint::Length(todo_height), Constraint::Min(1)])
+                        .areas(side_area);
+                draw_todo_sidebar(frame, app, todo_area);
+                draw_diff_sidebar(frame, app, diff_area);
+            }
+            (true, false) => draw_todo_sidebar(frame, app, side_area),
+            _ => draw_diff_sidebar(frame, app, side_area),
+        }
     } else {
         draw_transcript(frame, app, main_area);
     }
@@ -411,6 +424,47 @@ fn tool_card_lines(
     }
 }
 
+/// Todo side panel (`/todos`, auto-shown on the first todo update): the
+/// agent's working list with status glyphs — ✓ completed (dim,
+/// struck-through), ▸ in progress (accent), ☐ pending.
+fn draw_todo_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let (done, total) = crate::tools::todo::progress(&app.todos);
+    let block = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ≡ ", accent()),
+            Span::styled(
+                format!("todos {done}/{total}"),
+                Style::default().fg(TEXT_DIM),
+            ),
+        ]));
+    let inner_width = block.inner(area).width as usize;
+    let lines: Vec<Line<'static>> = if app.todos.is_empty() {
+        vec![Line::from(Span::styled("(empty)", dim().italic()))]
+    } else {
+        app.todos
+            .iter()
+            .map(|item| {
+                use crate::tools::todo::TodoStatus;
+                let (glyph_style, text_style) = match item.status {
+                    TodoStatus::Completed => (dim(), dim().add_modifier(Modifier::CROSSED_OUT)),
+                    TodoStatus::InProgress => (accent(), accent().bold()),
+                    TodoStatus::Pending => (dim(), Style::default().fg(TEXT_DIM)),
+                };
+                truncate_line(
+                    Line::from(vec![
+                        Span::styled(format!("{} ", item.status.glyph()), glyph_style),
+                        Span::styled(item.content.clone(), text_style),
+                    ]),
+                    inner_width,
+                )
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
 /// Git diff sidebar (`/diff`): separated from the chat by a single dim
 /// rule, syntax-highlighted (foreground colors only). Lines wider than
 /// the sidebar are cut with a dim `…` instead of clipping silently.
@@ -444,6 +498,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     if app.plan_mode {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("PLAN", accent().bold()));
+    }
+    let token_total = app.status.prompt_tokens + app.status.completion_tokens;
+    if token_total > 0 {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            crate::usage::format_tokens(token_total),
+            dim(),
+        ));
     }
     if let Some(label) = &app.rebuilding {
         spans.push(Span::styled(" · ", dim()));

@@ -176,6 +176,15 @@ pub async fn spawn(
         ChatMessage::user(task.to_string()),
     ];
 
+    // Subagents share the parent's cwd and task registry but get their own
+    // todo list (their working notes must not clobber the parent's) and no
+    // event channel — their activity surfaces as one tool result.
+    let ctx = ToolContext {
+        todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
+        events: None,
+        ..ctx.clone()
+    };
+
     let mut steps_used = 0;
     let mut completed = false;
     let mut last_text = String::new();
@@ -256,7 +265,7 @@ pub async fn spawn(
                     if let Some(updated) = updated {
                         args = updated;
                     }
-                    let mut output = match scoped.execute(&name, args.clone(), ctx).await {
+                    let mut output = match scoped.execute(&name, args.clone(), &ctx).await {
                         Ok(output) => output,
                         Err(err) => ToolOutput::error(err.to_string()),
                     };

@@ -36,6 +36,15 @@ pub trait LlmProvider: Send + Sync {
         request: crate::llm::ChatRequest,
     ) -> anyhow::Result<crate::llm::ChatStream>;
 
+    /// Total context window of `model` in tokens, when known. Drives
+    /// token-aware history compaction; `None` means unknown, in which case
+    /// only the byte threshold applies. Implementations may consult static
+    /// tables (cloud APIs) or query the backend (llama.cpp `/props`) — a
+    /// probe failure must degrade to `None`, never error.
+    async fn context_window(&self, _model: &str) -> Option<u32> {
+        None
+    }
+
     /// Short human label for the status bar / errors (e.g. the host or
     /// `"openai:gpt-4o"`).
     fn label(&self) -> String;

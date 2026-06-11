@@ -112,6 +112,16 @@ pub enum AgentEvent {
         plan: String,
         respond: tokio::sync::oneshot::Sender<PlanVerdict>,
     },
+    /// Token usage of one completed model call, when the backend reported
+    /// counts. Surfaces accumulate these (status bar, headless summary).
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
+    /// The todo list was replaced via the `todo` tool. Carries the full new
+    /// list; the TUI mirrors it in a side panel, headless prints a one-line
+    /// summary, the gateway ignores it.
+    TodoUpdated(Vec<crate::tools::todo::TodoItem>),
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -247,7 +257,9 @@ pub struct Agent {
     native_tools: bool,
     /// Skills baked into the system prompt (kept for `/mode` rebuilds).
     skills: Vec<Skill>,
-    /// Project `AGENTS.md` / `WIZARD.md` contents, if present.
+    /// Assembled instruction hierarchy (`WIZARD.md` / `AGENTS.md` /
+    /// `CLAUDE.md` from the project root up, plus `~/.wizard/WIZARD.md` —
+    /// see [`crate::instructions`]), if any file exists.
     agents_md: Option<String>,
     /// Persistent memory index (MEMORY.md) for this project, if any
     /// memories are saved. Re-read on every system prompt refresh so
@@ -264,10 +276,19 @@ pub struct Agent {
     /// Whether the plan-mode instruction block is currently baked into the
     /// system prompt; [`Agent::sync_plan_prompt`] refreshes on mismatch.
     plan_prompt_on: bool,
+    /// Token counters fed from `ChatChunk` eval counts during streaming.
+    usage: crate::usage::UsageTracker,
+    /// Where per-turn usage records are appended
+    /// (`~/.wizard/usage.jsonl`); `None` disables the log.
+    usage_log: Option<PathBuf>,
 }
 
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
+
+/// Fraction of the provider's context window the last prompt may fill before
+/// token-aware compaction kicks in.
+const COMPACT_WINDOW_FRACTION: f64 = 0.8;
 
 /// User-role nudge injected (in memory only) when a completion comes back
 /// with no visible text and no tool calls.
@@ -296,7 +317,7 @@ impl Agent {
         native_tools: bool,
         hooks: Arc<HookEngine>,
     ) -> Result<Self> {
-        let agents_md = read_project_instructions(&project_root);
+        let agents_md = crate::instructions::load(&project_root);
         let memory_index = read_memory_index(&project_root);
         let model = config.active().model;
         let mut load_warning = None;
@@ -345,6 +366,8 @@ impl Agent {
             load_warning,
             plan_mode,
             plan_prompt_on: false,
+            usage: crate::usage::UsageTracker::new(),
+            usage_log: crate::usage::default_log_path(),
         };
         agent
             .history
@@ -426,6 +449,17 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
+    /// Session token counters (prompt/completion totals, last prompt size).
+    pub fn usage(&self) -> &crate::usage::UsageTracker {
+        &self.usage
+    }
+
+    /// Redirect (or disable) the per-turn usage JSONL log. Defaults to
+    /// `~/.wizard/usage.jsonl`; tests point it into a temp dir.
+    pub fn set_usage_log(&mut self, path: Option<PathBuf>) {
+        self.usage_log = path;
+    }
+
     /// Whether plan mode is active.
     pub fn plan_mode(&self) -> bool {
         self.plan_mode.load(std::sync::atomic::Ordering::SeqCst)
@@ -482,6 +516,15 @@ impl Agent {
                 &self.dispatcher.registry().specs(),
             ));
         }
+        if self
+            .dispatcher
+            .registry()
+            .get(crate::tools::todo::TODO_TOOL_NAME)
+            .is_some()
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(prompts::TODO_PROMPT);
+        }
         if self.plan_mode() {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::PLAN_MODE_PROMPT);
@@ -522,6 +565,7 @@ impl Agent {
         if let Some(warning) = self.load_warning.take() {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
+        self.usage.begin_turn();
         let result = match self.turn_inner(input, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
@@ -541,7 +585,33 @@ impl Agent {
         };
         // turn_end hooks: observational, fired however the turn ended.
         self.hooks.turn_end(self.mode, Some(&events)).await;
+        self.record_turn_usage();
         result
+    }
+
+    /// Append this turn's token usage to the JSONL log (when the backend
+    /// reported counts and the log is enabled). Best-effort: failures are
+    /// logged, never surfaced.
+    fn record_turn_usage(&self) {
+        let (prompt_tokens, completion_tokens) = self.usage.turn_totals();
+        if prompt_tokens == 0 && completion_tokens == 0 {
+            return;
+        }
+        let Some(path) = &self.usage_log else {
+            return;
+        };
+        let record = crate::usage::UsageRecord {
+            ts: crate::usage::unix_now(),
+            project: self.ctx.cwd.display().to_string(),
+            model: self.model.clone(),
+            provider: self.config.active().name,
+            prompt_tokens,
+            completion_tokens,
+            mode: self.mode.to_string(),
+        };
+        if let Err(err) = crate::usage::append(path, &record) {
+            tracing::warn!("could not append usage record: {err:#}");
+        }
     }
 
     async fn turn_inner(
@@ -638,6 +708,13 @@ impl Agent {
                 }
             }
 
+            // Compact between steps too, so a long tool loop cannot outgrow
+            // the context window mid-turn. The compactor always keeps the
+            // most recent messages verbatim, so the in-flight turn's tail —
+            // the tool calls and results the model is reasoning about —
+            // stays intact.
+            self.compact_if_needed(events).await;
+
             if !emit(events, AgentEvent::StepCompleted { step }).await {
                 return Ok(DoneReason::Stopped);
             }
@@ -675,6 +752,8 @@ impl Agent {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut prompt_tokens = None;
+        let mut completion_tokens = None;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading chat stream")?;
             if let Some(message) = chunk.message {
@@ -690,9 +769,26 @@ impl Agent {
                 }
                 tool_calls.extend(message.tool_calls);
             }
+            if chunk.prompt_eval_count.is_some() {
+                prompt_tokens = chunk.prompt_eval_count;
+            }
+            if chunk.eval_count.is_some() {
+                completion_tokens = chunk.eval_count;
+            }
             if chunk.done {
                 break;
             }
+        }
+        if prompt_tokens.is_some() || completion_tokens.is_some() {
+            self.usage.record(prompt_tokens, completion_tokens);
+            let _ = emit(
+                events,
+                AgentEvent::Usage {
+                    prompt_tokens: prompt_tokens.unwrap_or(0),
+                    completion_tokens: completion_tokens.unwrap_or(0),
+                },
+            )
+            .await;
         }
         Ok((content, tool_calls))
     }
@@ -743,15 +839,32 @@ impl Agent {
         }
     }
 
-    /// Keep history bounded so the agent can run indefinitely. When the
-    /// serialized history exceeds `compact_threshold_bytes`, summarize the
-    /// middle span (everything between the system prompt and the last
-    /// [`KEEP_RECENT`] messages) into a single progress note. Best-effort:
-    /// a summarization failure falls back to dropping the middle span. Never
-    /// aborts the turn.
-    async fn compact_if_needed(&mut self, events: &mpsc::Sender<AgentEvent>) {
+    /// Whether the history is close enough to overflowing to warrant
+    /// compaction: either the serialized history exceeds the byte threshold,
+    /// or the last model call's reported prompt size exceeds
+    /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window.
+    async fn should_compact(&self) -> bool {
         let total: usize = self.history.iter().map(|msg| msg.content.len()).sum();
-        if total <= self.config.compact_threshold_bytes {
+        if total > self.config.compact_threshold_bytes {
+            return true;
+        }
+        let Some(last_prompt) = self.usage.last_prompt_tokens() else {
+            return false;
+        };
+        let Some(window) = self.client.context_window(&self.model).await else {
+            return false;
+        };
+        last_prompt as f64 > f64::from(window) * COMPACT_WINDOW_FRACTION
+    }
+
+    /// Keep history bounded so the agent can run indefinitely. When
+    /// [`Self::should_compact`] fires (byte threshold, or the last prompt
+    /// nearing the provider's context window), summarize the middle span
+    /// (everything between the system prompt and the last [`KEEP_RECENT`]
+    /// messages) into a single progress note. Best-effort: a summarization
+    /// failure falls back to dropping the middle span. Never aborts the turn.
+    async fn compact_if_needed(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        if !self.should_compact().await {
             return;
         }
         // Need history[0] (system prompt) + a non-empty middle + the recent tail.
@@ -808,6 +921,9 @@ impl Agent {
                 .await;
             }
         }
+        // The history just shrank: the last reported prompt size is stale
+        // and must not re-trigger compaction on the next step.
+        self.usage.clear_last_prompt();
     }
 
     /// Summarize a transcript blob into a terse progress note via the model.
@@ -819,7 +935,10 @@ impl Agent {
                 ChatMessage::system(
                     "Summarize the following Wizard agent transcript into a compact progress \
                      note. Preserve: the mission/goal, decisions made, files changed, commands \
-                     run, what worked/failed, and open next steps. Be terse and factual.",
+                     run, what worked/failed, and open next steps. Preserve the current todo \
+                     list state verbatim (every item and its status) if one was maintained, \
+                     and mention the plan file path (.wizard/plan.md) if a plan was written. \
+                     Be terse and factual.",
                 ),
                 ChatMessage::user(blob.to_string()),
             ],
@@ -911,21 +1030,6 @@ impl Agent {
             }
         }
     }
-}
-
-/// Read project-level instructions: `AGENTS.md`, falling back to
-/// `WIZARD.md`.
-fn read_project_instructions(project_root: &Path) -> Option<String> {
-    for name in ["AGENTS.md", "WIZARD.md"] {
-        let path = project_root.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(contents) if !contents.trim().is_empty() => return Some(contents),
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!("could not read {}: {err}", path.display()),
-        }
-    }
-    None
 }
 
 /// Read the persistent memory index (MEMORY.md) for `project_root`, if any
@@ -1125,7 +1229,11 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let printer_spinner = Arc::clone(&spinner);
+    // The printer returns the run's accumulated (prompt, completion) token
+    // totals for the final summary line.
     let printer = tokio::spawn(async move {
+        let mut prompt_total: u64 = 0;
+        let mut completion_total: u64 = 0;
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::TextDelta(delta) => {
@@ -1172,12 +1280,23 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     let _ = respond.send(PlanVerdict::approve());
                     printer_spinner.show();
                 }
+                AgentEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    prompt_total += prompt_tokens;
+                    completion_total += completion_tokens;
+                }
+                AgentEvent::TodoUpdated(items) => {
+                    printer_spinner.println(&crate::tools::todo::summary_line(&items));
+                }
                 AgentEvent::Done { reason } => {
                     printer_spinner.hide();
                     println!("\n[turn done: {reason:?}]");
                 }
             }
         }
+        (prompt_total, completion_total)
     });
 
     println!(
@@ -1335,7 +1454,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     agent.fire_session_end(Some(&tx)).await;
 
     drop(tx);
-    let _ = printer.await;
+    let (prompt_tokens, completion_tokens) = printer.await.unwrap_or((0, 0));
     spinner.finish();
 
     if reexec_after {
@@ -1355,7 +1474,14 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     if let Some(err) = run_error {
         return Err(err);
     }
-    println!("[run finished: {final_reason:?}]");
+    if prompt_tokens > 0 || completion_tokens > 0 {
+        println!(
+            "[run finished: {final_reason:?} — {prompt_tokens} prompt + {completion_tokens} \
+             completion tokens]"
+        );
+    } else {
+        println!("[run finished: {final_reason:?}]");
+    }
     Ok(())
 }
 
@@ -1393,6 +1519,8 @@ mod tests {
     struct ScriptedProvider {
         responses: Mutex<VecDeque<Vec<ChatChunk>>>,
         requests: Mutex<Vec<ChatRequest>>,
+        /// Reported context window (None = unknown, like a local model).
+        context_window: Option<u32>,
     }
 
     impl ScriptedProvider {
@@ -1400,6 +1528,15 @@ mod tests {
             Arc::new(Self {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
+                context_window: None,
+            })
+        }
+
+        fn with_context_window(responses: Vec<Vec<ChatChunk>>, window: u32) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+                context_window: Some(window),
             })
         }
     }
@@ -1431,6 +1568,10 @@ mod tests {
             )))
         }
 
+        async fn context_window(&self, _model: &str) -> Option<u32> {
+            self.context_window
+        }
+
         fn label(&self) -> String {
             "scripted:test".to_string()
         }
@@ -1449,6 +1590,15 @@ mod tests {
         }
     }
 
+    /// `done: true` chunk carrying token counts alongside `content`.
+    fn usage_chunk(content: &str, prompt_tokens: u64, completion_tokens: u64) -> ChatChunk {
+        ChatChunk {
+            eval_count: Some(completion_tokens),
+            prompt_eval_count: Some(prompt_tokens),
+            ..final_chunk(content)
+        }
+    }
+
     fn test_agent(responses: Vec<Vec<ChatChunk>>) -> (Agent, Arc<ScriptedProvider>, TempDir) {
         let tmp = TempDir::new();
         let (agent, provider) = test_agent_in(&tmp, responses, Vec::new(), ToolRegistry::new());
@@ -1464,14 +1614,26 @@ mod tests {
         registry: ToolRegistry,
     ) -> (Agent, Arc<ScriptedProvider>) {
         let provider = ScriptedProvider::new(responses);
+        let agent = test_agent_with(tmp, Arc::clone(&provider), hook_defs, registry);
+        (agent, provider)
+    }
+
+    /// Build a test agent around an existing provider. The usage log is
+    /// redirected into the temp dir so tests never touch ~/.wizard.
+    fn test_agent_with(
+        tmp: &TempDir,
+        provider: Arc<ScriptedProvider>,
+        hook_defs: Vec<HookDef>,
+        registry: ToolRegistry,
+    ) -> Agent {
         let session = Session::create(&tmp.0).expect("create session");
         let hooks = Arc::new(HookEngine::new(
             hook_defs,
             tmp.0.clone(),
             session.id.clone(),
         ));
-        let agent = Agent::new(
-            provider.clone(),
+        let mut agent = Agent::new(
+            provider,
             registry,
             Config::default(),
             Vec::new(),
@@ -1481,7 +1643,8 @@ mod tests {
             hooks,
         )
         .expect("build agent");
-        (agent, provider)
+        agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+        agent
     }
 
     /// Drain a finished turn's events into (text, errors).
@@ -2201,6 +2364,293 @@ mod tests {
         // A registry swap (/reload, /evolve) re-registers it.
         agent.set_registry(ToolRegistry::new());
         assert!(has_exit_plan(&agent), "re-registered after set_registry");
+    }
+
+    #[tokio::test]
+    async fn usage_counts_accumulate_emit_events_and_land_in_the_jsonl_log() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![usage_chunk("first", 100, 20)],
+            vec![usage_chunk("second", 150, 30)],
+        ]);
+        let mut agent =
+            test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("one", tx).await.expect("turn ok");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } = event
+            {
+                usage_events.push((prompt_tokens, completion_tokens));
+            }
+        }
+        assert_eq!(usage_events, [(100, 20)], "one Usage event per model call");
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("two", tx).await.expect("turn ok");
+
+        assert_eq!(agent.usage().session_totals(), (250, 50));
+        assert_eq!(agent.usage().turn_totals(), (150, 30), "last turn only");
+        assert_eq!(agent.usage().last_prompt_tokens(), Some(150));
+
+        // One JSONL record per turn, in order.
+        let raw = std::fs::read_to_string(tmp.0.join("usage.jsonl")).expect("log written");
+        let records: Vec<crate::usage::UsageRecord> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid json"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].prompt_tokens, 100);
+        assert_eq!(records[0].completion_tokens, 20);
+        assert_eq!(records[1].prompt_tokens, 150);
+        assert_eq!(records[1].completion_tokens, 30);
+        assert_eq!(records[0].mode, "genie");
+        assert!(records[0].ts > 0);
+        assert_eq!(records[0].project, tmp.0.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn turns_without_reported_counts_write_no_usage_records() {
+        let (mut agent, _provider, tmp) = test_agent(vec![vec![final_chunk("plain")]]);
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(agent.usage().session_totals(), (0, 0));
+        assert!(!tmp.0.join("usage.jsonl").exists(), "no counts, no log");
+    }
+
+    #[tokio::test]
+    async fn prompt_tokens_near_the_context_window_trigger_compaction() {
+        let tmp = TempDir::new();
+        // Window 1000 → compaction at >800 prompt tokens. The byte threshold
+        // (48k) is never reached: the messages are tiny.
+        let provider = ScriptedProvider::with_context_window(
+            vec![
+                // Turn 1: reports a prompt size of 900 tokens.
+                vec![usage_chunk("ok", 900, 10)],
+                // Turn 2: the compaction summary, then the actual reply.
+                vec![final_chunk("progress so far")],
+                vec![final_chunk("done")],
+            ],
+            1000,
+        );
+        let mut agent =
+            test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+        for i in 0..14 {
+            agent.history.push(ChatMessage::user(format!("filler {i}")));
+        }
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("one", tx).await.expect("turn ok");
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "no compaction before a token count arrives"
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("two", tx).await.expect("turn ok");
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "token threshold compacted the history"
+        );
+        let (_text, errors) = drain_events(&mut rx);
+        assert!(
+            errors.iter().any(|e| e.contains("compacted")),
+            "compaction surfaced: {errors:?}"
+        );
+        assert_eq!(
+            agent.usage().last_prompt_tokens(),
+            None,
+            "stale prompt size cleared so compaction does not re-trigger"
+        );
+
+        // The summarization request carried the extended preservation
+        // instructions (todo list + plan file).
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let summarize_prompt = &requests[1].messages[0].content;
+        assert!(summarize_prompt.contains("todo"), "{summarize_prompt}");
+        assert!(
+            summarize_prompt.contains(".wizard/plan.md"),
+            "{summarize_prompt}"
+        );
+    }
+
+    /// Test tool returning a large fixed blob, to cross the byte threshold
+    /// mid-turn.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for BigOutputTool {
+        fn name(&self) -> &str {
+            "big"
+        }
+
+        fn description(&self) -> &str {
+            "Return a large blob (test tool)."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::ok("B".repeat(5_000)))
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("big", json!({}))],
+            vec![final_chunk("progress so far")], // compaction summary
+            vec![final_chunk("done")],
+        ]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BigOutputTool));
+        let mut agent = test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), registry);
+        for i in 0..13 {
+            agent.history.push(ChatMessage::user(format!("filler {i}")));
+        }
+        // Threshold just above the current size: crossed only once the 5k
+        // tool result lands, so the compaction must happen mid-turn.
+        let base: usize = agent.history.iter().map(|m| m.content.len()).sum();
+        agent.config.compact_threshold_bytes = base + 1_000;
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "mid-turn compaction happened"
+        );
+        // The in-flight turn's tail — the big tool result the model is
+        // reasoning about — survived verbatim.
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("BBBB")),
+            "tool feedback preserved through compaction"
+        );
+        // The final completion saw the compacted history.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]"))
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_writes_update_shared_state_and_emit_events() {
+        let tmp = TempDir::new();
+        let items = json!([
+            { "content": "investigate", "status": "completed" },
+            { "content": "implement", "status": "in_progress" },
+            { "content": "test", "status": "pending" }
+        ]);
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "todo",
+                    json!({ "action": "write", "items": items }),
+                )],
+                vec![final_chunk("noted")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+
+        let mut updates = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::TodoUpdated(items) = event {
+                updates.push(items);
+            }
+        }
+        assert_eq!(updates.len(), 1, "one TodoUpdated per write");
+        assert_eq!(updates[0].len(), 3);
+        assert_eq!(updates[0][1].content, "implement");
+        assert_eq!(
+            updates[0][1].status,
+            crate::tools::todo::TodoStatus::InProgress
+        );
+
+        // The shared state holds the list for later read calls.
+        assert_eq!(agent.ctx.todos.lock().unwrap().len(), 3);
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(feedback.contains("1/3 done"), "{feedback}");
+    }
+
+    #[tokio::test]
+    async fn todo_tool_stays_usable_in_plan_mode() {
+        let tmp = TempDir::new();
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "todo",
+                    json!({ "action": "write", "items": [
+                        { "content": "draft plan", "status": "in_progress" }
+                    ] }),
+                )],
+                vec![final_chunk("planning")],
+            ],
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.set_plan_mode(true);
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+        let feedback = tool_feedback_of(&provider, 1);
+        assert!(
+            feedback.contains("todo list updated"),
+            "todo runs under the plan gate: {feedback}"
+        );
+        assert!(agent.plan_mode(), "plan mode untouched");
+    }
+
+    #[test]
+    fn todo_instruction_appears_only_when_the_tool_is_registered() {
+        let tmp = TempDir::new();
+        let (agent, _provider) = test_agent_in(
+            &tmp,
+            Vec::new(),
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        assert!(agent.history[0].content.contains("## Working todo list"));
+
+        let (agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+        assert!(
+            !agent.history[0].content.contains("## Working todo list"),
+            "no instruction without the tool"
+        );
     }
 
     #[tokio::test]

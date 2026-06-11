@@ -27,6 +27,7 @@ use crate::memory::MemoryStore;
 use crate::server;
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::todo::TodoItem;
 
 /// One rendered entry in the chat transcript.
 #[derive(Debug)]
@@ -102,6 +103,10 @@ pub enum SlashCommand {
     Plan,
     /// Toggle the git diff sidebar.
     Diff,
+    /// Toggle the todo side panel.
+    Todos,
+    /// Show session token usage (and cost when rates are configured).
+    Cost,
     /// Show the saved project memories.
     Memory,
     /// `/publish [branch]` — fork Wizard and get a one-line installer.
@@ -247,6 +252,8 @@ impl SlashCommand {
             "reload" => Ok(Self::Reload),
             "plan" => Ok(Self::Plan),
             "diff" => Ok(Self::Diff),
+            "todos" => Ok(Self::Todos),
+            "cost" => Ok(Self::Cost),
             "memory" => Ok(Self::Memory),
             "publish" => Ok(Self::Publish {
                 branch: args.first().map(|s| s.to_string()),
@@ -346,6 +353,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         takes_args: false,
     },
     CommandSpec {
+        name: "todos",
+        args: "",
+        description: "toggle the todo side panel",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "cost",
+        args: "",
+        description: "show session token usage and cost",
+        takes_args: false,
+    },
+    CommandSpec {
         name: "memory",
         args: "",
         description: "show saved project memories",
@@ -430,6 +449,10 @@ pub struct StatusLine {
     pub max_steps: u32,
     /// True while a turn is streaming.
     pub busy: bool,
+    /// Session prompt-token total (from [`AgentEvent::Usage`]).
+    pub prompt_tokens: u64,
+    /// Session completion-token total.
+    pub completion_tokens: u64,
 }
 
 /// Full TUI state. [`crate::ui::draw`] renders it; [`App::handle_event`]
@@ -453,6 +476,15 @@ pub struct App {
     /// Git diff sidebar visibility and cached contents.
     pub show_diff: bool,
     pub diff_text: String,
+    /// Todo side panel visibility (toggled by `/todos`; auto-shown on the
+    /// first todo update of the session).
+    pub show_todos: bool,
+    /// The agent's current todo list, mirrored from
+    /// [`AgentEvent::TodoUpdated`].
+    pub todos: Vec<TodoItem>,
+    /// Whether a todo update has arrived yet (drives the one-time
+    /// auto-show).
+    todos_seen: bool,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -502,6 +534,8 @@ impl App {
             step: 0,
             max_steps: config.max_steps,
             busy: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
         };
         Self {
             config,
@@ -515,6 +549,9 @@ impl App {
             status,
             show_diff: false,
             diff_text: String::new(),
+            show_todos: false,
+            todos: Vec::new(),
+            todos_seen: false,
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -1198,6 +1235,22 @@ impl App {
                     scroll: 0,
                 });
             }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                self.status.prompt_tokens += prompt_tokens;
+                self.status.completion_tokens += completion_tokens;
+            }
+            AgentEvent::TodoUpdated(items) => {
+                self.todos = items;
+                // Auto-show the panel the first time the agent starts a
+                // list; afterwards /todos controls visibility.
+                if !self.todos_seen && !self.todos.is_empty() {
+                    self.todos_seen = true;
+                    self.show_todos = true;
+                }
+            }
             AgentEvent::Done { reason } => {
                 self.flush_streaming();
                 self.status.busy = false;
@@ -1478,6 +1531,8 @@ const HELP_TEXT: &str = "available commands:\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
+/todos                      toggle the todo side panel\n  \
+/cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /quit                       exit\n\
 keys:\n  \
@@ -1600,6 +1655,8 @@ async fn startup_client(config: &mut Config) -> Result<Arc<dyn LlmProvider>> {
             model: model.to_string(),
             api_key_env: Some(key_env.to_string()),
             gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
         };
         match try_provider(&provider).await {
             Ok(client) => {
@@ -1890,6 +1947,8 @@ impl CommandContext<'_> {
             SlashCommand::Help => self.app.notice(HELP_TEXT),
             SlashCommand::Quit => self.app.should_quit = true,
             SlashCommand::Diff => self.toggle_diff().await,
+            SlashCommand::Todos => self.toggle_todos(),
+            SlashCommand::Cost => self.cost(),
             SlashCommand::Memory => self.memory(),
             SlashCommand::Clear => self.clear(),
             SlashCommand::Model(None) => self.open_model_picker().await,
@@ -1930,6 +1989,38 @@ impl CommandContext<'_> {
                 Err(err) => format!("could not read git diff: {err:#}"),
             };
         }
+    }
+
+    /// `/todos`: toggle the todo side panel.
+    fn toggle_todos(&mut self) {
+        self.app.show_todos = !self.app.show_todos;
+        if self.app.show_todos && self.app.todos.is_empty() {
+            self.app
+                .notice("todo list is empty — the agent fills it via the `todo` tool");
+        }
+    }
+
+    /// `/cost`: session token totals, plus an estimate when the active
+    /// provider has `usd_per_mtok_in` / `usd_per_mtok_out` configured.
+    fn cost(&mut self) {
+        let prompt = self.app.status.prompt_tokens;
+        let completion = self.app.status.completion_tokens;
+        let mut text = format!("session usage: {prompt} prompt + {completion} completion tokens");
+        let provider = self.app.config.active();
+        match crate::usage::cost_usd(
+            prompt,
+            completion,
+            provider.usd_per_mtok_in,
+            provider.usd_per_mtok_out,
+        ) {
+            Some(cost) => text.push_str(&format!(" · est. ${cost:.4}")),
+            None => text.push_str(&format!(
+                "\nset usd_per_mtok_in / usd_per_mtok_out on provider '{}' in \
+                 ~/.wizard/config.toml for cost estimates",
+                provider.name
+            )),
+        }
+        self.app.notice(text);
     }
 
     /// `/memory`: list the saved project memories (name — description).
@@ -2333,6 +2424,8 @@ impl CommandContext<'_> {
             model,
             api_key_env: api_key_env.clone(),
             gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
         };
         // Dedup by name: replace an existing entry with the same name.
         self.app.config.providers.retain(|p| p.name != name);
@@ -2828,6 +2921,48 @@ mod tests {
     #[test]
     fn plan_parses_as_a_toggle() {
         assert_eq!(SlashCommand::parse("/plan"), Some(Ok(SlashCommand::Plan)));
+    }
+
+    #[test]
+    fn todos_and_cost_parse() {
+        assert_eq!(SlashCommand::parse("/todos"), Some(Ok(SlashCommand::Todos)));
+        assert_eq!(SlashCommand::parse("/cost"), Some(Ok(SlashCommand::Cost)));
+    }
+
+    #[test]
+    fn todo_update_mirrors_the_list_and_auto_shows_the_panel_once() {
+        use crate::tools::todo::{TodoItem, TodoStatus};
+        let mut app = app();
+        assert!(!app.show_todos);
+
+        let items = vec![TodoItem {
+            content: "first".to_string(),
+            status: TodoStatus::InProgress,
+        }];
+        app.handle_agent_event(AgentEvent::TodoUpdated(items.clone()));
+        assert_eq!(app.todos, items);
+        assert!(app.show_todos, "first update auto-shows the panel");
+
+        // The user hides it; later updates respect that.
+        app.show_todos = false;
+        app.handle_agent_event(AgentEvent::TodoUpdated(items.clone()));
+        assert!(!app.show_todos, "auto-show happens only once");
+        assert_eq!(app.todos, items, "the list still updates");
+    }
+
+    #[test]
+    fn usage_events_accumulate_session_totals_in_the_status_bar() {
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+        });
+        app.handle_agent_event(AgentEvent::Usage {
+            prompt_tokens: 50,
+            completion_tokens: 5,
+        });
+        assert_eq!(app.status.prompt_tokens, 150);
+        assert_eq!(app.status.completion_tokens, 25);
     }
 
     #[test]
