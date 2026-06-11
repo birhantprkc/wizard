@@ -51,6 +51,9 @@ pub enum DoneReason {
 pub enum AgentEvent {
     /// Streaming assistant text delta.
     TextDelta(String),
+    /// Streaming model reasoning ("thinking") delta. Rendered dimmed by the
+    /// TUI; never part of the assistant message or the session history.
+    ThinkingDelta(String),
     /// A tool call is requesting approval via the opt-in y/n gate (only fires
     /// when `auto_approve = false`). Send `true` on `respond` to run it,
     /// `false` to deny.
@@ -217,6 +220,16 @@ const CIRCUIT_BREAKER_LIMIT: u32 = 3;
 
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
+
+/// User-role nudge injected (in memory only) when a completion comes back
+/// with no visible text and no tool calls.
+const EMPTY_COMPLETION_NUDGE: &str = "(continue: reply to the user with your findings)";
+
+/// True when a completed assistant message has neither visible content nor
+/// tool calls (e.g. a reasoning model that thought and then just stopped).
+pub(crate) fn completion_is_empty(content: &str, tool_calls: &[ToolCall]) -> bool {
+    content.trim().is_empty() && tool_calls.is_empty()
+}
 
 /// Consecutive failures of one tool (any args) before the model is nudged
 /// to change approach.
@@ -469,7 +482,31 @@ impl Agent {
                 return Ok(reason);
             }
 
-            let (content, mut tool_calls) = self.stream_completion_with_retry(events).await?;
+            let (mut content, mut tool_calls) = self.stream_completion_with_retry(events).await?;
+
+            // Some reasoning models (xAI grok-4.3 after tool results) emit
+            // only reasoning and stop, leaving the visible message empty.
+            // Nudge once; if it stays empty, surface a notice instead of
+            // ending the turn silently.
+            if completion_is_empty(&content, &tool_calls) {
+                // In-memory only (not `push`): the nudge must not pollute the
+                // persisted session history.
+                self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
+                let retried = self.stream_completion_with_retry(events).await;
+                self.history.pop();
+                let (retry_content, retry_calls) = retried?;
+                if completion_is_empty(&retry_content, &retry_calls) {
+                    let _ = emit(
+                        events,
+                        AgentEvent::Error("model returned an empty response".to_string()),
+                    )
+                    .await;
+                    return Ok(DoneReason::Completed);
+                }
+                content = retry_content;
+                tool_calls = retry_calls;
+            }
+
             let assistant = ChatMessage {
                 role: Role::Assistant,
                 content: content.clone(),
@@ -537,8 +574,14 @@ impl Agent {
             let chunk = chunk.context("reading chat stream")?;
             if let Some(message) = chunk.message {
                 if !message.content.is_empty() {
-                    content.push_str(&message.content);
-                    let _ = emit(events, AgentEvent::TextDelta(message.content)).await;
+                    if chunk.thinking {
+                        // Reasoning is surfaced to the UI but never becomes
+                        // part of the assistant message.
+                        let _ = emit(events, AgentEvent::ThinkingDelta(message.content)).await;
+                    } else {
+                        content.push_str(&message.content);
+                        let _ = emit(events, AgentEvent::TextDelta(message.content)).await;
+                    }
                 }
                 tool_calls.extend(message.tool_calls);
             }
@@ -691,7 +734,9 @@ impl Agent {
         let mut summary = String::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading compaction stream")?;
-            if let Some(message) = chunk.message {
+            if let Some(message) = chunk.message
+                && !chunk.thinking
+            {
                 summary.push_str(&message.content);
             }
             if chunk.done {
@@ -1044,6 +1089,11 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     print!("{delta}");
                     let _ = std::io::stdout().flush();
                 }
+                AgentEvent::ThinkingDelta(delta) => {
+                    // ANSI faint so reasoning reads as background noise.
+                    print!("\x1b[2m{delta}\x1b[0m");
+                    let _ = std::io::stdout().flush();
+                }
                 AgentEvent::ApprovalRequest { respond, .. } => {
                     // Both modes auto-approve by default; this is a safety net for the opt-in gating path.
                     let _ = respond.send(true);
@@ -1227,7 +1277,13 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use futures_util::stream;
+
     use super::*;
+    use crate::llm::{ChatChunk, ChatStream};
 
     /// Temp project dir removed on drop.
     struct TempDir(PathBuf);
@@ -1244,6 +1300,188 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Provider that replays canned chunk sequences and records the requests
+    /// it received, for exercising the agent loop without a server.
+    #[derive(Debug)]
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<Vec<ChatChunk>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
+            self.requests.lock().unwrap().push(request);
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted response available");
+            Ok(futures_util::StreamExt::boxed(stream::iter(
+                chunks.into_iter().map(Ok),
+            )))
+        }
+
+        fn label(&self) -> String {
+            "scripted:test".to_string()
+        }
+    }
+
+    /// `done: true` chunk; `content` becomes the visible message when
+    /// non-empty.
+    fn final_chunk(content: &str) -> ChatChunk {
+        ChatChunk {
+            message: (!content.is_empty()).then(|| ChatMessage::assistant(content)),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    fn test_agent(responses: Vec<Vec<ChatChunk>>) -> (Agent, Arc<ScriptedProvider>, TempDir) {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(responses);
+        let session = Session::create(&tmp.0).expect("create session");
+        let agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::new(),
+            Config::default(),
+            Vec::new(),
+            tmp.0.clone(),
+            session,
+            true,
+        )
+        .expect("build agent");
+        (agent, provider, tmp)
+    }
+
+    /// Drain a finished turn's events into (text, errors).
+    fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> (String, Vec<String>) {
+        let mut text = String::new();
+        let mut errors = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                AgentEvent::Error(message) => errors.push(message),
+                _ => {}
+            }
+        }
+        (text, errors)
+    }
+
+    #[test]
+    fn completion_is_empty_requires_no_text_and_no_calls() {
+        assert!(completion_is_empty("", &[]));
+        assert!(completion_is_empty("  \n\t", &[]));
+        assert!(!completion_is_empty("done", &[]));
+        let call = ToolCall {
+            function: FunctionCall {
+                name: "execute".to_string(),
+                arguments: json!({}),
+            },
+        };
+        assert!(!completion_is_empty("", std::slice::from_ref(&call)));
+        assert!(!completion_is_empty("done", &[call]));
+    }
+
+    #[tokio::test]
+    async fn empty_completion_retries_with_nudge_then_succeeds() {
+        let (mut agent, provider, _tmp) = test_agent(vec![
+            // First completion: reasoning-only stop, nothing visible.
+            vec![final_chunk("")],
+            // Retry after the nudge: a real reply.
+            vec![final_chunk("Here are my findings.")],
+        ]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("hi", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        let (text, errors) = drain_events(&mut rx);
+        assert_eq!(text, "Here are my findings.");
+        assert!(errors.is_empty(), "no notice on a successful retry");
+
+        // The retry request carried the nudge as its final user message.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let nudge = requests[1].messages.last().expect("retry has messages");
+        assert_eq!(nudge.role, Role::User);
+        assert_eq!(nudge.content, EMPTY_COMPLETION_NUDGE);
+
+        // The nudge never lands in history or the persisted session.
+        assert!(
+            agent
+                .history()
+                .iter()
+                .all(|m| m.content != EMPTY_COMPLETION_NUDGE),
+            "nudge is not kept in history"
+        );
+        let persisted = agent.session().load_messages().expect("session readable");
+        assert!(
+            persisted
+                .iter()
+                .all(|m| m.content != EMPTY_COMPLETION_NUDGE),
+            "nudge is not persisted"
+        );
+        assert!(
+            persisted
+                .iter()
+                .any(|m| m.content == "Here are my findings."),
+            "the real reply is persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_empty_completion_surfaces_a_notice() {
+        let (mut agent, provider, _tmp) =
+            test_agent(vec![vec![final_chunk("")], vec![final_chunk("")]]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("hi", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        let (text, errors) = drain_events(&mut rx);
+        assert!(text.is_empty());
+        assert!(
+            errors.iter().any(|e| e.contains("empty response")),
+            "visible notice emitted: {errors:?}"
+        );
+
+        assert_eq!(provider.requests.lock().unwrap().len(), 2, "retried once");
+        // No empty assistant message is recorded.
+        assert!(
+            agent
+                .history()
+                .iter()
+                .all(|m| m.role != Role::Assistant || !m.content.is_empty()),
+            "no empty assistant message in history"
+        );
     }
 
     #[test]

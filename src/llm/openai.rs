@@ -363,6 +363,10 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning ("thinking") fragments streamed before the visible text by
+    /// reasoning models (xAI grok-4.3, DeepSeek R1, ...).
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
 }
@@ -401,6 +405,8 @@ struct ToolAccum {
 struct SseState<S> {
     bytes: S,
     buf: Vec<u8>,
+    /// Second chunk queued when one delta carries both reasoning and content.
+    pending: Option<ChatChunk>,
     tool_calls: BTreeMap<u64, ToolAccum>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
@@ -440,6 +446,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     };
     ChatChunk {
         message,
+        thinking: false,
         done: true,
         done_reason: None,
         eval_count: state.eval_count,
@@ -447,9 +454,22 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     }
 }
 
-/// Decode an OpenAI SSE byte stream into a [`ChatStream`]: text deltas are
-/// emitted live as `done: false` chunks; tool-call fragments are accumulated
-/// per index and emitted in a single synthesized `done: true` chunk at the end.
+/// A live `done: false` text chunk; `thinking` marks reasoning deltas.
+fn text_chunk(content: String, thinking: bool) -> ChatChunk {
+    ChatChunk {
+        message: Some(ChatMessage::assistant(content)),
+        thinking,
+        done: false,
+        done_reason: None,
+        eval_count: None,
+        prompt_eval_count: None,
+    }
+}
+
+/// Decode an OpenAI SSE byte stream into a [`ChatStream`]: text and reasoning
+/// deltas are emitted live as `done: false` chunks; tool-call fragments are
+/// accumulated per index and emitted in a single synthesized `done: true`
+/// chunk at the end.
 pub(crate) fn decode_sse<S>(bytes: S) -> ChatStream
 where
     S: Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
@@ -457,6 +477,7 @@ where
     let state = SseState {
         bytes,
         buf: Vec::new(),
+        pending: None,
         tool_calls: BTreeMap::new(),
         prompt_eval_count: None,
         eval_count: None,
@@ -467,6 +488,9 @@ where
         loop {
             if state.emitted_final {
                 return Ok(None);
+            }
+            if let Some(queued) = state.pending.take() {
+                return Ok(Some((queued, state)));
             }
             // Drain complete lines, returning the first content delta we find.
             while let Some(pos) = state.buf.iter().position(|&b| b == b'\n') {
@@ -506,17 +530,19 @@ where
                             }
                         }
                     }
-                    if let Some(content) = choice.delta.content
-                        && !content.is_empty()
-                    {
-                        let out = ChatChunk {
-                            message: Some(ChatMessage::assistant(content)),
-                            done: false,
-                            done_reason: None,
-                            eval_count: None,
-                            prompt_eval_count: None,
-                        };
-                        return Ok(Some((out, state)));
+                    let reasoning = choice
+                        .delta
+                        .reasoning_content
+                        .filter(|text| !text.is_empty());
+                    let content = choice.delta.content.filter(|text| !text.is_empty());
+                    if let Some(reasoning) = reasoning {
+                        // Both in one delta: queue the content behind the
+                        // reasoning so neither fragment is lost.
+                        state.pending = content.map(|content| text_chunk(content, false));
+                        return Ok(Some((text_chunk(reasoning, true), state)));
+                    }
+                    if let Some(content) = content {
+                        return Ok(Some((text_chunk(content, false), state)));
                     }
                 }
             }
@@ -674,5 +700,88 @@ mod tests {
         assert_eq!(message.tool_calls[0].function.arguments["command"], "ls");
 
         assert!(chunks.next().await.is_none(), "stream ends after done");
+    }
+
+    #[tokio::test]
+    async fn decodes_xai_reasoning_content_as_thinking() {
+        // Real xAI grok-4.3 stream shape: `delta.reasoning_content` fragments
+        // first, then the visible `delta.content`.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"grok-4.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Weighing the \"},\"finish_reason\":null}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"grok-4.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"options.\"},\"finish_reason\":null}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"grok-4.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Done.\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("reasoning").expect("ok");
+        assert!(first.thinking, "reasoning delta is flagged");
+        assert_eq!(first.message.expect("message").content, "Weighing the ");
+
+        let second = chunks.next().await.expect("reasoning").expect("ok");
+        assert!(second.thinking);
+        assert_eq!(second.message.expect("message").content, "options.");
+
+        let third = chunks.next().await.expect("content").expect("ok");
+        assert!(!third.thinking, "visible text is not flagged");
+        assert_eq!(third.message.expect("message").content, "Done.");
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_completion_yields_empty_final_chunk() {
+        // grok-4.3 sometimes thinks and then just stops (no text, no tools).
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hmm\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("reasoning").expect("ok");
+        assert!(first.thinking);
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert!(last.message.is_none(), "no visible message was produced");
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_content_in_one_delta_keeps_both() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"why\",\"content\":\"Hi\"}}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("reasoning").expect("ok");
+        assert!(first.thinking);
+        assert_eq!(first.message.expect("message").content, "why");
+
+        let second = chunks.next().await.expect("content").expect("ok");
+        assert!(!second.thinking);
+        assert_eq!(second.message.expect("message").content, "Hi");
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert!(chunks.next().await.is_none());
     }
 }

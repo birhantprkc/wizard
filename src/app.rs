@@ -32,6 +32,9 @@ use crate::tools::registry::ToolRegistry;
 pub enum TranscriptEntry {
     User(String),
     Assistant(String),
+    /// Model reasoning ("thinking") that preceded an assistant reply,
+    /// rendered dimmed.
+    Thinking(String),
     /// Collapsible tool invocation card.
     ToolCard {
         name: String,
@@ -417,6 +420,9 @@ pub struct App {
     /// Partial assistant text of the in-flight turn (moved into the
     /// transcript when the turn ends).
     pub streaming: String,
+    /// Partial model reasoning of the in-flight turn, rendered dimmed and
+    /// flushed to the transcript alongside `streaming`.
+    pub streaming_thinking: String,
     pub pending_approval: Option<PendingApproval>,
     pub status: StatusLine,
     /// Git diff sidebar visibility and cached contents.
@@ -466,6 +472,7 @@ impl App {
             input_mode: InputMode::default(),
             transcript: Vec::new(),
             streaming: String::new(),
+            streaming_thinking: String::new(),
             pending_approval: None,
             status,
             show_diff: false,
@@ -661,8 +668,13 @@ impl App {
         }
     }
 
-    /// Move any in-flight streaming text into the transcript.
+    /// Move any in-flight streaming text into the transcript. Reasoning
+    /// flushes first: it streams before the visible reply.
     fn flush_streaming(&mut self) {
+        if !self.streaming_thinking.is_empty() {
+            let text = std::mem::take(&mut self.streaming_thinking);
+            self.transcript.push(TranscriptEntry::Thinking(text));
+        }
         if !self.streaming.is_empty() {
             let text = std::mem::take(&mut self.streaming);
             self.transcript.push(TranscriptEntry::Assistant(text));
@@ -1017,6 +1029,9 @@ impl App {
         match event {
             AgentEvent::TextDelta(delta) => {
                 self.streaming.push_str(&delta);
+            }
+            AgentEvent::ThinkingDelta(delta) => {
+                self.streaming_thinking.push_str(&delta);
             }
             AgentEvent::ApprovalRequest { call, respond } => {
                 // The approval modal takes over; drop any open picker so it
@@ -1595,6 +1610,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
                         app.status.busy = true;
                         app.status.step = 0;
                         app.streaming.clear();
+                        app.streaming_thinking.clear();
                         app.turn_started = Some(Instant::now());
 
                         // Bridge AgentEvent -> Event::Agent for the UI loop.
@@ -1774,6 +1790,7 @@ impl CommandContext<'_> {
         }
         self.app.transcript.clear();
         self.app.streaming.clear();
+        self.app.streaming_thinking.clear();
         self.app.scroll = 0;
         self.app.notice("conversation cleared");
     }

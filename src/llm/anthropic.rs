@@ -318,6 +318,9 @@ enum BlockStart {
 enum BlockDelta {
     #[serde(rename = "text_delta")]
     Text { text: String },
+    /// Extended-thinking reasoning fragment.
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
     #[serde(other)]
@@ -379,6 +382,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     };
     ChatChunk {
         message,
+        thinking: false,
         done: true,
         done_reason: None,
         eval_count: state.eval_count,
@@ -386,9 +390,21 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     }
 }
 
+/// A live `done: false` text chunk; `thinking` marks reasoning deltas.
+fn text_chunk(content: String, thinking: bool) -> ChatChunk {
+    ChatChunk {
+        message: Some(ChatMessage::assistant(content)),
+        thinking,
+        done: false,
+        done_reason: None,
+        eval_count: None,
+        prompt_eval_count: None,
+    }
+}
+
 /// Decode an Anthropic Messages SSE byte stream into a [`ChatStream`]: text
-/// deltas are emitted live; `tool_use` blocks are accumulated and emitted in a
-/// single synthesized `done: true` chunk at the end.
+/// and thinking deltas are emitted live; `tool_use` blocks are accumulated and
+/// emitted in a single synthesized `done: true` chunk at the end.
 pub(crate) fn decode_sse<S>(bytes: S) -> ChatStream
 where
     S: Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
@@ -438,14 +454,12 @@ where
                     Event::ContentBlockDelta { index, delta } => match delta {
                         BlockDelta::Text { text } => {
                             if !text.is_empty() {
-                                let out = ChatChunk {
-                                    message: Some(ChatMessage::assistant(text)),
-                                    done: false,
-                                    done_reason: None,
-                                    eval_count: None,
-                                    prompt_eval_count: None,
-                                };
-                                return Ok(Some((out, state)));
+                                return Ok(Some((text_chunk(text, false), state)));
+                            }
+                        }
+                        BlockDelta::Thinking { thinking } => {
+                            if !thinking.is_empty() {
+                                return Ok(Some((text_chunk(thinking, true), state)));
                             }
                         }
                         BlockDelta::InputJson { partial_json } => {
@@ -601,6 +615,38 @@ mod tests {
         assert_eq!(message.tool_calls[0].function.name, "execute");
         assert_eq!(message.tool_calls[0].function.arguments["command"], "ls");
 
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn decodes_thinking_deltas_as_thinking() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Considering...\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Answer.\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("thinking").expect("ok");
+        assert!(first.thinking, "thinking delta is flagged");
+        assert_eq!(first.message.expect("message").content, "Considering...");
+
+        let second = chunks.next().await.expect("text").expect("ok");
+        assert!(!second.thinking, "visible text is not flagged");
+        assert_eq!(second.message.expect("message").content, "Answer.");
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
         assert!(chunks.next().await.is_none());
     }
 }

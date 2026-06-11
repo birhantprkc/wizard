@@ -164,6 +164,11 @@ pub struct ChatRequest {
 pub struct ChatChunk {
     #[serde(default)]
     pub message: Option<ChatMessage>,
+    /// True when `message.content` is model reasoning ("thinking") rather
+    /// than answer text (Anthropic `thinking_delta`, xAI `reasoning_content`).
+    /// The UI renders it dimmed; it is never fed back into history.
+    #[serde(default)]
+    pub thinking: bool,
     pub done: bool,
     #[serde(default)]
     pub done_reason: Option<String>,

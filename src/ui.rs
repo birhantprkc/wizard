@@ -224,6 +224,17 @@ fn gutter_block(lines: &mut Vec<Line<'static>>, text: Text<'static>, marker: Spa
     }
 }
 
+/// Render model reasoning ("thinking") as plain dimmed-italic lines.
+/// No markdown: reasoning is background noise, not the answer.
+fn thinking_text(message: &str) -> Text<'static> {
+    let style = dim().italic();
+    let lines: Vec<Line<'static>> = message
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), style)))
+        .collect();
+    Text::from(lines)
+}
+
 /// Build the full (unwrapped) transcript text from app state.
 fn transcript_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -266,6 +277,13 @@ fn transcript_text(app: &App) -> Text<'static> {
                     Span::styled("· ", accent()),
                 );
             }
+            TranscriptEntry::Thinking(message) => {
+                gutter_block(
+                    &mut lines,
+                    thinking_text(message),
+                    Span::styled("· ", dim()),
+                );
+            }
             TranscriptEntry::ToolCard {
                 name,
                 args,
@@ -296,6 +314,18 @@ fn transcript_text(app: &App) -> Text<'static> {
         }
     }
 
+    if !app.streaming_thinking.is_empty() {
+        if !first {
+            lines.push(Line::raw(""));
+        }
+        first = false;
+        // In-flight reasoning, dimmed so it reads as background noise.
+        gutter_block(
+            &mut lines,
+            thinking_text(&app.streaming_thinking),
+            Span::styled("· ", dim()),
+        );
+    }
     if !app.streaming.is_empty() {
         if !first {
             lines.push(Line::raw(""));
