@@ -251,6 +251,89 @@ fn headless_mode_without_a_prompt_is_an_actionable_error() {
     );
 }
 
+#[test]
+fn schedule_add_list_remove_round_trip() {
+    let home = TempDir::new();
+    let cwd = home.0.to_string_lossy().to_string();
+
+    let output = run_wizard(
+        &home.0,
+        &[
+            "schedule",
+            "add",
+            "nightly",
+            "--cron",
+            "0 3 * * *",
+            "--prompt",
+            "tidy the repo",
+            "--cwd",
+            &cwd,
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "add must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("next fire"),
+        "add must print the next fire time:\n{stdout}"
+    );
+    assert!(
+        home.0.join(".wizard").join("schedule.toml").exists(),
+        "add must persist schedule.toml"
+    );
+
+    let output = run_wizard(&home.0, &["schedule", "list"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("nightly") && stdout.contains("0 3 * * *"),
+        "list must show the entry:\n{stdout}"
+    );
+
+    let output = run_wizard(&home.0, &["schedule", "remove", "nightly"], &[]);
+    assert!(output.status.success(), "remove must succeed");
+
+    let output = run_wizard(&home.0, &["schedule", "list"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no entries"),
+        "list after remove must be empty:\n{stdout}"
+    );
+
+    let output = run_wizard(&home.0, &["schedule", "remove", "nightly"], &[]);
+    assert!(
+        !output.status.success(),
+        "removing a missing entry must fail"
+    );
+}
+
+#[test]
+fn schedule_add_rejects_a_bad_cron_expression() {
+    let home = TempDir::new();
+    let cwd = home.0.to_string_lossy().to_string();
+    let output = run_wizard(
+        &home.0,
+        &[
+            "schedule", "add", "broken", "--cron", "whenever", "--prompt", "x", "--cwd", &cwd,
+        ],
+        &[],
+    );
+    assert!(!output.status.success(), "a bad cron must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cron"),
+        "error must mention the cron expression:\n{stderr}"
+    );
+    assert!(
+        !home.0.join(".wizard").join("schedule.toml").exists(),
+        "nothing may be persisted on a failed add"
+    );
+}
+
 /// Real inference end to end: auto-spawn llama-server, load a GGUF, run one
 /// sovereign turn. Opt-in only — set `WIZARD_E2E_GGUF` to a local GGUF path
 /// (small models recommended); skipped otherwise so `cargo test` never loads

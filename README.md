@@ -169,6 +169,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 - [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
+- [Scheduler](docs/scheduler.md): cron-scheduled headless runs; `wizard schedule`, `wizard scheduler`
 - [Architecture](docs/architecture.md): how it's built
 - [Security](SECURITY.md): threat model
 - [WIZARD.md](WIZARD.md): the agent's bundled behavioral charter; inherited and editable by every fork

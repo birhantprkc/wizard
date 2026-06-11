@@ -107,6 +107,69 @@ pub enum Command {
     /// hooks, writable state dirs, checkpoints. Exits 0 when no check
     /// failed.
     Doctor,
+
+    /// Manage scheduled runs (~/.wizard/schedule.toml): cron entries the
+    /// `wizard scheduler` daemon fires as headless wizard runs.
+    Schedule {
+        #[command(subcommand)]
+        cmd: ScheduleCmd,
+    },
+
+    /// Run the scheduler daemon in the foreground: reload
+    /// ~/.wizard/schedule.toml each pass and fire due entries as headless
+    /// wizard child processes. Daemonize externally (e.g. systemd); see
+    /// docs/scheduler.md.
+    Scheduler,
+}
+
+/// `wizard schedule` subcommands. Like bench, these are self-contained:
+/// they edit `~/.wizard/schedule.toml` directly and never load
+/// `~/.wizard/config.toml` or trigger onboarding.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ScheduleCmd {
+    /// Add an entry; validates the cron expression and prints the next
+    /// fire time.
+    Add {
+        /// Unique entry name; `[a-zA-Z0-9_-]+` only.
+        name: String,
+
+        /// Standard 5-field cron expression (minute hour day month weekday),
+        /// evaluated in local time.
+        #[arg(long)]
+        cron: String,
+
+        /// Task prompt handed to the spawned headless wizard run.
+        #[arg(long)]
+        prompt: String,
+
+        /// Directory the run executes in (must exist).
+        #[arg(long)]
+        cwd: PathBuf,
+
+        /// Wall-clock cap in hours for the spawned run.
+        #[arg(long)]
+        max_hours: Option<f64>,
+
+        /// Run mode for the job: `sovereign` (default) or `continuous`.
+        #[arg(long, default_value = "sovereign")]
+        mode: String,
+    },
+
+    /// List entries with their next fire times.
+    List,
+
+    /// Remove an entry by name.
+    Remove {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
+    },
+
+    /// Run one entry's job immediately in the foreground (same child
+    /// command the daemon would spawn); exits with the child's exit code.
+    Run {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
+    },
 }
 
 /// `wizard bench` subcommands. Self-contained: no flag here depends on the
@@ -347,6 +410,83 @@ mod tests {
     fn doctor_parses_as_a_subcommand() {
         let cli = parse(&["doctor"]).expect("doctor parses");
         assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn scheduler_parses_as_a_subcommand() {
+        let cli = parse(&["scheduler"]).expect("scheduler parses");
+        assert!(matches!(cli.command, Some(Command::Scheduler)));
+    }
+
+    #[test]
+    fn schedule_add_parses_with_defaults() {
+        let cli = parse(&[
+            "schedule",
+            "add",
+            "nightly",
+            "--cron",
+            "0 3 * * *",
+            "--prompt",
+            "tidy up",
+            "--cwd",
+            "/tmp/proj",
+        ])
+        .expect("schedule add parses");
+        let Some(Command::Schedule {
+            cmd:
+                ScheduleCmd::Add {
+                    name,
+                    cron,
+                    prompt,
+                    cwd,
+                    max_hours,
+                    mode,
+                },
+        }) = cli.command
+        else {
+            panic!("expected schedule add");
+        };
+        assert_eq!(name, "nightly");
+        assert_eq!(cron, "0 3 * * *");
+        assert_eq!(prompt, "tidy up");
+        assert_eq!(cwd, PathBuf::from("/tmp/proj"));
+        assert_eq!(max_hours, None);
+        assert_eq!(mode, "sovereign");
+    }
+
+    #[test]
+    fn schedule_add_requires_cron_prompt_and_cwd() {
+        let err = parse(&["schedule", "add", "nightly"]).expect_err("missing args rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn schedule_list_remove_and_run_parse() {
+        let cli = parse(&["schedule", "list"]).expect("schedule list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Schedule {
+                cmd: ScheduleCmd::List
+            })
+        ));
+
+        let cli = parse(&["schedule", "remove", "nightly"]).expect("schedule remove parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Remove { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule remove");
+        };
+        assert_eq!(name, "nightly");
+
+        let cli = parse(&["schedule", "run", "nightly"]).expect("schedule run parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Run { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule run");
+        };
+        assert_eq!(name, "nightly");
     }
 
     #[test]

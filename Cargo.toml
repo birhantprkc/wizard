@@ -51,6 +51,9 @@ indicatif = "0.17"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Cron parsing + next-occurrence math (`wizard schedule` / `wizard scheduler`)
+croner = "3"
+
 # File matching for list_files / skills discovery
 globset = "0.4"
 

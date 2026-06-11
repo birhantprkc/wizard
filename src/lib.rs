@@ -26,6 +26,7 @@ pub mod memory;
 pub mod onboarding;
 pub mod output;
 pub mod progress;
+pub mod schedule;
 pub mod server;
 pub mod skills;
 pub mod tools;
@@ -63,6 +64,23 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return doctor::run().await;
+    }
+
+    // Schedule CRUD and the scheduler daemon are config-independent too:
+    // they only touch ~/.wizard/schedule.toml, and the jobs they spawn are
+    // wizard child processes that load config themselves. `schedule run`
+    // propagates the child's exit code.
+    if let Some(cli::Command::Schedule { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return schedule::run(cmd.clone()).await;
+    }
+    if let Some(cli::Command::Scheduler) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return schedule::run_daemon().await;
     }
 
     // `--login` is a one-shot credential flow: no config, no onboarding,

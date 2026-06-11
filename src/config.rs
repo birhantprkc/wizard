@@ -548,6 +548,12 @@ impl Config {
         Ok(Self::wizard_dir()?.join("logs"))
     }
 
+    /// `~/.wizard/schedule.toml` — cron schedule entries
+    /// (`crate::schedule`).
+    pub fn schedule_path() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("schedule.toml"))
+    }
+
     /// Create the `~/.wizard` directory tree (sessions, tools, skills, logs)
     /// if it does not exist yet. Idempotent; called on every load so a fresh
     /// install is usable without running the installer.
