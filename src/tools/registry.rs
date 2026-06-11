@@ -14,6 +14,7 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolOutput};
 
 use super::file::{EditFileTool, ListFilesTool, ReadFileTool, SearchFilesTool, WriteFileTool};
 use super::git::{GitDiffTool, GitStatusTool};
+use super::memory::MemoryTool;
 use super::shell::ExecuteTool;
 
 /// Registry of every callable tool, keyed by advertised name.
@@ -32,7 +33,7 @@ impl ToolRegistry {
 
     /// Registry pre-populated with all native tools
     /// (`read_file`, `write_file`, `edit_file`, `list_files`,
-    /// `search_files`, `execute`, `git_status`, `git_diff`).
+    /// `search_files`, `execute`, `git_status`, `git_diff`, `memory`).
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
@@ -43,6 +44,7 @@ impl ToolRegistry {
         registry.register(Arc::new(ExecuteTool));
         registry.register(Arc::new(GitStatusTool));
         registry.register(Arc::new(GitDiffTool));
+        registry.register(Arc::new(MemoryTool));
         registry
     }
 
@@ -201,9 +203,10 @@ mod tests {
                 "execute",
                 "git_status",
                 "git_diff",
+                "memory",
             ]
         );
-        assert_eq!(registry.len(), 8);
+        assert_eq!(registry.len(), 9);
         assert!(!registry.is_empty());
 
         for spec in registry.specs() {
@@ -227,6 +230,7 @@ mod tests {
             "search_files",
             "git_status",
             "git_diff",
+            "memory",
         ] {
             assert!(!approval(safe), "{safe} must not require approval");
         }

@@ -15,6 +15,7 @@ pub mod gateway;
 pub mod hardware;
 pub mod llm;
 pub mod mcp;
+pub mod memory;
 pub mod onboarding;
 pub mod server;
 pub mod skills;

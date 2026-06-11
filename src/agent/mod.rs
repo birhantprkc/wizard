@@ -203,6 +203,10 @@ pub struct Agent {
     skills: Vec<Skill>,
     /// Project `AGENTS.md` / `WIZARD.md` contents, if present.
     agents_md: Option<String>,
+    /// Persistent memory index (MEMORY.md) for this project, if any
+    /// memories are saved. Re-read on every system prompt refresh so
+    /// `/reload` picks up changes.
+    memory_index: Option<String>,
     /// Wall-clock deadline for sovereign runs (`--max-hours`).
     deadline: Option<Instant>,
     /// Circuit breaker state: signature of the last failing tool call and
@@ -292,6 +296,7 @@ impl Agent {
         native_tools: bool,
     ) -> Result<Self> {
         let agents_md = read_project_instructions(&project_root);
+        let memory_index = read_memory_index(&project_root);
         let model = config.active().model;
         let mut load_warning = None;
         let prior = session
@@ -320,6 +325,7 @@ impl Agent {
             native_tools,
             skills,
             agents_md,
+            memory_index,
             deadline: None,
             failure_streak: None,
             tool_failures: ToolFailureCounter::default(),
@@ -396,8 +402,12 @@ impl Agent {
     }
 
     fn compose_system_prompt(&self) -> String {
-        let mut prompt =
-            prompts::build_system_prompt(self.mode, &self.skills, self.agents_md.as_deref());
+        let mut prompt = prompts::build_system_prompt(
+            self.mode,
+            &self.skills,
+            self.agents_md.as_deref(),
+            self.memory_index.as_deref(),
+        );
         if !self.native_tools {
             prompt.push_str("\n\n");
             prompt.push_str(&prompts::render_tool_protocol(&self.registry.specs()));
@@ -406,6 +416,7 @@ impl Agent {
     }
 
     fn refresh_system_prompt(&mut self) {
+        self.memory_index = read_memory_index(&self.ctx.cwd);
         let prompt = self.compose_system_prompt();
         match self.history.first_mut() {
             Some(first) if first.role == Role::System => first.content = prompt,
@@ -931,6 +942,26 @@ fn read_project_instructions(project_root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Read the persistent memory index (MEMORY.md) for `project_root`, if any
+/// memories are saved. Failures are logged, not fatal — memory is an
+/// enhancement, never a reason a session cannot start.
+fn read_memory_index(project_root: &Path) -> Option<String> {
+    let store = match crate::memory::MemoryStore::open(project_root) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!("could not open memory store: {err:#}");
+            return None;
+        }
+    };
+    match store.index() {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::warn!("could not read memory index: {err:#}");
+            None
+        }
+    }
 }
 
 /// Build a fully wired headless [`Agent`]: construct the active provider's

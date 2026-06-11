@@ -38,10 +38,37 @@ repeat a failing action verbatim.
 - Keep edits minimal and consistent with the existing code style.
 - Commit when a coherent unit of work passes tests, with a clear message.";
 
+/// Memory guidance injected when the project has saved memories; the index
+/// (MEMORY.md) follows it.
+const MEMORY_PROMPT_WITH_INDEX: &str = "\
+You have persistent project memory. The index below lists saved memories \
+(one per file). Use the `memory` tool with action \"read\" to recall \
+details, \"save\" to record new durable facts (user preferences, project \
+conventions, decisions not derivable from the code), and \"delete\" for \
+stale ones. Keep names kebab-case and descriptions one line. Don't save \
+things the repo already records.";
+
+/// Memory guidance injected when no memories exist yet, so memory
+/// bootstraps on first use.
+const MEMORY_PROMPT_EMPTY: &str = "\
+You have persistent project memory via the `memory` tool, but nothing is \
+saved for this project yet. When you learn a durable fact (user \
+preferences, project conventions, decisions not derivable from the code), \
+record it with action \"save\" (kebab-case name, one-line description); it \
+will appear in your system prompt next session. Don't save things the repo \
+already records.";
+
 /// Compose the full system prompt for `mode`: personality prompt, then the
 /// bundled `WIZARD.md` charter, then a rendered skills section, then the
-/// project's `AGENTS.md` contents (if present at the project root).
-pub fn build_system_prompt(mode: Mode, skills: &[Skill], agents_md: Option<&str>) -> String {
+/// project's `AGENTS.md` contents (if present at the project root), then
+/// the persistent memory section (`memory_index` is the project's
+/// MEMORY.md, when any memories are saved).
+pub fn build_system_prompt(
+    mode: Mode,
+    skills: &[Skill],
+    agents_md: Option<&str>,
+    memory_index: Option<&str>,
+) -> String {
     let base = match mode {
         Mode::Genie => GENIE_SYSTEM_PROMPT,
         Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
@@ -63,6 +90,16 @@ pub fn build_system_prompt(mode: Mode, skills: &[Skill], agents_md: Option<&str>
     if let Some(agents_md) = agents_md {
         prompt.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
         prompt.push_str(agents_md);
+    }
+
+    prompt.push_str("\n\n## Memory\n\n");
+    match memory_index {
+        Some(index) => {
+            prompt.push_str(MEMORY_PROMPT_WITH_INDEX);
+            prompt.push_str("\n\n### Memory index (MEMORY.md)\n\n");
+            prompt.push_str(index);
+        }
+        None => prompt.push_str(MEMORY_PROMPT_EMPTY),
     }
 
     prompt
@@ -109,7 +146,7 @@ mod tests {
     #[test]
     fn system_prompt_contains_wizard_charter() {
         for mode in [Mode::Genie, Mode::Sovereign] {
-            let prompt = build_system_prompt(mode, &[], None);
+            let prompt = build_system_prompt(mode, &[], None, None);
             assert!(
                 prompt.contains("## Wizard charter (WIZARD.md)"),
                 "charter header missing in {mode} prompt"
@@ -125,7 +162,7 @@ mod tests {
     /// Skills and AGENTS.md appear after the charter.
     #[test]
     fn charter_comes_before_agents_md() {
-        let prompt = build_system_prompt(Mode::Genie, &[], Some("# Project rules"));
+        let prompt = build_system_prompt(Mode::Genie, &[], Some("# Project rules"), None);
         let charter_pos = prompt
             .find("## Wizard charter (WIZARD.md)")
             .expect("charter present");
@@ -135,6 +172,26 @@ mod tests {
         assert!(
             charter_pos < agents_pos,
             "charter must appear before project instructions"
+        );
+    }
+
+    /// The memory index appears verbatim under its own section when saved
+    /// memories exist; without one, the bootstrap guidance still mentions
+    /// the `memory` tool.
+    #[test]
+    fn memory_index_is_injected_when_present() {
+        let index = "- [build-system](build-system.md) — uses cargo with lto\n";
+        let prompt = build_system_prompt(Mode::Genie, &[], None, Some(index));
+        assert!(prompt.contains("## Memory"));
+        assert!(prompt.contains("### Memory index (MEMORY.md)"));
+        assert!(prompt.contains(index));
+
+        let prompt = build_system_prompt(Mode::Genie, &[], None, None);
+        assert!(prompt.contains("## Memory"));
+        assert!(prompt.contains("`memory` tool"));
+        assert!(
+            !prompt.contains("### Memory index (MEMORY.md)"),
+            "no index section without saved memories"
         );
     }
 }

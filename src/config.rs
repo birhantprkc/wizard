@@ -374,6 +374,12 @@ impl Config {
         Ok(Self::wizard_dir()?.join("src"))
     }
 
+    /// `~/.wizard/memory/` — persistent per-project memory
+    /// (`crate::memory::MemoryStore`).
+    pub fn memory_dir() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("memory"))
+    }
+
     /// `~/.wizard/evolution.jsonl` — self-extension log.
     pub fn evolution_log_path() -> Result<PathBuf> {
         Ok(Self::wizard_dir()?.join("evolution.jsonl"))
@@ -394,6 +400,7 @@ impl Config {
             Self::scripted_tools_dir()?,
             Self::skills_dir()?,
             Self::subagents_dir()?,
+            Self::memory_dir()?,
             Self::logs_dir()?,
         ] {
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

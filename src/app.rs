@@ -23,6 +23,7 @@ use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRe
 use crate::llm::ToolCall;
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
+use crate::memory::MemoryStore;
 use crate::server;
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
@@ -108,6 +109,8 @@ pub enum SlashCommand {
     Reload,
     /// Toggle the git diff sidebar.
     Diff,
+    /// Show the saved project memories.
+    Memory,
     /// `/publish [branch]` — fork Wizard and get a one-line installer.
     Publish {
         branch: Option<String>,
@@ -249,6 +252,7 @@ impl SlashCommand {
             }
             "reload" => Ok(Self::Reload),
             "diff" => Ok(Self::Diff),
+            "memory" => Ok(Self::Memory),
             "publish" => Ok(Self::Publish {
                 branch: args.first().map(|s| s.to_string()),
             }),
@@ -338,6 +342,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "diff",
         args: "",
         description: "toggle the git diff sidebar",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "memory",
+        args: "",
+        description: "show saved project memories",
         takes_args: false,
     },
     CommandSpec {
@@ -1368,6 +1378,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
+/memory                     show saved project memories\n  \
 /quit                       exit\n\
 keys:\n  \
 Tab / →                     accept command completion\n  \
@@ -1737,6 +1748,7 @@ impl CommandContext<'_> {
             SlashCommand::Help => self.app.notice(HELP_TEXT),
             SlashCommand::Quit => self.app.should_quit = true,
             SlashCommand::Diff => self.toggle_diff().await,
+            SlashCommand::Memory => self.memory(),
             SlashCommand::Clear => self.clear(),
             SlashCommand::Model(None) => self.open_model_picker().await,
             SlashCommand::Model(Some(tag)) => self.switch_model(tag),
@@ -1774,6 +1786,31 @@ impl CommandContext<'_> {
                 Ok(text) => text,
                 Err(err) => format!("could not read git diff: {err:#}"),
             };
+        }
+    }
+
+    /// `/memory`: list the saved project memories (name — description).
+    fn memory(&mut self) {
+        let store = match MemoryStore::open(self.project_root) {
+            Ok(store) => store,
+            Err(err) => {
+                self.app
+                    .notice(format!("could not open memory store: {err:#}"));
+                return;
+            }
+        };
+        match store.list() {
+            Ok(entries) if entries.is_empty() => self
+                .app
+                .notice(format!("no memories saved yet ({})", store.dir().display())),
+            Ok(entries) => {
+                let mut text = format!("saved memories ({}):\n", store.dir().display());
+                for entry in &entries {
+                    text.push_str(&format!("  {} — {}\n", entry.name, entry.description));
+                }
+                self.app.notice(text.trim_end().to_string());
+            }
+            Err(err) => self.app.notice(format!("could not list memories: {err:#}")),
         }
     }
 
@@ -2390,7 +2427,8 @@ mod tests {
         let mut app = app();
         type_str(&mut app, "/mo");
         let names: Vec<&str> = app.suggestions.iter().map(|s| s.name).collect();
-        assert_eq!(names, ["model", "mode"]);
+        // Prefix matches first, then substring matches ("me*mo*ry").
+        assert_eq!(names, ["model", "mode", "memory"]);
         assert_eq!(app.input_mode, InputMode::Command);
     }
 
@@ -2409,9 +2447,11 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert_eq!(app.suggestion_index, 1);
         press(&mut app, KeyCode::Down);
+        assert_eq!(app.suggestion_index, 2);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.suggestion_index, 0);
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.suggestion_index, 1);
+        assert_eq!(app.suggestion_index, 2);
     }
 
     #[test]
