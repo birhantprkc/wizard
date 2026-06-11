@@ -14,6 +14,7 @@ pub mod scripted;
 pub mod shell;
 pub mod tasks;
 pub mod todo;
+pub mod web;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,9 @@ pub struct ToolContext {
     /// approval round-trip) can reach it. `None` outside the dispatch
     /// pipeline (subagents, direct registry execution).
     pub events: Option<tokio::sync::mpsc::Sender<crate::agent::AgentEvent>>,
+    /// Settings for the native web tools (`[web]` in `config.toml`), set by
+    /// the agent at construction; defaults elsewhere.
+    pub web: Arc<crate::config::WebConfig>,
 }
 
 impl ToolContext {
@@ -68,7 +72,14 @@ impl ToolContext {
             tasks: Arc::new(tasks::TaskRegistry::new()),
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
             events: None,
+            web: Arc::new(crate::config::WebConfig::default()),
         }
+    }
+
+    /// This context with `web` tool settings applied (agent construction).
+    pub fn with_web(mut self, web: crate::config::WebConfig) -> Self {
+        self.web = Arc::new(web);
+        self
     }
 
     /// A copy of this context carrying the turn's event channel.

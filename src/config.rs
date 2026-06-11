@@ -206,6 +206,39 @@ fn splitmix64(seed: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Settings for the native web tools (`[web]` in `config.toml`): `web_fetch`
+/// response caps, the SSRF guard escape hatch, and `web_search` backend
+/// selection. Search API keys are never stored here — only the name of the
+/// environment variable holding the key (`search_api_key_env`), read at call
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Byte cap on a `web_fetch` response body (default 100_000).
+    pub fetch_max_bytes: usize,
+    /// Allow fetches that resolve to localhost / private address ranges
+    /// (default false). The SSRF guard is on unless this is set.
+    pub allow_local: bool,
+    /// `web_search` backend: `"duckduckgo"` (default, no key),
+    /// `"brave"`, or `"tavily"`.
+    pub search_backend: String,
+    /// Name of the env var holding the search API key (brave/tavily); the
+    /// key itself is never persisted and is read at call time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_api_key_env: Option<String>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            fetch_max_bytes: 100_000,
+            allow_local: false,
+            search_backend: "duckduckgo".to_string(),
+            search_api_key_env: None,
+        }
+    }
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +432,9 @@ pub struct Config {
     /// Cosmetic TUI settings (spinner verbs).
     #[serde(default)]
     pub ui: UiConfig,
+    /// Native web tool settings (`web_fetch` / `web_search`).
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 impl Default for Config {
@@ -422,6 +458,7 @@ impl Default for Config {
             active_provider: None,
             gateway: GatewayConfig::default(),
             ui: UiConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }
@@ -739,6 +776,12 @@ mod tests {
             ui: UiConfig {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
             },
+            web: WebConfig {
+                fetch_max_bytes: 250_000,
+                allow_local: true,
+                search_backend: "brave".to_string(),
+                search_api_key_env: Some("BRAVE_API_KEY".to_string()),
+            },
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -770,6 +813,31 @@ mod tests {
         assert_eq!(parsed.gateway.token_env.as_deref(), Some("MY_BOT_TOKEN"));
         assert_eq!(parsed.gateway.allowed_chat_ids, vec![42, -100123]);
         assert_eq!(parsed.ui, original.ui);
+        assert_eq!(parsed.web, original.web);
+    }
+
+    #[test]
+    fn web_defaults_when_section_missing() {
+        let config: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(config.web, WebConfig::default());
+        assert_eq!(config.web.fetch_max_bytes, 100_000);
+        assert!(!config.web.allow_local);
+        assert_eq!(config.web.search_backend, "duckduckgo");
+        assert!(config.web.search_api_key_env.is_none());
+    }
+
+    #[test]
+    fn web_section_parses_partial_keys() {
+        let config: Config = toml::from_str(
+            "[web]\nsearch_backend = \"tavily\"\nsearch_api_key_env = \"TAVILY_API_KEY\"",
+        )
+        .expect("valid toml");
+        assert_eq!(config.web.search_backend, "tavily");
+        assert_eq!(
+            config.web.search_api_key_env.as_deref(),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(config.web.fetch_max_bytes, 100_000, "missing keys default");
     }
 
     #[test]

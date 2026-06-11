@@ -338,6 +338,7 @@ impl Agent {
         // Plan mode: one flag shared by the dispatcher (read-only gate) and
         // the always-registered exit_plan tool (cleared on approval).
         let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let web = config.web.clone();
         let mut registry = registry;
         registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
             &plan_mode,
@@ -357,7 +358,7 @@ impl Agent {
             config,
             history: Vec::new(),
             session,
-            ctx: ToolContext::new(project_root),
+            ctx: ToolContext::new(project_root).with_web(web),
             native_tools,
             skills,
             agents_md,

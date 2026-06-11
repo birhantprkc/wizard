@@ -59,6 +59,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# Web tools: HTML → markdown for web_fetch, result scraping for web_search
+htmd = "0.5"
+scraper = "0.27"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

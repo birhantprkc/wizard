@@ -17,6 +17,7 @@ use super::git::{GitDiffTool, GitStatusTool};
 use super::memory::MemoryTool;
 use super::shell::ExecuteTool;
 use super::todo::TodoTool;
+use super::web::{WebFetchTool, WebSearchTool};
 
 /// Registry of every callable tool, keyed by advertised name.
 /// Registration order is preserved for stable spec ordering in prompts.
@@ -35,7 +36,7 @@ impl ToolRegistry {
     /// Registry pre-populated with all native tools
     /// (`read_file`, `write_file`, `edit_file`, `list_files`,
     /// `search_files`, `execute`, `git_status`, `git_diff`, `memory`,
-    /// `todo`).
+    /// `todo`, `web_fetch`, `web_search`).
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
@@ -48,6 +49,8 @@ impl ToolRegistry {
         registry.register(Arc::new(GitDiffTool));
         registry.register(Arc::new(MemoryTool));
         registry.register(Arc::new(TodoTool));
+        registry.register(Arc::new(WebFetchTool));
+        registry.register(Arc::new(WebSearchTool));
         registry
     }
 
@@ -208,9 +211,11 @@ mod tests {
                 "git_diff",
                 "memory",
                 "todo",
+                "web_fetch",
+                "web_search",
             ]
         );
-        assert_eq!(registry.len(), 10);
+        assert_eq!(registry.len(), 12);
         assert!(!registry.is_empty());
 
         for spec in registry.specs() {
@@ -234,6 +239,9 @@ mod tests {
             // `todo` mutates only agent-local state, so it stays usable in
             // plan mode.
             "todo",
+            // The web tools only observe the outside world.
+            "web_fetch",
+            "web_search",
         ] {
             assert_eq!(access(read_only), ToolAccess::ReadOnly, "{read_only}");
         }
