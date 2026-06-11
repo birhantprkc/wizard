@@ -23,6 +23,7 @@ pub mod local_setup;
 pub mod mcp;
 pub mod memory;
 pub mod onboarding;
+pub mod output;
 pub mod progress;
 pub mod server;
 pub mod skills;
@@ -38,21 +39,28 @@ use crate::config::Mode;
 
 /// Top-level entry point: load config, apply CLI overrides, and dispatch to
 /// the selected run mode (genie TUI, sovereign headless loop, or `--evolve`).
-pub async fn run(cli: cli::Cli) -> Result<()> {
+///
+/// Returns the process exit code: headless runs map their outcome through
+/// [`output::exit_code`] (0 completed, 2 max-steps, 3 circuit breaker, 4 time
+/// limit); every other mode exits 0 on success. Hard errors surface as `Err`
+/// and exit 1 from `main`.
+pub async fn run(cli: cli::Cli) -> Result<i32> {
     // Bench is self-contained tooling: it must work with no config and no
     // LLM, so dispatch before onboarding and before the config load.
     if let Some(cli::Command::Bench { cmd }) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        return bench::run(cmd.clone()).await;
+        return bench::run(cmd.clone()).await.map(|()| 0);
     }
 
     // `--login` is a one-shot credential flow: no config, no onboarding,
     // no TUI. Tokens land in a dedicated file under ~/.wizard/.
     if let Some(provider) = &cli.login {
         return match provider.as_str() {
-            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}")).await,
+            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"))
+                .await
+                .map(|()| 0),
             other => anyhow::bail!("unknown login provider '{other}' (supported: xai)"),
         };
     }
@@ -65,7 +73,7 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
             Some(config) => config,
             None => {
                 println!("onboarding cancelled — run `wizard --onboard` any time.");
-                return Ok(());
+                return Ok(0);
             }
         }
     } else {
@@ -84,15 +92,15 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
     }
 
     if cli.publish {
-        return evolve::run_publish_cli(config, cli).await;
+        return evolve::run_publish_cli(config, cli).await.map(|()| 0);
     }
 
     if cli.evolve {
-        return evolve::run_cli(config, cli).await;
+        return evolve::run_cli(config, cli).await.map(|()| 0);
     }
 
     if cli.gateway {
-        return gateway::run(config, cli).await;
+        return gateway::run(config, cli).await.map(|()| 0);
     }
 
     match config.mode {

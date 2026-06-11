@@ -9,7 +9,6 @@ pub mod prompts;
 pub mod session;
 pub mod subagent;
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1348,7 +1347,8 @@ fn rollback_failed_cycle(
     project_root: &Path,
     first_turn: u64,
     why: &str,
-    spinner: &crate::progress::TurnSpinner,
+    // `None` in the structured output formats, where stdout is JSON-only.
+    spinner: Option<&crate::progress::TurnSpinner>,
 ) {
     if !config.rollback_failed_cycles {
         return;
@@ -1358,10 +1358,12 @@ fn rollback_failed_cycle(
             if restored.is_empty() {
                 return;
             }
-            spinner.println(&format!(
-                "[rolled back {} file(s) after {why}]",
-                restored.len()
-            ));
+            if let Some(spinner) = spinner {
+                spinner.println(&format!(
+                    "[rolled back {} file(s) after {why}]",
+                    restored.len()
+                ));
+            }
             if let Some(mission) = mission {
                 mission.note(format!(
                     "rolled back {} file(s) after {why} (cycle starting at turn {first_turn})",
@@ -1384,8 +1386,10 @@ fn rollback_failed_cycle(
 /// outages, compacting context, and re-exec'ing itself after a self-evolve —
 /// until stopped via `.wizard/loop-control`, `--max-hours`, or the circuit
 /// breaker. Otherwise it honors the `--loop N` bound. Prints progress to
-/// stdout instead of the TUI.
-pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
+/// stdout instead of the TUI (`--output-format` selects the
+/// [`crate::output::EventSink`]); the returned exit code encodes the
+/// outcome (see [`crate::output::exit_code`]).
+pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
     let project_root = std::env::current_dir().context("determining project root")?;
 
     // Goal resolution: an explicit `-p` wins; otherwise resume the standing
@@ -1423,96 +1427,38 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     }
 
     // Busy spinner ("Conjuring…") shown while the model thinks or a tool
-    // runs, hidden while output streams. Shared with the printer task; a
-    // no-op when stderr is not a terminal.
+    // runs, hidden while output streams. Shared with the text sink; a
+    // no-op when stderr is not a terminal. The structured formats never
+    // show it and keep stdout pure JSON (`text_mode` gates every plain
+    // stdout line below).
     let spinner = Arc::new(crate::progress::TurnSpinner::new());
+    let text_mode = cli.output_format == crate::output::OutputFormat::Text;
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-    let printer_spinner = Arc::clone(&spinner);
-    // The printer returns the run's accumulated (prompt, completion) token
-    // totals for the final summary line.
-    let printer = tokio::spawn(async move {
-        let mut prompt_total: u64 = 0;
-        let mut completion_total: u64 = 0;
-        while let Some(event) = rx.recv().await {
-            match event {
-                AgentEvent::TextDelta(delta) => {
-                    printer_spinner.hide();
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                }
-                AgentEvent::ThinkingDelta(delta) => {
-                    // ANSI faint so reasoning reads as background noise.
-                    printer_spinner.hide();
-                    print!("\x1b[2m{delta}\x1b[0m");
-                    let _ = std::io::stdout().flush();
-                }
-                AgentEvent::ToolStarted { name, args } => {
-                    printer_spinner.println(&format!("\n→ {name} {args}"));
-                    // The tool may run for a while: keep the verb spinning.
-                    printer_spinner.show();
-                }
-                AgentEvent::ToolFinished { name, output } => {
-                    let status = if output.is_error { "error" } else { "ok" };
-                    printer_spinner.println(&format!("← {name} [{status}]"));
-                    // Back to the model: it is thinking about the result.
-                    printer_spinner.show();
-                }
-                AgentEvent::StepCompleted { step } => {
-                    tracing::debug!("step {step} completed");
-                }
-                AgentEvent::Error(message) => {
-                    printer_spinner.hide();
-                    eprintln!("\nwizard error: {message}");
-                }
-                AgentEvent::HookFired {
-                    event,
-                    command,
-                    outcome,
-                } => {
-                    printer_spinner.println(&format!("~ hook {event}: {outcome} ({command})"));
-                }
-                AgentEvent::PlanReady { plan, respond } => {
-                    // Headless: print the plan and approve it, so the turn
-                    // moves from planning to execution on its own.
-                    printer_spinner
-                        .println(&format!("\n=== plan ===\n{plan}\n=== plan approved ==="));
-                    let _ = respond.send(PlanVerdict::approve());
-                    printer_spinner.show();
-                }
-                AgentEvent::Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                } => {
-                    prompt_total += prompt_tokens;
-                    completion_total += completion_tokens;
-                }
-                AgentEvent::TodoUpdated(items) => {
-                    printer_spinner.println(&crate::tools::todo::summary_line(&items));
-                }
-                AgentEvent::TaskFinished {
-                    id,
-                    command,
-                    status,
-                } => {
-                    printer_spinner.println(&format!(
-                        "⏺ background task #{id} finished ({}): {command}",
-                        status.describe()
-                    ));
-                }
-                AgentEvent::Done { reason } => {
-                    printer_spinner.hide();
-                    println!("\n[turn done: {reason:?}]");
-                }
-            }
+    // The sink consumes every agent event off the run loop; it is returned
+    // so `finish` can emit the run summary once the outcome is known.
+    let mut sink: Box<dyn crate::output::EventSink> = match cli.output_format {
+        crate::output::OutputFormat::Text => {
+            Box::new(crate::output::TextSink::new(Arc::clone(&spinner)))
         }
-        (prompt_total, completion_total)
+        crate::output::OutputFormat::Json => Box::new(crate::output::JsonSink::stdout()),
+        crate::output::OutputFormat::StreamJson => {
+            Box::new(crate::output::StreamJsonSink::stdout())
+        }
+    };
+    let printer = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            sink.event(event);
+        }
+        sink
     });
 
-    println!(
-        "wizard {} — model {model} @ {endpoint} — task: {goal}",
-        config.mode
-    );
+    if text_mode {
+        println!(
+            "wizard {} — model {model} @ {endpoint} — task: {goal}",
+            config.mode
+        );
+    }
 
     // session_start hooks fire once for the whole run.
     agent.fire_session_start(&tx).await;
@@ -1555,24 +1501,28 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
             break;
         }
         if config.continuous {
-            spinner.println(&format!("\n=== cycle {iteration} ==="));
+            if text_mode {
+                spinner.println(&format!("\n=== cycle {iteration} ==="));
+            }
             // `plan_each_cycle = true`: every cycle starts by planning again
             // (the previous cycle's exit_plan approval cleared the flag).
             if config.plan_each_cycle {
                 agent.set_plan_mode(true);
             }
-        } else if max_iterations > 1 {
+        } else if max_iterations > 1 && text_mode {
             spinner.println(&format!("\n=== iteration {iteration}/{max_iterations} ==="));
         }
 
         // Fresh verb per turn (same mechanism as the TUI's busy spinner), so
-        // one turn reads as one activity.
-        let verb_seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
-            .wrapping_add(u64::from(iteration));
-        spinner.set_verb(config.ui.spinner_verb(verb_seed));
-        spinner.show();
+        // one turn reads as one activity. Structured formats never spin.
+        if text_mode {
+            let verb_seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos() as u64)
+                .wrapping_add(u64::from(iteration));
+            spinner.set_verb(config.ui.spinner_verb(verb_seed));
+            spinner.show();
+        }
 
         // Surface background tasks that finished between cycles (the turn
         // loop also drains at the top of every step).
@@ -1643,7 +1593,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                             &project_root,
                             cycle_first_turn,
                             "circuit breaker",
-                            &spinner,
+                            text_mode.then_some(&*spinner),
                         );
                         break;
                     }
@@ -1657,7 +1607,7 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
                     &project_root,
                     cycle_first_turn,
                     "hard error",
-                    &spinner,
+                    text_mode.then_some(&*spinner),
                 );
                 run_error = Some(err);
                 break;
@@ -1692,13 +1642,18 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     agent.fire_session_end(Some(&tx)).await;
 
     drop(tx);
-    let (prompt_tokens, completion_tokens) = printer.await.unwrap_or((0, 0));
+    let mut sink = match printer.await {
+        Ok(sink) => sink,
+        Err(err) => return Err(anyhow::anyhow!("output task panicked: {err}")),
+    };
     spinner.finish();
 
     if reexec_after {
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().context("locating current executable for re-exec")?;
-        println!("[re-exec into evolved binary {}]", exe.display());
+        if text_mode {
+            println!("[re-exec into evolved binary {}]", exe.display());
+        }
         let err = std::process::Command::new(exe)
             .arg("--mode")
             .arg("sovereign")
@@ -1712,15 +1667,10 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<()> {
     if let Some(err) = run_error {
         return Err(err);
     }
-    if prompt_tokens > 0 || completion_tokens > 0 {
-        println!(
-            "[run finished: {final_reason:?} — {prompt_tokens} prompt + {completion_tokens} \
-             completion tokens]"
-        );
-    } else {
-        println!("[run finished: {final_reason:?}]");
-    }
-    Ok(())
+    // The sink emits the run summary (the text trailer line, or the final
+    // JSON object / `done` JSONL line) and leaves stdout flushed.
+    sink.finish(final_reason);
+    Ok(crate::output::exit_code(final_reason))
 }
 
 #[cfg(test)]
@@ -2759,7 +2709,7 @@ mod tests {
             &tmp.0,
             cycle_first_turn,
             "circuit breaker",
-            &spinner,
+            Some(&spinner),
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "broken");
         assert!(mission.notes.is_empty());
@@ -2776,7 +2726,7 @@ mod tests {
             &tmp.0,
             cycle_first_turn,
             "circuit breaker",
-            &spinner,
+            Some(&spinner),
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "good");
         assert!(
@@ -3202,5 +3152,55 @@ mod tests {
             "the hook was killed at its 1s timeout (took {:?})",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn stream_json_sink_renders_a_scripted_run_as_jsonl_ending_in_done() {
+        use crate::output::{EventSink, StreamJsonSink, tests::SharedBuf};
+
+        let tmp = TempDir::new();
+        let (registry, _calls) = recording_registry();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk("echo", json!({ "text": "hi" }))],
+                vec![usage_chunk("all wrapped up", 42, 7)],
+            ],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        // Feed the turn's real event stream through the stream-json sink,
+        // exactly as run_headless wires it.
+        let buf = SharedBuf::default();
+        let mut sink = StreamJsonSink::new(buf.clone());
+        while let Ok(event) = rx.try_recv() {
+            sink.event(event);
+        }
+        sink.finish(reason);
+
+        let out = buf.contents();
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is valid JSON"))
+            .collect();
+        assert!(values.len() >= 4, "got: {out}");
+        let types: Vec<&str> = values
+            .iter()
+            .filter_map(|value| value["type"].as_str())
+            .collect();
+        assert!(types.contains(&"tool_call"), "got: {types:?}");
+        assert!(types.contains(&"tool_result"), "got: {types:?}");
+        assert!(types.contains(&"text_delta"), "got: {types:?}");
+        assert!(types.contains(&"usage"), "got: {types:?}");
+        let done = values.last().expect("at least the done line");
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["reason"], "completed");
+        assert_eq!(done["usage"]["prompt_tokens"], 42);
+        assert_eq!(done["usage"]["completion_tokens"], 7);
     }
 }

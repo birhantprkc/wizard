@@ -1890,8 +1890,9 @@ async fn startup_client(config: &mut Config) -> Result<Arc<dyn LlmProvider>> {
 /// screen), build the agent stack (LLM provider, registry with scripted +
 /// MCP tools, skills, session), pre-fill `cli.prompt` if given, and drive
 /// the [`EventLoop`](crate::event::EventLoop) until quit. Restores the
-/// terminal on exit and on panic.
-pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
+/// terminal on exit and on panic. Returns the process exit code: 0 from the
+/// TUI itself; the headless fallback propagates its outcome code.
+pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     // No usable terminal: run headless when a task was given, otherwise we
     // cannot do anything sensible.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
@@ -2122,7 +2123,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<()> {
 
     drop(_guard);
     restore_terminal_best_effort();
-    Ok(())
+    Ok(0)
 }
 
 /// Everything a slash command may touch, borrowed from the main loop for

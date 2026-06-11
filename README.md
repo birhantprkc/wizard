@@ -161,6 +161,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 - [Getting started](docs/getting-started.md): install, tiers, first run, troubleshooting
 - [Modes](docs/modes.md): genie vs sovereign
+- [Headless output](docs/headless.md): `--output-format text|json|stream-json`, exit codes
 - [Checkpoints](docs/checkpoints.md): per-file snapshots, `/rewind`, perpetual rollback
 - [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback

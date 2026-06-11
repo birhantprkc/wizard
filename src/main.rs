@@ -18,11 +18,20 @@ async fn main() {
     }));
 
     let cli = Cli::parse();
-    if let Err(err) = wizard::run(cli).await {
-        // Make sure the error lands on a sane terminal even when the TUI
-        // errored out mid-frame.
-        wizard::app::restore_terminal_best_effort();
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
-    }
+    let code = match wizard::run(cli).await {
+        Ok(code) => code,
+        Err(err) => {
+            // Make sure the error lands on a sane terminal even when the TUI
+            // errored out mid-frame.
+            wizard::app::restore_terminal_best_effort();
+            eprintln!("error: {err:#}");
+            1
+        }
+    };
+    // Headless runs encode their outcome in the exit code (see
+    // `wizard::output::exit_code`); flush before exiting so structured
+    // output is never cut off.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
 }

@@ -60,6 +60,13 @@ pub struct Cli {
     #[arg(long)]
     pub continuous: bool,
 
+    /// Output format for headless (sovereign `-p`) runs: `text` streams
+    /// human-readable output (default), `json` emits one final JSON summary
+    /// object, `stream-json` emits one JSON object per line as events
+    /// arrive. Ignored by the TUI and the gateway.
+    #[arg(long, value_enum, default_value_t)]
+    pub output_format: crate::output::OutputFormat,
+
     /// Project root override (defaults to the current directory).
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -232,6 +239,7 @@ mod tests {
         assert_eq!(cli.max_hours, None);
         assert_eq!(cli.loop_limit, None);
         assert!(!cli.continuous);
+        assert_eq!(cli.output_format, crate::output::OutputFormat::Text);
         assert_eq!(cli.cwd, None);
         assert!(!cli.resume);
         assert!(!cli.onboard);
@@ -307,6 +315,21 @@ mod tests {
     fn deep_requires_evolve() {
         let err = parse(&["--deep"]).expect_err("--deep alone must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn output_format_parses_all_values() {
+        use crate::output::OutputFormat;
+        for (raw, expected) in [
+            ("text", OutputFormat::Text),
+            ("json", OutputFormat::Json),
+            ("stream-json", OutputFormat::StreamJson),
+        ] {
+            let cli = parse(&["--output-format", raw]).expect("format parses");
+            assert_eq!(cli.output_format, expected);
+        }
+        let err = parse(&["--output-format", "yaml"]).expect_err("unknown format rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]
