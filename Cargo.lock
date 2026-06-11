@@ -3265,6 +3265,7 @@ dependencies = [
  "globset",
  "htmd",
  "indicatif",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",
