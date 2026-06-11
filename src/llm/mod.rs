@@ -6,6 +6,7 @@ pub mod anthropic;
 pub mod llamacpp;
 pub mod ollama;
 pub mod openai;
+pub mod openrouter;
 pub mod provider;
 pub mod xai_oauth;
 

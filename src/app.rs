@@ -155,7 +155,7 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
         Some("add") => {
             if args.len() < 5 {
                 return Err(
-                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|xai|xaioauth> <base_url> <model> [API_KEY_ENV]"
+                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth> <base_url> <model> [API_KEY_ENV]"
                         .to_string(),
                 );
             }
@@ -164,11 +164,12 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
                 "ollama" => ProviderKind::Ollama,
                 "openai" => ProviderKind::Openai,
                 "anthropic" => ProviderKind::Anthropic,
+                "openrouter" => ProviderKind::OpenRouter,
                 "xai" => ProviderKind::Xai,
                 "xaioauth" => ProviderKind::XaiOauth,
                 other => {
                     return Err(format!(
-                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|xai|xaioauth)"
+                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth)"
                     ));
                 }
             };
@@ -1390,7 +1391,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
-/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/xai/xaioauth)\n  \
+/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
 /server [status|start|stop] manage the local llama-server\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
@@ -1460,6 +1461,13 @@ const BYOP_ENV_FALLBACKS: &[(&str, ProviderKind, &str, &str, &str)] = &[
         "https://api.x.ai/v1",
         "grok-4.3",
         "xai",
+    ),
+    (
+        "OPENROUTER_API_KEY",
+        ProviderKind::OpenRouter,
+        "https://openrouter.ai/api/v1",
+        "openrouter/auto",
+        "openrouter",
     ),
 ];
 
@@ -2135,7 +2143,7 @@ impl CommandContext<'_> {
             let synth = self.app.config.active();
             self.app.notice(format!(
                 "no providers configured — using the default: {} ({}) {} @ {}\n\
-                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic|xai|xaioauth> <base_url> <model> [API_KEY_ENV]",
+                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth> <base_url> <model> [API_KEY_ENV]",
                 synth.name, synth.kind, synth.model, synth.base_url
             ));
             return;
@@ -2645,6 +2653,31 @@ mod tests {
             .expect("is a slash command");
         let message = parsed.expect_err("unknown kind");
         assert!(message.contains("xai|xaioauth"), "got: {message}");
+    }
+
+    #[test]
+    fn provider_add_accepts_openrouter_kind() {
+        let parsed = SlashCommand::parse(
+            "/provider add openrouter openrouter https://openrouter.ai/api/v1 openrouter/auto OPENROUTER_API_KEY",
+        )
+        .expect("is a slash command")
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            SlashCommand::Provider(ProviderAction::Add {
+                name: "openrouter".to_string(),
+                kind: ProviderKind::OpenRouter,
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                model: "openrouter/auto".to_string(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            })
+        );
+
+        // The error for an unknown kind names openrouter too.
+        let parsed = SlashCommand::parse("/provider add x bogus https://e.com m")
+            .expect("is a slash command");
+        let message = parsed.expect_err("unknown kind");
+        assert!(message.contains("openrouter"), "got: {message}");
     }
 
     #[test]
