@@ -90,7 +90,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks — llama.cpp (your own GGUF and server URL) and Ollama (your own model tag) — for bringing a model you already have. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 

@@ -235,8 +235,9 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     // Step 1 — provider. "Local" is one pick: no further model questions —
     // Wizard self-configures llama.cpp (or an Ollama install that already has
-    // a model) and downloads a hardware-sized GGUF on first run. The manual
-    // local flavors sit at the bottom for people who want to pick the pieces.
+    // a model) and downloads a hardware-sized GGUF on first run. The BYOM
+    // local flavors sit alongside the cloud providers for people who want to
+    // bring their own model and pick the pieces themselves.
     let provider_options = [
         Opt::new(
             "Local (recommended)",
@@ -250,10 +251,10 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         Opt::new("Anthropic (Claude)", "claude-fable-5"),
         Opt::new("Custom OpenAI-compatible endpoint", "any base URL"),
         Opt::new(
-            "Local — llama.cpp, manual",
-            "pick a GGUF and server URL yourself",
+            "BYOM — llama.cpp",
+            "bring your own model: any GGUF, your server URL",
         ),
-        Opt::new("Local — Ollama, manual", "pick a model tag yourself"),
+        Opt::new("BYOM — Ollama", "bring your own model: any Ollama tag"),
     ];
     let provider = match select(
         terminal,

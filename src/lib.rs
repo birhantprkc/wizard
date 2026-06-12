@@ -123,8 +123,8 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             // Non-interactive first runs (piped stdout, CI, cron) must not
             // silently fall back to a baked-in local provider — there is no
             // config yet and onboarding needs a TTY.
-            let headless_with_prompt = cli.prompt.is_some()
-                && (cli.mode == Some(Mode::Sovereign) || cli.continuous);
+            let headless_with_prompt =
+                cli.prompt.is_some() && (cli.mode == Some(Mode::Sovereign) || cli.continuous);
             if !headless_with_prompt {
                 anyhow::bail!(
                     "no config at {} — run `wizard` in an interactive terminal \
