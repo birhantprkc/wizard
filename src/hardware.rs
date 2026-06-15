@@ -121,6 +121,15 @@ pub fn detect_memory() -> Option<Detected> {
     None
 }
 
+/// Whether [`detect_memory`] found GPU VRAM rather than falling back to system
+/// RAM. The local model tier is sized to the detected budget, so a `true` here
+/// means a VRAM-tiered model was picked and the spawned `llama-server` must
+/// offload to the GPU — otherwise it loads entirely into RAM and a large model
+/// OOMs the host during startup.
+pub fn has_gpu() -> bool {
+    detect_memory().is_some_and(|detected| detected.source.starts_with("GPU VRAM"))
+}
+
 /// Suggest an Ollama model tag for a given memory budget (GB). Mirrors
 /// `install.sh`'s tiers.
 pub fn suggest_ollama_model(gb: u64) -> &'static str {

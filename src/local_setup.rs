@@ -179,15 +179,11 @@ fn asset_variants() -> Vec<String> {
         "x64"
     };
     let mut variants = Vec::new();
-    if gpu_detected() && vulkan_loader_present() {
+    if crate::hardware::has_gpu() && vulkan_loader_present() {
         variants.push(format!("ubuntu-vulkan-{suffix}"));
     }
     variants.push(format!("ubuntu-{suffix}"));
     variants
-}
-
-fn gpu_detected() -> bool {
-    crate::hardware::detect_memory().is_some_and(|d| d.source.starts_with("GPU VRAM"))
 }
 
 fn vulkan_loader_present() -> bool {

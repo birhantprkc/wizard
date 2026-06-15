@@ -19,6 +19,11 @@ use crate::config::{Config, ProviderConfig};
 /// system prompt and tool specs fit comfortably.
 const CTX_SIZE: u32 = 16_384;
 
+/// `--n-gpu-layers` value meaning "offload every layer". llama.cpp clamps it to
+/// the model's actual layer count, so this offloads the whole model on a GPU
+/// build and is a harmless no-op on a CPU-only build.
+const GPU_OFFLOAD_ALL: &str = "99";
+
 /// How long to wait for a spawned server to finish loading its GGUF.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -176,6 +181,32 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>
     )
 }
 
+/// Command-line arguments for a spawned `llama-server`.
+///
+/// `--jinja` enables the chat-template engine llama-server needs for
+/// OpenAI-style tool calling; without it `/v1/chat/completions` rejects
+/// requests that carry tools. When `gpu` is set the model is offloaded to the
+/// GPU ([`GPU_OFFLOAD_ALL`]): the local model tier is sized to GPU VRAM
+/// ([`crate::hardware::suggest_gguf`]), so a VRAM-tiered model must run on the
+/// GPU — left on the CPU it loads entirely into RAM and a large model OOMs the
+/// host during startup.
+fn server_args(gguf_path: &str, port: u16, gpu: bool) -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        gguf_path.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--ctx-size".to_string(),
+        CTX_SIZE.to_string(),
+        "--jinja".to_string(),
+    ];
+    if gpu {
+        args.push("--n-gpu-layers".to_string());
+        args.push(GPU_OFFLOAD_ALL.to_string());
+    }
+    args
+}
+
 /// Start a detached `llama-server` serving `gguf_path` on `port`. The child
 /// gets its own process group and appends stdout/stderr to [`log_path`], so
 /// it keeps serving after Wizard exits. The PID is recorded in [`pid_path`]
@@ -189,11 +220,7 @@ pub fn spawn(binary: &Path, gguf_path: &str, port: u16) -> Result<u32> {
         .with_context(|| format!("opening {}", log_path.display()))?;
     let mut command = std::process::Command::new(binary);
     command
-        .args(["-m", gguf_path, "--port", &port.to_string()])
-        // --jinja enables the chat-template engine llama-server needs for
-        // OpenAI-style tool calling; without it /v1/chat/completions
-        // rejects requests that carry tools.
-        .args(["--ctx-size", &CTX_SIZE.to_string(), "--jinja"])
+        .args(server_args(gguf_path, port, crate::hardware::has_gpu()))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().context("duplicating log handle")?)
         .stderr(log);
@@ -459,6 +486,34 @@ mod tests {
             stop_at(&dir.path().join("llama-server.pid")).expect("stop runs"),
             StopOutcome::NotRecorded
         );
+    }
+
+    #[test]
+    fn server_args_always_carry_model_context_and_jinja() {
+        let args = server_args("/models/m.gguf", 8080, false);
+        // -m <path>, --port 8080, --ctx-size, --jinja, all present and paired.
+        let pos = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(args[pos + 1], "/models/m.gguf");
+        let port = args.iter().position(|a| a == "--port").expect("--port");
+        assert_eq!(args[port + 1], "8080");
+        assert!(args.iter().any(|a| a == "--ctx-size"));
+        assert!(args.iter().any(|a| a == "--jinja"));
+    }
+
+    #[test]
+    fn server_args_offload_to_gpu_only_when_a_gpu_is_present() {
+        let cpu = server_args("/models/m.gguf", 8080, false);
+        assert!(
+            !cpu.iter().any(|a| a == "--n-gpu-layers"),
+            "CPU-only spawn must not request GPU offload"
+        );
+
+        let gpu = server_args("/models/m.gguf", 8080, true);
+        let pos = gpu
+            .iter()
+            .position(|a| a == "--n-gpu-layers")
+            .expect("GPU spawn offloads layers");
+        assert_eq!(gpu[pos + 1], GPU_OFFLOAD_ALL, "offload every layer");
     }
 
     #[tokio::test]
