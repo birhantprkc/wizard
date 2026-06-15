@@ -92,6 +92,18 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
              `base_url` in ~/.wizard/config.toml"
         );
     };
+    // Probe said Down, but if something is already bound to the port it is not a
+    // ready llama-server (or `probe` would have seen its /health). Spawning here
+    // just loses a race to bind and exits — "couldn't bind HTTP server socket".
+    // Bail with the actionable cause instead of looping on doomed spawns.
+    if port_in_use(port) {
+        bail!(
+            "port {port} on this machine is already in use, but the process holding it is not a \
+             ready llama-server (it did not answer {base_url}/health). Free the port \
+             (e.g. `fuser -k {port}/tcp`), or point the provider's `base_url` at a different \
+             port in ~/.wizard/config.toml"
+        );
+    }
     let Some(gguf) = provider
         .gguf_path
         .as_deref()
@@ -355,6 +367,17 @@ pub fn local_port(base_url: &str) -> Option<u16> {
     local.then(|| url.port_or_known_default())?
 }
 
+/// Whether something already accepts TCP connections on `127.0.0.1:port`.
+///
+/// `llama-server` binds the loopback address, so a successful connect here
+/// means a spawn would fail with `couldn't bind HTTP server socket`. A short
+/// timeout keeps the check cheap; "connection refused" (nothing listening)
+/// returns quickly as `false`.
+fn port_in_use(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+}
+
 /// `~/.wizard/llama-server.log` — stdout/stderr of servers Wizard spawned.
 pub fn log_path() -> Result<PathBuf> {
     Ok(Config::wizard_dir()?.join("llama-server.log"))
@@ -514,6 +537,25 @@ mod tests {
             .position(|a| a == "--n-gpu-layers")
             .expect("GPU spawn offloads layers");
         assert_eq!(gpu[pos + 1], GPU_OFFLOAD_ALL, "offload every layer");
+    }
+
+    #[test]
+    fn port_in_use_detects_a_bound_socket() {
+        // Bind an ephemeral loopback port: nothing else can be on it, and it is
+        // definitively in use while the listener lives.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("addr").port();
+        assert!(port_in_use(port), "a bound port reads as in use");
+
+        drop(listener);
+        // The OS may hold the port briefly in TIME_WAIT, but a listener-less
+        // port refuses connections; allow a couple of retries to avoid flaking.
+        let freed = (0..20).any(|_| {
+            std::thread::sleep(Duration::from_millis(25));
+            !port_in_use(port)
+        });
+        assert!(freed, "a released port eventually reads as free");
     }
 
     #[tokio::test]
