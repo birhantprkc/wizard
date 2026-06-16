@@ -19,10 +19,11 @@
 # Flavors (mutually exclusive):
 #   WIZARD_LOCAL=1    preinstall the local stack non-interactively (headless
 #                     boxes, provisioning scripts; what the default used to do):
-#                       1. Install llama.cpp's `llama-server` from official
-#                          GitHub releases if absent. On a GPU box it installs a
-#                          Vulkan loader if needed and uses the GPU build —
-#                          upgrading an earlier CPU-only build in place
+#                       1. Install llama.cpp's `llama-server` if absent, using
+#                          the GPU: on NVIDIA it compiles a CUDA build (when
+#                          nvcc is present); on other GPUs it installs a Vulkan
+#                          loader and uses the prebuilt Vulkan build; CPU build
+#                          otherwise. Upgrades an earlier CPU-only build in place
 #                       2. Select a model tier based on available VRAM (or
 #                          system RAM on CPU-only)
 #                       3. Download the matching Qwen3 GGUF (Q4_K_M) from
@@ -57,6 +58,8 @@
 #                                prompts)
 #   WIZARD_SKIP_MODEL_PULL       1 = local flavors: skip the model download (default 0)
 #   WIZARD_SKIP_LLAMACPP_INSTALL 1 = WIZARD_LOCAL: llama-server managed elsewhere (default 0)
+#   WIZARD_LLAMACPP_NO_CUDA      1 = never compile a CUDA llama-server; use the
+#                                    prebuilt Vulkan/CPU build instead (default 0)
 #   WIZARD_USE_OLLAMA            1 = local flavor on Ollama instead of llama.cpp
 #                                    (implies WIZARD_LOCAL)    (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
@@ -78,6 +81,7 @@ WIZARD_BYOM="${WIZARD_BYOM:-0}"
 WIZARD_MODEL="${WIZARD_MODEL:-}"
 WIZARD_SKIP_MODEL_PULL="${WIZARD_SKIP_MODEL_PULL:-0}"
 WIZARD_SKIP_LLAMACPP_INSTALL="${WIZARD_SKIP_LLAMACPP_INSTALL:-0}"
+WIZARD_LLAMACPP_NO_CUDA="${WIZARD_LLAMACPP_NO_CUDA:-0}"
 WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
@@ -244,7 +248,99 @@ ensure_vulkan_loader() {
 # for external installs), which read as "not a GPU build" so a GPU box upgrades.
 installed_llamacpp_is_gpu_build() {
     local marker="$HOME/.wizard/llama.cpp/.variant"
-    [ -f "$marker" ] && grep -q vulkan "$marker"
+    [ -f "$marker" ] && grep -qE 'vulkan|cuda' "$marker"
+}
+
+# An NVIDIA GPU that nvidia-smi can see.
+nvidia_gpu_present() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+# Whether to build llama.cpp from source with CUDA. llama.cpp ships no prebuilt
+# Linux CUDA binary, and the prebuilt Vulkan build cannot see an NVIDIA GPU on
+# images that lack the Vulkan ICD (e.g. Colab) — so CUDA, compiled on the box,
+# is the only reliable GPU path for NVIDIA. Requires nvcc already present (the
+# full CUDA toolkit is multi-GB and not something an installer should pull).
+should_build_cuda() {
+    [ "$WIZARD_LLAMACPP_NO_CUDA" = "1" ] && return 1
+    nvidia_gpu_present || return 1
+    command -v nvcc >/dev/null 2>&1
+}
+
+# Best-effort install of the tools needed to compile llama.cpp (cmake, a C/C++
+# compiler, git). Returns non-zero if any remain missing afterwards.
+ensure_build_tools() {
+    if ! { command -v cmake >/dev/null 2>&1 && command -v git >/dev/null 2>&1 \
+        && { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }; }; then
+        local sudo=""
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            sudo="sudo"
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+            $sudo apt-get update -qq >/dev/null 2>&1 || true
+            $sudo apt-get install -y -qq cmake build-essential git >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            $sudo dnf install -y cmake gcc gcc-c++ make git >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            $sudo pacman -Sy --noconfirm cmake base-devel git >/dev/null 2>&1 || true
+        fi
+    fi
+    command -v cmake >/dev/null 2>&1 && command -v git >/dev/null 2>&1 \
+        && { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }
+}
+
+# Build llama-server from source with CUDA and install it under
+# ~/.wizard/llama.cpp. Returns non-zero on any failure so the caller can fall
+# back to the prebuilt Vulkan/CPU path.
+build_llamacpp_cuda() {
+    say "Building llama.cpp with CUDA for your NVIDIA GPU — this takes a few minutes ..."
+    if ! ensure_build_tools; then
+        warn "missing build tools (cmake/compiler/git) and could not install them — skipping CUDA build"
+        return 1
+    fi
+
+    local src="${TMP_DIR}/llamacpp-cuda-src" jobs
+    jobs="$(nproc 2>/dev/null || echo 4)"
+    rm -rf "$src"
+    if ! git clone --depth=1 https://github.com/"${LLAMACPP_REPO}".git "$src" >/dev/null 2>&1; then
+        warn "could not clone llama.cpp for the CUDA build"
+        return 1
+    fi
+
+    # Configure for the GPUs on this box (CMAKE_CUDA_ARCHITECTURES=native needs
+    # CMake >= 3.24); retry without it on older CMake.
+    if ! cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES=native >/dev/null 2>&1; then
+        if ! cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF >/dev/null 2>&1; then
+            warn "CUDA cmake configure failed (is the CUDA toolkit complete?)"
+            return 1
+        fi
+    fi
+    if ! cmake --build "$src/build" --config Release -j "$jobs" --target llama-server >/dev/null 2>&1; then
+        warn "CUDA build failed"
+        return 1
+    fi
+
+    local bin
+    bin="$(find "$src/build" -type f -name llama-server | head -n1 || true)"
+    if [ -z "$bin" ] || ! "$bin" --version >/dev/null 2>&1; then
+        warn "the CUDA-built llama-server did not run"
+        return 1
+    fi
+
+    local dest="$HOME/.wizard/llama.cpp"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    # Keep the whole bin/ tree: the build's shared libraries (libggml-cuda.so,
+    # …) must sit beside llama-server for its $ORIGIN runpath to resolve them.
+    cp -R "$(dirname "$bin")"/. "$dest/"
+    printf 'cuda-source\n' >"${dest}/.variant"
+    mkdir -p "$LLAMA_BIN_DIR"
+    ln -sfn "${dest}/llama-server" "${LLAMA_BIN_DIR}/llama-server"
+    say "Installed CUDA llama-server to ${dest}"
+    return 0
 }
 
 llamacpp_variants() {
@@ -290,19 +386,28 @@ install_llamacpp() {
         say "Skipping llama.cpp install (WIZARD_SKIP_LLAMACPP_INSTALL=1)"
         return
     fi
-    # The Vulkan-vs-CPU choice (and the CPU→GPU upgrade below) needs to know
-    # whether a GPU is present; on a GPU box, make sure a Vulkan loader exists
-    # first so the GPU build is actually usable (and so the upgrade check below
-    # only fires when a GPU build can really be installed).
+    # Decide the GPU strategy up front (needs to know whether a GPU is present).
+    # NVIDIA → compile a CUDA build (the only reliable NVIDIA path; no prebuilt
+    # CUDA asset exists and the Vulkan prebuilt can't see NVIDIA without an ICD).
+    # Otherwise, on a GPU box, install a Vulkan loader and use the Vulkan
+    # prebuilt. The strategy is non-empty only when a GPU build is actually
+    # achievable, so the upgrade check below never churns on un-accelerable boxes.
     [ -n "$MEM_SOURCE" ] || detect_memory
-    ensure_vulkan_loader
+    local gpu_strategy=""
+    if gpu_present; then
+        if should_build_cuda; then
+            gpu_strategy="cuda"
+        else
+            ensure_vulkan_loader
+            have_vulkan_loader && gpu_strategy="vulkan"
+        fi
+    fi
 
-    # An existing install Wizard manages lives under ~/.wizard/llama.cpp. On a
-    # GPU box with a usable loader, upgrade a CPU-only build to a GPU build;
-    # otherwise leave it untouched (no churn when no GPU build is possible).
+    # An existing install Wizard manages lives under ~/.wizard/llama.cpp. Upgrade
+    # a CPU-only build to a GPU build when one is achievable; otherwise leave it.
     if [ -x "$HOME/.wizard/llama.cpp/llama-server" ]; then
-        if gpu_present && have_vulkan_loader && ! installed_llamacpp_is_gpu_build; then
-            say "GPU detected but the installed llama-server is a CPU build — reinstalling a GPU build"
+        if [ -n "$gpu_strategy" ] && ! installed_llamacpp_is_gpu_build; then
+            say "GPU detected but the installed llama-server is a CPU build — reinstalling a GPU build (${gpu_strategy})"
         else
             say "llama-server already installed at $HOME/.wizard/llama.cpp/llama-server"
             expose_llama_server
@@ -312,6 +417,16 @@ install_llamacpp() {
         # An external llama-server (brew, nix, hand-built): never clobber it.
         say "llama-server already installed ($(command -v llama-server)) — leaving it as is"
         return
+    fi
+
+    # NVIDIA: compile CUDA; on success we're done, otherwise fall back to prebuilt.
+    if [ "$gpu_strategy" = "cuda" ]; then
+        if build_llamacpp_cuda; then
+            expose_llama_server
+            return
+        fi
+        warn "falling back to a prebuilt llama-server (Vulkan/CPU)"
+        ensure_vulkan_loader
     fi
 
     say "Installing llama-server (llama.cpp official releases) ..."
