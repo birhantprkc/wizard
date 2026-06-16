@@ -80,7 +80,7 @@ These override `~/.wizard/config.toml` for a single run:
 | Variable | Description |
 |----------|-------------|
 | `WIZARD_MODEL` | Override the model tag |
-| `WIZARD_LLAMACPP_HOST` | Override the llama-server URL (default `http://127.0.0.1:8080`) |
+| `WIZARD_LLAMACPP_HOST` | Override the llama-server URL (default `http://127.0.0.1:11435`) |
 | `WIZARD_GGUF_PATH` | Override the GGUF file Wizard uses when it starts `llama-server` |
 | `WIZARD_OLLAMA_HOST` | Point Wizard at an Ollama host (also switches the synthesized local provider to Ollama) |
 
@@ -94,13 +94,13 @@ With no config present (the default and minimal installs), the first launch open
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
-- Probes `llama-server`'s health endpoint (`GET http://127.0.0.1:8080/health`)
+- Probes `llama-server`'s health endpoint (`GET http://127.0.0.1:11435/health`)
 - If nothing answers, starts `llama-server` itself with your GGUF and waits (up to 60 s) for the model to load
 - Opens the Ratatui interface in genie mode
 
 The server Wizard starts is detached: it keeps serving after Wizard exits, so the next launch connects instantly. Its output goes to `~/.wizard/llama-server.log`, and its PID is recorded in `~/.wizard/llama-server.pid` so `/server stop` never kills anything else.
 
-Auto-start requires three things: the provider's `base_url` points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` names an existing file. Otherwise Wizard prints exactly what to run by hand (`llama-server -m <model.gguf> --port 8080`).
+Auto-start requires three things: the provider's `base_url` points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` names an existing file. Otherwise Wizard prints exactly what to run by hand (`llama-server -m <model.gguf> --port 11435`).
 
 Manage the server from the TUI:
 
@@ -131,7 +131,7 @@ max_steps = 25
 [[providers]]
 name = "local"
 kind = "llamacpp"
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11435"
 model = "Qwen3.6-27B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
@@ -156,13 +156,13 @@ A non-empty list fully replaces the defaults; omitting the section or setting `s
 The local default is llama.cpp; Ollama stays fully supported but is opt-in:
 
 - Explicit `[[providers]]` entries with `kind = "ollama"` behave exactly as before.
-- A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:8080`; add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
+- A legacy config that only sets top-level `model` / `ollama_host` now resolves to llama.cpp at `http://127.0.0.1:11435`; add an explicit Ollama provider (`/provider add local ollama http://127.0.0.1:11434 <model>`) to stay on Ollama.
 - If the local backend isn't installed or can't start, Wizard falls back to bring-your-own-provider: any configured cloud provider, then `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` / `OPENROUTER_API_KEY` from the environment, then interactive setup.
 
 To switch an existing install to llama.cpp, add a provider from the TUI and point it at a GGUF:
 
 ```
-/provider add local-llamacpp llamacpp http://127.0.0.1:8080 Qwen3.6-27B-Q4_K_M
+/provider add local-llamacpp llamacpp http://127.0.0.1:11435 Qwen3.6-27B-Q4_K_M
 /provider use local-llamacpp
 ```
 
@@ -302,7 +302,7 @@ Switch to a smaller tier: download `Qwen3.5-9B-Q4_K_M.gguf` (~6 GB) from Hugging
 [[providers]]
 name = "local"
 kind = "llamacpp"
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11435"
 model = "Qwen3.5-9B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.5-9B-Q4_K_M.gguf"
 ```

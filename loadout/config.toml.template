@@ -23,7 +23,7 @@ active_provider = "local"
 [[providers]]
 name = "local"
 kind = "llamacpp"
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11435"
 model = "__MODEL__"
 # gguf_path = "/path/to/model.gguf"
 

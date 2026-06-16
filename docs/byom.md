@@ -10,7 +10,7 @@ With the llama.cpp default there is no special installer: `llama-server` loads a
 [[providers]]
 name = "local"
 kind = "llamacpp"
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11435"
 model = "my-coder-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/my-coder-Q4_K_M.gguf"
 ```

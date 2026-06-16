@@ -86,7 +86,7 @@ The default installer also downloads `llama-server` from llama.cpp's official Gi
 
 ## Where your data goes
 
-Inference goes to whichever provider is active: the core loop sends prompts, code context, and tool output to that endpoint and nowhere else. With the default local provider that endpoint is `llama-server` on your machine (`http://127.0.0.1:8080`); with a cloud provider it is that vendor's API, under their data-handling terms. The other network actors are the things you add: MCP servers and scripted tools can make whatever calls they like, and deep evolve clones the source repo and may install a Rust toolchain via rustup on first use.
+Inference goes to whichever provider is active: the core loop sends prompts, code context, and tool output to that endpoint and nowhere else. With the default local provider that endpoint is `llama-server` on your machine (`http://127.0.0.1:11435`); with a cloud provider it is that vendor's API, under their data-handling terms. The other network actors are the things you add: MCP servers and scripted tools can make whatever calls they like, and deep evolve clones the source repo and may install a Rust toolchain via rustup on first use.
 
 ## Reporting a vulnerability
 

@@ -314,7 +314,7 @@ pub fn spawned_pid() -> Option<u32> {
 const BINARY_NAME: &str = "llama-server";
 
 /// The "start it yourself" command quoted by every unspawnable-server error.
-const START_HINT: &str = "`llama-server -m <model.gguf> --port 8080`";
+const START_HINT: &str = "`llama-server -m <model.gguf> --port 11435`";
 
 /// Find `llama-server`: on `PATH`, then in the locations Wizard's own
 /// installer uses (`~/.wizard/bin`, `~/.wizard/llama.cpp`) — those are not

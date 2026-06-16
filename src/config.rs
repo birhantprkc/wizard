@@ -288,7 +288,7 @@ pub struct ProviderConfig {
     pub name: String,
     /// Backend kind.
     pub kind: ProviderKind,
-    /// Base URL: llamacpp `http://127.0.0.1:8080`; ollama
+    /// Base URL: llamacpp `http://127.0.0.1:11435`; ollama
     /// `http://127.0.0.1:11434`; openai `https://api.openai.com/v1`;
     /// anthropic `https://api.anthropic.com`; openrouter
     /// `https://openrouter.ai/api/v1`; xai / xaioauth
@@ -488,12 +488,21 @@ pub struct Config {
     pub fleet: FleetConfig,
 }
 
+/// Default port for the local llama.cpp `llama-server`. Deliberately not 8080:
+/// that is a very common dev-server/proxy port (Jupyter and friends on hosted
+/// notebooks, local proxies, other web apps), and a collision there makes
+/// `llama-server` fail to bind and exit during startup.
+pub const DEFAULT_LLAMACPP_PORT: u16 = 11435;
+
+/// Default base URL for the local llama.cpp `llama-server` ([`DEFAULT_LLAMACPP_PORT`]).
+pub const DEFAULT_LLAMACPP_HOST: &str = "http://127.0.0.1:11435";
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             model: "qwen3.6:27b".to_string(),
             ollama_host: "http://127.0.0.1:11434".to_string(),
-            llamacpp_host: "http://127.0.0.1:8080".to_string(),
+            llamacpp_host: DEFAULT_LLAMACPP_HOST.to_string(),
             gguf_path: None,
             mode: Mode::Genie,
             auto_approve: true,
@@ -768,7 +777,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
-        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert_eq!(config.llamacpp_host, DEFAULT_LLAMACPP_HOST);
         assert!(config.gguf_path.is_none());
         assert_eq!(config.mode, Mode::Genie);
         assert_eq!(config.max_steps, 25);
@@ -1009,7 +1018,7 @@ mod tests {
         let active = config.active();
         assert_eq!(active.name, "local");
         assert_eq!(active.kind, ProviderKind::LlamaCpp);
-        assert_eq!(active.base_url, "http://127.0.0.1:8080");
+        assert_eq!(active.base_url, DEFAULT_LLAMACPP_HOST);
         assert_eq!(active.model, "qwen3.5:9b");
         assert!(active.api_key_env.is_none());
         assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
@@ -1022,7 +1031,7 @@ mod tests {
         let active = config.active();
         assert_eq!(active.name, "local");
         assert_eq!(active.kind, ProviderKind::LlamaCpp);
-        assert_eq!(active.base_url, "http://127.0.0.1:8080");
+        assert_eq!(active.base_url, DEFAULT_LLAMACPP_HOST);
         assert_eq!(active.model, "qwen3.6:27b");
         assert!(active.api_key_env.is_none());
         assert!(active.gguf_path.is_none());
@@ -1359,7 +1368,7 @@ usd_per_mtok_out = 15.0
         config.apply_env_from(|_| None);
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
-        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert_eq!(config.llamacpp_host, DEFAULT_LLAMACPP_HOST);
         assert!(config.gguf_path.is_none());
     }
 
@@ -1375,7 +1384,7 @@ usd_per_mtok_out = 15.0
         });
         assert_eq!(config.model, "qwen3.6:27b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
-        assert_eq!(config.llamacpp_host, "http://127.0.0.1:8080");
+        assert_eq!(config.llamacpp_host, DEFAULT_LLAMACPP_HOST);
         assert!(config.gguf_path.is_none());
         assert_eq!(
             config.active().kind,

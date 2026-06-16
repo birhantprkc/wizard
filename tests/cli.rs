@@ -386,7 +386,7 @@ fn e2e_inference_with_auto_spawned_llama_server() {
 
     let home = TempDir::new();
     // An uncommon port so the test never collides with a llama-server the
-    // developer is actually running on the default 8080.
+    // developer is actually running on the default 11435.
     let host = "http://127.0.0.1:18434";
     let output = run_wizard(
         &home.0,

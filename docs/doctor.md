@@ -6,7 +6,7 @@ Diagnoses the environment and prints one line per check:
 
 ```
 ✓ config            /home/you/.wizard/config.toml parses
-✓ provider local    llamacpp @ http://127.0.0.1:8080 (qwen3-30b) reachable
+✓ provider local    llamacpp @ http://127.0.0.1:11435 (qwen3-30b) reachable
 – provider openai   $OPENAI_API_KEY not set
 ✗ mcp playwright    spawn failed: No such file or directory (os error 2)
 ✓ native tools      14 tools registered
@@ -42,7 +42,7 @@ A one-shot snapshot of the running TUI session:
 
 ```
 model: qwen3-30b
-provider: local (LlamaCpp @ http://127.0.0.1:8080)
+provider: local (LlamaCpp @ http://127.0.0.1:11435)
 mode: genie
 session: 2026-06-11T09-30-00
 usage: 1200 prompt + 240 completion tokens

@@ -170,7 +170,7 @@ const XAI_MODELS: &[&str] = &["grok-4.3", "grok-code-fast-1"];
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
 /// Default base URL for a local llama.cpp `llama-server`.
-const LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080";
+const LLAMACPP_BASE_URL: &str = crate::config::DEFAULT_LLAMACPP_HOST;
 /// Default base URL for a local Ollama server.
 const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// Default base URL for the OpenAI API.
@@ -977,7 +977,10 @@ fn print_summary(config: &Config) {
                 println!("    (Wizard then starts llama-server automatically)");
             }
             None => {
-                println!("  • start the server: llama-server -m <model.gguf> --port 8080");
+                println!(
+                    "  • start the server: llama-server -m <model.gguf> --port {}",
+                    crate::config::DEFAULT_LLAMACPP_PORT
+                );
             }
         },
         ProviderKind::Ollama => {
