@@ -20,7 +20,9 @@
 #   WIZARD_LOCAL=1    preinstall the local stack non-interactively (headless
 #                     boxes, provisioning scripts; what the default used to do):
 #                       1. Install llama.cpp's `llama-server` from official
-#                          GitHub releases if absent
+#                          GitHub releases if absent. On a GPU box it installs a
+#                          Vulkan loader if needed and uses the GPU build —
+#                          upgrading an earlier CPU-only build in place
 #                       2. Select a model tier based on available VRAM (or
 #                          system RAM on CPU-only)
 #                       3. Download the matching Qwen3 GGUF (Q4_K_M) from
@@ -192,6 +194,59 @@ have_vulkan_loader() {
     ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so'
 }
 
+gpu_present() {
+    case "$MEM_SOURCE" in
+        "GPU VRAM"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Best-effort: on a GPU box with no Vulkan loader, install one so the prebuilt
+# Vulkan build of llama.cpp can actually use the GPU. The NVIDIA/AMD drivers
+# ship the Vulkan ICD; only the loader (libvulkan) is usually missing — exactly
+# the case on hosted notebooks (Colab) where the default install otherwise falls
+# back to a CPU build and inference crawls. Never fatal: if no loader can be
+# installed, the install proceeds on CPU with a warning.
+ensure_vulkan_loader() {
+    gpu_present || return 0
+    have_vulkan_loader && return 0
+
+    say "GPU detected but no Vulkan loader — installing one so llama.cpp can use the GPU ..."
+    local sudo=""
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        sudo="sudo"
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        $sudo apt-get update -qq >/dev/null 2>&1 || true
+        $sudo apt-get install -y -qq libvulkan1 mesa-vulkan-drivers >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        $sudo dnf install -y vulkan-loader mesa-vulkan-drivers >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        $sudo yum install -y vulkan-loader mesa-vulkan-drivers >/dev/null 2>&1 || true
+    elif command -v pacman >/dev/null 2>&1; then
+        $sudo pacman -Sy --noconfirm vulkan-icd-loader >/dev/null 2>&1 || true
+    elif command -v zypper >/dev/null 2>&1; then
+        $sudo zypper --non-interactive install libvulkan1 >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        $sudo apk add --no-cache vulkan-loader >/dev/null 2>&1 || true
+    fi
+
+    if have_vulkan_loader; then
+        say "Vulkan loader installed — using the GPU build of llama.cpp"
+    else
+        warn "could not install a Vulkan loader automatically — llama.cpp will run on CPU"
+        warn "install one (e.g. 'apt-get install libvulkan1') and re-run for GPU acceleration"
+    fi
+}
+
+# Whether the llama.cpp build Wizard installed is a GPU (Vulkan) build. Recorded
+# in a .variant marker at install time; absent for installs predating it (and
+# for external installs), which read as "not a GPU build" so a GPU box upgrades.
+installed_llamacpp_is_gpu_build() {
+    local marker="$HOME/.wizard/llama.cpp/.variant"
+    [ -f "$marker" ] && grep -q vulkan "$marker"
+}
+
 llamacpp_variants() {
     # Candidate release-asset variants, preferred first. llama.cpp ships no
     # Linux CUDA release asset; Vulkan is the prebuilt GPU backend (and it
@@ -235,18 +290,29 @@ install_llamacpp() {
         say "Skipping llama.cpp install (WIZARD_SKIP_LLAMACPP_INSTALL=1)"
         return
     fi
-    if command -v llama-server >/dev/null 2>&1; then
-        say "llama-server already installed ($(command -v llama-server))"
-        return
-    fi
-    if [ -x "${LLAMA_BIN_DIR}/llama-server" ]; then
-        say "llama-server already installed at ${LLAMA_BIN_DIR}/llama-server"
-        expose_llama_server
-        return
-    fi
-
-    # The Vulkan-vs-CPU choice needs to know whether a GPU is present.
+    # The Vulkan-vs-CPU choice (and the CPU→GPU upgrade below) needs to know
+    # whether a GPU is present; on a GPU box, make sure a Vulkan loader exists
+    # first so the GPU build is actually usable (and so the upgrade check below
+    # only fires when a GPU build can really be installed).
     [ -n "$MEM_SOURCE" ] || detect_memory
+    ensure_vulkan_loader
+
+    # An existing install Wizard manages lives under ~/.wizard/llama.cpp. On a
+    # GPU box with a usable loader, upgrade a CPU-only build to a GPU build;
+    # otherwise leave it untouched (no churn when no GPU build is possible).
+    if [ -x "$HOME/.wizard/llama.cpp/llama-server" ]; then
+        if gpu_present && have_vulkan_loader && ! installed_llamacpp_is_gpu_build; then
+            say "GPU detected but the installed llama-server is a CPU build — reinstalling a GPU build"
+        else
+            say "llama-server already installed at $HOME/.wizard/llama.cpp/llama-server"
+            expose_llama_server
+            return
+        fi
+    elif command -v llama-server >/dev/null 2>&1; then
+        # An external llama-server (brew, nix, hand-built): never clobber it.
+        say "llama-server already installed ($(command -v llama-server)) — leaving it as is"
+        return
+    fi
 
     say "Installing llama-server (llama.cpp official releases) ..."
     local variant url archive dir bin dest
@@ -287,6 +353,8 @@ install_llamacpp() {
         rm -rf "$dest"
         mkdir -p "$dest"
         cp -R "$(dirname "$bin")"/. "$dest/"
+        # Record the variant so a later run knows whether this is a GPU build.
+        printf '%s\n' "$variant" >"${dest}/.variant"
         mkdir -p "$LLAMA_BIN_DIR"
         ln -sfn "${dest}/llama-server" "${LLAMA_BIN_DIR}/llama-server"
         say "Installed llama-server to ${dest} (${variant} build)"
