@@ -89,7 +89,7 @@ if [ "${WIZARD_BESPOKE:-0}" = "1" ]; then WIZARD_MINIMAL=1; fi
 REPO="${WIZARD_REPO}"
 RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
 LLAMACPP_REPO="ggml-org/llama.cpp"
-LLAMACPP_URL="http://127.0.0.1:8080"
+LLAMACPP_URL="http://127.0.0.1:11435"
 LLAMA_BIN_DIR="$HOME/.wizard/bin"
 MODELS_DIR="$HOME/.wizard/models"
 OLLAMA_URL="http://127.0.0.1:11434"

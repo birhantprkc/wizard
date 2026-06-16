@@ -25,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct LlamaCppProvider {
     http: reqwest::Client,
-    /// Server root, e.g. `http://127.0.0.1:8080` (no `/v1` suffix). Trailing
+    /// Server root, e.g. `http://127.0.0.1:11435` (no `/v1` suffix). Trailing
     /// slashes are trimmed.
     base_url: String,
     /// Model tag for [`LlmProvider::label`]; llama-server serves whatever
@@ -41,7 +41,7 @@ pub struct LlamaCppProvider {
 
 impl LlamaCppProvider {
     /// Build a client for `base_url` (the server root, e.g.
-    /// `http://127.0.0.1:8080` — without `/v1`).
+    /// `http://127.0.0.1:11435` — without `/v1`).
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let model = model.into();
@@ -85,7 +85,7 @@ impl LlamaCppProvider {
     fn unreachable(&self, source: reqwest::Error) -> anyhow::Error {
         anyhow!(
             "cannot reach llama-server at {} — is the server running? Start it with \
-             `llama-server -m <model.gguf> --port 8080` (or check the provider's `base_url` \
+             `llama-server -m <model.gguf> --port 11435` (or check the provider's `base_url` \
              in ~/.wizard/config.toml). Cause: {source}",
             self.base_url
         )
@@ -103,7 +103,7 @@ impl LlamaCppProvider {
         if is_connect_failure {
             err.context(format!(
                 "cannot reach llama-server at {} — is the server running? Start it with \
-                 `llama-server -m <model.gguf> --port 8080`",
+                 `llama-server -m <model.gguf> --port 11435`",
                 self.base_url
             ))
         } else {

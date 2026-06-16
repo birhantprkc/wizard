@@ -19,6 +19,11 @@ use crate::config::{Config, ProviderConfig};
 /// system prompt and tool specs fit comfortably.
 const CTX_SIZE: u32 = 16_384;
 
+/// `--n-gpu-layers` value meaning "offload every layer". llama.cpp clamps it to
+/// the model's actual layer count, so this offloads the whole model on a GPU
+/// build and is a harmless no-op on a CPU-only build.
+const GPU_OFFLOAD_ALL: &str = "99";
+
 /// How long to wait for a spawned server to finish loading its GGUF.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -87,6 +92,18 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
              `base_url` in ~/.wizard/config.toml"
         );
     };
+    // Probe said Down, but if something is already bound to the port it is not a
+    // ready llama-server (or `probe` would have seen its /health). Spawning here
+    // just loses a race to bind and exits — "couldn't bind HTTP server socket".
+    // Bail with the actionable cause instead of looping on doomed spawns.
+    if port_in_use(port) {
+        bail!(
+            "port {port} on this machine is already in use, but the process holding it is not a \
+             ready llama-server (it did not answer {base_url}/health). Free the port \
+             (e.g. `fuser -k {port}/tcp`), or point the provider's `base_url` at a different \
+             port in ~/.wizard/config.toml"
+        );
+    }
     let Some(gguf) = provider
         .gguf_path
         .as_deref()
@@ -176,6 +193,32 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>
     )
 }
 
+/// Command-line arguments for a spawned `llama-server`.
+///
+/// `--jinja` enables the chat-template engine llama-server needs for
+/// OpenAI-style tool calling; without it `/v1/chat/completions` rejects
+/// requests that carry tools. When `gpu` is set the model is offloaded to the
+/// GPU ([`GPU_OFFLOAD_ALL`]): the local model tier is sized to GPU VRAM
+/// ([`crate::hardware::suggest_gguf`]), so a VRAM-tiered model must run on the
+/// GPU — left on the CPU it loads entirely into RAM and a large model OOMs the
+/// host during startup.
+fn server_args(gguf_path: &str, port: u16, gpu: bool) -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        gguf_path.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--ctx-size".to_string(),
+        CTX_SIZE.to_string(),
+        "--jinja".to_string(),
+    ];
+    if gpu {
+        args.push("--n-gpu-layers".to_string());
+        args.push(GPU_OFFLOAD_ALL.to_string());
+    }
+    args
+}
+
 /// Start a detached `llama-server` serving `gguf_path` on `port`. The child
 /// gets its own process group and appends stdout/stderr to [`log_path`], so
 /// it keeps serving after Wizard exits. The PID is recorded in [`pid_path`]
@@ -189,11 +232,7 @@ pub fn spawn(binary: &Path, gguf_path: &str, port: u16) -> Result<u32> {
         .with_context(|| format!("opening {}", log_path.display()))?;
     let mut command = std::process::Command::new(binary);
     command
-        .args(["-m", gguf_path, "--port", &port.to_string()])
-        // --jinja enables the chat-template engine llama-server needs for
-        // OpenAI-style tool calling; without it /v1/chat/completions
-        // rejects requests that carry tools.
-        .args(["--ctx-size", &CTX_SIZE.to_string(), "--jinja"])
+        .args(server_args(gguf_path, port, crate::hardware::has_gpu()))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().context("duplicating log handle")?)
         .stderr(log);
@@ -275,7 +314,7 @@ pub fn spawned_pid() -> Option<u32> {
 const BINARY_NAME: &str = "llama-server";
 
 /// The "start it yourself" command quoted by every unspawnable-server error.
-const START_HINT: &str = "`llama-server -m <model.gguf> --port 8080`";
+const START_HINT: &str = "`llama-server -m <model.gguf> --port 11435`";
 
 /// Find `llama-server`: on `PATH`, then in the locations Wizard's own
 /// installer uses (`~/.wizard/bin`, `~/.wizard/llama.cpp`) — those are not
@@ -326,6 +365,17 @@ pub fn local_port(base_url: &str) -> Option<u16> {
         Some("127.0.0.1" | "localhost" | "[::1]" | "::1" | "0.0.0.0")
     );
     local.then(|| url.port_or_known_default())?
+}
+
+/// Whether something already accepts TCP connections on `127.0.0.1:port`.
+///
+/// `llama-server` binds the loopback address, so a successful connect here
+/// means a spawn would fail with `couldn't bind HTTP server socket`. A short
+/// timeout keeps the check cheap; "connection refused" (nothing listening)
+/// returns quickly as `false`.
+fn port_in_use(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
 }
 
 /// `~/.wizard/llama-server.log` — stdout/stderr of servers Wizard spawned.
@@ -459,6 +509,53 @@ mod tests {
             stop_at(&dir.path().join("llama-server.pid")).expect("stop runs"),
             StopOutcome::NotRecorded
         );
+    }
+
+    #[test]
+    fn server_args_always_carry_model_context_and_jinja() {
+        let args = server_args("/models/m.gguf", 8080, false);
+        // -m <path>, --port 8080, --ctx-size, --jinja, all present and paired.
+        let pos = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(args[pos + 1], "/models/m.gguf");
+        let port = args.iter().position(|a| a == "--port").expect("--port");
+        assert_eq!(args[port + 1], "8080");
+        assert!(args.iter().any(|a| a == "--ctx-size"));
+        assert!(args.iter().any(|a| a == "--jinja"));
+    }
+
+    #[test]
+    fn server_args_offload_to_gpu_only_when_a_gpu_is_present() {
+        let cpu = server_args("/models/m.gguf", 8080, false);
+        assert!(
+            !cpu.iter().any(|a| a == "--n-gpu-layers"),
+            "CPU-only spawn must not request GPU offload"
+        );
+
+        let gpu = server_args("/models/m.gguf", 8080, true);
+        let pos = gpu
+            .iter()
+            .position(|a| a == "--n-gpu-layers")
+            .expect("GPU spawn offloads layers");
+        assert_eq!(gpu[pos + 1], GPU_OFFLOAD_ALL, "offload every layer");
+    }
+
+    #[test]
+    fn port_in_use_detects_a_bound_socket() {
+        // Bind an ephemeral loopback port: nothing else can be on it, and it is
+        // definitively in use while the listener lives.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("addr").port();
+        assert!(port_in_use(port), "a bound port reads as in use");
+
+        drop(listener);
+        // The OS may hold the port briefly in TIME_WAIT, but a listener-less
+        // port refuses connections; allow a couple of retries to avoid flaking.
+        let freed = (0..20).any(|_| {
+            std::thread::sleep(Duration::from_millis(25));
+            !port_in_use(port)
+        });
+        assert!(freed, "a released port eventually reads as free");
     }
 
     #[tokio::test]

@@ -99,12 +99,12 @@ max_steps = 25
 [[providers]]
 name = "local"
 kind = "llamacpp"
-base_url = "http://127.0.0.1:8080"
+base_url = "http://127.0.0.1:11435"
 model = "Qwen3.6-27B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
-When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:8080` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry).
+When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:11435` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry).
 
 At TUI startup, a local backend that is missing or cannot start is not fatal: Wizard falls back to bring-your-own-provider: first any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and finally the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
 
@@ -114,7 +114,7 @@ All providers implement the `LlmProvider` trait (health, model listing, streamin
 
 - Streaming token delivery to the TUI
 - Native tool-call round-trips, with a prompt-based JSON fallback when the model lacks native tool support
-- Actionable errors when the server is down (`llama-server -m <model.gguf> --port 8080`)
+- Actionable errors when the server is down (`llama-server -m <model.gguf> --port 11435`)
 
 `llm/ollama.rs` is a thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the `/v1` shim; the native endpoint exposes Ollama's streaming and `tool_calls` fields directly), with its own health probe (`GET /api/tags`) and no `ollama-rs` dependency. `llm/anthropic.rs` covers the Anthropic API.
 
