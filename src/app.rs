@@ -2151,8 +2151,11 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         .filter(|line| !line.is_empty())
         .map(|line| line.chars().take(48).collect::<String>())
         .unwrap_or_else(|| {
-            let short: String = session_id.chars().take(8).collect();
-            format!("session {short}")
+            // No prompt: name the session after its working directory.
+            project_root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "session".to_string())
         });
 
     let mut app = App::new(config);
