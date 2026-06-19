@@ -567,12 +567,6 @@ impl Agent {
         &self.usage
     }
 
-    /// Snapshot of all background tasks (running and finished) for the
-    /// dashboard's task list.
-    pub fn tasks(&self) -> Vec<crate::tools::tasks::Task> {
-        self.ctx.tasks.list()
-    }
-
     /// Number of background tasks (`execute` with `run_in_background`)
     /// still running, for `/status`.
     pub fn running_tasks(&self) -> usize {

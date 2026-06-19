@@ -26,6 +26,7 @@ use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::memory::MemoryStore;
 use crate::server;
+use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoItem;
@@ -115,8 +116,8 @@ pub enum SlashCommand {
     Diff,
     /// Toggle the todo side panel.
     Todos,
-    /// Toggle the full-screen agent dashboard (session, in-flight tools and
-    /// subagents, todos, background tasks, subagent roster).
+    /// Toggle the machine-wide session manager: every live Wizard session on
+    /// the machine, grouped by state.
     Dashboard,
     /// Show session token usage (and cost when rates are configured).
     Cost,
@@ -409,7 +410,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "dashboard",
         args: "",
-        description: "toggle the agent dashboard (tasks, subagents, todos)",
+        description: "session manager: all live wizard sessions on this machine",
         takes_args: false,
     },
     CommandSpec {
@@ -546,15 +547,6 @@ pub struct Picker {
     pub selected: usize,
 }
 
-/// A background task as mirrored into the dashboard. Built from
-/// [`AgentEvent::TaskStarted`] and updated by [`AgentEvent::TaskFinished`].
-#[derive(Debug, Clone)]
-pub struct BgTask {
-    pub id: u32,
-    pub command: String,
-    pub status: crate::tools::tasks::TaskStatus,
-}
-
 /// In-flight plan review (plan mode): the model called `exit_plan` and the
 /// turn is paused inside the tool until a [`PlanVerdict`] is sent back.
 #[derive(Debug)]
@@ -620,9 +612,17 @@ pub struct App {
     pub show_dashboard: bool,
     /// In-session subagent monitor visibility (toggled by `/subagents`).
     pub show_subagents: bool,
-    /// Background tasks mirrored from [`AgentEvent::TaskStarted`] /
-    /// [`AgentEvent::TaskFinished`], newest last, for the dashboard.
-    pub bg_tasks: Vec<BgTask>,
+    /// This session's id (heartbeat filename + dashboard identity).
+    pub session_id: String,
+    /// This session's display name (from the first prompt, or the id).
+    pub session_name: String,
+    /// Unix start time, stamped once at registration.
+    pub session_started_unix: u64,
+    /// Live sessions on the machine, refreshed from the registry while the
+    /// dashboard is open.
+    pub sessions: Vec<SessionRecord>,
+    /// Selected row in the dashboard list.
+    pub dashboard_selected: usize,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -698,7 +698,11 @@ impl App {
             todos_seen: false,
             show_dashboard: false,
             show_subagents: false,
-            bg_tasks: Vec::new(),
+            session_id: String::new(),
+            session_name: String::new(),
+            session_started_unix: 0,
+            sessions: Vec::new(),
+            dashboard_selected: 0,
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -731,6 +735,78 @@ impl App {
     pub fn notice(&mut self, message: impl Into<String>) {
         self.transcript
             .push(TranscriptEntry::Notice(message.into()));
+    }
+
+    /// Current state for this session's heartbeat: needs-input when paused on a
+    /// plan review, working while a turn streams, otherwise idle.
+    fn session_state(&self) -> SessionState {
+        if self.plan_review.is_some() {
+            SessionState::NeedsInput
+        } else if self.status.busy {
+            SessionState::Working
+        } else {
+            SessionState::Idle
+        }
+    }
+
+    /// One-line summary of what this session is doing, for the dashboard row.
+    fn session_activity(&self) -> String {
+        if self.plan_review.is_some() {
+            return "waiting for plan approval".to_string();
+        }
+        if !self.status.busy {
+            return "idle".to_string();
+        }
+        // The newest in-flight tool call reads best; fall back to the verb.
+        for entry in self.transcript.iter().rev() {
+            if let TranscriptEntry::ToolCard {
+                name, output: None, ..
+            } = entry
+            {
+                return name.clone();
+            }
+        }
+        format!("{}…", self.spinner_verb)
+    }
+
+    /// Build this session's heartbeat record from current state.
+    pub fn session_record(&self) -> SessionRecord {
+        SessionRecord {
+            id: self.session_id.clone(),
+            name: self.session_name.clone(),
+            cwd: self.project_root.display().to_string(),
+            model: self.status.model.clone(),
+            mode: self.mode.to_string(),
+            state: self.session_state(),
+            activity: self.session_activity(),
+            pid: std::process::id(),
+            started_unix: self.session_started_unix,
+            updated_unix: 0, // stamped by session_registry::write
+        }
+    }
+
+    /// Reload the live-session list from the registry, keeping the selection
+    /// in range.
+    pub fn refresh_sessions(&mut self) {
+        self.sessions = session_registry::list();
+        if self.dashboard_selected >= self.sessions.len() {
+            self.dashboard_selected = self.sessions.len().saturating_sub(1);
+        }
+    }
+
+    /// Move the dashboard selection up/down, clamped to the session list.
+    fn dashboard_select(&mut self, delta: isize) {
+        let len = self.sessions.len();
+        if len == 0 {
+            self.dashboard_selected = 0;
+            return;
+        }
+        let last = len - 1;
+        self.dashboard_selected = match delta {
+            d if d < 0 => self.dashboard_selected.checked_sub(1).unwrap_or(last),
+            _ if self.dashboard_selected >= last => 0,
+            _ => self.dashboard_selected + 1,
+        };
     }
 
     /// Recompute [`InputMode`] from the input text, then refresh the command
@@ -958,6 +1034,10 @@ impl App {
             Event::Resize(_, _) => Ok(None),
             Event::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                // Keep the dashboard's session list current while it's open.
+                if self.show_dashboard && self.tick.is_multiple_of(4) {
+                    self.refresh_sessions();
+                }
                 Ok(None)
             }
             Event::Agent(agent_event) => {
@@ -1031,12 +1111,22 @@ impl App {
             }
         }
 
-        // The dashboard and subagent monitor are modal views: while one is
-        // open, Esc / Enter / q close it and other keys are swallowed (global
-        // chords above still work). They refresh from live App state each frame.
-        if self.show_dashboard || self.show_subagents {
+        // The dashboard is modal: ↑/↓ move the selection, Esc/q close it.
+        // (Enter will attach in a later milestone; it's a no-op for now.)
+        if self.show_dashboard {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.show_dashboard = false,
+                KeyCode::Up | KeyCode::BackTab => self.dashboard_select(-1),
+                KeyCode::Down | KeyCode::Tab => self.dashboard_select(1),
+                _ => {}
+            }
+            return Ok(None);
+        }
+
+        // The subagent monitor is modal too: Esc / Enter / q close it; other
+        // keys are swallowed. It refreshes from live App state each frame.
+        if self.show_subagents {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                self.show_dashboard = false;
                 self.show_subagents = false;
             }
             return Ok(None);
@@ -1518,29 +1608,14 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
-            AgentEvent::TaskStarted { id, command } => {
-                self.bg_tasks.push(BgTask {
-                    id,
-                    command,
-                    status: crate::tools::tasks::TaskStatus::Running,
-                });
-            }
+            // TaskStarted is mirrored to the gateway's JSON stream (see
+            // output.rs); the TUI surfaces only the finish notice.
+            AgentEvent::TaskStarted { .. } => {}
             AgentEvent::TaskFinished {
                 id,
                 command,
                 status,
             } => {
-                // Update the mirrored task (or record it if we never saw the
-                // start) so the dashboard reflects the final state.
-                if let Some(task) = self.bg_tasks.iter_mut().find(|t| t.id == id) {
-                    task.status = status;
-                } else {
-                    self.bg_tasks.push(BgTask {
-                        id,
-                        command: command.clone(),
-                        status,
-                    });
-                }
                 self.notice(format!(
                     "background task #{id} finished ({}): {command}",
                     status.describe()
@@ -1839,7 +1914,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /todos                      toggle the todo side panel\n  \
-/dashboard                  toggle the agent dashboard (tasks, subagents, todos)\n  \
+/dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
@@ -2063,9 +2138,34 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     // sovereign in-session.
     let genie_max_steps = config.max_steps;
 
+    // Identity for this session's dashboard heartbeat.
+    let session_id = agent_slot
+        .as_ref()
+        .map(|agent| agent.session().id.clone())
+        .unwrap_or_default();
+    let session_name = cli
+        .prompt
+        .as_deref()
+        .and_then(|prompt| prompt.lines().next())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.chars().take(48).collect::<String>())
+        .unwrap_or_else(|| {
+            let short: String = session_id.chars().take(8).collect();
+            format!("session {short}")
+        });
+
     let mut app = App::new(config);
     app.project_root = project_root.clone();
     app.custom_commands = crate::commands::load(&project_root);
+    app.session_id = session_id.clone();
+    app.session_name = session_name;
+    app.session_started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Register this session so other sessions' /dashboard can see it.
+    crate::session_registry::write(&app.session_record());
     if let Some(prompt) = cli.prompt.clone() {
         app.set_input(prompt);
     }
@@ -2089,8 +2189,16 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
 
+    let mut last_heartbeat = Instant::now();
+
     loop {
         terminal.draw(|frame| crate::ui::draw(frame, &app))?;
+
+        // Refresh this session's heartbeat so other dashboards see it live.
+        if last_heartbeat.elapsed() >= Duration::from_secs(3) {
+            session_registry::write(&app.session_record());
+            last_heartbeat = Instant::now();
+        }
 
         let Some(event) = events.next().await else {
             break;
@@ -2234,6 +2342,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         agent.fire_session_end(None).await;
     }
 
+    // Drop this session's heartbeat so it leaves the dashboard immediately.
+    session_registry::remove(&app.session_id);
+
     drop(_guard);
     restore_terminal_best_effort();
     Ok(0)
@@ -2320,26 +2431,14 @@ impl CommandContext<'_> {
         }
     }
 
-    /// `/dashboard`: toggle the full-screen agent view. When opening while the
-    /// agent is idle, refresh the background-task mirror from the live registry
-    /// so tasks spawned before the dashboard was first shown still appear.
+    /// `/dashboard`: toggle the machine-wide session manager. On open, refresh
+    /// the live-session list from the registry; the event loop keeps it current
+    /// while it's up.
     fn toggle_dashboard(&mut self) {
         self.app.show_dashboard = !self.app.show_dashboard;
-        if self.app.show_dashboard
-            && let Some(agent) = self.agent_slot.as_ref()
-        {
-            for task in agent.tasks() {
-                if let Some(existing) = self.app.bg_tasks.iter_mut().find(|t| t.id == task.id) {
-                    existing.status = task.status;
-                } else {
-                    self.app.bg_tasks.push(BgTask {
-                        id: task.id,
-                        command: task.command,
-                        status: task.status,
-                    });
-                }
-            }
-            self.app.bg_tasks.sort_by_key(|t| t.id);
+        if self.app.show_dashboard {
+            self.app.show_subagents = false;
+            self.app.refresh_sessions();
         }
     }
 
@@ -3694,29 +3793,48 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_mirrors_background_tasks_and_esc_closes() {
-        use crate::tools::tasks::TaskStatus;
+    fn dashboard_navigates_and_esc_closes() {
+        use crate::session_registry::{SessionRecord, SessionState};
         let mut app = app();
-        app.handle_agent_event(AgentEvent::TaskStarted {
-            id: 1,
-            command: "sleep 5".to_string(),
-        });
-        assert_eq!(app.bg_tasks.len(), 1);
-        assert_eq!(app.bg_tasks[0].status, TaskStatus::Running);
-
-        // Finishing updates the existing row rather than adding a new one.
-        app.handle_agent_event(AgentEvent::TaskFinished {
-            id: 1,
-            command: "sleep 5".to_string(),
-            status: TaskStatus::Done(0),
-        });
-        assert_eq!(app.bg_tasks.len(), 1);
-        assert_eq!(app.bg_tasks[0].status, TaskStatus::Done(0));
-
-        // The dashboard is modal: Esc closes it.
+        let make = |id: &str, state: SessionState| SessionRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            cwd: "/tmp".to_string(),
+            model: "m".to_string(),
+            mode: "genie".to_string(),
+            state,
+            activity: String::new(),
+            pid: 1,
+            started_unix: 0,
+            updated_unix: 0,
+        };
+        app.sessions = vec![
+            make("a", SessionState::Working),
+            make("b", SessionState::Idle),
+        ];
         app.show_dashboard = true;
+
+        // ↓ moves the selection and wraps; ↑ wraps back.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.dashboard_selected, 1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.dashboard_selected, 0, "wraps to the top");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.dashboard_selected, 1, "wraps to the bottom");
+
+        // Esc closes the modal.
         press(&mut app, KeyCode::Esc);
         assert!(!app.show_dashboard);
+    }
+
+    #[test]
+    fn session_record_reflects_state() {
+        let mut app = app();
+        app.session_id = "sess-1".to_string();
+        app.session_name = "fix bug".to_string();
+        assert_eq!(app.session_record().state, SessionState::Idle);
+        app.status.busy = true;
+        assert_eq!(app.session_record().state, SessionState::Working);
     }
 
     #[test]

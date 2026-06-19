@@ -29,6 +29,7 @@ pub mod output;
 pub mod progress;
 pub mod schedule;
 pub mod server;
+pub mod session_registry;
 pub mod skills;
 pub mod tools;
 pub mod ui;

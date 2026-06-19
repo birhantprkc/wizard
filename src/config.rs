@@ -593,6 +593,7 @@ impl Config {
             Self::subagents_dir()?,
             Self::memory_dir()?,
             Self::logs_dir()?,
+            Self::wizard_dir()?.join("running"),
         ] {
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }

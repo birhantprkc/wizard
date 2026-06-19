@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
@@ -33,6 +34,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, InputMode, TranscriptEntry};
 use crate::config::Mode;
+use crate::session_registry::SessionState;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -821,41 +823,52 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// One "key: value" row in the dashboard, clipped to `width`.
-fn dash_kv(key: &str, value: &str, width: usize) -> Line<'static> {
-    truncate_line(
-        Line::from(vec![
-            Span::styled(format!("{key}: "), dim()),
-            Span::styled(value.to_string(), Style::default().fg(TEXT_DIM)),
-        ]),
-        width,
-    )
-}
-
-/// A dim "· text" placeholder row for an empty dashboard section.
+/// A dim "· text" placeholder row for an empty modal section.
 fn dash_bullet(text: &str, style: Style) -> Line<'static> {
     Line::from(Span::styled(format!("· {text}"), style))
 }
 
-/// Full-screen agent dashboard (`/dashboard`): a live, at-a-glance view of the
-/// session, in-flight tools and subagents, the todo list, and background
-/// tasks. Modal — Esc/Enter/q close it — and rendered purely from mirrored
-/// [`App`] state, so it refreshes every frame.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Compact "how long ago" label: `12s`, `4m`, `2h`, `3d`.
+fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Machine-wide session manager (`/dashboard`): every live Wizard session on
+/// the machine, grouped by state, refreshed from the registry while open.
+/// Modal — ↑/↓ move the selection, Esc/q close. Dispatch and attach arrive in
+/// later milestones.
 fn draw_dashboard(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
 
+    let count = app.sessions.len();
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
             Span::styled(" ✦ ", accent()),
             Span::styled(
-                "agent dashboard",
+                "wizard sessions",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
+            Span::styled(format!("  ({count} live on this machine)"), dim()),
         ]))
-        .title_bottom(Line::from(Span::styled(" Esc close · refreshes live ", dim())).centered());
+        .title_bottom(Line::from(Span::styled(" ↑↓ move · Esc close ", dim())).centered());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 8 || inner.height < 4 {
@@ -863,152 +876,67 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
     }
     let width = inner.width as usize;
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+    let now = now_unix();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let header = |lines: &mut Vec<Line<'static>>, text: &str| {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
+    if app.sessions.is_empty() {
+        lines.push(dash_bullet("no running sessions", dim().italic()));
+        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            text.to_string(),
-            accent().add_modifier(Modifier::BOLD),
-        )));
-    };
-
-    // -- Session ----------------------------------------------------------
-    header(&mut lines, "SESSION");
-    let provider = app.config.active();
-    lines.push(dash_kv("model", &app.status.model, width));
-    lines.push(dash_kv(
-        "provider",
-        &format!("{} ({:?})", provider.name, provider.kind),
-        width,
-    ));
-    lines.push(dash_kv(
-        "mode",
-        &format!(
-            "{}{}",
-            app.status.mode,
-            if app.plan_mode { " · plan mode" } else { "" }
-        ),
-        width,
-    ));
-    let activity = if app.status.busy {
-        let elapsed = app
-            .turn_started
-            .map(|t| format!(" · {}s", t.elapsed().as_secs()))
-            .unwrap_or_default();
-        format!(
-            "{spinner} {}… · step {}/{}{elapsed}",
-            app.spinner_verb, app.status.step, app.status.max_steps
-        )
-    } else {
-        "idle".to_string()
-    };
-    lines.push(dash_kv("activity", &activity, width));
-    lines.push(dash_kv(
-        "tokens",
-        &format!(
-            "{} prompt · {} completion",
-            app.status.prompt_tokens, app.status.completion_tokens
-        ),
-        width,
-    ));
-
-    // -- Now running: in-flight tool calls and subagent steps -------------
-    header(&mut lines, "NOW RUNNING");
-    let mut any_running = false;
-    for entry in &app.transcript {
-        if let TranscriptEntry::ToolCard {
-            name,
-            args,
-            output: None,
-            ..
-        } = entry
-        {
-            any_running = true;
-            let (label, summary) = tool_label(name, args);
-            let text = if summary.is_empty() {
-                label
-            } else {
-                format!("{label}  {summary}")
-            };
-            lines.push(truncate_line(
-                Line::from(vec![
-                    Span::styled(format!("{spinner} "), accent()),
-                    Span::styled(text, Style::default().fg(TEXT_DIM)),
-                ]),
-                width,
-            ));
-        }
-    }
-    if !any_running {
-        lines.push(dash_bullet(
-            if app.status.busy {
-                "thinking…"
-            } else {
-                "nothing running"
-            },
+            "every running wizard registers here — start another to see it appear",
             dim().italic(),
-        ));
-    }
-
-    // -- Todos ------------------------------------------------------------
-    let (done, total) = crate::tools::todo::progress(&app.todos);
-    header(&mut lines, &format!("TODOS  {done}/{total}"));
-    if app.todos.is_empty() {
-        lines.push(dash_bullet("none", dim().italic()));
+        )));
     } else {
-        use crate::tools::todo::TodoStatus;
-        for item in app.todos.iter().take(12) {
-            let (glyph_style, text_style) = match item.status {
-                TodoStatus::Completed => (dim(), dim().add_modifier(Modifier::CROSSED_OUT)),
-                TodoStatus::InProgress => (accent(), accent().bold()),
-                TodoStatus::Pending => (dim(), Style::default().fg(TEXT_DIM)),
+        // Sessions arrive pre-sorted by state then recency; emit a group header
+        // whenever the state group changes.
+        let mut current_group = "";
+        for (i, session) in app.sessions.iter().enumerate() {
+            let group = session.state.group();
+            if group != current_group {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                lines.push(Line::from(Span::styled(
+                    group.to_string(),
+                    accent().add_modifier(Modifier::BOLD),
+                )));
+                current_group = group;
+            }
+
+            let selected = i == app.dashboard_selected;
+            let marker = if selected { "❯ " } else { "  " };
+            let (icon, icon_style) = match session.state {
+                SessionState::Working => (spinner.to_string(), accent()),
+                SessionState::NeedsInput => ("?".to_string(), accent().bold()),
+                SessionState::Idle => ("·".to_string(), dim()),
+                SessionState::Completed => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
+                SessionState::Failed => ("✗".to_string(), Style::default().fg(Color::White).bold()),
             };
+            let name_style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_DIM)
+            };
+            // Mark this very session so the user can spot which row is them.
+            let you = if session.id == app.session_id {
+                " (this one)"
+            } else {
+                ""
+            };
+            let age = fmt_age(now.saturating_sub(session.updated_unix));
             lines.push(truncate_line(
                 Line::from(vec![
-                    Span::styled(format!("{} ", item.status.glyph()), glyph_style),
-                    Span::styled(item.content.clone(), text_style),
+                    Span::styled(marker, accent()),
+                    Span::styled(format!("{icon} "), icon_style),
+                    Span::styled(format!("{}{you}", session.name), name_style),
+                    Span::styled(format!("  {}", session.activity), dim()),
+                    Span::styled(format!("  · {} · {age}", session.mode), dim()),
                 ]),
                 width,
             ));
         }
     }
 
-    // -- Background tasks -------------------------------------------------
-    header(&mut lines, "BACKGROUND TASKS");
-    if app.bg_tasks.is_empty() {
-        lines.push(dash_bullet("none", dim().italic()));
-    } else {
-        use crate::tools::tasks::TaskStatus;
-        for task in app.bg_tasks.iter().rev().take(12) {
-            let (glyph, style) = match task.status {
-                TaskStatus::Running => (spinner.to_string(), accent()),
-                TaskStatus::Done(0) => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
-                _ => ("✗".to_string(), Style::default().fg(Color::White).bold()),
-            };
-            lines.push(truncate_line(
-                Line::from(vec![
-                    Span::styled(format!("{glyph} "), style),
-                    Span::styled(
-                        format!("#{} {}", task.id, task.command),
-                        Style::default().fg(TEXT_DIM),
-                    ),
-                    Span::styled(format!("  {}", task.status.describe()), dim()),
-                ]),
-                width,
-            ));
-        }
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "/agents to browse and delegate to subagents",
-        dim().italic(),
-    )));
-
-    // No scrolling — the dashboard is a glance, not a log; clip to height.
     let max = inner.height as usize;
     if lines.len() > max {
         lines.truncate(max);
