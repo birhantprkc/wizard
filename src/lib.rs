@@ -19,6 +19,7 @@ pub mod fleet;
 pub mod gateway;
 pub mod hardware;
 pub mod hooks;
+pub mod import_claude;
 pub mod instructions;
 pub mod llm;
 pub mod local_setup;

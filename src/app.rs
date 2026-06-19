@@ -22,6 +22,7 @@ use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
+use crate::import_claude::{self, ImportSelection};
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::memory::MemoryStore;
@@ -139,6 +140,12 @@ pub enum SlashCommand {
     /// `/login <provider>`: OAuth sign-in for providers that support it
     /// (currently `xai`).
     Login(String),
+    /// `/settings` — open the in-app settings menu (a reusable picker).
+    Settings,
+    /// Import the selected artifacts from Claude Code (`~/.claude/`). Not a
+    /// typed command; dispatched from the `/settings` import picker, which is
+    /// why it carries the [`ImportSelection`].
+    ImportClaude(ImportSelection),
     Quit,
 }
 
@@ -295,6 +302,7 @@ impl SlashCommand {
                 Some(provider) => Ok(Self::Login((*provider).to_string())),
                 None => Err("usage: /login xai".to_string()),
             },
+            "settings" => Ok(Self::Settings),
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -432,6 +440,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         takes_args: false,
     },
     CommandSpec {
+        name: "settings",
+        args: "",
+        description: "open the settings menu (change config anytime)",
+        takes_args: false,
+    },
+    CommandSpec {
         name: "doctor",
         args: "",
         description: "diagnose config, providers, MCP, hooks, state dirs",
@@ -524,6 +538,12 @@ pub enum PickerKind {
     /// one pre-fills the input with a delegation request rather than running a
     /// command, since subagents are invoked by the model, not directly.
     Subagent,
+    /// The settings menu. Rows are dispatched by index against
+    /// [`App::settings_rows`]; toggles mutate config inline and re-open.
+    Settings,
+    /// "Import from Claude Code": a multi-select where Space toggles a row
+    /// (MCP servers / commands / spinner verbs) and Enter runs the import.
+    ClaudeImport,
 }
 
 /// One selectable row in a picker popup.
@@ -673,6 +693,10 @@ pub struct App {
     /// Number of verb rolls so far, mixed into the roll seed so back-to-back
     /// turns starting on the same tick still draw fresh verbs.
     verb_rolls: u64,
+    /// Set by the `/settings` "Open config file" row; the main loop (which owns
+    /// the terminal) suspends the TUI, opens `$EDITOR` on the config file, then
+    /// reloads config. Cleared once handled.
+    pub pending_edit_config: bool,
 }
 
 impl App {
@@ -731,6 +755,7 @@ impl App {
             rebuilding: None,
             spinner_verb,
             verb_rolls: 0,
+            pending_edit_config: false,
         }
     }
 
@@ -746,6 +771,176 @@ impl App {
     pub fn notice(&mut self, message: impl Into<String>) {
         self.transcript
             .push(TranscriptEntry::Notice(message.into()));
+    }
+
+    /// The settings menu rows, in display order: `(action id, label, current
+    /// value)`. [`open_settings_picker`](Self::open_settings_picker) renders
+    /// the label/value and [`apply_setting`](Self::apply_setting) dispatches by
+    /// the row index, so both share this single ordered source of truth.
+    ///
+    /// Numeric/list fields (`max_steps`, retry/compaction knobs, spinner verbs,
+    /// gateway, …) are intentionally absent — the overlay has no text input, so
+    /// they live behind the "Open config file" row.
+    fn settings_rows(&self) -> Vec<(&'static str, String, String)> {
+        let on = |b: bool| if b { "on" } else { "off" }.to_string();
+        let providers = self.config.providers.len();
+        let import_detail = if import_claude::claude_home().is_some() {
+            "MCP servers, commands, spinner verbs".to_string()
+        } else {
+            "no ~/.claude found".to_string()
+        };
+        let config_path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.wizard/config.toml".to_string());
+        vec![
+            ("model", "Model".to_string(), self.config.active().model),
+            ("mode", "Mode".to_string(), self.mode.to_string()),
+            (
+                "plan_first",
+                "Plan mode at startup".to_string(),
+                on(self.config.plan_first),
+            ),
+            (
+                "continuous",
+                "Continuous (sovereign)".to_string(),
+                on(self.config.continuous),
+            ),
+            (
+                "plan_each_cycle",
+                "Plan each cycle".to_string(),
+                on(self.config.plan_each_cycle),
+            ),
+            (
+                "rollback",
+                "Rollback failed cycles".to_string(),
+                on(self.config.rollback_failed_cycles),
+            ),
+            (
+                "web_backend",
+                "Web search backend".to_string(),
+                self.config.web.search_backend.clone(),
+            ),
+            (
+                "web_allow_local",
+                "Web: allow localhost".to_string(),
+                on(self.config.web.allow_local),
+            ),
+            (
+                "fleet_synthesize",
+                "Fleet: synthesis turn".to_string(),
+                on(self.config.fleet.synthesize),
+            ),
+            ("import", "Import from Claude Code".to_string(), import_detail),
+            (
+                "provider",
+                "Manage providers…".to_string(),
+                format!("{providers} configured"),
+            ),
+            ("config_file", "Open config file…".to_string(), config_path),
+        ]
+    }
+
+    /// Open the `/settings` menu as a [`Picker`]. Re-callable: toggles re-open
+    /// it so the new value is visible.
+    pub fn open_settings_picker(&mut self) {
+        let items: Vec<PickerItem> = self
+            .settings_rows()
+            .into_iter()
+            .map(|(_, label, detail)| PickerItem {
+                value: label,
+                detail,
+                current: false,
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Settings,
+            title: " settings · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Dispatch the settings row at `selected`. Routing rows return an
+    /// [`AppAction`] to run a command; inline toggle/cycle rows mutate config,
+    /// persist, and re-open the menu (keeping the cursor on the same row).
+    fn apply_setting(&mut self, selected: usize) -> Option<AppAction> {
+        let rows = self.settings_rows();
+        let (id, _, _) = rows.get(selected)?;
+        match *id {
+            "model" => return Some(AppAction::Command(SlashCommand::Model(None))),
+            "mode" => return Some(AppAction::Command(SlashCommand::Mode(None))),
+            "provider" => {
+                return Some(AppAction::Command(SlashCommand::Provider(
+                    ProviderAction::List,
+                )));
+            }
+            "import" => {
+                self.open_claude_import_picker();
+                return None;
+            }
+            "config_file" => {
+                // Handled by the main loop, which owns the terminal.
+                self.pending_edit_config = true;
+                return None;
+            }
+            "plan_first" => self.config.plan_first = !self.config.plan_first,
+            "continuous" => self.config.continuous = !self.config.continuous,
+            "plan_each_cycle" => self.config.plan_each_cycle = !self.config.plan_each_cycle,
+            "rollback" => {
+                self.config.rollback_failed_cycles = !self.config.rollback_failed_cycles;
+            }
+            "web_allow_local" => self.config.web.allow_local = !self.config.web.allow_local,
+            "fleet_synthesize" => self.config.fleet.synthesize = !self.config.fleet.synthesize,
+            "web_backend" => {
+                self.config.web.search_backend = cycle_backend(&self.config.web.search_backend);
+            }
+            _ => return None,
+        }
+        // Inline change: persist and re-open, restoring the cursor so repeated
+        // toggles stay on the same row. (These flags take effect at the next
+        // cycle / startup, not mid-session.)
+        if let Err(err) = self.config.save() {
+            self.notice(format!("could not save config: {err:#}"));
+        }
+        self.open_settings_picker();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = selected.min(picker.items.len().saturating_sub(1));
+        }
+        None
+    }
+
+    /// Open the "import from Claude Code" multi-select. Each row is a toggleable
+    /// artifact (Space toggles, Enter runs); order is mcp / commands / verbs to
+    /// match the [`ImportSelection`] built in the Enter handler.
+    fn open_claude_import_picker(&mut self) {
+        if import_claude::claude_home().is_none() {
+            self.notice("no Claude Code install found (~/.claude)");
+            return;
+        }
+        let (mcp, commands, verbs) = import_claude::counts();
+        let items = vec![
+            PickerItem {
+                value: format!("MCP servers ({mcp})"),
+                detail: "merge into ~/.wizard/mcp.toml".to_string(),
+                current: false,
+            },
+            PickerItem {
+                value: format!("Custom commands ({commands})"),
+                detail: "copy into ~/.wizard/commands/".to_string(),
+                current: false,
+            },
+            PickerItem {
+                value: format!("Spinner verbs ({verbs})"),
+                detail: "adopt Claude Code's spinner verbs".to_string(),
+                current: false,
+            },
+        ];
+        self.picker = Some(Picker {
+            kind: PickerKind::ClaudeImport,
+            title: " import from claude code · space toggles · enter runs ".to_string(),
+            items,
+            selected: 0,
+        });
     }
 
     /// Current state for this session's heartbeat: needs-input when paused on a
@@ -1289,6 +1484,12 @@ impl App {
                         picker.selected + 1
                     };
                 }
+                // Space toggles a checkbox row in the Claude-import multi-select.
+                KeyCode::Char(' ') if picker.kind == PickerKind::ClaudeImport => {
+                    if let Some(item) = picker.items.get_mut(picker.selected) {
+                        item.current = !item.current;
+                    }
+                }
                 KeyCode::Esc => {
                     self.picker = None;
                 }
@@ -1322,6 +1523,28 @@ impl App {
                             // just types the task and submits.
                             self.set_input(format!("Use the {} subagent to ", item.value));
                             return Ok(None);
+                        }
+                        PickerKind::Settings => {
+                            let selected = picker.selected;
+                            return Ok(self.apply_setting(selected));
+                        }
+                        PickerKind::ClaudeImport => {
+                            // Build the selection from the toggled rows (order
+                            // matches `open_claude_import_picker`: mcp, commands,
+                            // verbs) and hand off to the command handler, which
+                            // has the live MCP manager.
+                            let flags: Vec<bool> =
+                                picker.items.iter().map(|i| i.current).collect();
+                            let selection = ImportSelection {
+                                mcp: flags.first().copied().unwrap_or(false),
+                                commands: flags.get(1).copied().unwrap_or(false),
+                                verbs: flags.get(2).copied().unwrap_or(false),
+                            };
+                            if selection.is_empty() {
+                                self.notice("nothing selected to import");
+                                return Ok(None);
+                            }
+                            AppAction::Command(SlashCommand::ImportClaude(selection))
                         }
                     };
                     return Ok(Some(action));
@@ -1816,6 +2039,70 @@ fn setup_terminal() -> Result<Tui> {
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
 }
 
+/// Suspend the TUI, open `$VISUAL`/`$EDITOR` on `~/.wizard/config.toml`, then
+/// restore the TUI and reload the edited config. Driven by the `/settings`
+/// "Open config file" row; runs from the main loop because it owns `terminal`.
+/// Falls back to a path notice when no editor is configured.
+fn edit_config_file(app: &mut App, terminal: &mut Tui) {
+    let path = match Config::path() {
+        Ok(path) => path,
+        Err(err) => {
+            app.notice(format!("could not locate config: {err:#}"));
+            return;
+        }
+    };
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_default();
+    if editor.trim().is_empty() {
+        app.notice(format!(
+            "no $EDITOR set — edit {} by hand, then /reload",
+            path.display()
+        ));
+        return;
+    }
+
+    // Leave the alternate screen so the editor draws on the real terminal.
+    if let Err(err) = restore_terminal() {
+        app.notice(format!("could not suspend the TUI: {err:#}"));
+        return;
+    }
+    // `sh -c` so editors with flags ("code --wait", "emacsclient -t") work.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"{}\"", path.display()))
+        .status();
+
+    // Re-enter the TUI regardless of how the editor exited.
+    match setup_terminal() {
+        Ok(new_terminal) => {
+            *terminal = new_terminal;
+            let _ = terminal.clear();
+        }
+        Err(err) => {
+            app.notice(format!("could not restore the TUI: {err:#} — /quit and relaunch"));
+            return;
+        }
+    }
+
+    match status {
+        Ok(status) if status.success() => match Config::load() {
+            Ok(config) => {
+                app.config = config;
+                app.mode = app.config.mode;
+                app.status.mode = app.config.mode;
+                app.status.model = app.config.active().model;
+                app.notice(
+                    "config reloaded — restart for provider/model changes to take effect",
+                );
+            }
+            Err(err) => app.notice(format!("config not reloaded (parse error): {err:#}")),
+        },
+        Ok(_) => app.notice("editor exited without success — config not reloaded"),
+        Err(err) => app.notice(format!("could not launch editor: {err:#}")),
+    }
+}
+
 fn restore_terminal() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
@@ -2054,6 +2341,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
+/settings                   open the settings menu (change config anytime)\n  \
 /doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
 /quit                       exit\n\
 keys:\n  \
@@ -2072,6 +2360,17 @@ Ctrl-C                      quit";
 /// True for backends that run on this machine (no API key, no cloud).
 fn is_local_kind(kind: ProviderKind) -> bool {
     matches!(kind, ProviderKind::LlamaCpp | ProviderKind::Ollama)
+}
+
+/// Rotate the `web_search` backend for the settings menu's cycle row:
+/// duckduckgo → brave → tavily → duckduckgo.
+fn cycle_backend(current: &str) -> String {
+    match current {
+        "duckduckgo" => "brave",
+        "brave" => "tavily",
+        _ => "duckduckgo",
+    }
+    .to_string()
 }
 
 /// Build `provider`'s client and prove it usable: for local llama.cpp this
@@ -2478,6 +2777,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             }
         }
 
+        // The `/settings` "Open config file" row asks the main loop (the
+        // terminal owner) to suspend the TUI and run an external editor.
+        if app.pending_edit_config {
+            app.pending_edit_config = false;
+            edit_config_file(&mut app, &mut terminal);
+        }
+
         if turn_done && let Some(handle) = agent_task.take() {
             match handle.await {
                 Ok(agent) => agent_slot = Some(agent),
@@ -2585,6 +2891,8 @@ impl CommandContext<'_> {
             SlashCommand::Provider(action) => self.provider(action).await,
             SlashCommand::Server(action) => self.server(action).await,
             SlashCommand::Login(provider) => self.login(provider),
+            SlashCommand::Settings => self.app.open_settings_picker(),
+            SlashCommand::ImportClaude(selection) => self.import_claude(selection).await,
         }
     }
 
@@ -3009,6 +3317,8 @@ impl CommandContext<'_> {
             }
         }
         self.app.status.max_steps = self.app.config.max_steps;
+        // Persist so the mode survives a restart (consistent with /provider).
+        self.persist_config();
         self.app.notice(format!("switched to {mode} mode"));
     }
 
@@ -3051,6 +3361,61 @@ impl CommandContext<'_> {
             }
             Err(err) => self.app.notice(format!("reload failed: {err:#}")),
         }
+    }
+
+    /// Run a Claude Code import (dispatched from the `/settings` import
+    /// picker), then reload custom commands + MCP servers live so the imported
+    /// artifacts take effect without a restart.
+    async fn import_claude(&mut self, selection: ImportSelection) {
+        if self.agent_unavailable("import from Claude Code") {
+            return;
+        }
+        let outcome = match import_claude::run_import(&selection) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.app.notice(format!("Claude Code import failed: {err:#}"));
+                return;
+            }
+        };
+
+        // Adopt the imported spinner verbs (replacing the active list).
+        if !outcome.spinner_verbs.is_empty() {
+            self.app.config.ui.spinner_verbs = outcome.spinner_verbs.clone();
+            self.persist_config();
+        }
+
+        // Reload custom commands + MCP servers and rebuild the live tool
+        // registry (mirrors `reload`) so imports are usable immediately.
+        self.app.custom_commands = crate::commands::load(self.project_root);
+        let mut manager = self.manager.lock().await;
+        match McpConfig::load(self.mcp_path) {
+            Ok(mcp_config) => {
+                if let Err(err) = manager.reload(&mcp_config).await {
+                    self.app.notice(format!("MCP reload warning: {err:#}"));
+                }
+            }
+            Err(err) => self
+                .app
+                .notice(format!("could not reload MCP config: {err:#}")),
+        }
+        if let Some(hooks) = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| Arc::clone(agent.hooks()))
+            && let Ok(registry) = build_registry(&manager, self.client, &hooks).await
+            && let Some(agent) = self.agent_slot.as_mut()
+        {
+            agent.set_registry(registry);
+            agent.set_skills(self.skills.clone());
+        }
+        drop(manager);
+
+        let summary = outcome.summary();
+        self.app.notice(if summary.is_empty() {
+            "nothing to import from Claude Code".to_string()
+        } else {
+            format!("imported from Claude Code:\n{summary}")
+        });
     }
 
     fn evolve(&mut self, deep: bool, description: String) {

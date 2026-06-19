@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::config::{Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind};
 use crate::hardware::{self, GgufModel};
+use crate::import_claude::{self, ImportSelection};
 
 /// White accent, matching [`crate::ui`].
 const ACCENT: Color = Color::White;
@@ -88,6 +89,11 @@ pub struct Answers {
     pub gateway_allowed_chat_ids: Vec<i64>,
     /// Personality mode.
     pub mode: Mode,
+    /// Artifacts to import from an existing Claude Code install, if any. The
+    /// actual import (file writes + spinner verbs) runs in [`run_blocking`]
+    /// after [`Answers::into_config`], so this is consumed there rather than in
+    /// the pure config mapping.
+    pub claude_import: Option<ImportSelection>,
 }
 
 impl Answers {
@@ -222,9 +228,35 @@ fn run_blocking() -> Result<Option<Config>> {
         Err(err) => return Err(err),
     };
 
-    let config = answers.into_config();
+    let import = answers.claude_import;
+    let mut config = answers.into_config();
+
+    // Perform the Claude Code import (MCP/commands file writes + spinner verbs)
+    // before saving, so the verbs land in the same config write.
+    let import_summary = match import {
+        Some(selection) => match import_claude::run_import(&selection) {
+            Ok(outcome) => {
+                if !outcome.spinner_verbs.is_empty() {
+                    config.ui.spinner_verbs = outcome.spinner_verbs.clone();
+                }
+                Some(outcome.summary())
+            }
+            Err(err) => Some(format!("import failed: {err:#}")),
+        },
+        None => None,
+    };
+
     config.save().context("saving config from onboarding")?;
     print_summary(&config);
+    if let Some(summary) = import_summary
+        && !summary.is_empty()
+    {
+        println!("Imported from Claude Code:");
+        for line in summary.lines() {
+            println!("  • {line}");
+        }
+        println!();
+    }
     Ok(Some(config))
 }
 
@@ -375,6 +407,15 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
+    // Step 5 — optional: import artifacts from an existing Claude Code install.
+    // Only shown when `~/.claude` exists. Esc here skips the import (the rest of
+    // the config is already complete) rather than aborting onboarding.
+    let claude_import = if import_claude::claude_home().is_some() {
+        collect_claude_import(terminal)?
+    } else {
+        None
+    };
+
     Ok(Some(Answers {
         provider: collected.provider,
         provider_name: collected.provider_name,
@@ -387,7 +428,44 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         gateway_token_env,
         gateway_allowed_chat_ids,
         mode,
+        claude_import,
     }))
+}
+
+/// Optional final step: offer to import artifacts from an existing Claude Code
+/// install (`~/.claude`). Returns the chosen selection, or `None` to skip (Esc,
+/// or nothing toggled).
+fn collect_claude_import(terminal: &mut Tui) -> Result<Option<ImportSelection>> {
+    let (mcp, commands, verbs) = import_claude::counts();
+    let options = [
+        Opt::new(
+            format!("MCP servers ({mcp})"),
+            "merge into ~/.wizard/mcp.toml",
+        ),
+        Opt::new(
+            format!("Custom commands ({commands})"),
+            "copy into ~/.wizard/commands/",
+        ),
+        Opt::new(
+            format!("Spinner verbs ({verbs})"),
+            "adopt Claude Code's spinner verbs",
+        ),
+    ];
+    let checked = match multi_select(
+        terminal,
+        "Import from Claude Code",
+        "Found ~/.claude — bring over any of these?",
+        &options,
+    )? {
+        Some(checked) => checked,
+        None => return Ok(None), // skipped
+    };
+    let selection = ImportSelection {
+        mcp: checked.first().copied().unwrap_or(false),
+        commands: checked.get(1).copied().unwrap_or(false),
+        verbs: checked.get(2).copied().unwrap_or(false),
+    };
+    Ok((!selection.is_empty()).then_some(selection))
 }
 
 /// Per-provider answers gathered in step 2.
@@ -1004,6 +1082,7 @@ fn print_summary(config: &Config) {
     }
 
     println!("  • start Wizard:    wizard");
+    println!("  • change settings: run /settings anytime inside Wizard");
     println!();
 }
 
@@ -1085,6 +1164,49 @@ fn select(
                 };
             }
             KeyCode::Enter => return Ok(Some(selected)),
+            _ => {}
+        }
+    }
+}
+
+/// Render a checklist of options; ↑/↓ move, Space toggles the current row,
+/// Enter confirms. Returns the per-row checked state, or `None` on Esc/Ctrl-C.
+/// All rows start unchecked.
+fn multi_select(
+    terminal: &mut Tui,
+    title: &str,
+    subtitle: &str,
+    options: &[Opt],
+) -> Result<Option<Vec<bool>>> {
+    let mut checked = vec![false; options.len()];
+    let mut selected = 0usize;
+    loop {
+        terminal.draw(|frame| draw_multi_select(frame, title, subtitle, options, &checked, selected))?;
+        let Some(key) = next_key()? else { continue };
+        if is_cancel(&key) {
+            return Ok(None);
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                selected = if selected == 0 {
+                    options.len().saturating_sub(1)
+                } else {
+                    selected - 1
+                };
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                selected = if selected + 1 >= options.len() {
+                    0
+                } else {
+                    selected + 1
+                };
+            }
+            KeyCode::Char(' ') => {
+                if let Some(slot) = checked.get_mut(selected) {
+                    *slot = !*slot;
+                }
+            }
+            KeyCode::Enter => return Ok(Some(checked)),
             _ => {}
         }
     }
@@ -1236,6 +1358,50 @@ fn draw_select(
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+fn draw_multi_select(
+    frame: &mut ratatui::Frame,
+    title: &str,
+    subtitle: &str,
+    options: &[Opt],
+    checked: &[bool],
+    selected: usize,
+) {
+    let inner = frame_body(
+        frame,
+        title,
+        subtitle,
+        "↑/↓ move · space toggle · enter confirm · esc skip",
+    );
+    let mut lines = Vec::with_capacity(options.len());
+    for (index, option) in options.iter().enumerate() {
+        let active = index == selected;
+        let marker = if active { "▸ " } else { "  " };
+        let box_ = if checked.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let label_style = if active {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_DIM)
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {marker}"), Style::default().fg(ACCENT)),
+            Span::styled(format!("{box_} "), Style::default().fg(ACCENT)),
+            Span::styled(option.label.clone(), label_style),
+        ];
+        if !option.detail.is_empty() {
+            spans.push(Span::styled(
+                format!("   {}", option.detail),
+                Style::default().fg(DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 fn draw_input(
     frame: &mut ratatui::Frame,
     title: &str,
@@ -1319,6 +1485,7 @@ mod tests {
             gateway_token_env: None,
             gateway_allowed_chat_ids: Vec::new(),
             mode: Mode::Genie,
+            claude_import: None,
         }
     }
 
