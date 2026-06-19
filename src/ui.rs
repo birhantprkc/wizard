@@ -92,7 +92,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() && app.plan_review.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() && !app.show_dashboard {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -100,6 +100,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.plan_review.is_some() {
         draw_plan_review(frame, app);
+    }
+    // The dashboard is modal and full-screen, so it paints last (on top).
+    if app.show_dashboard {
+        draw_dashboard(frame, app);
     }
 }
 
@@ -367,6 +371,30 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Human label + one-line summary for a tool call. `spawn_subagent` reads as
+/// "subagent <name> · <task>" so the user can see which subagent is working
+/// and on what; every other tool is its own name plus its JSON args. The
+/// summary is returned untruncated — callers clip it to their width.
+fn tool_label(name: &str, args: &serde_json::Value) -> (String, String) {
+    if name == "spawn_subagent" {
+        let who = args.get("subagent").and_then(|v| v.as_str()).unwrap_or("?");
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = if task.is_empty() {
+            who.to_string()
+        } else {
+            format!("{who} · {task}")
+        };
+        ("subagent".to_string(), summary)
+    } else if args.is_null() {
+        (name.to_string(), String::new())
+    } else {
+        (
+            name.to_string(),
+            serde_json::to_string(args).unwrap_or_default(),
+        )
+    }
+}
+
 /// Render one tool invocation as a compact single-line card: status glyph,
 /// tool name in accent, truncated args in dim. Output expands below only
 /// when relevant (errors, or Ctrl-T).
@@ -390,25 +418,8 @@ fn tool_card_lines(
         (Some(_), true) => Span::styled("✗", Style::default().fg(Color::White).bold()),
     };
 
-    // `spawn_subagent` reads better as "subagent <name> · <task>" than as raw
-    // JSON, so the user can see which subagent is working and on what.
-    let (label, summary) = if name == "spawn_subagent" {
-        let who = args.get("subagent").and_then(|v| v.as_str()).unwrap_or("?");
-        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-        let summary = if task.is_empty() {
-            who.to_string()
-        } else {
-            format!("{who} · {task}")
-        };
-        ("subagent".to_string(), truncate_width(&summary, 64))
-    } else if args.is_null() {
-        (name.to_string(), String::new())
-    } else {
-        (
-            name.to_string(),
-            truncate_width(&serde_json::to_string(args).unwrap_or_default(), 64),
-        )
-    };
+    let (label, summary) = tool_label(name, args);
+    let summary = truncate_width(&summary, 64);
     let mut card = vec![glyph, Span::raw(" "), Span::styled(label, accent())];
     if !summary.is_empty() {
         card.push(Span::styled(format!("  {summary}"), dim()));
@@ -800,6 +811,201 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
         );
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// One "key: value" row in the dashboard, clipped to `width`.
+fn dash_kv(key: &str, value: &str, width: usize) -> Line<'static> {
+    truncate_line(
+        Line::from(vec![
+            Span::styled(format!("{key}: "), dim()),
+            Span::styled(value.to_string(), Style::default().fg(TEXT_DIM)),
+        ]),
+        width,
+    )
+}
+
+/// A dim "· text" placeholder row for an empty dashboard section.
+fn dash_bullet(text: &str, style: Style) -> Line<'static> {
+    Line::from(Span::styled(format!("· {text}"), style))
+}
+
+/// Full-screen agent dashboard (`/dashboard`): a live, at-a-glance view of the
+/// session, in-flight tools and subagents, the todo list, and background
+/// tasks. Modal — Esc/Enter/q close it — and rendered purely from mirrored
+/// [`App`] state, so it refreshes every frame.
+fn draw_dashboard(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦ ", accent()),
+            Span::styled(
+                "agent dashboard",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .title_bottom(Line::from(Span::styled(" Esc close · refreshes live ", dim())).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height < 4 {
+        return;
+    }
+    let width = inner.width as usize;
+    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let header = |lines: &mut Vec<Line<'static>>, text: &str| {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            text.to_string(),
+            accent().add_modifier(Modifier::BOLD),
+        )));
+    };
+
+    // -- Session ----------------------------------------------------------
+    header(&mut lines, "SESSION");
+    let provider = app.config.active();
+    lines.push(dash_kv("model", &app.status.model, width));
+    lines.push(dash_kv(
+        "provider",
+        &format!("{} ({:?})", provider.name, provider.kind),
+        width,
+    ));
+    lines.push(dash_kv(
+        "mode",
+        &format!(
+            "{}{}",
+            app.status.mode,
+            if app.plan_mode { " · plan mode" } else { "" }
+        ),
+        width,
+    ));
+    let activity = if app.status.busy {
+        let elapsed = app
+            .turn_started
+            .map(|t| format!(" · {}s", t.elapsed().as_secs()))
+            .unwrap_or_default();
+        format!(
+            "{spinner} {}… · step {}/{}{elapsed}",
+            app.spinner_verb, app.status.step, app.status.max_steps
+        )
+    } else {
+        "idle".to_string()
+    };
+    lines.push(dash_kv("activity", &activity, width));
+    lines.push(dash_kv(
+        "tokens",
+        &format!(
+            "{} prompt · {} completion",
+            app.status.prompt_tokens, app.status.completion_tokens
+        ),
+        width,
+    ));
+
+    // -- Now running: in-flight tool calls and subagent steps -------------
+    header(&mut lines, "NOW RUNNING");
+    let mut any_running = false;
+    for entry in &app.transcript {
+        if let TranscriptEntry::ToolCard {
+            name,
+            args,
+            output: None,
+            ..
+        } = entry
+        {
+            any_running = true;
+            let (label, summary) = tool_label(name, args);
+            let text = if summary.is_empty() {
+                label
+            } else {
+                format!("{label}  {summary}")
+            };
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(format!("{spinner} "), accent()),
+                    Span::styled(text, Style::default().fg(TEXT_DIM)),
+                ]),
+                width,
+            ));
+        }
+    }
+    if !any_running {
+        lines.push(dash_bullet(
+            if app.status.busy {
+                "thinking…"
+            } else {
+                "nothing running"
+            },
+            dim().italic(),
+        ));
+    }
+
+    // -- Todos ------------------------------------------------------------
+    let (done, total) = crate::tools::todo::progress(&app.todos);
+    header(&mut lines, &format!("TODOS  {done}/{total}"));
+    if app.todos.is_empty() {
+        lines.push(dash_bullet("none", dim().italic()));
+    } else {
+        use crate::tools::todo::TodoStatus;
+        for item in app.todos.iter().take(12) {
+            let (glyph_style, text_style) = match item.status {
+                TodoStatus::Completed => (dim(), dim().add_modifier(Modifier::CROSSED_OUT)),
+                TodoStatus::InProgress => (accent(), accent().bold()),
+                TodoStatus::Pending => (dim(), Style::default().fg(TEXT_DIM)),
+            };
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(format!("{} ", item.status.glyph()), glyph_style),
+                    Span::styled(item.content.clone(), text_style),
+                ]),
+                width,
+            ));
+        }
+    }
+
+    // -- Background tasks -------------------------------------------------
+    header(&mut lines, "BACKGROUND TASKS");
+    if app.bg_tasks.is_empty() {
+        lines.push(dash_bullet("none", dim().italic()));
+    } else {
+        use crate::tools::tasks::TaskStatus;
+        for task in app.bg_tasks.iter().rev().take(12) {
+            let (glyph, style) = match task.status {
+                TaskStatus::Running => (spinner.to_string(), accent()),
+                TaskStatus::Done(0) => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
+                _ => ("✗".to_string(), Style::default().fg(Color::White).bold()),
+            };
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(
+                        format!("#{} {}", task.id, task.command),
+                        Style::default().fg(TEXT_DIM),
+                    ),
+                    Span::styled(format!("  {}", task.status.describe()), dim()),
+                ]),
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "/agents to browse and delegate to subagents",
+        dim().italic(),
+    )));
+
+    // No scrolling — the dashboard is a glance, not a log; clip to height.
+    let max = inner.height as usize;
+    if lines.len() > max {
+        lines.truncate(max);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Plan-review modal (plan mode): the plan markdown with a verdict footer.

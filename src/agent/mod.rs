@@ -121,6 +121,10 @@ pub enum AgentEvent {
     /// list; the TUI mirrors it in a side panel, headless prints a one-line
     /// summary, the gateway ignores it.
     TodoUpdated(Vec<crate::tools::todo::TodoItem>),
+    /// A background task (`execute` with `run_in_background`) was just
+    /// spawned. The TUI mirrors it into the dashboard's task list; other
+    /// surfaces ignore it.
+    TaskStarted { id: u32, command: String },
     /// A background task (`execute` with `run_in_background`) finished; its
     /// output tail was injected into history. The TUI and headless surfaces
     /// print a one-liner, the gateway ignores it.
@@ -561,6 +565,12 @@ impl Agent {
     /// Session token counters (prompt/completion totals, last prompt size).
     pub fn usage(&self) -> &crate::usage::UsageTracker {
         &self.usage
+    }
+
+    /// Snapshot of all background tasks (running and finished) for the
+    /// dashboard's task list.
+    pub fn tasks(&self) -> Vec<crate::tools::tasks::Task> {
+        self.ctx.tasks.list()
     }
 
     /// Number of background tasks (`execute` with `run_in_background`)

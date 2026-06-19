@@ -112,6 +112,9 @@ pub enum SlashCommand {
     Diff,
     /// Toggle the todo side panel.
     Todos,
+    /// Toggle the full-screen agent dashboard (session, in-flight tools and
+    /// subagents, todos, background tasks, subagent roster).
+    Dashboard,
     /// Show session token usage (and cost when rates are configured).
     Cost,
     /// Show the saved project memories.
@@ -273,6 +276,7 @@ impl SlashCommand {
             "agents" | "subagents" => Ok(Self::Agents),
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
+            "dashboard" => Ok(Self::Dashboard),
             "cost" => Ok(Self::Cost),
             "memory" => Ok(Self::Memory),
             "doctor" => Ok(Self::Doctor),
@@ -390,6 +394,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "todos",
         args: "",
         description: "toggle the todo side panel",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "dashboard",
+        args: "",
+        description: "toggle the agent dashboard (tasks, subagents, todos)",
         takes_args: false,
     },
     CommandSpec {
@@ -526,6 +536,15 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// A background task as mirrored into the dashboard. Built from
+/// [`AgentEvent::TaskStarted`] and updated by [`AgentEvent::TaskFinished`].
+#[derive(Debug, Clone)]
+pub struct BgTask {
+    pub id: u32,
+    pub command: String,
+    pub status: crate::tools::tasks::TaskStatus,
+}
+
 /// In-flight plan review (plan mode): the model called `exit_plan` and the
 /// turn is paused inside the tool until a [`PlanVerdict`] is sent back.
 #[derive(Debug)]
@@ -587,6 +606,11 @@ pub struct App {
     /// Whether a todo update has arrived yet (drives the one-time
     /// auto-show).
     todos_seen: bool,
+    /// Full-screen agent dashboard visibility (toggled by `/dashboard`).
+    pub show_dashboard: bool,
+    /// Background tasks mirrored from [`AgentEvent::TaskStarted`] /
+    /// [`AgentEvent::TaskFinished`], newest last, for the dashboard.
+    pub bg_tasks: Vec<BgTask>,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -660,6 +684,8 @@ impl App {
             show_todos: false,
             todos: Vec::new(),
             todos_seen: false,
+            show_dashboard: false,
+            bg_tasks: Vec::new(),
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -990,6 +1016,16 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // The dashboard is a modal view: while it's open, Esc / Enter / q
+        // close it and other keys are swallowed (global chords above still
+        // work). The view itself refreshes from live App state every frame.
+        if self.show_dashboard {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                self.show_dashboard = false;
+            }
+            return Ok(None);
         }
 
         // An open plan review captures all keys: the turn is paused inside
@@ -1468,11 +1504,29 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
+            AgentEvent::TaskStarted { id, command } => {
+                self.bg_tasks.push(BgTask {
+                    id,
+                    command,
+                    status: crate::tools::tasks::TaskStatus::Running,
+                });
+            }
             AgentEvent::TaskFinished {
                 id,
                 command,
                 status,
             } => {
+                // Update the mirrored task (or record it if we never saw the
+                // start) so the dashboard reflects the final state.
+                if let Some(task) = self.bg_tasks.iter_mut().find(|t| t.id == id) {
+                    task.status = status;
+                } else {
+                    self.bg_tasks.push(BgTask {
+                        id,
+                        command: command.clone(),
+                        status,
+                    });
+                }
                 self.notice(format!(
                     "background task #{id} finished ({}): {command}",
                     status.describe()
@@ -1770,6 +1824,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /todos                      toggle the todo side panel\n  \
+/dashboard                  toggle the agent dashboard (tasks, subagents, todos)\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
@@ -2191,6 +2246,7 @@ impl CommandContext<'_> {
             SlashCommand::Quit => self.app.should_quit = true,
             SlashCommand::Diff => self.toggle_diff().await,
             SlashCommand::Todos => self.toggle_todos(),
+            SlashCommand::Dashboard => self.toggle_dashboard(),
             SlashCommand::Cost => self.cost(),
             SlashCommand::Memory => self.memory(),
             SlashCommand::Doctor => self.doctor().await,
@@ -2245,6 +2301,29 @@ impl CommandContext<'_> {
         if self.app.show_todos && self.app.todos.is_empty() {
             self.app
                 .notice("todo list is empty — the agent fills it via the `todo` tool");
+        }
+    }
+
+    /// `/dashboard`: toggle the full-screen agent view. When opening while the
+    /// agent is idle, refresh the background-task mirror from the live registry
+    /// so tasks spawned before the dashboard was first shown still appear.
+    fn toggle_dashboard(&mut self) {
+        self.app.show_dashboard = !self.app.show_dashboard;
+        if self.app.show_dashboard
+            && let Some(agent) = self.agent_slot.as_ref()
+        {
+            for task in agent.tasks() {
+                if let Some(existing) = self.app.bg_tasks.iter_mut().find(|t| t.id == task.id) {
+                    existing.status = task.status;
+                } else {
+                    self.app.bg_tasks.push(BgTask {
+                        id: task.id,
+                        command: task.command,
+                        status: task.status,
+                    });
+                }
+            }
+            self.app.bg_tasks.sort_by_key(|t| t.id);
         }
     }
 
@@ -3577,6 +3656,40 @@ mod tests {
         assert!(app.picker.is_none(), "the picker closed");
         assert_eq!(app.input, "Use the reviewer subagent to ");
         assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn dashboard_command_parses() {
+        assert!(matches!(
+            SlashCommand::parse("/dashboard"),
+            Some(Ok(SlashCommand::Dashboard))
+        ));
+    }
+
+    #[test]
+    fn dashboard_mirrors_background_tasks_and_esc_closes() {
+        use crate::tools::tasks::TaskStatus;
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::TaskStarted {
+            id: 1,
+            command: "sleep 5".to_string(),
+        });
+        assert_eq!(app.bg_tasks.len(), 1);
+        assert_eq!(app.bg_tasks[0].status, TaskStatus::Running);
+
+        // Finishing updates the existing row rather than adding a new one.
+        app.handle_agent_event(AgentEvent::TaskFinished {
+            id: 1,
+            command: "sleep 5".to_string(),
+            status: TaskStatus::Done(0),
+        });
+        assert_eq!(app.bg_tasks.len(), 1);
+        assert_eq!(app.bg_tasks[0].status, TaskStatus::Done(0));
+
+        // The dashboard is modal: Esc closes it.
+        app.show_dashboard = true;
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_dashboard);
     }
 
     #[test]
