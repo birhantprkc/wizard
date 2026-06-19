@@ -108,6 +108,9 @@ pub enum SlashCommand {
     /// `/agents` — open the subagent roster picker (browse the available
     /// subagents and what each does; Enter pre-fills a delegation request).
     Agents,
+    /// `/subagents` — toggle the in-session subagent monitor: the subagents
+    /// that have run (or are running) this session, with live status.
+    Subagents,
     /// Toggle the git diff sidebar.
     Diff,
     /// Toggle the todo side panel.
@@ -273,7 +276,8 @@ impl SlashCommand {
                     .map(|turn| Self::Rewind(Some(turn)))
                     .map_err(|_| "usage: /rewind [turn]".to_string()),
             },
-            "agents" | "subagents" => Ok(Self::Agents),
+            "agents" => Ok(Self::Agents),
+            "subagents" => Ok(Self::Subagents),
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
             "dashboard" => Ok(Self::Dashboard),
@@ -352,6 +356,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "agents",
         args: "",
         description: "browse subagents and delegate to one",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "subagents",
+        args: "",
+        description: "monitor the subagents running in this session",
         takes_args: false,
     },
     CommandSpec {
@@ -608,6 +618,8 @@ pub struct App {
     todos_seen: bool,
     /// Full-screen agent dashboard visibility (toggled by `/dashboard`).
     pub show_dashboard: bool,
+    /// In-session subagent monitor visibility (toggled by `/subagents`).
+    pub show_subagents: bool,
     /// Background tasks mirrored from [`AgentEvent::TaskStarted`] /
     /// [`AgentEvent::TaskFinished`], newest last, for the dashboard.
     pub bg_tasks: Vec<BgTask>,
@@ -685,6 +697,7 @@ impl App {
             todos: Vec::new(),
             todos_seen: false,
             show_dashboard: false,
+            show_subagents: false,
             bg_tasks: Vec::new(),
             scroll: 0,
             should_quit: false,
@@ -1018,12 +1031,13 @@ impl App {
             }
         }
 
-        // The dashboard is a modal view: while it's open, Esc / Enter / q
-        // close it and other keys are swallowed (global chords above still
-        // work). The view itself refreshes from live App state every frame.
-        if self.show_dashboard {
+        // The dashboard and subagent monitor are modal views: while one is
+        // open, Esc / Enter / q close it and other keys are swallowed (global
+        // chords above still work). They refresh from live App state each frame.
+        if self.show_dashboard || self.show_subagents {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.show_dashboard = false;
+                self.show_subagents = false;
             }
             return Ok(None);
         }
@@ -1816,6 +1830,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
 /agents                     browse subagents and delegate to one\n  \
+/subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
@@ -2247,6 +2262,7 @@ impl CommandContext<'_> {
             SlashCommand::Diff => self.toggle_diff().await,
             SlashCommand::Todos => self.toggle_todos(),
             SlashCommand::Dashboard => self.toggle_dashboard(),
+            SlashCommand::Subagents => self.toggle_subagents(),
             SlashCommand::Cost => self.cost(),
             SlashCommand::Memory => self.memory(),
             SlashCommand::Doctor => self.doctor().await,
@@ -2324,6 +2340,15 @@ impl CommandContext<'_> {
                 }
             }
             self.app.bg_tasks.sort_by_key(|t| t.id);
+        }
+    }
+
+    /// `/subagents`: toggle the in-session subagent monitor.
+    fn toggle_subagents(&mut self) {
+        self.app.show_subagents = !self.app.show_subagents;
+        // Mutually exclusive with the dashboard so only one modal is up.
+        if self.app.show_subagents {
+            self.app.show_dashboard = false;
         }
     }
 
@@ -3617,14 +3642,16 @@ mod tests {
     }
 
     #[test]
-    fn agents_and_subagents_parse_to_the_agents_command() {
+    fn agents_and_subagents_parse_to_distinct_commands() {
+        // /agents opens the roster picker; /subagents opens the in-session
+        // monitor — they are no longer aliases.
         assert!(matches!(
             SlashCommand::parse("/agents"),
             Some(Ok(SlashCommand::Agents))
         ));
         assert!(matches!(
             SlashCommand::parse("/subagents"),
-            Some(Ok(SlashCommand::Agents))
+            Some(Ok(SlashCommand::Subagents))
         ));
     }
 

@@ -92,7 +92,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() && app.plan_review.is_none() && !app.show_dashboard {
+    if app.picker.is_none()
+        && app.plan_review.is_none()
+        && !app.show_dashboard
+        && !app.show_subagents
+    {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -101,9 +105,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.plan_review.is_some() {
         draw_plan_review(frame, app);
     }
-    // The dashboard is modal and full-screen, so it paints last (on top).
+    // The dashboard and subagent monitor are modal and full-screen, so they
+    // paint last (on top). Only one is ever open at a time.
     if app.show_dashboard {
         draw_dashboard(frame, app);
+    }
+    if app.show_subagents {
+        draw_subagents(frame, app);
     }
 }
 
@@ -1001,6 +1009,152 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
     )));
 
     // No scrolling — the dashboard is a glance, not a log; clip to height.
+    let max = inner.height as usize;
+    if lines.len() > max {
+        lines.truncate(max);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// In-session subagent monitor (`/subagents`): the subagents that have run or
+/// are running this session, with live status. Modal — Esc/Enter/q close it —
+/// and reconstructed from the transcript each frame: a `spawn_subagent` card is
+/// one run, and the `<name> ▸ <tool>` cards that follow it are its steps.
+fn draw_subagents(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    // Walk the transcript once, grouping nested `▸` steps under their run.
+    struct Run {
+        name: String,
+        task: String,
+        /// 0 = running, 1 = completed, 2 = failed / hit budget.
+        state: u8,
+        steps: usize,
+        current: Option<String>,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for entry in &app.transcript {
+        let TranscriptEntry::ToolCard {
+            name,
+            args,
+            output,
+            is_error,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        if name == "spawn_subagent" {
+            let who = args
+                .get("subagent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subagent");
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+            let state = match output {
+                None => 0,
+                Some(_) if *is_error => 2,
+                Some(_) => 1,
+            };
+            runs.push(Run {
+                name: who.to_string(),
+                task: task.to_string(),
+                state,
+                steps: 0,
+                current: None,
+            });
+        } else if let Some(tool) = name.split(" ▸ ").nth(1) {
+            // A nested subagent step belongs to the most recent run.
+            if let Some(run) = runs.last_mut() {
+                run.steps += 1;
+                run.current = if output.is_none() {
+                    Some(tool.to_string())
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦ ", accent()),
+            Span::styled(
+                "subagents · this session",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .title_bottom(Line::from(Span::styled(" Esc close · refreshes live ", dim())).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height < 4 {
+        return;
+    }
+    let width = inner.width as usize;
+    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if runs.is_empty() {
+        lines.push(dash_bullet(
+            "no subagents have run this session",
+            dim().italic(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "the agent delegates via spawn_subagent · /agents to browse the roster",
+            dim().italic(),
+        )));
+    } else {
+        // Running first (there is at most one at a time), then finished newest
+        // first so the latest result is on top.
+        let mut order: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].state == 0).collect();
+        order.extend((0..runs.len()).filter(|&i| runs[i].state != 0).rev());
+        for i in order {
+            let run = &runs[i];
+            let (glyph, style) = match run.state {
+                0 => (spinner.to_string(), accent()),
+                1 => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
+                _ => ("✗".to_string(), Style::default().fg(Color::White).bold()),
+            };
+            let suffix = match run.state {
+                0 => format!(" · step {}", run.steps.max(1)),
+                2 => format!(" · stopped at {} steps", run.steps),
+                _ => format!(" · {} steps", run.steps),
+            };
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(
+                        run.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(suffix, dim()),
+                ]),
+                width,
+            ));
+            if !run.task.is_empty() {
+                lines.push(truncate_line(
+                    Line::from(Span::styled(
+                        format!("    {}", run.task),
+                        Style::default().fg(TEXT_DIM),
+                    )),
+                    width,
+                ));
+            }
+            if let Some(current) = &run.current {
+                lines.push(truncate_line(
+                    Line::from(vec![
+                        Span::styled("    ▸ ", accent()),
+                        Span::styled(current.clone(), dim()),
+                    ]),
+                    width,
+                ));
+            }
+        }
+    }
+
     let max = inner.height as usize;
     if lines.len() > max {
         lines.truncate(max);
