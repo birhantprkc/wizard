@@ -46,6 +46,30 @@ enum SessionLine {
 /// Cap on the prompt snippet stored in a [`TurnMarker`].
 const MARKER_PROMPT_CHARS: usize = 120;
 
+/// Read the last `n` message lines of session `id` for the dashboard peek
+/// panel, as `(role, text)` pairs in file order. Best-effort: any error (no
+/// such session, unreadable, corrupt) yields an empty vec.
+pub fn peek(id: &str, n: usize) -> Vec<(String, String)> {
+    let Ok(dir) = crate::config::Config::sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(file) = std::fs::File::open(dir.join(format!("{id}.jsonl"))) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(SessionLine::Message(record)) = serde_json::from_str::<SessionLine>(&line) {
+            let role = format!("{:?}", record.message.role).to_lowercase();
+            messages.push((role, record.message.content));
+        }
+    }
+    let start = messages.len().saturating_sub(n);
+    messages.split_off(start)
+}
+
 /// Handle to one session file. Append-only; cheap to clone the path out of.
 #[derive(Debug, Clone)]
 pub struct Session {

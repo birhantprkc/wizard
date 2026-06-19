@@ -876,9 +876,22 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
     if outer.width < 8 || outer.height < 5 {
         return;
     }
+    // On a wide terminal, a peek panel of the selected session sits on the
+    // right; the list and dispatch input take the left.
+    let (body_area, peek_area) = if outer.width >= 80 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .areas(outer);
+        (left, Some(right))
+    } else {
+        (outer, None)
+    };
+    if let Some(peek_area) = peek_area {
+        draw_peek(frame, app, peek_area);
+    }
     // Reserve the bottom rows for the dispatch input.
     let [inner, input_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(outer);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(body_area);
     let width = inner.width as usize;
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let now = now_unix();
@@ -968,6 +981,59 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
         Paragraph::new(Text::from(vec![prompt_line, hint])),
         input_area,
     );
+}
+
+/// The dashboard's peek panel: the selected session's recent transcript,
+/// role-prefixed, pinned to the latest output. Read-only.
+fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
+    let title = app
+        .sessions
+        .get(app.dashboard_selected)
+        .map(|session| format!(" peek · {} ", session.name))
+        .unwrap_or_else(|| " peek ".to_string());
+    let pblock = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(dim())
+        .title(Line::from(Span::styled(title, accent())));
+    let pinner = pblock.inner(area);
+    frame.render_widget(pblock, area);
+    if pinner.width < 2 || pinner.height < 1 {
+        return;
+    }
+    let pwidth = pinner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.peek_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no transcript yet)",
+            dim().italic(),
+        )));
+    } else {
+        for (role, text) in &app.peek_lines {
+            let role_style = match role.as_str() {
+                "user" => accent().add_modifier(Modifier::BOLD),
+                "assistant" => Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+                _ => dim().add_modifier(Modifier::BOLD),
+            };
+            lines.push(Line::from(Span::styled(role.clone(), role_style)));
+            for line in text.lines() {
+                lines.push(truncate_line(
+                    Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(TEXT_DIM),
+                    )),
+                    pwidth,
+                ));
+            }
+        }
+    }
+    // Pin to the latest: keep the tail that fits.
+    let height = pinner.height as usize;
+    if lines.len() > height {
+        let start = lines.len() - height;
+        lines.drain(..start);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), pinner);
 }
 
 /// In-session subagent monitor (`/subagents`): the subagents that have run or

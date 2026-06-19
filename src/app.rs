@@ -626,6 +626,9 @@ pub struct App {
     /// Dispatch input at the bottom of the dashboard (the prompt for a new
     /// background session).
     pub dashboard_input: String,
+    /// Recent transcript of the selected session (role, text), shown in the
+    /// dashboard's peek panel; refreshed as the selection moves.
+    pub peek_lines: Vec<(String, String)>,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -707,6 +710,7 @@ impl App {
             sessions: Vec::new(),
             dashboard_selected: 0,
             dashboard_input: String::new(),
+            peek_lines: Vec::new(),
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -790,12 +794,21 @@ impl App {
     }
 
     /// Reload the live-session list from the registry, keeping the selection
-    /// in range.
+    /// in range, and refresh the peek panel for the selected row.
     pub fn refresh_sessions(&mut self) {
         self.sessions = session_registry::list();
         if self.dashboard_selected >= self.sessions.len() {
             self.dashboard_selected = self.sessions.len().saturating_sub(1);
         }
+        self.refresh_peek();
+    }
+
+    /// Reload the peek panel with the selected session's recent transcript.
+    fn refresh_peek(&mut self) {
+        self.peek_lines = match self.sessions.get(self.dashboard_selected) {
+            Some(session) => crate::agent::session::peek(&session.id, 80),
+            None => Vec::new(),
+        };
     }
 
     /// Spawn a detached background session for `prompt`: a headless sovereign
@@ -871,6 +884,7 @@ impl App {
             _ if self.dashboard_selected >= last => 0,
             _ => self.dashboard_selected + 1,
         };
+        self.refresh_peek();
     }
 
     /// Recompute [`InputMode`] from the input text, then refresh the command
