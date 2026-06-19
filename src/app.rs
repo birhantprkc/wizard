@@ -105,6 +105,9 @@ pub enum SlashCommand {
     /// `/rewind [turn]` — restore file checkpoints and truncate history.
     /// `None` opens the turn picker; `Some` rewinds to before that turn.
     Rewind(Option<u64>),
+    /// `/agents` — open the subagent roster picker (browse the available
+    /// subagents and what each does; Enter pre-fills a delegation request).
+    Agents,
     /// Toggle the git diff sidebar.
     Diff,
     /// Toggle the todo side panel.
@@ -267,6 +270,7 @@ impl SlashCommand {
                     .map(|turn| Self::Rewind(Some(turn)))
                     .map_err(|_| "usage: /rewind [turn]".to_string()),
             },
+            "agents" | "subagents" => Ok(Self::Agents),
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
             "cost" => Ok(Self::Cost),
@@ -338,6 +342,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "rewind",
         args: "[turn]",
         description: "rewind files and conversation to before a turn",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "agents",
+        args: "",
+        description: "browse subagents and delegate to one",
         takes_args: false,
     },
     CommandSpec {
@@ -489,6 +499,10 @@ pub enum PickerKind {
     Mode,
     /// A turn to rewind to (item values are turn ids).
     Rewind,
+    /// A subagent to delegate to (item values are subagent names). Selecting
+    /// one pre-fills the input with a delegation request rather than running a
+    /// command, since subagents are invoked by the model, not directly.
+    Subagent,
 }
 
 /// One selectable row in a picker popup.
@@ -589,7 +603,7 @@ pub struct App {
     pub custom_commands: Vec<CustomCommand>,
     /// Project root `@file` references resolve against.
     pub project_root: PathBuf,
-    /// Open selection popup (model / mode / rewind picker), if any.
+    /// Open selection popup (model / mode / rewind / subagent picker), if any.
     pub picker: Option<Picker>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
@@ -1028,6 +1042,13 @@ impl App {
                                 return Ok(None);
                             };
                             AppAction::Command(SlashCommand::Rewind(Some(turn)))
+                        }
+                        PickerKind::Subagent => {
+                            // Subagents are spawned by the model, not run as a
+                            // command. Pre-fill a delegation request so the user
+                            // just types the task and submits.
+                            self.set_input(format!("Use the {} subagent to ", item.value));
+                            return Ok(None);
                         }
                     };
                     return Ok(Some(action));
@@ -1740,6 +1761,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
+/agents                     browse subagents and delegate to one\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
@@ -2181,6 +2203,7 @@ impl CommandContext<'_> {
             SlashCommand::Plan => self.toggle_plan(),
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
+            SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
@@ -2422,6 +2445,42 @@ impl CommandContext<'_> {
             title: " select mode ".to_string(),
             items,
             selected,
+        });
+    }
+
+    /// `/agents`: open the subagent roster picker. Lists the built-in and
+    /// user-defined subagents with their purpose, tool scope, and step budget.
+    /// Selecting one pre-fills a delegation request (subagents are spawned by
+    /// the model, so this isn't a direct command).
+    fn open_agents_picker(&mut self) {
+        let dir = Config::subagents_dir().unwrap_or_default();
+        let configs = subagent::available_configs(&dir);
+        if configs.is_empty() {
+            self.app.notice("no subagents available");
+            return;
+        }
+        let items: Vec<PickerItem> = configs
+            .into_iter()
+            .map(|config| {
+                let scope = match &config.tool_scope {
+                    None => "all tools".to_string(),
+                    Some(names) => names.join(", "),
+                };
+                PickerItem {
+                    detail: format!(
+                        "{} · {scope} · {} steps",
+                        config.description, config.max_steps
+                    ),
+                    value: config.name,
+                    current: false,
+                }
+            })
+            .collect();
+        self.app.picker = Some(Picker {
+            kind: PickerKind::Subagent,
+            title: " delegate to subagent ".to_string(),
+            items,
+            selected: 0,
         });
     }
 
@@ -3476,6 +3535,48 @@ mod tests {
         let action = press(&mut app, KeyCode::Esc);
         assert!(action.is_none());
         assert!(app.picker.is_none(), "Esc closed the picker");
+    }
+
+    #[test]
+    fn agents_and_subagents_parse_to_the_agents_command() {
+        assert!(matches!(
+            SlashCommand::parse("/agents"),
+            Some(Ok(SlashCommand::Agents))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/subagents"),
+            Some(Ok(SlashCommand::Agents))
+        ));
+    }
+
+    #[test]
+    fn subagent_picker_selection_prefills_a_delegation_request() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Subagent,
+            title: " delegate to subagent ".to_string(),
+            items: vec![
+                PickerItem {
+                    value: "worker".to_string(),
+                    detail: "general-purpose".to_string(),
+                    current: false,
+                },
+                PickerItem {
+                    value: "reviewer".to_string(),
+                    detail: "code review".to_string(),
+                    current: false,
+                },
+            ],
+            selected: 0,
+        });
+        press(&mut app, KeyCode::Down);
+        let action = press(&mut app, KeyCode::Enter);
+        // Subagents are model-invoked, so Enter pre-fills input instead of
+        // emitting a command.
+        assert!(action.is_none());
+        assert!(app.picker.is_none(), "the picker closed");
+        assert_eq!(app.input, "Use the reviewer subagent to ");
+        assert_eq!(app.cursor, app.input.chars().count());
     }
 
     #[test]

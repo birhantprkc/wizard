@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
 //! line and a quiet status line. Floating layers: the command-suggestion
-//! popup and the model/mode/rewind picker.
+//! popup and the model/mode/rewind/subagent picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -390,16 +390,26 @@ fn tool_card_lines(
         (Some(_), true) => Span::styled("✗", Style::default().fg(Color::White).bold()),
     };
 
-    let summary = if args.is_null() {
-        String::new()
+    // `spawn_subagent` reads better as "subagent <name> · <task>" than as raw
+    // JSON, so the user can see which subagent is working and on what.
+    let (label, summary) = if name == "spawn_subagent" {
+        let who = args.get("subagent").and_then(|v| v.as_str()).unwrap_or("?");
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = if task.is_empty() {
+            who.to_string()
+        } else {
+            format!("{who} · {task}")
+        };
+        ("subagent".to_string(), truncate_width(&summary, 64))
+    } else if args.is_null() {
+        (name.to_string(), String::new())
     } else {
-        truncate_width(&serde_json::to_string(args).unwrap_or_default(), 64)
+        (
+            name.to_string(),
+            truncate_width(&serde_json::to_string(args).unwrap_or_default(), 64),
+        )
     };
-    let mut card = vec![
-        glyph,
-        Span::raw(" "),
-        Span::styled(name.to_string(), accent()),
-    ];
+    let mut card = vec![glyph, Span::raw(" "), Span::styled(label, accent())];
     if !summary.is_empty() {
         card.push(Span::styled(format!("  {summary}"), dim()));
     }
@@ -707,7 +717,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// Centered modal for the model / mode / rewind picker.
+/// Centered modal for the model / mode / rewind / subagent picker.
 fn draw_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = &app.picker else {
         return;

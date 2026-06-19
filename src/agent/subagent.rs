@@ -331,12 +331,32 @@ impl SpawnSubagentTool {
     ) -> Self {
         let roster = configs
             .iter()
-            .map(|c| format!("`{}` ({})", c.name, c.description))
-            .collect::<Vec<_>>()
-            .join("; ");
+            .map(|c| {
+                let scope = match &c.tool_scope {
+                    None => "all tools".to_string(),
+                    Some(names) => names.join(", "),
+                };
+                format!(
+                    "\n  - `{}` — {} (tools: {}; up to {} steps)",
+                    c.name, c.description, scope, c.max_steps
+                )
+            })
+            .collect::<String>();
         let description = format!(
-            "Delegate a self-contained sub-task to an isolated subagent with its own context \
-             and step budget. Returns the subagent's final answer. Available subagents: {roster}"
+            "Delegate a self-contained sub-task to an isolated subagent. It runs its own loop \
+             with a fresh context and scoped tools, then returns one final report — its \
+             intermediate steps never enter your context, so a multi-step sub-task costs you a \
+             single turn.\n\n\
+             Delegate when the work is self-contained, when it would otherwise flood your \
+             context with output you don't need to keep (large greps, reading many files, long \
+             logs), or when a specialist fits better than you do. Don't delegate trivial \
+             one-tool actions, work that needs the user mid-flight (the subagent can't ask \
+             questions), or a task you can't yet describe in full.\n\n\
+             `task` is the ONLY context the subagent gets besides its own prompt — make it \
+             self-contained: state the goal, the relevant paths/context, any constraints, and \
+             exactly what to report back. You can't steer it once it's running, so prefer one \
+             well-scoped task over a chain of follow-ups.\n\n\
+             Available subagents:{roster}"
         );
         Self {
             configs,
