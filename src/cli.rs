@@ -60,6 +60,12 @@ pub struct Cli {
     #[arg(long)]
     pub continuous: bool,
 
+    /// Internal: this headless run was dispatched from `/dashboard`, so it
+    /// registers in the session registry and persists its terminal state for
+    /// the dashboard to display.
+    #[arg(long, hide = true)]
+    pub bg: bool,
+
     /// Output format for headless (sovereign `-p`) runs: `text` streams
     /// human-readable output (default), `json` emits one final JSON summary
     /// object, `stream-json` emits one JSON object per line as events

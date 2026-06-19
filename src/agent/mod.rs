@@ -1441,6 +1441,54 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         agent.set_plan_mode(true);
     }
 
+    // Dashboard-dispatched background session (`--bg`): register in the session
+    // registry and keep a heartbeat ticking so `/dashboard` shows it as a live
+    // "Working" row. The terminal state is written once the run ends, below.
+    let bg_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut bg_record: Option<crate::session_registry::SessionRecord> = None;
+    let mut bg_ticker: Option<tokio::task::JoinHandle<()>> = None;
+    if cli.bg {
+        let headline = goal
+            .lines()
+            .next()
+            .unwrap_or("background run")
+            .chars()
+            .take(48)
+            .collect::<String>();
+        let record = crate::session_registry::SessionRecord {
+            id: agent.session().id.clone(),
+            name: if headline.is_empty() {
+                "background run".to_string()
+            } else {
+                headline.clone()
+            },
+            cwd: project_root.display().to_string(),
+            model: model.clone(),
+            mode: "sovereign".to_string(),
+            state: crate::session_registry::SessionState::Working,
+            activity: format!("working: {headline}"),
+            pid: std::process::id(),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            updated_unix: 0,
+        };
+        crate::session_registry::write(&record);
+        let stop = Arc::clone(&bg_stop);
+        let ticker_record = record.clone();
+        bg_ticker = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                crate::session_registry::write(&ticker_record);
+            }
+        }));
+        bg_record = Some(record);
+    }
+
     // Busy spinner ("Conjuring…") shown while the model thinks or a tool
     // runs, hidden while output streams. Shared with the text sink; a
     // no-op when stderr is not a terminal. The structured formats never
@@ -1662,6 +1710,24 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         Err(err) => return Err(anyhow::anyhow!("output task panicked: {err}")),
     };
     spinner.finish();
+
+    // Background session: stop the heartbeat and record the terminal state so
+    // the dashboard shows the result (completed/failed) rather than the row
+    // vanishing. The terminal record is retained (not removed) by the registry.
+    if let Some(mut record) = bg_record.take() {
+        bg_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ticker) = bg_ticker.take() {
+            ticker.abort();
+        }
+        if run_error.is_some() {
+            record.state = crate::session_registry::SessionState::Failed;
+            record.activity = "failed".to_string();
+        } else {
+            record.state = crate::session_registry::SessionState::Completed;
+            record.activity = "completed".to_string();
+        }
+        crate::session_registry::write(&record);
+    }
 
     if reexec_after {
         use std::os::unix::process::CommandExt;

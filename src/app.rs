@@ -623,6 +623,9 @@ pub struct App {
     pub sessions: Vec<SessionRecord>,
     /// Selected row in the dashboard list.
     pub dashboard_selected: usize,
+    /// Dispatch input at the bottom of the dashboard (the prompt for a new
+    /// background session).
+    pub dashboard_input: String,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -703,6 +706,7 @@ impl App {
             session_started_unix: 0,
             sessions: Vec::new(),
             dashboard_selected: 0,
+            dashboard_input: String::new(),
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -792,6 +796,66 @@ impl App {
         if self.dashboard_selected >= self.sessions.len() {
             self.dashboard_selected = self.sessions.len().saturating_sub(1);
         }
+    }
+
+    /// Spawn a detached background session for `prompt`: a headless sovereign
+    /// `wizard --bg` run that registers in the session registry, so it shows up
+    /// in every dashboard on the machine and survives this session exiting.
+    fn dispatch_session(&mut self, prompt: String) {
+        use std::os::unix::process::CommandExt;
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                self.notice(format!("could not locate the wizard binary: {err}"));
+                return;
+            }
+        };
+        let spawned = std::process::Command::new(exe)
+            .arg("--bg")
+            .arg("--mode")
+            .arg("sovereign")
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--cwd")
+            .arg(&self.project_root)
+            .current_dir(&self.project_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Own process group: detached from the TUI's job control, and
+            // killable as a group when stopped.
+            .process_group(0)
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                self.notice(format!("dispatched background session: {prompt}"));
+                self.refresh_sessions();
+            }
+            Err(err) => self.notice(format!("dispatch failed: {err}")),
+        }
+    }
+
+    /// Stop the selected background session (Ctrl-X): SIGTERM its process group
+    /// and drop its registry row. Refuses to stop the session you're in.
+    fn stop_selected_session(&mut self) {
+        let Some(session) = self.sessions.get(self.dashboard_selected) else {
+            return;
+        };
+        if session.id == self.session_id {
+            self.notice("that's this session — use /quit to leave it");
+            return;
+        }
+        let (id, name, pid) = (session.id.clone(), session.name.clone(), session.pid as i32);
+        // Signal the whole group (dispatched sessions are group leaders, so
+        // their tool subprocesses die too); fall back to the bare pid.
+        unsafe {
+            if libc::kill(-pid, libc::SIGTERM) != 0 {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        session_registry::remove(&id);
+        self.notice(format!("stopped session: {name}"));
+        self.refresh_sessions();
     }
 
     /// Move the dashboard selection up/down, clamped to the session list.
@@ -1111,13 +1175,34 @@ impl App {
             }
         }
 
-        // The dashboard is modal: ↑/↓ move the selection, Esc/q close it.
-        // (Enter will attach in a later milestone; it's a no-op for now.)
+        // The dashboard is modal: ↑/↓ move the selection, typing fills the
+        // dispatch input, Enter dispatches a background session, Ctrl-X stops
+        // the selected one, Esc clears the input or closes. (Enter will also
+        // attach to the selected session once the supervisor lands.)
         if self.show_dashboard {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.show_dashboard = false,
                 KeyCode::Up | KeyCode::BackTab => self.dashboard_select(-1),
                 KeyCode::Down | KeyCode::Tab => self.dashboard_select(1),
+                KeyCode::Char('x') if ctrl => self.stop_selected_session(),
+                KeyCode::Enter => {
+                    let prompt = self.dashboard_input.trim().to_string();
+                    if !prompt.is_empty() {
+                        self.dashboard_input.clear();
+                        self.dispatch_session(prompt);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.dashboard_input.pop();
+                }
+                KeyCode::Esc => {
+                    if self.dashboard_input.is_empty() {
+                        self.show_dashboard = false;
+                    } else {
+                        self.dashboard_input.clear();
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => self.dashboard_input.push(c),
                 _ => {}
             }
             return Ok(None);
@@ -3826,6 +3911,24 @@ mod tests {
         assert_eq!(app.dashboard_selected, 1, "wraps to the bottom");
 
         // Esc closes the modal.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_dashboard);
+    }
+
+    #[test]
+    fn dashboard_input_composes_and_esc_clears_then_closes() {
+        let mut app = app();
+        app.show_dashboard = true;
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.dashboard_input, "hi");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.dashboard_input, "h");
+        // Esc with text clears it but keeps the modal open.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.dashboard_input, "");
+        assert!(app.show_dashboard);
+        // Esc again, now empty, closes the modal.
         press(&mut app, KeyCode::Esc);
         assert!(!app.show_dashboard);
     }

@@ -14,8 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-/// A session whose heartbeat is older than this is considered gone.
+/// A non-terminal session whose heartbeat is older than this is considered
+/// gone (its process died without cleaning up).
 pub const STALE_SECS: u64 = 12;
+
+/// Terminal records (completed/failed background sessions) are kept this long
+/// so the result stays visible in the dashboard, then aged out.
+pub const RETAIN_SECS: u64 = 24 * 60 * 60;
 
 /// What a session is currently doing, for the dashboard's grouping and icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +47,11 @@ impl SessionState {
             SessionState::Idle => "Idle",
             SessionState::Completed | SessionState::Failed => "Completed",
         }
+    }
+
+    /// A finished background session (no live process behind it).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, SessionState::Completed | SessionState::Failed)
     }
 
     /// Sort key: the ones that need you first, finished last.
@@ -144,8 +154,16 @@ pub fn list() -> Vec<SessionRecord> {
         let Ok(record) = serde_json::from_str::<SessionRecord>(&raw) else {
             continue;
         };
-        if now.saturating_sub(record.updated_unix) > STALE_SECS {
-            // Aged out — the session exited without cleaning up. Prune it.
+        let age = now.saturating_sub(record.updated_unix);
+        // Terminal records (finished background runs) persist so their result
+        // stays visible, then age out after RETAIN_SECS. A non-terminal record
+        // older than STALE_SECS means its process died without cleaning up.
+        let expired = if record.state.is_terminal() {
+            age > RETAIN_SECS
+        } else {
+            age > STALE_SECS
+        };
+        if expired {
             let _ = std::fs::remove_file(&path);
             continue;
         }

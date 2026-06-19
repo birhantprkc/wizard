@@ -868,12 +868,17 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
             ),
             Span::styled(format!("  ({count} live on this machine)"), dim()),
         ]))
-        .title_bottom(Line::from(Span::styled(" ↑↓ move · Esc close ", dim())).centered());
-    let inner = block.inner(area);
+        .title_bottom(
+            Line::from(Span::styled(" ↑↓ select · Ctrl-X stop · Esc close ", dim())).centered(),
+        );
+    let outer = block.inner(area);
     frame.render_widget(block, area);
-    if inner.width < 8 || inner.height < 4 {
+    if outer.width < 8 || outer.height < 5 {
         return;
     }
+    // Reserve the bottom rows for the dispatch input.
+    let [inner, input_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(outer);
     let width = inner.width as usize;
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let now = now_unix();
@@ -942,6 +947,27 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
         lines.truncate(max);
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+
+    // Dispatch input: type a task + Enter to spawn a background session.
+    let prompt_line = truncate_line(
+        Line::from(vec![
+            Span::styled("› ", accent()),
+            if app.dashboard_input.is_empty() {
+                Span::styled("dispatch a task…", dim().italic())
+            } else {
+                Span::styled(app.dashboard_input.clone(), Style::default().fg(CODE))
+            },
+        ]),
+        input_area.width as usize,
+    );
+    let hint = Line::from(Span::styled(
+        "Enter dispatch · type to compose",
+        dim().italic(),
+    ));
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![prompt_line, hint])),
+        input_area,
+    );
 }
 
 /// In-session subagent monitor (`/subagents`): the subagents that have run or
