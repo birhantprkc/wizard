@@ -134,6 +134,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: FleetCmd,
     },
+
+    /// Open the agent dashboard: every running Wizard session on the machine.
+    /// Dispatch background sessions, watch their state, peek their output, and
+    /// stop them. Same view as `/dashboard` inside a session.
+    Agents,
 }
 
 /// `wizard fleet` subcommands. `run` loads config (the coordinator drives a

@@ -621,6 +621,8 @@ pub struct App {
     /// Live sessions on the machine, refreshed from the registry while the
     /// dashboard is open.
     pub sessions: Vec<SessionRecord>,
+    /// Armed by a first Ctrl-C; a second one exits. Disarmed by any other key.
+    pub ctrl_c_armed: bool,
     /// Selected row in the dashboard list.
     pub dashboard_selected: usize,
     /// Dispatch input at the bottom of the dashboard (the prompt for a new
@@ -708,6 +710,7 @@ impl App {
             session_name: String::new(),
             session_started_unix: 0,
             sessions: Vec::new(),
+            ctrl_c_armed: false,
             dashboard_selected: 0,
             dashboard_input: String::new(),
             peek_lines: Vec::new(),
@@ -794,19 +797,21 @@ impl App {
     }
 
     /// Reload the live-session list from the registry, keeping the selection
-    /// in range, and refresh the peek panel for the selected row.
+    /// in range. Cheap (a few small files); safe to poll. The peek panel is
+    /// refreshed separately on a slower cadence — see [`App::refresh_peek`].
     pub fn refresh_sessions(&mut self) {
         self.sessions = session_registry::list();
         if self.dashboard_selected >= self.sessions.len() {
             self.dashboard_selected = self.sessions.len().saturating_sub(1);
         }
-        self.refresh_peek();
     }
 
     /// Reload the peek panel with the selected session's recent transcript.
-    fn refresh_peek(&mut self) {
+    /// Reads only the tail of the session file, so it is cheap enough to call
+    /// on selection changes and a ~1s poll, but not every frame.
+    pub fn refresh_peek(&mut self) {
         self.peek_lines = match self.sessions.get(self.dashboard_selected) {
-            Some(session) => crate::agent::session::peek(&session.id, 80),
+            Some(session) => crate::agent::session::peek(&session.id, 50),
             None => Vec::new(),
         };
     }
@@ -1113,8 +1118,15 @@ impl App {
             Event::Tick => {
                 self.tick = self.tick.wrapping_add(1);
                 // Keep the dashboard's session list current while it's open.
-                if self.show_dashboard && self.tick.is_multiple_of(4) {
-                    self.refresh_sessions();
+                if self.show_dashboard {
+                    // List is cheap (small files); peek reads a transcript tail
+                    // so poll it less often.
+                    if self.tick.is_multiple_of(4) {
+                        self.refresh_sessions();
+                    }
+                    if self.tick.is_multiple_of(10) {
+                        self.refresh_peek();
+                    }
                 }
                 Ok(None)
             }
@@ -1139,10 +1151,32 @@ impl App {
             return Ok(None);
         }
 
+        // Any key other than Ctrl-C disarms the "press again to exit" latch.
+        let is_ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if !is_ctrl_c {
+            self.ctrl_c_armed = false;
+        }
+
         // Global chords, regardless of input mode.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') | KeyCode::Char('d') => {
+                KeyCode::Char('c') => {
+                    // Once interrupts a running turn; pressed again (while
+                    // armed) it exits. Idle: first press arms, second exits.
+                    if self.ctrl_c_armed {
+                        self.should_quit = true;
+                        return Ok(None);
+                    }
+                    self.ctrl_c_armed = true;
+                    if self.status.busy {
+                        self.notice("interrupting… (Ctrl-C again to exit)");
+                        return Ok(Some(AppAction::Interrupt));
+                    }
+                    self.notice("press Ctrl-C again to exit");
+                    return Ok(None);
+                }
+                KeyCode::Char('d') => {
                     self.should_quit = true;
                     return Ok(None);
                 }
@@ -1758,6 +1792,9 @@ pub enum AppAction {
     Submit(String),
     /// Execute a parsed slash command.
     Command(SlashCommand),
+    /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
+    /// the agent from the last session.
+    Interrupt,
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,6 +2305,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         .unwrap_or(0);
     // Register this session so other sessions' /dashboard can see it.
     crate::session_registry::write(&app.session_record());
+    // `wizard agents` opens straight into the dashboard.
+    if matches!(cli.command, Some(crate::cli::Command::Agents)) {
+        app.show_dashboard = true;
+        app.refresh_sessions();
+        app.refresh_peek();
+    }
     if let Some(prompt) = cli.prompt.clone() {
         app.set_input(prompt);
     }
@@ -2384,6 +2427,53 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     }
                     .run(command)
                     .await;
+                }
+                AppAction::Interrupt => {
+                    // Cancel the running turn by aborting its task; the agent
+                    // moved into it is lost, so rebuild from the last session
+                    // (same path as crash recovery).
+                    if let Some(handle) = agent_task.take() {
+                        handle.abort();
+                        app.flush_streaming();
+                        app.status.busy = false;
+                        app.status.step = 0;
+                        app.turn_started = None;
+                        app.notice("interrupted");
+                        app.rebuilding = Some("restarting agent".to_string());
+                        let client = client.clone();
+                        let config = app.config.clone();
+                        let skills = skills.clone();
+                        let project_root = project_root.clone();
+                        let manager = Arc::clone(&manager);
+                        let notify = events.sender();
+                        tokio::spawn(async move {
+                            let manager = manager.lock().await;
+                            let rebuild = match build_agent(
+                                &client,
+                                &config,
+                                &skills,
+                                &project_root,
+                                &manager,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(agent) => AgentRebuild {
+                                    agent: Some(agent),
+                                    model: None,
+                                    notice: "ready".to_string(),
+                                },
+                                Err(err) => AgentRebuild {
+                                    agent: None,
+                                    model: None,
+                                    notice: format!(
+                                        "could not restart the agent: {err:#} — /quit and relaunch"
+                                    ),
+                                },
+                            };
+                            let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+                        });
+                    }
                 }
             }
         }
@@ -2541,6 +2631,7 @@ impl CommandContext<'_> {
         if self.app.show_dashboard {
             self.app.show_subagents = false;
             self.app.refresh_sessions();
+            self.app.refresh_peek();
         }
     }
 
@@ -3404,6 +3495,11 @@ mod tests {
             .expect("key handled")
     }
 
+    fn press_ctrl(app: &mut App, c: char) -> Option<AppAction> {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            .expect("key handled")
+    }
+
     fn type_str(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
@@ -3884,6 +3980,43 @@ mod tests {
         assert!(app.picker.is_none(), "the picker closed");
         assert_eq!(app.input, "Use the reviewer subagent to ");
         assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn ctrl_c_idle_arms_then_exits() {
+        let mut app = app();
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.ctrl_c_armed);
+        assert!(!app.should_quit, "first press only arms");
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.should_quit, "second press exits");
+    }
+
+    #[test]
+    fn ctrl_c_busy_interrupts_then_exits() {
+        let mut app = app();
+        app.status.busy = true;
+        // First press while busy interrupts the turn, doesn't quit.
+        assert!(matches!(
+            press_ctrl(&mut app, 'c'),
+            Some(AppAction::Interrupt)
+        ));
+        assert!(!app.should_quit);
+        // Armed now: a second press exits even while busy.
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn any_other_key_disarms_ctrl_c() {
+        let mut app = app();
+        press_ctrl(&mut app, 'c');
+        assert!(app.ctrl_c_armed);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.ctrl_c_armed);
+        // So the next Ctrl-C re-arms rather than quitting.
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(!app.should_quit);
     }
 
     #[test]

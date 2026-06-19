@@ -1001,38 +1001,45 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let pwidth = pinner.width as usize;
+    let height = pinner.height as usize;
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
     if app.peek_lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "(no transcript yet)",
-            dim().italic(),
-        )));
-    } else {
-        for (role, text) in &app.peek_lines {
-            let role_style = match role.as_str() {
-                "user" => accent().add_modifier(Modifier::BOLD),
-                "assistant" => Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
-                _ => dim().add_modifier(Modifier::BOLD),
-            };
-            lines.push(Line::from(Span::styled(role.clone(), role_style)));
-            for line in text.lines() {
-                lines.push(truncate_line(
-                    Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(TEXT_DIM),
-                    )),
-                    pwidth,
-                ));
+        frame.render_widget(
+            Paragraph::new(Span::styled("(no transcript yet)", dim().italic())),
+            pinner,
+        );
+        return;
+    }
+
+    // Build only the visible tail: walk messages newest-first, emit each
+    // message's lines bottom-up, and stop once the panel is full. This keeps
+    // rendering O(panel height) instead of O(whole transcript).
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    'outer: for (role, text) in app.peek_lines.iter().rev() {
+        let role_style = match role.as_str() {
+            "user" => accent().add_modifier(Modifier::BOLD),
+            "assistant" => Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+            _ => dim().add_modifier(Modifier::BOLD),
+        };
+        let mut block: Vec<Line<'static>> =
+            vec![Line::from(Span::styled(role.clone(), role_style))];
+        for line in text.lines() {
+            block.push(truncate_line(
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(TEXT_DIM),
+                )),
+                pwidth,
+            ));
+        }
+        for line in block.into_iter().rev() {
+            lines.push(line);
+            if lines.len() >= height {
+                break 'outer;
             }
         }
     }
-    // Pin to the latest: keep the tail that fits.
-    let height = pinner.height as usize;
-    if lines.len() > height {
-        let start = lines.len() - height;
-        lines.drain(..start);
-    }
+    lines.reverse();
     frame.render_widget(Paragraph::new(Text::from(lines)), pinner);
 }
 

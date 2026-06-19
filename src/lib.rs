@@ -160,6 +160,12 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return gateway::run(config, cli).await.map(|()| 0);
     }
 
+    // `wizard agents` always opens the TUI dashboard, regardless of the
+    // configured default mode.
+    if matches!(cli.command, Some(cli::Command::Agents)) {
+        return app::run_tui(config, cli).await;
+    }
+
     match config.mode {
         Mode::Genie => app::run_tui(config, cli).await,
         Mode::Sovereign => agent::run_headless(config, cli).await,

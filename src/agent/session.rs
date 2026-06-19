@@ -47,23 +47,52 @@ enum SessionLine {
 const MARKER_PROMPT_CHARS: usize = 120;
 
 /// Read the last `n` message lines of session `id` for the dashboard peek
-/// panel, as `(role, text)` pairs in file order. Best-effort: any error (no
-/// such session, unreadable, corrupt) yields an empty vec.
+/// panel, as `(role, text)` pairs in file order. Only the tail of the file is
+/// read (bounded by [`PEEK_TAIL_BYTES`]) so a huge transcript stays cheap to
+/// poll, and each message's text is clipped to [`PEEK_MSG_CHARS`]. Best-effort:
+/// any error (no such session, unreadable, corrupt) yields an empty vec.
 pub fn peek(id: &str, n: usize) -> Vec<(String, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// Read at most this many bytes from the end of the session file.
+    const PEEK_TAIL_BYTES: u64 = 96 * 1024;
+    /// Clip each message's text so one huge tool result can't dominate.
+    const PEEK_MSG_CHARS: usize = 4000;
+
     let Ok(dir) = crate::config::Config::sessions_dir() else {
         return Vec::new();
     };
-    let Ok(file) = std::fs::File::open(dir.join(format!("{id}.jsonl"))) else {
+    let Ok(mut file) = std::fs::File::open(dir.join(format!("{id}.jsonl"))) else {
         return Vec::new();
     };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let seeked = len > PEEK_TAIL_BYTES;
+    if seeked && file.seek(SeekFrom::Start(len - PEEK_TAIL_BYTES)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    // The seek may land mid-codepoint; lossily decode and drop the first
+    // (partial) line.
+    let text = String::from_utf8_lossy(&bytes);
     let mut messages = Vec::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut lines = text.lines();
+    if seeked {
+        lines.next();
+    }
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(SessionLine::Message(record)) = serde_json::from_str::<SessionLine>(&line) {
+        if let Ok(SessionLine::Message(record)) = serde_json::from_str::<SessionLine>(line) {
             let role = format!("{:?}", record.message.role).to_lowercase();
-            messages.push((role, record.message.content));
+            let mut content = record.message.content;
+            if content.chars().count() > PEEK_MSG_CHARS {
+                content = content.chars().take(PEEK_MSG_CHARS).collect::<String>() + " …";
+            }
+            messages.push((role, content));
         }
     }
     let start = messages.len().saturating_sub(n);
