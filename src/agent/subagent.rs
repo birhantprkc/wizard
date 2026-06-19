@@ -176,9 +176,12 @@ pub async fn spawn(
         ChatMessage::user(task.to_string()),
     ];
 
-    // Subagents share the parent's cwd and task registry but get their own
-    // todo list (their working notes must not clobber the parent's) and no
-    // event channel — their activity surfaces as one tool result.
+    // The subagent reports back to the model as one tool result, but its
+    // individual tool calls are surfaced to the UI (prefixed with the
+    // subagent's name) on the parent's event channel so the user can watch
+    // what it's doing. Nested tools run with `events: None` so they don't
+    // double-emit (todos, background tasks); we emit our own start/finish pair.
+    let progress = ctx.events.clone();
     let ctx = ToolContext {
         todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
         events: None,
@@ -252,6 +255,19 @@ pub async fn spawn(
         for call in tool_calls {
             let name = call.function.name.clone();
             let mut args = normalize_args(&call.function.arguments);
+            // Surface this call to the UI as `<subagent> ▸ <tool>` so the user
+            // sees what the subagent is doing while it runs.
+            let label = format!("{} ▸ {}", config.name, name);
+            if let Some(events) = &progress {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::ToolStarted {
+                        name: label.clone(),
+                        args: args.clone(),
+                    },
+                )
+                .await;
+            }
             // Same hook pipeline as the parent's dispatcher: pre-hooks may
             // rewrite the arguments or veto, post-hooks may append context.
             let output = match hooks
@@ -282,6 +298,16 @@ pub async fn spawn(
                     output
                 }
             };
+            if let Some(events) = &progress {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::ToolFinished {
+                        name: label.clone(),
+                        output: output.clone(),
+                    },
+                )
+                .await;
+            }
             let body = if output.is_error {
                 format!("Error: {}", output.content)
             } else {

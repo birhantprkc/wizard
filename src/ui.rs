@@ -766,15 +766,24 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             // Ellipsize long model tags so the current marker stays visible.
             let suffix = if item.current { " ●".width() } else { 0 };
             let value_room = inner_width.saturating_sub(2 + suffix + 1);
+            let value = truncate_width(&item.value, value_room);
+            // Width consumed so far: marker (2) + value + the current-marker.
+            let consumed = 2 + value.width() + suffix;
             let mut spans = vec![
                 Span::styled(marker, accent()),
-                Span::styled(truncate_width(&item.value, value_room), value_style),
+                Span::styled(value, value_style),
             ];
             if item.current {
                 spans.push(Span::styled(" ●", Style::default().fg(Color::White)));
             }
+            // Truncate the detail to the room left on the line (after a two-space
+            // gap) so long descriptions never spill past the modal border.
             if !item.detail.is_empty() {
-                spans.push(Span::styled(format!("  {}", item.detail), dim()));
+                let room = inner_width.saturating_sub(consumed + 2);
+                if room > 0 {
+                    let detail = truncate_width(&item.detail, room);
+                    spans.push(Span::styled(format!("  {detail}"), dim()));
+                }
             }
             Line::from(spans)
         })
