@@ -314,26 +314,17 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Read the API key from `api_key_env`, or empty when unset/missing.
-    fn api_key(&self) -> String {
-        self.api_key_env
-            .as_ref()
-            .and_then(|name| std::env::var(name).ok())
-            .unwrap_or_default()
-    }
-
-    /// Like [`api_key`](Self::api_key) but with a per-kind default env var
-    /// when `api_key_env` is unset, warning when the key is missing.
-    fn cloud_key(&self, default_env: &str) -> String {
-        let env_name = self.api_key_env.as_deref().unwrap_or(default_env);
-        let key = std::env::var(env_name).unwrap_or_default();
-        if key.is_empty() {
-            tracing::warn!(
-                "provider '{}' has no API key (set {env_name}); requests will likely 401",
-                self.name,
-            );
+    /// Resolve the API key: credential file (by provider name) first, then the
+    /// configured/default env var. Empty string when nothing is set.
+    fn resolved_key(&self, default_env: Option<&str>) -> String {
+        if let Some(key) = crate::credentials::get(&self.name)
+            && !key.is_empty()
+        {
+            return key;
         }
-        key
+        let env = self.api_key_env.as_deref().or(default_env);
+        env.and_then(|name| std::env::var(name).ok())
+            .unwrap_or_default()
     }
 
     /// Construct the concrete client for this provider. For cloud kinds a
@@ -347,10 +338,10 @@ impl ProviderConfig {
             ))),
             ProviderKind::Ollama => Ok(Arc::new(OllamaClient::new(self.base_url.clone()))),
             ProviderKind::Openai => {
-                let key = self.api_key();
+                let key = self.resolved_key(None);
                 if key.is_empty() {
                     tracing::warn!(
-                        "provider '{}' has no API key (set {}); requests will likely 401",
+                        "provider '{}' has no API key (store one via /provider or set {}); requests will likely 401",
                         self.name,
                         self.api_key_env.as_deref().unwrap_or("an env var")
                     );
@@ -362,10 +353,10 @@ impl ProviderConfig {
                 )))
             }
             ProviderKind::Anthropic => {
-                let key = self.api_key();
+                let key = self.resolved_key(None);
                 if key.is_empty() {
                     tracing::warn!(
-                        "provider '{}' has no API key (set {}); requests will likely 401",
+                        "provider '{}' has no API key (store one via /provider or set {}); requests will likely 401",
                         self.name,
                         self.api_key_env.as_deref().unwrap_or("an env var")
                     );
@@ -379,7 +370,7 @@ impl ProviderConfig {
             // OpenRouter speaks the OpenAI-compatible Chat Completions API;
             // the helper adds the attribution headers.
             ProviderKind::OpenRouter => {
-                let key = self.cloud_key(openrouter::DEFAULT_KEY_ENV);
+                let key = self.resolved_key(Some(openrouter::DEFAULT_KEY_ENV));
                 Ok(Arc::new(openrouter::provider(
                     self.base_url.clone(),
                     self.model.clone(),
@@ -389,7 +380,7 @@ impl ProviderConfig {
             // xAI speaks the OpenAI-compatible Chat Completions API; only the
             // credentials differ between the two kinds.
             ProviderKind::Xai => {
-                let key = self.cloud_key(xai_oauth::DEFAULT_KEY_ENV);
+                let key = self.resolved_key(Some(xai_oauth::DEFAULT_KEY_ENV));
                 Ok(Arc::new(OpenAiProvider::with_token_source(
                     self.base_url.clone(),
                     self.model.clone(),

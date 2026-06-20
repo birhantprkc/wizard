@@ -83,6 +83,32 @@ pub enum InputMode {
     Chat,
     /// Composing a `/slash` command.
     Command,
+    /// Answering an inline prompt (the interactive provider-setup flow): the
+    /// composer collects one field at a time instead of submitting a message.
+    Prompt,
+}
+
+/// A field being collected in the inline provider-setup prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptField {
+    Name,
+    BaseUrl,
+    Model,
+    ApiKey,
+}
+
+/// In-progress provider setup driven by composer prompts. Each queued
+/// [`PromptField`] is asked in turn; the answers fill the draft, and the last
+/// answer emits a [`SlashCommand::ProviderSetup`].
+#[derive(Debug, Clone)]
+pub struct ProviderPrompt {
+    kind: ProviderKind,
+    name: String,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    /// Remaining fields to ask, in order.
+    queue: std::collections::VecDeque<PromptField>,
 }
 
 /// Parsed `/slash` command (see the README table).
@@ -135,6 +161,17 @@ pub enum SlashCommand {
     },
     /// `/provider ...` — add, remove, or switch LLM providers.
     Provider(ProviderAction),
+    /// Finalize an interactive provider setup: add the provider (storing the
+    /// API key in `~/.wizard/credentials.toml` when present) and switch to it.
+    /// Emitted internally by the inline prompt flow, never parsed from text —
+    /// hence the primitive fields (so `SlashCommand` can stay `Eq`).
+    ProviderSetup {
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    },
     /// `/server ...` — status / start / stop the local llama-server.
     Server(ServerAction),
     /// `/login <provider>`: OAuth sign-in for providers that support it
@@ -152,7 +189,10 @@ pub enum SlashCommand {
 /// What a `/provider` subcommand does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderAction {
-    /// `/provider` / `/provider list` — show configured providers.
+    /// `/provider` (no args) — open the interactive two-level picker (switch
+    /// providers, or add a new one).
+    Menu,
+    /// `/provider list` — show configured providers.
     List,
     /// `/provider use <name>` — switch the active provider.
     Use(String),
@@ -171,7 +211,8 @@ pub enum ProviderAction {
 /// Parse the arguments to `/provider` (everything after the command word).
 fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
     let action = match args.first().copied() {
-        None | Some("list") => ProviderAction::List,
+        None => ProviderAction::Menu,
+        Some("list") => ProviderAction::List,
         Some("use") => match args.get(1) {
             Some(name) => ProviderAction::Use((*name).to_string()),
             None => return Err("usage: /provider use <name>".to_string()),
@@ -216,6 +257,52 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
         }
     };
     Ok(SlashCommand::Provider(action))
+}
+
+/// Sentinel value of the final "add provider" row in the level-1 provider
+/// picker. The dispatch also keys off the last index, but matching the value
+/// keeps it robust if the list grows.
+const PROVIDER_ADD_ROW: &str = "＋ Add provider…";
+
+/// The level-2 provider-type menu: `(label, detail)` in dispatch order. The
+/// Enter handler in [`App::handle_key`] matches on the row index, so this
+/// order is the single source of truth for both rendering and dispatch.
+const PROVIDER_TYPES: &[(&str, &str)] = &[
+    ("xAI (Grok) — sign in", "OAuth · no API key"),
+    (
+        "xAI (Grok) — API key",
+        "stored in ~/.wizard/credentials.toml",
+    ),
+    ("OpenRouter — API key", "openrouter.ai"),
+    ("OpenAI — API key", "api.openai.com"),
+    ("OpenAI — sign in", "coming soon"),
+    ("Anthropic (Claude) — API key", "api.anthropic.com"),
+    ("OpenAI-compatible — custom", "any base URL + key"),
+];
+
+/// Human-readable provider name for a kind, used in inline prompt questions.
+fn provider_display(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Xai | ProviderKind::XaiOauth => "xAI",
+        ProviderKind::OpenRouter => "OpenRouter",
+        ProviderKind::Openai => "OpenAI-compatible",
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::LlamaCpp => "llama.cpp",
+        ProviderKind::Ollama => "Ollama",
+    }
+}
+
+/// The question shown when collecting `field` for the in-progress `prompt`.
+fn prompt_question(field: PromptField, prompt: &ProviderPrompt) -> String {
+    match field {
+        PromptField::Name => "Provider name (id):".to_string(),
+        PromptField::BaseUrl => "Base URL:".to_string(),
+        PromptField::Model => "Model:".to_string(),
+        PromptField::ApiKey => format!(
+            "Paste your {} API key, then Enter (input hidden):",
+            provider_display(prompt.kind)
+        ),
+    }
 }
 
 /// What a `/server` subcommand does.
@@ -387,8 +474,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "provider",
-        args: "[list|use|add|remove]",
-        description: "add, remove, or switch LLM providers",
+        args: "",
+        description: "add or switch LLM providers (interactive)",
         takes_args: false,
     },
     CommandSpec {
@@ -544,6 +631,12 @@ pub enum PickerKind {
     /// "Import from Claude Code": a multi-select where Space toggles a row
     /// (MCP servers / commands / spinner verbs) and Enter runs the import.
     ClaudeImport,
+    /// Level 1 of `/provider`: configured providers (Enter switches) plus a
+    /// final "add provider" row that opens [`PickerKind::ProviderType`].
+    Provider,
+    /// Level 2 of `/provider`: the menu of provider kinds to add. Rows are
+    /// dispatched by index against [`PROVIDER_TYPES`].
+    ProviderType,
 }
 
 /// One selectable row in a picker popup.
@@ -573,9 +666,7 @@ impl Picker {
     /// different hint than the Enter-to-select pickers.
     pub fn footer_hint(&self) -> &'static str {
         match self.kind {
-            PickerKind::ClaudeImport => {
-                " ↑↓ move · space toggles · enter runs · Esc cancel "
-            }
+            PickerKind::ClaudeImport => " ↑↓ move · space toggles · enter runs · Esc cancel ",
             _ => " ↑↓ move · Enter select · Esc cancel ",
         }
     }
@@ -683,6 +774,9 @@ pub struct App {
     pub project_root: PathBuf,
     /// Open selection popup (model / mode / rewind / subagent picker), if any.
     pub picker: Option<Picker>,
+    /// In-progress interactive provider setup, when the composer is collecting
+    /// fields ([`InputMode::Prompt`]).
+    pub prompt: Option<ProviderPrompt>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
@@ -760,6 +854,7 @@ impl App {
             custom_commands: Vec::new(),
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker: None,
+            prompt: None,
             plan_mode,
             plan_review: None,
             history: Vec::new(),
@@ -844,7 +939,11 @@ impl App {
                 "Fleet: synthesis turn".to_string(),
                 on(self.config.fleet.synthesize),
             ),
-            ("import", "Import from Claude Code".to_string(), import_detail),
+            (
+                "import",
+                "Import from Claude Code".to_string(),
+                import_detail,
+            ),
             (
                 "provider",
                 "Manage providers…".to_string(),
@@ -955,6 +1054,136 @@ impl App {
             items,
             selected: 0,
         });
+    }
+
+    /// Open the provider picker (level 1): the configured providers (Enter
+    /// switches) plus a final "＋ Add provider…" row that opens the type
+    /// picker. With no providers configured, only the add row shows.
+    pub fn open_provider_picker(&mut self) {
+        let active = self.config.active().name;
+        let mut items: Vec<PickerItem> = self
+            .config
+            .providers
+            .iter()
+            .map(|provider| PickerItem {
+                value: provider.name.clone(),
+                detail: format!(
+                    "{} · {} @ {}",
+                    provider.kind, provider.model, provider.base_url
+                ),
+                current: provider.name == active,
+            })
+            .collect();
+        items.push(PickerItem {
+            value: PROVIDER_ADD_ROW.to_string(),
+            detail: "configure a new provider".to_string(),
+            current: false,
+        });
+        self.picker = Some(Picker {
+            kind: PickerKind::Provider,
+            title: " providers · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Open the provider-type picker (level 2): the menu of provider kinds to
+    /// add. Rows are dispatched by index against the fixed order in
+    /// [`PROVIDER_TYPES`], so the labels stay human-readable.
+    pub fn open_provider_type_picker(&mut self) {
+        let items: Vec<PickerItem> = PROVIDER_TYPES
+            .iter()
+            .map(|(label, detail)| PickerItem {
+                value: (*label).to_string(),
+                detail: (*detail).to_string(),
+                current: false,
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::ProviderType,
+            title: " add provider · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// True when the composer is collecting a masked field (the API key) in
+    /// the inline provider-setup prompt. Drives the bullet masking in
+    /// [`crate::ui`].
+    pub fn prompt_is_masked(&self) -> bool {
+        self.input_mode == InputMode::Prompt
+            && self
+                .prompt
+                .as_ref()
+                .and_then(|prompt| prompt.queue.front())
+                .copied()
+                == Some(PromptField::ApiKey)
+    }
+
+    /// Start the inline provider-setup prompt: switch the composer into
+    /// [`InputMode::Prompt`] and ask the first queued field.
+    pub fn begin_provider_prompt(&mut self, prompt: ProviderPrompt) {
+        self.prompt = Some(prompt);
+        self.input_mode = InputMode::Prompt;
+        self.clear_input();
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        if let Some(prompt) = self.prompt.as_ref()
+            && let Some(field) = prompt.queue.front().copied()
+        {
+            let question = prompt_question(field, prompt);
+            self.notice(question);
+        }
+    }
+
+    /// Cancel an in-progress provider-setup prompt and return to normal input.
+    fn cancel_prompt(&mut self) {
+        self.prompt = None;
+        self.input.clear();
+        self.cursor = 0;
+        self.input_mode = InputMode::Chat;
+        self.sync_input_mode();
+        self.notice("cancelled");
+    }
+
+    /// Consume the current input as the answer to the front prompt field. When
+    /// more fields remain, ask the next and stay in prompt mode; when the queue
+    /// drains, emit a [`SlashCommand::ProviderSetup`].
+    fn submit_prompt_field(&mut self) -> Option<AppAction> {
+        let value = self.input.trim().to_string();
+        let prompt = self.prompt.as_mut()?;
+        let field = prompt.queue.pop_front()?;
+        match field {
+            PromptField::Name => prompt.name = value,
+            PromptField::BaseUrl => prompt.base_url = value,
+            PromptField::Model => prompt.model = value,
+            PromptField::ApiKey => {
+                if value.is_empty() {
+                    // An empty key is treated as "never mind".
+                    self.cancel_prompt();
+                    return None;
+                }
+                prompt.api_key = Some(value);
+            }
+        }
+        self.input.clear();
+        self.cursor = 0;
+        if let Some(next) = prompt.queue.front().copied() {
+            let question = prompt_question(next, prompt);
+            self.notice(question);
+            return None;
+        }
+        // Queue drained: build the setup command and return to normal input.
+        let prompt = self.prompt.take().expect("prompt is set");
+        self.input_mode = InputMode::Chat;
+        self.sync_input_mode();
+        Some(AppAction::Command(SlashCommand::ProviderSetup {
+            name: prompt.name,
+            kind: prompt.kind,
+            base_url: prompt.base_url,
+            model: prompt.model,
+            api_key: prompt.api_key,
+        }))
     }
 
     /// Current state for this session's heartbeat: needs-input when paused on a
@@ -1104,6 +1333,12 @@ impl App {
     /// Recompute [`InputMode`] from the input text, then refresh the command
     /// suggestions.
     fn sync_input_mode(&mut self) {
+        // While answering an inline prompt the composer stays in Prompt mode no
+        // matter what is typed (a key never flips it to Command/Chat), and the
+        // suggestion popup is suppressed.
+        if self.prompt.is_some() {
+            return;
+        }
         self.input_mode = if self.input.trim_start().starts_with('/') {
             InputMode::Command
         } else {
@@ -1347,9 +1582,9 @@ impl App {
                 self.notice(message);
                 Ok(None)
             }
-            // Owned by the main loop (it holds the agent slot); never
-            // reaches here.
-            Event::AgentRebuilt(_) => Ok(None),
+            // Owned by the main loop (it holds the agent slot / config); never
+            // reach here.
+            Event::AgentRebuilt(_) | Event::ProviderActivated(_) => Ok(None),
         }
     }
 
@@ -1547,8 +1782,7 @@ impl App {
                             // matches `open_claude_import_picker`: mcp, commands,
                             // verbs) and hand off to the command handler, which
                             // has the live MCP manager.
-                            let flags: Vec<bool> =
-                                picker.items.iter().map(|i| i.current).collect();
+                            let flags: Vec<bool> = picker.items.iter().map(|i| i.current).collect();
                             let selection = ImportSelection {
                                 mcp: flags.first().copied().unwrap_or(false),
                                 commands: flags.get(1).copied().unwrap_or(false),
@@ -1560,11 +1794,124 @@ impl App {
                             }
                             AppAction::Command(SlashCommand::ImportClaude(selection))
                         }
+                        PickerKind::Provider => {
+                            // The final row opens the add-provider type menu;
+                            // every other row switches to that provider.
+                            if picker.selected + 1 == picker.items.len()
+                                || item.value == PROVIDER_ADD_ROW
+                            {
+                                self.open_provider_type_picker();
+                                return Ok(None);
+                            }
+                            AppAction::Command(SlashCommand::Provider(ProviderAction::Use(
+                                item.value.clone(),
+                            )))
+                        }
+                        PickerKind::ProviderType => {
+                            use crate::llm::{openrouter, xai_oauth};
+                            use std::collections::VecDeque;
+                            match picker.selected {
+                                // xAI sign-in: run the OAuth flow; login()
+                                // auto-adds the provider on success.
+                                0 => {
+                                    return Ok(Some(AppAction::Command(SlashCommand::Login(
+                                        "xai".to_string(),
+                                    ))));
+                                }
+                                // xAI API key.
+                                1 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::Xai,
+                                        name: "xai".to_string(),
+                                        base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
+                                        model: xai_oauth::DEFAULT_MODEL.to_string(),
+                                        api_key: None,
+                                        queue: VecDeque::from([PromptField::ApiKey]),
+                                    });
+                                }
+                                // OpenRouter — model is unknown, so prompt for
+                                // it alongside the key.
+                                2 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::OpenRouter,
+                                        name: "openrouter".to_string(),
+                                        base_url: openrouter::DEFAULT_BASE_URL.to_string(),
+                                        model: String::new(),
+                                        api_key: None,
+                                        queue: VecDeque::from([
+                                            PromptField::Model,
+                                            PromptField::ApiKey,
+                                        ]),
+                                    });
+                                }
+                                // OpenAI — model + key.
+                                3 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::Openai,
+                                        name: "openai".to_string(),
+                                        base_url: "https://api.openai.com/v1".to_string(),
+                                        model: String::new(),
+                                        api_key: None,
+                                        queue: VecDeque::from([
+                                            PromptField::Model,
+                                            PromptField::ApiKey,
+                                        ]),
+                                    });
+                                }
+                                // OpenAI sign-in (ChatGPT) — not wired up yet.
+                                4 => {
+                                    self.notice(
+                                        "OpenAI sign-in (ChatGPT) is coming soon — use OpenAI API key for now",
+                                    );
+                                }
+                                // Anthropic — model + key.
+                                5 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::Anthropic,
+                                        name: "claude".to_string(),
+                                        base_url: "https://api.anthropic.com".to_string(),
+                                        model: String::new(),
+                                        api_key: None,
+                                        queue: VecDeque::from([
+                                            PromptField::Model,
+                                            PromptField::ApiKey,
+                                        ]),
+                                    });
+                                }
+                                // OpenAI-compatible custom — everything is
+                                // prompted, starting with the name.
+                                6 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::Openai,
+                                        name: String::new(),
+                                        base_url: String::new(),
+                                        model: String::new(),
+                                        api_key: None,
+                                        queue: VecDeque::from([
+                                            PromptField::Name,
+                                            PromptField::BaseUrl,
+                                            PromptField::Model,
+                                            PromptField::ApiKey,
+                                        ]),
+                                    });
+                                }
+                                _ => {}
+                            }
+                            return Ok(None);
+                        }
                     };
                     return Ok(Some(action));
                 }
                 _ => {}
             }
+            return Ok(None);
+        }
+
+        // In the inline provider-setup prompt, Esc cancels; every other key
+        // falls through to normal line editing and the Enter→submit path
+        // (which `submit` routes to `submit_prompt_field`).
+        if self.prompt.is_some() && key.code == KeyCode::Esc {
+            self.cancel_prompt();
             return Ok(None);
         }
 
@@ -1672,6 +2019,11 @@ impl App {
     /// Enter pressed: complete the highlighted suggestion if the command is
     /// still partial, then parse the input line into an action.
     fn submit(&mut self) -> Option<AppAction> {
+        // The inline provider-setup prompt intercepts Enter: each submission is
+        // an answer to a field, not a chat message or command.
+        if self.prompt.is_some() {
+            return self.submit_prompt_field();
+        }
         if self.input_mode == InputMode::Command && !self.suggestions.is_empty() {
             let typed = self
                 .input
@@ -2094,7 +2446,9 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
             let _ = terminal.clear();
         }
         Err(err) => {
-            app.notice(format!("could not restore the TUI: {err:#} — /quit and relaunch"));
+            app.notice(format!(
+                "could not restore the TUI: {err:#} — /quit and relaunch"
+            ));
             return;
         }
     }
@@ -2106,9 +2460,7 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
                 app.mode = app.config.mode;
                 app.status.mode = app.config.mode;
                 app.status.model = app.config.active().model;
-                app.notice(
-                    "config reloaded — restart for provider/model changes to take effect",
-                );
+                app.notice("config reloaded — restart for provider/model changes to take effect");
             }
             Err(err) => app.notice(format!("config not reloaded (parse error): {err:#}")),
         },
@@ -2377,7 +2729,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
-/provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
+/provider                   add or switch LLM providers (interactive picker)\n  \
 /server [status|start|stop] manage the local llama-server\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
@@ -2714,6 +3066,28 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             continue;
         }
 
+        // A background sign-in succeeded: add and switch to the provider. Owned
+        // here because it mutates config and the agent slot.
+        if let Event::ProviderActivated(cfg) = event {
+            CommandContext {
+                app: &mut app,
+                client: &mut client,
+                agent_slot: &mut agent_slot,
+                manager: &manager,
+                skills: &mut skills,
+                project_root: &project_root,
+                mcp_path: &mcp_path,
+                genie_max_steps,
+                events: &events,
+            }
+            .add_provider_config(
+                *cfg,
+                "signed in to xAI — provider added and active".to_string(),
+            )
+            .await;
+            continue;
+        }
+
         let turn_done = matches!(&event, Event::Agent(AgentEvent::Done { .. }));
 
         let action = app.handle_event(event)?;
@@ -2935,6 +3309,16 @@ impl CommandContext<'_> {
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
             SlashCommand::Provider(action) => self.provider(action).await,
+            SlashCommand::ProviderSetup {
+                name,
+                kind,
+                base_url,
+                model,
+                api_key,
+            } => {
+                self.provider_setup(name, kind, base_url, model, api_key)
+                    .await
+            }
             SlashCommand::Server(action) => self.server(action).await,
             SlashCommand::Login(provider) => self.login(provider),
             SlashCommand::Settings => self.app.open_settings_picker(),
@@ -3419,7 +3803,8 @@ impl CommandContext<'_> {
         let outcome = match import_claude::run_import(&selection) {
             Ok(outcome) => outcome,
             Err(err) => {
-                self.app.notice(format!("Claude Code import failed: {err:#}"));
+                self.app
+                    .notice(format!("Claude Code import failed: {err:#}"));
                 return;
             }
         };
@@ -3581,6 +3966,7 @@ impl CommandContext<'_> {
     /// Handle `/provider` subcommands: list, switch, add, or remove providers.
     async fn provider(&mut self, action: ProviderAction) {
         match action {
+            ProviderAction::Menu => self.app.open_provider_picker(),
             ProviderAction::List => self.provider_list(),
             ProviderAction::Use(name) => self.provider_use(name).await,
             ProviderAction::Add {
@@ -3602,7 +3988,7 @@ impl CommandContext<'_> {
             let synth = self.app.config.active();
             self.app.notice(format!(
                 "no providers configured — using the default: {} ({}) {} @ {}\n\
-                 add one with: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth> <base_url> <model> [API_KEY_ENV]",
+                 add one with /provider (interactive)",
                 synth.name, synth.kind, synth.model, synth.base_url
             ));
             return;
@@ -3661,15 +4047,61 @@ impl CommandContext<'_> {
             usd_per_mtok_in: None,
             usd_per_mtok_out: None,
         };
-        // Dedup by name: replace an existing entry with the same name.
-        self.app.config.providers.retain(|p| p.name != name);
-        self.app.config.providers.push(provider);
-        self.app.config.active_provider = Some(name.clone());
-        self.persist_config();
         let reminder = api_key_env
             .map(|env| format!(" — remember to `export {env}=<key>` for this provider"))
             .unwrap_or_default();
-        self.rebuild_active_provider(format!("added and switched to provider '{name}'{reminder}"))
+        self.add_provider_config(
+            provider,
+            format!("added and switched to provider '{name}'{reminder}"),
+        )
+        .await;
+    }
+
+    /// Add (or replace) `provider`, switch to it, persist config, and rebuild
+    /// the live agent. Shared by the text `/provider add`, the interactive
+    /// setup flow, and the xAI OAuth auto-add.
+    async fn add_provider_config(&mut self, provider: ProviderConfig, summary: String) {
+        let name = provider.name.clone();
+        // Dedup by name: replace an existing entry with the same name.
+        self.app.config.providers.retain(|p| p.name != name);
+        self.app.config.providers.push(provider);
+        self.app.config.active_provider = Some(name);
+        self.persist_config();
+        self.rebuild_active_provider(summary).await;
+    }
+
+    /// Finalize an interactive provider setup ([`SlashCommand::ProviderSetup`]):
+    /// store the API key in `~/.wizard/credentials.toml` when present, then add
+    /// and switch to the provider.
+    async fn provider_setup(
+        &mut self,
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    ) {
+        if self.agent_unavailable("add a provider") {
+            return;
+        }
+        if let Some(key) = api_key.as_deref()
+            && !key.is_empty()
+            && let Err(err) = crate::credentials::store(&name, key)
+        {
+            self.app
+                .notice(format!("could not save API key for '{name}': {err:#}"));
+        }
+        let provider = ProviderConfig {
+            name: name.clone(),
+            kind,
+            base_url,
+            model,
+            api_key_env: None,
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+        };
+        self.add_provider_config(provider, format!("added and switched to provider '{name}'"))
             .await;
     }
 
@@ -3796,13 +4228,30 @@ impl CommandContext<'_> {
                     });
                 }
             };
-            let message = match crate::llm::xai_oauth::login(progress).await {
-                Ok(()) => "signed in to xAI; add the provider with \
-                           /provider add xai xaioauth https://api.x.ai/v1 grok-4.3"
-                    .to_string(),
-                Err(err) => format!("xAI sign-in failed: {err:#}"),
-            };
-            let _ = notify.send(Event::Notice(message)).await;
+            match crate::llm::xai_oauth::login(progress).await {
+                Ok(()) => {
+                    // Auto-add the OAuth provider and switch to it; the main
+                    // loop owns the config + agent slot.
+                    let provider = ProviderConfig {
+                        name: "xai-oauth".to_string(),
+                        kind: ProviderKind::XaiOauth,
+                        base_url: crate::llm::xai_oauth::DEFAULT_BASE_URL.to_string(),
+                        model: crate::llm::xai_oauth::DEFAULT_MODEL.to_string(),
+                        api_key_env: None,
+                        gguf_path: None,
+                        usd_per_mtok_in: None,
+                        usd_per_mtok_out: None,
+                    };
+                    let _ = notify
+                        .send(Event::ProviderActivated(Box::new(provider)))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = notify
+                        .send(Event::Notice(format!("xAI sign-in failed: {err:#}")))
+                        .await;
+                }
+            }
         });
     }
 
@@ -4290,6 +4739,20 @@ mod tests {
             .expect("is a slash command");
         let message = parsed.expect_err("unknown kind");
         assert!(message.contains("openrouter"), "got: {message}");
+    }
+
+    #[test]
+    fn provider_no_args_opens_the_menu_and_list_still_lists() {
+        // Bare `/provider` opens the interactive picker; `/provider list` keeps
+        // the scripting/text behavior.
+        assert_eq!(
+            SlashCommand::parse("/provider"),
+            Some(Ok(SlashCommand::Provider(ProviderAction::Menu)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/provider list"),
+            Some(Ok(SlashCommand::Provider(ProviderAction::List)))
+        );
     }
 
     #[test]

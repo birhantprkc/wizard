@@ -180,7 +180,9 @@ Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speak
 
 ## Using a cloud or remote provider
 
-Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. Add one from the TUI and switch to it:
+Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. The simplest path is `/provider` inside the TUI: it opens a menu of your configured providers (Enter switches to one) with an **Add provider…** entry that walks you through each type. Pick xAI (API key or account sign-in), OpenRouter, OpenAI, Anthropic, or an OpenAI-compatible custom endpoint; you type the API key inline (hidden) and it is stored in `~/.wizard/credentials.toml` (file mode 0600). xAI account sign-in runs the OAuth flow and adds the provider for you.
+
+The same thing is scriptable with explicit arguments:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
@@ -188,7 +190,7 @@ Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. Add one fro
 /provider use openai
 ```
 
-The last argument names the environment variable holding your API key; the key itself is never written to disk. Export it before launching (`export OPENAI_API_KEY=sk-...`). Onboarding offers the same choices interactively — the default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
+With `/provider add`, the last argument names the environment variable holding your API key (export it before launching, `export OPENAI_API_KEY=sk-...`); the key itself is never written to disk. The interactive menu instead stores the key in `~/.wizard/credentials.toml`. Onboarding offers the same choices interactively — the default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
 
 ### Using OpenRouter
 
@@ -203,18 +205,13 @@ OpenRouter serves hundreds of hosted models behind one OpenAI-compatible endpoin
 
 ### Signing in with an xAI account
 
-You can use xAI without an API key by signing in with your xAI account (OAuth 2.0 with PKCE):
+You can use xAI without an API key by signing in with your xAI account (OAuth 2.0 with PKCE). Pick **Add provider… → xAI (Grok) — sign in** from the `/provider` menu, or run it directly:
 
 ```bash
 wizard --login xai     # or /login xai from inside the TUI
 ```
 
-Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. Then add the provider:
-
-```
-/provider add xai xaioauth https://api.x.ai/v1 grok-4.3
-/provider use xai
-```
+Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. On success it adds the `xai-oauth` provider and switches the live agent to it — no `/provider add` needed.
 
 Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come back with HTTP 403, use the API-key flavor (`kind = "xai"` with `XAI_API_KEY`) instead.
 

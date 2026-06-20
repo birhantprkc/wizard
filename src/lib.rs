@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod credentials;
 pub mod dispatch;
 pub mod doctor;
 pub mod event;
