@@ -133,6 +133,9 @@ pub enum SlashCommand {
     /// `/rewind [turn]` — restore file checkpoints and truncate history.
     /// `None` opens the turn picker; `Some` rewinds to before that turn.
     Rewind(Option<u64>),
+    /// `/resume [id]` — reopen a past session and continue it. `None` opens
+    /// the session picker; `Some` resumes that session id directly.
+    Resume(Option<String>),
     /// `/agents` — open the subagent roster picker (browse the available
     /// subagents and what each does; Enter pre-fills a delegation request).
     Agents,
@@ -371,6 +374,7 @@ impl SlashCommand {
                     .map(|turn| Self::Rewind(Some(turn)))
                     .map_err(|_| "usage: /rewind [turn]".to_string()),
             },
+            "resume" => Ok(Self::Resume(args.first().map(|s| s.to_string()))),
             "agents" => Ok(Self::Agents),
             "subagents" => Ok(Self::Subagents),
             "diff" => Ok(Self::Diff),
@@ -446,6 +450,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "rewind",
         args: "[turn]",
         description: "rewind files and conversation to before a turn",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "resume",
+        args: "",
+        description: "reopen and continue a past session",
         takes_args: false,
     },
     CommandSpec {
@@ -627,6 +637,8 @@ pub enum PickerKind {
     Mode,
     /// A turn to rewind to (item values are turn ids).
     Rewind,
+    /// A past session to resume (item values are session ids).
+    Resume,
     /// A subagent to delegate to (item values are subagent names). Selecting
     /// one pre-fills the input with a delegation request rather than running a
     /// command, since subagents are invoked by the model, not directly.
@@ -1060,6 +1072,105 @@ impl App {
             items,
             selected: 0,
         });
+    }
+
+    /// Open the `/resume` picker: every past session on disk, newest first,
+    /// each row labeled with its first prompt. The current session is marked
+    /// and selecting it is a no-op.
+    pub fn open_resume_picker(&mut self) {
+        let dir = match crate::config::Config::sessions_dir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.notice(format!("cannot locate sessions: {err:#}"));
+                return;
+            }
+        };
+        let summaries = crate::agent::session::summaries(&dir);
+        if summaries.is_empty() {
+            self.notice("no past sessions to resume");
+            return;
+        }
+        let items: Vec<PickerItem> = summaries
+            .into_iter()
+            .map(|session| {
+                let plural = if session.messages == 1 { "" } else { "s" };
+                PickerItem {
+                    detail: format!("{} · {} msg{plural}", session.summary, session.messages),
+                    current: session.id == self.session_id,
+                    value: session.id,
+                }
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Resume,
+            title: " resume session · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Rebuild the transcript view from a session's persisted messages, so a
+    /// resumed conversation reads back the way it was left. Mirrors the live
+    /// event handling: assistant text and tool calls become cards, tool
+    /// results fill the matching open card. System messages are dropped.
+    fn load_transcript(&mut self, messages: Vec<crate::llm::ChatMessage>) {
+        use crate::llm::Role;
+        self.transcript.clear();
+        for message in messages {
+            match message.role {
+                Role::System => {}
+                Role::User => {
+                    if !message.content.trim().is_empty() {
+                        self.transcript.push(TranscriptEntry::User(message.content));
+                    }
+                }
+                Role::Assistant => {
+                    if !message.content.trim().is_empty() {
+                        self.transcript
+                            .push(TranscriptEntry::Assistant(message.content));
+                    }
+                    for call in message.tool_calls {
+                        self.transcript.push(TranscriptEntry::ToolCard {
+                            name: call.function.name,
+                            args: call.function.arguments,
+                            output: None,
+                            is_error: false,
+                            collapsed: true,
+                        });
+                    }
+                }
+                Role::Tool => {
+                    let name = message.tool_name.unwrap_or_default();
+                    // Fill the most recent open card for this tool, as a live
+                    // ToolFinished would.
+                    let card = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            TranscriptEntry::ToolCard {
+                                name: card_name,
+                                output: slot @ None,
+                                ..
+                            } if *card_name == name => Some(slot),
+                            _ => None,
+                        });
+                    match card {
+                        Some(slot) => *slot = Some(message.content),
+                        None => self.transcript.push(TranscriptEntry::ToolCard {
+                            name,
+                            args: Value::Null,
+                            output: Some(message.content),
+                            is_error: false,
+                            collapsed: true,
+                        }),
+                    }
+                }
+            }
+        }
+        self.streaming.clear();
+        self.streaming_thinking.clear();
+        self.scroll = 0;
     }
 
     /// Open the provider picker (level 1): the configured providers (Enter
@@ -1771,6 +1882,10 @@ impl App {
                                 return Ok(None);
                             };
                             AppAction::Command(SlashCommand::Rewind(Some(turn)))
+                        }
+                        PickerKind::Resume => {
+                            // Item values are session ids.
+                            AppAction::Command(SlashCommand::Resume(Some(item.value.clone())))
                         }
                         PickerKind::Subagent => {
                             // Subagents are spawned by the model, not run as a
@@ -2569,25 +2684,41 @@ fn attach_config_tools(registry: &mut crate::tools::registry::ToolRegistry, conf
     )));
 }
 
-/// Build a fully wired [`Agent`]. `resume` reopens the latest session file
-/// instead of starting a new one.
+/// Which session a freshly built [`Agent`] attaches to.
+#[derive(Debug, Clone)]
+enum SessionTarget {
+    /// Start a brand-new session file.
+    Fresh,
+    /// Reopen the most recent session (`--resume`).
+    Latest,
+    /// Reopen a specific session by id (`/resume`, and crash/interrupt
+    /// recovery of the active session so it survives a prior `/resume`).
+    Id(String),
+}
+
 async fn build_agent(
     client: &Arc<dyn LlmProvider>,
     config: &Config,
     skills: &[Skill],
     project_root: &Path,
     manager: &McpManager,
-    resume: bool,
+    resume: SessionTarget,
 ) -> Result<Agent> {
     // Session first: the hook engine carries its id in every payload.
     let sessions_dir = Config::sessions_dir()?;
-    let session = if resume {
-        match Session::open_latest(&sessions_dir)? {
+    let open_latest_or_fresh = || match Session::open_latest(&sessions_dir)? {
+        Some(session) => Ok(session),
+        None => Session::create(&sessions_dir),
+    };
+    let session = match resume {
+        SessionTarget::Fresh => Session::create(&sessions_dir)?,
+        SessionTarget::Latest => open_latest_or_fresh()?,
+        SessionTarget::Id(id) => match Session::open_by_id(&sessions_dir, &id)? {
             Some(session) => session,
-            None => Session::create(&sessions_dir)?,
-        }
-    } else {
-        Session::create(&sessions_dir)?
+            // The id vanished (deleted, or empty after a fallback) — degrade
+            // to the latest session rather than silently starting blank.
+            None => open_latest_or_fresh()?,
+        },
     };
     let hooks = Arc::new(HookEngine::new(
         crate::hooks::load(project_root),
@@ -2731,6 +2862,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
+/resume                     reopen and continue a past session\n  \
 /agents                     browse subagents and delegate to one\n  \
 /subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
@@ -2960,7 +3092,11 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             &skills,
             &project_root,
             &*manager.lock().await,
-            cli.resume,
+            if cli.resume {
+                SessionTarget::Latest
+            } else {
+                SessionTarget::Fresh
+            },
         )
         .await?,
     );
@@ -3171,6 +3307,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         let project_root = project_root.clone();
                         let manager = Arc::clone(&manager);
                         let notify = events.sender();
+                        let session = SessionTarget::Id(app.session_id.clone());
                         tokio::spawn(async move {
                             let manager = manager.lock().await;
                             let rebuild = match build_agent(
@@ -3179,7 +3316,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                                 &skills,
                                 &project_root,
                                 &manager,
-                                true,
+                                session,
                             )
                             .await
                             {
@@ -3224,6 +3361,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     let project_root = project_root.clone();
                     let manager = Arc::clone(&manager);
                     let notify = events.sender();
+                    let session = SessionTarget::Id(app.session_id.clone());
                     tokio::spawn(async move {
                         let manager = manager.lock().await;
                         let rebuild = match build_agent(
@@ -3232,7 +3370,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             &skills,
                             &project_root,
                             &manager,
-                            true,
+                            session,
                         )
                         .await
                         {
@@ -3310,6 +3448,8 @@ impl CommandContext<'_> {
             SlashCommand::Plan => self.toggle_plan(),
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
+            SlashCommand::Resume(None) => self.app.open_resume_picker(),
+            SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
@@ -3730,6 +3870,70 @@ impl CommandContext<'_> {
         }
     }
 
+    /// `/resume <id>` (or a picker selection): swap the live agent for one
+    /// reopened on session `id` and replay its transcript. The agent must be
+    /// idle (the slot is taken during a turn).
+    async fn resume_session(&mut self, id: String) {
+        if id == self.app.session_id {
+            self.app.notice("already in this session");
+            return;
+        }
+        if self.agent_unavailable("resume a session") {
+            return;
+        }
+        if self.agent_slot.is_none() {
+            self.app.notice("the agent is busy — try again in a moment");
+            return;
+        }
+        let manager = self.manager.lock().await;
+        let agent = build_agent(
+            self.client,
+            &self.app.config,
+            self.skills,
+            self.project_root,
+            &manager,
+            SessionTarget::Id(id.clone()),
+        )
+        .await;
+        drop(manager);
+        let mut agent = match agent {
+            Ok(agent) => agent,
+            Err(err) => {
+                self.app
+                    .notice(format!("could not resume session: {err:#}"));
+                return;
+            }
+        };
+        if self.app.plan_mode {
+            agent.set_plan_mode(true);
+        }
+        // Replay the reopened conversation into the transcript view.
+        let messages = agent.session().load_messages().unwrap_or_default();
+        let resumed_id = agent.session().id.clone();
+        let turns = messages
+            .iter()
+            .filter(|m| m.role == crate::llm::Role::User)
+            .count();
+        let name = messages
+            .iter()
+            .find(|m| m.role == crate::llm::Role::User)
+            .and_then(|m| m.content.lines().next())
+            .map(|line| line.trim().chars().take(48).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| resumed_id.clone());
+        self.app.load_transcript(messages);
+        *self.agent_slot = Some(agent);
+
+        // Hand this session's identity over to the new one: drop the old
+        // heartbeat, adopt the resumed id, and re-register.
+        crate::session_registry::remove(&self.app.session_id);
+        self.app.session_id = resumed_id.clone();
+        self.app.session_name = name;
+        crate::session_registry::write(&self.app.session_record());
+        self.app
+            .notice(format!("resumed session {resumed_id} · {turns} turns"));
+    }
+
     fn switch_mode(&mut self, mode: Mode) {
         if self.agent_unavailable("switch modes") {
             return;
@@ -3946,7 +4150,7 @@ impl CommandContext<'_> {
             self.skills,
             self.project_root,
             &manager,
-            false,
+            SessionTarget::Fresh,
         )
         .await
         {
@@ -4332,7 +4536,16 @@ async fn switch_model_task(
         None => {
             config.model = tag.clone();
             let manager = manager.lock().await;
-            match build_agent(client, &config, &skills, &project_root, &manager, false).await {
+            match build_agent(
+                client,
+                &config,
+                &skills,
+                &project_root,
+                &manager,
+                SessionTarget::Fresh,
+            )
+            .await
+            {
                 Ok(agent) => AgentRebuild {
                     agent: Some(agent),
                     model: Some(tag.clone()),
@@ -4796,6 +5009,75 @@ mod tests {
         let parsed = SlashCommand::parse("/rewind soon").expect("is a slash command");
         let message = parsed.expect_err("non-numeric turn");
         assert!(message.contains("/rewind [turn]"), "got: {message}");
+    }
+
+    #[test]
+    fn resume_parses_with_and_without_an_id() {
+        assert_eq!(
+            SlashCommand::parse("/resume"),
+            Some(Ok(SlashCommand::Resume(None)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/resume 2026-06-09T09-30-00"),
+            Some(Ok(SlashCommand::Resume(Some(
+                "2026-06-09T09-30-00".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn resume_picker_selection_becomes_a_resume_command() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Resume,
+            title: " resume session ".to_string(),
+            items: vec![PickerItem {
+                value: "2026-06-09T09-30-00".to_string(),
+                detail: "add resume · 4 msgs".to_string(),
+                current: false,
+            }],
+            selected: 0,
+        });
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            action,
+            Some(AppAction::Command(SlashCommand::Resume(Some(id)))) if id == "2026-06-09T09-30-00"
+        ));
+        assert!(app.picker.is_none(), "the picker closed");
+    }
+
+    #[test]
+    fn load_transcript_replays_messages_and_pairs_tool_results() {
+        use crate::llm::{ChatMessage, FunctionCall, ToolCall};
+        let mut app = app();
+        let mut assistant = ChatMessage::assistant("reading it");
+        assistant.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": "x.rs" }),
+            },
+        });
+        app.load_transcript(vec![
+            ChatMessage::system("ignored system prompt"),
+            ChatMessage::user("read x.rs"),
+            assistant,
+            ChatMessage::tool_result("read_file", "fn main() {}"),
+        ]);
+        // System dropped; user + assistant + one filled tool card remain.
+        assert!(matches!(
+            app.transcript.first(),
+            Some(TranscriptEntry::User(text)) if text == "read x.rs"
+        ));
+        assert!(matches!(
+            app.transcript.get(1),
+            Some(TranscriptEntry::Assistant(text)) if text == "reading it"
+        ));
+        assert!(matches!(
+            app.transcript.get(2),
+            Some(TranscriptEntry::ToolCard { name, output: Some(out), .. })
+                if name == "read_file" && out == "fn main() {}"
+        ));
+        assert_eq!(app.transcript.len(), 3);
     }
 
     #[test]
