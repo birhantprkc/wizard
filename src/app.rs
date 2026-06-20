@@ -1470,14 +1470,14 @@ impl App {
         // An open picker captures navigation keys.
         if let Some(picker) = self.picker.as_mut() {
             match key.code {
-                KeyCode::Up | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
                     picker.selected = if picker.selected == 0 {
                         picker.items.len().saturating_sub(1)
                     } else {
                         picker.selected - 1
                     };
                 }
-                KeyCode::Down | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
                     picker.selected = if picker.selected + 1 >= picker.items.len() {
                         0
                     } else {
@@ -1840,8 +1840,8 @@ impl App {
                 self.finish_plan_review(PlanVerdict::approve());
             }
             KeyCode::Char('n') => review.feedback = Some(String::new()),
-            KeyCode::Up => review.scroll = review.scroll.saturating_sub(1),
-            KeyCode::Down => review.scroll = review.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => review.scroll = review.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => review.scroll = review.scroll.saturating_add(1),
             KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(10),
             KeyCode::PageDown => review.scroll = review.scroll.saturating_add(10),
             _ => {}

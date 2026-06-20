@@ -1152,14 +1152,14 @@ fn select(
             return Ok(None);
         }
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
                 selected = if selected == 0 {
                     options.len().saturating_sub(1)
                 } else {
                     selected - 1
                 };
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
                 selected = if selected + 1 >= options.len() {
                     0
                 } else {
@@ -1190,14 +1190,14 @@ fn multi_select(
             return Ok(None);
         }
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
                 selected = if selected == 0 {
                     options.len().saturating_sub(1)
                 } else {
                     selected - 1
                 };
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
                 selected = if selected + 1 >= options.len() {
                     0
                 } else {
