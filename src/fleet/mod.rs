@@ -21,11 +21,13 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -690,13 +692,79 @@ fn heartbeat_note(status: &str, age: Option<u64>) -> Option<String> {
     })
 }
 
+/// Live supervision display: one spinner per worker slot when stderr is a
+/// terminal, plain `println!` lines otherwise (logs, pipes). The periodic
+/// status lines route above the bars so they never tear.
+struct FleetReporter {
+    bars: Option<(MultiProgress, Vec<ProgressBar>)>,
+}
+
+impl FleetReporter {
+    fn new(slot_count: usize) -> Self {
+        let bars = std::io::stderr()
+            .is_terminal()
+            .then(|| crate::progress::fleet_bars(slot_count));
+        Self { bars }
+    }
+
+    /// Print a status line above the bars (or plainly off-terminal).
+    fn println(&self, line: impl AsRef<str>) {
+        match &self.bars {
+            Some((multi, _)) => {
+                let _ = multi.println(line.as_ref());
+            }
+            None => println!("{}", line.as_ref()),
+        }
+    }
+
+    /// Refresh each slot's spinner from its current worker — claimed task id
+    /// and elapsed seconds, or "idle".
+    fn sync(&self, slots: &[Slot]) {
+        let Some((_, bars)) = &self.bars else {
+            return;
+        };
+        for (bar, slot) in bars.iter().zip(slots) {
+            let message = match &slot.running {
+                Some(worker) => {
+                    format!(
+                        "{} · {}s",
+                        worker.task.id,
+                        worker.started.elapsed().as_secs()
+                    )
+                }
+                None => "idle".to_string(),
+            };
+            bar.set_message(message);
+        }
+    }
+
+    /// Flag slot `i`'s spinner with a ✓ for the task that just completed.
+    fn mark_done(&self, i: usize, task_id: &str) {
+        if let Some((_, bars)) = &self.bars
+            && let Some(bar) = bars.get(i)
+        {
+            bar.set_message(format!("{task_id} ✓"));
+        }
+    }
+
+    /// Clear the bars at the end of supervision.
+    fn finish(&self) {
+        if let Some((multi, bars)) = &self.bars {
+            for bar in bars {
+                bar.finish_and_clear();
+            }
+            let _ = multi.clear();
+        }
+    }
+}
+
 /// Kill every running child and record killed-task results. Used by the
 /// stop sentinel and ctrl-c paths.
-async fn stop_all(slots: &mut [Slot], dirs: &FleetDirs) {
+async fn stop_all(slots: &mut [Slot], dirs: &FleetDirs, reporter: &FleetReporter) {
     for slot in slots.iter_mut() {
         if let Some(mut worker) = slot.running.take() {
             worker.child.kill().await.ok();
-            println!("✗ killed task '{}' on shutdown", worker.task.id);
+            reporter.println(format!("✗ killed task '{}' on shutdown", worker.task.id));
             if let Err(err) = write_result(
                 dirs,
                 &worker.task,
@@ -713,11 +781,26 @@ async fn stop_all(slots: &mut [Slot], dirs: &FleetDirs) {
 
 /// The real supervision loop around [`tick`]. Returns `true` when the queue
 /// drained and every child finished, `false` on a stop (sentinel or ctrl-c).
+/// Wraps the loop in a [`FleetReporter`] so the per-slot bars are always
+/// cleared, whichever way the loop exits.
 async fn supervise(
     dirs: &FleetDirs,
     slots: &mut [Slot],
     state: &mut FleetState,
     max_minutes: u64,
+) -> Result<bool> {
+    let reporter = FleetReporter::new(slots.len());
+    let result = supervise_loop(dirs, slots, state, max_minutes, &reporter).await;
+    reporter.finish();
+    result
+}
+
+async fn supervise_loop(
+    dirs: &FleetDirs,
+    slots: &mut [Slot],
+    state: &mut FleetState,
+    max_minutes: u64,
+    reporter: &FleetReporter,
 ) -> Result<bool> {
     let max_age = Duration::from_secs(max_minutes.saturating_mul(60));
     loop {
@@ -756,8 +839,8 @@ async fn supervise(
         for action in actions {
             match action {
                 TickAction::StopAll => {
-                    println!("fleet: stop requested — winding down");
-                    stop_all(slots, dirs).await;
+                    reporter.println("fleet: stop requested — winding down");
+                    stop_all(slots, dirs, reporter).await;
                     return Ok(false);
                 }
                 TickAction::Reap(i) => {
@@ -771,12 +854,13 @@ async fn supervise(
                             false,
                             &worker.stdout_path,
                         )?;
-                        println!(
+                        reporter.mark_done(i, &worker.task.id);
+                        reporter.println(format!(
                             "← task '{}' finished ({}) on {}",
                             worker.task.id,
                             describe_exit(&result),
                             slot.branch
-                        );
+                        ));
                     }
                 }
                 TickAction::Kill(i) => {
@@ -791,20 +875,20 @@ async fn supervise(
                             true,
                             &worker.stdout_path,
                         )?;
-                        println!(
+                        reporter.println(format!(
                             "⏱ task '{}' exceeded {max_minutes} min — killed",
                             worker.task.id
-                        );
+                        ));
                     }
                 }
                 TickAction::Spawn(i) => {
                     if let Some(task) = claim_next(&dirs.queue(), &dirs.claimed())? {
                         let slot = &mut slots[i];
                         let worker = spawn_worker(task, &slot.worktree, dirs)?;
-                        println!(
+                        reporter.println(format!(
                             "→ task '{}' ({}) started on {}",
                             worker.task.id, worker.task.title, slot.branch
-                        );
+                        ));
                         slot.running = Some(worker);
                     }
                 }
@@ -822,11 +906,14 @@ async fn supervise(
             save_state(&dirs.state_path(), state)?;
         }
 
+        // Refresh the per-slot bars (elapsed advances every tick).
+        reporter.sync(slots);
+
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.context("listening for ctrl-c")?;
-                println!("\nfleet: interrupt — winding down");
-                stop_all(slots, dirs).await;
+                reporter.println("fleet: interrupt — winding down");
+                stop_all(slots, dirs, reporter).await;
                 return Ok(false);
             }
             () = tokio::time::sleep(TICK) => {}

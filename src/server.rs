@@ -33,8 +33,31 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a TCP connection on a single health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// User-visible progress callback for the slow paths (spawn, model load).
-pub type Progress<'a> = &'a (dyn Fn(&str) + Send + Sync);
+/// User-visible progress sink for the slow paths (spawn, model load,
+/// downloads). [`crate::progress::ServerSpinner`] is the terminal
+/// implementation; other surfaces (the TUI's `/server start`) supply their
+/// own. `status` reports a one-line update; `bytes` opens a determinate
+/// byte-counted phase whose guard is ticked with [`ByteProgress::inc`] and
+/// restores the prior UI on finish or drop.
+pub trait Progress: Send + Sync {
+    /// Report a one-line status update.
+    fn status(&self, line: &str);
+    /// Begin a byte-counted download phase. `total` is the expected byte
+    /// count when the server advertised a `Content-Length`, `None` for an
+    /// indeterminate stream.
+    fn bytes(&self, label: &str, total: Option<u64>) -> Box<dyn ByteProgress>;
+}
+
+/// A determinate byte-counted phase opened by [`Progress::bytes`]. Dropping
+/// the guard restores the surface's prior UI; [`ByteProgress::finish`] does
+/// the same after recording a closing message.
+pub trait ByteProgress: Send {
+    /// Account for `n` more bytes transferred.
+    fn inc(&self, n: u64);
+    /// Close the phase, optionally leaving `msg` as the surface's status
+    /// (an empty `msg` means no closing message).
+    fn finish(self: Box<Self>, msg: &str);
+}
 
 /// What `GET {base_url}/health` says about the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,12 +95,12 @@ pub async fn probe(base_url: &str) -> Health {
 /// `llama-server` is on `PATH`, and the provider has a usable `gguf_path` —
 /// and waits for it; anything less is an actionable error telling the user
 /// how to start the server themselves.
-pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -> Result<()> {
+pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) -> Result<()> {
     let base_url = provider.base_url.trim_end_matches('/');
     match probe(base_url).await {
         Health::Ready => return Ok(()),
         Health::Loading => {
-            progress(&format!(
+            progress.status(&format!(
                 "llama-server at {base_url} is loading its model — waiting…"
             ));
             return wait_ready(base_url, None, progress).await;
@@ -149,11 +172,11 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
     };
 
     let pid = spawn(&binary, gguf, port)?;
-    progress(&format!(
+    progress.status(&format!(
         "started llama-server (PID {pid}, port {port}) — log: {}",
         log_path()?.display()
     ));
-    progress(&format!(
+    progress.status(&format!(
         "waiting for the model to load (up to {}s)…",
         READY_TIMEOUT.as_secs()
     ));
@@ -164,7 +187,7 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
 /// [`READY_TIMEOUT`] (GGUF loads are slow). When `pid` names a server Wizard
 /// just spawned, its early death short-circuits the wait with a pointer to
 /// the log instead of timing out.
-pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>) -> Result<()> {
+pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: &dyn Progress) -> Result<()> {
     let started = Instant::now();
     let mut reported_loading = false;
     while started.elapsed() < READY_TIMEOUT {
@@ -172,7 +195,7 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>
             Health::Ready => return Ok(()),
             Health::Loading if !reported_loading => {
                 reported_loading = true;
-                progress("llama-server is up — loading the model…");
+                progress.status("llama-server is up — loading the model…");
             }
             _ => {}
         }

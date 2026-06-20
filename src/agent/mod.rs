@@ -1681,7 +1681,7 @@ pub async fn build_headless_agent(
     // stdout lines when stderr is not a terminal).
     if active.kind == ProviderKind::LlamaCpp {
         let wait = crate::progress::ServerSpinner::start();
-        let outcome = crate::server::ensure_running(&active, &|line: &str| wait.update(line)).await;
+        let outcome = crate::server::ensure_running(&active, &wait).await;
         wait.finish(outcome.is_ok());
         outcome?;
     }

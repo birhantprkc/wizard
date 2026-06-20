@@ -14,7 +14,9 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+use crate::server::{ByteProgress, Progress};
 
 /// Braille frames matching the TUI spinner in `src/ui.rs`, plus a final
 /// check mark shown when a spinner finishes with a message.
@@ -46,6 +48,34 @@ fn bar_style() -> ProgressStyle {
 /// [`ProgressBar::suspend`] so lines land above the bar.
 pub fn bar(len: u64) -> ProgressBar {
     let bar = ProgressBar::new(len).with_style(bar_style());
+    bar.enable_steady_tick(TICK_INTERVAL);
+    bar
+}
+
+/// Byte-counted style for downloads: a determinate bar with transfer rate and
+/// ETA when the total is known, an indeterminate spinner+counter otherwise.
+fn download_style(total_known: bool) -> ProgressStyle {
+    let template = if total_known {
+        "{spinner:.white} {msg:.dim} [{bar:24.white/black}] {bytes}/{total_bytes} \
+         {binary_bytes_per_sec:.dim} {eta:.dim}"
+    } else {
+        "{spinner:.white} {msg:.dim} {bytes} {binary_bytes_per_sec:.dim}"
+    };
+    ProgressStyle::with_template(template)
+        .expect("static download template is valid")
+        .tick_chars(TICK_CHARS)
+        .progress_chars("█▓░")
+}
+
+/// A byte-counted progress bar drawn to stderr (hidden automatically when
+/// stderr is not a terminal). `total` is the expected byte count; `None`
+/// gives an indeterminate spinner that still shows bytes transferred.
+pub fn download_bar(total: Option<u64>) -> ProgressBar {
+    let bar = match total {
+        Some(total) => ProgressBar::new(total),
+        None => ProgressBar::new_spinner(),
+    }
+    .with_style(download_style(total.is_some()));
     bar.enable_steady_tick(TICK_INTERVAL);
     bar
 }
@@ -129,6 +159,10 @@ pub struct ServerSpinner {
     /// Whether any status line arrived — i.e. the server was actually
     /// spawned or waited on rather than already answering.
     waited: AtomicBool,
+    /// Whether stderr is a terminal. When false the spinner draws nothing
+    /// and status falls back to plain `println!` lines (matching the prior
+    /// behavior for scripts and piped runs).
+    enabled: bool,
 }
 
 impl ServerSpinner {
@@ -142,16 +176,7 @@ impl ServerSpinner {
         Self {
             bar,
             waited: AtomicBool::new(false),
-        }
-    }
-
-    /// Report a status line ("waiting for the model to load…").
-    pub fn update(&self, line: &str) {
-        self.waited.store(true, Ordering::SeqCst);
-        if self.bar.is_hidden() {
-            println!("{line}");
-        } else {
-            self.bar.set_message(line.to_string());
+            enabled: std::io::stderr().is_terminal(),
         }
     }
 
@@ -161,16 +186,147 @@ impl ServerSpinner {
     /// are reported by the caller.
     pub fn finish(&self, ok: bool) {
         if ok && self.waited.load(Ordering::SeqCst) {
-            if self.bar.is_hidden() {
+            if self.enabled {
+                self.bar.finish_with_message("llama-server ready");
+            } else {
                 self.bar.finish_and_clear();
                 println!("llama-server ready");
-            } else {
-                self.bar.finish_with_message("llama-server ready");
             }
         } else {
             self.bar.finish_and_clear();
         }
     }
+}
+
+impl Progress for ServerSpinner {
+    /// Report a status line ("waiting for the model to load…").
+    fn status(&self, line: &str) {
+        self.waited.store(true, Ordering::SeqCst);
+        if self.enabled {
+            self.bar.set_message(line.to_string());
+        } else {
+            println!("{line}");
+        }
+    }
+
+    /// Open a byte-counted download phase: suspend the spinner, hand back a
+    /// determinate byte bar, and restore the spinner when the guard finishes
+    /// or drops. A no-op guard off-terminal, where downloads stay silent.
+    fn bytes(&self, label: &str, total: Option<u64>) -> Box<dyn ByteProgress> {
+        self.waited.store(true, Ordering::SeqCst);
+        if !self.enabled {
+            return Box::new(ServerByteProgress {
+                spinner: self.bar.clone(),
+                download: None,
+                restored: AtomicBool::new(false),
+            });
+        }
+        // Hand the screen to the byte bar while the download runs.
+        self.bar.disable_steady_tick();
+        self.bar.set_draw_target(ProgressDrawTarget::hidden());
+        let download = download_bar(total);
+        download.set_message(label.to_string());
+        Box::new(ServerByteProgress {
+            spinner: self.bar.clone(),
+            download: Some(download),
+            restored: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Guard for a [`ServerSpinner`] byte phase: ticks a determinate byte bar and
+/// restores the spinner (clearing the byte bar) when finished or dropped.
+struct ServerByteProgress {
+    /// Clone of the [`ServerSpinner`] bar (indicatif bars are `Arc`-backed,
+    /// so this shares state with the original).
+    spinner: ProgressBar,
+    /// The byte bar, or `None` off-terminal where the phase is a no-op.
+    download: Option<ProgressBar>,
+    restored: AtomicBool,
+}
+
+impl ServerByteProgress {
+    /// Clear the byte bar and bring the spinner back, optionally leaving
+    /// `msg` as its status. Idempotent across `finish` and `Drop`.
+    fn restore(&self, msg: Option<&str>) {
+        if self.restored.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match &self.download {
+            Some(download) => {
+                download.finish_and_clear();
+                if let Some(msg) = msg.filter(|msg| !msg.is_empty()) {
+                    self.spinner.set_message(msg.to_string());
+                }
+                self.spinner.set_draw_target(ProgressDrawTarget::stderr());
+                self.spinner.enable_steady_tick(TICK_INTERVAL);
+            }
+            // Off-terminal: surface a closing message as a plain line, the
+            // way status lines fall back when there is no spinner to update.
+            None => {
+                if let Some(msg) = msg.filter(|msg| !msg.is_empty()) {
+                    println!("{msg}");
+                }
+            }
+        }
+    }
+}
+
+impl ByteProgress for ServerByteProgress {
+    fn inc(&self, n: u64) {
+        if let Some(download) = &self.download {
+            download.inc(n);
+        }
+    }
+
+    fn finish(self: Box<Self>, msg: &str) {
+        self.restore(Some(msg));
+    }
+}
+
+impl Drop for ServerByteProgress {
+    fn drop(&mut self) {
+        self.restore(None);
+    }
+}
+
+/// A bare spinner for an indeterminate wait (e.g. `wizard doctor`'s network
+/// probes): shows `msg`, animates on a terminal, and is silent otherwise.
+/// [`Spinner::finish`] clears it before any report is printed.
+pub struct Spinner {
+    bar: ProgressBar,
+}
+
+impl Spinner {
+    /// Start a spinner showing `msg`.
+    pub fn start(msg: &str) -> Self {
+        let bar = ProgressBar::new_spinner()
+            .with_style(spinner_style())
+            .with_message(msg.to_string());
+        bar.enable_steady_tick(TICK_INTERVAL);
+        Self { bar }
+    }
+
+    /// Clear the spinner.
+    pub fn finish(self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+/// One [`MultiProgress`] with a spinner per worker slot, sharing the TUI
+/// look. Callers route interleaved lines through [`MultiProgress::println`]
+/// (or `suspend`) so they land above the bars without tearing. Off-terminal
+/// the bars draw nothing; callers TTY-gate the whole surface upstream.
+pub fn fleet_bars(slots: usize) -> (MultiProgress, Vec<ProgressBar>) {
+    let multi = MultiProgress::new();
+    let bars = (0..slots)
+        .map(|_| {
+            let bar = multi.add(ProgressBar::new_spinner().with_style(spinner_style()));
+            bar.enable_steady_tick(TICK_INTERVAL);
+            bar
+        })
+        .collect();
+    (multi, bars)
 }
 
 #[cfg(test)]
@@ -182,6 +338,59 @@ mod tests {
     fn styles_construct_without_panicking() {
         let _ = spinner_style();
         let _ = bar_style();
+        let _ = download_style(true);
+        let _ = download_style(false);
+    }
+
+    #[test]
+    fn download_bar_counts_in_both_modes() {
+        // Determinate: a known total caps the bar's length.
+        let bar = download_bar(Some(1_000));
+        bar.inc(400);
+        assert_eq!(bar.position(), 400);
+        bar.finish_and_clear();
+
+        // Indeterminate: no length, but bytes still accumulate.
+        let bar = download_bar(None);
+        bar.inc(128);
+        assert_eq!(bar.position(), 128);
+        bar.finish_and_clear();
+    }
+
+    #[test]
+    fn server_byte_progress_is_safe_off_terminal() {
+        // Under captured stderr `bytes()` returns a no-op guard; ticking and
+        // finishing it must stay quiet and not touch the spinner state.
+        let spinner = ServerSpinner::start();
+        let bar = spinner.bytes("downloading model", Some(2_048));
+        bar.inc(1_024);
+        bar.finish("saved /tmp/model.gguf");
+        // A dropped (unfinished) guard restores cleanly too.
+        let bar = spinner.bytes("downloading again", None);
+        bar.inc(10);
+        drop(bar);
+        spinner.finish(true);
+    }
+
+    #[test]
+    fn spinner_lifecycle_is_safe_off_terminal() {
+        let spinner = Spinner::start("running checks…");
+        spinner.finish();
+    }
+
+    #[test]
+    fn fleet_bars_yields_one_bar_per_slot() {
+        let (multi, bars) = fleet_bars(3);
+        assert_eq!(bars.len(), 3);
+        for (i, bar) in bars.iter().enumerate() {
+            bar.set_message(format!("task-{i} · 0s"));
+        }
+        // Routing a line through the group is a quiet no-op off-terminal.
+        let _ = multi.println("→ task-0 started");
+        for bar in &bars {
+            bar.finish_and_clear();
+        }
+        let _ = multi.clear();
     }
 
     #[test]
@@ -228,7 +437,7 @@ mod tests {
         wait.finish(true); // fast path: no "ready" line, just a clear
 
         let wait = ServerSpinner::start();
-        wait.update("waiting for the model to load…");
+        wait.status("waiting for the model to load…");
         assert!(wait.waited.load(Ordering::SeqCst));
         wait.finish(false); // failure: cleared, the caller prints the error
     }
