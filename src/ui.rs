@@ -62,7 +62,7 @@ fn accent() -> Style {
 pub fn draw(frame: &mut Frame, app: &App) {
     let [main_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -521,7 +521,7 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let mut spans = vec![
-        Span::styled(" ✦ ", accent()),
+        Span::raw(" "),
         Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
@@ -592,10 +592,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Input: a dim rule above a clean accent prompt — no box. Handles
-/// cursor-aware horizontal scrolling and inline ghost-text completion.
+/// Input: a clean accent prompt bracketed by dim rules above and below — no
+/// box. Handles cursor-aware horizontal scrolling and inline ghost-text
+/// completion.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height < 2 || area.width < 6 {
+    if area.height < 3 || area.width < 6 {
         return;
     }
     let rule = Line::from(Span::styled("─".repeat(area.width as usize), dim()));
@@ -660,7 +661,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(
-        Paragraph::new(Text::from(vec![rule, Line::from(spans)])),
+        Paragraph::new(Text::from(vec![rule.clone(), Line::from(spans), rule])),
         area,
     );
 
