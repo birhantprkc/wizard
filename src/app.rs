@@ -2262,10 +2262,14 @@ async fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Compose the `/diff` sidebar contents: unstaged then staged changes.
+/// Compose the `/diff` sidebar contents: unstaged, then staged, then
+/// untracked changes. Untracked (new) files are invisible to plain `git
+/// diff`, so without the third section a tree whose only changes are new
+/// files reads as "clean" — the diff sidebar looks broken.
 async fn git_diff_text(root: &Path) -> Result<String> {
     let unstaged = git_output(root, &["diff"]).await?;
     let staged = git_output(root, &["diff", "--staged"]).await?;
+    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard"]).await?;
     let mut text = String::new();
     if !unstaged.trim().is_empty() {
         text.push_str(&unstaged);
@@ -2277,10 +2281,38 @@ async fn git_diff_text(root: &Path) -> Result<String> {
         text.push_str("# --- staged ---\n");
         text.push_str(&staged);
     }
+    let mut untracked_text = String::new();
+    for file in untracked.lines().filter(|l| !l.trim().is_empty()) {
+        untracked_text.push_str(&git_diff_untracked(root, file).await);
+    }
+    if !untracked_text.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("# --- untracked ---\n");
+        text.push_str(&untracked_text);
+    }
     if text.is_empty() {
         text = "(working tree clean)".to_string();
     }
     Ok(text)
+}
+
+/// Render a single untracked file as a full addition by diffing it against
+/// `/dev/null`. `git diff --no-index` exits 1 when the inputs differ (the
+/// normal case here) and reads nothing from the index, so it stays
+/// read-only; we take its stdout regardless of exit status and drop the
+/// file silently if git can't read it.
+async fn git_diff_untracked(root: &Path, file: &str) -> String {
+    match tokio::process::Command::new("git")
+        .args(["diff", "--no-index", "--no-color", "--", "/dev/null", file])
+        .current_dir(root)
+        .output()
+        .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 fn describe_evolve_outcome(outcome: &EvolveOutcome) -> String {
@@ -3869,6 +3901,33 @@ mod tests {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    /// Untracked (new) files are invisible to plain `git diff`, so `/diff`
+    /// must surface them itself — otherwise a tree whose only change is a new
+    /// file reads as "(working tree clean)".
+    #[tokio::test]
+    async fn diff_text_includes_untracked_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("brand_new.txt"), "fresh content\n").expect("write");
+
+        let text = git_diff_text(root).await.expect("diff text");
+        assert!(
+            text.contains("brand_new.txt") && text.contains("fresh content"),
+            "untracked file missing from /diff output:\n{text}"
+        );
+        assert!(text.contains("# --- untracked ---"));
     }
 
     #[test]
