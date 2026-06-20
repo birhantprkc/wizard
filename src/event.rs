@@ -29,6 +29,11 @@ pub enum Event {
     /// Carries the agent back to the main loop's slot (boxed: an [`Agent`]
     /// is large next to the input variants).
     AgentRebuilt(Box<crate::app::AgentRebuild>),
+    /// A background sign-in (xAI OAuth) succeeded: add this provider and switch
+    /// to it. Owned by the main loop (it holds the config + agent slot); boxed
+    /// because [`ProviderConfig`](crate::config::ProviderConfig) is large next
+    /// to the input variants.
+    ProviderActivated(Box<crate::config::ProviderConfig>),
 }
 
 /// Owns the merged event channel. A background task pumps crossterm's

@@ -92,7 +92,9 @@ wizard --onboard
 wizard --gateway
 ```
 
-Add or switch model providers at any time from inside the TUI, with any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI:
+Add or switch model providers at any time from inside the TUI. Run `/provider` for an interactive menu: it lists your configured providers (Enter switches the live agent to one) and an **Add provider…** entry that walks you through xAI (API key or account sign-in), OpenRouter, OpenAI, Anthropic, or any OpenAI-compatible custom endpoint. API keys are entered inline (hidden) and stored in `~/.wizard/credentials.toml` (file mode 0600); xAI account sign-in runs the OAuth flow in your browser and adds the provider for you.
+
+The same thing is scriptable with explicit arguments:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
@@ -102,7 +104,7 @@ Add or switch model providers at any time from inside the TUI, with any OpenAI-c
 /provider list                # show configured providers
 ```
 
-Or sign in with your xAI account instead of using an API key: run `wizard --login xai` (or `/login xai` inside the TUI) to complete the OAuth flow in your browser, then `/provider add xai xaioauth https://api.x.ai/v1 grok-4.3`.
+With `/provider add` the last argument names an environment variable holding the key (never written to disk); the interactive menu stores the key in `~/.wizard/credentials.toml` instead. Either source works at request time.
 
 ### Run models locally
 

@@ -609,7 +609,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(pad + prompt_width + 1)
         .max(1);
 
-    let chars: Vec<char> = app.input.chars().collect();
+    // In the inline provider-setup prompt the API-key field is masked: each
+    // typed character renders as a width-1 bullet (so the cursor math is
+    // unaffected) and the real key never reaches the screen.
+    let chars: Vec<char> = if app.prompt_is_masked() {
+        vec!['•'; app.input.chars().count()]
+    } else {
+        app.input.chars().collect()
+    };
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
     let cursor = app.cursor.min(chars.len());
     // Keep the cursor visible: scroll the window (in display columns, so
@@ -820,9 +827,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Span::styled(" ✦", accent()),
             Span::styled(picker.title.clone(), Style::default().fg(TEXT_DIM)),
         ]))
-        .title_bottom(
-            Line::from(Span::styled(picker.footer_hint(), dim())).centered(),
-        );
+        .title_bottom(Line::from(Span::styled(picker.footer_hint(), dim())).centered());
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
