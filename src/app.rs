@@ -475,6 +475,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "exit wizard",
         takes_args: false,
     },
+    CommandSpec {
+        name: "exit",
+        args: "",
+        description: "exit wizard",
+        takes_args: false,
+    },
 ];
 
 /// One row in the suggestion popup: a builtin [`CommandSpec`] or a custom

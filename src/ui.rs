@@ -206,7 +206,7 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("/model", accent()),
-            Span::styled("  pick a model (or Ctrl-P)", dim()),
+            Span::styled("  pick a model", dim()),
         ]),
         Line::from(vec![
             Span::styled("/help", accent()),
@@ -576,9 +576,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
     } else if app.status.busy {
-        "PgUp/PgDn scroll · ^C quit"
+        "PgUp/PgDn scroll"
     } else {
-        "/ commands · ↑ history · ^P model · ^C quit"
+        "/ commands · ↑ history"
     };
     let width = hints.width() as u16 + 1;
     if area.width > left_width + width {
