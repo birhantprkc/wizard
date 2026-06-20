@@ -64,7 +64,11 @@ impl ImportOutcome {
         if self.mcp_added > 0 || !self.mcp_skipped.is_empty() {
             let mut line = format!("MCP servers: {} imported", self.mcp_added);
             if !self.mcp_skipped.is_empty() {
-                line.push_str(&format!(" ({} skipped: {})", self.mcp_skipped.len(), self.mcp_skipped.join(", ")));
+                line.push_str(&format!(
+                    " ({} skipped: {})",
+                    self.mcp_skipped.len(),
+                    self.mcp_skipped.join(", ")
+                ));
             }
             lines.push(line);
         }
@@ -76,7 +80,10 @@ impl ImportOutcome {
             lines.push(line);
         }
         if !self.spinner_verbs.is_empty() {
-            lines.push(format!("spinner verbs: {} imported", self.spinner_verbs.len()));
+            lines.push(format!(
+                "spinner verbs: {} imported",
+                self.spinner_verbs.len()
+            ));
         }
         lines.join("\n")
     }
@@ -331,8 +338,8 @@ fn import_mcp(outcome: &mut ImportOutcome) -> Result<()> {
     let Some(path) = claude_json_path() else {
         return Ok(());
     };
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let Ok(json) = serde_json::from_str::<Value>(&raw) else {
         return Ok(()); // not our place to hard-fail on Claude's config
     };
@@ -356,8 +363,7 @@ fn import_commands(outcome: &mut ImportOutcome) -> Result<()> {
         return Ok(());
     }
     let dst_dir = Config::wizard_dir()?.join("commands");
-    std::fs::create_dir_all(&dst_dir)
-        .with_context(|| format!("creating {}", dst_dir.display()))?;
+    std::fs::create_dir_all(&dst_dir).with_context(|| format!("creating {}", dst_dir.display()))?;
     let (to_copy, skipped) = plan_command_copies(&src_files, &dst_dir);
     for src in &to_copy {
         if let Some(name) = src.file_name() {
@@ -449,7 +455,10 @@ mod tests {
     #[test]
     fn parse_spinner_verbs_reads_list() {
         let raw = r#"{ "spinnerVerbs": { "mode": "replace", "verbs": ["A", "B"] } }"#;
-        assert_eq!(parse_spinner_verbs(raw), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            parse_spinner_verbs(raw),
+            vec!["A".to_string(), "B".to_string()]
+        );
     }
 
     #[test]
@@ -475,8 +484,7 @@ mod tests {
         let existing = McpConfig {
             servers: vec![server("keep")],
         };
-        let (merged, added, skipped) =
-            merge_mcp(&existing, vec![server("keep"), server("new")]);
+        let (merged, added, skipped) = merge_mcp(&existing, vec![server("keep"), server("new")]);
         assert_eq!(added, 1);
         assert_eq!(skipped, vec!["keep".to_string()]);
         let names: Vec<&str> = merged.servers.iter().map(|s| s.name.as_str()).collect();

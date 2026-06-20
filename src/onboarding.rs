@@ -1184,7 +1184,8 @@ fn multi_select(
     let mut checked = vec![false; options.len()];
     let mut selected = 0usize;
     loop {
-        terminal.draw(|frame| draw_multi_select(frame, title, subtitle, options, &checked, selected))?;
+        terminal
+            .draw(|frame| draw_multi_select(frame, title, subtitle, options, &checked, selected))?;
         let Some(key) = next_key()? else { continue };
         if is_cancel(&key) {
             return Ok(None);
