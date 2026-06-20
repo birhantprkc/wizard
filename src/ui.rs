@@ -530,6 +530,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("PLAN", accent().bold()));
     }
+    spans.push(Span::styled(" · ", dim()));
+    spans.push(Span::styled(format_cwd(&app.project_root, 32), dim()));
     let token_total = app.status.prompt_tokens + app.status.completion_tokens;
     if token_total > 0 {
         spans.push(Span::styled(" · ", dim()));
@@ -1528,6 +1530,49 @@ fn take_width(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Format the working directory for the status bar: abbreviate `$HOME` to
+/// `~`, and when wider than `max` columns drop leading components (prefixing
+/// `…/`) so the leaf directory — the part you actually care about — stays
+/// visible instead of being clipped off the end.
+fn format_cwd(root: &std::path::Path, max: usize) -> String {
+    let full = root.display().to_string();
+    let display = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full,
+    };
+    if display.width() <= max {
+        return display;
+    }
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let mut parts: Vec<&str> = display.split(&sep).filter(|p| !p.is_empty()).collect();
+    while parts.len() > 1 {
+        parts.remove(0);
+        let candidate = format!("…{sep}{}", parts.join(&sep));
+        if candidate.width() <= max {
+            return candidate;
+        }
+    }
+    // A single leaf still too wide: keep its tail under a leading `…`.
+    let leaf = parts.last().copied().unwrap_or(&display);
+    let budget = max.saturating_sub(1);
+    let tail: String = {
+        let mut used = 0;
+        let mut chars: Vec<char> = Vec::new();
+        for ch in leaf.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            chars.push(ch);
+        }
+        chars.into_iter().rev().collect()
+    };
+    format!("…{tail}")
+}
+
 /// Truncate to `max` display columns (not chars), appending `…` when cut.
 fn truncate_width(text: &str, max: usize) -> String {
     if text.width() <= max {
@@ -2017,6 +2062,30 @@ mod tests {
 
     fn flats(lines: &[Line]) -> Vec<String> {
         lines.iter().map(flat).collect()
+    }
+
+    #[test]
+    fn cwd_keeps_short_path_intact() {
+        let p = std::path::Path::new("/srv/app");
+        assert_eq!(format_cwd(p, 32), "/srv/app");
+    }
+
+    #[test]
+    fn cwd_drops_leading_components_keeping_leaf() {
+        let p = std::path::Path::new("/home/gradient/projects/ai/wizard");
+        // Narrow budget forces dropping leading parts but keeps the leaf.
+        let out = format_cwd(p, 14);
+        assert!(out.starts_with('…'), "expected ellipsis prefix, got {out}");
+        assert!(out.ends_with("wizard"), "expected leaf kept, got {out}");
+        assert!(out.width() <= 14, "expected within budget, got {out}");
+    }
+
+    #[test]
+    fn cwd_abbreviates_home() {
+        // SAFETY: single-threaded test process.
+        unsafe { std::env::set_var("HOME", "/home/gradient") };
+        let p = std::path::Path::new("/home/gradient/projects/ai");
+        assert_eq!(format_cwd(p, 32), "~/projects/ai");
     }
 
     #[test]
