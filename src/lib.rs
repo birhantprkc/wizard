@@ -19,6 +19,7 @@ pub mod fleet;
 pub mod gateway;
 pub mod hardware;
 pub mod hooks;
+pub mod import_claude;
 pub mod instructions;
 pub mod llm;
 pub mod local_setup;
@@ -29,6 +30,7 @@ pub mod output;
 pub mod progress;
 pub mod schedule;
 pub mod server;
+pub mod session_registry;
 pub mod skills;
 pub mod tools;
 pub mod ui;
@@ -157,6 +159,12 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
 
     if cli.gateway {
         return gateway::run(config, cli).await.map(|()| 0);
+    }
+
+    // `wizard agents` always opens the TUI dashboard, regardless of the
+    // configured default mode.
+    if matches!(cli.command, Some(cli::Command::Agents)) {
+        return app::run_tui(config, cli).await;
     }
 
     match config.mode {

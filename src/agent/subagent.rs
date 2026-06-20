@@ -176,9 +176,12 @@ pub async fn spawn(
         ChatMessage::user(task.to_string()),
     ];
 
-    // Subagents share the parent's cwd and task registry but get their own
-    // todo list (their working notes must not clobber the parent's) and no
-    // event channel — their activity surfaces as one tool result.
+    // The subagent reports back to the model as one tool result, but its
+    // individual tool calls are surfaced to the UI (prefixed with the
+    // subagent's name) on the parent's event channel so the user can watch
+    // what it's doing. Nested tools run with `events: None` so they don't
+    // double-emit (todos, background tasks); we emit our own start/finish pair.
+    let progress = ctx.events.clone();
     let ctx = ToolContext {
         todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
         events: None,
@@ -252,6 +255,19 @@ pub async fn spawn(
         for call in tool_calls {
             let name = call.function.name.clone();
             let mut args = normalize_args(&call.function.arguments);
+            // Surface this call to the UI as `<subagent> ▸ <tool>` so the user
+            // sees what the subagent is doing while it runs.
+            let label = format!("{} ▸ {}", config.name, name);
+            if let Some(events) = &progress {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::ToolStarted {
+                        name: label.clone(),
+                        args: args.clone(),
+                    },
+                )
+                .await;
+            }
             // Same hook pipeline as the parent's dispatcher: pre-hooks may
             // rewrite the arguments or veto, post-hooks may append context.
             let output = match hooks
@@ -282,6 +298,16 @@ pub async fn spawn(
                     output
                 }
             };
+            if let Some(events) = &progress {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::ToolFinished {
+                        name: label.clone(),
+                        output: output.clone(),
+                    },
+                )
+                .await;
+            }
             let body = if output.is_error {
                 format!("Error: {}", output.content)
             } else {
@@ -331,12 +357,32 @@ impl SpawnSubagentTool {
     ) -> Self {
         let roster = configs
             .iter()
-            .map(|c| format!("`{}` ({})", c.name, c.description))
-            .collect::<Vec<_>>()
-            .join("; ");
+            .map(|c| {
+                let scope = match &c.tool_scope {
+                    None => "all tools".to_string(),
+                    Some(names) => names.join(", "),
+                };
+                format!(
+                    "\n  - `{}` — {} (tools: {}; up to {} steps)",
+                    c.name, c.description, scope, c.max_steps
+                )
+            })
+            .collect::<String>();
         let description = format!(
-            "Delegate a self-contained sub-task to an isolated subagent with its own context \
-             and step budget. Returns the subagent's final answer. Available subagents: {roster}"
+            "Delegate a self-contained sub-task to an isolated subagent. It runs its own loop \
+             with a fresh context and scoped tools, then returns one final report — its \
+             intermediate steps never enter your context, so a multi-step sub-task costs you a \
+             single turn.\n\n\
+             Delegate when the work is self-contained, when it would otherwise flood your \
+             context with output you don't need to keep (large greps, reading many files, long \
+             logs), or when a specialist fits better than you do. Don't delegate trivial \
+             one-tool actions, work that needs the user mid-flight (the subagent can't ask \
+             questions), or a task you can't yet describe in full.\n\n\
+             `task` is the ONLY context the subagent gets besides its own prompt — make it \
+             self-contained: state the goal, the relevant paths/context, any constraints, and \
+             exactly what to report back. You can't steer it once it's running, so prefer one \
+             well-scoped task over a chain of follow-ups.\n\n\
+             Available subagents:{roster}"
         );
         Self {
             configs,

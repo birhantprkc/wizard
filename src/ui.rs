@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
 //! line and a quiet status line. Floating layers: the command-suggestion
-//! popup and the model/mode/rewind picker.
+//! popup and the model/mode/rewind/subagent picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
@@ -33,6 +34,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, InputMode, TranscriptEntry};
 use crate::config::Mode;
+use crate::session_registry::SessionState;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -92,7 +94,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none() && app.plan_review.is_none() {
+    if app.picker.is_none()
+        && app.plan_review.is_none()
+        && !app.show_dashboard
+        && !app.show_subagents
+    {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -100,6 +106,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.plan_review.is_some() {
         draw_plan_review(frame, app);
+    }
+    // The dashboard and subagent monitor are modal and full-screen, so they
+    // paint last (on top). Only one is ever open at a time.
+    if app.show_dashboard {
+        draw_dashboard(frame, app);
+    }
+    if app.show_subagents {
+        draw_subagents(frame, app);
     }
 }
 
@@ -367,6 +381,30 @@ fn transcript_text(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Human label + one-line summary for a tool call. `spawn_subagent` reads as
+/// "subagent <name> · <task>" so the user can see which subagent is working
+/// and on what; every other tool is its own name plus its JSON args. The
+/// summary is returned untruncated — callers clip it to their width.
+fn tool_label(name: &str, args: &serde_json::Value) -> (String, String) {
+    if name == "spawn_subagent" {
+        let who = args.get("subagent").and_then(|v| v.as_str()).unwrap_or("?");
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = if task.is_empty() {
+            who.to_string()
+        } else {
+            format!("{who} · {task}")
+        };
+        ("subagent".to_string(), summary)
+    } else if args.is_null() {
+        (name.to_string(), String::new())
+    } else {
+        (
+            name.to_string(),
+            serde_json::to_string(args).unwrap_or_default(),
+        )
+    }
+}
+
 /// Render one tool invocation as a compact single-line card: status glyph,
 /// tool name in accent, truncated args in dim. Output expands below only
 /// when relevant (errors, or Ctrl-T).
@@ -390,16 +428,9 @@ fn tool_card_lines(
         (Some(_), true) => Span::styled("✗", Style::default().fg(Color::White).bold()),
     };
 
-    let summary = if args.is_null() {
-        String::new()
-    } else {
-        truncate_width(&serde_json::to_string(args).unwrap_or_default(), 64)
-    };
-    let mut card = vec![
-        glyph,
-        Span::raw(" "),
-        Span::styled(name.to_string(), accent()),
-    ];
+    let (label, summary) = tool_label(name, args);
+    let summary = truncate_width(&summary, 64);
+    let mut card = vec![glyph, Span::raw(" "), Span::styled(label, accent())];
     if !summary.is_empty() {
         card.push(Span::styled(format!("  {summary}"), dim()));
     }
@@ -707,7 +738,7 @@ fn draw_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-/// Centered modal for the model / mode / rewind picker.
+/// Centered modal for the model / mode / rewind / subagent picker.
 fn draw_picker(frame: &mut Frame, app: &App) {
     let Some(picker) = &app.picker else {
         return;
@@ -756,15 +787,24 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             // Ellipsize long model tags so the current marker stays visible.
             let suffix = if item.current { " ●".width() } else { 0 };
             let value_room = inner_width.saturating_sub(2 + suffix + 1);
+            let value = truncate_width(&item.value, value_room);
+            // Width consumed so far: marker (2) + value + the current-marker.
+            let consumed = 2 + value.width() + suffix;
             let mut spans = vec![
                 Span::styled(marker, accent()),
-                Span::styled(truncate_width(&item.value, value_room), value_style),
+                Span::styled(value, value_style),
             ];
             if item.current {
                 spans.push(Span::styled(" ●", Style::default().fg(Color::White)));
             }
+            // Truncate the detail to the room left on the line (after a two-space
+            // gap) so long descriptions never spill past the modal border.
             if !item.detail.is_empty() {
-                spans.push(Span::styled(format!("  {}", item.detail), dim()));
+                let room = inner_width.saturating_sub(consumed + 2);
+                if room > 0 {
+                    let detail = truncate_width(&item.detail, room);
+                    spans.push(Span::styled(format!("  {detail}"), dim()));
+                }
             }
             Line::from(spans)
         })
@@ -781,6 +821,372 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
         );
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// A dim "· text" placeholder row for an empty modal section.
+fn dash_bullet(text: &str, style: Style) -> Line<'static> {
+    Line::from(Span::styled(format!("· {text}"), style))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Compact "how long ago" label: `12s`, `4m`, `2h`, `3d`.
+fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Machine-wide session manager (`/dashboard`): every live Wizard session on
+/// the machine, grouped by state, refreshed from the registry while open.
+/// Modal — ↑/↓ move the selection, Esc/q close. Dispatch and attach arrive in
+/// later milestones.
+fn draw_dashboard(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let count = app.sessions.len();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦ ", accent()),
+            Span::styled(
+                "wizard sessions",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ({count} live on this machine)"), dim()),
+        ]))
+        .title_bottom(
+            Line::from(Span::styled(" ↑↓ select · Ctrl-X stop · Esc close ", dim())).centered(),
+        );
+    let outer = block.inner(area);
+    frame.render_widget(block, area);
+    if outer.width < 8 || outer.height < 5 {
+        return;
+    }
+    // On a wide terminal, a peek panel of the selected session sits on the
+    // right; the list and dispatch input take the left.
+    let (body_area, peek_area) = if outer.width >= 80 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .areas(outer);
+        (left, Some(right))
+    } else {
+        (outer, None)
+    };
+    if let Some(peek_area) = peek_area {
+        draw_peek(frame, app, peek_area);
+    }
+    // Reserve the bottom rows for the dispatch input.
+    let [inner, input_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(body_area);
+    let width = inner.width as usize;
+    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+    let now = now_unix();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.sessions.is_empty() {
+        lines.push(dash_bullet("no running sessions", dim().italic()));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "every running wizard registers here — start another to see it appear",
+            dim().italic(),
+        )));
+    } else {
+        // Sessions arrive pre-sorted by state then recency; emit a group header
+        // whenever the state group changes.
+        let mut current_group = "";
+        for (i, session) in app.sessions.iter().enumerate() {
+            let group = session.state.group();
+            if group != current_group {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                lines.push(Line::from(Span::styled(
+                    group.to_string(),
+                    accent().add_modifier(Modifier::BOLD),
+                )));
+                current_group = group;
+            }
+
+            let selected = i == app.dashboard_selected;
+            let marker = if selected { "❯ " } else { "  " };
+            let (icon, icon_style) = match session.state {
+                SessionState::Working => (spinner.to_string(), accent()),
+                SessionState::NeedsInput => ("?".to_string(), accent().bold()),
+                SessionState::Idle => ("·".to_string(), dim()),
+                SessionState::Completed => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
+                SessionState::Failed => ("✗".to_string(), Style::default().fg(Color::White).bold()),
+            };
+            let name_style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_DIM)
+            };
+            // Mark this very session so the user can spot which row is them.
+            let you = if session.id == app.session_id {
+                " (this one)"
+            } else {
+                ""
+            };
+            let age = fmt_age(now.saturating_sub(session.updated_unix));
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(marker, accent()),
+                    Span::styled(format!("{icon} "), icon_style),
+                    Span::styled(format!("{}{you}", session.name), name_style),
+                    Span::styled(format!("  {}", session.activity), dim()),
+                    Span::styled(format!("  · {} · {age}", session.mode), dim()),
+                ]),
+                width,
+            ));
+        }
+    }
+
+    let max = inner.height as usize;
+    if lines.len() > max {
+        lines.truncate(max);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+
+    // Dispatch input: type a task + Enter to spawn a background session.
+    let prompt_line = truncate_line(
+        Line::from(vec![
+            Span::styled("› ", accent()),
+            if app.dashboard_input.is_empty() {
+                Span::styled("dispatch a task…", dim().italic())
+            } else {
+                Span::styled(app.dashboard_input.clone(), Style::default().fg(CODE))
+            },
+        ]),
+        input_area.width as usize,
+    );
+    let hint = Line::from(Span::styled(
+        "Enter dispatch · type to compose",
+        dim().italic(),
+    ));
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![prompt_line, hint])),
+        input_area,
+    );
+}
+
+/// The dashboard's peek panel: the selected session's recent transcript,
+/// role-prefixed, pinned to the latest output. Read-only.
+fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
+    let title = app
+        .sessions
+        .get(app.dashboard_selected)
+        .map(|session| format!(" peek · {} ", session.name))
+        .unwrap_or_else(|| " peek ".to_string());
+    let pblock = Block::new()
+        .borders(Borders::LEFT)
+        .border_style(dim())
+        .title(Line::from(Span::styled(title, accent())));
+    let pinner = pblock.inner(area);
+    frame.render_widget(pblock, area);
+    if pinner.width < 2 || pinner.height < 1 {
+        return;
+    }
+    let pwidth = pinner.width as usize;
+    let height = pinner.height as usize;
+
+    if app.peek_lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("(no transcript yet)", dim().italic())),
+            pinner,
+        );
+        return;
+    }
+
+    // Build only the visible tail: walk messages newest-first, emit each
+    // message's lines bottom-up, and stop once the panel is full. This keeps
+    // rendering O(panel height) instead of O(whole transcript).
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    'outer: for (role, text) in app.peek_lines.iter().rev() {
+        let role_style = match role.as_str() {
+            "user" => accent().add_modifier(Modifier::BOLD),
+            "assistant" => Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD),
+            _ => dim().add_modifier(Modifier::BOLD),
+        };
+        let mut block: Vec<Line<'static>> =
+            vec![Line::from(Span::styled(role.clone(), role_style))];
+        for line in text.lines() {
+            block.push(truncate_line(
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(TEXT_DIM),
+                )),
+                pwidth,
+            ));
+        }
+        for line in block.into_iter().rev() {
+            lines.push(line);
+            if lines.len() >= height {
+                break 'outer;
+            }
+        }
+    }
+    lines.reverse();
+    frame.render_widget(Paragraph::new(Text::from(lines)), pinner);
+}
+
+/// In-session subagent monitor (`/subagents`): the subagents that have run or
+/// are running this session, with live status. Modal — Esc/Enter/q close it —
+/// and reconstructed from the transcript each frame: a `spawn_subagent` card is
+/// one run, and the `<name> ▸ <tool>` cards that follow it are its steps.
+fn draw_subagents(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    // Walk the transcript once, grouping nested `▸` steps under their run.
+    struct Run {
+        name: String,
+        task: String,
+        /// 0 = running, 1 = completed, 2 = failed / hit budget.
+        state: u8,
+        steps: usize,
+        current: Option<String>,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for entry in &app.transcript {
+        let TranscriptEntry::ToolCard {
+            name,
+            args,
+            output,
+            is_error,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        if name == "spawn_subagent" {
+            let who = args
+                .get("subagent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subagent");
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
+            let state = match output {
+                None => 0,
+                Some(_) if *is_error => 2,
+                Some(_) => 1,
+            };
+            runs.push(Run {
+                name: who.to_string(),
+                task: task.to_string(),
+                state,
+                steps: 0,
+                current: None,
+            });
+        } else if let Some(tool) = name.split(" ▸ ").nth(1) {
+            // A nested subagent step belongs to the most recent run.
+            if let Some(run) = runs.last_mut() {
+                run.steps += 1;
+                run.current = if output.is_none() {
+                    Some(tool.to_string())
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦ ", accent()),
+            Span::styled(
+                "subagents · this session",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .title_bottom(Line::from(Span::styled(" Esc close · refreshes live ", dim())).centered());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height < 4 {
+        return;
+    }
+    let width = inner.width as usize;
+    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if runs.is_empty() {
+        lines.push(dash_bullet(
+            "no subagents have run this session",
+            dim().italic(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "the agent delegates via spawn_subagent · /agents to browse the roster",
+            dim().italic(),
+        )));
+    } else {
+        // Running first (there is at most one at a time), then finished newest
+        // first so the latest result is on top.
+        let mut order: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].state == 0).collect();
+        order.extend((0..runs.len()).filter(|&i| runs[i].state != 0).rev());
+        for i in order {
+            let run = &runs[i];
+            let (glyph, style) = match run.state {
+                0 => (spinner.to_string(), accent()),
+                1 => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
+                _ => ("✗".to_string(), Style::default().fg(Color::White).bold()),
+            };
+            let suffix = match run.state {
+                0 => format!(" · step {}", run.steps.max(1)),
+                2 => format!(" · stopped at {} steps", run.steps),
+                _ => format!(" · {} steps", run.steps),
+            };
+            lines.push(truncate_line(
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(
+                        run.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(suffix, dim()),
+                ]),
+                width,
+            ));
+            if !run.task.is_empty() {
+                lines.push(truncate_line(
+                    Line::from(Span::styled(
+                        format!("    {}", run.task),
+                        Style::default().fg(TEXT_DIM),
+                    )),
+                    width,
+                ));
+            }
+            if let Some(current) = &run.current {
+                lines.push(truncate_line(
+                    Line::from(vec![
+                        Span::styled("    ▸ ", accent()),
+                        Span::styled(current.clone(), dim()),
+                    ]),
+                    width,
+                ));
+            }
+        }
+    }
+
+    let max = inner.height as usize;
+    if lines.len() > max {
+        lines.truncate(max);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Plan-review modal (plan mode): the plan markdown with a verdict footer.

@@ -33,7 +33,7 @@ with no recompile.
 3. **Scripted tool.** A small, self-contained shell/Python/JS helper exposed
    as a tool.
 4. **Subagent.** A reusable specialist worker with its own prompt and tool
-   scope.
+   scope. See §2.5 for when and how to delegate to one.
 5. **Deep evolve (source).** None of the above fit and the capability must
    live in Wizard's own Rust. Use `evolve` with `deep=true`: it edits the
    source checkout, rebuilds, smoke-tests, and replaces the running binary,
@@ -62,6 +62,41 @@ absent, install it (a scripted tool or `execute`), or fall back to a scripted
 `curl`/`lynx` fetch tool for read-only tasks. **Try the real thing before
 declaring it impossible.** The same pattern covers databases (a
 Postgres/SQLite MCP server), search, and computer use.
+
+## 2.5. Delegating to subagents
+
+A subagent is an isolated worker spawned with `spawn_subagent(subagent, task)`.
+It runs its own loop with a fresh context, a scoped tool set, and its own step
+budget, then returns a single final report. Its intermediate steps never enter
+your context, so a ten-step sub-task costs you one turn. The user can browse the
+roster any time with `/agents`.
+
+**Delegate when:**
+
+- The work is **self-contained** and you can hand off everything it needs in one
+  task description (a focused investigation, a refactor, running and reading a
+  test suite, writing docs).
+- It would otherwise **flood your context** with output you don't need to keep —
+  grepping a large tree, reading many files to answer one question, sifting long
+  logs. Let the subagent absorb the noise and report the conclusion.
+- A **specialist** fits the job better than the generalist you are right now
+  (e.g. `reviewer` for a read-only code review, `tester` for the test loop).
+
+**Don't delegate** trivial one-tool actions (just call the tool), work that needs
+the user's input mid-flight (a subagent can't ask questions), or a task you can't
+yet describe completely — scope it out yourself first, then hand off the pieces.
+
+**Writing the task.** The subagent sees only the `task` string and its own system
+prompt — not your conversation. Make `task` self-contained: state the goal, the
+relevant paths/context, any constraints, and exactly what to report back. A vague
+task yields a vague report. Prefer one well-scoped task over a chain of follow-ups
+(you can't steer it once it's running).
+
+**Picking the subagent.** Match the job to a roster entry by its description; use
+`worker` (the general-purpose default) when nothing more specific fits. To browse
+what's installed and what each one does, run `/agents`. If you keep needing a
+specialist that doesn't exist, that's a cue to climb the ladder and `evolve` one
+into `~/.wizard/subagents/`.
 
 ## 3. Self-ownership: fork, then distribute
 

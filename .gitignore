@@ -1,4 +1,5 @@
 /target/
+/target-glibc/
 **/*.rs.bk
 *.pdb
 .DS_Store

@@ -197,6 +197,16 @@ impl Tool for ExecuteTool {
                 source: anyhow::Error::new(err).context("failed to spawn background process"),
             })?;
             let id = ctx.tasks.spawn(&args.command, child);
+            // Mirror the new task to the UI dashboard (TaskFinished follows
+            // when it ends). Surfaces that don't care just drop it.
+            if let Some(events) = &ctx.events {
+                let _ = events
+                    .send(crate::agent::AgentEvent::TaskStarted {
+                        id,
+                        command: args.command.clone(),
+                    })
+                    .await;
+            }
             return Ok(ToolOutput::ok(format!(
                 "Background task #{id} started: {}\nYou will be notified when it finishes; \
                  use task_output to inspect it or task_kill to stop it.",

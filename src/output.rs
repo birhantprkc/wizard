@@ -148,6 +148,7 @@ impl EventSink for TextSink {
                 self.spinner
                     .println(&crate::tools::todo::summary_line(&items));
             }
+            AgentEvent::TaskStarted { .. } => {}
             AgentEvent::TaskFinished {
                 id,
                 command,
@@ -262,6 +263,7 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             AgentEvent::ThinkingDelta(_)
             | AgentEvent::HookFired { .. }
             | AgentEvent::TodoUpdated(_)
+            | AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished { .. } => {}
         }
     }
@@ -380,6 +382,13 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                 self.emit(json!({
                     "type": "todo",
                     "items": serde_json::to_value(&items).unwrap_or_default(),
+                }));
+            }
+            AgentEvent::TaskStarted { id, command } => {
+                self.emit(json!({
+                    "type": "task_started",
+                    "id": id,
+                    "command": command,
                 }));
             }
             AgentEvent::TaskFinished {

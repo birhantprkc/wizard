@@ -22,10 +22,12 @@ use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
+use crate::import_claude::{self, ImportSelection};
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::memory::MemoryStore;
 use crate::server;
+use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::skills::Skill;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoItem;
@@ -105,10 +107,19 @@ pub enum SlashCommand {
     /// `/rewind [turn]` — restore file checkpoints and truncate history.
     /// `None` opens the turn picker; `Some` rewinds to before that turn.
     Rewind(Option<u64>),
+    /// `/agents` — open the subagent roster picker (browse the available
+    /// subagents and what each does; Enter pre-fills a delegation request).
+    Agents,
+    /// `/subagents` — toggle the in-session subagent monitor: the subagents
+    /// that have run (or are running) this session, with live status.
+    Subagents,
     /// Toggle the git diff sidebar.
     Diff,
     /// Toggle the todo side panel.
     Todos,
+    /// Toggle the machine-wide session manager: every live Wizard session on
+    /// the machine, grouped by state.
+    Dashboard,
     /// Show session token usage (and cost when rates are configured).
     Cost,
     /// Show the saved project memories.
@@ -129,6 +140,12 @@ pub enum SlashCommand {
     /// `/login <provider>`: OAuth sign-in for providers that support it
     /// (currently `xai`).
     Login(String),
+    /// `/settings` — open the in-app settings menu (a reusable picker).
+    Settings,
+    /// Import the selected artifacts from Claude Code (`~/.claude/`). Not a
+    /// typed command; dispatched from the `/settings` import picker, which is
+    /// why it carries the [`ImportSelection`].
+    ImportClaude(ImportSelection),
     Quit,
 }
 
@@ -267,8 +284,11 @@ impl SlashCommand {
                     .map(|turn| Self::Rewind(Some(turn)))
                     .map_err(|_| "usage: /rewind [turn]".to_string()),
             },
+            "agents" => Ok(Self::Agents),
+            "subagents" => Ok(Self::Subagents),
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
+            "dashboard" => Ok(Self::Dashboard),
             "cost" => Ok(Self::Cost),
             "memory" => Ok(Self::Memory),
             "doctor" => Ok(Self::Doctor),
@@ -282,6 +302,7 @@ impl SlashCommand {
                 Some(provider) => Ok(Self::Login((*provider).to_string())),
                 None => Err("usage: /login xai".to_string()),
             },
+            "settings" => Ok(Self::Settings),
             "quit" | "q" | "exit" => Ok(Self::Quit),
             other => Err(format!("unknown command '/{other}' — try /help")),
         };
@@ -341,6 +362,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         takes_args: false,
     },
     CommandSpec {
+        name: "agents",
+        args: "",
+        description: "browse subagents and delegate to one",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "subagents",
+        args: "",
+        description: "monitor the subagents running in this session",
+        takes_args: false,
+    },
+    CommandSpec {
         name: "evolve",
         args: "[--deep] <desc>",
         description: "self-extend: add a skill, tool, or MCP server",
@@ -383,6 +416,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         takes_args: false,
     },
     CommandSpec {
+        name: "dashboard",
+        args: "",
+        description: "session manager: all live wizard sessions on this machine",
+        takes_args: false,
+    },
+    CommandSpec {
         name: "cost",
         args: "",
         description: "show session token usage and cost",
@@ -398,6 +437,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "status",
         args: "",
         description: "show session status: model, usage, todos, tasks",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "settings",
+        args: "",
+        description: "open the settings menu (change config anytime)",
         takes_args: false,
     },
     CommandSpec {
@@ -489,6 +534,16 @@ pub enum PickerKind {
     Mode,
     /// A turn to rewind to (item values are turn ids).
     Rewind,
+    /// A subagent to delegate to (item values are subagent names). Selecting
+    /// one pre-fills the input with a delegation request rather than running a
+    /// command, since subagents are invoked by the model, not directly.
+    Subagent,
+    /// The settings menu. Rows are dispatched by index against
+    /// [`App::settings_rows`]; toggles mutate config inline and re-open.
+    Settings,
+    /// "Import from Claude Code": a multi-select where Space toggles a row
+    /// (MCP servers / commands / spinner verbs) and Enter runs the import.
+    ClaudeImport,
 }
 
 /// One selectable row in a picker popup.
@@ -573,6 +628,29 @@ pub struct App {
     /// Whether a todo update has arrived yet (drives the one-time
     /// auto-show).
     todos_seen: bool,
+    /// Full-screen agent dashboard visibility (toggled by `/dashboard`).
+    pub show_dashboard: bool,
+    /// In-session subagent monitor visibility (toggled by `/subagents`).
+    pub show_subagents: bool,
+    /// This session's id (heartbeat filename + dashboard identity).
+    pub session_id: String,
+    /// This session's display name (from the first prompt, or the id).
+    pub session_name: String,
+    /// Unix start time, stamped once at registration.
+    pub session_started_unix: u64,
+    /// Live sessions on the machine, refreshed from the registry while the
+    /// dashboard is open.
+    pub sessions: Vec<SessionRecord>,
+    /// Armed by a first Ctrl-C; a second one exits. Disarmed by any other key.
+    pub ctrl_c_armed: bool,
+    /// Selected row in the dashboard list.
+    pub dashboard_selected: usize,
+    /// Dispatch input at the bottom of the dashboard (the prompt for a new
+    /// background session).
+    pub dashboard_input: String,
+    /// Recent transcript of the selected session (role, text), shown in the
+    /// dashboard's peek panel; refreshed as the selection moves.
+    pub peek_lines: Vec<(String, String)>,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
     pub should_quit: bool,
@@ -589,7 +667,7 @@ pub struct App {
     pub custom_commands: Vec<CustomCommand>,
     /// Project root `@file` references resolve against.
     pub project_root: PathBuf,
-    /// Open selection popup (model / mode / rewind picker), if any.
+    /// Open selection popup (model / mode / rewind / subagent picker), if any.
     pub picker: Option<Picker>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
@@ -615,6 +693,10 @@ pub struct App {
     /// Number of verb rolls so far, mixed into the roll seed so back-to-back
     /// turns starting on the same tick still draw fresh verbs.
     verb_rolls: u64,
+    /// Set by the `/settings` "Open config file" row; the main loop (which owns
+    /// the terminal) suspends the TUI, opens `$EDITOR` on the config file, then
+    /// reloads config. Cleared once handled.
+    pub pending_edit_config: bool,
 }
 
 impl App {
@@ -646,6 +728,16 @@ impl App {
             show_todos: false,
             todos: Vec::new(),
             todos_seen: false,
+            show_dashboard: false,
+            show_subagents: false,
+            session_id: String::new(),
+            session_name: String::new(),
+            session_started_unix: 0,
+            sessions: Vec::new(),
+            ctrl_c_armed: false,
+            dashboard_selected: 0,
+            dashboard_input: String::new(),
+            peek_lines: Vec::new(),
             scroll: 0,
             should_quit: false,
             tick: 0,
@@ -663,6 +755,7 @@ impl App {
             rebuilding: None,
             spinner_verb,
             verb_rolls: 0,
+            pending_edit_config: false,
         }
     }
 
@@ -678,6 +771,320 @@ impl App {
     pub fn notice(&mut self, message: impl Into<String>) {
         self.transcript
             .push(TranscriptEntry::Notice(message.into()));
+    }
+
+    /// The settings menu rows, in display order: `(action id, label, current
+    /// value)`. [`open_settings_picker`](Self::open_settings_picker) renders
+    /// the label/value and [`apply_setting`](Self::apply_setting) dispatches by
+    /// the row index, so both share this single ordered source of truth.
+    ///
+    /// Numeric/list fields (`max_steps`, retry/compaction knobs, spinner verbs,
+    /// gateway, …) are intentionally absent — the overlay has no text input, so
+    /// they live behind the "Open config file" row.
+    fn settings_rows(&self) -> Vec<(&'static str, String, String)> {
+        let on = |b: bool| if b { "on" } else { "off" }.to_string();
+        let providers = self.config.providers.len();
+        let import_detail = if import_claude::claude_home().is_some() {
+            "MCP servers, commands, spinner verbs".to_string()
+        } else {
+            "no ~/.claude found".to_string()
+        };
+        let config_path = Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.wizard/config.toml".to_string());
+        vec![
+            ("model", "Model".to_string(), self.config.active().model),
+            ("mode", "Mode".to_string(), self.mode.to_string()),
+            (
+                "plan_first",
+                "Plan mode at startup".to_string(),
+                on(self.config.plan_first),
+            ),
+            (
+                "continuous",
+                "Continuous (sovereign)".to_string(),
+                on(self.config.continuous),
+            ),
+            (
+                "plan_each_cycle",
+                "Plan each cycle".to_string(),
+                on(self.config.plan_each_cycle),
+            ),
+            (
+                "rollback",
+                "Rollback failed cycles".to_string(),
+                on(self.config.rollback_failed_cycles),
+            ),
+            (
+                "web_backend",
+                "Web search backend".to_string(),
+                self.config.web.search_backend.clone(),
+            ),
+            (
+                "web_allow_local",
+                "Web: allow localhost".to_string(),
+                on(self.config.web.allow_local),
+            ),
+            (
+                "fleet_synthesize",
+                "Fleet: synthesis turn".to_string(),
+                on(self.config.fleet.synthesize),
+            ),
+            ("import", "Import from Claude Code".to_string(), import_detail),
+            (
+                "provider",
+                "Manage providers…".to_string(),
+                format!("{providers} configured"),
+            ),
+            ("config_file", "Open config file…".to_string(), config_path),
+        ]
+    }
+
+    /// Open the `/settings` menu as a [`Picker`]. Re-callable: toggles re-open
+    /// it so the new value is visible.
+    pub fn open_settings_picker(&mut self) {
+        let items: Vec<PickerItem> = self
+            .settings_rows()
+            .into_iter()
+            .map(|(_, label, detail)| PickerItem {
+                value: label,
+                detail,
+                current: false,
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Settings,
+            title: " settings · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Dispatch the settings row at `selected`. Routing rows return an
+    /// [`AppAction`] to run a command; inline toggle/cycle rows mutate config,
+    /// persist, and re-open the menu (keeping the cursor on the same row).
+    fn apply_setting(&mut self, selected: usize) -> Option<AppAction> {
+        let rows = self.settings_rows();
+        let (id, _, _) = rows.get(selected)?;
+        match *id {
+            "model" => return Some(AppAction::Command(SlashCommand::Model(None))),
+            "mode" => return Some(AppAction::Command(SlashCommand::Mode(None))),
+            "provider" => {
+                return Some(AppAction::Command(SlashCommand::Provider(
+                    ProviderAction::List,
+                )));
+            }
+            "import" => {
+                self.open_claude_import_picker();
+                return None;
+            }
+            "config_file" => {
+                // Handled by the main loop, which owns the terminal.
+                self.pending_edit_config = true;
+                return None;
+            }
+            "plan_first" => self.config.plan_first = !self.config.plan_first,
+            "continuous" => self.config.continuous = !self.config.continuous,
+            "plan_each_cycle" => self.config.plan_each_cycle = !self.config.plan_each_cycle,
+            "rollback" => {
+                self.config.rollback_failed_cycles = !self.config.rollback_failed_cycles;
+            }
+            "web_allow_local" => self.config.web.allow_local = !self.config.web.allow_local,
+            "fleet_synthesize" => self.config.fleet.synthesize = !self.config.fleet.synthesize,
+            "web_backend" => {
+                self.config.web.search_backend = cycle_backend(&self.config.web.search_backend);
+            }
+            _ => return None,
+        }
+        // Inline change: persist and re-open, restoring the cursor so repeated
+        // toggles stay on the same row. (These flags take effect at the next
+        // cycle / startup, not mid-session.)
+        if let Err(err) = self.config.save() {
+            self.notice(format!("could not save config: {err:#}"));
+        }
+        self.open_settings_picker();
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = selected.min(picker.items.len().saturating_sub(1));
+        }
+        None
+    }
+
+    /// Open the "import from Claude Code" multi-select. Each row is a toggleable
+    /// artifact (Space toggles, Enter runs); order is mcp / commands / verbs to
+    /// match the [`ImportSelection`] built in the Enter handler.
+    fn open_claude_import_picker(&mut self) {
+        if import_claude::claude_home().is_none() {
+            self.notice("no Claude Code install found (~/.claude)");
+            return;
+        }
+        let (mcp, commands, verbs) = import_claude::counts();
+        let items = vec![
+            PickerItem {
+                value: format!("MCP servers ({mcp})"),
+                detail: "merge into ~/.wizard/mcp.toml".to_string(),
+                current: false,
+            },
+            PickerItem {
+                value: format!("Custom commands ({commands})"),
+                detail: "copy into ~/.wizard/commands/".to_string(),
+                current: false,
+            },
+            PickerItem {
+                value: format!("Spinner verbs ({verbs})"),
+                detail: "adopt Claude Code's spinner verbs".to_string(),
+                current: false,
+            },
+        ];
+        self.picker = Some(Picker {
+            kind: PickerKind::ClaudeImport,
+            title: " import from claude code · space toggles · enter runs ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Current state for this session's heartbeat: needs-input when paused on a
+    /// plan review, working while a turn streams, otherwise idle.
+    fn session_state(&self) -> SessionState {
+        if self.plan_review.is_some() {
+            SessionState::NeedsInput
+        } else if self.status.busy {
+            SessionState::Working
+        } else {
+            SessionState::Idle
+        }
+    }
+
+    /// One-line summary of what this session is doing, for the dashboard row.
+    fn session_activity(&self) -> String {
+        if self.plan_review.is_some() {
+            return "waiting for plan approval".to_string();
+        }
+        if !self.status.busy {
+            return "idle".to_string();
+        }
+        // The newest in-flight tool call reads best; fall back to the verb.
+        for entry in self.transcript.iter().rev() {
+            if let TranscriptEntry::ToolCard {
+                name, output: None, ..
+            } = entry
+            {
+                return name.clone();
+            }
+        }
+        format!("{}…", self.spinner_verb)
+    }
+
+    /// Build this session's heartbeat record from current state.
+    pub fn session_record(&self) -> SessionRecord {
+        SessionRecord {
+            id: self.session_id.clone(),
+            name: self.session_name.clone(),
+            cwd: self.project_root.display().to_string(),
+            model: self.status.model.clone(),
+            mode: self.mode.to_string(),
+            state: self.session_state(),
+            activity: self.session_activity(),
+            pid: std::process::id(),
+            started_unix: self.session_started_unix,
+            updated_unix: 0, // stamped by session_registry::write
+        }
+    }
+
+    /// Reload the live-session list from the registry, keeping the selection
+    /// in range. Cheap (a few small files); safe to poll. The peek panel is
+    /// refreshed separately on a slower cadence — see [`App::refresh_peek`].
+    pub fn refresh_sessions(&mut self) {
+        self.sessions = session_registry::list();
+        if self.dashboard_selected >= self.sessions.len() {
+            self.dashboard_selected = self.sessions.len().saturating_sub(1);
+        }
+    }
+
+    /// Reload the peek panel with the selected session's recent transcript.
+    /// Reads only the tail of the session file, so it is cheap enough to call
+    /// on selection changes and a ~1s poll, but not every frame.
+    pub fn refresh_peek(&mut self) {
+        self.peek_lines = match self.sessions.get(self.dashboard_selected) {
+            Some(session) => crate::agent::session::peek(&session.id, 50),
+            None => Vec::new(),
+        };
+    }
+
+    /// Spawn a detached background session for `prompt`: a headless sovereign
+    /// `wizard --bg` run that registers in the session registry, so it shows up
+    /// in every dashboard on the machine and survives this session exiting.
+    fn dispatch_session(&mut self, prompt: String) {
+        use std::os::unix::process::CommandExt;
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                self.notice(format!("could not locate the wizard binary: {err}"));
+                return;
+            }
+        };
+        let spawned = std::process::Command::new(exe)
+            .arg("--bg")
+            .arg("--mode")
+            .arg("sovereign")
+            .arg("-p")
+            .arg(&prompt)
+            .arg("--cwd")
+            .arg(&self.project_root)
+            .current_dir(&self.project_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Own process group: detached from the TUI's job control, and
+            // killable as a group when stopped.
+            .process_group(0)
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                self.notice(format!("dispatched background session: {prompt}"));
+                self.refresh_sessions();
+            }
+            Err(err) => self.notice(format!("dispatch failed: {err}")),
+        }
+    }
+
+    /// Stop the selected background session (Ctrl-X): SIGTERM its process group
+    /// and drop its registry row. Refuses to stop the session you're in.
+    fn stop_selected_session(&mut self) {
+        let Some(session) = self.sessions.get(self.dashboard_selected) else {
+            return;
+        };
+        if session.id == self.session_id {
+            self.notice("that's this session — use /quit to leave it");
+            return;
+        }
+        let (id, name, pid) = (session.id.clone(), session.name.clone(), session.pid as i32);
+        // Signal the whole group (dispatched sessions are group leaders, so
+        // their tool subprocesses die too); fall back to the bare pid.
+        unsafe {
+            if libc::kill(-pid, libc::SIGTERM) != 0 {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        session_registry::remove(&id);
+        self.notice(format!("stopped session: {name}"));
+        self.refresh_sessions();
+    }
+
+    /// Move the dashboard selection up/down, clamped to the session list.
+    fn dashboard_select(&mut self, delta: isize) {
+        let len = self.sessions.len();
+        if len == 0 {
+            self.dashboard_selected = 0;
+            return;
+        }
+        let last = len - 1;
+        self.dashboard_selected = match delta {
+            d if d < 0 => self.dashboard_selected.checked_sub(1).unwrap_or(last),
+            _ if self.dashboard_selected >= last => 0,
+            _ => self.dashboard_selected + 1,
+        };
+        self.refresh_peek();
     }
 
     /// Recompute [`InputMode`] from the input text, then refresh the command
@@ -905,6 +1312,17 @@ impl App {
             Event::Resize(_, _) => Ok(None),
             Event::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                // Keep the dashboard's session list current while it's open.
+                if self.show_dashboard {
+                    // List is cheap (small files); peek reads a transcript tail
+                    // so poll it less often.
+                    if self.tick.is_multiple_of(4) {
+                        self.refresh_sessions();
+                    }
+                    if self.tick.is_multiple_of(10) {
+                        self.refresh_peek();
+                    }
+                }
                 Ok(None)
             }
             Event::Agent(agent_event) => {
@@ -928,10 +1346,32 @@ impl App {
             return Ok(None);
         }
 
+        // Any key other than Ctrl-C disarms the "press again to exit" latch.
+        let is_ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        if !is_ctrl_c {
+            self.ctrl_c_armed = false;
+        }
+
         // Global chords, regardless of input mode.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') | KeyCode::Char('d') => {
+                KeyCode::Char('c') => {
+                    // Once interrupts a running turn; pressed again (while
+                    // armed) it exits. Idle: first press arms, second exits.
+                    if self.ctrl_c_armed {
+                        self.should_quit = true;
+                        return Ok(None);
+                    }
+                    self.ctrl_c_armed = true;
+                    if self.status.busy {
+                        self.notice("interrupting… (Ctrl-C again to exit)");
+                        return Ok(Some(AppAction::Interrupt));
+                    }
+                    self.notice("press Ctrl-C again to exit");
+                    return Ok(None);
+                }
+                KeyCode::Char('d') => {
                     self.should_quit = true;
                     return Ok(None);
                 }
@@ -978,6 +1418,48 @@ impl App {
             }
         }
 
+        // The dashboard is modal: ↑/↓ move the selection, typing fills the
+        // dispatch input, Enter dispatches a background session, Ctrl-X stops
+        // the selected one, Esc clears the input or closes. (Enter will also
+        // attach to the selected session once the supervisor lands.)
+        if self.show_dashboard {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => self.dashboard_select(-1),
+                KeyCode::Down | KeyCode::Tab => self.dashboard_select(1),
+                KeyCode::Char('x') if ctrl => self.stop_selected_session(),
+                KeyCode::Enter => {
+                    let prompt = self.dashboard_input.trim().to_string();
+                    if !prompt.is_empty() {
+                        self.dashboard_input.clear();
+                        self.dispatch_session(prompt);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.dashboard_input.pop();
+                }
+                KeyCode::Esc => {
+                    if self.dashboard_input.is_empty() {
+                        self.show_dashboard = false;
+                    } else {
+                        self.dashboard_input.clear();
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => self.dashboard_input.push(c),
+                _ => {}
+            }
+            return Ok(None);
+        }
+
+        // The subagent monitor is modal too: Esc / Enter / q close it; other
+        // keys are swallowed. It refreshes from live App state each frame.
+        if self.show_subagents {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                self.show_subagents = false;
+            }
+            return Ok(None);
+        }
+
         // An open plan review captures all keys: the turn is paused inside
         // exit_plan until a verdict is sent.
         if self.plan_review.is_some() {
@@ -1001,6 +1483,12 @@ impl App {
                     } else {
                         picker.selected + 1
                     };
+                }
+                // Space toggles a checkbox row in the Claude-import multi-select.
+                KeyCode::Char(' ') if picker.kind == PickerKind::ClaudeImport => {
+                    if let Some(item) = picker.items.get_mut(picker.selected) {
+                        item.current = !item.current;
+                    }
                 }
                 KeyCode::Esc => {
                     self.picker = None;
@@ -1028,6 +1516,35 @@ impl App {
                                 return Ok(None);
                             };
                             AppAction::Command(SlashCommand::Rewind(Some(turn)))
+                        }
+                        PickerKind::Subagent => {
+                            // Subagents are spawned by the model, not run as a
+                            // command. Pre-fill a delegation request so the user
+                            // just types the task and submits.
+                            self.set_input(format!("Use the {} subagent to ", item.value));
+                            return Ok(None);
+                        }
+                        PickerKind::Settings => {
+                            let selected = picker.selected;
+                            return Ok(self.apply_setting(selected));
+                        }
+                        PickerKind::ClaudeImport => {
+                            // Build the selection from the toggled rows (order
+                            // matches `open_claude_import_picker`: mcp, commands,
+                            // verbs) and hand off to the command handler, which
+                            // has the live MCP manager.
+                            let flags: Vec<bool> =
+                                picker.items.iter().map(|i| i.current).collect();
+                            let selection = ImportSelection {
+                                mcp: flags.first().copied().unwrap_or(false),
+                                commands: flags.get(1).copied().unwrap_or(false),
+                                verbs: flags.get(2).copied().unwrap_or(false),
+                            };
+                            if selection.is_empty() {
+                                self.notice("nothing selected to import");
+                                return Ok(None);
+                            }
+                            AppAction::Command(SlashCommand::ImportClaude(selection))
                         }
                     };
                     return Ok(Some(action));
@@ -1447,6 +1964,9 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
+            // TaskStarted is mirrored to the gateway's JSON stream (see
+            // output.rs); the TUI surfaces only the finish notice.
+            AgentEvent::TaskStarted { .. } => {}
             AgentEvent::TaskFinished {
                 id,
                 command,
@@ -1495,6 +2015,9 @@ pub enum AppAction {
     Submit(String),
     /// Execute a parsed slash command.
     Command(SlashCommand),
+    /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
+    /// the agent from the last session.
+    Interrupt,
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,6 +2037,70 @@ fn setup_terminal() -> Result<Tui> {
     )
     .context("entering alternate screen")?;
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
+}
+
+/// Suspend the TUI, open `$VISUAL`/`$EDITOR` on `~/.wizard/config.toml`, then
+/// restore the TUI and reload the edited config. Driven by the `/settings`
+/// "Open config file" row; runs from the main loop because it owns `terminal`.
+/// Falls back to a path notice when no editor is configured.
+fn edit_config_file(app: &mut App, terminal: &mut Tui) {
+    let path = match Config::path() {
+        Ok(path) => path,
+        Err(err) => {
+            app.notice(format!("could not locate config: {err:#}"));
+            return;
+        }
+    };
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_default();
+    if editor.trim().is_empty() {
+        app.notice(format!(
+            "no $EDITOR set — edit {} by hand, then /reload",
+            path.display()
+        ));
+        return;
+    }
+
+    // Leave the alternate screen so the editor draws on the real terminal.
+    if let Err(err) = restore_terminal() {
+        app.notice(format!("could not suspend the TUI: {err:#}"));
+        return;
+    }
+    // `sh -c` so editors with flags ("code --wait", "emacsclient -t") work.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"{}\"", path.display()))
+        .status();
+
+    // Re-enter the TUI regardless of how the editor exited.
+    match setup_terminal() {
+        Ok(new_terminal) => {
+            *terminal = new_terminal;
+            let _ = terminal.clear();
+        }
+        Err(err) => {
+            app.notice(format!("could not restore the TUI: {err:#} — /quit and relaunch"));
+            return;
+        }
+    }
+
+    match status {
+        Ok(status) if status.success() => match Config::load() {
+            Ok(config) => {
+                app.config = config;
+                app.mode = app.config.mode;
+                app.status.mode = app.config.mode;
+                app.status.model = app.config.active().model;
+                app.notice(
+                    "config reloaded — restart for provider/model changes to take effect",
+                );
+            }
+            Err(err) => app.notice(format!("config not reloaded (parse error): {err:#}")),
+        },
+        Ok(_) => app.notice("editor exited without success — config not reloaded"),
+        Err(err) => app.notice(format!("could not launch editor: {err:#}")),
+    }
 }
 
 fn restore_terminal() -> Result<()> {
@@ -1740,6 +2327,8 @@ const HELP_TEXT: &str = "available commands:\n  \
 /genie · /sovereign         switch mode directly\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
+/agents                     browse subagents and delegate to one\n  \
+/subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider [list|use|...]    add, remove, or switch LLM providers (llamacpp/ollama/openai/anthropic/openrouter/xai/xaioauth)\n  \
@@ -1748,9 +2337,11 @@ const HELP_TEXT: &str = "available commands:\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
 /todos                      toggle the todo side panel\n  \
+/dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
+/settings                   open the settings menu (change config anytime)\n  \
 /doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
 /quit                       exit\n\
 keys:\n  \
@@ -1769,6 +2360,17 @@ Ctrl-C                      quit";
 /// True for backends that run on this machine (no API key, no cloud).
 fn is_local_kind(kind: ProviderKind) -> bool {
     matches!(kind, ProviderKind::LlamaCpp | ProviderKind::Ollama)
+}
+
+/// Rotate the `web_search` backend for the settings menu's cycle row:
+/// duckduckgo → brave → tavily → duckduckgo.
+fn cycle_backend(current: &str) -> String {
+    match current {
+        "duckduckgo" => "brave",
+        "brave" => "tavily",
+        _ => "duckduckgo",
+    }
+    .to_string()
 }
 
 /// Build `provider`'s client and prove it usable: for local llama.cpp this
@@ -1971,9 +2573,43 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     // sovereign in-session.
     let genie_max_steps = config.max_steps;
 
+    // Identity for this session's dashboard heartbeat.
+    let session_id = agent_slot
+        .as_ref()
+        .map(|agent| agent.session().id.clone())
+        .unwrap_or_default();
+    let session_name = cli
+        .prompt
+        .as_deref()
+        .and_then(|prompt| prompt.lines().next())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.chars().take(48).collect::<String>())
+        .unwrap_or_else(|| {
+            // No prompt: name the session after its working directory.
+            project_root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "session".to_string())
+        });
+
     let mut app = App::new(config);
     app.project_root = project_root.clone();
     app.custom_commands = crate::commands::load(&project_root);
+    app.session_id = session_id.clone();
+    app.session_name = session_name;
+    app.session_started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Register this session so other sessions' /dashboard can see it.
+    crate::session_registry::write(&app.session_record());
+    // `wizard agents` opens straight into the dashboard.
+    if matches!(cli.command, Some(crate::cli::Command::Agents)) {
+        app.show_dashboard = true;
+        app.refresh_sessions();
+        app.refresh_peek();
+    }
     if let Some(prompt) = cli.prompt.clone() {
         app.set_input(prompt);
     }
@@ -1997,8 +2633,16 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
 
+    let mut last_heartbeat = Instant::now();
+
     loop {
         terminal.draw(|frame| crate::ui::draw(frame, &app))?;
+
+        // Refresh this session's heartbeat so other dashboards see it live.
+        if last_heartbeat.elapsed() >= Duration::from_secs(3) {
+            session_registry::write(&app.session_record());
+            last_heartbeat = Instant::now();
+        }
 
         let Some(event) = events.next().await else {
             break;
@@ -2083,7 +2727,61 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     .run(command)
                     .await;
                 }
+                AppAction::Interrupt => {
+                    // Cancel the running turn by aborting its task; the agent
+                    // moved into it is lost, so rebuild from the last session
+                    // (same path as crash recovery).
+                    if let Some(handle) = agent_task.take() {
+                        handle.abort();
+                        app.flush_streaming();
+                        app.status.busy = false;
+                        app.status.step = 0;
+                        app.turn_started = None;
+                        app.notice("interrupted");
+                        app.rebuilding = Some("restarting agent".to_string());
+                        let client = client.clone();
+                        let config = app.config.clone();
+                        let skills = skills.clone();
+                        let project_root = project_root.clone();
+                        let manager = Arc::clone(&manager);
+                        let notify = events.sender();
+                        tokio::spawn(async move {
+                            let manager = manager.lock().await;
+                            let rebuild = match build_agent(
+                                &client,
+                                &config,
+                                &skills,
+                                &project_root,
+                                &manager,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(agent) => AgentRebuild {
+                                    agent: Some(agent),
+                                    model: None,
+                                    notice: "ready".to_string(),
+                                },
+                                Err(err) => AgentRebuild {
+                                    agent: None,
+                                    model: None,
+                                    notice: format!(
+                                        "could not restart the agent: {err:#} — /quit and relaunch"
+                                    ),
+                                },
+                            };
+                            let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+                        });
+                    }
+                }
             }
+        }
+
+        // The `/settings` "Open config file" row asks the main loop (the
+        // terminal owner) to suspend the TUI and run an external editor.
+        if app.pending_edit_config {
+            app.pending_edit_config = false;
+            edit_config_file(&mut app, &mut terminal);
         }
 
         if turn_done && let Some(handle) = agent_task.take() {
@@ -2142,6 +2840,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         agent.fire_session_end(None).await;
     }
 
+    // Drop this session's heartbeat so it leaves the dashboard immediately.
+    session_registry::remove(&app.session_id);
+
     drop(_guard);
     restore_terminal_best_effort();
     Ok(0)
@@ -2169,6 +2870,8 @@ impl CommandContext<'_> {
             SlashCommand::Quit => self.app.should_quit = true,
             SlashCommand::Diff => self.toggle_diff().await,
             SlashCommand::Todos => self.toggle_todos(),
+            SlashCommand::Dashboard => self.toggle_dashboard(),
+            SlashCommand::Subagents => self.toggle_subagents(),
             SlashCommand::Cost => self.cost(),
             SlashCommand::Memory => self.memory(),
             SlashCommand::Doctor => self.doctor().await,
@@ -2181,12 +2884,15 @@ impl CommandContext<'_> {
             SlashCommand::Plan => self.toggle_plan(),
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
+            SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
             SlashCommand::Provider(action) => self.provider(action).await,
             SlashCommand::Server(action) => self.server(action).await,
             SlashCommand::Login(provider) => self.login(provider),
+            SlashCommand::Settings => self.app.open_settings_picker(),
+            SlashCommand::ImportClaude(selection) => self.import_claude(selection).await,
         }
     }
 
@@ -2222,6 +2928,27 @@ impl CommandContext<'_> {
         if self.app.show_todos && self.app.todos.is_empty() {
             self.app
                 .notice("todo list is empty — the agent fills it via the `todo` tool");
+        }
+    }
+
+    /// `/dashboard`: toggle the machine-wide session manager. On open, refresh
+    /// the live-session list from the registry; the event loop keeps it current
+    /// while it's up.
+    fn toggle_dashboard(&mut self) {
+        self.app.show_dashboard = !self.app.show_dashboard;
+        if self.app.show_dashboard {
+            self.app.show_subagents = false;
+            self.app.refresh_sessions();
+            self.app.refresh_peek();
+        }
+    }
+
+    /// `/subagents`: toggle the in-session subagent monitor.
+    fn toggle_subagents(&mut self) {
+        self.app.show_subagents = !self.app.show_subagents;
+        // Mutually exclusive with the dashboard so only one modal is up.
+        if self.app.show_subagents {
+            self.app.show_dashboard = false;
         }
     }
 
@@ -2425,6 +3152,42 @@ impl CommandContext<'_> {
         });
     }
 
+    /// `/agents`: open the subagent roster picker. Lists the built-in and
+    /// user-defined subagents with their purpose, tool scope, and step budget.
+    /// Selecting one pre-fills a delegation request (subagents are spawned by
+    /// the model, so this isn't a direct command).
+    fn open_agents_picker(&mut self) {
+        let dir = Config::subagents_dir().unwrap_or_default();
+        let configs = subagent::available_configs(&dir);
+        if configs.is_empty() {
+            self.app.notice("no subagents available");
+            return;
+        }
+        let items: Vec<PickerItem> = configs
+            .into_iter()
+            .map(|config| {
+                let scope = match &config.tool_scope {
+                    None => "all tools".to_string(),
+                    Some(names) => names.join(", "),
+                };
+                PickerItem {
+                    detail: format!(
+                        "{} · {scope} · {} steps",
+                        config.description, config.max_steps
+                    ),
+                    value: config.name,
+                    current: false,
+                }
+            })
+            .collect();
+        self.app.picker = Some(Picker {
+            kind: PickerKind::Subagent,
+            title: " delegate to subagent ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
     /// `/plan` (and Shift+Tab): toggle plan mode on the live agent.
     fn toggle_plan(&mut self) {
         if self.agent_unavailable("toggle plan mode") {
@@ -2554,6 +3317,8 @@ impl CommandContext<'_> {
             }
         }
         self.app.status.max_steps = self.app.config.max_steps;
+        // Persist so the mode survives a restart (consistent with /provider).
+        self.persist_config();
         self.app.notice(format!("switched to {mode} mode"));
     }
 
@@ -2596,6 +3361,61 @@ impl CommandContext<'_> {
             }
             Err(err) => self.app.notice(format!("reload failed: {err:#}")),
         }
+    }
+
+    /// Run a Claude Code import (dispatched from the `/settings` import
+    /// picker), then reload custom commands + MCP servers live so the imported
+    /// artifacts take effect without a restart.
+    async fn import_claude(&mut self, selection: ImportSelection) {
+        if self.agent_unavailable("import from Claude Code") {
+            return;
+        }
+        let outcome = match import_claude::run_import(&selection) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.app.notice(format!("Claude Code import failed: {err:#}"));
+                return;
+            }
+        };
+
+        // Adopt the imported spinner verbs (replacing the active list).
+        if !outcome.spinner_verbs.is_empty() {
+            self.app.config.ui.spinner_verbs = outcome.spinner_verbs.clone();
+            self.persist_config();
+        }
+
+        // Reload custom commands + MCP servers and rebuild the live tool
+        // registry (mirrors `reload`) so imports are usable immediately.
+        self.app.custom_commands = crate::commands::load(self.project_root);
+        let mut manager = self.manager.lock().await;
+        match McpConfig::load(self.mcp_path) {
+            Ok(mcp_config) => {
+                if let Err(err) = manager.reload(&mcp_config).await {
+                    self.app.notice(format!("MCP reload warning: {err:#}"));
+                }
+            }
+            Err(err) => self
+                .app
+                .notice(format!("could not reload MCP config: {err:#}")),
+        }
+        if let Some(hooks) = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| Arc::clone(agent.hooks()))
+            && let Ok(registry) = build_registry(&manager, self.client, &hooks).await
+            && let Some(agent) = self.agent_slot.as_mut()
+        {
+            agent.set_registry(registry);
+            agent.set_skills(self.skills.clone());
+        }
+        drop(manager);
+
+        let summary = outcome.summary();
+        self.app.notice(if summary.is_empty() {
+            "nothing to import from Claude Code".to_string()
+        } else {
+            format!("imported from Claude Code:\n{summary}")
+        });
     }
 
     fn evolve(&mut self, deep: bool, description: String) {
@@ -3040,6 +3860,11 @@ mod tests {
             .expect("key handled")
     }
 
+    fn press_ctrl(app: &mut App, c: char) -> Option<AppAction> {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            .expect("key handled")
+    }
+
     fn type_str(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
@@ -3476,6 +4301,158 @@ mod tests {
         let action = press(&mut app, KeyCode::Esc);
         assert!(action.is_none());
         assert!(app.picker.is_none(), "Esc closed the picker");
+    }
+
+    #[test]
+    fn agents_and_subagents_parse_to_distinct_commands() {
+        // /agents opens the roster picker; /subagents opens the in-session
+        // monitor — they are no longer aliases.
+        assert!(matches!(
+            SlashCommand::parse("/agents"),
+            Some(Ok(SlashCommand::Agents))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/subagents"),
+            Some(Ok(SlashCommand::Subagents))
+        ));
+    }
+
+    #[test]
+    fn subagent_picker_selection_prefills_a_delegation_request() {
+        let mut app = app();
+        app.picker = Some(Picker {
+            kind: PickerKind::Subagent,
+            title: " delegate to subagent ".to_string(),
+            items: vec![
+                PickerItem {
+                    value: "worker".to_string(),
+                    detail: "general-purpose".to_string(),
+                    current: false,
+                },
+                PickerItem {
+                    value: "reviewer".to_string(),
+                    detail: "code review".to_string(),
+                    current: false,
+                },
+            ],
+            selected: 0,
+        });
+        press(&mut app, KeyCode::Down);
+        let action = press(&mut app, KeyCode::Enter);
+        // Subagents are model-invoked, so Enter pre-fills input instead of
+        // emitting a command.
+        assert!(action.is_none());
+        assert!(app.picker.is_none(), "the picker closed");
+        assert_eq!(app.input, "Use the reviewer subagent to ");
+        assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn ctrl_c_idle_arms_then_exits() {
+        let mut app = app();
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.ctrl_c_armed);
+        assert!(!app.should_quit, "first press only arms");
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.should_quit, "second press exits");
+    }
+
+    #[test]
+    fn ctrl_c_busy_interrupts_then_exits() {
+        let mut app = app();
+        app.status.busy = true;
+        // First press while busy interrupts the turn, doesn't quit.
+        assert!(matches!(
+            press_ctrl(&mut app, 'c'),
+            Some(AppAction::Interrupt)
+        ));
+        assert!(!app.should_quit);
+        // Armed now: a second press exits even while busy.
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn any_other_key_disarms_ctrl_c() {
+        let mut app = app();
+        press_ctrl(&mut app, 'c');
+        assert!(app.ctrl_c_armed);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.ctrl_c_armed);
+        // So the next Ctrl-C re-arms rather than quitting.
+        assert!(press_ctrl(&mut app, 'c').is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn dashboard_command_parses() {
+        assert!(matches!(
+            SlashCommand::parse("/dashboard"),
+            Some(Ok(SlashCommand::Dashboard))
+        ));
+    }
+
+    #[test]
+    fn dashboard_navigates_and_esc_closes() {
+        use crate::session_registry::{SessionRecord, SessionState};
+        let mut app = app();
+        let make = |id: &str, state: SessionState| SessionRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            cwd: "/tmp".to_string(),
+            model: "m".to_string(),
+            mode: "genie".to_string(),
+            state,
+            activity: String::new(),
+            pid: 1,
+            started_unix: 0,
+            updated_unix: 0,
+        };
+        app.sessions = vec![
+            make("a", SessionState::Working),
+            make("b", SessionState::Idle),
+        ];
+        app.show_dashboard = true;
+
+        // ↓ moves the selection and wraps; ↑ wraps back.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.dashboard_selected, 1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.dashboard_selected, 0, "wraps to the top");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.dashboard_selected, 1, "wraps to the bottom");
+
+        // Esc closes the modal.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_dashboard);
+    }
+
+    #[test]
+    fn dashboard_input_composes_and_esc_clears_then_closes() {
+        let mut app = app();
+        app.show_dashboard = true;
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.dashboard_input, "hi");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.dashboard_input, "h");
+        // Esc with text clears it but keeps the modal open.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.dashboard_input, "");
+        assert!(app.show_dashboard);
+        // Esc again, now empty, closes the modal.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_dashboard);
+    }
+
+    #[test]
+    fn session_record_reflects_state() {
+        let mut app = app();
+        app.session_id = "sess-1".to_string();
+        app.session_name = "fix bug".to_string();
+        assert_eq!(app.session_record().state, SessionState::Idle);
+        app.status.busy = true;
+        assert_eq!(app.session_record().state, SessionState::Working);
     }
 
     #[test]
