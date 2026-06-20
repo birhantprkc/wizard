@@ -818,7 +818,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             Span::styled(picker.title.clone(), Style::default().fg(TEXT_DIM)),
         ]))
         .title_bottom(
-            Line::from(Span::styled(" ↑↓ move · Enter select · Esc cancel ", dim())).centered(),
+            Line::from(Span::styled(picker.footer_hint(), dim())).centered(),
         );
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }

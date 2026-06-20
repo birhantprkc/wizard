@@ -567,6 +567,20 @@ pub struct Picker {
     pub selected: usize,
 }
 
+impl Picker {
+    /// Footer hint shown along the modal's bottom border. The Claude-import
+    /// picker is a multi-select (Space toggles, Enter runs), so it needs a
+    /// different hint than the Enter-to-select pickers.
+    pub fn footer_hint(&self) -> &'static str {
+        match self.kind {
+            PickerKind::ClaudeImport => {
+                " ↑↓ move · space toggles · enter runs · Esc cancel "
+            }
+            _ => " ↑↓ move · Enter select · Esc cancel ",
+        }
+    }
+}
+
 /// In-flight plan review (plan mode): the model called `exit_plan` and the
 /// turn is paused inside the tool until a [`PlanVerdict`] is sent back.
 #[derive(Debug)]
