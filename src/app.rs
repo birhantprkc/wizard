@@ -15,7 +15,9 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentEvent, DoneReason, PlanVerdict, session::Session, subagent};
+use crate::agent::{
+    Agent, AgentEvent, CompactOutcome, DoneReason, PlanVerdict, session::Session, subagent,
+};
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
@@ -136,6 +138,9 @@ pub enum SlashCommand {
     /// `/resume [id]` — reopen a past session and continue it. `None` opens
     /// the session picker; `Some` resumes that session id directly.
     Resume(Option<String>),
+    /// `/compact` — summarize older history into a progress note now, instead
+    /// of waiting for the automatic threshold.
+    Compact,
     /// `/agents` — open the subagent roster picker (browse the available
     /// subagents and what each does; Enter pre-fills a delegation request).
     Agents,
@@ -375,6 +380,7 @@ impl SlashCommand {
                     .map_err(|_| "usage: /rewind [turn]".to_string()),
             },
             "resume" => Ok(Self::Resume(args.first().map(|s| s.to_string()))),
+            "compact" => Ok(Self::Compact),
             "agents" => Ok(Self::Agents),
             "subagents" => Ok(Self::Subagents),
             "diff" => Ok(Self::Diff),
@@ -456,6 +462,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "resume",
         args: "",
         description: "reopen and continue a past session",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "compact",
+        args: "",
+        description: "summarize older history into a progress note now",
         takes_args: false,
     },
     CommandSpec {
@@ -823,6 +835,12 @@ pub struct App {
     /// the terminal) suspends the TUI, opens `$EDITOR` on the config file, then
     /// reloads config. Cleared once handled.
     pub pending_edit_config: bool,
+    /// Set by `/compact`; the main loop takes the agent and runs compaction in
+    /// the background. Cleared once the task is spawned.
+    pub pending_compact: bool,
+    /// True while a background `/compact` is running: the status bar shows an
+    /// animated progress bar instead of its usual contents.
+    pub compacting: bool,
 }
 
 impl App {
@@ -883,6 +901,8 @@ impl App {
             spinner_verb,
             verb_rolls: 0,
             pending_edit_config: false,
+            pending_compact: false,
+            compacting: false,
         }
     }
 
@@ -2863,6 +2883,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
 /resume                     reopen and continue a past session\n  \
+/compact                    summarize older history into a progress note now\n  \
 /agents                     browse subagents and delegate to one\n  \
 /subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
@@ -3192,6 +3213,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         if let Event::AgentRebuilt(rebuild) = event {
             let rebuild = *rebuild;
             app.rebuilding = None;
+            app.compacting = false;
             if let Some(model) = rebuild.model {
                 app.config.model = model.clone();
                 app.status.model = model;
@@ -3347,6 +3369,37 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             edit_config_file(&mut app, &mut terminal);
         }
 
+        // `/compact`: take the agent and summarize history off the event loop
+        // so the TUI keeps animating the progress bar. The agent returns via
+        // Event::AgentRebuilt, the same path as crash recovery.
+        if app.pending_compact {
+            app.pending_compact = false;
+            match agent_slot.take() {
+                Some(mut agent) => {
+                    app.compacting = true;
+                    let notify = events.sender();
+                    tokio::spawn(async move {
+                        let notice = match agent.compact_now().await {
+                            CompactOutcome::Nothing => "nothing to compact yet".to_string(),
+                            CompactOutcome::Summarized(count) => {
+                                format!("compacted {count} messages into a summary")
+                            }
+                            CompactOutcome::Truncated { count, error } => format!(
+                                "compacted {count} messages by truncation (summary failed: {error})"
+                            ),
+                        };
+                        let rebuild = AgentRebuild {
+                            agent: Some(agent),
+                            model: None,
+                            notice,
+                        };
+                        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+                    });
+                }
+                None => app.notice("the agent is busy — try again in a moment"),
+            }
+        }
+
         if turn_done && let Some(handle) = agent_task.take() {
             match handle.await {
                 Ok(agent) => agent_slot = Some(agent),
@@ -3450,6 +3503,7 @@ impl CommandContext<'_> {
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
             SlashCommand::Resume(None) => self.app.open_resume_picker(),
             SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
+            SlashCommand::Compact => self.request_compact(),
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
@@ -3932,6 +3986,24 @@ impl CommandContext<'_> {
         crate::session_registry::write(&self.app.session_record());
         self.app
             .notice(format!("resumed session {resumed_id} · {turns} turns"));
+    }
+
+    /// `/compact`: ask the main loop to run compaction in the background (it
+    /// owns the agent slot). Guarded so it can't stack on a busy/rebuilding
+    /// agent or a compaction already in flight.
+    fn request_compact(&mut self) {
+        if self.agent_unavailable("compact") {
+            return;
+        }
+        if self.app.compacting {
+            self.app.notice("already compacting");
+            return;
+        }
+        if self.agent_slot.is_none() {
+            self.app.notice("the agent is busy — try again in a moment");
+            return;
+        }
+        self.app.pending_compact = true;
     }
 
     fn switch_mode(&mut self, mode: Mode) {
@@ -5022,6 +5094,14 @@ mod tests {
             Some(Ok(SlashCommand::Resume(Some(
                 "2026-06-09T09-30-00".to_string()
             ))))
+        );
+    }
+
+    #[test]
+    fn compact_parses() {
+        assert_eq!(
+            SlashCommand::parse("/compact"),
+            Some(Ok(SlashCommand::Compact))
         );
     }
 

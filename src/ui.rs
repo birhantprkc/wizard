@@ -518,7 +518,48 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Bottom status line: model, mode, and turn state on the left; contextual
 /// key hints on the right. One quiet line, no background fill.
+/// An indeterminate, indicatif-style block bar: a lit window of `█` slides
+/// across a dim `░` track, wrapping. Driven by `tick` so it animates frame to
+/// frame without knowing a total (compaction is one opaque LLM call).
+fn indeterminate_bar(width: usize, tick: u64) -> Line<'static> {
+    let width = width.max(4);
+    let window = (width / 5).max(3);
+    let offset = (tick as usize) % width;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_lit: Option<bool> = None;
+    for i in 0..width {
+        // Lit cells are the `window` columns starting at `offset`, wrapping.
+        let lit = (i + width - offset) % width < window;
+        if run_lit != Some(lit) {
+            if let Some(prev) = run_lit {
+                let style = if prev { accent() } else { dim() };
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+            }
+            run_lit = Some(lit);
+        }
+        run.push(if lit { '█' } else { '░' });
+    }
+    if let Some(prev) = run_lit {
+        let style = if prev { accent() } else { dim() };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    // Compaction owns the status line while it runs: a label plus the animated
+    // bar, full width.
+    if app.compacting {
+        let label = " compacting… ";
+        let bar_width = (area.width as usize)
+            .saturating_sub(label.width() + 1)
+            .max(4);
+        let mut spans = vec![Span::styled(label, accent().bold())];
+        spans.extend(indeterminate_bar(bar_width, app.tick).spans);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let mut spans = vec![
         Span::raw(" "),
@@ -2068,6 +2109,15 @@ mod tests {
 
     fn flats(lines: &[Line]) -> Vec<String> {
         lines.iter().map(flat).collect()
+    }
+
+    #[test]
+    fn indeterminate_bar_fills_width_and_animates() {
+        let a = flat(&indeterminate_bar(20, 0));
+        let b = flat(&indeterminate_bar(20, 7));
+        assert_eq!(a.chars().count(), 20, "bar spans the full width");
+        assert!(a.contains('█') && a.contains('░'), "has lit and dim cells");
+        assert_ne!(a, b, "the lit window moves with the tick");
     }
 
     #[test]

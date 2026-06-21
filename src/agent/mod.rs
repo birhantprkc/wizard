@@ -317,6 +317,18 @@ const KEEP_RECENT: usize = 10;
 /// token-aware compaction kicks in.
 const COMPACT_WINDOW_FRACTION: f64 = 0.8;
 
+/// What a compaction pass did, reported back so callers (auto-compaction
+/// notices and the `/compact` command) can describe the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOutcome {
+    /// Too little history between the system prompt and the recent tail.
+    Nothing,
+    /// Summarized `count` middle messages into one progress note.
+    Summarized(usize),
+    /// The summary LLM failed, so `count` middle messages were dropped.
+    Truncated { count: usize, error: String },
+}
+
 /// User-role nudge injected (in memory only) when a completion comes back
 /// with no visible text and no tool calls.
 const EMPTY_COMPLETION_NUDGE: &str = "(continue: reply to the user with your findings)";
@@ -1000,16 +1012,43 @@ impl Agent {
         if !self.should_compact().await {
             return;
         }
+        match self.compact_now().await {
+            CompactOutcome::Nothing => {}
+            CompactOutcome::Summarized(count) => {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!("compacted {count} messages → summary")),
+                )
+                .await;
+            }
+            CompactOutcome::Truncated { count, error } => {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!(
+                        "compacted {count} messages by truncation (summary LLM failed: {error})"
+                    )),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Summarize the middle span (everything between the system prompt and the
+    /// last [`KEEP_RECENT`] messages) into a single note, unconditionally —
+    /// the `/compact` command's force path, and the shared core of
+    /// [`compact_if_needed`]. A summarization failure falls back to dropping
+    /// the middle span. Never aborts a turn.
+    pub async fn compact_now(&mut self) -> CompactOutcome {
         // Need history[0] (system prompt) + a non-empty middle + the recent tail.
         if self.history.len() <= KEEP_RECENT + 1 {
-            return;
+            return CompactOutcome::Nothing;
         }
         let start = 1;
         let end = self.history.len() - KEEP_RECENT;
         if start >= end {
-            return;
+            return CompactOutcome::Nothing;
         }
-        let middle_count = end - start;
+        let count = end - start;
 
         // Render the middle span as one text blob, capped to ~20k chars.
         let mut blob = String::new();
@@ -1030,33 +1069,27 @@ impl Agent {
             }
         }
 
-        match self.summarize_transcript(&blob).await {
+        let outcome = match self.summarize_transcript(&blob).await {
             Ok(summary) => {
                 let replacement =
                     ChatMessage::system(format!("[Compacted progress summary]\n{summary}"));
                 self.history
                     .splice(start..end, std::iter::once(replacement));
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!("compacted {middle_count} messages → summary")),
-                )
-                .await;
+                CompactOutcome::Summarized(count)
             }
             Err(err) => {
                 // Fall back to truncation: drop the middle span outright.
                 self.history.drain(start..end);
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!(
-                        "compacted {middle_count} messages by truncation (summary LLM failed: {err:#})"
-                    )),
-                )
-                .await;
+                CompactOutcome::Truncated {
+                    count,
+                    error: format!("{err:#}"),
+                }
             }
-        }
+        };
         // The history just shrank: the last reported prompt size is stale
         // and must not re-trigger compaction on the next step.
         self.usage.clear_last_prompt();
+        outcome
     }
 
     /// Summarize a transcript blob into a terse progress note via the model.
@@ -2968,6 +3001,48 @@ mod tests {
         ) -> Result<ToolOutput, crate::tools::ToolError> {
             Ok(ToolOutput::ok("B".repeat(5_000)))
         }
+    }
+
+    #[tokio::test]
+    async fn compact_now_force_summarizes_and_keeps_the_recent_tail() {
+        // One scripted response: the summarization call.
+        let (mut agent, _provider, _tmp) =
+            test_agent(vec![vec![final_chunk("a terse progress note")]]);
+        // history[0] is the system prompt; add a middle span + recent tail.
+        let extra = KEEP_RECENT + 5;
+        for i in 0..extra {
+            agent.history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        let before = agent.history.len();
+
+        let outcome = agent.compact_now().await;
+
+        assert_eq!(
+            outcome,
+            CompactOutcome::Summarized(before - 1 - KEEP_RECENT)
+        );
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains("[Compacted progress summary]")),
+            "the middle span became a summary note"
+        );
+        // The system prompt and the last KEEP_RECENT messages survive verbatim.
+        assert_eq!(agent.history[0].role, Role::System);
+        assert_eq!(
+            agent.history.last().unwrap().content,
+            format!("msg {}", extra - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_now_is_a_noop_with_little_history() {
+        let (mut agent, _provider, _tmp) = test_agent(vec![]);
+        // Only the system prompt plus a couple messages: nothing to compact.
+        agent.history.push(ChatMessage::user("hi"));
+        let outcome = agent.compact_now().await;
+        assert_eq!(outcome, CompactOutcome::Nothing);
     }
 
     #[tokio::test]
