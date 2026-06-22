@@ -877,6 +877,11 @@ impl McpManager {
         }
     }
 
+    /// Number of connected servers.
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     /// List the tools of every connected server as registry-ready [`Tool`]
     /// objects. Tool names colliding across servers (or with native tools)
     /// are namespaced `server__tool`.

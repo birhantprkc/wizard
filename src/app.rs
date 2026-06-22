@@ -841,6 +841,11 @@ pub struct App {
     /// True while a background `/compact` is running: the status bar shows an
     /// animated progress bar instead of its usual contents.
     pub compacting: bool,
+    /// Set when the background MCP connect finishes while a turn is running
+    /// (so the agent is out of its slot and can't take the rebuilt registry
+    /// yet). The main loop merges the MCP tools once the turn returns the
+    /// agent. Cleared then.
+    pub mcp_merge_pending: bool,
 }
 
 impl App {
@@ -903,6 +908,7 @@ impl App {
             pending_edit_config: false,
             pending_compact: false,
             compacting: false,
+            mcp_merge_pending: false,
         }
     }
 
@@ -1721,7 +1727,9 @@ impl App {
             }
             // Owned by the main loop (it holds the agent slot / config); never
             // reach here.
-            Event::AgentRebuilt(_) | Event::ProviderActivated(_) => Ok(None),
+            Event::AgentRebuilt(_) | Event::ProviderActivated(_) | Event::McpConnected(_) => {
+                Ok(None)
+            }
         }
     }
 
@@ -3091,23 +3099,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let mut skills = load_skill_roots();
 
     let mcp_path = Config::mcp_config_path()?;
-    let mcp_config = match McpConfig::load(&mcp_path) {
-        Ok(config) => config,
-        Err(err) => {
-            tracing::warn!("loading {}: {err:#}", mcp_path.display());
-            McpConfig::default()
-        }
-    };
+    // Start with no MCP servers connected. Connecting them means spawning stdio
+    // servers and running the `initialize` handshake (e.g. `npx @playwright/mcp`,
+    // ~2s) — far too slow to block the first paint. The connect runs on a
+    // background task once the TUI is up (see below); its tools merge into the
+    // registry via `Event::McpConnected`. Built-in tools work immediately.
     // Shared with background rebuild tasks (model switch, crash recovery).
-    let manager = Arc::new(Mutex::new(
-        match McpManager::connect_all(&mcp_config).await {
-            Ok(manager) => manager,
-            Err(err) => {
-                tracing::warn!("connecting MCP servers: {err:#}");
-                McpManager::empty()
-            }
-        },
-    ));
+    let manager = Arc::new(Mutex::new(McpManager::empty()));
 
     let mut agent_slot: Option<Agent> = Some(
         build_agent(
@@ -3197,6 +3195,37 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
 
+    // Connect MCP servers off the draw path so a slow stdio server (npx, etc.)
+    // can't delay launch. When the connect finishes, the main loop rebuilds the
+    // registry from the now-populated manager (`Event::McpConnected`).
+    {
+        let manager = Arc::clone(&manager);
+        let mcp_path = mcp_path.clone();
+        let notify = events.sender();
+        tokio::spawn(async move {
+            let mcp_config = match McpConfig::load(&mcp_path) {
+                Ok(config) => config,
+                Err(err) => {
+                    tracing::warn!("loading {}: {err:#}", mcp_path.display());
+                    return;
+                }
+            };
+            if mcp_config.servers.is_empty() {
+                // Nothing to connect: keep the empty manager and skip the
+                // registry rebuild entirely (the agent already has every tool).
+                return;
+            }
+            {
+                let mut manager = manager.lock().await;
+                if let Err(err) = manager.reload(&mcp_config).await {
+                    tracing::warn!("connecting MCP servers: {err:#}");
+                }
+            }
+            let connected = manager.lock().await.connection_count();
+            let _ = notify.send(Event::McpConnected(connected)).await;
+        });
+    }
+
     let mut last_heartbeat = Instant::now();
 
     loop {
@@ -3230,6 +3259,32 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
+            continue;
+        }
+
+        // The background MCP connect finished: merge the servers' tools into the
+        // live agent's registry. If a turn is running the agent is out of its
+        // slot, so defer the merge until the turn returns it.
+        if let Event::McpConnected(connected) = event {
+            if connected > 0 {
+                if agent_slot.is_some() {
+                    CommandContext {
+                        app: &mut app,
+                        client: &mut client,
+                        agent_slot: &mut agent_slot,
+                        manager: &manager,
+                        skills: &mut skills,
+                        project_root: &project_root,
+                        mcp_path: &mcp_path,
+                        genie_max_steps,
+                        events: &events,
+                    }
+                    .merge_mcp_registry()
+                    .await;
+                } else {
+                    app.mcp_merge_pending = true;
+                }
+            }
             continue;
         }
 
@@ -3405,7 +3460,27 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
 
         if turn_done && let Some(handle) = agent_task.take() {
             match handle.await {
-                Ok(agent) => agent_slot = Some(agent),
+                Ok(agent) => {
+                    agent_slot = Some(agent);
+                    // MCP finished connecting mid-turn: merge its tools now that
+                    // the agent is back in its slot.
+                    if app.mcp_merge_pending {
+                        app.mcp_merge_pending = false;
+                        CommandContext {
+                            app: &mut app,
+                            client: &mut client,
+                            agent_slot: &mut agent_slot,
+                            manager: &manager,
+                            skills: &mut skills,
+                            project_root: &project_root,
+                            mcp_path: &mcp_path,
+                            genie_max_steps,
+                            events: &events,
+                        }
+                        .merge_mcp_registry()
+                        .await;
+                    }
+                }
                 Err(err) => {
                     // The turn task panicked and took the agent with it.
                     // Rebuild off the event loop so the TUI stays responsive.
@@ -4075,6 +4150,37 @@ impl CommandContext<'_> {
                 ));
             }
             Err(err) => self.app.notice(format!("reload failed: {err:#}")),
+        }
+    }
+
+    /// Merge the already-connected MCP servers' tools into the live agent's
+    /// registry. Called after the startup background connect finishes — the
+    /// slow part (spawning servers, `initialize`) is already done, so this just
+    /// re-enumerates tools and swaps the registry. No-op if the agent is not in
+    /// its slot (a turn is running); the main loop defers via `mcp_merge_pending`.
+    async fn merge_mcp_registry(&mut self) {
+        let Some(hooks) = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| Arc::clone(agent.hooks()))
+        else {
+            return;
+        };
+        let manager = self.manager.lock().await;
+        match build_registry(&manager, self.client, &hooks).await {
+            Ok(registry) => {
+                let tool_count = registry.len();
+                if let Some(agent) = self.agent_slot.as_mut() {
+                    agent.set_registry(registry);
+                }
+                self.app.notice(format!(
+                    "MCP ready: {} server(s) connected, {tool_count} tools available",
+                    manager.connection_count()
+                ));
+            }
+            Err(err) => self
+                .app
+                .notice(format!("MCP connected but registry rebuild failed: {err:#}")),
         }
     }
 

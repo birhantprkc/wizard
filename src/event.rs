@@ -25,6 +25,12 @@ pub enum Event {
     /// Out-of-band notice from a background task (`/evolve`, `/reload`),
     /// rendered as a [`crate::app::TranscriptEntry::Notice`].
     Notice(String),
+    /// The background MCP connect (spawned at startup so the first paint isn't
+    /// blocked on slow stdio servers) finished populating the shared manager.
+    /// The main loop rebuilds the tool registry from it so the servers' tools
+    /// merge into the live agent. Carries the number of connected servers so
+    /// the loop can stay quiet when nothing actually connected.
+    McpConnected(usize),
     /// A background agent rebuild (model switch, crash recovery) finished.
     /// Carries the agent back to the main loop's slot (boxed: an [`Agent`]
     /// is large next to the input variants).
