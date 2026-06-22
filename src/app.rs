@@ -4210,9 +4210,9 @@ impl CommandContext<'_> {
                     manager.connection_count()
                 ));
             }
-            Err(err) => self
-                .app
-                .notice(format!("MCP connected but registry rebuild failed: {err:#}")),
+            Err(err) => self.app.notice(format!(
+                "MCP connected but registry rebuild failed: {err:#}"
+            )),
         }
     }
 
