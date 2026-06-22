@@ -3006,10 +3006,20 @@ const BYOP_ENV_FALLBACKS: &[(&str, ProviderKind, &str, &str, &str)] = &[
 /// onboarding persists anything to disk.
 async fn startup_client(config: &mut Config) -> Result<Arc<dyn LlmProvider>> {
     let active = config.active();
+    // Cloud provider: build the client (cheap — it just reads cached
+    // credentials) and return immediately. The health probe is a network
+    // round-trip that would block the first paint, so `run_tui` runs it in the
+    // background and surfaces a failure as a notice. A *build* error is a config
+    // error (e.g. malformed base URL), so it stays fatal. The local fallback
+    // chain below only matters when a local backend is the active provider.
+    if !is_local_kind(active.kind) {
+        return active
+            .build()
+            .with_context(|| format!("building provider '{}'", active.name));
+    }
     let local_err = match try_provider(&active).await {
         Ok(client) => return Ok(client),
-        Err(err) if is_local_kind(active.kind) => err,
-        Err(err) => return Err(err),
+        Err(err) => err,
     };
     println!("local model unavailable: {local_err:#}");
 
@@ -3094,6 +3104,10 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     }
 
     let mut client = startup_client(&mut config).await?;
+    // A cloud provider's health probe was skipped at startup (it would block the
+    // first paint); run_tui runs it in the background below. Local providers
+    // already proved themselves in startup_client (and loaded the model).
+    let active_is_cloud = !is_local_kind(config.active().kind);
 
     let project_root = std::env::current_dir().context("resolving project root")?;
     let mut skills = load_skill_roots();
@@ -3194,6 +3208,24 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let mut events = EventLoop::new(Duration::from_millis(100));
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
+
+    // Probe the cloud provider's health off the draw path so the network
+    // round-trip doesn't delay launch. Only a failure is surfaced (as a notice);
+    // success is silent. A genuinely broken provider still errors clearly on the
+    // first message, but launch — and /login, /provider, /model — stay usable.
+    if active_is_cloud {
+        let probe = client.clone();
+        let notify = events.sender();
+        tokio::spawn(async move {
+            if let Err(err) = probe.health().await {
+                let _ = notify
+                    .send(Event::Notice(format!(
+                        "provider health check failed: {err:#}"
+                    )))
+                    .await;
+            }
+        });
+    }
 
     // Connect MCP servers off the draw path so a slow stdio server (npx, etc.)
     // can't delay launch. When the connect finishes, the main loop rebuilds the
