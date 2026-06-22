@@ -2536,10 +2536,14 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn setup_terminal() -> Result<Tui> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = std::io::stdout();
+    // Deliberately NOT enabling mouse capture: capturing the mouse hijacks the
+    // terminal's own click-drag-to-select, which is how users copy a question
+    // or response out of the transcript. Leaving it off keeps copy/paste
+    // working like any normal terminal app (scroll via PgUp/PgDn). Bracketed
+    // paste stays on so pasted text lands in the composer as one chunk.
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
     )
     .context("entering alternate screen")?;
@@ -2614,7 +2618,6 @@ fn restore_terminal() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen,
     )
     .context("leaving alternate screen")?;
@@ -2905,7 +2908,7 @@ keys:\n  \
 Tab / →                     accept command completion\n  \
 Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
-PgUp/PgDn · mouse wheel     scroll the transcript\n  \
+PgUp/PgDn                   scroll the transcript (drag to select · copy as usual)\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-C                      quit";
