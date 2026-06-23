@@ -8,6 +8,7 @@
 # local server running).
 
 Output demo/demo.gif
+Output demo/demo.mp4
 
 Set Shell "bash"
 Set FontSize 15
@@ -46,6 +47,9 @@ Enter
 Sleep 2.5s
 Screenshot demo/frame-2.png
 Sleep 1s
+# close the provider picker before composing (Esc cancels, leaves provider unchanged)
+Escape
+Sleep 800ms
 
 # --- ask for the fix ----------------------------------------------------------
 Type@45ms 'Read main.py and fix the add() bug: it subtracts instead of adding.'
