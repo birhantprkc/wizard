@@ -121,7 +121,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// collapsible tool cards. Borderless; a one-column side margin keeps the
 /// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    if app.transcript.is_empty() && app.streaming.is_empty() && !app.status.busy {
+    // Stay on the welcome screen until the conversation actually begins. Early
+    // system notices (e.g. "MCP ready") land in the transcript before the user
+    // sends anything; those alone shouldn't dismiss the opening screen.
+    let has_conversation = app
+        .transcript
+        .iter()
+        .any(|entry| !matches!(entry, TranscriptEntry::Notice(_)));
+    if !has_conversation && app.streaming.is_empty() && !app.status.busy {
         draw_welcome(frame, app, area);
         return;
     }
