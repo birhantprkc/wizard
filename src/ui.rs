@@ -62,7 +62,7 @@ fn accent() -> Style {
 pub fn draw(frame: &mut Frame, app: &App) {
     let [main_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -121,8 +121,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// collapsible tool cards. Borderless; a one-column side margin keeps the
 /// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    if app.transcript.is_empty() && app.streaming.is_empty() && !app.status.busy {
-        draw_welcome(frame, app, area);
+    // Stay on the home screen until the conversation actually begins (see
+    // `App::has_conversation`: early system notices alone don't dismiss it).
+    if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
+        draw_home(frame, app, area);
         return;
     }
 
@@ -173,59 +175,204 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Welcome screen shown before the first message: a small centered card,
-/// no borders, no banner art.
-fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled("✦", accent())),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "w i z a r d",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "your sovereign agent — self-extending, fully local",
-            dim().italic(),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
-            Span::styled(" · ", dim()),
-            mode_span(app.status.mode),
-        ]),
-        Line::raw(""),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("type a message", Style::default().fg(TEXT_DIM)),
-            Span::styled(" and press Enter to begin", dim()),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("/", accent()),
-            Span::styled("  commands — Tab completes, ↑/↓ select", dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("/model", accent()),
-            Span::styled("  pick a model (or Ctrl-P)", dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("/help", accent()),
-            Span::styled("  all commands & keys", dim()),
-        ]),
-    ];
+/// Home screen shown before the first message: a left-aligned dashboard with
+/// recent resumable sessions, a project/git line, and a capability footer.
+/// No borders, no banner art. Falls back to a short getting-started block on
+/// first run (no past sessions yet).
+fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
 
-    let height = lines.len() as u16;
-    let top = area.height.saturating_sub(height) / 2;
-    let centered = Rect {
-        x: area.x,
-        y: area.y + top,
-        width: area.width,
-        height: height.min(area.height),
-    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header: ✦ wizard    ~/path · branch ✎ N changed
+    let mut header = vec![
+        Span::styled("✦ ", accent()),
+        Span::styled("wizard", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("    "),
+        Span::styled(
+            abbreviate_home(&app.project_root),
+            Style::default().fg(TEXT_DIM),
+        ),
+    ];
+    if let Some(branch) = &app.git_branch {
+        header.push(Span::styled(" · ", dim()));
+        header.push(Span::styled(branch.clone(), Style::default().fg(TEXT_DIM)));
+        if app.git_changed > 0 {
+            header.push(Span::styled(
+                format!(" ✎ {} changed", app.git_changed),
+                dim(),
+            ));
+        }
+    }
+    lines.push(Line::from(header));
+
+    // A broken provider, caught by the deferred health probe, shows right under
+    // the header so it's the first thing seen at launch rather than only when
+    // the first message fails.
+    if let Some(err) = &app.provider_health_error {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ provider unreachable: {err}"),
+            Style::default().fg(Color::White).bold(),
+        )));
+    }
+    lines.push(Line::raw(""));
+
+    if app.home_sessions.is_empty() {
+        // First run: a short getting-started so the screen is still useful.
+        lines.push(Line::from(Span::styled("Get started", dim())));
+        for example in [
+            "explain this codebase",
+            "add a test for the parser",
+            "what changed on this branch?",
+        ] {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(example.to_string(), Style::default().fg(TEXT_DIM)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("/", accent()),
+            Span::styled(" commands · ", dim()),
+            Span::styled("/help", accent()),
+            Span::styled(" keys", dim()),
+        ]));
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        lines.push(Line::from(Span::styled(
+            "Continue where you left off",
+            dim(),
+        )));
+        for (index, session) in app.home_sessions.iter().enumerate() {
+            // Row indent (2) + index + two spaces, then summary, then a
+            // right-aligned meta column ("N msgs · ago").
+            let prefix = format!("{}  ", index + 1);
+            let mut meta = format!(
+                "{} msg{}",
+                session.messages,
+                if session.messages == 1 { "" } else { "s" }
+            );
+            let ago = ago(now, session.updated_unix);
+            if !ago.is_empty() {
+                meta.push_str(" · ");
+                meta.push_str(&ago);
+            }
+            let indent = 2usize;
+            let budget = width
+                .saturating_sub(indent + prefix.width() + meta.width() + 2)
+                .max(8);
+            let summary = truncate_width(&session.summary, budget);
+            let pad =
+                width.saturating_sub(indent + prefix.width() + summary.width() + meta.width());
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(prefix, accent()),
+                Span::raw(summary),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(meta, dim()),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("/resume <n>", Style::default().fg(TEXT_DIM)),
+            Span::styled("  or  ", dim()),
+            Span::styled("/resume", Style::default().fg(TEXT_DIM)),
+            Span::styled(" to browse", dim()),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+
+    // Footer: model · mode · N tools · M MCP servers
+    let mut footer = vec![
+        Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+        Span::styled(" · ", dim()),
+        mode_span(app.status.mode),
+        Span::styled(format!(" · {} tools", app.tool_count), dim()),
+    ];
+    if app.mcp_servers > 0 {
+        footer.push(Span::styled(
+            format!(
+                " · {} MCP server{}",
+                app.mcp_servers,
+                if app.mcp_servers == 1 { "" } else { "s" }
+            ),
+            dim(),
+        ));
+    }
+    lines.push(Line::from(footer));
+    if !app.home_sessions.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("/", accent()),
+            Span::styled(" commands · ", dim()),
+            Span::styled("/help", accent()),
+            Span::styled(" keys", dim()),
+        ]));
+    }
+
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
-        centered,
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Left),
+        inner,
     );
+}
+
+/// Abbreviate `path` with `~` for `$HOME`, for the home-screen header.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    let display = path.to_string_lossy();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = display.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    display.into_owned()
+}
+
+/// Coarse "… ago" label for a unix timestamp. Empty string when `then` is 0
+/// (mtime unavailable). Falls back to a `YYYY-MM-DD` date past a week.
+fn ago(now: u64, then: u64) -> String {
+    if then == 0 {
+        return String::new();
+    }
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=172_799 => "yesterday".to_string(),
+        172_800..=604_799 => format!("{}d ago", secs / 86_400),
+        _ => {
+            // Past a week: a plain date (days since epoch -> Y-M-D).
+            let days = then / 86_400;
+            let (y, m, d) = civil_from_days(days as i64);
+            format!("{y:04}-{m:02}-{d:02}")
+        }
+    }
+}
+
+/// Convert days-since-epoch to a (year, month, day) civil date. Howard
+/// Hinnant's algorithm; used only for the home screen's old-session dates.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Colored span for a mode name: genie is quiet, sovereign is a warning.
@@ -518,10 +665,51 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Bottom status line: model, mode, and turn state on the left; contextual
 /// key hints on the right. One quiet line, no background fill.
+/// An indeterminate, indicatif-style block bar: a lit window of `█` slides
+/// across a dim `░` track, wrapping. Driven by `tick` so it animates frame to
+/// frame without knowing a total (compaction is one opaque LLM call).
+fn indeterminate_bar(width: usize, tick: u64) -> Line<'static> {
+    let width = width.max(4);
+    let window = (width / 5).max(3);
+    let offset = (tick as usize) % width;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_lit: Option<bool> = None;
+    for i in 0..width {
+        // Lit cells are the `window` columns starting at `offset`, wrapping.
+        let lit = (i + width - offset) % width < window;
+        if run_lit != Some(lit) {
+            if let Some(prev) = run_lit {
+                let style = if prev { accent() } else { dim() };
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+            }
+            run_lit = Some(lit);
+        }
+        run.push(if lit { '█' } else { '░' });
+    }
+    if let Some(prev) = run_lit {
+        let style = if prev { accent() } else { dim() };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    // Compaction owns the status line while it runs: a label plus the animated
+    // bar, full width.
+    if app.compacting {
+        let label = " compacting… ";
+        let bar_width = (area.width as usize)
+            .saturating_sub(label.width() + 1)
+            .max(4);
+        let mut spans = vec![Span::styled(label, accent().bold())];
+        spans.extend(indeterminate_bar(bar_width, app.tick).spans);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let mut spans = vec![
-        Span::styled(" ✦ ", accent()),
+        Span::raw(" "),
         Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
@@ -530,6 +718,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("PLAN", accent().bold()));
     }
+    spans.push(Span::styled(" · ", dim()));
+    spans.push(Span::styled(format_cwd(&app.project_root, 32), dim()));
     let token_total = app.status.prompt_tokens + app.status.completion_tokens;
     if token_total > 0 {
         spans.push(Span::styled(" · ", dim()));
@@ -557,6 +747,24 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             dim(),
         ));
     }
+    // MCP is still connecting in the background: a transient marker, shown
+    // alongside the busy/step indicator (a turn can start before tools arrive)
+    // so the missing-tools window isn't a silent surprise. Vanishes when the
+    // connect finishes.
+    if app.mcp_connecting {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(format!("{spinner} "), accent()));
+        spans.push(Span::styled("connecting tools…", dim().italic()));
+    }
+    // A failed health probe leaves a persistent marker so the breakage survives
+    // once the user starts typing and the welcome screen is gone.
+    if app.provider_health_error.is_some() {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            "⚠ provider",
+            Style::default().fg(Color::White).bold(),
+        ));
+    }
     let line = Line::from(spans);
     let left_width = line.width() as u16;
     frame.render_widget(Paragraph::new(line), area);
@@ -574,9 +782,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
     } else if app.status.busy {
-        "PgUp/PgDn scroll · ^C quit"
+        "PgUp/PgDn scroll"
     } else {
-        "/ commands · ↑ history · ^P model · ^C quit"
+        "/ commands · ↑ history"
     };
     let width = hints.width() as u16 + 1;
     if area.width > left_width + width {
@@ -590,10 +798,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Input: a dim rule above a clean accent prompt — no box. Handles
-/// cursor-aware horizontal scrolling and inline ghost-text completion.
+/// Input: a clean accent prompt bracketed by dim rules above and below — no
+/// box. Handles cursor-aware horizontal scrolling and inline ghost-text
+/// completion.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height < 2 || area.width < 6 {
+    if area.height < 3 || area.width < 6 {
         return;
     }
     let rule = Line::from(Span::styled("─".repeat(area.width as usize), dim()));
@@ -665,7 +874,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(
-        Paragraph::new(Text::from(vec![rule, Line::from(spans)])),
+        Paragraph::new(Text::from(vec![rule.clone(), Line::from(spans), rule])),
         area,
     );
 
@@ -1533,6 +1742,49 @@ fn take_width(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Format the working directory for the status bar: abbreviate `$HOME` to
+/// `~`, and when wider than `max` columns drop leading components (prefixing
+/// `…/`) so the leaf directory — the part you actually care about — stays
+/// visible instead of being clipped off the end.
+fn format_cwd(root: &std::path::Path, max: usize) -> String {
+    let full = root.display().to_string();
+    let display = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full,
+    };
+    if display.width() <= max {
+        return display;
+    }
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let mut parts: Vec<&str> = display.split(&sep).filter(|p| !p.is_empty()).collect();
+    while parts.len() > 1 {
+        parts.remove(0);
+        let candidate = format!("…{sep}{}", parts.join(&sep));
+        if candidate.width() <= max {
+            return candidate;
+        }
+    }
+    // A single leaf still too wide: keep its tail under a leading `…`.
+    let leaf = parts.last().copied().unwrap_or(&display);
+    let budget = max.saturating_sub(1);
+    let tail: String = {
+        let mut used = 0;
+        let mut chars: Vec<char> = Vec::new();
+        for ch in leaf.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            chars.push(ch);
+        }
+        chars.into_iter().rev().collect()
+    };
+    format!("…{tail}")
+}
+
 /// Truncate to `max` display columns (not chars), appending `…` when cut.
 fn truncate_width(text: &str, max: usize) -> String {
     if text.width() <= max {
@@ -2022,6 +2274,39 @@ mod tests {
 
     fn flats(lines: &[Line]) -> Vec<String> {
         lines.iter().map(flat).collect()
+    }
+
+    #[test]
+    fn indeterminate_bar_fills_width_and_animates() {
+        let a = flat(&indeterminate_bar(20, 0));
+        let b = flat(&indeterminate_bar(20, 7));
+        assert_eq!(a.chars().count(), 20, "bar spans the full width");
+        assert!(a.contains('█') && a.contains('░'), "has lit and dim cells");
+        assert_ne!(a, b, "the lit window moves with the tick");
+    }
+
+    #[test]
+    fn cwd_keeps_short_path_intact() {
+        let p = std::path::Path::new("/srv/app");
+        assert_eq!(format_cwd(p, 32), "/srv/app");
+    }
+
+    #[test]
+    fn cwd_drops_leading_components_keeping_leaf() {
+        let p = std::path::Path::new("/home/gradient/projects/ai/wizard");
+        // Narrow budget forces dropping leading parts but keeps the leaf.
+        let out = format_cwd(p, 14);
+        assert!(out.starts_with('…'), "expected ellipsis prefix, got {out}");
+        assert!(out.ends_with("wizard"), "expected leaf kept, got {out}");
+        assert!(out.width() <= 14, "expected within budget, got {out}");
+    }
+
+    #[test]
+    fn cwd_abbreviates_home() {
+        // SAFETY: single-threaded test process.
+        unsafe { std::env::set_var("HOME", "/home/gradient") };
+        let p = std::path::Path::new("/home/gradient/projects/ai");
+        assert_eq!(format_cwd(p, 32), "~/projects/ai");
     }
 
     #[test]

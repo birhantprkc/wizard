@@ -99,6 +99,91 @@ pub fn peek(id: &str, n: usize) -> Vec<(String, String)> {
     messages.split_off(start)
 }
 
+/// One past session, summarized for the `/resume` picker.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    /// Session id (filename stem), used to reopen the file.
+    pub id: String,
+    /// First user prompt (or turn-marker snippet), for the picker label.
+    pub summary: String,
+    /// Number of message records (turn markers excluded).
+    pub messages: usize,
+    /// File mtime as unix seconds (0 if unavailable), for the "… ago" label.
+    pub updated_unix: u64,
+}
+
+/// List past sessions in `dir`, newest id first, skipping empty ones (no
+/// message records). Best-effort: unreadable or corrupt files are dropped.
+/// Each file is scanned once for its first prompt and message count.
+pub fn summaries(dir: &Path) -> Vec<SessionSummary> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut messages = 0usize;
+        let mut marker_prompt: Option<String> = None;
+        let mut first_user: Option<String> = None;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionLine>(&line) {
+                Ok(SessionLine::Message(record)) => {
+                    messages += 1;
+                    if first_user.is_none() && record.message.role == crate::llm::Role::User {
+                        first_user = record.message.content.lines().next().map(str::to_string);
+                    }
+                }
+                Ok(SessionLine::Marker(marker)) => {
+                    if marker_prompt.is_none() && !marker.prompt.is_empty() {
+                        marker_prompt = Some(marker.prompt);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if messages == 0 {
+            continue;
+        }
+        let summary = marker_prompt
+            .or(first_user)
+            .unwrap_or_else(|| "(no prompt)".to_string());
+        let updated_unix = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_secs())
+            .unwrap_or(0);
+        out.push(SessionSummary {
+            id,
+            summary,
+            messages,
+            updated_unix,
+        });
+    }
+    // Ids are zero-padded timestamps, so lexical order is chronological.
+    out.sort_by(|a, b| b.id.cmp(&a.id));
+    out
+}
+
 /// Handle to one session file. Append-only; cheap to clone the path out of.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -139,6 +224,19 @@ impl Session {
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
             Self { id, path }
+        }))
+    }
+
+    /// Open a specific session by id (its filename stem), for `/resume`.
+    /// `None` when `id` is empty or no such file exists.
+    pub fn open_by_id(dir: &Path, id: &str) -> Result<Option<Self>> {
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let path = dir.join(format!("{id}.jsonl"));
+        Ok(path.is_file().then(|| Self {
+            id: id.to_string(),
+            path,
         }))
     }
 
@@ -468,6 +566,55 @@ mod tests {
         let messages = session.load_messages().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn open_by_id_finds_the_named_session_only() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        session.append(&ChatMessage::user("hi")).unwrap();
+
+        let reopened = Session::open_by_id(&tmp.0, &session.id)
+            .unwrap()
+            .expect("found by id");
+        assert_eq!(reopened.id, session.id);
+        assert_eq!(reopened.load_messages().unwrap().len(), 1);
+
+        assert!(Session::open_by_id(&tmp.0, "nope").unwrap().is_none());
+        assert!(Session::open_by_id(&tmp.0, "").unwrap().is_none());
+    }
+
+    #[test]
+    fn summaries_lists_nonempty_sessions_newest_first_with_prompts() {
+        let tmp = TempDir::new();
+        // Oldest: marker prompt wins over the user message.
+        let a = Session::create(&tmp.0).unwrap();
+        std::fs::rename(a.path(), tmp.0.join("2026-06-08T10-00-00.jsonl")).unwrap();
+        let a = Session::open_by_id(&tmp.0, "2026-06-08T10-00-00")
+            .unwrap()
+            .unwrap();
+        a.append_marker(1, "fix the parser\nignored").unwrap();
+        a.append(&ChatMessage::user("fix the parser")).unwrap();
+        a.append(&ChatMessage::assistant("on it")).unwrap();
+
+        // Newest: no marker, so the first user line is used.
+        let b = Session::create(&tmp.0).unwrap();
+        std::fs::rename(b.path(), tmp.0.join("2026-06-09T09-30-00.jsonl")).unwrap();
+        let b = Session::open_by_id(&tmp.0, "2026-06-09T09-30-00")
+            .unwrap()
+            .unwrap();
+        b.append(&ChatMessage::user("add resume\nmore")).unwrap();
+
+        // Empty session: excluded.
+        Session::create(&tmp.0).unwrap();
+
+        let list = summaries(&tmp.0);
+        assert_eq!(list.len(), 2, "the empty session is skipped");
+        assert_eq!(list[0].id, "2026-06-09T09-30-00", "newest first");
+        assert_eq!(list[0].summary, "add resume");
+        assert_eq!(list[0].messages, 1);
+        assert_eq!(list[1].summary, "fix the parser");
+        assert_eq!(list[1].messages, 2);
     }
 
     #[test]
