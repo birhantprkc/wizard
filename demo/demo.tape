@@ -21,10 +21,14 @@ Set TypingSpeed 40ms
 # dim #94908a, faint #55524b). Ratatui maps White -> brightWhite, Gray ->
 # white, DarkGray -> brightBlack, so those slots carry the bright/dim/faint
 # text tiers.
-Set Theme { "name": "wizard-warm", "background": "#0b0b0a", "foreground": "#e9e6df", "cursor": "#e9e6df", "black": "#11110f", "red": "#e06a55", "green": "#a3b285", "yellow": "#d6b36a", "blue": "#95a3b3", "magenta": "#b59a8e", "cyan": "#9cb3a8", "white": "#94908a", "brightBlack": "#55524b", "brightRed": "#f0836b", "brightGreen": "#b8c79a", "brightYellow": "#e8c98a", "brightBlue": "#aebccb", "brightMagenta": "#c9ada0", "brightCyan": "#b0c7bc", "brightWhite": "#f1eee6" }
+Set Theme { "name": "wizard-warm", "background": "#1a1a17", "foreground": "#e9e6df", "cursor": "#e9e6df", "black": "#11110f", "red": "#e06a55", "green": "#a3b285", "yellow": "#d6b36a", "blue": "#95a3b3", "magenta": "#b59a8e", "cyan": "#9cb3a8", "white": "#94908a", "brightBlack": "#55524b", "brightRed": "#f0836b", "brightGreen": "#b8c79a", "brightYellow": "#e8c98a", "brightBlue": "#aebccb", "brightMagenta": "#c9ada0", "brightCyan": "#b0c7bc", "brightWhite": "#f1eee6" }
 
 # --- hidden setup: throwaway copy of the sample repo --------------------------
 Hide
+# Drop starship (purple-arrow prompt) and emulate the default fish prompt:
+# bright-green user, normal host, green cwd, '>' suffix.
+Type "unset PROMPT_COMMAND; export PS1='\[\e[92m\]user\[\e[0m\]@wizard \[\e[32m\]/t/wizard-demo\[\e[0m\]> '"
+Enter
 Type "mkdir -p /tmp/wizard-demo-bin && ln -sf ${WIZARD_DEMO_BIN:-$PWD/target/release/wizard} /tmp/wizard-demo-bin/wizard && export PATH=/tmp/wizard-demo-bin:$PATH"
 Enter
 Type "rm -rf /tmp/wizard-demo && cp -r ${WIZARD_DEMO_SRC:-$PWD/demo}/sample-project /tmp/wizard-demo && cd /tmp/wizard-demo && git init -q && git add -A && git -c user.name=Demo -c user.email=demo@example.com commit -qm initial && clear"
