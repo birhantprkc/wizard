@@ -124,7 +124,16 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     // Stay on the welcome screen until the conversation actually begins (see
     // `App::has_conversation`: early system notices alone don't dismiss it).
     if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
-        draw_welcome(frame, app, area);
+        // A slash-command menu (e.g. `/provider`) or other modal floats over a
+        // small centered area; the welcome card would show through around it.
+        // Drop the card while any overlay is open so there's no text overlay.
+        let overlay_open = app.picker.is_some()
+            || app.plan_review.is_some()
+            || app.show_dashboard
+            || app.show_subagents;
+        if !overlay_open {
+            draw_welcome(frame, app, area);
+        }
         return;
     }
 
