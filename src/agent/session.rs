@@ -108,6 +108,8 @@ pub struct SessionSummary {
     pub summary: String,
     /// Number of message records (turn markers excluded).
     pub messages: usize,
+    /// File mtime as unix seconds (0 if unavailable), for the "… ago" label.
+    pub updated_unix: u64,
 }
 
 /// List past sessions in `dir`, newest id first, skipping empty ones (no
@@ -163,10 +165,18 @@ pub fn summaries(dir: &Path) -> Vec<SessionSummary> {
         let summary = marker_prompt
             .or(first_user)
             .unwrap_or_else(|| "(no prompt)".to_string());
+        let updated_unix = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_secs())
+            .unwrap_or(0);
         out.push(SessionSummary {
             id,
             summary,
             messages,
+            updated_unix,
         });
     }
     // Ids are zero-padded timestamps, so lexical order is chronological.

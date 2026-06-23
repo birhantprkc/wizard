@@ -458,6 +458,11 @@ impl Agent {
         &self.session
     }
 
+    /// Number of tools in the live registry (drives the home-screen footer).
+    pub fn tool_count(&self) -> usize {
+        self.dispatcher.registry().len()
+    }
+
     /// The per-file checkpoint store (snapshots powering `/rewind` and
     /// perpetual rollback).
     pub fn checkpoints(&self) -> &Arc<crate::checkpoint::CheckpointStore> {

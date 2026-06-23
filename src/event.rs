@@ -31,6 +31,13 @@ pub enum Event {
     /// merge into the live agent. Carries the number of connected servers so
     /// the loop can stay quiet when nothing actually connected.
     McpConnected(usize),
+    /// The background git probe (spawned at startup so the first paint isn't
+    /// blocked on `git`) finished. Carries the current branch and the count of
+    /// changed working-tree files for the home screen.
+    GitInfo {
+        branch: Option<String>,
+        changed: usize,
+    },
     /// A background agent rebuild (model switch, crash recovery) finished.
     /// Carries the agent back to the main loop's slot (boxed: an [`Agent`]
     /// is large next to the input variants).

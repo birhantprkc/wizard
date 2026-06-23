@@ -846,6 +846,18 @@ pub struct App {
     /// yet). The main loop merges the MCP tools once the turn returns the
     /// agent. Cleared then.
     pub mcp_merge_pending: bool,
+    /// Recent resumable sessions shown on the home screen (newest first,
+    /// current session excluded). Loaded once at startup.
+    pub home_sessions: Vec<crate::agent::session::SessionSummary>,
+    /// Current git branch (None when not a repo / probe failed). Filled by the
+    /// background `Event::GitInfo`.
+    pub git_branch: Option<String>,
+    /// Number of changed files in the working tree (`git status --porcelain`).
+    pub git_changed: usize,
+    /// Number of connected MCP servers, for the home-screen footer.
+    pub mcp_servers: usize,
+    /// Number of tools in the live registry, for the home-screen footer.
+    pub tool_count: usize,
 }
 
 impl App {
@@ -909,6 +921,11 @@ impl App {
             pending_compact: false,
             compacting: false,
             mcp_merge_pending: false,
+            home_sessions: Vec::new(),
+            git_branch: None,
+            git_changed: 0,
+            mcp_servers: 0,
+            tool_count: 0,
         }
     }
 
@@ -1727,9 +1744,10 @@ impl App {
             }
             // Owned by the main loop (it holds the agent slot / config); never
             // reach here.
-            Event::AgentRebuilt(_) | Event::ProviderActivated(_) | Event::McpConnected(_) => {
-                Ok(None)
-            }
+            Event::AgentRebuilt(_)
+            | Event::ProviderActivated(_)
+            | Event::McpConnected(_)
+            | Event::GitInfo { .. } => Ok(None),
         }
     }
 
@@ -3180,6 +3198,20 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         .unwrap_or(0);
     // Register this session so other sessions' /dashboard can see it.
     crate::session_registry::write(&app.session_record());
+    // Home screen: recent resumable sessions (newest first, current excluded)
+    // and the live tool count. Git info and MCP count arrive from background
+    // probes once the TUI is up.
+    if let Ok(dir) = Config::sessions_dir() {
+        app.home_sessions = crate::agent::session::summaries(&dir)
+            .into_iter()
+            .filter(|summary| summary.id != app.session_id)
+            .take(5)
+            .collect();
+    }
+    app.tool_count = agent_slot
+        .as_ref()
+        .map(|agent| agent.tool_count())
+        .unwrap_or(0);
     // `wizard agents` opens straight into the dashboard.
     if matches!(cli.command, Some(crate::cli::Command::Agents)) {
         app.show_dashboard = true;
@@ -3258,6 +3290,31 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         });
     }
 
+    // Probe git off the draw path so a slow/cold `git` can't delay launch.
+    // The home screen fills in the branch + changed-file count when it lands.
+    {
+        let project_root = project_root.clone();
+        let notify = events.sender();
+        tokio::spawn(async move {
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&project_root)
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            };
+            let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let changed = git(&["status", "--porcelain"])
+                .map(|s| s.lines().filter(|line| !line.trim().is_empty()).count())
+                .unwrap_or(0);
+            let _ = notify.send(Event::GitInfo { branch, changed }).await;
+        });
+    }
+
     let mut last_heartbeat = Instant::now();
 
     loop {
@@ -3294,10 +3351,18 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             continue;
         }
 
+        // The background git probe finished: update the home-screen header.
+        if let Event::GitInfo { branch, changed } = event {
+            app.git_branch = branch;
+            app.git_changed = changed;
+            continue;
+        }
+
         // The background MCP connect finished: merge the servers' tools into the
         // live agent's registry. If a turn is running the agent is out of its
         // slot, so defer the merge until the turn returns it.
         if let Event::McpConnected(connected) = event {
+            app.mcp_servers = connected;
             if connected > 0 {
                 if agent_slot.is_some() {
                     CommandContext {
@@ -3612,7 +3677,17 @@ impl CommandContext<'_> {
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
             SlashCommand::Resume(None) => self.app.open_resume_picker(),
-            SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
+            SlashCommand::Resume(Some(arg)) => {
+                // A bare 1-based index selects from the home screen's list;
+                // anything else is treated as a literal session id.
+                let id = match arg.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= self.app.home_sessions.len() => {
+                        self.app.home_sessions[n - 1].id.clone()
+                    }
+                    _ => arg,
+                };
+                self.resume_session(id).await;
+            }
             SlashCommand::Compact => self.request_compact(),
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
@@ -4205,6 +4280,7 @@ impl CommandContext<'_> {
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
                 }
+                self.app.tool_count = tool_count;
                 self.app.notice(format!(
                     "MCP ready: {} server(s) connected, {tool_count} tools available",
                     manager.connection_count()
