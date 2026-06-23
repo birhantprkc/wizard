@@ -28,9 +28,13 @@ pub enum Event {
     /// The background MCP connect (spawned at startup so the first paint isn't
     /// blocked on slow stdio servers) finished populating the shared manager.
     /// The main loop rebuilds the tool registry from it so the servers' tools
-    /// merge into the live agent. Carries the number of connected servers so
-    /// the loop can stay quiet when nothing actually connected.
-    McpConnected(usize),
+    /// merge into the live agent. Carries `{connected, configured}` so the loop
+    /// can stay quiet when nothing connected and surface a shortfall when some
+    /// (but not all) configured servers came up.
+    McpConnected {
+        connected: usize,
+        configured: usize,
+    },
     /// The background git probe (spawned at startup so the first paint isn't
     /// blocked on `git`) finished. Carries the current branch and the count of
     /// changed working-tree files for the home screen.
@@ -38,6 +42,11 @@ pub enum Event {
         branch: Option<String>,
         changed: usize,
     },
+    /// The deferred cloud-provider health probe failed. Carries the error
+    /// string; the main loop stores it in `App::provider_health_error` so the
+    /// breakage shows at launch (welcome screen + status bar) rather than only
+    /// when the first message fails.
+    ProviderHealthFailed(String),
     /// A background agent rebuild (model switch, crash recovery) finished.
     /// Carries the agent back to the main loop's slot (boxed: an [`Agent`]
     /// is large next to the input variants).

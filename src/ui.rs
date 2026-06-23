@@ -121,14 +121,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// collapsible tool cards. Borderless; a one-column side margin keeps the
 /// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    // Stay on the welcome screen until the conversation actually begins. Early
-    // system notices (e.g. "MCP ready") land in the transcript before the user
-    // sends anything; those alone shouldn't dismiss the opening screen.
-    let has_conversation = app
-        .transcript
-        .iter()
-        .any(|entry| !matches!(entry, TranscriptEntry::Notice(_)));
-    if !has_conversation && app.streaming.is_empty() && !app.status.busy {
+    // Stay on the home screen until the conversation actually begins (see
+    // `App::has_conversation`: early system notices alone don't dismiss it).
+    if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
         draw_home(frame, app, area);
         return;
     }
@@ -201,16 +196,32 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("✦ ", accent()),
         Span::styled("wizard", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("    "),
-        Span::styled(abbreviate_home(&app.project_root), Style::default().fg(TEXT_DIM)),
+        Span::styled(
+            abbreviate_home(&app.project_root),
+            Style::default().fg(TEXT_DIM),
+        ),
     ];
     if let Some(branch) = &app.git_branch {
         header.push(Span::styled(" · ", dim()));
         header.push(Span::styled(branch.clone(), Style::default().fg(TEXT_DIM)));
         if app.git_changed > 0 {
-            header.push(Span::styled(format!(" ✎ {} changed", app.git_changed), dim()));
+            header.push(Span::styled(
+                format!(" ✎ {} changed", app.git_changed),
+                dim(),
+            ));
         }
     }
     lines.push(Line::from(header));
+
+    // A broken provider, caught by the deferred health probe, shows right under
+    // the header so it's the first thing seen at launch rather than only when
+    // the first message fails.
+    if let Some(err) = &app.provider_health_error {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ provider unreachable: {err}"),
+            Style::default().fg(Color::White).bold(),
+        )));
+    }
     lines.push(Line::raw(""));
 
     if app.home_sessions.is_empty() {
@@ -238,7 +249,10 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        lines.push(Line::from(Span::styled("Continue where you left off", dim())));
+        lines.push(Line::from(Span::styled(
+            "Continue where you left off",
+            dim(),
+        )));
         for (index, session) in app.home_sessions.iter().enumerate() {
             // Row indent (2) + index + two spaces, then summary, then a
             // right-aligned meta column ("N msgs · ago").
@@ -258,8 +272,8 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
                 .saturating_sub(indent + prefix.width() + meta.width() + 2)
                 .max(8);
             let summary = truncate_width(&session.summary, budget);
-            let pad = width
-                .saturating_sub(indent + prefix.width() + summary.width() + meta.width());
+            let pad =
+                width.saturating_sub(indent + prefix.width() + summary.width() + meta.width());
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(prefix, accent()),
@@ -731,6 +745,24 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 app.status.step, app.status.max_steps
             ),
             dim(),
+        ));
+    }
+    // MCP is still connecting in the background: a transient marker, shown
+    // alongside the busy/step indicator (a turn can start before tools arrive)
+    // so the missing-tools window isn't a silent surprise. Vanishes when the
+    // connect finishes.
+    if app.mcp_connecting {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(format!("{spinner} "), accent()));
+        spans.push(Span::styled("connecting tools…", dim().italic()));
+    }
+    // A failed health probe leaves a persistent marker so the breakage survives
+    // once the user starts typing and the welcome screen is gone.
+    if app.provider_health_error.is_some() {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            "⚠ provider",
+            Style::default().fg(Color::White).bold(),
         ));
     }
     let line = Line::from(spans);

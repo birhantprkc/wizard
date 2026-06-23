@@ -858,6 +858,16 @@ pub struct App {
     pub mcp_servers: usize,
     /// Number of tools in the live registry, for the home-screen footer.
     pub tool_count: usize,
+    /// True while the background MCP connect is in flight (servers spawning,
+    /// `initialize` round-trips). Drives a transient status-bar indicator so a
+    /// message sent before the tools arrive isn't a silent surprise. Cleared on
+    /// the no-servers early-return and once the connect finishes or fails.
+    pub mcp_connecting: bool,
+    /// Set by the deferred cloud-provider health probe when it fails, so the
+    /// breakage is visible at launch (home screen + status bar) instead of only
+    /// on the first message. Cleared once a turn completes successfully — the
+    /// provider has proven itself, so a transient blip self-heals.
+    pub provider_health_error: Option<String>,
 }
 
 impl App {
@@ -926,7 +936,19 @@ impl App {
             git_changed: 0,
             mcp_servers: 0,
             tool_count: 0,
+            mcp_connecting: false,
+            provider_health_error: None,
         }
+    }
+
+    /// True while the home screen should remain up: the conversation hasn't
+    /// begun. Early system notices (e.g. a provider-health warning) land in the
+    /// transcript before the user sends anything; those alone shouldn't dismiss
+    /// the opening screen, so only non-`Notice` entries count as conversation.
+    pub fn has_conversation(&self) -> bool {
+        self.transcript
+            .iter()
+            .any(|entry| !matches!(entry, TranscriptEntry::Notice(_)))
     }
 
     /// Pick a fresh spinner verb for a new busy period. The verb stays fixed
@@ -1746,8 +1768,9 @@ impl App {
             // reach here.
             Event::AgentRebuilt(_)
             | Event::ProviderActivated(_)
-            | Event::McpConnected(_)
-            | Event::GitInfo { .. } => Ok(None),
+            | Event::McpConnected { .. }
+            | Event::GitInfo { .. }
+            | Event::ProviderHealthFailed(_) => Ok(None),
         }
     }
 
@@ -3242,18 +3265,17 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let _guard = TerminalGuard;
 
     // Probe the cloud provider's health off the draw path so the network
-    // round-trip doesn't delay launch. Only a failure is surfaced (as a notice);
-    // success is silent. A genuinely broken provider still errors clearly on the
-    // first message, but launch — and /login, /provider, /model — stay usable.
+    // round-trip doesn't delay launch. Only a failure is surfaced; success is
+    // silent. The failure goes to `Event::ProviderHealthFailed` (not a plain
+    // notice) so the main loop can show it where it's visible pre-conversation
+    // — otherwise the welcome screen hides it until the first message fails.
     if active_is_cloud {
         let probe = client.clone();
         let notify = events.sender();
         tokio::spawn(async move {
             if let Err(err) = probe.health().await {
                 let _ = notify
-                    .send(Event::Notice(format!(
-                        "provider health check failed: {err:#}"
-                    )))
+                    .send(Event::ProviderHealthFailed(format!("{err:#}")))
                     .await;
             }
         });
@@ -3261,7 +3283,11 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
 
     // Connect MCP servers off the draw path so a slow stdio server (npx, etc.)
     // can't delay launch. When the connect finishes, the main loop rebuilds the
-    // registry from the now-populated manager (`Event::McpConnected`).
+    // registry from the now-populated manager (`Event::McpConnected`). The
+    // indicator goes up unconditionally and comes down on every exit path
+    // (no-servers early return, success, failure) so a message sent before the
+    // tools arrive isn't a silent surprise.
+    app.mcp_connecting = true;
     {
         let manager = Arc::clone(&manager);
         let mcp_path = mcp_path.clone();
@@ -3271,14 +3297,29 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 Ok(config) => config,
                 Err(err) => {
                     tracing::warn!("loading {}: {err:#}", mcp_path.display());
+                    // Tell the loop to clear the indicator (no servers will
+                    // connect): nothing configured, nothing missing.
+                    let _ = notify
+                        .send(Event::McpConnected {
+                            connected: 0,
+                            configured: 0,
+                        })
+                        .await;
                     return;
                 }
             };
             if mcp_config.servers.is_empty() {
                 // Nothing to connect: keep the empty manager and skip the
                 // registry rebuild entirely (the agent already has every tool).
+                let _ = notify
+                    .send(Event::McpConnected {
+                        connected: 0,
+                        configured: 0,
+                    })
+                    .await;
                 return;
             }
+            let configured = mcp_config.servers.len();
             {
                 let mut manager = manager.lock().await;
                 if let Err(err) = manager.reload(&mcp_config).await {
@@ -3286,7 +3327,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 }
             }
             let connected = manager.lock().await.connection_count();
-            let _ = notify.send(Event::McpConnected(connected)).await;
+            let _ = notify
+                .send(Event::McpConnected {
+                    connected,
+                    configured,
+                })
+                .await;
         });
     }
 
@@ -3361,8 +3407,23 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         // The background MCP connect finished: merge the servers' tools into the
         // live agent's registry. If a turn is running the agent is out of its
         // slot, so defer the merge until the turn returns it.
-        if let Event::McpConnected(connected) = event {
+        if let Event::McpConnected {
+            connected,
+            configured,
+        } = event
+        {
+            app.mcp_connecting = false;
+            // Drives the home-screen footer's "N MCP servers" count.
             app.mcp_servers = connected;
+            // Some configured servers came up but not all: surface the shortfall
+            // as an `error:`-prefixed notice (bold/white, counts as conversation)
+            // — the actionable counterpart to the now-silent success path.
+            if connected < configured {
+                app.notice(format!(
+                    "error: {} of {configured} MCP servers failed to connect (see logs)",
+                    configured - connected
+                ));
+            }
             if connected > 0 {
                 if agent_slot.is_some() {
                     CommandContext {
@@ -3382,6 +3443,14 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     app.mcp_merge_pending = true;
                 }
             }
+            continue;
+        }
+
+        // The deferred cloud-provider health probe failed: store the error so
+        // it shows at launch (home screen + status bar) rather than only on the
+        // first message.
+        if let Event::ProviderHealthFailed(err) = event {
+            app.provider_health_error = Some(err);
             continue;
         }
 
@@ -3559,6 +3628,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             match handle.await {
                 Ok(agent) => {
                     agent_slot = Some(agent);
+                    // The provider just served a turn, so any earlier health
+                    // warning was transient — drop it so it self-heals.
+                    app.provider_health_error = None;
                     // MCP finished connecting mid-turn: merge its tools now that
                     // the agent is back in its slot.
                     if app.mcp_merge_pending {
@@ -4276,15 +4348,16 @@ impl CommandContext<'_> {
         let manager = self.manager.lock().await;
         match build_registry(&manager, self.client, &hooks).await {
             Ok(registry) => {
+                // Success is silent: tools simply start working and the
+                // "connecting tools…" indicator disappears. A success notice
+                // here is tool-flex narration and, emitted ~2s in, floats above
+                // the user's first message as if it were a reply to it — but the
+                // home-screen footer's tool count still needs updating.
                 let tool_count = registry.len();
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
                 }
                 self.app.tool_count = tool_count;
-                self.app.notice(format!(
-                    "MCP ready: {} server(s) connected, {tool_count} tools available",
-                    manager.connection_count()
-                ));
             }
             Err(err) => self.app.notice(format!(
                 "MCP connected but registry rebuild failed: {err:#}"
@@ -4899,6 +4972,54 @@ mod tests {
             "untracked file missing from /diff output:\n{text}"
         );
         assert!(text.contains("# --- untracked ---"));
+    }
+
+    #[test]
+    fn launch_state_fields_default_inert() {
+        let app = app();
+        assert!(!app.mcp_connecting, "tools indicator starts hidden");
+        assert!(
+            app.provider_health_error.is_none(),
+            "no provider error until the probe fails"
+        );
+    }
+
+    #[test]
+    fn welcome_stays_up_for_empty_and_notice_only_transcripts() {
+        let mut app = app();
+        // Fresh launch: nothing typed, welcome screen.
+        assert!(!app.has_conversation());
+
+        // Early system notices (provider health, partial MCP failure) land
+        // before the first message; they alone must not dismiss the welcome.
+        app.notice("error: 1 of 2 MCP servers failed to connect (see logs)");
+        app.notice("just a status line");
+        assert!(
+            !app.has_conversation(),
+            "notices alone should not count as conversation"
+        );
+    }
+
+    #[test]
+    fn welcome_dismisses_once_real_entries_appear() {
+        for entry in [
+            TranscriptEntry::User("hi".to_string()),
+            TranscriptEntry::Assistant("hello".to_string()),
+            TranscriptEntry::ToolCard {
+                name: "read".to_string(),
+                args: serde_json::json!({}),
+                output: None,
+                is_error: false,
+                collapsed: false,
+            },
+        ] {
+            let mut app = app();
+            app.transcript.push(entry);
+            assert!(
+                app.has_conversation(),
+                "a User/Assistant/ToolCard entry begins the conversation"
+            );
+        }
     }
 
     #[test]
