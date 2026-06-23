@@ -35,13 +35,6 @@ pub enum Event {
         connected: usize,
         configured: usize,
     },
-    /// The background git probe (spawned at startup so the first paint isn't
-    /// blocked on `git`) finished. Carries the current branch and the count of
-    /// changed working-tree files for the home screen.
-    GitInfo {
-        branch: Option<String>,
-        changed: usize,
-    },
     /// The deferred cloud-provider health probe failed. Carries the error
     /// string; the main loop stores it in `App::provider_health_error` so the
     /// breakage shows at launch (welcome screen + status bar) rather than only

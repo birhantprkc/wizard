@@ -121,10 +121,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// collapsible tool cards. Borderless; a one-column side margin keeps the
 /// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    // Stay on the home screen until the conversation actually begins (see
+    // Stay on the welcome screen until the conversation actually begins (see
     // `App::has_conversation`: early system notices alone don't dismiss it).
     if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
-        draw_home(frame, app, area);
+        draw_welcome(frame, app, area);
         return;
     }
 
@@ -175,204 +175,68 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Home screen shown before the first message: a left-aligned dashboard with
-/// recent resumable sessions, a project/git line, and a capability footer.
-/// No borders, no banner art. Falls back to a short getting-started block on
-/// first run (no past sessions yet).
-fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
-    let inner = area.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let width = inner.width as usize;
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Header: ✦ wizard    ~/path · branch ✎ N changed
-    let mut header = vec![
-        Span::styled("✦ ", accent()),
-        Span::styled("wizard", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("    "),
-        Span::styled(
-            abbreviate_home(&app.project_root),
-            Style::default().fg(TEXT_DIM),
-        ),
+/// Welcome screen shown before the first message: a small centered card,
+/// no borders, no banner art.
+fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled("✦", accent())),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "w i z a r d",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("your sovereign agent", dim().italic())),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+            Span::styled(" · ", dim()),
+            mode_span(app.status.mode),
+        ]),
+        Line::raw(""),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("type a message", Style::default().fg(TEXT_DIM)),
+            Span::styled(" and press Enter to begin", dim()),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("/", accent()),
+            Span::styled("  commands — Tab completes, ↑/↓ select", dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("/model", accent()),
+            Span::styled("  pick a model", dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("/help", accent()),
+            Span::styled("  all commands & keys", dim()),
+        ]),
     ];
-    if let Some(branch) = &app.git_branch {
-        header.push(Span::styled(" · ", dim()));
-        header.push(Span::styled(branch.clone(), Style::default().fg(TEXT_DIM)));
-        if app.git_changed > 0 {
-            header.push(Span::styled(
-                format!(" ✎ {} changed", app.git_changed),
-                dim(),
-            ));
-        }
-    }
-    lines.push(Line::from(header));
 
-    // A broken provider, caught by the deferred health probe, shows right under
-    // the header so it's the first thing seen at launch rather than only when
-    // the first message fails.
+    // A broken provider, caught by the deferred health probe, surfaces under the
+    // model line so it's visible at launch rather than only when a turn fails.
     if let Some(err) = &app.provider_health_error {
-        lines.push(Line::from(Span::styled(
-            format!("⚠ provider unreachable: {err}"),
-            Style::default().fg(Color::White).bold(),
-        )));
-    }
-    lines.push(Line::raw(""));
-
-    if app.home_sessions.is_empty() {
-        // First run: a short getting-started so the screen is still useful.
-        lines.push(Line::from(Span::styled("Get started", dim())));
-        for example in [
-            "explain this codebase",
-            "add a test for the parser",
-            "what changed on this branch?",
-        ] {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(example.to_string(), Style::default().fg(TEXT_DIM)),
-            ]));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("/", accent()),
-            Span::styled(" commands · ", dim()),
-            Span::styled("/help", accent()),
-            Span::styled(" keys", dim()),
-        ]));
-    } else {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        lines.push(Line::from(Span::styled(
-            "Continue where you left off",
-            dim(),
-        )));
-        for (index, session) in app.home_sessions.iter().enumerate() {
-            // Row indent (2) + index + two spaces, then summary, then a
-            // right-aligned meta column ("N msgs · ago").
-            let prefix = format!("{}  ", index + 1);
-            let mut meta = format!(
-                "{} msg{}",
-                session.messages,
-                if session.messages == 1 { "" } else { "s" }
-            );
-            let ago = ago(now, session.updated_unix);
-            if !ago.is_empty() {
-                meta.push_str(" · ");
-                meta.push_str(&ago);
-            }
-            let indent = 2usize;
-            let budget = width
-                .saturating_sub(indent + prefix.width() + meta.width() + 2)
-                .max(8);
-            let summary = truncate_width(&session.summary, budget);
-            let pad =
-                width.saturating_sub(indent + prefix.width() + summary.width() + meta.width());
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(prefix, accent()),
-                Span::raw(summary),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(meta, dim()),
-            ]));
-        }
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("/resume <n>", Style::default().fg(TEXT_DIM)),
-            Span::styled("  or  ", dim()),
-            Span::styled("/resume", Style::default().fg(TEXT_DIM)),
-            Span::styled(" to browse", dim()),
-        ]));
+        lines.insert(
+            6,
+            Line::from(Span::styled(
+                format!("⚠ provider unreachable: {err}"),
+                Style::default().fg(Color::White).bold(),
+            )),
+        );
     }
 
-    lines.push(Line::raw(""));
-
-    // Footer: model · mode · N tools · M MCP servers
-    let mut footer = vec![
-        Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
-        Span::styled(" · ", dim()),
-        mode_span(app.status.mode),
-        Span::styled(format!(" · {} tools", app.tool_count), dim()),
-    ];
-    if app.mcp_servers > 0 {
-        footer.push(Span::styled(
-            format!(
-                " · {} MCP server{}",
-                app.mcp_servers,
-                if app.mcp_servers == 1 { "" } else { "s" }
-            ),
-            dim(),
-        ));
-    }
-    lines.push(Line::from(footer));
-    if !app.home_sessions.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("/", accent()),
-            Span::styled(" commands · ", dim()),
-            Span::styled("/help", accent()),
-            Span::styled(" keys", dim()),
-        ]));
-    }
-
+    let height = lines.len() as u16;
+    let top = area.height.saturating_sub(height) / 2;
+    let centered = Rect {
+        x: area.x,
+        y: area.y + top,
+        width: area.width,
+        height: height.min(area.height),
+    };
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).alignment(Alignment::Left),
-        inner,
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+        centered,
     );
-}
-
-/// Abbreviate `path` with `~` for `$HOME`, for the home-screen header.
-fn abbreviate_home(path: &std::path::Path) -> String {
-    let display = path.to_string_lossy();
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = display.strip_prefix(&home)
-    {
-        return format!("~{rest}");
-    }
-    display.into_owned()
-}
-
-/// Coarse "… ago" label for a unix timestamp. Empty string when `then` is 0
-/// (mtime unavailable). Falls back to a `YYYY-MM-DD` date past a week.
-fn ago(now: u64, then: u64) -> String {
-    if then == 0 {
-        return String::new();
-    }
-    let secs = now.saturating_sub(then);
-    match secs {
-        0..=59 => "just now".to_string(),
-        60..=3599 => format!("{}m ago", secs / 60),
-        3600..=86_399 => format!("{}h ago", secs / 3600),
-        86_400..=172_799 => "yesterday".to_string(),
-        172_800..=604_799 => format!("{}d ago", secs / 86_400),
-        _ => {
-            // Past a week: a plain date (days since epoch -> Y-M-D).
-            let days = then / 86_400;
-            let (y, m, d) = civil_from_days(days as i64);
-            format!("{y:04}-{m:02}-{d:02}")
-        }
-    }
-}
-
-/// Convert days-since-epoch to a (year, month, day) civil date. Howard
-/// Hinnant's algorithm; used only for the home screen's old-session dates.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Colored span for a mode name: genie is quiet, sovereign is a warning.

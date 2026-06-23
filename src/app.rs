@@ -846,27 +846,15 @@ pub struct App {
     /// yet). The main loop merges the MCP tools once the turn returns the
     /// agent. Cleared then.
     pub mcp_merge_pending: bool,
-    /// Recent resumable sessions shown on the home screen (newest first,
-    /// current session excluded). Loaded once at startup.
-    pub home_sessions: Vec<crate::agent::session::SessionSummary>,
-    /// Current git branch (None when not a repo / probe failed). Filled by the
-    /// background `Event::GitInfo`.
-    pub git_branch: Option<String>,
-    /// Number of changed files in the working tree (`git status --porcelain`).
-    pub git_changed: usize,
-    /// Number of connected MCP servers, for the home-screen footer.
-    pub mcp_servers: usize,
-    /// Number of tools in the live registry, for the home-screen footer.
-    pub tool_count: usize,
     /// True while the background MCP connect is in flight (servers spawning,
     /// `initialize` round-trips). Drives a transient status-bar indicator so a
     /// message sent before the tools arrive isn't a silent surprise. Cleared on
     /// the no-servers early-return and once the connect finishes or fails.
     pub mcp_connecting: bool,
     /// Set by the deferred cloud-provider health probe when it fails, so the
-    /// breakage is visible at launch (home screen + status bar) instead of only
-    /// on the first message. Cleared once a turn completes successfully — the
-    /// provider has proven itself, so a transient blip self-heals.
+    /// breakage is visible at launch (welcome screen + status bar) instead of
+    /// only on the first message. Cleared once a turn completes successfully —
+    /// the provider has proven itself, so a transient blip self-heals.
     pub provider_health_error: Option<String>,
 }
 
@@ -931,11 +919,6 @@ impl App {
             pending_compact: false,
             compacting: false,
             mcp_merge_pending: false,
-            home_sessions: Vec::new(),
-            git_branch: None,
-            git_changed: 0,
-            mcp_servers: 0,
-            tool_count: 0,
             mcp_connecting: false,
             provider_health_error: None,
         }
@@ -1769,7 +1752,6 @@ impl App {
             Event::AgentRebuilt(_)
             | Event::ProviderActivated(_)
             | Event::McpConnected { .. }
-            | Event::GitInfo { .. }
             | Event::ProviderHealthFailed(_) => Ok(None),
         }
     }
@@ -3221,20 +3203,6 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         .unwrap_or(0);
     // Register this session so other sessions' /dashboard can see it.
     crate::session_registry::write(&app.session_record());
-    // Home screen: recent resumable sessions (newest first, current excluded)
-    // and the live tool count. Git info and MCP count arrive from background
-    // probes once the TUI is up.
-    if let Ok(dir) = Config::sessions_dir() {
-        app.home_sessions = crate::agent::session::summaries(&dir)
-            .into_iter()
-            .filter(|summary| summary.id != app.session_id)
-            .take(5)
-            .collect();
-    }
-    app.tool_count = agent_slot
-        .as_ref()
-        .map(|agent| agent.tool_count())
-        .unwrap_or(0);
     // `wizard agents` opens straight into the dashboard.
     if matches!(cli.command, Some(crate::cli::Command::Agents)) {
         app.show_dashboard = true;
@@ -3336,31 +3304,6 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         });
     }
 
-    // Probe git off the draw path so a slow/cold `git` can't delay launch.
-    // The home screen fills in the branch + changed-file count when it lands.
-    {
-        let project_root = project_root.clone();
-        let notify = events.sender();
-        tokio::spawn(async move {
-            let git = |args: &[&str]| {
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(&project_root)
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            };
-            let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let changed = git(&["status", "--porcelain"])
-                .map(|s| s.lines().filter(|line| !line.trim().is_empty()).count())
-                .unwrap_or(0);
-            let _ = notify.send(Event::GitInfo { branch, changed }).await;
-        });
-    }
-
     let mut last_heartbeat = Instant::now();
 
     loop {
@@ -3397,13 +3340,6 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             continue;
         }
 
-        // The background git probe finished: update the home-screen header.
-        if let Event::GitInfo { branch, changed } = event {
-            app.git_branch = branch;
-            app.git_changed = changed;
-            continue;
-        }
-
         // The background MCP connect finished: merge the servers' tools into the
         // live agent's registry. If a turn is running the agent is out of its
         // slot, so defer the merge until the turn returns it.
@@ -3413,8 +3349,6 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         } = event
         {
             app.mcp_connecting = false;
-            // Drives the home-screen footer's "N MCP servers" count.
-            app.mcp_servers = connected;
             // Some configured servers came up but not all: surface the shortfall
             // as an `error:`-prefixed notice (bold/white, counts as conversation)
             // — the actionable counterpart to the now-silent success path.
@@ -3749,17 +3683,7 @@ impl CommandContext<'_> {
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
             SlashCommand::Resume(None) => self.app.open_resume_picker(),
-            SlashCommand::Resume(Some(arg)) => {
-                // A bare 1-based index selects from the home screen's list;
-                // anything else is treated as a literal session id.
-                let id = match arg.parse::<usize>() {
-                    Ok(n) if n >= 1 && n <= self.app.home_sessions.len() => {
-                        self.app.home_sessions[n - 1].id.clone()
-                    }
-                    _ => arg,
-                };
-                self.resume_session(id).await;
-            }
+            SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
             SlashCommand::Compact => self.request_compact(),
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
@@ -4350,14 +4274,11 @@ impl CommandContext<'_> {
             Ok(registry) => {
                 // Success is silent: tools simply start working and the
                 // "connecting tools…" indicator disappears. A success notice
-                // here is tool-flex narration and, emitted ~2s in, floats above
-                // the user's first message as if it were a reply to it — but the
-                // home-screen footer's tool count still needs updating.
-                let tool_count = registry.len();
+                // here is tool-flex narration and, emitted ~2s in, would float
+                // above the user's first message as if it were a reply to it.
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
                 }
-                self.app.tool_count = tool_count;
             }
             Err(err) => self.app.notice(format!(
                 "MCP connected but registry rebuild failed: {err:#}"
