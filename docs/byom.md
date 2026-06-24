@@ -126,7 +126,6 @@ You can also edit config by hand; Ollama is selected with an explicit provider e
 ```toml
 # ~/.wizard/config.toml
 mode = "genie"
-auto_approve = true
 
 [[providers]]
 name = "local"

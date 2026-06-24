@@ -125,7 +125,6 @@ Wizard reads files, applies changes, runs tests, and shows git diffs.
 ```toml
 active_provider = "local"
 mode = "genie"
-auto_approve = false
 max_steps = 25
 
 [[providers]]
@@ -226,7 +225,7 @@ wizard -p "find all TODO comments and list them by file"
 Combine with sovereign mode for autonomous execution:
 
 ```bash
-wizard --mode sovereign -p "implement JWT refresh tokens" --auto
+wizard --mode sovereign -p "implement JWT refresh tokens"
 ```
 
 ## Working in a project

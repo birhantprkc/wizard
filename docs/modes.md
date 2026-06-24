@@ -14,18 +14,15 @@ Genie is the interactive, conversational mode. It is eager and creative ("your w
 ### Behavior
 
 - Full Ratatui interface with chat history and tool output panels
-- Bypasses permissions: auto-approves all tool calls, with no per-action y/n prompt
+- Executes all tool calls directly; there is no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
 - Default loop limit: 25 agent steps per turn
 - Best for: collaboration, exploration, incremental changes
-
-> To restore per-action confirmation prompts, set `auto_approve = false` in `~/.wizard/config.toml`.
 
 ### Flags
 
 | Flag | Effect |
 |------|--------|
-| `--auto` | Auto-approve flag; now the default for genie. Pass for scripting compatibility or when `auto_approve = false` is set in config |
 | `-p "task"` | Pre-fill the first message |
 | `--resume` | Continue the last session |
 
@@ -68,7 +65,6 @@ Sovereign mode is the autonomous, proactive agent. It runs with minimal human in
 | `--max-hours 2` | Time limit for the run |
 | `--loop 10` | Max outer loop iterations |
 | `--continuous` | Run perpetually, never stopping at "done" (implies sovereign). See below |
-| `--auto` | Implicit in sovereign mode; included for consistency |
 | `--cwd /path/to/repo` | Set project root |
 
 ### Control file

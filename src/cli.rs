@@ -34,11 +34,6 @@ pub struct Cli {
     #[arg(long)]
     pub publish: bool,
 
-    /// Deprecated: approval gating was removed and every tool call executes
-    /// directly. Accepted for compatibility and ignored.
-    #[arg(long, hide = true)]
-    pub auto: bool,
-
     /// Start in plan mode: the agent investigates with read-only tools and
     /// presents a plan via the exit_plan tool before executing. The TUI asks
     /// for approval; headless runs and the gateway auto-approve, giving a
@@ -347,7 +342,6 @@ mod tests {
         assert_eq!(cli.prompt, None);
         assert!(!cli.evolve);
         assert!(!cli.deep);
-        assert!(!cli.auto);
         assert!(!cli.plan);
         assert_eq!(cli.max_hours, None);
         assert_eq!(cli.loop_limit, None);
@@ -377,7 +371,6 @@ mod tests {
             "sovereign",
             "-p",
             "add tests",
-            "--auto",
             "--plan",
             "--max-hours",
             "1.5",
@@ -393,7 +386,6 @@ mod tests {
         .expect("full flag set parses");
         assert_eq!(cli.mode, Some(Mode::Sovereign));
         assert_eq!(cli.prompt.as_deref(), Some("add tests"));
-        assert!(cli.auto);
         assert!(cli.plan);
         assert_eq!(cli.max_hours, Some(1.5));
         assert_eq!(cli.loop_limit, Some(10));

@@ -82,7 +82,6 @@ Parses arguments and selects run mode:
 | `--mode genie\|sovereign` | Personality |
 | `-p, --prompt` | Initial task (headless or pre-fill) |
 | `--evolve` | Self-extension mode |
-| `--auto` | Skip confirmation prompts |
 | `--max-hours` | Time limit (sovereign mode) |
 | `--cwd` | Project root override |
 
@@ -93,7 +92,6 @@ Loaded from `~/.wizard/config.toml` with optional env overrides (`WIZARD_MODEL`,
 ```toml
 active_provider = "local"
 mode = "genie"
-auto_approve = true
 max_steps = 25
 
 [[providers]]
@@ -198,9 +196,8 @@ Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Self-extension is sp
 1. Locate source (`~/.wizard/src`; cloned from the repo on first use)
 2. Ensure a Rust toolchain (installed via `rustup` on first use if absent; see [Install scripts](#install-scripts))
 3. Agent proposes a unified diff over its own source
-4. User approves (skipped by default; opt in via `auto_approve = false`)
-5. `cargo build --release`
-6. Replace the running process via `exec` (hot-reload)
+4. `cargo build --release`
+5. Replace the running process via `exec` (hot-reload)
 
 If no toolchain or source is available and it can't be provisioned, deep evolve falls back to Tier 1 with a clear message. Evolution events are logged to `~/.wizard/evolution.jsonl`.
 
@@ -262,7 +259,7 @@ Target release binary: **< 60 MB** (strip + LTO).
 - Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the local option, or the configured cloud API
 - Beyond the active provider, the core loop makes no outbound API calls in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
-- Both modes auto-approve tool calls (writes, shell, git, and `/evolve` changes) by default. An opt-in y/n confirmation gate is available via `auto_approve = false`. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run sovereign mode only on tasks and repos where unattended local command execution is acceptable
+- Both modes execute tool calls (writes, shell, git, and `/evolve` changes) directly — there is no approval gate. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run either mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training
 
 ## Roadmap additions

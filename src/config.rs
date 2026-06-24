@@ -421,11 +421,6 @@ pub struct Config {
     pub gguf_path: Option<String>,
     /// Default personality mode.
     pub mode: Mode,
-    /// Deprecated: approval gating was removed and every tool call executes
-    /// directly. Still parsed so old config files load; ignored (a startup
-    /// warning is printed when set to `false`) and never written back.
-    #[serde(skip_serializing)]
-    pub auto_approve: bool,
     /// Agent loop limit per turn (genie). Sovereign uses its own default
     /// unless this is explicitly raised above it.
     pub max_steps: u32,
@@ -496,7 +491,6 @@ impl Default for Config {
             llamacpp_host: DEFAULT_LLAMACPP_HOST.to_string(),
             gguf_path: None,
             mode: Mode::Genie,
-            auto_approve: true,
             max_steps: 25,
             continuous: false,
             plan_first: false,
@@ -833,7 +827,6 @@ mod tests {
             llamacpp_host: "http://10.0.0.5:8080".to_string(),
             gguf_path: Some("/models/qwen3-8b-q4_k_m.gguf".to_string()),
             mode: Mode::Sovereign,
-            auto_approve: true,
             max_steps: 200,
             continuous: true,
             plan_first: true,
@@ -1431,17 +1424,11 @@ usd_per_mtok_out = 15.0
     }
 
     #[test]
-    fn deprecated_auto_flag_is_accepted_and_ignored() {
-        let mut config = Config::default();
-        config.apply_cli(&cli(&["--auto"]));
-        assert_eq!(config.mode, Mode::Genie);
-        assert_eq!(config.max_steps, 25, "genie keeps its budget");
-    }
-
-    #[test]
-    fn deprecated_auto_approve_key_still_parses_and_is_not_written_back() {
+    fn unknown_keys_are_ignored_and_not_written_back() {
+        // Old configs carried an `auto_approve` key for the since-removed
+        // approval gate. Unknown keys must still load (no `deny_unknown_fields`)
+        // and never reappear on re-serialization.
         let config: Config = toml::from_str("auto_approve = false").expect("old key parses");
-        assert!(!config.auto_approve);
         let raw = toml::to_string_pretty(&config).expect("serialize");
         assert!(
             !raw.contains("auto_approve"),

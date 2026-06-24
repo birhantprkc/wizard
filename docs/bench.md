@@ -84,7 +84,7 @@ wizard bench run --label this-build
 
 # A different wizard build
 wizard bench run --label v2 \
-    --runner '/path/to/wizard-v2 --mode sovereign --auto -p {prompt}'
+    --runner '/path/to/wizard-v2 --mode sovereign -p {prompt}'
 
 # A different agent entirely (Claude Code)
 wizard bench run --label claude \

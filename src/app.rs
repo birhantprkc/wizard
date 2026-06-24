@@ -287,7 +287,6 @@ const PROVIDER_TYPES: &[(&str, &str)] = &[
     ),
     ("OpenRouter — API key", "openrouter.ai"),
     ("OpenAI — API key", "api.openai.com"),
-    ("OpenAI — sign in", "coming soon"),
     ("Anthropic (Claude) — API key", "api.anthropic.com"),
     ("OpenAI-compatible — custom", "any base URL + key"),
 ];
@@ -2053,14 +2052,8 @@ impl App {
                                         ]),
                                     });
                                 }
-                                // OpenAI sign-in (ChatGPT) — not wired up yet.
-                                4 => {
-                                    self.notice(
-                                        "OpenAI sign-in (ChatGPT) is coming soon — use OpenAI API key for now",
-                                    );
-                                }
                                 // Anthropic — model + key.
-                                5 => {
+                                4 => {
                                     self.begin_provider_prompt(ProviderPrompt {
                                         kind: ProviderKind::Anthropic,
                                         name: "claude".to_string(),
@@ -2075,7 +2068,7 @@ impl App {
                                 }
                                 // OpenAI-compatible custom — everything is
                                 // prompted, starting with the name.
-                                6 => {
+                                5 => {
                                     self.begin_provider_prompt(ProviderPrompt {
                                         kind: ProviderKind::Openai,
                                         name: String::new(),

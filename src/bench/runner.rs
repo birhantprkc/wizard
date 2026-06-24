@@ -36,7 +36,7 @@ pub async fn run_cases(
         None => {
             let exe =
                 std::env::current_exe().context("locating this binary for the default runner")?;
-            format!("{} --mode sovereign --auto -p {{prompt}}", exe.display())
+            format!("{} --mode sovereign -p {{prompt}}", exe.display())
         }
     };
 
@@ -243,8 +243,8 @@ mod tests {
     #[test]
     fn render_template_substitutes_prompt() {
         assert_eq!(
-            render_template("wizard --auto -p {prompt}", "add tests"),
-            "wizard --auto -p 'add tests'"
+            render_template("wizard -p {prompt}", "add tests"),
+            "wizard -p 'add tests'"
         );
     }
 
