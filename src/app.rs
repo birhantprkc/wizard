@@ -754,6 +754,10 @@ pub struct App {
     /// Git diff sidebar visibility and cached contents.
     pub show_diff: bool,
     pub diff_text: String,
+    /// Scroll offset (in lines, from the top) into the diff sidebar. Held
+    /// here so PgUp/PgDn can page a diff that's taller than the pane; the
+    /// renderer clamps it to the content height.
+    pub diff_scroll: u16,
     /// Todo side panel visibility (toggled by `/todos`; auto-shown on the
     /// first todo update of the session).
     pub show_todos: bool,
@@ -884,6 +888,7 @@ impl App {
             status,
             show_diff: false,
             diff_text: String::new(),
+            diff_scroll: 0,
             show_todos: false,
             todos: Vec::new(),
             todos_seen: false,
@@ -2131,11 +2136,26 @@ impl App {
             // Shift+Tab toggles plan mode (same as /plan).
             KeyCode::BackTab => Some(AppAction::Command(SlashCommand::Plan)),
             KeyCode::Esc => {
-                if self.scroll > 0 {
+                if self.show_diff {
+                    // Esc closes the diff sidebar before touching the input.
+                    self.show_diff = false;
+                    self.diff_scroll = 0;
+                } else if self.scroll > 0 {
                     self.scroll = 0;
                 } else {
                     self.clear_input();
                 }
+                None
+            }
+            // While the diff sidebar is open it owns paging: read a long diff
+            // top-to-bottom (offset from the top). Otherwise PgUp/PgDn scroll
+            // the transcript (offset from the bottom).
+            KeyCode::PageUp if self.show_diff => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(10);
+                None
+            }
+            KeyCode::PageDown if self.show_diff => {
+                self.diff_scroll = self.diff_scroll.saturating_add(10);
                 None
             }
             KeyCode::PageUp => {
@@ -2840,6 +2860,12 @@ async fn git_diff_text(root: &Path) -> Result<String> {
     }
     let mut untracked_text = String::new();
     for file in untracked.lines().filter(|l| !l.trim().is_empty()) {
+        // Skip Wizard's own session state (.wizard/checkpoints, snapshots,
+        // etc.) — it's an implementation detail, not the user's work, and
+        // dumping it here makes the diff sidebar look broken.
+        if is_wizard_state_path(file) {
+            continue;
+        }
         untracked_text.push_str(&git_diff_untracked(root, file).await);
     }
     if !untracked_text.trim().is_empty() {
@@ -2853,6 +2879,17 @@ async fn git_diff_text(root: &Path) -> Result<String> {
         text = "(working tree clean)".to_string();
     }
     Ok(text)
+}
+
+/// Is this repo-relative path inside Wizard's own state dir (`.wizard/`)?
+/// Such files (checkpoints, snapshots) are Wizard internals, not the user's
+/// changes, so `/diff` omits them. Matches the dir at the repo root or in
+/// any subdir, tolerating either path separator.
+fn is_wizard_state_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    path == ".wizard"
+        || path.starts_with(".wizard/")
+        || path.contains("/.wizard/")
 }
 
 /// Render a single untracked file as a full addition by diffing it against
@@ -3726,6 +3763,7 @@ impl CommandContext<'_> {
     async fn toggle_diff(&mut self) {
         self.app.show_diff = !self.app.show_diff;
         if self.app.show_diff {
+            self.app.diff_scroll = 0;
             self.app.diff_text = match git_diff_text(self.project_root).await {
                 Ok(text) => text,
                 Err(err) => format!("could not read git diff: {err:#}"),
@@ -4893,6 +4931,72 @@ mod tests {
             "untracked file missing from /diff output:\n{text}"
         );
         assert!(text.contains("# --- untracked ---"));
+    }
+
+    /// Wizard's own `.wizard/` session state (checkpoints, snapshots) is an
+    /// implementation detail — it must never show up in `/diff`, or the
+    /// sidebar fills with internal noise and looks broken.
+    #[tokio::test]
+    async fn diff_text_omits_wizard_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(root.join(".wizard/checkpoints/1")).expect("mkdir");
+        std::fs::write(root.join(".wizard/checkpoints/1/0.snap"), "internal\n").expect("write");
+        std::fs::write(root.join("real_change.txt"), "user content\n").expect("write");
+
+        let text = git_diff_text(root).await.expect("diff text");
+        assert!(
+            text.contains("real_change.txt"),
+            "real untracked change missing:\n{text}"
+        );
+        assert!(
+            !text.contains(".wizard/checkpoints"),
+            "wizard internal state leaked into /diff:\n{text}"
+        );
+    }
+
+    #[test]
+    fn is_wizard_state_path_matches_state_dir_only() {
+        assert!(is_wizard_state_path(".wizard/checkpoints/1/0.snap"));
+        assert!(is_wizard_state_path("sub/.wizard/x"));
+        assert!(is_wizard_state_path(".wizard"));
+        assert!(!is_wizard_state_path("src/wizard.rs"));
+        assert!(!is_wizard_state_path(".wizardrc"));
+    }
+
+    /// The diff sidebar paginates with PgUp/PgDn (offset from the top) and Esc
+    /// closes it — without this a diff taller than the pane is unreadable.
+    #[test]
+    fn diff_sidebar_pages_and_closes() {
+        let mut app = app();
+        app.show_diff = true;
+        assert_eq!(app.diff_scroll, 0);
+
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.diff_scroll, 10, "PgDn scrolls the diff down");
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.diff_scroll, 0, "PgUp scrolls back up");
+        // PgUp at the top stays clamped (no underflow).
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.diff_scroll, 0);
+
+        // While the diff owns paging, the transcript scroll is untouched.
+        assert_eq!(app.scroll, 0);
+
+        app.diff_scroll = 30;
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_diff, "Esc closes the diff sidebar");
+        assert_eq!(app.diff_scroll, 0, "closing resets the diff scroll");
     }
 
     #[test]

@@ -527,13 +527,44 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" ± ", accent()),
             Span::styled("git diff", Style::default().fg(TEXT_DIM)),
         ]));
-    let inner_width = block.inner(area).width as usize;
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
+    let inner_height = inner.height as usize;
     let lines: Vec<Line<'static>> = highlight_diff(&app.diff_text)
         .lines
         .into_iter()
         .map(|line| truncate_line(line, inner_width))
         .collect();
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    // Clamp the scroll to the content so PgDn can't strand the view past the
+    // end; the key handler lets diff_scroll grow unbounded (mirroring the
+    // transcript), and render is the single source of truth for the bound.
+    let max_scroll = lines.len().saturating_sub(inner_height);
+    let scroll = (app.diff_scroll as usize).min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)).block(block),
+        area,
+    );
+    // Quiet "↕ N more" hint in the top-right when the diff overflows, so it's
+    // discoverable that there's more below (and that PgUp/PgDn page it).
+    if max_scroll > 0 {
+        let remaining = max_scroll - scroll;
+        if remaining > 0 {
+            let label = format!(" ↓ {remaining} more ");
+            let label_width = label.width() as u16;
+            if inner.width > label_width {
+                let hint = Rect {
+                    x: inner.x + inner.width - label_width,
+                    y: inner.y,
+                    width: label_width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(label, dim()))),
+                    hint,
+                );
+            }
+        }
+    }
 }
 
 /// Bottom status line: model, mode, and turn state on the left; contextual
@@ -654,6 +685,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
+    } else if app.show_diff {
+        "PgUp/PgDn diff · Esc close"
     } else if app.status.busy {
         "PgUp/PgDn scroll"
     } else {
