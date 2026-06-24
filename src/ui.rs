@@ -541,7 +541,9 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let max_scroll = lines.len().saturating_sub(inner_height);
     let scroll = (app.diff_scroll as usize).min(max_scroll);
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)).block(block),
+        Paragraph::new(Text::from(lines))
+            .scroll((scroll as u16, 0))
+            .block(block),
         area,
     );
     // Quiet "↕ N more" hint in the top-right when the diff overflows, so it's
@@ -558,10 +560,7 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     width: label_width,
                     height: 1,
                 };
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(label, dim()))),
-                    hint,
-                );
+                frame.render_widget(Paragraph::new(Line::from(Span::styled(label, dim()))), hint);
             }
         }
     }

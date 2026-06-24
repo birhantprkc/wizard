@@ -2887,9 +2887,7 @@ async fn git_diff_text(root: &Path) -> Result<String> {
 /// any subdir, tolerating either path separator.
 fn is_wizard_state_path(path: &str) -> bool {
     let path = path.replace('\\', "/");
-    path == ".wizard"
-        || path.starts_with(".wizard/")
-        || path.contains("/.wizard/")
+    path == ".wizard" || path.starts_with(".wizard/") || path.contains("/.wizard/")
 }
 
 /// Render a single untracked file as a full addition by diffing it against
