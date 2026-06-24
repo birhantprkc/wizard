@@ -163,6 +163,10 @@ pub enum SlashCommand {
     /// Show the session status: model, provider, mode, session id, usage,
     /// todo progress, background tasks, plan mode.
     Status,
+    /// `/goal [text]` — show the standing mission goal, or set it. `None`
+    /// shows the current goal; `Some` sets it (drives sovereign/continuous
+    /// mode), persisting to `<project_root>/.wizard/mission.toml`.
+    Goal(Option<String>),
     /// `/publish [branch]` — fork Wizard and get a one-line installer.
     Publish {
         branch: Option<String>,
@@ -390,6 +394,14 @@ impl SlashCommand {
             "memory" => Ok(Self::Memory),
             "doctor" => Ok(Self::Doctor),
             "status" => Ok(Self::Status),
+            "goal" => {
+                let text = args.join(" ");
+                if text.is_empty() {
+                    Ok(Self::Goal(None))
+                } else {
+                    Ok(Self::Goal(Some(text)))
+                }
+            }
             "publish" => Ok(Self::Publish {
                 branch: args.first().map(|s| s.to_string()),
             }),
@@ -546,6 +558,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "status",
         args: "",
         description: "show session status: model, usage, todos, tasks",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "goal",
+        args: "[text]",
+        description: "show or set the standing mission goal",
         takes_args: false,
     },
     CommandSpec {
@@ -2967,6 +2985,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
+/goal [text]                show or set the standing mission goal\n  \
 /settings                   open the settings menu (change config anytime)\n  \
 /doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
 /quit                       exit\n\
@@ -3709,6 +3728,8 @@ impl CommandContext<'_> {
             SlashCommand::Memory => self.memory(),
             SlashCommand::Doctor => self.doctor().await,
             SlashCommand::Status => self.status(),
+            SlashCommand::Goal(None) => self.show_goal(),
+            SlashCommand::Goal(Some(text)) => self.set_goal(text),
             SlashCommand::Clear => self.clear(),
             SlashCommand::Model(None) => self.open_model_picker().await,
             SlashCommand::Model(Some(tag)) => self.switch_model(tag),
@@ -3899,6 +3920,61 @@ impl CommandContext<'_> {
             if self.app.plan_mode { "on" } else { "off" }
         ));
         self.app.notice(text);
+    }
+
+    /// `/goal`: show the standing mission goal that drives sovereign /
+    /// continuous mode, with its cycle count and a few recent progress notes.
+    fn show_goal(&mut self) {
+        match crate::agent::mission::Mission::load(self.project_root) {
+            Err(err) => self.app.notice(format!("could not read mission: {err:#}")),
+            Ok(None) => self.app.notice(
+                "no standing goal set — use `/goal <text>` to set one \
+                 (drives sovereign/continuous mode)",
+            ),
+            Ok(Some(m)) => {
+                let mut text = format!(
+                    "goal: {}\ncycles: {}  ·  updated {}",
+                    m.goal,
+                    m.cycles,
+                    m.updated.format("%Y-%m-%d %H:%M UTC"),
+                );
+                if !m.notes.is_empty() {
+                    text.push_str("\nrecent:");
+                    let skip = m.notes.len().saturating_sub(5);
+                    for note in &m.notes[skip..] {
+                        text.push_str(&format!("\n  - {note}"));
+                    }
+                }
+                self.app.notice(text);
+            }
+        }
+    }
+
+    /// `/goal <text>`: set (or replace) the standing mission goal,
+    /// non-destructively preserving cycles and existing progress notes.
+    fn set_goal(&mut self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            self.app.notice("usage: /goal <text>");
+            return;
+        }
+        let m = match crate::agent::mission::Mission::load(self.project_root) {
+            Err(err) => {
+                self.app.notice(format!("could not read mission: {err:#}"));
+                return;
+            }
+            Ok(Some(mut m)) => {
+                m.goal = text.clone();
+                m.note(format!("goal changed to: {text}"));
+                m
+            }
+            Ok(None) => crate::agent::mission::Mission::new(text.clone()),
+        };
+        if let Err(err) = m.save(self.project_root) {
+            self.app.notice(format!("could not save mission: {err:#}"));
+            return;
+        }
+        self.app.notice(format!("standing goal set:\n{text}"));
     }
 
     fn clear(&mut self) {
@@ -5303,6 +5379,18 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/sovereign"),
             Some(Ok(SlashCommand::Mode(Some(Mode::Sovereign))))
+        );
+    }
+
+    #[test]
+    fn goal_parses_show_and_set() {
+        assert_eq!(
+            SlashCommand::parse("/goal"),
+            Some(Ok(SlashCommand::Goal(None)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/goal ship the thing"),
+            Some(Ok(SlashCommand::Goal(Some("ship the thing".into()))))
         );
     }
 
