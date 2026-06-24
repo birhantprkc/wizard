@@ -3,7 +3,8 @@
 
 def add(a, b):
     """Return the sum of a and b."""
-    return a - b  # BUG: subtracts instead of adding
+    # BUG: this subtracts instead of adding
+    return a - b
 
 
 def main():
