@@ -171,6 +171,9 @@ pub enum SlashCommand {
     Publish {
         branch: Option<String>,
     },
+    /// `/fusion [config]` — toggle model fusion (a panel of providers debate
+    /// then a synthesizer answers), or open the panel configurator.
+    Fusion(FusionAction),
     /// `/provider ...` — add, remove, or switch LLM providers.
     Provider(ProviderAction),
     /// Finalize an interactive provider setup: add the provider (storing the
@@ -196,6 +199,15 @@ pub enum SlashCommand {
     /// why it carries the [`ImportSelection`].
     ImportClaude(ImportSelection),
     Quit,
+}
+
+/// What a `/fusion` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FusionAction {
+    /// `/fusion` (no args) — toggle fusion mode on/off.
+    Toggle,
+    /// `/fusion config` — open the panel/synthesizer configurator.
+    Config,
 }
 
 /// What a `/provider` subcommand does.
@@ -405,6 +417,13 @@ impl SlashCommand {
                 branch: args.first().map(|s| s.to_string()),
             }),
             "provider" => parse_provider(&args),
+            "fusion" => match args.first().copied() {
+                None => Ok(Self::Fusion(FusionAction::Toggle)),
+                Some("config") => Ok(Self::Fusion(FusionAction::Config)),
+                Some(other) => Err(format!(
+                    "unknown /fusion subcommand '{other}' — use /fusion or /fusion config"
+                )),
+            },
             "server" => parse_server(&args),
             "login" => match args.first() {
                 Some(provider) => Ok(Self::Login((*provider).to_string())),
@@ -509,6 +528,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "provider",
         args: "",
         description: "add or switch LLM providers (interactive)",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "fusion",
+        args: "[config]",
+        description: "toggle model fusion, or configure the panel",
         takes_args: false,
     },
     CommandSpec {
@@ -684,6 +709,10 @@ pub enum PickerKind {
     /// Level 2 of `/provider`: the menu of provider kinds to add. Rows are
     /// dispatched by index against [`PROVIDER_TYPES`].
     ProviderType,
+    /// `/fusion config`: a multi-select where Space toggles a provider into the
+    /// fusion panel and Enter saves `[fusion]` (the first toggled row becomes
+    /// the synthesizer). Reuses [`PickerItem::current`] as the checkbox.
+    FusionPanel,
 }
 
 /// One selectable row in a picker popup.
@@ -714,6 +743,7 @@ impl Picker {
     pub fn footer_hint(&self) -> &'static str {
         match self.kind {
             PickerKind::ClaudeImport => " ↑↓ move · space toggles · enter runs · Esc cancel ",
+            PickerKind::FusionPanel => " ↑↓ move · space toggles · enter saves · Esc cancel ",
             _ => " ↑↓ move · Enter select · Esc cancel ",
         }
     }
@@ -831,6 +861,10 @@ pub struct App {
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
+    /// Whether the active client is a [`FusionProvider`](crate::llm::fusion)
+    /// (`/fusion` toggled on). Drives the loud status-bar indicator and lets
+    /// `/fusion` toggle back to the underlying single provider.
+    pub fusion_active: bool,
     /// Open plan-review modal (the turn is paused inside `exit_plan` until
     /// it resolves), if any.
     pub plan_review: Option<PlanReview>,
@@ -929,6 +963,7 @@ impl App {
             picker: None,
             prompt: None,
             plan_mode,
+            fusion_active: false,
             plan_review: None,
             history: Vec::new(),
             history_pos: None,
@@ -1139,6 +1174,39 @@ impl App {
         self.picker = Some(Picker {
             kind: PickerKind::ClaudeImport,
             title: " import from claude code · space toggles · enter runs ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Open the `/fusion config` multi-select: one row per configured provider,
+    /// pre-toggled to the current/effective panel. Space toggles membership;
+    /// Enter saves `[fusion]` (first toggled row = synthesizer).
+    pub fn open_fusion_picker(&mut self) {
+        if self.config.providers.is_empty() {
+            self.notice(
+                "fusion needs configured providers — add at least two with /provider first",
+            );
+            return;
+        }
+        let in_panel: std::collections::HashSet<String> = self
+            .config
+            .effective_fusion()
+            .map(|fusion| fusion.panel.into_iter().collect())
+            .unwrap_or_default();
+        let items = self
+            .config
+            .providers
+            .iter()
+            .map(|provider| PickerItem {
+                value: provider.name.clone(),
+                detail: format!("{} · {}", provider.kind, provider.model),
+                current: in_panel.contains(&provider.name),
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::FusionPanel,
+            title: " fusion panel · space toggles · enter saves ".to_string(),
             items,
             selected: 0,
         });
@@ -1923,8 +1991,13 @@ impl App {
                         picker.selected + 1
                     };
                 }
-                // Space toggles a checkbox row in the Claude-import multi-select.
-                KeyCode::Char(' ') if picker.kind == PickerKind::ClaudeImport => {
+                // Space toggles a checkbox row in a multi-select picker.
+                KeyCode::Char(' ')
+                    if matches!(
+                        picker.kind,
+                        PickerKind::ClaudeImport | PickerKind::FusionPanel
+                    ) =>
+                {
                     if let Some(item) = picker.items.get_mut(picker.selected) {
                         item.current = !item.current;
                     }
@@ -1987,6 +2060,46 @@ impl App {
                                 return Ok(None);
                             }
                             AppAction::Command(SlashCommand::ImportClaude(selection))
+                        }
+                        PickerKind::FusionPanel => {
+                            // Panel = toggled rows; the first becomes the
+                            // synthesizer (the sole tool-caller). Persist
+                            // [fusion]; the new config takes effect next time
+                            // /fusion turns on.
+                            let panel: Vec<String> = picker
+                                .items
+                                .iter()
+                                .filter(|i| i.current)
+                                .map(|i| i.value.clone())
+                                .collect();
+                            if panel.is_empty() {
+                                self.notice(
+                                    "select at least one provider for the panel (Space toggles)",
+                                );
+                                return Ok(None);
+                            }
+                            let synthesizer = panel[0].clone();
+                            let rounds =
+                                self.config.fusion.as_ref().map(|f| f.rounds).unwrap_or(1);
+                            self.config.fusion = Some(crate::config::FusionConfig {
+                                panel: panel.clone(),
+                                synthesizer: synthesizer.clone(),
+                                rounds,
+                            });
+                            if let Err(err) = self.config.save() {
+                                self.notice(format!("could not save fusion config: {err:#}"));
+                                return Ok(None);
+                            }
+                            let tail = if self.fusion_active {
+                                " — /fusion off then on to apply"
+                            } else {
+                                " — /fusion to turn on"
+                            };
+                            self.notice(format!(
+                                "fusion: {} · synthesizer {synthesizer} · {rounds} round(s){tail}",
+                                panel.join("+")
+                            ));
+                            return Ok(None);
                         }
                         PickerKind::Provider => {
                             // The final row opens the add-provider type menu;
@@ -2969,6 +3082,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider                   add or switch LLM providers (interactive picker)\n  \
+/fusion [config]            toggle model fusion (panel debate → synthesis), or configure the panel\n  \
 /server [status|start|stop] manage the local llama-server\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
@@ -3738,6 +3852,8 @@ impl CommandContext<'_> {
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
             SlashCommand::Publish { branch } => self.publish(branch),
+            SlashCommand::Fusion(FusionAction::Toggle) => self.toggle_fusion().await,
+            SlashCommand::Fusion(FusionAction::Config) => self.open_fusion_picker(),
             SlashCommand::Provider(action) => self.provider(action).await,
             SlashCommand::ProviderSetup {
                 name,
@@ -4531,6 +4647,15 @@ impl CommandContext<'_> {
             ));
             self.start_server_task(provider.clone());
         }
+        let model = self.app.config.active().model;
+        self.rebuild_agent_with(model, summary, "switched provider").await;
+    }
+
+    /// Rebuild the live agent against the current `client` (which the caller has
+    /// already set), set the status-bar model label, and report `summary`.
+    /// Shared by [`rebuild_active_provider`](Self::rebuild_active_provider) and
+    /// the `/fusion` toggle. `context` names the action in the failure notice.
+    async fn rebuild_agent_with(&mut self, model_label: String, summary: String, context: &str) {
         let manager = self.manager.lock().await;
         match build_agent(
             self.client,
@@ -4549,16 +4674,65 @@ impl CommandContext<'_> {
                     agent.set_plan_mode(true);
                 }
                 *self.agent_slot = Some(agent);
-                self.app.status.model = self.app.config.active().model;
+                self.app.status.model = model_label;
                 self.app.notice(summary);
             }
             Err(err) => {
                 *self.agent_slot = None;
                 self.app.notice(format!(
-                    "switched provider but could not start the agent: {err:#} — /quit and relaunch"
+                    "{context} but could not start the agent: {err:#} — /quit and relaunch"
                 ));
             }
         }
+    }
+
+    /// Toggle `/fusion`: swap the active client to a
+    /// [`FusionProvider`](crate::llm::fusion) (panel debate → synthesizer) when
+    /// off, or back to the underlying single provider when on. Like a provider
+    /// switch, this resets the session.
+    async fn toggle_fusion(&mut self) {
+        if self.agent_unavailable("toggle fusion") {
+            return;
+        }
+        if self.app.fusion_active {
+            self.app.fusion_active = false;
+            self.rebuild_active_provider("fusion off — back to the single model".to_string())
+                .await;
+            return;
+        }
+
+        let fusion = match self.app.config.effective_fusion() {
+            Some(fusion) => fusion,
+            None => {
+                self.app.notice(
+                    "fusion needs at least one configured provider — add one with /provider, \
+                     then /fusion config",
+                );
+                return;
+            }
+        };
+        let provider = match self.app.config.build_fusion_from(&fusion) {
+            Ok(provider) => provider,
+            Err(err) => {
+                self.app.notice(format!("could not start fusion: {err:#}"));
+                return;
+            }
+        };
+        let label = provider.label();
+        *self.client = Arc::new(provider);
+        self.app.fusion_active = true;
+        self.rebuild_agent_with(
+            label.clone(),
+            format!("{label} — every turn now fuses the panel; /fusion to turn off"),
+            "started fusion",
+        )
+        .await;
+    }
+
+    /// Open the `/fusion config` panel selector: pick which providers form the
+    /// debate panel and which synthesizes.
+    fn open_fusion_picker(&mut self) {
+        self.app.open_fusion_picker();
     }
 
     /// Handle `/provider` subcommands: list, switch, add, or remove providers.
@@ -5508,6 +5682,22 @@ mod tests {
     fn todos_and_cost_parse() {
         assert_eq!(SlashCommand::parse("/todos"), Some(Ok(SlashCommand::Todos)));
         assert_eq!(SlashCommand::parse("/cost"), Some(Ok(SlashCommand::Cost)));
+    }
+
+    #[test]
+    fn fusion_parses_toggle_config_and_rejects_unknown() {
+        assert_eq!(
+            SlashCommand::parse("/fusion"),
+            Some(Ok(SlashCommand::Fusion(FusionAction::Toggle)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/fusion config"),
+            Some(Ok(SlashCommand::Fusion(FusionAction::Config)))
+        );
+        assert!(matches!(
+            SlashCommand::parse("/fusion bogus"),
+            Some(Err(_))
+        ));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! registry, and the TUI.
 
 pub mod anthropic;
+pub mod fusion;
 pub mod llamacpp;
 pub mod ollama;
 pub mod openai;

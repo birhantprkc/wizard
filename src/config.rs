@@ -280,6 +280,25 @@ impl Default for FleetConfig {
     }
 }
 
+/// Model-fusion settings (`[fusion]` in `config.toml`); see `/fusion` and
+/// [`crate::llm::fusion`]. Panel and synthesizer reference existing
+/// [`ProviderConfig`] entries by name — each provider already binds a model, so
+/// a panel member is just a registered provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FusionConfig {
+    /// Provider names forming the debate panel (advisors).
+    pub panel: Vec<String>,
+    /// Provider name that synthesizes the final answer (the sole tool-caller).
+    pub synthesizer: String,
+    /// Number of critique rounds (default 1).
+    #[serde(default = "default_fusion_rounds")]
+    pub rounds: u32,
+}
+
+fn default_fusion_rounds() -> u32 {
+    1
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +491,10 @@ pub struct Config {
     /// Fleet-mode settings (`wizard fleet`).
     #[serde(default)]
     pub fleet: FleetConfig,
+    /// Model-fusion settings (`/fusion`). Absent until configured; the toggle
+    /// falls back to a default panel derived from `providers` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<FusionConfig>,
 }
 
 /// Default port for the local llama.cpp `llama-server`. Deliberately not 8080:
@@ -507,6 +530,7 @@ impl Default for Config {
             web: WebConfig::default(),
             checkpoints: CheckpointConfig::default(),
             fleet: FleetConfig::default(),
+            fusion: None,
         }
     }
 }
@@ -648,6 +672,83 @@ impl Config {
             usd_per_mtok_in: None,
             usd_per_mtok_out: None,
         }
+    }
+
+    /// The effective fusion config: the explicit `[fusion]` block if set,
+    /// otherwise a default derived from `providers` (panel = first two, the
+    /// first as synthesizer). `None` when no providers are configured.
+    pub fn effective_fusion(&self) -> Option<FusionConfig> {
+        if let Some(fusion) = &self.fusion {
+            return Some(fusion.clone());
+        }
+        if self.providers.is_empty() {
+            return None;
+        }
+        let panel: Vec<String> = self
+            .providers
+            .iter()
+            .take(2)
+            .map(|p| p.name.clone())
+            .collect();
+        let synthesizer = panel[0].clone();
+        Some(FusionConfig {
+            panel,
+            synthesizer,
+            rounds: default_fusion_rounds(),
+        })
+    }
+
+    /// Build a [`FusionProvider`](crate::llm::fusion::FusionProvider) from the
+    /// effective fusion config, resolving panel/synthesizer names against
+    /// `providers`. Errors when no fusion config is resolvable or a referenced
+    /// provider name is unknown.
+    pub fn build_fusion(&self) -> Result<crate::llm::fusion::FusionProvider> {
+        let fusion = self
+            .effective_fusion()
+            .context("no [fusion] config and no providers to derive one from")?;
+        self.build_fusion_from(&fusion)
+    }
+
+    /// Build a [`FusionProvider`](crate::llm::fusion::FusionProvider) from a
+    /// specific fusion config (used by `/fusion config` before persisting).
+    pub fn build_fusion_from(
+        &self,
+        fusion: &FusionConfig,
+    ) -> Result<crate::llm::fusion::FusionProvider> {
+        use crate::llm::fusion::{FusionProvider, PanelMember};
+
+        let find = |name: &str| -> Result<&ProviderConfig> {
+            self.providers
+                .iter()
+                .find(|p| p.name == name)
+                .with_context(|| format!("fusion references unknown provider '{name}'"))
+        };
+
+        let mut panel = Vec::new();
+        for name in &fusion.panel {
+            let pc = find(name)?;
+            panel.push(PanelMember {
+                name: pc.name.clone(),
+                provider: pc.build()?,
+                model: pc.model.clone(),
+            });
+        }
+
+        let synth_pc = find(&fusion.synthesizer)?;
+        let synthesizer = synth_pc.build()?;
+
+        let label = format!(
+            "fusion: {} \u{00d7}{}",
+            fusion.panel.join("+"),
+            fusion.rounds
+        );
+        FusionProvider::new(
+            panel,
+            synthesizer,
+            synth_pc.model.clone(),
+            fusion.rounds,
+            label,
+        )
     }
 
     /// Index of the effective active provider in [`providers`](Self::providers),
@@ -866,6 +967,11 @@ mod tests {
                 max_minutes: 45,
                 synthesize: false,
             },
+            fusion: Some(FusionConfig {
+                panel: vec!["openai".to_string()],
+                synthesizer: "openai".to_string(),
+                rounds: 2,
+            }),
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -904,6 +1010,7 @@ mod tests {
         );
         assert_eq!(parsed.checkpoints, original.checkpoints);
         assert_eq!(parsed.fleet, original.fleet);
+        assert_eq!(parsed.fusion, original.fusion);
     }
 
     #[test]

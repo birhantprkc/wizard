@@ -197,7 +197,7 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("your sovereign agent", dim().italic())),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+            model_span(app),
             Span::styled(" · ", dim()),
             mode_span(app.status.mode),
         ]),
@@ -253,6 +253,17 @@ fn mode_span(mode: Mode) -> Span<'static> {
     match mode {
         Mode::Genie => Span::styled("genie", Style::default().fg(TEXT_DIM)),
         Mode::Sovereign => Span::styled("sovereign", Style::default().fg(Color::White).bold()),
+    }
+}
+
+/// The status-bar model label. Loud (accent, bold) while `/fusion` is on — it
+/// runs every turn through a panel of models, several× the tokens — so the mode
+/// is never left running unnoticed; dim otherwise.
+fn model_span(app: &App) -> Span<'static> {
+    if app.fusion_active {
+        Span::styled(app.status.model.clone(), accent().bold())
+    } else {
+        Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM))
     }
 }
 
@@ -613,7 +624,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM)),
+        model_span(app),
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];

@@ -7,6 +7,9 @@ description = "One line. Your sovereign agent. Self-extending. Fully local."
 repository = "https://github.com/teddytennant/wizard"
 
 [dependencies]
+# FUSION debate engine (provider-agnostic core; drives /fusion mode)
+fusion-core = { git = "https://github.com/teddytennant/FUSION.git" }
+
 # Errors
 anyhow = "1"
 thiserror = "2"
