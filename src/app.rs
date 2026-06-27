@@ -2079,8 +2079,7 @@ impl App {
                                 return Ok(None);
                             }
                             let synthesizer = panel[0].clone();
-                            let rounds =
-                                self.config.fusion.as_ref().map(|f| f.rounds).unwrap_or(1);
+                            let rounds = self.config.fusion.as_ref().map(|f| f.rounds).unwrap_or(1);
                             self.config.fusion = Some(crate::config::FusionConfig {
                                 panel: panel.clone(),
                                 synthesizer: synthesizer.clone(),
@@ -4648,7 +4647,8 @@ impl CommandContext<'_> {
             self.start_server_task(provider.clone());
         }
         let model = self.app.config.active().model;
-        self.rebuild_agent_with(model, summary, "switched provider").await;
+        self.rebuild_agent_with(model, summary, "switched provider")
+            .await;
     }
 
     /// Rebuild the live agent against the current `client` (which the caller has
@@ -5694,10 +5694,7 @@ mod tests {
             SlashCommand::parse("/fusion config"),
             Some(Ok(SlashCommand::Fusion(FusionAction::Config)))
         );
-        assert!(matches!(
-            SlashCommand::parse("/fusion bogus"),
-            Some(Err(_))
-        ));
+        assert!(matches!(SlashCommand::parse("/fusion bogus"), Some(Err(_))));
     }
 
     #[test]

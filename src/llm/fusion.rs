@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
@@ -59,12 +59,13 @@ struct RoutingBackend {
 #[async_trait]
 impl FcChatProvider for RoutingBackend {
     async fn chat(&self, req: &FcRequest) -> std::result::Result<FcResponse, FcProviderError> {
-        let route = self.routes.get(&req.model).ok_or_else(|| {
-            FcProviderError::Http {
+        let route = self
+            .routes
+            .get(&req.model)
+            .ok_or_else(|| FcProviderError::Http {
                 status: 400,
                 body: format!("no fusion route for panel member '{}'", req.model),
-            }
-        })?;
+            })?;
 
         // Panel members are advisors: translate the debate messages, attach no
         // tools, and stream the answer back as plain text.
@@ -95,10 +96,12 @@ impl FcChatProvider for RoutingBackend {
                 status: 400,
                 body: e.to_string(),
             })?;
-        let content = collect_text(stream).await.map_err(|e| FcProviderError::Http {
-            status: 400,
-            body: e.to_string(),
-        })?;
+        let content = collect_text(stream)
+            .await
+            .map_err(|e| FcProviderError::Http {
+                status: 400,
+                body: e.to_string(),
+            })?;
 
         Ok(FcResponse {
             content,
@@ -185,7 +188,9 @@ impl FusionProvider {
                 max_tokens: 2048,
                 temperature: 0.7,
                 seed: None,
-                log_file: Config::wizard_dir().ok().map(|d| d.join("fusion-runs.jsonl")),
+                log_file: Config::wizard_dir()
+                    .ok()
+                    .map(|d| d.join("fusion-runs.jsonl")),
                 extra_headers: Default::default(),
             };
             let backend = Arc::new(RoutingBackend { routes });
@@ -379,9 +384,14 @@ mod tests {
                 model: "m-bob".to_string(),
             },
         ];
-        let fusion =
-            FusionProvider::new(panel, synth, "m-synth".to_string(), 1, "fusion: test".to_string())
-                .unwrap();
+        let fusion = FusionProvider::new(
+            panel,
+            synth,
+            "m-synth".to_string(),
+            1,
+            "fusion: test".to_string(),
+        )
+        .unwrap();
 
         let out = collect_text(fusion.chat_stream(user_req("Q", true)).await.unwrap())
             .await
@@ -418,9 +428,14 @@ mod tests {
     #[tokio::test]
     async fn empty_panel_degrades_to_synthesizer_alone() {
         let (synth, synth_seen) = StubProvider::new("synth");
-        let fusion =
-            FusionProvider::new(Vec::new(), synth, "m-synth".to_string(), 1, "fusion".to_string())
-                .unwrap();
+        let fusion = FusionProvider::new(
+            Vec::new(),
+            synth,
+            "m-synth".to_string(),
+            1,
+            "fusion".to_string(),
+        )
+        .unwrap();
         let out = collect_text(fusion.chat_stream(user_req("Q", false)).await.unwrap())
             .await
             .unwrap();
