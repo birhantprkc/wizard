@@ -2710,15 +2710,20 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn setup_terminal() -> Result<Tui> {
     crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = std::io::stdout();
-    // Deliberately NOT enabling mouse capture: capturing the mouse hijacks the
-    // terminal's own click-drag-to-select, which is how users copy a question
-    // or response out of the transcript. Leaving it off keeps copy/paste
-    // working like any normal terminal app (scroll via PgUp/PgDn). Bracketed
-    // paste stays on so pasted text lands in the composer as one chunk.
+    // Capture the mouse so the scroll wheel scrolls the transcript (see the
+    // ScrollUp/ScrollDown handler in `handle_event`). Without capture, the
+    // terminal translates the wheel into ↑/↓ arrow keys in the alternate
+    // screen, which the composer reads as input-history recall — so spinning
+    // the wheel cycled previous messages instead of scrolling the text.
+    // Tradeoff: capture pre-empts the terminal's native click-drag-to-select,
+    // so to copy a question or response out of the transcript hold Shift while
+    // selecting (Option on macOS). Bracketed paste stays on so pasted text
+    // lands in the composer as one chunk.
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture,
     )
     .context("entering alternate screen")?;
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
@@ -2791,6 +2796,7 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
 fn restore_terminal() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen,
     )
@@ -3099,7 +3105,7 @@ keys:\n  \
 Tab / →                     accept command completion\n  \
 Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
-PgUp/PgDn                   scroll the transcript (drag to select · copy as usual)\n  \
+PgUp/PgDn · wheel           scroll the transcript (Shift+drag to select/copy)\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-C                      quit";
