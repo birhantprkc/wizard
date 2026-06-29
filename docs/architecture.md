@@ -148,7 +148,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `git_status` | Working tree status |
 | `git_diff` | Staged/unstaged diff |
 | `web_fetch` | Fetch a URL, HTML converted to markdown; SSRF-guarded ([web.md](web.md)) |
-| `web_search` | Web search via DuckDuckGo (default), Brave, or Tavily ([web.md](web.md)) |
+| `web_search` | Web search via DuckDuckGo (default), Brave, Tavily, or xAI Grok ([web.md](web.md)) |
 | `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
 | `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
 

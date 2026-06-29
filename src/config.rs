@@ -219,11 +219,14 @@ pub struct WebConfig {
     /// Allow fetches that resolve to localhost / private address ranges
     /// (default false). The SSRF guard is on unless this is set.
     pub allow_local: bool,
-    /// `web_search` backend: `"duckduckgo"` (default, no key),
-    /// `"brave"`, or `"tavily"`.
+    /// `web_search` backend: `"duckduckgo"` (default, no key), `"brave"`,
+    /// `"tavily"`, `"xai"`/`"grok"` (xAI Grok web search via the Responses
+    /// API, using the `wizard --login xai` OAuth session or `XAI_API_KEY`),
+    /// or `"auto"` (prefer the xAI session when signed in, else DuckDuckGo).
     pub search_backend: String,
-    /// Name of the env var holding the search API key (brave/tavily); the
-    /// key itself is never persisted and is read at call time.
+    /// Name of the env var holding the search API key (brave/tavily, or an
+    /// `xai` fallback when not signed in); the key itself is never persisted
+    /// and is read at call time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_api_key_env: Option<String>,
 }

@@ -21,6 +21,8 @@ use super::{
     MAX_OUTPUT_BYTES, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args,
     truncate_output,
 };
+use crate::llm::openai::TokenSource;
+use crate::llm::xai_oauth::{self, XaiTokenSource};
 
 /// Whole-request timeout for fetches and searches.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -524,6 +526,234 @@ impl SearchBackend for TavilySearch {
     }
 }
 
+/// How `XaiSearch` authenticates to xAI: the browser OAuth session
+/// (`wizard --login xai`) or a plain `XAI_API_KEY`. OAuth is preferred.
+enum XaiAuth {
+    Oauth(XaiTokenSource),
+    ApiKey(String),
+}
+
+/// xAI Grok web search via the Responses API server-side `web_search` tool.
+///
+/// Unlike the scraper/keyed backends this is an agentic call: Grok runs its
+/// own search-and-browse loop server-side and returns the synthesized hits.
+/// We ask for a strict JSON envelope and fall back to the response's
+/// `url_citation` annotations / top-level `citations` when the model adds
+/// prose anyway.
+pub struct XaiSearch {
+    base_url: String,
+    model: String,
+    auth: XaiAuth,
+}
+
+/// Whole-request timeout for an xAI search. Generous: the server-side
+/// search-and-browse loop is much slower than a single scrape.
+const XAI_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether an xAI OAuth session exists on disk (`wizard --login xai`).
+fn xai_signed_in() -> bool {
+    xai_oauth::token_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+impl XaiSearch {
+    /// Search using the stored xAI OAuth session.
+    fn oauth(source: XaiTokenSource) -> Self {
+        Self {
+            base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
+            model: xai_oauth::DEFAULT_MODEL.to_string(),
+            auth: XaiAuth::Oauth(source),
+        }
+    }
+
+    /// Search using a plain API key.
+    fn api_key(key: impl Into<String>) -> Self {
+        Self {
+            base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
+            model: xai_oauth::DEFAULT_MODEL.to_string(),
+            auth: XaiAuth::ApiKey(key.into()),
+        }
+    }
+
+    /// Point the backend at a different endpoint (tests use a local server).
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// Resolve the current bearer token (refreshing the OAuth access token
+    /// near expiry happens inside the token source).
+    async fn bearer(&self) -> anyhow::Result<String> {
+        match &self.auth {
+            XaiAuth::ApiKey(key) => Ok(key.clone()),
+            XaiAuth::Oauth(source) => source.bearer().await?.ok_or_else(|| {
+                anyhow::anyhow!("no xAI OAuth token available; run `wizard --login xai`")
+            }),
+        }
+    }
+
+    /// The Responses API request body: a single user turn that hands Grok the
+    /// `web_search` tool and constrains it to a JSON-only reply.
+    fn request_body(&self, query: &str, count: usize) -> Value {
+        json!({
+            "model": self.model,
+            "input": [{ "role": "user", "content": xai_search_prompt(query, count) }],
+            "tools": [{ "type": "web_search" }],
+            "include": ["no_inline_citations"],
+        })
+    }
+}
+
+#[async_trait]
+impl SearchBackend for XaiSearch {
+    async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(XAI_SEARCH_TIMEOUT)
+            .build()?;
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let body = self.request_body(query, count);
+
+        let mut retried = false;
+        let response = loop {
+            let token = self.bearer().await?;
+            let response = client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await?;
+            // One forced refresh after a 401, mirroring the chat provider.
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !retried
+                && let XaiAuth::Oauth(source) = &self.auth
+                && source.refresh_after_unauthorized().await.unwrap_or(false)
+            {
+                retried = true;
+                continue;
+            }
+            break response.error_for_status()?;
+        };
+
+        let payload: Value = response.json().await?;
+        // Some errors arrive as HTTP 200 with an `error` envelope.
+        if let Some(message) = payload["error"]["message"].as_str() {
+            anyhow::bail!("xAI web search error: {message}");
+        }
+        Ok(parse_xai_results(&payload, count))
+    }
+}
+
+/// Prompt that pins Grok to a JSON-only result envelope.
+fn xai_search_prompt(query: &str, count: usize) -> String {
+    format!(
+        "Use the web_search tool to find current information for the query below, then \
+         respond with ONLY a single JSON object — no prose, no markdown fences, no inline \
+         citation links — matching this exact schema:\n\n\
+         {{\"results\": [{{\"title\": \"string\", \"url\": \"string\", \"description\": \
+         \"1-2 sentence summary\"}}]}}\n\n\
+         Return at most {count} results, ordered by relevance, with absolute https:// URLs. \
+         If no usable results exist, return {{\"results\": []}}.\n\n\
+         Query: {query}"
+    )
+}
+
+/// Parse an xAI Responses API payload into search hits, in three tiers:
+/// 1. the JSON `{"results": [...]}` envelope the model was asked to emit,
+/// 2. `url_citation` annotations on the output text, then
+/// 3. a top-level `citations` array of bare URLs.
+fn parse_xai_results(payload: &Value, count: usize) -> Vec<SearchResult> {
+    let mut text = String::new();
+    let mut citations: Vec<SearchResult> = Vec::new();
+    if let Some(output) = payload["output"].as_array() {
+        for item in output {
+            let Some(content) = item["content"].as_array() else {
+                continue;
+            };
+            for part in content {
+                if let Some(chunk) = part["text"].as_str() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(chunk);
+                }
+                if let Some(annotations) = part["annotations"].as_array() {
+                    for annotation in annotations {
+                        if annotation["type"].as_str() != Some("url_citation") {
+                            continue;
+                        }
+                        if let Some(url) = annotation["url"].as_str() {
+                            citations.push(SearchResult {
+                                title: annotation["title"].as_str().unwrap_or(url).to_string(),
+                                url: url.to_string(),
+                                snippet: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(results) = extract_results_json(&text)
+        && !results.is_empty()
+    {
+        return results.into_iter().take(count).collect();
+    }
+    if !citations.is_empty() {
+        return citations.into_iter().take(count).collect();
+    }
+    if let Some(urls) = payload["citations"].as_array() {
+        return urls
+            .iter()
+            .filter_map(|url| url.as_str())
+            .map(|url| SearchResult {
+                title: url.to_string(),
+                url: url.to_string(),
+                snippet: String::new(),
+            })
+            .take(count)
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Pull a `{"results": [...]}` envelope out of model text. Tries the whole
+/// string first, then the widest `{...}` span (which transparently strips any
+/// surrounding prose or ```json fences).
+fn extract_results_json(text: &str) -> Option<Vec<SearchResult>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok().or_else(|| {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        serde_json::from_str(&trimmed[start..=end]).ok()
+    })?;
+    let results = value["results"].as_array()?;
+    Some(
+        results
+            .iter()
+            .filter_map(|hit| {
+                let title = hit["title"].as_str()?.to_string();
+                let url = hit["url"].as_str()?.to_string();
+                let snippet = hit["description"].as_str().unwrap_or("").to_string();
+                Some(SearchResult {
+                    title,
+                    url,
+                    snippet,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Render results as the numbered markdown list fed back to the model.
 fn render_results(results: &[SearchResult]) -> String {
     results
@@ -562,8 +792,40 @@ impl WebSearchTool {
             "" | "duckduckgo" => Ok(Box::new(DuckDuckGoHtml::new())),
             "brave" => Ok(Box::new(BraveSearch::new(Self::api_key(ctx, "brave")?))),
             "tavily" => Ok(Box::new(TavilySearch::new(Self::api_key(ctx, "tavily")?))),
+            "xai" | "grok" => Ok(Box::new(Self::xai_backend(ctx)?)),
+            // Prefer the xAI session when signed in; otherwise DuckDuckGo.
+            "auto" => {
+                if xai_signed_in() {
+                    Ok(Box::new(Self::xai_backend(ctx)?))
+                } else {
+                    Ok(Box::new(DuckDuckGoHtml::new()))
+                }
+            }
             other => Err(format!(
-                "unknown [web] search_backend '{other}' (expected duckduckgo, brave, or tavily)"
+                "unknown [web] search_backend '{other}' \
+                 (expected duckduckgo, brave, tavily, xai, or auto)"
+            )),
+        }
+    }
+
+    /// Build the xAI Grok backend: the OAuth session if the user has signed
+    /// in, else a plain `XAI_API_KEY` (or the configured key env var).
+    fn xai_backend(ctx: &ToolContext) -> Result<XaiSearch, String> {
+        if xai_signed_in() {
+            let source = XaiTokenSource::new()
+                .map_err(|err| format!("opening the xAI OAuth token store: {err:#}"))?;
+            return Ok(XaiSearch::oauth(source));
+        }
+        let env_name = ctx
+            .web
+            .search_api_key_env
+            .as_deref()
+            .unwrap_or(xai_oauth::DEFAULT_KEY_ENV);
+        match std::env::var(env_name) {
+            Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key)),
+            _ => Err(format!(
+                "xAI web search needs auth: run `wizard --login xai` to sign in, \
+                 or set ${env_name} to an xAI API key"
             )),
         }
     }
@@ -1038,6 +1300,89 @@ mod tests {
         let results = backend.search("anything", 5).await.expect("search ok");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].snippet, "summary text");
+    }
+
+    #[tokio::test]
+    async fn xai_backend_extracts_the_json_envelope() {
+        // Grok replies with the JSON envelope we asked for inside an
+        // output_text part.
+        let envelope =
+            r#"{"results":[{"title":"Grok 4.3","url":"https://x.ai/","description":"flagship"}]}"#;
+        let body = json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": envelope, "annotations": [] }]
+            }]
+        })
+        .to_string();
+        let addr = serve(http_response("application/json", &body)).await;
+        let backend = XaiSearch::api_key("test-key").with_base_url(format!("http://{addr}"));
+        let results = backend.search("grok", 5).await.expect("search ok");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Grok 4.3");
+        assert_eq!(results[0].url, "https://x.ai/");
+        assert_eq!(results[0].snippet, "flagship");
+    }
+
+    #[test]
+    fn xai_parser_strips_prose_and_fences_around_the_envelope() {
+        let payload = json!({
+            "output": [{
+                "content": [{
+                    "type": "output_text",
+                    "text": "Here you go:\n```json\n{\"results\":[{\"title\":\"A\",\"url\":\"https://a.example/\",\"description\":\"d\"}]}\n```",
+                    "annotations": []
+                }]
+            }]
+        });
+        let results = parse_xai_results(&payload, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://a.example/");
+    }
+
+    #[test]
+    fn xai_parser_falls_back_to_url_citation_annotations() {
+        // No JSON envelope — recover from annotations on the text part.
+        let payload = json!({
+            "output": [{
+                "content": [{
+                    "type": "output_text",
+                    "text": "Grok rambled without emitting JSON.",
+                    "annotations": [
+                        { "type": "url_citation", "title": "Cited One", "url": "https://one.example/" },
+                        { "type": "url_citation", "url": "https://two.example/" }
+                    ]
+                }]
+            }]
+        });
+        let results = parse_xai_results(&payload, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Cited One");
+        assert_eq!(
+            results[1].title, "https://two.example/",
+            "url stands in for a missing title"
+        );
+    }
+
+    #[test]
+    fn xai_parser_falls_back_to_top_level_citations() {
+        let payload = json!({
+            "output": [{ "content": [{ "type": "output_text", "text": "no json, no annotations" }] }],
+            "citations": ["https://cite.example/a", "https://cite.example/b"]
+        });
+        let results = parse_xai_results(&payload, 5);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].url, "https://cite.example/b");
+    }
+
+    #[test]
+    fn xai_parser_honors_count_and_empty_results() {
+        let payload = json!({
+            "output": [{ "content": [{ "type": "output_text", "text": "{\"results\":[]}" }] }]
+        });
+        assert!(parse_xai_results(&payload, 5).is_empty());
+        assert!(parse_xai_results(&json!({}), 5).is_empty());
     }
 
     #[test]
