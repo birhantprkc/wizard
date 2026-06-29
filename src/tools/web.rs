@@ -526,6 +526,121 @@ impl SearchBackend for TavilySearch {
     }
 }
 
+/// Exa Search API backend (`x-api-key` header). Neural/keyword search tuned
+/// for agents; we ask for short text snippets alongside each result.
+pub struct ExaSearch {
+    base_url: String,
+    api_key: String,
+}
+
+impl ExaSearch {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url("https://api.exa.ai", api_key)
+    }
+
+    pub fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchBackend for ExaSearch {
+    async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
+        let client = web_client(true)?;
+        let response = client
+            .post(format!("{}/search", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("Accept", "application/json")
+            .json(&json!({
+                "query": query,
+                "numResults": count,
+                "contents": { "text": { "maxCharacters": 300 } },
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: Value = response.json().await?;
+        let results = body["results"]
+            .as_array()
+            .map(|results| {
+                results
+                    .iter()
+                    .take(count)
+                    .filter_map(|hit| {
+                        let url = hit["url"].as_str()?.to_string();
+                        let title = hit["title"].as_str().unwrap_or(&url).to_string();
+                        let snippet = hit["text"].as_str().unwrap_or("").trim().to_string();
+                        Some(SearchResult {
+                            title,
+                            url,
+                            snippet,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(results)
+    }
+}
+
+/// Serper backend: Google results via serper.dev (`X-API-KEY` header).
+pub struct SerperSearch {
+    base_url: String,
+    api_key: String,
+}
+
+impl SerperSearch {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url("https://google.serper.dev", api_key)
+    }
+
+    pub fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchBackend for SerperSearch {
+    async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
+        let client = web_client(true)?;
+        let response = client
+            .post(format!("{}/search", self.base_url))
+            .header("X-API-KEY", &self.api_key)
+            .header("Accept", "application/json")
+            .json(&json!({ "q": query, "num": count }))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: Value = response.json().await?;
+        let results = body["organic"]
+            .as_array()
+            .map(|results| {
+                results
+                    .iter()
+                    .take(count)
+                    .filter_map(|hit| {
+                        let title = hit["title"].as_str()?.to_string();
+                        let url = hit["link"].as_str()?.to_string();
+                        let snippet = hit["snippet"].as_str().unwrap_or("").to_string();
+                        Some(SearchResult {
+                            title,
+                            url,
+                            snippet,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(results)
+    }
+}
+
 /// How `XaiSearch` authenticates to xAI: the browser OAuth session
 /// (`wizard --login xai`) or a plain `XAI_API_KEY`. OAuth is preferred.
 enum XaiAuth {
@@ -792,29 +907,30 @@ impl WebSearchTool {
             "" | "duckduckgo" => Ok(Box::new(DuckDuckGoHtml::new())),
             "brave" => Ok(Box::new(BraveSearch::new(Self::api_key(ctx, "brave")?))),
             "tavily" => Ok(Box::new(TavilySearch::new(Self::api_key(ctx, "tavily")?))),
+            "exa" => Ok(Box::new(ExaSearch::new(Self::api_key(ctx, "exa")?))),
+            "serper" => Ok(Box::new(SerperSearch::new(Self::api_key(ctx, "serper")?))),
             "xai" | "grok" => Ok(Box::new(Self::xai_backend(ctx)?)),
-            // Prefer the xAI session when signed in; otherwise DuckDuckGo.
-            "auto" => {
-                if xai_signed_in() {
-                    Ok(Box::new(Self::xai_backend(ctx)?))
-                } else {
-                    Ok(Box::new(DuckDuckGoHtml::new()))
-                }
-            }
             other => Err(format!(
                 "unknown [web] search_backend '{other}' \
-                 (expected duckduckgo, brave, tavily, xai, or auto)"
+                 (expected duckduckgo, brave, tavily, exa, serper, or xai) — \
+                 run /settings to configure web search"
             )),
         }
     }
 
     /// Build the xAI Grok backend: the OAuth session if the user has signed
-    /// in, else a plain `XAI_API_KEY` (or the configured key env var).
+    /// in, else a plain `XAI_API_KEY` (stored key or env var).
     fn xai_backend(ctx: &ToolContext) -> Result<XaiSearch, String> {
         if xai_signed_in() {
             let source = XaiTokenSource::new()
                 .map_err(|err| format!("opening the xAI OAuth token store: {err:#}"))?;
             return Ok(XaiSearch::oauth(source));
+        }
+        // Not signed in: a stored key, then a configured/default env var.
+        if let Some(key) = crate::credentials::get("xai")
+            && !key.trim().is_empty()
+        {
+            return Ok(XaiSearch::api_key(key));
         }
         let env_name = ctx
             .web
@@ -824,25 +940,36 @@ impl WebSearchTool {
         match std::env::var(env_name) {
             Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key)),
             _ => Err(format!(
-                "xAI web search needs auth: run `wizard --login xai` to sign in, \
+                "xAI web search needs auth: run `/login xai` to sign in (or `wizard --login xai`), \
                  or set ${env_name} to an xAI API key"
             )),
         }
     }
 
+    /// Resolve a keyed backend's API key. Prefers a key pasted via `/settings`
+    /// or onboarding (stored in `~/.wizard/credentials.toml` under the backend
+    /// name), then falls back to a configured env var.
     fn api_key(ctx: &ToolContext, backend: &str) -> Result<String, String> {
-        let Some(env_name) = ctx.web.search_api_key_env.as_deref() else {
-            return Err(format!(
-                "search backend '{backend}' needs an API key: set [web] search_api_key_env \
-                 in config.toml to the name of the env var holding it"
-            ));
-        };
-        match std::env::var(env_name) {
-            Ok(key) if !key.trim().is_empty() => Ok(key),
-            _ => Err(format!(
-                "search backend '{backend}' needs an API key, but ${env_name} is unset or empty"
-            )),
+        if let Some(key) = crate::credentials::get(backend)
+            && !key.trim().is_empty()
+        {
+            return Ok(key);
         }
+        if let Some(env_name) = ctx.web.search_api_key_env.as_deref() {
+            match std::env::var(env_name) {
+                Ok(key) if !key.trim().is_empty() => return Ok(key),
+                _ => {
+                    return Err(format!(
+                        "search backend '{backend}' needs an API key, but ${env_name} is unset \
+                         or empty — run /settings to paste one"
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "search backend '{backend}' needs an API key: run /settings to paste one \
+             (or set [web] search_api_key_env to the env var holding it)"
+        ))
     }
 }
 
@@ -1300,6 +1427,41 @@ mod tests {
         let results = backend.search("anything", 5).await.expect("search ok");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].snippet, "summary text");
+    }
+
+    #[tokio::test]
+    async fn exa_backend_parses_the_api_shape() {
+        let body = json!({
+            "results": [
+                { "title": "Exa Hit", "url": "https://exa.example/", "text": "  neural summary  " },
+                { "url": "https://exa.example/notitle", "text": "no title falls back to url" }
+            ]
+        })
+        .to_string();
+        let addr = serve(http_response("application/json", &body)).await;
+        let backend = ExaSearch::with_base_url(format!("http://{addr}"), "test-key");
+        let results = backend.search("anything", 5).await.expect("search ok");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Exa Hit");
+        assert_eq!(results[0].snippet, "neural summary", "text is trimmed");
+        assert_eq!(results[1].title, "https://exa.example/notitle");
+    }
+
+    #[tokio::test]
+    async fn serper_backend_parses_the_api_shape() {
+        let body = json!({
+            "organic": [
+                { "title": "Serper One", "link": "https://serper.example/1", "snippet": "first" },
+                { "title": "Serper Two", "link": "https://serper.example/2", "snippet": "second" }
+            ]
+        })
+        .to_string();
+        let addr = serve(http_response("application/json", &body)).await;
+        let backend = SerperSearch::with_base_url(format!("http://{addr}"), "test-key");
+        let results = backend.search("anything", 5).await.expect("search ok");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://serper.example/1");
+        assert_eq!(results[1].snippet, "second");
     }
 
     #[tokio::test]

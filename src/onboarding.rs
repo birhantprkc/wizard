@@ -89,6 +89,13 @@ pub struct Answers {
     pub gateway_allowed_chat_ids: Vec<i64>,
     /// Personality mode.
     pub mode: Mode,
+    /// `web_search` backend id (`"duckduckgo"`, `"brave"`, `"tavily"`,
+    /// `"exa"`, `"serper"`, or `"xai"`).
+    pub web_search_backend: String,
+    /// A pasted API key for the chosen web-search backend, stored under the
+    /// backend name in `~/.wizard/credentials.toml` by [`run_blocking`] after
+    /// the pure config mapping (so [`Answers::into_config`] stays pure).
+    pub web_search_api_key: Option<String>,
     /// Artifacts to import from an existing Claude Code install, if any. The
     /// actual import (file writes + spinner verbs) runs in [`run_blocking`]
     /// after [`Answers::into_config`], so this is consumed there rather than in
@@ -133,6 +140,7 @@ impl Answers {
         config.providers = vec![provider];
         config.active_provider = Some(self.provider_name);
         config.mode = self.mode;
+        config.web.search_backend = self.web_search_backend;
         config.gateway = GatewayConfig {
             kind: self.gateway_kind,
             token_env: self.gateway_token_env,
@@ -229,7 +237,19 @@ fn run_blocking() -> Result<Option<Config>> {
     };
 
     let import = answers.claude_import;
+    // The pasted web-search key (if any) is stored separately from config.
+    let web_search_backend = answers.web_search_backend.clone();
+    let web_search_api_key = answers.web_search_api_key.clone();
     let mut config = answers.into_config();
+
+    // Persist a pasted web-search API key under the backend name (0600),
+    // matching how the `web_search` tool resolves it at call time.
+    if let Some(key) = web_search_api_key
+        && !key.trim().is_empty()
+        && let Err(err) = crate::credentials::store(&web_search_backend, key.trim())
+    {
+        eprintln!("warning: could not save the {web_search_backend} API key: {err:#}");
+    }
 
     // Perform the Claude Code import (MCP/commands file writes + spinner verbs)
     // before saving, so the verbs land in the same config write.
@@ -407,7 +427,15 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    // Step 5 — optional: import artifacts from an existing Claude Code install.
+    // Step 5 — web search backend (used by the `web_search` tool). DuckDuckGo
+    // needs no key; the keyed backends prompt for one; xAI reuses an existing
+    // sign-in when present so the user is not asked to authenticate twice.
+    let (web_search_backend, web_search_api_key) = match collect_web_search(terminal)? {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+
+    // Step 6 — optional: import artifacts from an existing Claude Code install.
     // Only shown when `~/.claude` exists. Esc here skips the import (the rest of
     // the config is already complete) rather than aborting onboarding.
     let claude_import = if import_claude::claude_home().is_some() {
@@ -428,8 +456,95 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         gateway_token_env,
         gateway_allowed_chat_ids,
         mode,
+        web_search_backend,
+        web_search_api_key,
         claude_import,
     }))
+}
+
+/// The web-search backends offered in onboarding: `(label, detail, id)`. The id
+/// is written to `[web] search_backend` and used as the credentials key name.
+const WEB_SEARCH_OPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "DuckDuckGo",
+        "free · no API key (recommended)",
+        "duckduckgo",
+    ),
+    ("Brave Search", "API key · brave.com/search/api", "brave"),
+    ("Tavily", "API key · tavily.com", "tavily"),
+    ("Exa", "API key · exa.ai", "exa"),
+    ("Serper (Google)", "API key · serper.dev", "serper"),
+    ("xAI (Grok)", "your xAI sign-in, or an API key", "xai"),
+];
+
+/// Pick the `web_search` backend and, for keyed backends, collect the API key.
+/// Returns `(backend_id, Option<api_key>)`, or `None` if the user cancels.
+fn collect_web_search(terminal: &mut Tui) -> Result<Option<(String, Option<String>)>> {
+    let options: Vec<Opt> = WEB_SEARCH_OPTIONS
+        .iter()
+        .map(|(label, detail, _)| Opt::new(*label, *detail))
+        .collect();
+    let index = match select(
+        terminal,
+        "Web search",
+        "Which backend should the web_search tool use?",
+        &options,
+        0,
+    )? {
+        Some(index) => index,
+        None => return Ok(None),
+    };
+    let (label, _, id) = WEB_SEARCH_OPTIONS[index];
+
+    // DuckDuckGo: no key.
+    if id == "duckduckgo" {
+        return Ok(Some(("duckduckgo".to_string(), None)));
+    }
+
+    // xAI: reuse an existing sign-in; otherwise let them paste a key or defer.
+    if id == "xai" {
+        let signed_in = crate::llm::xai_oauth::token_path()
+            .map(|path| path.exists())
+            .unwrap_or(false);
+        if signed_in {
+            notice(terminal, "Using your existing xAI sign-in for web search.")?;
+            return Ok(Some(("xai".to_string(), None)));
+        }
+        let key = match text_input(
+            terminal,
+            "xAI API key (optional)",
+            "Paste an xAI API key, or leave empty to sign in later with /login xai.",
+            "",
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let key = key.trim();
+        return Ok(Some((
+            "xai".to_string(),
+            (!key.is_empty()).then(|| key.to_string()),
+        )));
+    }
+
+    // Keyed backends (brave/tavily/exa/serper): paste a key, or fall back.
+    let key = match text_input(
+        terminal,
+        &format!("{label} API key"),
+        "Paste your API key. Stored locally in ~/.wizard/credentials.toml (0600).",
+        "",
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        notice(
+            terminal,
+            "No key entered — using DuckDuckGo for web search.",
+        )?;
+        return Ok(Some(("duckduckgo".to_string(), None)));
+    }
+    Ok(Some((id.to_string(), Some(key.to_string()))))
 }
 
 /// Optional final step: offer to import artifacts from an existing Claude Code
@@ -1489,6 +1604,8 @@ mod tests {
             gateway_token_env: None,
             gateway_allowed_chat_ids: Vec::new(),
             mode: Mode::Genie,
+            web_search_backend: "duckduckgo".to_string(),
+            web_search_api_key: None,
             claude_import: None,
         }
     }
