@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -32,7 +33,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, InputMode, TranscriptEntry};
+use crate::app::{App, InputMode, Selection, TranscriptEntry};
 use crate::config::Mode;
 use crate::session_registry::SessionState;
 
@@ -114,6 +115,73 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.show_subagents {
         draw_subagents(frame, app);
+    }
+
+    // The selection highlight paints last so it reverses whatever ended up on
+    // screen — transcript, sidebar, or an overlay the user dragged across.
+    if let Some(selection) = app.selection {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+        for (y, start, end) in selection_rows(&selection, area.width, area.height) {
+            for x in start..end {
+                if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                    cell.modifier.insert(Modifier::REVERSED);
+                }
+            }
+        }
+    }
+}
+
+/// Per-row spans `(y, start_x, end_x_exclusive)` a selection covers over a grid
+/// `width` × `height`. Reading-order flow: the first row runs from the start
+/// column to the edge, full rows in between, the last row from the edge to the
+/// head column (inclusive). Shared by the highlight overlay and the clipboard
+/// extraction so what's shown is exactly what's copied.
+fn selection_rows(selection: &Selection, width: u16, height: u16) -> Vec<(u16, u16, u16)> {
+    let ((start_x, start_y), (end_x, end_y)) = selection.ordered();
+    let mut rows = Vec::new();
+    let last_y = end_y.min(height.saturating_sub(1));
+    for y in start_y..=last_y {
+        let row_start = if y == start_y { start_x } else { 0 }.min(width);
+        // Include the cell under the head: end column + 1, clamped to the edge.
+        let row_end = if y == end_y {
+            end_x.saturating_add(1)
+        } else {
+            width
+        }
+        .min(width);
+        if row_start < row_end {
+            rows.push((y, row_start, row_end));
+        }
+    }
+    rows
+}
+
+/// Extract the text under a selection from a rendered cell buffer, in reading
+/// order, one `\n` per screen row. Trailing whitespace is trimmed per line so
+/// the copy isn't padded out to the row width.
+pub fn selection_text(buf: &Buffer, selection: &Selection) -> String {
+    let area = buf.area;
+    let rows = selection_rows(selection, area.width, area.height);
+    let mut out = String::new();
+    for (i, (y, start, end)) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut line = String::new();
+        for x in *start..*end {
+            if let Some(cell) = buf.cell(Position::new(x, *y)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        out.push_str(line.trim_end());
+    }
+    // A selection of only blank cells trims to nothing; report it as empty so
+    // the caller skips the copy.
+    if out.trim().is_empty() {
+        String::new()
+    } else {
+        out
     }
 }
 
@@ -2190,6 +2258,65 @@ mod tests {
 
     fn flats(lines: &[Line]) -> Vec<String> {
         lines.iter().map(flat).collect()
+    }
+
+    fn sel(anchor: (u16, u16), head: (u16, u16)) -> Selection {
+        Selection {
+            anchor,
+            head,
+            dragging: false,
+        }
+    }
+
+    /// A 6×3 buffer holding three rows of text, for selection extraction tests.
+    fn sample_buffer() -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        buf.set_string(0, 0, "abcdef", Style::default());
+        buf.set_string(0, 1, "ghi", Style::default()); // trailing blanks
+        buf.set_string(0, 2, "jklmno", Style::default());
+        buf
+    }
+
+    #[test]
+    fn selection_on_one_row_includes_the_head_cell() {
+        // Drag from column 1 to column 3 on row 0 → "bcd" (head inclusive).
+        let rows = selection_rows(&sel((1, 0), (3, 0)), 6, 3);
+        assert_eq!(rows, vec![(0, 1, 4)]);
+        assert_eq!(
+            selection_text(&sample_buffer(), &sel((1, 0), (3, 0))),
+            "bcd"
+        );
+    }
+
+    #[test]
+    fn selection_orders_endpoints_regardless_of_drag_direction() {
+        // Dragging up-and-left yields the same span as down-and-right.
+        let forward = selection_text(&sample_buffer(), &sel((1, 0), (2, 2)));
+        let backward = selection_text(&sample_buffer(), &sel((2, 2), (1, 0)));
+        assert_eq!(forward, backward);
+        assert_eq!(forward, "bcdef\nghi\njkl");
+    }
+
+    #[test]
+    fn selection_trims_trailing_blanks_per_row() {
+        // Middle row "ghi" padded to width 6; the blanks must not be copied.
+        let text = selection_text(&sample_buffer(), &sel((0, 1), (5, 1)));
+        assert_eq!(text, "ghi");
+    }
+
+    #[test]
+    fn click_without_drag_is_empty() {
+        // anchor == head: the app's Up handler clears it (no copy) via
+        // is_empty(), so a no-drag click never reaches the copy path.
+        assert!(sel((2, 1), (2, 1)).is_empty());
+        assert!(!sel((2, 1), (3, 1)).is_empty());
+    }
+
+    #[test]
+    fn selection_clamps_to_buffer_bounds() {
+        // Head past the right/bottom edge stays within the grid.
+        let rows = selection_rows(&sel((0, 0), (99, 99)), 6, 3);
+        assert_eq!(rows, vec![(0, 0, 6), (1, 0, 6), (2, 0, 6)]);
     }
 
     #[test]

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::Value;
@@ -302,6 +304,44 @@ const PROVIDER_TYPES: &[(&str, &str)] = &[
     ("Anthropic (Claude) — API key", "api.anthropic.com"),
     ("OpenAI-compatible — custom", "any base URL + key"),
 ];
+
+/// The `web_search` backend menu (`/settings`): `(id, label, detail)`. The id
+/// is what gets written to `[web] search_backend` and (for keyed backends) the
+/// `~/.wizard/credentials.toml` key name; the order is the display order.
+const WEB_BACKENDS: &[(&str, &str, &str)] = &[
+    ("duckduckgo", "DuckDuckGo", "free · no API key"),
+    ("brave", "Brave Search", "API key · brave.com/search/api"),
+    ("tavily", "Tavily", "API key · tavily.com"),
+    ("exa", "Exa", "API key · exa.ai"),
+    ("serper", "Serper (Google)", "API key · serper.dev"),
+    ("xai", "xAI (Grok)", "sign in with xAI, or API key"),
+];
+
+/// Display label for a `web_search` backend id (falls back to the id itself).
+fn web_backend_label(id: &str) -> &str {
+    match id {
+        "grok" => "xAI (Grok)",
+        other => WEB_BACKENDS
+            .iter()
+            .find(|(value, _, _)| *value == other)
+            .map(|(_, label, _)| *label)
+            .unwrap_or(other),
+    }
+}
+
+/// Whether a keyed `web_search` backend needs a pasted API key (vs DuckDuckGo,
+/// which needs none, and xAI, which can use the OAuth session).
+fn web_backend_needs_key(id: &str) -> bool {
+    matches!(id, "brave" | "tavily" | "exa" | "serper")
+}
+
+/// Whether an xAI OAuth session already exists on disk (`wizard --login xai`),
+/// so web search can reuse it without a fresh sign-in.
+fn xai_oauth_session_present() -> bool {
+    crate::llm::xai_oauth::token_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
 
 /// Human-readable provider name for a kind, used in inline prompt questions.
 fn provider_display(kind: ProviderKind) -> &'static str {
@@ -709,6 +749,11 @@ pub enum PickerKind {
     /// Level 2 of `/provider`: the menu of provider kinds to add. Rows are
     /// dispatched by index against [`PROVIDER_TYPES`].
     ProviderType,
+    /// The `web_search` backend picker (from `/settings`). Item values are
+    /// backend ids ([`WEB_BACKENDS`]); selecting a keyed backend starts an
+    /// inline API-key prompt, xAI reuses the OAuth session, DuckDuckGo applies
+    /// immediately.
+    WebBackend,
     /// `/fusion config`: a multi-select where Space toggles a provider into the
     /// fusion panel and Enter saves `[fusion]` (the first toggled row becomes
     /// the synthesizer). Reuses [`PickerItem::current`] as the checkbox.
@@ -780,6 +825,41 @@ pub struct StatusLine {
     pub completion_tokens: u64,
 }
 
+/// A mouse text selection over the rendered screen. Coordinates are absolute
+/// terminal cells. Because wizard captures the mouse (so the wheel scrolls the
+/// transcript), the terminal's own click-drag-to-select is pre-empted — so the
+/// app draws the highlight itself ([`crate::ui`]) and copies the covered cells
+/// to the clipboard via OSC 52 on release.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    /// Cell where the drag began (mouse-down).
+    pub anchor: (u16, u16),
+    /// Cell under the cursor now: tracks the drag, frozen on release.
+    pub head: (u16, u16),
+    /// True while the button is held down.
+    pub dragging: bool,
+}
+
+impl Selection {
+    /// The endpoints in reading order: `(start, end)` such that `start`
+    /// precedes `end` row-major (top-to-bottom, then left-to-right).
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        // Compare by (row, column) so a point lower on screen always sorts last.
+        let key = |(x, y): (u16, u16)| (y, x);
+        if key(self.anchor) <= key(self.head) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// A click that never dragged: anchor and head are the same cell, so there
+    /// is nothing to highlight or copy.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 /// Full TUI state. [`crate::ui::draw`] renders it; [`App::handle_event`]
 /// mutates it.
 #[derive(Debug)]
@@ -839,6 +919,9 @@ pub struct App {
     pub peek_lines: Vec<(String, String)>,
     /// Transcript scroll offset from the bottom (0 = pinned to latest).
     pub scroll: u16,
+    /// Active or just-completed mouse text selection, if any. Drives the
+    /// highlight overlay and clipboard copy.
+    pub selection: Option<Selection>,
     pub should_quit: bool,
     /// Tick counter driving the busy spinner.
     pub tick: u64,
@@ -858,6 +941,10 @@ pub struct App {
     /// In-progress interactive provider setup, when the composer is collecting
     /// fields ([`InputMode::Prompt`]).
     pub prompt: Option<ProviderPrompt>,
+    /// When the composer is collecting a pasted API key for a keyed
+    /// `web_search` backend (the backend name); set from the `/settings` web
+    /// search picker, consumed by [`App::submit_web_key`].
+    pub web_key_backend: Option<String>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
@@ -954,6 +1041,7 @@ impl App {
             dashboard_input: String::new(),
             peek_lines: Vec::new(),
             scroll: 0,
+            selection: None,
             should_quit: false,
             tick: 0,
             suggestions: Vec::new(),
@@ -962,6 +1050,7 @@ impl App {
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker: None,
             prompt: None,
+            web_key_backend: None,
             plan_mode,
             fusion_active: false,
             plan_review: None,
@@ -1125,11 +1214,12 @@ impl App {
             "rollback" => {
                 self.config.rollback_failed_cycles = !self.config.rollback_failed_cycles;
             }
+            "web_backend" => {
+                self.open_web_backend_picker();
+                return None;
+            }
             "web_allow_local" => self.config.web.allow_local = !self.config.web.allow_local,
             "fleet_synthesize" => self.config.fleet.synthesize = !self.config.fleet.synthesize,
-            "web_backend" => {
-                self.config.web.search_backend = cycle_backend(&self.config.web.search_backend);
-            }
             _ => return None,
         }
         // Inline change: persist and re-open, restoring the cursor so repeated
@@ -1362,10 +1452,113 @@ impl App {
         });
     }
 
-    /// True when the composer is collecting a masked field (the API key) in
-    /// the inline provider-setup prompt. Drives the bullet masking in
-    /// [`crate::ui`].
+    /// Open the `web_search` backend picker (from `/settings`). Marks the
+    /// current backend so the user sees what is active.
+    pub fn open_web_backend_picker(&mut self) {
+        let active = self.config.web.search_backend.trim().to_ascii_lowercase();
+        let items: Vec<PickerItem> = WEB_BACKENDS
+            .iter()
+            .map(|(value, label, detail)| PickerItem {
+                value: (*value).to_string(),
+                detail: format!("{label} — {detail}"),
+                current: *value == active || (*value == "xai" && active == "grok"),
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::WebBackend,
+            title: " web search · ↑/↓ move · enter select · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Apply a `web_search` backend selection that needs no key entry
+    /// (DuckDuckGo, or xAI once a session/key exists): persist and report.
+    fn set_web_backend(&mut self, id: &str, note: &str) {
+        self.config.web.search_backend = id.to_string();
+        if let Err(err) = self.config.save() {
+            self.notice(format!("could not save config: {err:#}"));
+            return;
+        }
+        self.notice(note.to_string());
+    }
+
+    /// Handle a row from the `web_search` backend picker: DuckDuckGo applies at
+    /// once; keyed backends start an inline key prompt; xAI reuses the OAuth
+    /// session when present (no re-login) and otherwise points the user at
+    /// `/login xai`.
+    fn select_web_backend(&mut self, id: &str) {
+        match id {
+            "xai" | "grok" => {
+                if xai_oauth_session_present() {
+                    self.set_web_backend(
+                        "xai",
+                        "web search: using your xAI sign-in (no new login needed)",
+                    );
+                } else if crate::credentials::get("xai").is_some() {
+                    self.set_web_backend("xai", "web search: using xAI (stored API key)");
+                } else {
+                    self.set_web_backend(
+                        "xai",
+                        "web search set to xAI — run /login xai to sign in, or set XAI_API_KEY",
+                    );
+                }
+            }
+            keyed if web_backend_needs_key(keyed) => self.begin_web_key_prompt(keyed),
+            other => {
+                let label = web_backend_label(other).to_string();
+                self.set_web_backend(other, &format!("web search: using {label}"));
+            }
+        }
+    }
+
+    /// Start the inline prompt that collects (and stores) a pasted API key for
+    /// a keyed `web_search` backend.
+    fn begin_web_key_prompt(&mut self, id: &str) {
+        self.web_key_backend = Some(id.to_string());
+        self.input_mode = InputMode::Prompt;
+        self.clear_input();
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        self.notice(format!(
+            "paste your {} API key, then Enter (Esc to cancel):",
+            web_backend_label(id)
+        ));
+    }
+
+    /// Consume the composer input as the pasted API key: store it under the
+    /// backend name in `~/.wizard/credentials.toml`, switch to that backend,
+    /// and return to normal input. An empty entry cancels.
+    fn submit_web_key(&mut self) -> Option<AppAction> {
+        let id = self.web_key_backend.take()?;
+        let key = self.input.trim().to_string();
+        self.input.clear();
+        self.cursor = 0;
+        self.input_mode = InputMode::Chat;
+        self.sync_input_mode();
+        if key.is_empty() {
+            self.notice("cancelled (no key entered)");
+            return None;
+        }
+        if let Err(err) = crate::credentials::store(&id, &key) {
+            self.notice(format!("could not save the {id} API key: {err:#}"));
+            return None;
+        }
+        let label = web_backend_label(&id).to_string();
+        self.set_web_backend(
+            &id,
+            &format!("web search: using {label} (key saved to ~/.wizard/credentials.toml)"),
+        );
+        None
+    }
+
+    /// True when the composer is collecting a masked field (an API key) in an
+    /// inline prompt — provider setup or web-search key entry. Drives the
+    /// bullet masking in [`crate::ui`].
     pub fn prompt_is_masked(&self) -> bool {
+        if self.web_key_backend.is_some() {
+            return true;
+        }
         self.input_mode == InputMode::Prompt
             && self
                 .prompt
@@ -1394,6 +1587,7 @@ impl App {
     /// Cancel an in-progress provider-setup prompt and return to normal input.
     fn cancel_prompt(&mut self) {
         self.prompt = None;
+        self.web_key_backend = None;
         self.input.clear();
         self.cursor = 0;
         self.input_mode = InputMode::Chat;
@@ -1591,7 +1785,7 @@ impl App {
         // While answering an inline prompt the composer stays in Prompt mode no
         // matter what is typed (a key never flips it to Command/Chat), and the
         // suggestion popup is suppressed.
-        if self.prompt.is_some() {
+        if self.prompt.is_some() || self.web_key_backend.is_some() {
             return;
         }
         self.input_mode = if self.input.trim_start().starts_with('/') {
@@ -1797,12 +1991,45 @@ impl App {
         match event {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => {
+                let cell = (mouse.column, mouse.row);
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         self.scroll = self.scroll.saturating_add(3);
+                        // The content under each cell just moved, so the old
+                        // selection no longer maps to it.
+                        self.selection = None;
                     }
                     MouseEventKind::ScrollDown => {
                         self.scroll = self.scroll.saturating_sub(3);
+                        self.selection = None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.selection = Some(Selection {
+                            anchor: cell,
+                            head: cell,
+                            dragging: true,
+                        });
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.head = cell;
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.head = cell;
+                            sel.dragging = false;
+                            if sel.is_empty() {
+                                // A plain click (no drag) just clears any
+                                // previous selection.
+                                self.selection = None;
+                            } else {
+                                // Hand off to the main loop: it owns the
+                                // terminal, so it reads the rendered cells and
+                                // copies them.
+                                return Ok(Some(AppAction::CopySelection));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1852,6 +2079,10 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(None);
         }
+
+        // Any keystroke dismisses a lingering text selection (it was copied on
+        // release; the highlight is just a leftover once the user moves on).
+        self.selection = None;
 
         // Any key other than Ctrl-C disarms the "press again to exit" latch.
         let is_ctrl_c =
@@ -2199,6 +2430,11 @@ impl App {
                             }
                             return Ok(None);
                         }
+                        PickerKind::WebBackend => {
+                            let id = item.value.clone();
+                            self.select_web_backend(&id);
+                            return Ok(None);
+                        }
                     };
                     return Ok(Some(action));
                 }
@@ -2210,7 +2446,7 @@ impl App {
         // In the inline provider-setup prompt, Esc cancels; every other key
         // falls through to normal line editing and the Enter→submit path
         // (which `submit` routes to `submit_prompt_field`).
-        if self.prompt.is_some() && key.code == KeyCode::Esc {
+        if (self.prompt.is_some() || self.web_key_backend.is_some()) && key.code == KeyCode::Esc {
             self.cancel_prompt();
             return Ok(None);
         }
@@ -2334,8 +2570,11 @@ impl App {
     /// Enter pressed: complete the highlighted suggestion if the command is
     /// still partial, then parse the input line into an action.
     fn submit(&mut self) -> Option<AppAction> {
-        // The inline provider-setup prompt intercepts Enter: each submission is
-        // an answer to a field, not a chat message or command.
+        // The inline prompts intercept Enter: each submission is an answer to a
+        // field (provider setup) or a pasted web-search key, not a message.
+        if self.web_key_backend.is_some() {
+            return self.submit_web_key();
+        }
         if self.prompt.is_some() {
             return self.submit_prompt_field();
         }
@@ -2699,6 +2938,9 @@ pub enum AppAction {
     /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
     /// the agent from the last session.
     Interrupt,
+    /// Copy the current mouse selection to the clipboard. Handled in the main
+    /// loop because it owns the terminal (and thus the rendered cell buffer).
+    CopySelection,
 }
 
 // ---------------------------------------------------------------------------
@@ -2716,9 +2958,12 @@ fn setup_terminal() -> Result<Tui> {
     // screen, which the composer reads as input-history recall — so spinning
     // the wheel cycled previous messages instead of scrolling the text.
     // Tradeoff: capture pre-empts the terminal's native click-drag-to-select,
-    // so to copy a question or response out of the transcript hold Shift while
-    // selecting (Option on macOS). Bracketed paste stays on so pasted text
-    // lands in the composer as one chunk.
+    // so wizard draws its own selection instead — drag to highlight, and the
+    // covered text is copied to the clipboard (OSC 52) on release (see the
+    // Down/Drag/Up handlers in `handle_event` and the highlight overlay in
+    // `crate::ui`). Holding Shift still forces the terminal's own selection as
+    // a fallback. Bracketed paste stays on so pasted text lands in the composer
+    // as one chunk.
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
@@ -2791,6 +3036,22 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
         Ok(_) => app.notice("editor exited without success — config not reloaded"),
         Err(err) => app.notice(format!("could not launch editor: {err:#}")),
     }
+}
+
+/// Copy `text` to the system clipboard with the OSC 52 terminal escape. This
+/// needs no clipboard daemon and works over SSH, as long as the terminal
+/// supports OSC 52 (most modern ones do). The sequence is written straight to
+/// stdout — it's non-printing, so it doesn't disturb the rendered frame.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    // OSC 52: ESC ] 52 ; c ; <base64> BEL  — `c` targets the clipboard.
+    write!(stdout, "\x1b]52;c;{encoded}\x07").context("writing clipboard escape")?;
+    stdout.flush().context("flushing clipboard escape")?;
+    Ok(())
 }
 
 fn restore_terminal() -> Result<()> {
@@ -3105,7 +3366,8 @@ keys:\n  \
 Tab / →                     accept command completion\n  \
 Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
-PgUp/PgDn · wheel           scroll the transcript (Shift+drag to select/copy)\n  \
+PgUp/PgDn · wheel           scroll the transcript\n  \
+drag                        select text — copied to the clipboard on release\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-C                      quit";
@@ -3117,17 +3379,6 @@ Ctrl-C                      quit";
 /// True for backends that run on this machine (no API key, no cloud).
 fn is_local_kind(kind: ProviderKind) -> bool {
     matches!(kind, ProviderKind::LlamaCpp | ProviderKind::Ollama)
-}
-
-/// Rotate the `web_search` backend for the settings menu's cycle row:
-/// duckduckgo → brave → tavily → duckduckgo.
-fn cycle_backend(current: &str) -> String {
-    match current {
-        "duckduckgo" => "brave",
-        "brave" => "tavily",
-        _ => "duckduckgo",
-    }
-    .to_string()
 }
 
 /// Build `provider`'s client and prove it usable: for local llama.cpp this
@@ -3681,6 +3932,23 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             };
                             let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
                         });
+                    }
+                }
+                AppAction::CopySelection => {
+                    // The drag finished: read the just-rendered cells under the
+                    // selection straight from the terminal's current buffer and
+                    // copy their text. The highlight stays on screen until the
+                    // next keystroke / click / scroll.
+                    if let Some(selection) = app.selection {
+                        let text =
+                            crate::ui::selection_text(terminal.current_buffer_mut(), &selection);
+                        if text.is_empty() {
+                            app.selection = None;
+                        } else if let Err(err) = copy_to_clipboard(&text) {
+                            app.notice(format!("could not copy selection: {err:#}"));
+                        } else {
+                            app.notice(format!("copied {} chars", text.chars().count()));
+                        }
                     }
                 }
             }
