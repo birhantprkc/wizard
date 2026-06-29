@@ -41,6 +41,12 @@ pub struct Cli {
     #[arg(long)]
     pub plan: bool,
 
+    /// Start in omakase (chef's-choice) mode: plan mode where the agent
+    /// explores read-only, decides the approach itself, and auto-approves its
+    /// own plan — no interview, no review gate. Implies `--plan`.
+    #[arg(long)]
+    pub omakase: bool,
+
     /// Time limit in hours for a sovereign-mode run.
     #[arg(long)]
     pub max_hours: Option<f64>,

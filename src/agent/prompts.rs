@@ -47,10 +47,35 @@ pub const PLAN_MODE_PROMPT: &str = "\
 You are in PLAN MODE. Investigate using read-only tools only (reading, \
 listing, and searching files; inspecting git state); every other tool is \
 blocked until your plan is approved. Do not attempt to make changes yet. \
+Once you have explored enough to understand the shape of the task but still \
+have genuine open questions whose answers would change the plan (scope, \
+trade-offs, ambiguous intent, where something should live), call the \
+`interview` tool to ask the user a short batch of clarifying questions \
+before you commit to an approach — prefer one well-aimed interview over \
+guessing. Skip it when the task is already unambiguous. \
 Once you understand the task, present your implementation plan by calling \
 the `exit_plan` tool with the complete plan as markdown. If the plan is \
 approved, plan mode ends and you carry it out; if it is rejected, refine \
 the plan using the feedback you receive and call `exit_plan` again.";
+
+/// Appended after [`PLAN_MODE_PROMPT`] when omakase mode is active: the agent
+/// has full authority over the approach. It still explores read-only first,
+/// but it does not interview the user and its plan is auto-approved — it
+/// decides and proceeds. Like plan mode, this block disappears once omakase
+/// is turned off (the prompt is recomposed on every flag flip).
+pub const OMAKASE_PROMPT: &str = "\
+## Omakase mode (chef's choice)
+
+Omakase is on: this is the chef's-choice flavor of plan mode — you have full \
+authority over the approach and the user has handed you the wheel. After \
+exploring read-only, do NOT call `interview`; resolve every open question \
+yourself by making the most reasonable assumption a senior engineer would, \
+and choose the approach you judge best. Your plan is auto-approved — there \
+is no human review gate — so when you call `exit_plan`, make the plan \
+self-justifying: state the approach you picked, the alternatives you \
+weighed, the assumptions you made, and why. Then execute it end to end, \
+verify your work, and deliver a polished result. Be decisive and tasteful; \
+surprise them with quality, not with questions.";
 
 /// Appended to the system prompt when the `todo` tool is registered: keep a
 /// working todo list for multi-step tasks so every surface can mirror

@@ -6,6 +6,7 @@
 pub mod evolve;
 pub mod file;
 pub mod git;
+pub mod interview;
 pub mod memory;
 pub mod plan;
 pub mod publish;

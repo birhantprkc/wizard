@@ -34,11 +34,27 @@ pub struct ExitPlanTool {
     /// Plan-mode flag shared with the agent and its dispatcher; approval
     /// clears it.
     plan_mode: Arc<AtomicBool>,
+    /// Omakase (chef's-choice) flag shared with the agent. When set, the plan
+    /// is auto-approved with no review round-trip: the chef decides and
+    /// proceeds. Cleared alongside plan mode on approval.
+    omakase: Arc<AtomicBool>,
 }
 
 impl ExitPlanTool {
-    pub fn new(plan_mode: Arc<AtomicBool>) -> Self {
-        Self { plan_mode }
+    pub fn new(plan_mode: Arc<AtomicBool>, omakase: Arc<AtomicBool>) -> Self {
+        Self { plan_mode, omakase }
+    }
+
+    /// Persist the plan markdown to `<project>/.wizard/plan.md`.
+    fn persist(&self, ctx: &ToolContext, plan: &str) -> Result<(), ToolError> {
+        let path = ctx.cwd.join(PLAN_FILE);
+        path.parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, plan))
+            .map_err(|err| ToolError::Execution {
+                tool: EXIT_PLAN_TOOL_NAME.to_string(),
+                source: anyhow::anyhow!("writing {}: {err}", path.display()),
+            })
     }
 }
 
@@ -81,6 +97,27 @@ impl Tool for ExitPlanTool {
                 "not in plan mode — exit_plan only applies while plan mode is active",
             ));
         }
+
+        // Omakase: chef's choice. There is no review gate — persist the plan,
+        // clear the flags, tell the surface the chef is proceeding (best
+        // effort; this is informational), and let the agent execute. This
+        // path also covers contexts with no surface (subagents), where a
+        // review round-trip would otherwise be impossible.
+        if self.omakase.load(Ordering::SeqCst) {
+            self.persist(ctx, &plan)?;
+            self.plan_mode.store(false, Ordering::SeqCst);
+            self.omakase.store(false, Ordering::SeqCst);
+            if let Some(events) = ctx.events.clone() {
+                let _ = events
+                    .send(AgentEvent::OmakaseProceeding { plan })
+                    .await;
+            }
+            return Ok(ToolOutput::ok(
+                "Omakase — plan auto-approved (chef's choice). Plan mode is off; \
+                 execute the plan end to end now.",
+            ));
+        }
+
         let Some(events) = ctx.events.clone() else {
             // Outside the dispatch pipeline there is no surface to review the
             // plan (e.g. a subagent context); refuse rather than silently
@@ -92,17 +129,7 @@ impl Tool for ExitPlanTool {
 
         // Persist the plan before asking for a verdict, so it survives a
         // rejected or interrupted review.
-        let path = ctx.cwd.join(PLAN_FILE);
-        let write = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, &plan));
-        if let Err(err) = write {
-            return Err(ToolError::Execution {
-                tool: EXIT_PLAN_TOOL_NAME.to_string(),
-                source: anyhow::anyhow!("writing {}: {err}", path.display()),
-            });
-        }
+        self.persist(ctx, &plan)?;
 
         let (respond, verdict) = oneshot::channel();
         if events
@@ -173,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn errors_outside_plan_mode() {
         let tmp = TempDir::new();
-        let tool = ExitPlanTool::new(flag(false));
+        let tool = ExitPlanTool::new(flag(false), flag(false));
         let out = tool
             .execute(json!({ "plan": "# p" }), &ToolContext::new(&tmp.0))
             .await
@@ -186,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn errors_without_an_event_channel() {
         let tmp = TempDir::new();
-        let tool = ExitPlanTool::new(flag(true));
+        let tool = ExitPlanTool::new(flag(true), flag(false));
         let out = tool
             .execute(json!({ "plan": "# p" }), &ToolContext::new(&tmp.0))
             .await
@@ -199,7 +226,7 @@ mod tests {
     async fn approval_writes_plan_and_clears_the_flag() {
         let tmp = TempDir::new();
         let plan_mode = flag(true);
-        let tool = ExitPlanTool::new(Arc::clone(&plan_mode));
+        let tool = ExitPlanTool::new(Arc::clone(&plan_mode), flag(false));
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
@@ -227,7 +254,7 @@ mod tests {
     async fn rejection_keeps_plan_mode_and_returns_feedback() {
         let tmp = TempDir::new();
         let plan_mode = flag(true);
-        let tool = ExitPlanTool::new(Arc::clone(&plan_mode));
+        let tool = ExitPlanTool::new(Arc::clone(&plan_mode), flag(false));
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
@@ -255,7 +282,7 @@ mod tests {
     async fn dropped_verdict_keeps_plan_mode() {
         let tmp = TempDir::new();
         let plan_mode = flag(true);
-        let tool = ExitPlanTool::new(Arc::clone(&plan_mode));
+        let tool = ExitPlanTool::new(Arc::clone(&plan_mode), flag(false));
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
@@ -269,5 +296,51 @@ mod tests {
         let out = out.expect("executes");
         assert!(out.is_error);
         assert!(plan_mode.load(Ordering::SeqCst), "plan mode stays on");
+    }
+
+    #[tokio::test]
+    async fn omakase_auto_approves_without_a_review_round_trip() {
+        let tmp = TempDir::new();
+        let plan_mode = flag(true);
+        let omakase = flag(true);
+        let tool = ExitPlanTool::new(Arc::clone(&plan_mode), Arc::clone(&omakase));
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+
+        // The surface only observes an informational OmakaseProceeding event;
+        // it never sends a verdict.
+        let observer = async {
+            match rx.recv().await {
+                Some(AgentEvent::OmakaseProceeding { plan }) => plan,
+                other => panic!("expected OmakaseProceeding, got {other:?}"),
+            }
+        };
+        let (out, announced) =
+            tokio::join!(tool.execute(json!({ "plan": "# chef plan" }), &ctx), observer);
+        let out = out.expect("executes");
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Omakase"), "{}", out.content);
+        assert_eq!(announced, "# chef plan");
+        assert!(!plan_mode.load(Ordering::SeqCst), "plan mode cleared");
+        assert!(!omakase.load(Ordering::SeqCst), "omakase cleared");
+        let saved = std::fs::read_to_string(tmp.0.join(PLAN_FILE)).expect("plan persisted");
+        assert_eq!(saved, "# chef plan");
+    }
+
+    #[tokio::test]
+    async fn omakase_proceeds_even_without_a_surface() {
+        // Subagent context (no event channel): omakase still auto-approves
+        // rather than refusing, because the chef needs no human gate.
+        let tmp = TempDir::new();
+        let plan_mode = flag(true);
+        let omakase = flag(true);
+        let tool = ExitPlanTool::new(Arc::clone(&plan_mode), Arc::clone(&omakase));
+        let out = tool
+            .execute(json!({ "plan": "# p" }), &ToolContext::new(&tmp.0))
+            .await
+            .expect("executes");
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!plan_mode.load(Ordering::SeqCst), "plan mode cleared");
     }
 }

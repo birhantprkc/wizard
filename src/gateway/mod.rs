@@ -199,6 +199,23 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                 continue;
             }
 
+            // "/omakase" toggles chef's-choice mode: the agent plans read-only
+            // then decides and executes its own plan (the gateway has no human
+            // reviewer anyway, so this mainly steers the agent's autonomy).
+            if message.text.trim() == "/omakase" {
+                let on = !agent.omakase();
+                agent.set_omakase(on);
+                let confirmation = if on {
+                    "omakase on — chef's choice: the agent plans, decides, and executes on its own"
+                } else {
+                    "omakase off"
+                };
+                if let Err(err) = gateway.send(message.chat_id, confirmation).await {
+                    eprintln!("failed to confirm /omakase to {}: {err:#}", message.chat_id);
+                }
+                continue;
+            }
+
             println!("← [{}] {}", message.chat_id, first_line(&message.text));
             let reply = run_one_turn(&mut agent, &message.text).await;
             for chunk in split_message(&reply, MAX_MESSAGE_CHARS) {
