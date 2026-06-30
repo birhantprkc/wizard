@@ -50,7 +50,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install musl tooling
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: contains(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build (release)
@@ -58,6 +58,15 @@ jobs:
           # Statically link the C runtime for the musl targets so the binary
           # carries no dynamic loader dependency (runs on NixOS/Alpine/old glibc).
           RUSTFLAGS: ${{ contains(matrix.target, '-musl') && '-C target-feature=+crt-static' || '' }}
+          # Each musl runner is native (x86_64 runner / arm runner), so musl-tools'
+          # `musl-gcc` targets the runner's own arch. Point cc-rs (ring's C build) and
+          # the cargo linker at it explicitly; otherwise they look for a triple-prefixed
+          # `<arch>-linux-musl-gcc` that musl-tools doesn't install. These vars are
+          # target-scoped, so they're inert on the glibc/darwin jobs.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
