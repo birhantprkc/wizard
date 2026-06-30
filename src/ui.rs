@@ -754,6 +754,23 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             dim(),
         ));
     }
+    // Background tasks (`/bashes`): a persistent marker while any are
+    // running, so a detached command doesn't silently vanish from view.
+    if app.status.background_tasks > 0 {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            format!(
+                "⏵ {} bg task{}",
+                app.status.background_tasks,
+                if app.status.background_tasks == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            accent(),
+        ));
+    }
     // MCP is still connecting in the background: a transient marker, shown
     // alongside the busy/step indicator (a turn can start before tools arrive)
     // so the missing-tools window isn't a silent surprise. Vanishes when the

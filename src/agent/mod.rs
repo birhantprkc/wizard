@@ -643,6 +643,12 @@ impl Agent {
             .count()
     }
 
+    /// Snapshot of every background task this session has spawned (running
+    /// and finished), oldest first, for `/bashes`.
+    pub fn tasks(&self) -> Vec<crate::tools::tasks::Task> {
+        self.ctx.tasks.list()
+    }
+
     /// Redirect (or disable) the per-turn usage JSONL log. Defaults to
     /// `~/.wizard/usage.jsonl`; tests point it into a temp dir.
     pub fn set_usage_log(&mut self, path: Option<PathBuf>) {

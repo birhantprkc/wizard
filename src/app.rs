@@ -171,6 +171,9 @@ pub enum SlashCommand {
     /// Show the session status: model, provider, mode, session id, usage,
     /// todo progress, background tasks, plan mode.
     Status,
+    /// `/bashes` — list background tasks (`execute` with
+    /// `run_in_background`), running and finished, with id/status/command.
+    Bashes,
     /// `/goal [text]` — show the standing mission goal, or set it. `None`
     /// shows the current goal; `Some` sets it (drives sovereign/continuous
     /// mode), persisting to `<project_root>/.wizard/mission.toml`.
@@ -454,6 +457,7 @@ impl SlashCommand {
             "memory" => Ok(Self::Memory),
             "doctor" => Ok(Self::Doctor),
             "status" => Ok(Self::Status),
+            "bashes" => Ok(Self::Bashes),
             "goal" => {
                 let text = args.join(" ");
                 if text.is_empty() {
@@ -638,6 +642,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "status",
         args: "",
         description: "show session status: model, usage, todos, tasks",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "bashes",
+        args: "",
+        description: "list background tasks: id, status, command",
         takes_args: false,
     },
     CommandSpec {
@@ -872,6 +882,8 @@ pub struct StatusLine {
     pub prompt_tokens: u64,
     /// Session completion-token total.
     pub completion_tokens: u64,
+    /// Background tasks (`execute` with `run_in_background`) still running.
+    pub background_tasks: usize,
 }
 
 /// A mouse text selection over the rendered screen. Coordinates are absolute
@@ -1079,6 +1091,7 @@ impl App {
             busy: false,
             prompt_tokens: 0,
             completion_tokens: 0,
+            background_tasks: 0,
         };
         Self {
             config,
@@ -3515,14 +3528,19 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
-            // TaskStarted is mirrored to the gateway's JSON stream (see
-            // output.rs); the TUI surfaces only the finish notice.
-            AgentEvent::TaskStarted { .. } => {}
+            // TaskStarted is also mirrored to the gateway's JSON stream (see
+            // output.rs); the TUI additionally bumps the live status-bar
+            // counter (see draw_status_bar) so a running task stays visible
+            // without waiting for the finish notice.
+            AgentEvent::TaskStarted { .. } => {
+                self.status.background_tasks += 1;
+            }
             AgentEvent::TaskFinished {
                 id,
                 command,
                 status,
             } => {
+                self.status.background_tasks = self.status.background_tasks.saturating_sub(1);
                 self.notice(format!(
                     "background task #{id} finished ({}): {command}",
                     status.describe()
@@ -4010,6 +4028,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /cost                       show session token usage and cost\n  \
 /memory                     show saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
+/bashes                     list background tasks (id, status, command)\n  \
 /goal [text]                show or set the standing mission goal\n  \
 /settings                   open the settings menu (change config anytime)\n  \
 /vim                        toggle vim-style modal editing of the input line\n  \
@@ -4761,6 +4780,7 @@ impl CommandContext<'_> {
             SlashCommand::Memory => self.memory(),
             SlashCommand::Doctor => self.doctor().await,
             SlashCommand::Status => self.status(),
+            SlashCommand::Bashes => self.bashes(),
             SlashCommand::Goal(None) => self.show_goal(),
             SlashCommand::Goal(Some(text)) => self.set_goal(text),
             SlashCommand::Clear => self.clear(),
@@ -4963,6 +4983,32 @@ impl CommandContext<'_> {
             }
         ));
         self.app.notice(text);
+    }
+
+    /// `/bashes`: list every background task this session has spawned
+    /// (`execute` with `run_in_background`), running and finished, newest
+    /// last — id, status, and the command line.
+    fn bashes(&mut self) {
+        let Some(agent) = self.agent_slot.as_ref() else {
+            self.app
+                .notice("background tasks: unavailable while a turn is running");
+            return;
+        };
+        let tasks = agent.tasks();
+        if tasks.is_empty() {
+            self.app.notice("background tasks: none");
+            return;
+        }
+        let mut text = String::from("background tasks:\n");
+        for task in &tasks {
+            text.push_str(&format!(
+                "  #{} [{}] {}\n",
+                task.id,
+                task.status.describe(),
+                task.command
+            ));
+        }
+        self.app.notice(text.trim_end().to_string());
     }
 
     /// `/goal`: show the standing mission goal that drives sovereign /
@@ -6994,6 +7040,52 @@ mod tests {
         });
         assert_eq!(app.status.prompt_tokens, 150);
         assert_eq!(app.status.completion_tokens, 25);
+    }
+
+    #[test]
+    fn background_task_events_drive_the_live_status_bar_counter() {
+        let mut app = app();
+        assert_eq!(app.status.background_tasks, 0);
+
+        app.handle_agent_event(AgentEvent::TaskStarted {
+            id: 1,
+            command: "sleep 5".to_string(),
+        });
+        assert_eq!(
+            app.status.background_tasks, 1,
+            "marker appears while running"
+        );
+
+        app.handle_agent_event(AgentEvent::TaskStarted {
+            id: 2,
+            command: "ping -c 1 example.com".to_string(),
+        });
+        assert_eq!(app.status.background_tasks, 2);
+
+        app.handle_agent_event(AgentEvent::TaskFinished {
+            id: 1,
+            command: "sleep 5".to_string(),
+            status: crate::tools::tasks::TaskStatus::Done(0),
+        });
+        assert_eq!(
+            app.status.background_tasks, 1,
+            "counter drops back down as tasks finish"
+        );
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Notice(text))
+                if text.contains("background task #1 finished")
+        ));
+
+        app.handle_agent_event(AgentEvent::TaskFinished {
+            id: 2,
+            command: "ping -c 1 example.com".to_string(),
+            status: crate::tools::tasks::TaskStatus::Done(0),
+        });
+        assert_eq!(
+            app.status.background_tasks, 0,
+            "marker clears once all finish"
+        );
     }
 
     #[test]
