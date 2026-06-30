@@ -108,9 +108,7 @@ impl Tool for ExitPlanTool {
             self.plan_mode.store(false, Ordering::SeqCst);
             self.omakase.store(false, Ordering::SeqCst);
             if let Some(events) = ctx.events.clone() {
-                let _ = events
-                    .send(AgentEvent::OmakaseProceeding { plan })
-                    .await;
+                let _ = events.send(AgentEvent::OmakaseProceeding { plan }).await;
             }
             return Ok(ToolOutput::ok(
                 "Omakase — plan auto-approved (chef's choice). Plan mode is off; \
@@ -315,8 +313,10 @@ mod tests {
                 other => panic!("expected OmakaseProceeding, got {other:?}"),
             }
         };
-        let (out, announced) =
-            tokio::join!(tool.execute(json!({ "plan": "# chef plan" }), &ctx), observer);
+        let (out, announced) = tokio::join!(
+            tool.execute(json!({ "plan": "# chef plan" }), &ctx),
+            observer
+        );
         let out = out.expect("executes");
 
         assert!(!out.is_error, "{}", out.content);

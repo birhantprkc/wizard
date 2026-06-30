@@ -188,12 +188,14 @@ impl Tool for InterviewTool {
                 let mut out = String::from("The user answered your questions:\n");
                 for (i, q) in questions.iter().enumerate() {
                     let answer = answers.get(i).map(String::as_str).unwrap_or("").trim();
-                    let answer = if answer.is_empty() { "(skipped)" } else { answer };
+                    let answer = if answer.is_empty() {
+                        "(skipped)"
+                    } else {
+                        answer
+                    };
                     let _ = write!(out, "\nQ: {}\nA: {answer}\n", q.question);
                 }
-                out.push_str(
-                    "\nIncorporate these answers into your plan, then call exit_plan.",
-                );
+                out.push_str("\nIncorporate these answers into your plan, then call exit_plan.");
                 Ok(ToolOutput::ok(out))
             }
             Ok(None) => Ok(unanswered(
@@ -234,10 +236,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolContext::new("/tmp").with_events(tx);
         let out = tool
-            .execute(
-                json!({ "questions": [{ "question": "which db?" }] }),
-                &ctx,
-            )
+            .execute(json!({ "questions": [{ "question": "which db?" }] }), &ctx)
             .await
             .expect("executes");
         assert!(!out.is_error);

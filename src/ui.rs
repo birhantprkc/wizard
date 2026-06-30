@@ -1511,7 +1511,10 @@ fn draw_interview(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let total = interview.questions.len();
-    let title = format!(" question {} of {total} ", (interview.current + 1).min(total));
+    let title = format!(
+        " question {} of {total} ",
+        (interview.current + 1).min(total)
+    );
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim())
@@ -1549,7 +1552,10 @@ fn draw_interview(frame: &mut Frame, app: &App) {
                 Span::styled("✓ ", Style::default().fg(Color::Green)),
                 Span::styled(q.question.clone(), dim()),
             ]));
-            lines.push(Line::from(Span::styled(format!("    {answer}"), dim().italic())));
+            lines.push(Line::from(Span::styled(
+                format!("    {answer}"),
+                dim().italic(),
+            )));
         } else if i == interview.current {
             lines.push(Line::from(vec![
                 Span::styled("▶ ", accent().bold()),
@@ -1562,10 +1568,7 @@ fn draw_interview(frame: &mut Frame, app: &App) {
                 ]));
             }
         } else {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", q.question),
-                dim(),
-            )));
+            lines.push(Line::from(Span::styled(format!("  {}", q.question), dim())));
         }
     }
 

@@ -4710,7 +4710,8 @@ impl CommandContext<'_> {
                  approach itself, and executes its own plan (/omakase to leave)",
             );
         } else {
-            self.app.notice("omakase off — back to plan mode (you review the plan)");
+            self.app
+                .notice("omakase off — back to plan mode (you review the plan)");
         }
     }
 
@@ -6629,7 +6630,10 @@ mod tests {
 
     #[test]
     fn omakase_parses_and_round_trips() {
-        assert_eq!(SlashCommand::parse("/omakase"), Some(Ok(SlashCommand::Omakase)));
+        assert_eq!(
+            SlashCommand::parse("/omakase"),
+            Some(Ok(SlashCommand::Omakase))
+        );
     }
 
     #[test]
@@ -6651,7 +6655,10 @@ mod tests {
             "postgres",
             "digit fills the matching option"
         );
-        assert!(app.input.is_empty(), "interview keys never hit the input line");
+        assert!(
+            app.input.is_empty(),
+            "interview keys never hit the input line"
+        );
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.interview.as_ref().expect("still open").current, 1);
 
@@ -6659,7 +6666,10 @@ mod tests {
         type_str(&mut app, "yes, oauth");
         press(&mut app, KeyCode::Enter);
 
-        assert!(app.interview.is_none(), "interview closed after the last answer");
+        assert!(
+            app.interview.is_none(),
+            "interview closed after the last answer"
+        );
         assert_eq!(
             rx.try_recv(),
             Ok(Some(vec!["postgres".to_string(), "yes, oauth".to_string()]))
@@ -6693,10 +6703,12 @@ mod tests {
         });
         assert!(!app.plan_mode, "chef's choice leaves plan mode");
         assert!(!app.omakase, "omakase cleared once proceeding");
-        let shown = app.transcript.iter().any(|e| matches!(
-            e,
-            TranscriptEntry::ToolCard { output: Some(p), .. } if p == "# chef plan"
-        ));
+        let shown = app.transcript.iter().any(|e| {
+            matches!(
+                e,
+                TranscriptEntry::ToolCard { output: Some(p), .. } if p == "# chef plan"
+            )
+        });
         assert!(shown, "the chosen plan is surfaced in the transcript");
     }
 
