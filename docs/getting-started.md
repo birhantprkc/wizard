@@ -150,6 +150,23 @@ spinner_verbs = ["Pondering", "Musing", "Noodling"]
 
 A non-empty list fully replaces the defaults; omitting the section or setting `spinner_verbs = []` keeps the built-in wizard verbs. The status bar (`step x/y · Ns`) and tool spinners are unaffected.
 
+### Vim mode (`[ui]`)
+
+Modal (vim-style) editing for the input line, like Claude Code's. Toggle it live with `/vim` (or `/settings → Vim mode`), or set it as the default:
+
+```toml
+[ui]
+vim = true
+```
+
+The composer starts in **INSERT** (ordinary typing); **Esc** drops to **NORMAL**, where keys are motions and operators instead of text. The status bar shows the active mode and a block cursor marks NORMAL. Single-line vim:
+
+- **Motions:** `h`/`l` left/right, `0`/`^`/`$` line ends, `w`/`b`/`e` by word, `j`/`k` recall input history. A count prefix repeats them (`3w`, `2x`).
+- **Insert:** `i`/`a` before/after the cursor, `I`/`A` line start/end, `o`/`O` end/start (single-line analogs).
+- **Edits:** `x`/`X` delete a char, `r` replace one, `d`/`c`/`y` operators with a motion (`dw`, `c$`, `ye`) or doubled for the whole line (`dd`/`cc`/`yy`), `D`/`C`/`s`/`S`, `p`/`P` paste, `u` undo.
+
+The Ctrl readline chords (`Ctrl-A/E/U/W/K`, history, etc.) keep working in both modes, and **Enter** submits from either.
+
 ## Migrating from Ollama
 
 The local default is llama.cpp; Ollama stays fully supported but is opt-in:

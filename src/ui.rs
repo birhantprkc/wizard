@@ -36,6 +36,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, InputMode, Selection, TranscriptEntry};
 use crate::config::Mode;
 use crate::session_registry::SessionState;
+use crate::vim::VimMode;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -701,6 +702,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];
+    // Vim mode indicator: NORMAL stands out (bold accent), INSERT stays quiet.
+    if let Some(label) = app.vim.label() {
+        spans.push(Span::styled(" · ", dim()));
+        let style = if app.vim.mode == VimMode::Normal {
+            accent().bold()
+        } else {
+            dim()
+        };
+        spans.push(Span::styled(label, style));
+    }
     if app.omakase {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("OMAKASE", accent().bold()));
@@ -837,16 +848,33 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let visible: String = chars[start..end].iter().collect();
     let cursor_x = area.x + (pad + prompt_width) as u16 + cursor_cols as u16;
 
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled("❯ ", accent().bold()),
-        Span::raw(visible),
-    ];
+    // Vim Normal mode draws its own block cursor (reversed cell) instead of the
+    // terminal's thin bar, so the user can tell the modes apart at a glance.
+    let normal = app.vim.is_normal();
+    let mut spans = vec![Span::raw(" "), Span::styled("❯ ", accent().bold())];
+    if normal {
+        let vis: Vec<char> = chars[start..end].to_vec();
+        let rel = cursor.saturating_sub(start).min(vis.len());
+        let before: String = vis[..rel].iter().collect();
+        spans.push(Span::raw(before));
+        let block = Style::default().add_modifier(Modifier::REVERSED);
+        if rel < vis.len() {
+            spans.push(Span::styled(vis[rel].to_string(), block));
+            let after: String = vis[rel + 1..].iter().collect();
+            spans.push(Span::raw(after));
+        } else {
+            // Cursor past the last visible char (empty line): a reversed space.
+            spans.push(Span::styled(" ", block));
+        }
+    } else {
+        spans.push(Span::raw(visible));
+    }
 
     // Ghost text: the untyped remainder of the highlighted suggestion plus
     // its argument hint, dimmed (only when the whole input is visible and
     // the cursor sits at the end, where → can actually accept it).
-    if start == 0
+    if !normal
+        && start == 0
         && cursor == chars.len()
         && app.picker.is_none()
         && app.input_mode == InputMode::Command
@@ -872,7 +900,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    if app.picker.is_none() && app.plan_review.is_none() && app.interview.is_none() {
+    // In Normal mode the block cursor above is the only cursor; leave the
+    // terminal's hardware cursor hidden.
+    if !normal && app.picker.is_none() && app.plan_review.is_none() && app.interview.is_none() {
         frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
     }
 }

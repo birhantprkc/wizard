@@ -157,6 +157,17 @@ pub struct UiConfig {
     /// or empty keeps the defaults.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spinner_verbs: Vec<String>,
+    /// Modal (vim-style) editing for the input composer: NORMAL/INSERT modes,
+    /// `hjkl`/word motions, `d`/`c`/`y` operators, `x`/`r`/`p`. Off by
+    /// default; toggle live with `/vim`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vim: bool,
+}
+
+/// serde `skip_serializing_if` helper: keep `false` flags out of the written
+/// config so the file stays minimal.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl UiConfig {
@@ -970,6 +981,7 @@ mod tests {
             },
             ui: UiConfig {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
+                vim: true,
             },
             web: WebConfig {
                 fetch_max_bytes: 250_000,
