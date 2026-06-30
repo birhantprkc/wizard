@@ -19,7 +19,11 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
@@ -36,16 +40,26 @@ jobs:
           echo "Releasing version ${cargo_version}"
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install musl tooling
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build (release)
-        run: cargo build --release
+        env:
+          # Statically link the C runtime for the musl targets so the binary
+          # carries no dynamic loader dependency (runs on NixOS/Alpine/old glibc).
+          RUSTFLAGS: ${{ contains(matrix.target, '-musl') && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          strip target/release/wizard
-          tar -C target/release -czf "wizard-${{ matrix.target }}.tar.gz" wizard
+          strip "target/${{ matrix.target }}/release/wizard"
+          tar -C "target/${{ matrix.target }}/release" -czf "wizard-${{ matrix.target }}.tar.gz" wizard
 
       - uses: actions/upload-artifact@v7
         with:
@@ -71,5 +85,7 @@ jobs:
           prerelease: false
           files: |
             wizard-x86_64-unknown-linux-gnu.tar.gz
+            wizard-x86_64-unknown-linux-musl.tar.gz
             wizard-aarch64-unknown-linux-gnu.tar.gz
+            wizard-aarch64-unknown-linux-musl.tar.gz
             checksums.txt
