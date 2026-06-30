@@ -25,6 +25,10 @@ jobs:
             runner: ubuntu-22.04-arm
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -88,4 +92,6 @@ jobs:
             wizard-x86_64-unknown-linux-musl.tar.gz
             wizard-aarch64-unknown-linux-gnu.tar.gz
             wizard-aarch64-unknown-linux-musl.tar.gz
+            wizard-x86_64-apple-darwin.tar.gz
+            wizard-aarch64-apple-darwin.tar.gz
             checksums.txt

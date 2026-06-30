@@ -31,6 +31,15 @@ Running your own Ollama model (a fine-tune, a private registry tag, a local GGUF
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
 ```
 
+**Nix / NixOS.** There's a flake, so the install script isn't the only way in. `nix run` it without installing, add it to a profile, or wire the Home Manager module into your config. On NixOS the curl installer detects it, points you here, and (if you run it anyway) drops a static musl binary in `~/.local/bin` rather than fighting the FHS.
+
+```bash
+nix run github:teddytennant/wizard              # run without installing
+nix profile install github:teddytennant/wizard  # add to your profile
+```
+
+The flake exposes `packages.default`, `apps.default`, a `devShells.default` (Rust toolchain + `llama-cpp`), an overlay, and `homeManagerModules.default`.
+
 ---
 
 ## Why Wizard
@@ -152,9 +161,9 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 ---
 
-## Limitations (v0.1)
+## Limitations
 
-- **Linux only.** x86_64 and aarch64. macOS is planned for v0.2; the installer currently refuses Darwin rather than half-working.
+- **Platforms.** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel). Windows isn't supported — run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet.
 - **Small local models are worse than frontier models.** If you pick the local option, a 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude or GPT-class models. Wizard mitigates this with native tool-call probing, a JSON fallback, and retry prompts. The 27B+ tiers make much better agents than the 9B tier.
 - **No sandbox.** Tools run with your privileges; Wizard auto-approves tool calls by default in both modes. Read [SECURITY.md](SECURITY.md) before running on anything you don't trust, and prefer a container/VM for autonomous or continuous work.
 - **Context windows are finite.** Large codebases exceed what a model can hold; Wizard searches and reads selectively rather than ingesting the repo, and long sessions will eventually push out early context.

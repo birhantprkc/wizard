@@ -120,6 +120,7 @@ LLAMA_BIN_DIR="$HOME/.wizard/bin"
 MODELS_DIR="$HOME/.wizard/models"
 OLLAMA_URL="http://127.0.0.1:11434"
 
+OS=""
 ARCH=""
 MODEL=""
 GGUF_FILE=""
@@ -162,12 +163,10 @@ detect_platform() {
     local os arch
     os="$(uname -s)"
     case "$os" in
-        Linux) ;;
-        Darwin)
-            die "macOS is not supported in Wizard v0.1 — Linux only for now. macOS support is planned; sorry!"
-            ;;
+        Linux)  OS="linux" ;;
+        Darwin) OS="macos" ;;
         *)
-            die "unsupported operating system: $os (Wizard v0.1 supports Linux only)"
+            die "unsupported operating system: $os (Wizard supports Linux and macOS)"
             ;;
     esac
 
@@ -180,7 +179,7 @@ detect_platform() {
             ;;
     esac
 
-    say "Platform: linux/${ARCH}"
+    say "Platform: ${OS}/${ARCH}"
 }
 
 require_curl() {
@@ -385,6 +384,11 @@ llamacpp_variants() {
     # safe fallback.
     local suffix="x64"
     [ "$ARCH" = "aarch64" ] && suffix="arm64"
+    # macOS ships a single per-arch build with the Metal backend baked in.
+    if [ "$OS" = "macos" ]; then
+        printf 'macos-%s\n' "$suffix"
+        return
+    fi
     case "$MEM_SOURCE" in
         "GPU VRAM"*)
             if have_vulkan_loader; then
@@ -523,7 +527,7 @@ install_llamacpp() {
         return
     done
 
-    warn "could not install a prebuilt llama-server for linux/${ARCH}"
+    warn "could not install a prebuilt llama-server for ${OS}/${ARCH}"
     warn "install it yourself — wizard will start it automatically once it is on PATH:"
     printf '\n' >&2
     printf '    brew install llama.cpp                  # Homebrew / Linuxbrew\n' >&2
@@ -651,6 +655,19 @@ detect_memory() {
         MEM_GB=$((best / 1024 / 1024 / 1024))
         MEM_SOURCE="GPU VRAM (sysfs amdgpu)"
         return
+    fi
+
+    # macOS: Apple Silicon shares unified memory between CPU and the Metal GPU,
+    # so total RAM is the right tiering signal (and the Metal-backed llama-server
+    # can address most of it). sysctl reports it in bytes.
+    if [ "$OS" = "macos" ]; then
+        local mem_b
+        mem_b="$(sysctl -n hw.memsize 2>/dev/null || true)"
+        if is_uint "$mem_b" && [ "$mem_b" -gt 0 ]; then
+            MEM_GB=$((mem_b / 1024 / 1024 / 1024))
+            MEM_SOURCE="unified memory (Apple Silicon)"
+            return
+        fi
     fi
 
     local mem_kb
@@ -924,11 +941,15 @@ verify_checksum() {
         warn "checksums.txt has no entry for ${asset} — skipping checksum verification"
         return
     fi
-    if ! command -v sha256sum >/dev/null 2>&1; then
-        warn "sha256sum not found on PATH — skipping checksum verification"
+    # sha256sum on Linux; macOS ships `shasum -a 256` instead.
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$tarball" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$tarball" | awk '{print $1}')"
+    else
+        warn "no sha256 tool (sha256sum/shasum) found on PATH — skipping checksum verification"
         return
     fi
-    actual="$(sha256sum "$tarball" | awk '{print $1}')"
     if [ "$actual" != "$expected" ]; then
         die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}) — the download may be corrupted or tampered with; aborting"
     fi
@@ -938,12 +959,14 @@ verify_checksum() {
 download_binary() {
     say "Downloading wizard binary from GitHub releases (${REPO}) ..."
     local asset bin assets
-    # NixOS can't run the glibc (gnu) binary — no dynamic loader at the FHS
-    # path — so prefer the static musl asset there. Elsewhere try gnu first,
-    # but keep musl as a fallback: if the gnu binary fails its sanity check
-    # (loader/glibc mismatch on an old or unusual host), the loop drops to the
-    # static musl build automatically.
-    if is_nixos; then
+    # macOS ships a single per-arch Mach-O asset. On Linux, NixOS can't run the
+    # glibc (gnu) binary — no dynamic loader at the FHS path — so prefer the
+    # static musl asset there. Elsewhere try gnu first but keep musl as a
+    # fallback: if the gnu binary fails its sanity check (loader/glibc mismatch
+    # on an old or unusual host), the loop drops to the static musl build.
+    if [ "$OS" = "macos" ]; then
+        assets="wizard-${ARCH}-apple-darwin.tar.gz"
+    elif is_nixos; then
         assets="wizard-${ARCH}-unknown-linux-musl.tar.gz wizard-${ARCH}-unknown-linux-gnu.tar.gz wizard-linux-${ARCH}.tar.gz"
     else
         assets="wizard-${ARCH}-unknown-linux-gnu.tar.gz wizard-${ARCH}-unknown-linux-musl.tar.gz wizard-linux-${ARCH}.tar.gz"
@@ -971,7 +994,7 @@ download_binary() {
         fi
     done
 
-    warn "could not download a prebuilt wizard binary for linux/${ARCH}"
+    warn "could not download a prebuilt wizard binary for ${OS}/${ARCH}"
     warn "(a 404 here also happens when ${REPO} is private — 'gh auth login' enables an authenticated download)"
     warn "you can build it from source instead (requires a Rust toolchain):"
     printf '\n' >&2
