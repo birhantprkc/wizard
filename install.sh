@@ -45,7 +45,8 @@
 #                     loadout; the first `wizard` run starts onboarding
 #
 # Environment variables:
-#   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin)
+#   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin;
+#                                ~/.local/bin on NixOS)
 #   WIZARD_LOCAL                 1 = preinstall the llama.cpp stack and a model
 #                                    (see above)               (default 0)
 #   WIZARD_MINIMAL               1 = minimal install (see above)        (default 0)
@@ -72,9 +73,28 @@
 
 set -euo pipefail
 
+# --- NixOS detection ----------------------------------------------------
+# Defined early so the install-dir default below can branch on it. NixOS is
+# not an FHS distro: prebuilt glibc binaries can't find /lib64/ld-linux and
+# /usr/local/bin isn't on PATH, so the installer selects the static musl
+# asset and installs to ~/.local/bin instead.
+is_nixos() {
+    [ -f /etc/NIXOS ] && return 0
+    [ -r /etc/os-release ] && grep -qiE '^ID=nixos' /etc/os-release
+}
+
 # --- defaults -----------------------------------------------------------
 
-WIZARD_INSTALL_DIR="${WIZARD_INSTALL_DIR:-/usr/local/bin}"
+# /usr/local/bin is the right default on FHS distros, but not on NixOS (not on
+# PATH, wrong place for an FHS binary). An explicit WIZARD_INSTALL_DIR override
+# always wins; otherwise pick ~/.local/bin on NixOS, /usr/local/bin elsewhere.
+if [ -z "${WIZARD_INSTALL_DIR:-}" ]; then
+    if is_nixos; then
+        WIZARD_INSTALL_DIR="$HOME/.local/bin"
+    else
+        WIZARD_INSTALL_DIR="/usr/local/bin"
+    fi
+fi
 WIZARD_LOCAL="${WIZARD_LOCAL:-0}"
 WIZARD_MINIMAL="${WIZARD_MINIMAL:-0}"
 WIZARD_BYOM="${WIZARD_BYOM:-0}"
@@ -165,6 +185,20 @@ detect_platform() {
 
 require_curl() {
     command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH"
+}
+
+nixos_banner() {
+    printf '\n'
+    say "NixOS detected."
+    warn "The supported, idiomatic way to run Wizard on NixOS is Nix, not this script:"
+    printf '\n' >&2
+    printf '    nix run github:%s              # run without installing\n' "$WIZARD_REPO" >&2
+    printf '    nix profile install github:%s  # add to your profile\n' "$WIZARD_REPO" >&2
+    printf '    # or add the flake as an input to your system/home configuration\n' >&2
+    printf '\n' >&2
+    warn "Proceeding with a static musl binary instead → ${WIZARD_INSTALL_DIR}"
+    warn "Set WIZARD_INSTALL_DIR to override the install location."
+    printf '\n'
 }
 
 # --- llama.cpp ----------------------------------------------------------
@@ -386,6 +420,18 @@ install_llamacpp() {
         say "Skipping llama.cpp install (WIZARD_SKIP_LLAMACPP_INSTALL=1)"
         return
     fi
+    # On NixOS, never compile from source or drop a prebuilt FHS binary — use an
+    # existing llama-server if present, otherwise point the user at Nix.
+    if is_nixos; then
+        if command -v llama-server >/dev/null 2>&1; then
+            say "llama-server already on PATH ($(command -v llama-server)) — wizard will use it"
+        else
+            warn "On NixOS, install llama.cpp declaratively instead of compiling it here:"
+            warn "    nix profile install nixpkgs#llama-cpp"
+            warn "then re-run (or add it to your system/home configuration). Skipping for now."
+        fi
+        return
+    fi
     # Decide the GPU strategy up front (needs to know whether a GPU is present).
     # NVIDIA → compile a CUDA build (the only reliable NVIDIA path; no prebuilt
     # CUDA asset exists and the Vulkan prebuilt can't see NVIDIA without an ICD).
@@ -500,6 +546,11 @@ install_ollama() {
     if command -v ollama >/dev/null 2>&1; then
         say "Ollama already installed"
         return
+    fi
+    # On NixOS the curl|sh Ollama installer drops an FHS binary that won't run —
+    # require a declarative install instead.
+    if is_nixos; then
+        die "On NixOS, install Ollama declaratively rather than via the curl installer — e.g. 'nix profile install nixpkgs#ollama' (or set services.ollama.enable = true), then re-run."
     fi
     say "Installing Ollama (official install script) ..."
     curl -fsSL https://ollama.com/install.sh | sh \
@@ -886,8 +937,18 @@ verify_checksum() {
 
 download_binary() {
     say "Downloading wizard binary from GitHub releases (${REPO}) ..."
-    local asset bin
-    for asset in "wizard-${ARCH}-unknown-linux-gnu.tar.gz" "wizard-linux-${ARCH}.tar.gz"; do
+    local asset bin assets
+    # NixOS can't run the glibc (gnu) binary — no dynamic loader at the FHS
+    # path — so prefer the static musl asset there. Elsewhere try gnu first,
+    # but keep musl as a fallback: if the gnu binary fails its sanity check
+    # (loader/glibc mismatch on an old or unusual host), the loop drops to the
+    # static musl build automatically.
+    if is_nixos; then
+        assets="wizard-${ARCH}-unknown-linux-musl.tar.gz wizard-${ARCH}-unknown-linux-gnu.tar.gz wizard-linux-${ARCH}.tar.gz"
+    else
+        assets="wizard-${ARCH}-unknown-linux-gnu.tar.gz wizard-${ARCH}-unknown-linux-musl.tar.gz wizard-linux-${ARCH}.tar.gz"
+    fi
+    for asset in $assets; do
         if download_release_asset "$asset" "${TMP_DIR}/${asset}"; then
             verify_checksum "${TMP_DIR}/${asset}" "${asset}"
             tar -xzf "${TMP_DIR}/${asset}" -C "$TMP_DIR" || continue
@@ -1306,6 +1367,10 @@ main() {
     fi
     require_curl
     detect_platform
+
+    if is_nixos; then
+        nixos_banner
+    fi
 
     if [ "$WIZARD_MINIMAL" = "1" ]; then
         say "Minimal install (WIZARD_MINIMAL=1): binary only — no model runtime, model, config, or loadout"
