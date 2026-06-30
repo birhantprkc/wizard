@@ -18,7 +18,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, CompactOutcome, DoneReason, PlanVerdict, session::Session, subagent,
+    Agent, AgentEvent, CompactOutcome, DoneReason, InterviewQuestion, PlanVerdict,
+    session::Session, subagent,
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
@@ -134,6 +135,10 @@ pub enum SlashCommand {
     /// Toggle plan mode (also Shift+Tab): read-only investigation until a
     /// plan is approved via `exit_plan`.
     Plan,
+    /// Toggle omakase (chef's-choice) mode: plan mode where the agent decides
+    /// the approach itself and auto-approves its own plan — no interview, no
+    /// review gate.
+    Omakase,
     /// `/rewind [turn]` — restore file checkpoints and truncate history.
     /// `None` opens the turn picker; `Some` rewinds to before that turn.
     Rewind(Option<u64>),
@@ -427,6 +432,7 @@ impl SlashCommand {
             }
             "reload" => Ok(Self::Reload),
             "plan" => Ok(Self::Plan),
+            "omakase" => Ok(Self::Omakase),
             "rewind" => match args.first() {
                 None => Ok(Self::Rewind(None)),
                 Some(arg) => arg
@@ -520,6 +526,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "plan",
         args: "",
         description: "toggle plan mode: read-only until a plan is approved",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "omakase",
+        args: "",
+        description: "toggle omakase: chef's-choice plan mode, the agent decides",
         takes_args: false,
     },
     CommandSpec {
@@ -809,6 +821,33 @@ pub struct PlanReview {
     pub scroll: u16,
 }
 
+/// In-flight interview (plan mode): the model called `interview` and the turn
+/// is paused inside the tool until the user answers every question or
+/// dismisses the modal.
+#[derive(Debug)]
+pub struct Interview {
+    /// The questions, in order.
+    pub questions: Vec<InterviewQuestion>,
+    /// Answers collected so far, one per answered question (parallel to
+    /// `questions[..current]`).
+    pub answers: Vec<String>,
+    /// Index of the question currently being answered.
+    pub current: usize,
+    /// The answer being typed for the current question.
+    pub input: String,
+    /// Answer channel back into the paused `interview` call; taken exactly
+    /// once when the interview finishes (`Some(answers)`) or is dismissed
+    /// (`None`).
+    respond: Option<tokio::sync::oneshot::Sender<Option<Vec<String>>>>,
+}
+
+impl Interview {
+    /// The question now being answered, if any remain.
+    pub fn current_question(&self) -> Option<&InterviewQuestion> {
+        self.questions.get(self.current)
+    }
+}
+
 /// Status bar contents.
 #[derive(Debug, Default)]
 pub struct StatusLine {
@@ -948,6 +987,9 @@ pub struct App {
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
+    /// Whether omakase (chef's-choice) mode is active (mirrors the agent's
+    /// flag; toggled by `/omakase`). Implies `plan_mode`.
+    pub omakase: bool,
     /// Whether the active client is a [`FusionProvider`](crate::llm::fusion)
     /// (`/fusion` toggled on). Drives the loud status-bar indicator and lets
     /// `/fusion` toggle back to the underlying single provider.
@@ -955,6 +997,9 @@ pub struct App {
     /// Open plan-review modal (the turn is paused inside `exit_plan` until
     /// it resolves), if any.
     pub plan_review: Option<PlanReview>,
+    /// Open interview modal (the turn is paused inside the `interview` tool
+    /// until the user answers or dismisses), if any.
+    pub interview: Option<Interview>,
     /// Previously submitted inputs, oldest first (↑/↓ recall).
     pub history: Vec<String>,
     /// Position while browsing `history`; `None` when composing fresh input.
@@ -1003,7 +1048,9 @@ pub struct App {
 impl App {
     pub fn new(config: Config) -> Self {
         let mode = config.mode;
-        let plan_mode = config.plan_first;
+        // Omakase implies plan mode (the read-only exploration phase).
+        let omakase = config.omakase;
+        let plan_mode = config.plan_first || omakase;
         let spinner_verb = config.ui.spinner_verb(0).to_string();
         let status = StatusLine {
             model: config.active().model,
@@ -1052,8 +1099,10 @@ impl App {
             prompt: None,
             web_key_backend: None,
             plan_mode,
+            omakase,
             fusion_active: false,
             plan_review: None,
+            interview: None,
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -1638,7 +1687,7 @@ impl App {
     /// Current state for this session's heartbeat: needs-input when paused on a
     /// plan review, working while a turn streams, otherwise idle.
     fn session_state(&self) -> SessionState {
-        if self.plan_review.is_some() {
+        if self.plan_review.is_some() || self.interview.is_some() {
             SessionState::NeedsInput
         } else if self.status.busy {
             SessionState::Working
@@ -1651,6 +1700,9 @@ impl App {
     fn session_activity(&self) -> String {
         if self.plan_review.is_some() {
             return "waiting for plan approval".to_string();
+        }
+        if self.interview.is_some() {
+            return "waiting for interview answers".to_string();
         }
         if !self.status.busy {
             return "idle".to_string();
@@ -2202,6 +2254,13 @@ impl App {
         // exit_plan until a verdict is sent.
         if self.plan_review.is_some() {
             self.handle_plan_review_key(key);
+            return Ok(None);
+        }
+
+        // An open interview captures all keys: the turn is paused inside the
+        // interview tool until the user answers or dismisses it.
+        if self.interview.is_some() {
+            self.handle_interview_key(key);
             return Ok(None);
         }
 
@@ -2787,6 +2846,81 @@ impl App {
         }
     }
 
+    /// Drive the interview modal: number keys pick a suggested option, typing
+    /// composes a free-text answer, Enter commits the current question and
+    /// advances (committing the last one sends every answer back), and Esc
+    /// dismisses the whole interview (the model proceeds on its own judgment).
+    fn handle_interview_key(&mut self, key: KeyEvent) {
+        let Some(interview) = self.interview.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.finish_interview(None);
+            }
+            KeyCode::Enter => {
+                // Commit the current answer (the typed text wins; empty means
+                // "skip this one") and advance.
+                let answer = interview.input.trim().to_string();
+                interview.answers.push(answer);
+                interview.input.clear();
+                interview.current += 1;
+                if interview.current >= interview.questions.len() {
+                    let answers = std::mem::take(&mut interview.answers);
+                    self.finish_interview(Some(answers));
+                }
+            }
+            KeyCode::Backspace => {
+                interview.input.pop();
+            }
+            // 1-9 fill the input with the matching suggested option, so the
+            // user can accept it with Enter or edit it first.
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    && c != '0'
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let idx = (c as u8 - b'1') as usize;
+                if let Some(option) = interview
+                    .current_question()
+                    .and_then(|q| q.options.get(idx))
+                {
+                    interview.input = option.clone();
+                } else {
+                    interview.input.push(c);
+                }
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                interview.input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Close the interview and send `answers` back into the paused
+    /// `interview` call: `Some(answers)` aligned with the questions, or `None`
+    /// when the user dismissed it (the model then uses its best judgment).
+    fn finish_interview(&mut self, answers: Option<Vec<String>>) {
+        let Some(mut interview) = self.interview.take() else {
+            return;
+        };
+        let answered = answers.is_some();
+        if let Some(respond) = interview.respond.take() {
+            let _ = respond.send(answers);
+        }
+        self.notice(if answered {
+            "answers sent — the agent is finishing its plan"
+        } else {
+            "interview dismissed — the agent will use its best judgment"
+        });
+    }
+
     /// Record a submitted input for ↑/↓ recall (skipping immediate repeats).
     fn push_history(&mut self, input: &str) {
         if self.history.last().map(String::as_str) != Some(input) {
@@ -2876,6 +3010,37 @@ impl App {
                     feedback: None,
                     scroll: 0,
                 });
+            }
+            AgentEvent::Interview { questions, respond } => {
+                self.flush_streaming();
+                // Defensive: an empty set would leave the modal with nothing
+                // to answer and the turn wedged — decline immediately.
+                if questions.is_empty() {
+                    let _ = respond.send(None);
+                } else {
+                    self.interview = Some(Interview {
+                        questions,
+                        answers: Vec::new(),
+                        current: 0,
+                        input: String::new(),
+                        respond: Some(respond),
+                    });
+                }
+            }
+            AgentEvent::OmakaseProceeding { plan } => {
+                self.flush_streaming();
+                // Chef's choice: no review gate. Mirror the agent clearing its
+                // flags and surface the plan it chose.
+                self.plan_mode = false;
+                self.omakase = false;
+                self.transcript.push(TranscriptEntry::ToolCard {
+                    name: "omakase plan (chef's choice)".to_string(),
+                    args: Value::Null,
+                    output: Some(plan),
+                    is_error: false,
+                    collapsed: false,
+                });
+                self.notice("omakase — chef's choice: proceeding with the agent's own plan");
             }
             AgentEvent::Usage {
                 prompt_tokens,
@@ -3340,6 +3505,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
 /genie · /sovereign         switch mode directly\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
+/omakase                    toggle omakase: chef's-choice plan mode, the agent decides\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
 /resume                     reopen and continue a past session\n  \
 /compact                    summarize older history into a progress note now\n  \
@@ -4116,6 +4282,7 @@ impl CommandContext<'_> {
             SlashCommand::Mode(None) => self.open_mode_picker(),
             SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
             SlashCommand::Plan => self.toggle_plan(),
+            SlashCommand::Omakase => self.toggle_omakase(),
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
             SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
             SlashCommand::Resume(None) => self.app.open_resume_picker(),
@@ -4299,7 +4466,13 @@ impl CommandContext<'_> {
         }
         text.push_str(&format!(
             "\nplan mode: {}",
-            if self.app.plan_mode { "on" } else { "off" }
+            if self.app.omakase {
+                "on (omakase — chef's choice)"
+            } else if self.app.plan_mode {
+                "on"
+            } else {
+                "off"
+            }
         ));
         self.app.notice(text);
     }
@@ -4503,12 +4676,43 @@ impl CommandContext<'_> {
             agent.set_plan_mode(on);
         }
         self.app.plan_mode = on;
+        // Plain plan mode and omakase are mutually exclusive flavors; turning
+        // plan mode off leaves omakase too (mirrors the agent).
+        if !on {
+            self.app.omakase = false;
+        }
         self.app.notice(if on {
             "plan mode on — the agent investigates read-only and presents a plan via \
              exit_plan for approval (/plan or Shift+Tab to leave)"
         } else {
             "plan mode off"
         });
+    }
+
+    /// `/omakase`: toggle chef's-choice mode on the live agent. Omakase is a
+    /// flavor of plan mode — the agent explores read-only, then decides the
+    /// approach itself and auto-approves its own plan (no interview, no review
+    /// gate). Enabling it enables plan mode; disabling it drops back to plain
+    /// plan mode.
+    fn toggle_omakase(&mut self) {
+        if self.agent_unavailable("toggle omakase") {
+            return;
+        }
+        let on = !self.app.omakase;
+        if let Some(agent) = self.agent_slot.as_mut() {
+            agent.set_omakase(on);
+        }
+        self.app.omakase = on;
+        if on {
+            self.app.plan_mode = true;
+            self.app.notice(
+                "omakase on — chef's choice: the agent explores read-only, decides the \
+                 approach itself, and executes its own plan (/omakase to leave)",
+            );
+        } else {
+            self.app
+                .notice("omakase off — back to plan mode (you review the plan)");
+        }
     }
 
     /// `/rewind`: open the turn picker (newest first). Each row shows the
@@ -6405,6 +6609,107 @@ mod tests {
             app.plan_review.as_ref().expect("open").feedback.as_deref(),
             Some("")
         );
+    }
+
+    /// Open an interview via the agent event, returning the answers receiver.
+    fn open_interview(
+        app: &mut App,
+        questions: Vec<InterviewQuestion>,
+    ) -> tokio::sync::oneshot::Receiver<Option<Vec<String>>> {
+        let (respond, rx) = tokio::sync::oneshot::channel();
+        app.handle_agent_event(AgentEvent::Interview { questions, respond });
+        rx
+    }
+
+    fn question(q: &str, options: &[&str]) -> InterviewQuestion {
+        InterviewQuestion {
+            question: q.to_string(),
+            options: options.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn omakase_parses_and_round_trips() {
+        assert_eq!(
+            SlashCommand::parse("/omakase"),
+            Some(Ok(SlashCommand::Omakase))
+        );
+    }
+
+    #[test]
+    fn interview_collects_answers_and_advances() {
+        let mut app = app();
+        let mut rx = open_interview(
+            &mut app,
+            vec![
+                question("which db?", &["sqlite", "postgres"]),
+                question("any auth?", &[]),
+            ],
+        );
+        assert!(app.interview.is_some(), "interview modal open");
+
+        // Pick option 2 for the first question, then accept it with Enter.
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(
+            app.interview.as_ref().expect("open").input,
+            "postgres",
+            "digit fills the matching option"
+        );
+        assert!(
+            app.input.is_empty(),
+            "interview keys never hit the input line"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.interview.as_ref().expect("still open").current, 1);
+
+        // Free-text the second answer.
+        type_str(&mut app, "yes, oauth");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.interview.is_none(),
+            "interview closed after the last answer"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Some(vec!["postgres".to_string(), "yes, oauth".to_string()]))
+        );
+    }
+
+    #[test]
+    fn interview_esc_dismisses_with_no_answers() {
+        let mut app = app();
+        let mut rx = open_interview(&mut app, vec![question("which db?", &[])]);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.interview.is_none(), "dismissed");
+        assert_eq!(rx.try_recv(), Ok(None), "decline sent to the tool");
+    }
+
+    #[test]
+    fn empty_interview_declines_immediately() {
+        let mut app = app();
+        let mut rx = open_interview(&mut app, vec![]);
+        assert!(app.interview.is_none(), "nothing to ask");
+        assert_eq!(rx.try_recv(), Ok(None));
+    }
+
+    #[test]
+    fn omakase_proceeding_clears_flags_and_shows_the_plan() {
+        let mut app = app();
+        app.plan_mode = true;
+        app.omakase = true;
+        app.handle_agent_event(AgentEvent::OmakaseProceeding {
+            plan: "# chef plan".to_string(),
+        });
+        assert!(!app.plan_mode, "chef's choice leaves plan mode");
+        assert!(!app.omakase, "omakase cleared once proceeding");
+        let shown = app.transcript.iter().any(|e| {
+            matches!(
+                e,
+                TranscriptEntry::ToolCard { output: Some(p), .. } if p == "# chef plan"
+            )
+        });
+        assert!(shown, "the chosen plan is surfaced in the transcript");
     }
 
     #[test]

@@ -73,6 +73,18 @@ impl PlanVerdict {
     }
 }
 
+/// One clarifying question asked via the `interview` tool (plan mode). The
+/// surface collects an answer for each; an empty option list means a
+/// free-text answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterviewQuestion {
+    /// The question text shown to the user.
+    pub question: String,
+    /// Suggested answers the user can pick from; empty for free-text only.
+    /// The user may always type their own answer instead of picking.
+    pub options: Vec<String>,
+}
+
 /// Events emitted by the agent loop. The TUI renders them; the headless
 /// runner logs them.
 #[derive(Debug)]
@@ -110,6 +122,26 @@ pub enum AgentEvent {
         /// The plan markdown (also persisted to `.wizard/plan.md`).
         plan: String,
         respond: tokio::sync::oneshot::Sender<PlanVerdict>,
+    },
+    /// Plan mode: the model asked clarifying questions via the `interview`
+    /// tool and the turn is paused awaiting answers. The consumer must send
+    /// exactly one response on `respond`: `Some(answers)` aligned with
+    /// `questions` (empty string = the user skipped that one), or `None` to
+    /// decline the interview entirely (no interactive user, or the user
+    /// dismissed it). Dropping the sender counts as `None`. Read-only, so it
+    /// is allowed mid-plan.
+    Interview {
+        /// The questions to put to the user, in order.
+        questions: Vec<InterviewQuestion>,
+        respond: tokio::sync::oneshot::Sender<Option<Vec<String>>>,
+    },
+    /// Omakase (chef's-choice) mode: the model finished planning and, because
+    /// there is no human review gate, is proceeding to execute. Informational
+    /// only — the plan markdown for the surface to display. The plan is also
+    /// persisted to `.wizard/plan.md`.
+    OmakaseProceeding {
+        /// The plan markdown the chef chose.
+        plan: String,
     },
     /// Token usage of one completed model call, when the backend reported
     /// counts. Surfaces accumulate these (status bar, headless summary).
@@ -287,6 +319,14 @@ pub struct Agent {
     /// Whether the plan-mode instruction block is currently baked into the
     /// system prompt; [`Agent::sync_plan_prompt`] refreshes on mismatch.
     plan_prompt_on: bool,
+    /// Omakase (chef's-choice) flag, shared with the `exit_plan` and
+    /// `interview` tools. While set, `exit_plan` auto-approves the plan and
+    /// `interview` declines to ask — the agent decides and proceeds.
+    /// Implies plan mode (the read-only exploration phase).
+    omakase: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the omakase instruction block is currently baked into the
+    /// system prompt; refreshed on mismatch alongside the plan block.
+    omakase_prompt_on: bool,
     /// Token counters fed from `ChatChunk` eval counts during streaming.
     usage: crate::usage::UsageTracker,
     /// Where per-turn usage records are appended
@@ -377,6 +417,9 @@ impl Agent {
         // Plan mode: one flag shared by the dispatcher (read-only gate) and
         // the always-registered exit_plan tool (cleared on approval).
         let plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Omakase: chef's-choice flavor of plan mode, shared with exit_plan
+        // (auto-approve) and interview (decline to ask).
+        let omakase = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let web = config.web.clone();
 
         // Checkpoints: per-file snapshots of everything this agent edits.
@@ -394,9 +437,13 @@ impl Agent {
         }
 
         let mut registry = registry;
-        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
-            &plan_mode,
-        ))));
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(
+            Arc::clone(&plan_mode),
+            Arc::clone(&omakase),
+        )));
+        registry.register(Arc::new(crate::tools::interview::InterviewTool::new(
+            Arc::clone(&omakase),
+        )));
 
         let mut agent = Self {
             client,
@@ -423,6 +470,8 @@ impl Agent {
             load_warning,
             plan_mode,
             plan_prompt_on: false,
+            omakase,
+            omakase_prompt_on: false,
             usage: crate::usage::UsageTracker::new(),
             usage_log: crate::usage::default_log_path(),
             checkpoints,
@@ -563,13 +612,17 @@ impl Agent {
     }
 
     /// Swap the tool registry (after `/reload` or `/evolve`). Re-registers
-    /// the always-present `exit_plan` tool (sharing this agent's plan-mode
-    /// flag) and refreshes the system prompt so the JSON tool protocol's
-    /// tool list stays current.
+    /// the always-present `exit_plan` and `interview` tools (sharing this
+    /// agent's plan-mode and omakase flags) and refreshes the system prompt so
+    /// the JSON tool protocol's tool list stays current.
     pub fn set_registry(&mut self, mut registry: ToolRegistry) {
-        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(Arc::clone(
-            &self.plan_mode,
-        ))));
+        registry.register(Arc::new(crate::tools::plan::ExitPlanTool::new(
+            Arc::clone(&self.plan_mode),
+            Arc::clone(&self.omakase),
+        )));
+        registry.register(Arc::new(crate::tools::interview::InterviewTool::new(
+            Arc::clone(&self.omakase),
+        )));
         self.dispatcher.set_registry(registry);
         self.refresh_system_prompt();
     }
@@ -607,16 +660,42 @@ impl Agent {
     pub fn set_plan_mode(&mut self, on: bool) {
         self.plan_mode
             .store(on, std::sync::atomic::Ordering::SeqCst);
+        // Leaving plan mode also leaves omakase (omakase is a flavor of plan
+        // mode; there is no omakase without the read-only exploration phase).
+        if !on {
+            self.omakase
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         self.sync_plan_prompt();
     }
 
-    /// Re-compose the system prompt when the plan-mode flag changed since it
-    /// was last baked in. The flag can flip mid-turn (exit_plan approval
-    /// clears it), so the turn loop calls this before every completion.
+    /// Whether omakase (chef's-choice) mode is active.
+    pub fn omakase(&self) -> bool {
+        self.omakase.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Turn omakase mode on or off (`/omakase`, `--omakase`). Omakase implies
+    /// plan mode, so enabling it enables plan mode too; the agent explores
+    /// read-only, then auto-approves its own plan and proceeds.
+    pub fn set_omakase(&mut self, on: bool) {
+        self.omakase.store(on, std::sync::atomic::Ordering::SeqCst);
+        if on {
+            self.plan_mode
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.sync_plan_prompt();
+    }
+
+    /// Re-compose the system prompt when the plan-mode or omakase flag changed
+    /// since it was last baked in. Either flag can flip mid-turn (exit_plan
+    /// approval clears plan mode), so the turn loop calls this before every
+    /// completion.
     fn sync_plan_prompt(&mut self) {
-        let on = self.plan_mode();
-        if on != self.plan_prompt_on {
-            self.plan_prompt_on = on;
+        let plan = self.plan_mode();
+        let omakase = self.omakase();
+        if plan != self.plan_prompt_on || omakase != self.omakase_prompt_on {
+            self.plan_prompt_on = plan;
+            self.omakase_prompt_on = omakase;
             self.refresh_system_prompt();
         }
     }
@@ -664,6 +743,10 @@ impl Agent {
         if self.plan_mode() {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::PLAN_MODE_PROMPT);
+            if self.omakase() {
+                prompt.push_str("\n\n");
+                prompt.push_str(prompts::OMAKASE_PROMPT);
+            }
         }
         prompt
     }

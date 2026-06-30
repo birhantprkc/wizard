@@ -149,14 +149,28 @@ While plan mode is on:
 - Only read-only tools run (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, ...). Every other tool — including `execute`, file writes, scripted/MCP tools, and `spawn_subagent` — returns a "blocked by plan mode" error to the model. These blocks are fed back as ordinary tool errors (not fatal) and are exempt from the circuit breakers.
 - The one way out is the `exit_plan` tool: the model calls it with the finished plan as markdown. The plan is saved to `<project>/.wizard/plan.md` and presented for a verdict.
 - Approval ends plan mode and the model executes the plan in the same turn. Rejection (with optional feedback) keeps plan mode on; the feedback is fed back so the model can revise and call `exit_plan` again.
+- Before finishing, the model can call the read-only `interview` tool to ask a short batch of clarifying questions (see below) when answers would change the plan.
+
+### Interview
+
+When the agent has explored enough to understand the shape of the task but still has genuine open questions whose answers would change the plan (scope, trade-offs, ambiguous intent), it calls the `interview` tool with a short batch of questions — each optionally offering suggested answers. In the TUI an interview modal opens: type a free-text answer, or press `1`–`9` to fill in a suggested option (then edit or accept it), `Enter` commits the current answer and advances, `Esc` dismisses the whole interview. The answers are fed back to the model, which folds them into the plan before calling `exit_plan`. Headless runs, the gateway, and the fleet have no interactive user, so the interview is declined automatically and the model proceeds on its best judgment. The tool is read-only, so it works mid-plan without tripping the gate.
+
+### Omakase (chef's choice)
+
+Omakase is the chef's-choice flavor of plan mode, going beyond a simple review gate: the agent still explores read-only, but then it **decides the approach itself and auto-approves its own plan** — no interview, no human review. It is for when you want the result, not the deliberation. The plan it commits to is written to `<project>/.wizard/plan.md` and surfaced (in the TUI as a "chef's choice" card; headless prints it) before execution begins, so the chosen approach is never a black box. Because the agent is told there is no review gate, its `exit_plan` plan is self-justifying: it states the approach picked, the alternatives weighed, and the assumptions made. The `interview` tool declines to ask in omakase — the chef decides.
+
+```
+/omakase       # toggle omakase mode (implies plan mode)
+```
 
 ### TUI (genie)
 
 ```
 /plan          # toggle plan mode (Shift+Tab does the same)
+/omakase       # toggle omakase (chef's-choice) mode
 ```
 
-The status bar shows `PLAN` while active. When the model presents a plan, a review modal opens: `y`/Enter approves, `n` opens a feedback line (type the reason, Enter sends the rejection, Esc goes back), ↑/↓ scroll the plan.
+The status bar shows `PLAN` while plan mode is active, or `OMAKASE` in omakase mode. When the model presents a plan for review (non-omakase), a review modal opens: `y`/Enter approves, `n` opens a feedback line (type the reason, Enter sends the rejection, Esc goes back), ↑/↓ scroll the plan.
 
 ### Headless (sovereign / continuous / gateway)
 
@@ -167,10 +181,12 @@ wizard --mode sovereign --plan -p "refactor the config loader"
 | Knob | Effect |
 |------|--------|
 | `--plan` (flag) | This run starts in plan mode |
+| `--omakase` (flag) | This run starts in omakase mode (implies `--plan`) |
 | `plan_first = true` (config) | Every session starts in plan mode |
+| `omakase = true` (config) | Every session starts in omakase mode (implies `plan_first`) |
 | `plan_each_cycle = true` (config) | Continuous mode re-enters plan mode at the top of every cycle |
 
-With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute — a natural two-phase plan-then-execute turn. The gateway also accepts a `/plan` chat message to toggle plan mode for subsequent messages.
+With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute — a natural two-phase plan-then-execute turn. (Omakase makes this explicit: the agent always decides for itself, with or without a human present.) The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
 
 The last presented plan is always available at `<project>/.wizard/plan.md`.
 

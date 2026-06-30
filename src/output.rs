@@ -137,6 +137,17 @@ impl EventSink for TextSink {
                 let _ = respond.send(PlanVerdict::approve());
                 self.spinner.show();
             }
+            AgentEvent::Interview { respond, .. } => {
+                // Headless: no interactive user — decline so the model
+                // proceeds with its best judgment.
+                let _ = respond.send(None);
+            }
+            AgentEvent::OmakaseProceeding { plan } => {
+                self.spinner.println(&format!(
+                    "\n=== plan (omakase — chef's choice) ===\n{plan}\n=== proceeding ==="
+                ));
+                self.spinner.show();
+            }
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -252,6 +263,10 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                 // No human in the loop: approve so the turn executes.
                 let _ = respond.send(PlanVerdict::approve());
             }
+            AgentEvent::Interview { respond, .. } => {
+                // No interactive user: decline so the model uses its judgment.
+                let _ = respond.send(None);
+            }
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -262,6 +277,7 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             AgentEvent::Done { .. } => self.turns += 1,
             AgentEvent::ThinkingDelta(_)
             | AgentEvent::HookFired { .. }
+            | AgentEvent::OmakaseProceeding { .. }
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished { .. } => {}
@@ -365,6 +381,16 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                 // No human in the loop: report the plan and approve it.
                 self.emit(json!({"type": "plan", "plan": plan, "approved": true}));
                 let _ = respond.send(PlanVerdict::approve());
+            }
+            AgentEvent::Interview { questions, respond } => {
+                // No interactive user: report the questions, then decline so
+                // the model proceeds with its best judgment.
+                let asked: Vec<&str> = questions.iter().map(|q| q.question.as_str()).collect();
+                self.emit(json!({"type": "interview", "questions": asked, "answered": false}));
+                let _ = respond.send(None);
+            }
+            AgentEvent::OmakaseProceeding { plan } => {
+                self.emit(json!({"type": "plan", "plan": plan, "omakase": true, "approved": true}));
             }
             AgentEvent::Usage {
                 prompt_tokens,

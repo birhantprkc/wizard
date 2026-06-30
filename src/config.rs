@@ -454,6 +454,10 @@ pub struct Config {
     /// run): the agent investigates with read-only tools and presents a plan
     /// via `exit_plan` before executing. Headless runs auto-approve the plan.
     pub plan_first: bool,
+    /// Start every session in omakase (chef's-choice) mode (the `--omakase`
+    /// flag sets this for one run): plan mode where the agent decides the
+    /// approach itself and auto-approves its own plan. Implies `plan_first`.
+    pub omakase: bool,
     /// Continuous mode: re-enter plan mode at the top of every cycle, so each
     /// cycle plans read-only before acting.
     pub plan_each_cycle: bool,
@@ -521,6 +525,7 @@ impl Default for Config {
             max_steps: 25,
             continuous: false,
             plan_first: false,
+            omakase: false,
             plan_each_cycle: false,
             rollback_failed_cycles: false,
             retry_base_secs: 5,
@@ -846,6 +851,11 @@ impl Config {
         if cli.plan {
             self.plan_first = true;
         }
+        if cli.omakase {
+            // Omakase is a flavor of plan mode; it implies plan_first.
+            self.omakase = true;
+            self.plan_first = true;
+        }
         if self.mode == Mode::Sovereign && self.max_steps < Mode::Sovereign.default_max_steps() {
             self.max_steps = Mode::Sovereign.default_max_steps();
         }
@@ -935,6 +945,7 @@ mod tests {
             max_steps: 200,
             continuous: true,
             plan_first: true,
+            omakase: true,
             plan_each_cycle: true,
             rollback_failed_cycles: true,
             retry_base_secs: 10,

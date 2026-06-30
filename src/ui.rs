@@ -97,6 +97,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Floating layers, back to front.
     if app.picker.is_none()
         && app.plan_review.is_none()
+        && app.interview.is_none()
         && !app.show_dashboard
         && !app.show_subagents
     {
@@ -107,6 +108,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.plan_review.is_some() {
         draw_plan_review(frame, app);
+    }
+    if app.interview.is_some() {
+        draw_interview(frame, app);
     }
     // The dashboard and subagent monitor are modal and full-screen, so they
     // paint last (on top). Only one is ever open at a time.
@@ -197,6 +201,7 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
         // Drop the card while any overlay is open so there's no text overlay.
         let overlay_open = app.picker.is_some()
             || app.plan_review.is_some()
+            || app.interview.is_some()
             || app.show_dashboard
             || app.show_subagents;
         if !overlay_open {
@@ -696,7 +701,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];
-    if app.plan_mode {
+    if app.omakase {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled("OMAKASE", accent().bold()));
+    } else if app.plan_mode {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("PLAN", accent().bold()));
     }
@@ -759,6 +767,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "y/Enter approve · n reject · ↑↓ scroll"
         }
+    } else if app.interview.is_some() {
+        "1-9 pick · type answer · Enter next · Esc skip"
     } else if app.picker.is_some() {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
@@ -862,7 +872,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    if app.picker.is_none() && app.plan_review.is_none() {
+    if app.picker.is_none() && app.plan_review.is_none() && app.interview.is_none() {
         frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
     }
 }
@@ -1474,6 +1484,130 @@ fn draw_plan_review(frame: &mut Frame, app: &App) {
             feedback_area,
         );
     }
+}
+
+/// Centered modal for the plan-mode interview: the agent's clarifying
+/// questions with their answer-so-far status, and a free-text input for the
+/// current question. The turn is paused inside the `interview` tool until the
+/// user answers every question or dismisses the modal.
+fn draw_interview(frame: &mut Frame, app: &App) {
+    let Some(interview) = &app.interview else {
+        return;
+    };
+
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(6).clamp(24, 92);
+    let height = frame_area.height.saturating_sub(2).max(5);
+    let area = Rect {
+        x: frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
+        y: frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+    .intersection(frame_area);
+    if area.height < 5 || area.width < 10 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    let total = interview.questions.len();
+    let title = format!(
+        " question {} of {total} ",
+        (interview.current + 1).min(total)
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Line::from(vec![
+            Span::styled(" ✦", accent()),
+            Span::styled(" interview ", Style::default().fg(TEXT_DIM)),
+            Span::styled(title, dim()),
+        ]))
+        .title_bottom(
+            Line::from(Span::styled(
+                " 1-9 pick · type answer · Enter next · Esc skip ",
+                dim(),
+            ))
+            .centered(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    // Body: every question with its status; the current one gets its options
+    // and the live answer input. The input occupies the bottom line.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, q) in interview.questions.iter().enumerate() {
+        if i < interview.current {
+            // Answered: show the question dimmed with its answer.
+            let answer = interview.answers.get(i).map(String::as_str).unwrap_or("");
+            let answer = if answer.trim().is_empty() {
+                "(skipped)".to_string()
+            } else {
+                answer.to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("✓ ", Style::default().fg(Color::Green)),
+                Span::styled(q.question.clone(), dim()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("    {answer}"),
+                dim().italic(),
+            )));
+        } else if i == interview.current {
+            lines.push(Line::from(vec![
+                Span::styled("▶ ", accent().bold()),
+                Span::styled(q.question.clone(), Style::default().fg(Color::White).bold()),
+            ]));
+            for (n, option) in q.options.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {}) ", n + 1), accent()),
+                    Span::raw(option.clone()),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(format!("  {}", q.question), dim())));
+        }
+    }
+
+    let body_area = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    if body_area.height > 0 {
+        let wrapped = wrap_lines(Text::from(lines), body_area.width as usize);
+        let skip = wrapped.len().saturating_sub(body_area.height as usize);
+        let visible: Vec<Line<'static>> = wrapped.into_iter().skip(skip).collect();
+        frame.render_widget(Paragraph::new(Text::from(visible)), body_area);
+    }
+
+    // Answer input on the bottom line, scrolled to keep the tail visible.
+    let input_area = Rect {
+        y: inner.bottom().saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    let prompt = "answer ❯ ";
+    let budget = (input_area.width as usize).saturating_sub(prompt.width() + 1);
+    let shown: String = interview
+        .input
+        .chars()
+        .rev()
+        .take(budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt, accent().bold()),
+            Span::raw(shown),
+            Span::styled("▍", dim()),
+        ])),
+        input_area,
+    );
 }
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs
