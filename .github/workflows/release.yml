@@ -25,8 +25,11 @@ jobs:
             runner: ubuntu-22.04-arm
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
+          # Both macOS targets build on Apple Silicon runners (macos-14): the macOS
+          # SDK is universal, so x86_64 cross-compiles fine, and we avoid the scarce
+          # Intel `macos-13` runners that leave the job stuck in queue for hours.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: aarch64-apple-darwin
             runner: macos-14
     runs-on: ${{ matrix.runner }}
