@@ -3556,7 +3556,11 @@ impl App {
                 self.status.background_subagents += 1;
             }
             AgentEvent::SubagentFinished {
-                id, name, task, completed, ..
+                id,
+                name,
+                task,
+                completed,
+                ..
             } => {
                 self.status.background_subagents =
                     self.status.background_subagents.saturating_sub(1);

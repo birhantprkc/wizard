@@ -3537,10 +3537,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(64);
-        let reason = agent
-            .run_turn("delegate this", tx)
-            .await
-            .expect("turn ok");
+        let reason = agent.run_turn("delegate this", tx).await.expect("turn ok");
         assert_eq!(reason, DoneReason::Completed);
 
         // The turn did not wait on the subagent: both of the parent's
@@ -3614,7 +3611,9 @@ mod tests {
             agent
                 .history()
                 .iter()
-                .filter(|m| m.content.contains("background subagent #1 'worker' completed"))
+                .filter(|m| m
+                    .content
+                    .contains("background subagent #1 'worker' completed"))
                 .count(),
             1,
             "the report appears exactly once in history"
