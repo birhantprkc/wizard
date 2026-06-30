@@ -42,6 +42,27 @@ The same script has four mutually exclusive flavors:
 
 `WIZARD_USE_OLLAMA=1` is the Ollama variant of the local flavor (installs Ollama, starts it, pulls the same auto-tiered model) and implies it — no need to also set `WIZARD_LOCAL`. Combining `WIZARD_LOCAL`, `WIZARD_MINIMAL`, or `WIZARD_BYOM` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; note it is stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
 
+### Platforms
+
+| Platform | Notes |
+|----------|-------|
+| Linux x86_64 / aarch64 | Prebuilt glibc and static-musl binaries; the installer prefers musl on NixOS |
+| macOS Apple Silicon / Intel | Same `curl … \| bash`; Metal-backed `llama-server` for the local stack. Until prebuilt Mac binaries are published for a release, the installer builds from source (needs a Rust toolchain) |
+| Windows | Not supported natively — use WSL2 |
+
+The installer downloads the prebuilt binary matching your OS and architecture, verifies its checksum, and falls back to a source build when no prebuilt asset is available.
+
+### Nix / NixOS
+
+Wizard ships a flake, so on Nix you don't need the install script at all:
+
+```bash
+nix run github:teddytennant/wizard              # run without installing
+nix profile install github:teddytennant/wizard  # add to your profile
+```
+
+The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard), `overlays.default`, and `homeManagerModules.default` for wiring it into a Home Manager config. On NixOS the curl installer detects the system, points you at these commands, and — if you run it anyway — installs the static musl binary into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there).
+
 ### Model tiers (automatic)
 
 Picking Local in onboarding and the `WIZARD_LOCAL=1` / `WIZARD_USE_OLLAMA=1` flavors size the model to your hardware:
