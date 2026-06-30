@@ -1984,6 +1984,12 @@ impl App {
         self.cursor += 1;
     }
 
+    /// Insert a hard line break at the cursor (Shift/Alt+Enter). The composer
+    /// grows to a multi-line box; Enter alone still submits.
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
     fn insert_str(&mut self, text: &str) {
         let index = self.byte_index();
         self.input.insert_str(index, text);
@@ -2376,6 +2382,14 @@ impl App {
                 }
 
                 // --- still-useful editing keys in Normal mode ---
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    self.vim.count = None;
+                    self.insert_newline();
+                }
                 KeyCode::Enter => {
                     self.vim.count = None;
                     action = self.submit();
@@ -2954,6 +2968,16 @@ impl App {
 
         let suggesting = !self.suggestions.is_empty();
         let action = match key.code {
+            // Shift+Enter (terminals with keyboard enhancement) or Alt+Enter
+            // (the fallback elsewhere) inserts a newline instead of submitting.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_newline();
+                None
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.delete_back();
@@ -3578,6 +3602,18 @@ fn setup_terminal() -> Result<Tui> {
         crossterm::event::EnableMouseCapture,
     )
     .context("entering alternate screen")?;
+    // Kitty keyboard protocol (best-effort): with disambiguation on, terminals
+    // report Shift+Enter as Enter+SHIFT instead of a bare Enter, which lets the
+    // composer bind it to a newline. Terminals that don't support it are left
+    // untouched (Alt+Enter is the fallback there). Popped in `restore_terminal`.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ),
+        );
+    }
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
 }
 
@@ -3662,6 +3698,14 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn restore_terminal() -> Result<()> {
+    // Pop the keyboard-enhancement flags pushed in `setup_terminal`. Done
+    // unconditionally (and ignoring errors): popping an empty/absent stack is a
+    // no-op on supporting terminals and an ignored escape elsewhere, which is
+    // safer than re-querying support from a panic/teardown path.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PopKeyboardEnhancementFlags,
+    );
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
@@ -6063,6 +6107,11 @@ mod tests {
             .expect("key handled")
     }
 
+    fn press_mod(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<AppAction> {
+        app.handle_key(KeyEvent::new(code, mods))
+            .expect("key handled")
+    }
+
     fn type_str(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
@@ -7437,5 +7486,57 @@ mod tests {
         type_str(&mut app, "hjkl");
         press(&mut app, KeyCode::Esc); // plain clear, not a mode switch
         assert_eq!(app.input, "");
+    }
+
+    // --- Shift/Alt+Enter newline ---
+
+    #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let mut app = app();
+        type_str(&mut app, "line one");
+        let action = press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(action.is_none());
+        type_str(&mut app, "line two");
+        assert_eq!(app.input, "line one\nline two");
+        // Nothing was submitted.
+        assert!(!app.has_conversation());
+    }
+
+    #[test]
+    fn alt_enter_also_inserts_newline() {
+        let mut app = app();
+        type_str(&mut app, "a");
+        press_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        type_str(&mut app, "b");
+        assert_eq!(app.input, "a\nb");
+    }
+
+    #[test]
+    fn plain_enter_submits_multiline_input() {
+        let mut app = app();
+        type_str(&mut app, "first");
+        press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_str(&mut app, "second");
+        let action = press(&mut app, KeyCode::Enter);
+        match action {
+            Some(AppAction::Submit(text)) => {
+                assert!(text.contains("first") && text.contains('\n') && text.contains("second"));
+            }
+            other => panic!("expected a submit action, got {other:?}"),
+        }
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_in_vim_normal_mode() {
+        let mut app = vim_app();
+        type_str(&mut app, "xy");
+        press(&mut app, KeyCode::Esc); // NORMAL, cursor on the last char
+        let action = press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        // A break is inserted (never submits); the cursor sits on a char, so it
+        // lands before it rather than at the very end.
+        assert!(action.is_none());
+        assert!(app.input.contains('\n'));
+        assert_eq!(app.input.chars().filter(|c| !c.is_whitespace()).count(), 2);
     }
 }

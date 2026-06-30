@@ -118,6 +118,8 @@ Type a task in natural language:
 
 Wizard reads files, applies changes, runs tests, and shows git diffs.
 
+**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol — Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing.
+
 ## Configuration
 
 `~/.wizard/config.toml` as written by onboarding's Local pick (or a `WIZARD_LOCAL=1` install):
