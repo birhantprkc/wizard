@@ -170,6 +170,23 @@ impl EventSink for TextSink {
                     status.describe()
                 ));
             }
+            AgentEvent::SubagentStarted { .. } => {}
+            AgentEvent::SubagentFinished {
+                id,
+                name,
+                task,
+                completed,
+                ..
+            } => {
+                self.spinner.println(&format!(
+                    "⏺ background subagent #{id} '{name}' {}: {task}",
+                    if completed {
+                        "finished"
+                    } else {
+                        "hit its step budget"
+                    }
+                ));
+            }
             AgentEvent::Done { reason } => {
                 self.spinner.hide();
                 println!("\n[turn done: {reason:?}]");
@@ -280,7 +297,9 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             | AgentEvent::OmakaseProceeding { .. }
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TaskStarted { .. }
-            | AgentEvent::TaskFinished { .. } => {}
+            | AgentEvent::TaskFinished { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentFinished { .. } => {}
         }
     }
 
@@ -427,6 +446,30 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "id": id,
                     "command": command,
                     "status": status.describe(),
+                }));
+            }
+            AgentEvent::SubagentStarted { id, name, task } => {
+                self.emit(json!({
+                    "type": "subagent_started",
+                    "id": id,
+                    "name": name,
+                    "task": task,
+                }));
+            }
+            AgentEvent::SubagentFinished {
+                id,
+                name,
+                task,
+                completed,
+                output,
+            } => {
+                self.emit(json!({
+                    "type": "subagent_finished",
+                    "id": id,
+                    "name": name,
+                    "task": task,
+                    "completed": completed,
+                    "output": output,
                 }));
             }
             AgentEvent::Done { reason } => {

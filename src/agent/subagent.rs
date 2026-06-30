@@ -373,11 +373,17 @@ impl SpawnSubagentTool {
              with a fresh context and scoped tools, then returns one final report — its \
              intermediate steps never enter your context, so a multi-step sub-task costs you a \
              single turn.\n\n\
-             Delegate when the work is self-contained, when it would otherwise flood your \
-             context with output you don't need to keep (large greps, reading many files, long \
-             logs), or when a specialist fits better than you do. Don't delegate trivial \
-             one-tool actions, work that needs the user mid-flight (the subagent can't ask \
-             questions), or a task you can't yet describe in full.\n\n\
+             Delegate almost always for anything beyond a quick one-off, and set \
+             `background: true` when you do — it returns immediately instead of making the \
+             user wait, so they can keep talking to you while the subagent runs. Its progress \
+             streams in as it works and its report lands in your context automatically once \
+             it's done. Only omit `background` (synchronous) when you need the report to keep \
+             working within this same turn.\n\n\
+             Delegating also pays off when the work would otherwise flood your context with \
+             output you don't need to keep (large greps, reading many files, long logs), or \
+             when a specialist fits better than you do. Don't delegate trivial one-tool \
+             actions, work that needs the user mid-flight (the subagent can't ask questions), \
+             or a task you can't yet describe in full.\n\n\
              `task` is the ONLY context the subagent gets besides its own prompt — make it \
              self-contained: state the goal, the relevant paths/context, any constraints, and \
              exactly what to report back. You can't steer it once it's running, so prefer one \
@@ -409,7 +415,13 @@ impl Tool for SpawnSubagentTool {
             "type": "object",
             "properties": {
                 "subagent": { "type": "string", "description": "Name of the subagent to use" },
-                "task": { "type": "string", "description": "Self-contained task description with all needed context" }
+                "task": { "type": "string", "description": "Self-contained task description with all needed context" },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run detached and return immediately instead of waiting for \
+                        the report. Default false. Set true for self-contained, non-blocking \
+                        delegation — the common case — so the user isn't stuck waiting on you."
+                }
             },
             "required": ["subagent", "task"]
         })
@@ -420,6 +432,8 @@ impl Tool for SpawnSubagentTool {
         struct Args {
             subagent: String,
             task: String,
+            #[serde(default)]
+            background: bool,
         }
         let args: Args = serde_json::from_value(args).map_err(|err| ToolError::InvalidArgs {
             tool: "spawn_subagent".to_string(),
@@ -442,6 +456,40 @@ impl Tool for SpawnSubagentTool {
                         .join(", ")
                 ),
             })?;
+
+        if args.background {
+            let name = config.name.clone();
+            let config = config.clone();
+            let task = args.task.clone();
+            let client = Arc::clone(&self.client);
+            let registry = Arc::clone(&self.registry);
+            let hooks = Arc::clone(&self.hooks);
+            let fut_ctx = ctx.clone();
+            let fut = async move {
+                match spawn(&config, &task, &client, &registry, &hooks, &fut_ctx).await {
+                    Ok(result) => (result.completed, result.output, result.steps_used),
+                    Err(err) => (false, format!("subagent failed: {err:#}"), 0),
+                }
+            };
+            let id = ctx.subagents.spawn(&name, &args.task, fut);
+            if let Some(events) = &ctx.events {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::SubagentStarted {
+                        id,
+                        name: name.clone(),
+                        task: args.task.clone(),
+                    },
+                )
+                .await;
+            }
+            return Ok(ToolOutput::ok(format!(
+                "Delegated to subagent '{name}' (#{id}): {}.\nRunning in the background — \
+                 you'll see its progress as it works, and the report lands in your context \
+                 once it's done.",
+                args.task
+            )));
+        }
 
         let result = spawn(
             config,

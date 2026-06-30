@@ -13,6 +13,7 @@ pub mod publish;
 pub mod registry;
 pub mod scripted;
 pub mod shell;
+pub mod subagent_tasks;
 pub mod tasks;
 pub mod todo;
 pub mod web;
@@ -54,6 +55,9 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// Session-wide registry of background shell tasks.
     pub tasks: Arc<tasks::TaskRegistry>,
+    /// Session-wide registry of background subagent runs (`spawn_subagent`
+    /// with `background: true`).
+    pub subagents: Arc<subagent_tasks::SubagentTaskRegistry>,
     /// The agent's working todo list, shared by every call in the session.
     pub todos: Arc<Mutex<todo::TodoList>>,
     /// Event channel of the turn currently dispatching, injected by the
@@ -76,6 +80,7 @@ impl ToolContext {
         Self {
             cwd: cwd.into(),
             tasks: Arc::new(tasks::TaskRegistry::new()),
+            subagents: Arc::new(subagent_tasks::SubagentTaskRegistry::new()),
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),

@@ -884,6 +884,9 @@ pub struct StatusLine {
     pub completion_tokens: u64,
     /// Background tasks (`execute` with `run_in_background`) still running.
     pub background_tasks: usize,
+    /// Backgrounded subagents (`spawn_subagent` with `background: true`)
+    /// still running.
+    pub background_subagents: usize,
 }
 
 /// A mouse text selection over the rendered screen. Coordinates are absolute
@@ -1092,6 +1095,7 @@ impl App {
             prompt_tokens: 0,
             completion_tokens: 0,
             background_tasks: 0,
+            background_subagents: 0,
         };
         Self {
             config,
@@ -3544,6 +3548,25 @@ impl App {
                 self.notice(format!(
                     "background task #{id} finished ({}): {command}",
                     status.describe()
+                ));
+            }
+            // Same pattern as TaskStarted/TaskFinished above, for subagents
+            // delegated with `background: true`.
+            AgentEvent::SubagentStarted { .. } => {
+                self.status.background_subagents += 1;
+            }
+            AgentEvent::SubagentFinished {
+                id, name, task, completed, ..
+            } => {
+                self.status.background_subagents =
+                    self.status.background_subagents.saturating_sub(1);
+                self.notice(format!(
+                    "background subagent #{id} '{name}' {}: {task}",
+                    if completed {
+                        "finished"
+                    } else {
+                        "hit its step budget"
+                    }
                 ));
             }
             AgentEvent::TodoUpdated(items) => {

@@ -165,6 +165,20 @@ pub enum AgentEvent {
         command: String,
         status: crate::tools::tasks::TaskStatus,
     },
+    /// `spawn_subagent` was called with `background: true` and just detached.
+    /// The TUI mirrors it into the dashboard's subagent list; other surfaces
+    /// ignore it.
+    SubagentStarted { id: u32, name: String, task: String },
+    /// A backgrounded subagent finished; its report was injected into
+    /// history. The TUI and headless surfaces print a one-liner, the gateway
+    /// ignores it.
+    SubagentFinished {
+        id: u32,
+        name: String,
+        task: String,
+        completed: bool,
+        output: String,
+    },
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -877,6 +891,7 @@ impl Agent {
         for step in 1..=max_steps {
             // Surface background tasks that finished since the last step.
             self.drain_background_tasks(events).await;
+            self.drain_background_subagents(events).await;
             if let Some(deadline) = self.deadline
                 && Instant::now() >= deadline
             {
@@ -1311,6 +1326,42 @@ impl Agent {
                     id: task.id,
                     command: task.command,
                     status: task.status,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Drain backgrounded subagents (`spawn_subagent` with `background: true`)
+    /// that finished since the last check (each reported exactly once):
+    /// inject the report into history so the model sees it on its next
+    /// completion, and emit [`AgentEvent::SubagentFinished`] for the
+    /// surfaces. Called at the top of every agent step, alongside
+    /// [`Self::drain_background_tasks`].
+    async fn drain_background_subagents(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        for task in self.ctx.subagents.drain_completed() {
+            let note = format!(
+                "[background subagent #{} '{}' {} after {} step(s)] {}\n\n{}",
+                task.id,
+                task.name,
+                if task.completed {
+                    "completed"
+                } else {
+                    "hit its step budget"
+                },
+                task.steps_used,
+                task.task,
+                task.output
+            );
+            self.push(ChatMessage::system(note));
+            let _ = emit(
+                events,
+                AgentEvent::SubagentFinished {
+                    id: task.id,
+                    name: task.name,
+                    task: task.task,
+                    completed: task.completed,
+                    output: task.output,
                 },
             )
             .await;
@@ -3447,5 +3498,126 @@ mod tests {
         assert_eq!(done["reason"], "completed");
         assert_eq!(done["usage"]["prompt_tokens"], 42);
         assert_eq!(done["usage"]["completion_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_background_returns_immediately_and_reports_on_a_later_turn() {
+        let tmp = TempDir::new();
+
+        // The subagent gets its own scripted provider so its chat_stream
+        // calls can't race the parent's — they're decoupled queues.
+        let sub_provider = ScriptedProvider::new(vec![vec![final_chunk("found the answer")]]);
+        let sub_hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "sub-session".to_string(),
+        ));
+        let spawn_tool = subagent::SpawnSubagentTool::new(
+            subagent::builtin_configs(),
+            sub_provider,
+            Arc::new(ToolRegistry::new()),
+            sub_hooks,
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(spawn_tool));
+
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            vec![
+                vec![tool_call_chunk(
+                    "spawn_subagent",
+                    json!({"subagent": "worker", "task": "investigate X", "background": true}),
+                )],
+                vec![final_chunk("kicked it off, anything else?")],
+                // Second turn's response, below.
+                vec![final_chunk("got it")],
+            ],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent
+            .run_turn("delegate this", tx)
+            .await
+            .expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        // The turn did not wait on the subagent: both of the parent's
+        // scripted responses were already consumed.
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+
+        let mut started = None;
+        let mut tool_result = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::SubagentStarted { id, name, task } => {
+                    started = Some((id, name, task));
+                }
+                AgentEvent::ToolFinished { name, output } if name == "spawn_subagent" => {
+                    tool_result = Some(output);
+                }
+                _ => {}
+            }
+        }
+        let (id, name, task) = started.expect("SubagentStarted was emitted");
+        assert_eq!(id, 1);
+        assert_eq!(name, "worker");
+        assert_eq!(task, "investigate X");
+        let tool_result = tool_result.expect("spawn_subagent's tool result was observed");
+        assert!(!tool_result.is_error);
+        assert!(
+            tool_result.content.contains("Running in the background"),
+            "{}",
+            tool_result.content
+        );
+
+        // Let the detached subagent actually finish before the next turn.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.ctx.subagents.pending_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "background subagent did not finish in time"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // A follow-up turn's top-of-loop drain picks up the report: it's
+        // injected into history and surfaced as SubagentFinished, without
+        // the model ever having to ask for it.
+        let (tx2, mut rx2) = mpsc::channel(64);
+        agent
+            .run_turn("anything happen?", tx2)
+            .await
+            .expect("second turn ok");
+
+        let mut finished = None;
+        while let Ok(event) = rx2.try_recv() {
+            if let AgentEvent::SubagentFinished {
+                id,
+                name,
+                completed,
+                output,
+                ..
+            } = event
+            {
+                finished = Some((id, name, completed, output));
+            }
+        }
+        let (id, name, completed, output) = finished.expect("SubagentFinished was emitted");
+        assert_eq!(id, 1);
+        assert_eq!(name, "worker");
+        assert!(completed);
+        assert_eq!(output, "found the answer");
+
+        assert_eq!(
+            agent
+                .history()
+                .iter()
+                .filter(|m| m.content.contains("background subagent #1 'worker' completed"))
+                .count(),
+            1,
+            "the report appears exactly once in history"
+        );
     }
 }
