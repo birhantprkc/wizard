@@ -118,6 +118,8 @@ Type a task in natural language:
 
 Wizard reads files, applies changes, runs tests, and shows git diffs.
 
+**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol — Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing.
+
 ## Configuration
 
 `~/.wizard/config.toml` as written by onboarding's Local pick (or a `WIZARD_LOCAL=1` install):
@@ -149,6 +151,23 @@ spinner_verbs = ["Pondering", "Musing", "Noodling"]
 ```
 
 A non-empty list fully replaces the defaults; omitting the section or setting `spinner_verbs = []` keeps the built-in wizard verbs. The status bar (`step x/y · Ns`) and tool spinners are unaffected.
+
+### Vim mode (`[ui]`)
+
+Modal (vim-style) editing for the input line, like Claude Code's. Toggle it live with `/vim` (or `/settings → Vim mode`), or set it as the default:
+
+```toml
+[ui]
+vim = true
+```
+
+The composer starts in **INSERT** (ordinary typing); **Esc** drops to **NORMAL**, where keys are motions and operators instead of text. The status bar shows the active mode and a block cursor marks NORMAL. Single-line vim:
+
+- **Motions:** `h`/`l` left/right, `0`/`^`/`$` line ends, `w`/`b`/`e` by word, `j`/`k` recall input history. A count prefix repeats them (`3w`, `2x`).
+- **Insert:** `i`/`a` before/after the cursor, `I`/`A` line start/end, `o`/`O` end/start (single-line analogs).
+- **Edits:** `x`/`X` delete a char, `r` replace one, `d`/`c`/`y` operators with a motion (`dw`, `c$`, `ye`) or doubled for the whole line (`dd`/`cc`/`yy`), `D`/`C`/`s`/`S`, `p`/`P` paste, `u` undo.
+
+The Ctrl readline chords (`Ctrl-A/E/U/W/K`, history, etc.) keep working in both modes, and **Enter** submits from either.
 
 ## Migrating from Ollama
 

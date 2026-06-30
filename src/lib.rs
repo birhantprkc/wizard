@@ -36,6 +36,7 @@ pub mod skills;
 pub mod tools;
 pub mod ui;
 pub mod usage;
+pub mod vim;
 
 use std::io::IsTerminal;
 

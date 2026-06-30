@@ -36,8 +36,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, InputMode, Selection, TranscriptEntry};
 use crate::config::Mode;
 use crate::session_registry::SessionState;
+use crate::vim::VimMode;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Tallest the multi-line composer grows before it scrolls internally.
+const MAX_INPUT_ROWS: u16 = 10;
 
 /// The single accent color used for chrome (prompt, gutters, names,
 /// attention borders).
@@ -61,9 +65,12 @@ fn accent() -> Style {
 /// Render one frame. The only entry point the main loop calls; everything
 /// else in this module is a helper.
 pub fn draw(frame: &mut Frame, app: &App) {
+    // The composer grows with its content (one row per hard line break) up to
+    // MAX_INPUT_ROWS, then scrolls internally. +2 for the rules above/below.
+    let input_rows = (app.input.split('\n').count() as u16).clamp(1, MAX_INPUT_ROWS);
     let [main_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(input_rows + 2),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -701,6 +708,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" · ", dim()),
         mode_span(app.status.mode),
     ];
+    // Vim mode indicator: NORMAL stands out (bold accent), INSERT stays quiet.
+    if let Some(label) = app.vim.label() {
+        spans.push(Span::styled(" · ", dim()));
+        let style = if app.vim.mode == VimMode::Normal {
+            accent().bold()
+        } else {
+            dim()
+        };
+        spans.push(Span::styled(label, style));
+    }
     if app.omakase {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("OMAKASE", accent().bold()));
@@ -817,63 +834,142 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.input.chars().collect()
     };
-    let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
     let cursor = app.cursor.min(chars.len());
-    // Keep the cursor visible: scroll the window (in display columns, so
-    // wide CJK/emoji glyphs count properly) until the cursor column fits,
-    // truncating the tail if needed.
-    let mut start = 0usize;
-    let mut cursor_cols: usize = widths[..cursor].iter().sum();
-    while start < cursor && cursor_cols > budget - 1 {
-        cursor_cols -= widths[start];
-        start += 1;
-    }
-    let mut end = start;
-    let mut used_cols = 0usize;
-    while end < chars.len() && used_cols + widths[end] <= budget {
-        used_cols += widths[end];
-        end += 1;
-    }
-    let visible: String = chars[start..end].iter().collect();
-    let cursor_x = area.x + (pad + prompt_width) as u16 + cursor_cols as u16;
+    let normal = app.vim.is_normal();
 
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled("❯ ", accent().bold()),
-        Span::raw(visible),
-    ];
+    // Split the buffer into logical rows on hard line breaks; each row is the
+    // half-open char range `[rs, re)` (the '\n' itself is not part of a row).
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut start_char = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            rows.push((start_char, i));
+            start_char = i + 1;
+        }
+    }
+    rows.push((start_char, chars.len()));
 
-    // Ghost text: the untyped remainder of the highlighted suggestion plus
-    // its argument hint, dimmed (only when the whole input is visible and
-    // the cursor sits at the end, where → can actually accept it).
-    if start == 0
-        && cursor == chars.len()
-        && app.picker.is_none()
-        && app.input_mode == InputMode::Command
-        && let Some(spec) = app.suggestions.get(app.suggestion_index)
-    {
-        let typed = app.input.trim_start().strip_prefix('/').unwrap_or_default();
-        if let Some(remainder) = spec.name.strip_prefix(typed) {
-            let mut ghost = remainder.to_string();
-            if !spec.args.is_empty() {
-                ghost.push(' ');
-                ghost.push_str(&spec.args);
-            }
-            let room = budget.saturating_sub(used_cols);
-            if !ghost.is_empty() && room > 0 {
-                let ghost: String = ghost.chars().take(room).collect();
-                spans.push(Span::styled(ghost, dim().italic()));
-            }
+    // Locate the cursor (row, column-in-chars). `cursor <= re` puts an
+    // end-of-row cursor (just before the break) on that row, not the next.
+    let (mut crow, mut ccol) = (0usize, 0usize);
+    for (ri, &(rs, re)) in rows.iter().enumerate() {
+        if cursor <= re {
+            crow = ri;
+            ccol = cursor - rs;
+            break;
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![rule.clone(), Line::from(spans), rule])),
-        area,
-    );
+    // Vertical window: show a block of rows that keeps the cursor row in view.
+    let content_h = (area.height as usize).saturating_sub(2).max(1);
+    let voff = if crow < content_h {
+        0
+    } else {
+        crow - content_h + 1
+    };
+    let last = (voff + content_h).min(rows.len());
 
-    if app.picker.is_none() && app.plan_review.is_none() && app.interview.is_none() {
-        frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
+    let block = Style::default().add_modifier(Modifier::REVERSED);
+    let mut lines: Vec<Line> = vec![rule.clone()];
+    let mut cursor_xy: Option<(u16, u16)> = None;
+
+    for ri in voff..last {
+        let (rs, re) = rows[ri];
+        let row: &[char] = &chars[rs..re];
+        let widths: Vec<usize> = row.iter().map(|c| c.width().unwrap_or(0)).collect();
+        let is_cursor_row = ri == crow;
+
+        // Only the cursor's row scrolls horizontally to keep the caret visible;
+        // other rows render from their start and truncate at the budget.
+        let mut hstart = 0usize;
+        if is_cursor_row {
+            let mut cols: usize = widths[..ccol.min(widths.len())].iter().sum();
+            while hstart < ccol && cols > budget - 1 {
+                cols -= widths[hstart];
+                hstart += 1;
+            }
+        }
+        let mut hend = hstart;
+        let mut used = 0usize;
+        while hend < row.len() && used + widths[hend] <= budget {
+            used += widths[hend];
+            hend += 1;
+        }
+
+        // First row carries the prompt glyph; continuation rows indent to match.
+        let leading = if ri == 0 {
+            Span::styled("❯ ", accent().bold())
+        } else {
+            Span::raw("  ")
+        };
+        let mut spans = vec![Span::raw(" "), leading];
+
+        if normal && is_cursor_row {
+            // Vim Normal mode paints its own block cursor (reversed cell) so the
+            // mode is legible without a hardware caret.
+            let rel = ccol.saturating_sub(hstart).min(hend - hstart);
+            spans.push(Span::raw(
+                row[hstart..hstart + rel].iter().collect::<String>(),
+            ));
+            if hstart + rel < hend {
+                spans.push(Span::styled(row[hstart + rel].to_string(), block));
+                spans.push(Span::raw(
+                    row[hstart + rel + 1..hend].iter().collect::<String>(),
+                ));
+            } else {
+                spans.push(Span::styled(" ", block));
+            }
+        } else {
+            spans.push(Span::raw(row[hstart..hend].iter().collect::<String>()));
+
+            // Ghost text (command completion) only makes sense on a single-row
+            // line with the cursor at the very end, where → can accept it.
+            if is_cursor_row
+                && !normal
+                && rows.len() == 1
+                && hstart == 0
+                && cursor == chars.len()
+                && app.picker.is_none()
+                && app.input_mode == InputMode::Command
+                && let Some(spec) = app.suggestions.get(app.suggestion_index)
+            {
+                let typed = app.input.trim_start().strip_prefix('/').unwrap_or_default();
+                if let Some(remainder) = spec.name.strip_prefix(typed) {
+                    let mut ghost = remainder.to_string();
+                    if !spec.args.is_empty() {
+                        ghost.push(' ');
+                        ghost.push_str(&spec.args);
+                    }
+                    let room = budget.saturating_sub(used);
+                    if !ghost.is_empty() && room > 0 {
+                        let ghost: String = ghost.chars().take(room).collect();
+                        spans.push(Span::styled(ghost, dim().italic()));
+                    }
+                }
+            }
+
+            if is_cursor_row && !normal {
+                let cols: usize = widths[hstart..ccol.min(widths.len())].iter().sum();
+                let x = area.x + (pad + prompt_width) as u16 + cols as u16;
+                let y = area.y + 1 + (ri - voff) as u16;
+                cursor_xy = Some((x, y));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(rule);
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+
+    // In Normal mode the block cursor above is the only cursor; otherwise place
+    // the terminal's caret on the cursor row.
+    if !normal
+        && app.picker.is_none()
+        && app.plan_review.is_none()
+        && app.interview.is_none()
+        && let Some((x, y)) = cursor_xy
+    {
+        frame.set_cursor_position(Position::new(x, y));
     }
 }
 
