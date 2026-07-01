@@ -54,6 +54,10 @@ The agent authors a small script (the Hermes `execute_code` analog), saved to `~
 
 Saved as `~/.wizard/tools/mermaid-png.sh` with a manifest describing its name, arguments, and description; exposed as a normal tool after `/reload`.
 
+### System prompt override
+
+The baked-in base personality prompt can be replaced at runtime by a file: `~/.wizard/system_prompt.md` (or the path in `$WIZARD_SYSTEM_PROMPT`, which wins). When present and non-empty, its contents replace the compiled prompt for the active mode; absent, behavior is identical to the default. The bundled `WIZARD.md` charter, skills, project instructions, and memory sections are always appended on top, so this override tunes personality/instructions without dropping the charter. This is the surface external harness-evolution tooling (e.g. AHE) mutates to measure and improve prompt quality.
+
 ### Subagents
 
 Configure a named, reusable subagent with its own prompt, tool scope, and step budget, for fan-out or specialized sub-tasks.

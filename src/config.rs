@@ -619,6 +619,15 @@ impl Config {
         Ok(Self::wizard_dir()?.join("schedule.toml"))
     }
 
+    /// `~/.wizard/system_prompt.md` — optional override for the baked base
+    /// personality prompt. When this file (or the path in `$WIZARD_SYSTEM_PROMPT`)
+    /// exists and is non-empty, its contents replace the compiled prompt; this
+    /// is the surface external harness-evolution tools mutate. Absent → baked
+    /// default, so behavior is unchanged on a normal install.
+    pub fn system_prompt_path() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("system_prompt.md"))
+    }
+
     /// Create the `~/.wizard` directory tree (sessions, tools, skills, logs)
     /// if it does not exist yet. Idempotent; called on every load so a fresh
     /// install is usable without running the installer.

@@ -1,7 +1,9 @@
 //! System prompts: genie vs sovereign personalities, plus composition with
 //! skills, the bundled WIZARD.md charter, and project `AGENTS.md`.
 
-use crate::config::Mode;
+use std::path::{Path, PathBuf};
+
+use crate::config::{Config, Mode};
 use crate::llm::ToolSpec;
 use crate::skills::Skill;
 
@@ -108,6 +110,42 @@ record it with action \"save\" (kebab-case name, one-line description); it \
 will appear in your system prompt next session. Don't save things the repo \
 already records.";
 
+/// Resolve the base personality prompt for `mode`. An external override —
+/// `$WIZARD_SYSTEM_PROMPT` if set, otherwise `~/.wizard/system_prompt.md` —
+/// replaces the compiled default when it exists and is non-empty. This is the
+/// single file external harness-evolution tools (e.g. AHE) mutate; with no
+/// override present, the result is byte-identical to the baked prompt. The
+/// charter, skills, instructions, and memory sections are always appended on
+/// top by [`build_system_prompt`], so the charter cannot be evolved away here.
+fn base_system_prompt(mode: Mode) -> String {
+    let default = match mode {
+        Mode::Genie => GENIE_SYSTEM_PROMPT,
+        Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
+    };
+    override_path()
+        .as_deref()
+        .and_then(read_prompt_override)
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// The path an override would live at, if any: `$WIZARD_SYSTEM_PROMPT` wins,
+/// else the well-known `~/.wizard/system_prompt.md`.
+fn override_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("WIZARD_SYSTEM_PROMPT") {
+        return Some(PathBuf::from(p));
+    }
+    Config::system_prompt_path().ok()
+}
+
+/// Read an override file, returning its trimmed contents only when the file
+/// exists and is non-empty. A missing or empty file yields `None` so the
+/// caller falls back to the baked default.
+fn read_prompt_override(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Compose the full system prompt for `mode`: personality prompt, then the
 /// bundled `WIZARD.md` charter, then a rendered skills section, then the
 /// project's instruction hierarchy (`agents_md`, assembled by
@@ -120,12 +158,7 @@ pub fn build_system_prompt(
     agents_md: Option<&str>,
     memory_index: Option<&str>,
 ) -> String {
-    let base = match mode {
-        Mode::Genie => GENIE_SYSTEM_PROMPT,
-        Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
-    };
-
-    let mut prompt = base.to_string();
+    let mut prompt = base_system_prompt(mode);
 
     // Inject the bundled WIZARD.md charter so every session — genie and
     // sovereign alike — operates under it, and so forks inherit it.
@@ -223,6 +256,39 @@ mod tests {
         assert!(
             charter_pos < agents_pos,
             "charter must appear before project instructions"
+        );
+    }
+
+    /// `read_prompt_override` returns trimmed contents for a non-empty file,
+    /// and `None` for an empty or missing one (so the baked default is used).
+    #[test]
+    fn prompt_override_reads_nonempty_file_only() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        let present = dir.join(format!("wizard_prompt_override_{pid}.md"));
+        std::fs::write(&present, "  CUSTOM EVOLVED PROMPT\n").expect("write temp prompt");
+        assert_eq!(
+            read_prompt_override(&present).as_deref(),
+            Some("CUSTOM EVOLVED PROMPT"),
+            "non-empty override should be read and trimmed"
+        );
+        std::fs::remove_file(&present).ok();
+
+        let empty = dir.join(format!("wizard_prompt_override_empty_{pid}.md"));
+        std::fs::write(&empty, "   \n\t").expect("write empty temp prompt");
+        assert_eq!(
+            read_prompt_override(&empty),
+            None,
+            "whitespace-only override should fall back to default"
+        );
+        std::fs::remove_file(&empty).ok();
+
+        let missing = dir.join(format!("wizard_prompt_override_missing_{pid}.md"));
+        assert_eq!(
+            read_prompt_override(&missing),
+            None,
+            "missing override → None"
         );
     }
 
