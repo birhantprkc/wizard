@@ -58,6 +58,21 @@ Saved as `~/.wizard/tools/mermaid-png.sh` with a manifest describing its name, a
 
 The baked-in base personality prompt can be replaced at runtime by a file: `~/.wizard/system_prompt.md` (or the path in `$WIZARD_SYSTEM_PROMPT`, which wins). When present and non-empty, its contents replace the compiled prompt for the active mode; absent, behavior is identical to the default. The bundled `WIZARD.md` charter, skills, project instructions, and memory sections are always appended on top, so this override tunes personality/instructions without dropping the charter. This is the surface external harness-evolution tooling (e.g. AHE) mutates to measure and improve prompt quality.
 
+### Harness bundles
+
+The full evolvable surface — not just the prompt — can be externalized as a *harness bundle*: a directory activated with `--harness-dir <dir>` (or `$WIZARD_HARNESS_DIR`) whose files shadow the compiled defaults per component:
+
+```
+<bundle>/
+  system_prompt.md            # base personality prompt (highest-precedence override)
+  tool_descriptions/<tool>.md # description advertised to the model for that native tool
+  skills/<name>/SKILL.md      # shadows bundled and user skills by name
+  subagents/<name>.toml       # shadows user-defined and built-in subagents by name
+  HARNESS.md                  # generated guide for evolution agents
+```
+
+Any missing or empty file falls back to the compiled default, so a partial or broken bundle degrades gracefully and deleting a file reverts that component. `wizard harness export <dir>` dumps the current compiled defaults as a bundle — the seed an external harness-evolution loop (e.g. AHE) edits, measures, and hands back for review. Winning changes get baked into the source as new defaults and re-exported, which is what makes the loop recursive. Methodology credit: [Agentic Harness Engineering](https://github.com/china-qijizhifeng/agentic-harness-engineering) (arXiv:2604.25850).
+
 ### Subagents
 
 Configure a named, reusable subagent with its own prompt, tool scope, and step budget, for fan-out or specialized sub-tasks.

@@ -36,7 +36,7 @@ pub struct Skill {
 /// Default skill roots, in shadowing order (later roots win on name
 /// collision): the repo checkout's `skills/` (dev builds), `skills/` next to
 /// the installed binary, then the user's `~/.wizard/skills/` where `/evolve`
-/// writes new skills.
+/// writes new skills, then the active harness bundle's `skills/` (if any).
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -57,9 +57,18 @@ pub fn default_roots() -> Vec<PathBuf> {
         }
     }
 
-    // User skills last so they shadow bundled ones.
+    // User skills after bundled ones so they shadow them.
     if let Ok(user) = crate::config::Config::skills_dir() {
         roots.push(user);
+    }
+
+    // Harness bundle skills very last: the active bundle shadows everything,
+    // since it is the surface harness-evolution loops mutate.
+    if let Some(harness) = crate::config::Config::harness_dir() {
+        let skills = harness.join("skills");
+        if skills.is_dir() {
+            roots.push(skills);
+        }
     }
 
     roots

@@ -128,9 +128,17 @@ fn base_system_prompt(mode: Mode) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The path an override would live at, if any: `$WIZARD_SYSTEM_PROMPT` wins,
-/// else the well-known `~/.wizard/system_prompt.md`.
+/// The path an override would live at, if any: the harness bundle's
+/// `system_prompt.md` wins when it exists (so a bundle missing the file
+/// degrades to the next candidate), then `$WIZARD_SYSTEM_PROMPT`, then the
+/// well-known `~/.wizard/system_prompt.md`.
 fn override_path() -> Option<PathBuf> {
+    if let Some(dir) = Config::harness_dir() {
+        let bundled = dir.join("system_prompt.md");
+        if bundled.exists() {
+            return Some(bundled);
+        }
+    }
     if let Some(p) = std::env::var_os("WIZARD_SYSTEM_PROMPT") {
         return Some(PathBuf::from(p));
     }
