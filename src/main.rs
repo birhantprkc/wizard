@@ -6,8 +6,18 @@ use clap::Parser;
 
 use wizard::cli::Cli;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let cli = Cli::parse();
+
+    // Publish `--harness-dir` as `$WIZARD_HARNESS_DIR` before the tokio
+    // runtime exists: every subsystem (prompts, registry, skills, subagents)
+    // and every spawned wizard child process then resolves the same bundle
+    // from one source.
+    // SAFETY: no other threads have been spawned yet.
+    if let Some(dir) = &cli.harness_dir {
+        unsafe { std::env::set_var("WIZARD_HARNESS_DIR", dir) };
+    }
+
     // If the TUI is up when something panics, raw mode and the alternate
     // screen must be torn down before the panic message prints, or the
     // terminal is left unusable.
@@ -17,8 +27,11 @@ async fn main() {
         default_hook(info);
     }));
 
-    let cli = Cli::parse();
-    let code = match wizard::run(cli).await {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let code = match runtime.block_on(wizard::run(cli)) {
         Ok(code) => code,
         Err(err) => {
             // Make sure the error lands on a sane terminal even when the TUI

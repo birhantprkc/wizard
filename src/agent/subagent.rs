@@ -117,17 +117,28 @@ pub fn load_dir(dir: &Path) -> Result<Vec<SubagentConfig>> {
     Ok(configs)
 }
 
-/// Built-in subagents plus any user-defined ones from `dir`; user
-/// definitions shadow built-ins by name.
+/// Built-in subagents plus any user-defined ones from `dir`, plus the active
+/// harness bundle's `subagents/` (if any); later sources shadow earlier ones
+/// by name, so bundle definitions win over user definitions win over
+/// built-ins.
 pub fn available_configs(dir: &Path) -> Vec<SubagentConfig> {
     let mut configs = builtin_configs();
-    let user = load_dir(dir).unwrap_or_else(|err| {
-        tracing::warn!("loading subagents from {} failed: {err}", dir.display());
-        Vec::new()
-    });
-    for config in user {
-        configs.retain(|existing| existing.name != config.name);
-        configs.push(config);
+    let mut merge_from = |dir: &Path| {
+        let loaded = load_dir(dir).unwrap_or_else(|err| {
+            tracing::warn!("loading subagents from {} failed: {err}", dir.display());
+            Vec::new()
+        });
+        for config in loaded {
+            configs.retain(|existing| existing.name != config.name);
+            configs.push(config);
+        }
+    };
+    merge_from(dir);
+    if let Some(harness) = crate::config::Config::harness_dir() {
+        let bundle = harness.join("subagents");
+        if bundle.is_dir() {
+            merge_from(&bundle);
+        }
     }
     configs
 }

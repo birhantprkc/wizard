@@ -1748,6 +1748,7 @@ pub async fn build_headless_agent(
     if let Err(err) = base.attach_mcp(&manager).await {
         tracing::warn!("attaching MCP tools failed: {err}");
     }
+    base.apply_harness_overrides();
 
     let subagents_dir = Config::subagents_dir()?;
     let subagent_configs = subagent::available_configs(&subagents_dir);

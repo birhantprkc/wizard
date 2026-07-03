@@ -39,6 +39,8 @@ fn run_wizard(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         .env_remove("WIZARD_OLLAMA_HOST")
         .env_remove("WIZARD_LLAMACPP_HOST")
         .env_remove("WIZARD_GGUF_PATH")
+        .env_remove("WIZARD_SYSTEM_PROMPT")
+        .env_remove("WIZARD_HARNESS_DIR")
         .current_dir(home);
     for (key, value) in envs {
         command.env(key, value);
@@ -602,4 +604,52 @@ fn e2e_inference_with_auto_spawned_llama_server() {
         "wizard must report the server it spawned:\n{stdout}"
     );
     assert!(!stderr.contains("panicked"), "must not panic:\n{stderr}");
+}
+
+#[test]
+fn harness_export_writes_a_complete_bundle() {
+    let home = TempDir::new();
+    let bundle = home.0.join("bundle");
+    let output = run_wizard(
+        &home.0,
+        &["harness", "export", bundle.to_str().unwrap()],
+        &[],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "harness export must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let prompt = std::fs::read_to_string(bundle.join("system_prompt.md"))
+        .expect("bundle has system_prompt.md");
+    assert!(!prompt.trim().is_empty(), "exported prompt is non-empty");
+
+    // One description file per native tool, contents matching the compiled
+    // defaults' non-empty guarantee.
+    for tool in ["read_file", "write_file", "execute", "web_search"] {
+        let path = bundle.join("tool_descriptions").join(format!("{tool}.md"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("bundle has tool_descriptions/{tool}.md"));
+        assert!(!text.trim().is_empty(), "{tool} description is non-empty");
+    }
+
+    // Bundled skills and loadout subagents ride along (dev-build discovery
+    // via the repo checkout), plus the built-in worker definition.
+    assert!(
+        bundle.join("skills/coding/SKILL.md").is_file(),
+        "bundled coding skill exported"
+    );
+    assert!(
+        bundle.join("subagents/reviewer.toml").is_file(),
+        "loadout reviewer subagent exported"
+    );
+    assert!(
+        bundle.join("subagents/worker.toml").is_file(),
+        "built-in worker subagent exported"
+    );
+    assert!(bundle.join("HARNESS.md").is_file(), "bundle guide exported");
+    assert!(stdout.contains("exported harness bundle"), "{stdout}");
 }

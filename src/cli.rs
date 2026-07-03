@@ -96,6 +96,13 @@ pub struct Cli {
     #[arg(long, value_name = "PROVIDER")]
     pub login: Option<String>,
 
+    /// Harness bundle directory (sets `$WIZARD_HARNESS_DIR`): per-component
+    /// overrides for the compiled harness defaults — system_prompt.md,
+    /// tool_descriptions/, skills/, subagents/. Missing files fall back to
+    /// the baked defaults. Produce a bundle with `wizard harness export`.
+    #[arg(long, value_name = "DIR")]
+    pub harness_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -201,6 +208,15 @@ pub enum Command {
     /// stop them. Same view as `/dashboard` inside a session.
     Agents,
 
+    /// Harness bundle tooling: export the compiled harness defaults
+    /// (system prompt, tool descriptions, skills, subagents) as an editable
+    /// bundle for external harness-evolution loops. Load one with
+    /// `--harness-dir` / `$WIZARD_HARNESS_DIR`.
+    Harness {
+        #[command(subcommand)]
+        cmd: HarnessCmd,
+    },
+
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
     /// project and per provider. Self-contained; never loads config.
     Usage {
@@ -231,6 +247,20 @@ pub enum EvolveCmd {
     Undo {
         /// Entry number as shown by `wizard evolve list`.
         n: usize,
+    },
+}
+
+/// `wizard harness` subcommands. Self-contained like bench: no config load,
+/// no onboarding, no LLM.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum HarnessCmd {
+    /// Write the compiled harness defaults into `dir` as a bundle:
+    /// `system_prompt.md`, `tool_descriptions/<tool>.md`,
+    /// `skills/<name>/SKILL.md`, `subagents/<name>.toml`, plus a generated
+    /// `HARNESS.md` describing each component.
+    Export {
+        /// Target directory (created if missing; existing files overwritten).
+        dir: PathBuf,
     },
 }
 

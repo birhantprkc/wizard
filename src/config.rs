@@ -619,6 +619,31 @@ impl Config {
         Ok(Self::wizard_dir()?.join("schedule.toml"))
     }
 
+    /// `~/.wizard/system_prompt.md` — optional override for the baked base
+    /// personality prompt. When this file (or the path in `$WIZARD_SYSTEM_PROMPT`)
+    /// exists and is non-empty, its contents replace the compiled prompt; this
+    /// is the surface external harness-evolution tools mutate. Absent → baked
+    /// default, so behavior is unchanged on a normal install.
+    pub fn system_prompt_path() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("system_prompt.md"))
+    }
+
+    /// The active harness bundle directory, if any: `$WIZARD_HARNESS_DIR`
+    /// (set directly or via `--harness-dir`). A bundle shadows the compiled
+    /// harness defaults per component — `system_prompt.md`,
+    /// `tool_descriptions/<tool>.md`, `skills/<name>/SKILL.md`,
+    /// `subagents/<name>.toml` — and any missing file falls back to the
+    /// default, so a partial or broken bundle degrades gracefully. This is
+    /// the surface external harness-evolution tools (e.g. AHE) mutate;
+    /// `wizard harness export` produces a bundle of the current defaults.
+    pub fn harness_dir() -> Option<PathBuf> {
+        let raw = std::env::var_os("WIZARD_HARNESS_DIR")?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(raw))
+    }
+
     /// Create the `~/.wizard` directory tree (sessions, tools, skills, logs)
     /// if it does not exist yet. Idempotent; called on every load so a fresh
     /// install is usable without running the installer.

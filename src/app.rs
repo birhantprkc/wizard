@@ -3818,6 +3818,7 @@ async fn build_registry(
     if let Err(err) = base.attach_mcp(manager).await {
         tracing::warn!("attaching MCP tools: {err:#}");
     }
+    base.apply_harness_overrides();
 
     let subagents_dir = Config::subagents_dir()?;
     let subagent_configs = subagent::available_configs(&subagents_dir);

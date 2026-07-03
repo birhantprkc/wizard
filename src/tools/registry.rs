@@ -8,9 +8,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
+use async_trait::async_trait;
+
 use crate::llm::ToolSpec;
 use crate::mcp::McpManager;
-use crate::tools::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::tools::{Tool, ToolAccess, ToolContext, ToolError, ToolKind, ToolOutput};
 
 use super::file::{EditFileTool, ListFilesTool, ReadFileTool, SearchFilesTool, WriteFileTool};
 use super::git::{GitDiffTool, GitStatusTool};
@@ -132,12 +134,106 @@ impl ToolRegistry {
     }
 
     /// `/reload`: drop scripted and MCP tools, re-register natives, and
-    /// reload both dynamic sources.
+    /// reload both dynamic sources. Harness description overrides are
+    /// re-applied last so they keep shadowing across reloads.
     pub async fn reload(&mut self, scripted_dir: &Path, manager: &McpManager) -> Result<()> {
         *self = Self::with_native_tools();
         self.load_scripted(scripted_dir)?;
         self.attach_mcp(manager).await?;
+        self.apply_harness_overrides();
         Ok(())
+    }
+
+    /// Apply the active harness bundle's tool-description overrides
+    /// (`<harness_dir>/tool_descriptions/<tool>.md`), if a bundle is set.
+    /// Returns how many descriptions were replaced.
+    pub fn apply_harness_overrides(&mut self) -> usize {
+        match crate::config::Config::harness_dir() {
+            Some(dir) => self.apply_description_overrides(&dir.join("tool_descriptions")),
+            None => 0,
+        }
+    }
+
+    /// Replace the advertised description of every registered tool that has
+    /// a matching non-empty `<dir>/<tool_name>.md`. Files that name no
+    /// registered tool are skipped with a warning (the evolve loop may edit
+    /// a description for a tool this build doesn't ship). Returns how many
+    /// descriptions were replaced.
+    pub fn apply_description_overrides(&mut self, dir: &Path) -> usize {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return 0, // no overrides shipped — the common case
+        };
+        let mut replaced = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(name) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(tool) = self.tools.get(&name) else {
+                tracing::warn!(
+                    "harness description override {} names no registered tool",
+                    path.display()
+                );
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                tracing::warn!("unreadable harness description override {}", path.display());
+                continue;
+            };
+            let description = text.trim().to_string();
+            if description.is_empty() {
+                continue; // empty file ⇒ keep the compiled default
+            }
+            self.register(Arc::new(DescriptionOverride {
+                inner: Arc::clone(tool),
+                description,
+            }));
+            replaced += 1;
+        }
+        replaced
+    }
+}
+
+/// A registered tool with its advertised description replaced by a harness
+/// bundle override. Everything except the description delegates to the
+/// wrapped tool, so behavior, access class, and origin are unchanged.
+struct DescriptionOverride {
+    inner: Arc<dyn Tool>,
+    description: String,
+}
+
+#[async_trait]
+impl Tool for DescriptionOverride {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+
+    fn access(&self) -> ToolAccess {
+        self.inner.access()
+    }
+
+    fn kind(&self) -> ToolKind {
+        self.inner.kind()
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        self.inner.execute(args, ctx).await
     }
 }
 
@@ -348,6 +444,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "v2");
+    }
+
+    #[tokio::test]
+    async fn description_overrides_shadow_matching_tools_only() {
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("tool_descriptions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("read_file.md"), "EVOLVED read_file description\n").unwrap();
+        std::fs::write(dir.join("no_such_tool.md"), "orphan override\n").unwrap();
+        std::fs::write(dir.join("todo.md"), "  \n").unwrap(); // empty ⇒ keep default
+        std::fs::write(dir.join("execute.txt"), "wrong extension\n").unwrap();
+
+        let mut registry = ToolRegistry::with_native_tools();
+        let default_todo = registry.get("todo").unwrap().description().to_string();
+        let order_before: Vec<String> = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+
+        assert_eq!(registry.apply_description_overrides(&dir), 1);
+
+        let read_file = registry.get("read_file").unwrap();
+        assert_eq!(read_file.description(), "EVOLVED read_file description");
+        assert_eq!(
+            read_file.access(),
+            ToolAccess::ReadOnly,
+            "override keeps the wrapped tool's access class"
+        );
+        assert_eq!(registry.get("todo").unwrap().description(), default_todo);
+        assert!(registry.get("no_such_tool").is_none());
+        let order_after: Vec<String> = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.function.name)
+            .collect();
+        assert_eq!(order_before, order_after, "overrides keep spec order");
+
+        // The wrapped tool still executes: behavior is untouched.
+        std::fs::write(tmp.0.join("hello.txt"), "hello override\n").unwrap();
+        let out = registry
+            .execute("read_file", json!({ "path": "hello.txt" }), &tmp.ctx())
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("hello override"));
+    }
+
+    #[test]
+    fn description_overrides_missing_dir_is_a_noop() {
+        let tmp = TempDir::new();
+        let mut registry = ToolRegistry::with_native_tools();
+        assert_eq!(
+            registry.apply_description_overrides(&tmp.0.join("absent")),
+            0
+        );
+        assert_eq!(registry.len(), 16);
     }
 
     #[test]

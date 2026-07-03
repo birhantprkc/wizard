@@ -19,6 +19,7 @@ pub mod evolve;
 pub mod fleet;
 pub mod gateway;
 pub mod hardware;
+pub mod harness;
 pub mod hooks;
 pub mod import_claude;
 pub mod instructions;
@@ -68,6 +69,16 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
                 ignored.join(", ")
             );
         }
+    }
+
+    // Harness bundle tooling is self-contained: no config, no LLM.
+    // (`--harness-dir` itself is published as `$WIZARD_HARNESS_DIR` in
+    // `main`, pre-runtime.)
+    if let Some(cli::Command::Harness { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return harness::run(cmd.clone()).map(|()| 0);
     }
 
     // Bench is self-contained tooling: it must work with no config and no
