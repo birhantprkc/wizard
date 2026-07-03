@@ -394,10 +394,16 @@ pub async fn run_checks(project_root: &Path) -> Vec<Check> {
     checks
 }
 
-/// `wizard doctor`: print the report, exit 0 when nothing failed.
+/// `wizard doctor`: print the report, exit 0 when nothing failed. A spinner
+/// covers the network probes (capped at [`PROBE_TIMEOUT`] each) while they
+/// run, then clears before the report so the rendered output is unchanged;
+/// it is silent when stderr is not a terminal. The TUI `/doctor` calls
+/// [`run_checks`] directly — it owns the screen and draws no spinner here.
 pub async fn run() -> Result<i32> {
     let project_root = std::env::current_dir()?;
+    let spinner = crate::progress::Spinner::start("running checks…");
     let checks = run_checks(&project_root).await;
+    spinner.finish();
     println!("{}", render(&checks));
     Ok(if has_failures(&checks) { 1 } else { 0 })
 }

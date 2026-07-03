@@ -4091,7 +4091,7 @@ async fn try_provider(provider: &ProviderConfig) -> Result<Arc<dyn LlmProvider>>
         .with_context(|| format!("building provider '{}'", provider.name))?;
     if provider.kind == ProviderKind::LlamaCpp {
         let wait = crate::progress::ServerSpinner::start();
-        let outcome = server::ensure_running(provider, &|line: &str| wait.update(line)).await;
+        let outcome = server::ensure_running(provider, &wait).await;
         wait.finish(outcome.is_ok());
         outcome?;
     }
@@ -6073,17 +6073,8 @@ impl CommandContext<'_> {
     fn start_server_task(&self, provider: ProviderConfig) {
         let notify = self.events.sender();
         tokio::spawn(async move {
-            let progress = {
-                let notify = notify.clone();
-                move |line: &str| {
-                    // The progress callback is sync; relay each line through
-                    // its own send task.
-                    let notify = notify.clone();
-                    let line = line.to_string();
-                    tokio::spawn(async move {
-                        let _ = notify.send(Event::Notice(line)).await;
-                    });
-                }
+            let progress = NoticeProgress {
+                notify: notify.clone(),
             };
             let message = match server::ensure_running(&provider, &progress).await {
                 Ok(()) => format!("llama-server at {} is ready", provider.base_url),
@@ -6091,6 +6082,76 @@ impl CommandContext<'_> {
             };
             let _ = notify.send(Event::Notice(message)).await;
         });
+    }
+}
+
+/// [`crate::server::Progress`] adapter for the TUI's `/server start`: relays
+/// status lines and download milestones into the transcript as notices (the
+/// callback is sync, so each line is sent from its own task). Byte progress
+/// is throttled to whole-percent steps, the way the plain-terminal download
+/// bar fills, so a multi-GB pull does not flood the transcript.
+struct NoticeProgress {
+    notify: mpsc::Sender<Event>,
+}
+
+impl NoticeProgress {
+    fn notice(notify: &mpsc::Sender<Event>, line: String) {
+        let notify = notify.clone();
+        tokio::spawn(async move {
+            let _ = notify.send(Event::Notice(line)).await;
+        });
+    }
+}
+
+impl server::Progress for NoticeProgress {
+    fn status(&self, line: &str) {
+        Self::notice(&self.notify, line.to_string());
+    }
+
+    fn bytes(&self, label: &str, total: Option<u64>) -> Box<dyn server::ByteProgress> {
+        Box::new(NoticeBytes {
+            notify: self.notify.clone(),
+            label: label.to_string(),
+            total: total.filter(|total| *total > 0),
+            written: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+/// Byte-progress guard for [`NoticeProgress`]: emits a transcript notice on
+/// each whole-percent advance and a closing milestone on finish.
+struct NoticeBytes {
+    notify: mpsc::Sender<Event>,
+    label: String,
+    total: Option<u64>,
+    written: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU64,
+}
+
+impl server::ByteProgress for NoticeBytes {
+    fn inc(&self, n: u64) {
+        use std::sync::atomic::Ordering;
+        let written = self.written.fetch_add(n, Ordering::Relaxed) + n;
+        if let Some(total) = self.total {
+            let percent = written * 100 / total;
+            if percent > self.last_percent.swap(percent, Ordering::Relaxed) {
+                NoticeProgress::notice(
+                    &self.notify,
+                    format!(
+                        "{} — {percent}% of {:.1} GB",
+                        self.label,
+                        total as f64 / 1e9
+                    ),
+                );
+            }
+        }
+    }
+
+    fn finish(self: Box<Self>, msg: &str) {
+        if !msg.is_empty() {
+            NoticeProgress::notice(&self.notify, msg.to_string());
+        }
     }
 }
 

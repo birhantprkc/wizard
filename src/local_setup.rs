@@ -41,8 +41,8 @@ pub fn bin_dir() -> Result<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Download `tier` to `dest`, resuming `dest.partial` if a previous attempt
-/// was interrupted. Reports progress as whole-percent steps.
-pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: Progress<'_>) -> Result<()> {
+/// was interrupted. Reports progress on a byte-counted bar.
+pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: &dyn Progress) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -50,7 +50,7 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: Progress<'_>
     let partial = dest.with_extension("gguf.partial");
     let mut offset = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
 
-    progress(&format!(
+    progress.status(&format!(
         "downloading {} ({}) — several GB, one-time…",
         tier.file, tier.name
     ));
@@ -94,24 +94,17 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: Progress<'_>
         .with_context(|| format!("opening {}", partial.display()))?;
 
     let mut written = offset;
-    let mut last_percent = 0u64;
+    let bar = progress.bytes(&format!("downloading {}", tier.file), total);
+    // Resumed bytes are already on disk; count them so the bar starts where
+    // the previous attempt left off.
+    bar.inc(offset);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("reading from {}", tier.url))?;
         std::io::Write::write_all(&mut file, &chunk)
             .with_context(|| format!("writing {}", partial.display()))?;
         written += chunk.len() as u64;
-        if let Some(total) = total.filter(|total| *total > 0) {
-            let percent = written * 100 / total;
-            if percent > last_percent {
-                last_percent = percent;
-                progress(&format!(
-                    "downloading {} — {percent}% of {:.1} GB",
-                    tier.file,
-                    total as f64 / 1e9
-                ));
-            }
-        }
+        bar.inc(chunk.len() as u64);
     }
     drop(file);
 
@@ -125,7 +118,7 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: Progress<'_>
     }
     std::fs::rename(&partial, dest)
         .with_context(|| format!("moving {} into place", partial.display()))?;
-    progress(&format!("saved {}", dest.display()));
+    bar.finish(&format!("saved {}", dest.display()));
     Ok(())
 }
 
@@ -139,8 +132,8 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: Progress<'_>
 /// `~/.wizard/llama.cpp` (the binary resolves its shared libraries via an
 /// `$ORIGIN` runpath, so the `.so` files must stay beside it), and link it
 /// from `~/.wizard/bin/llama-server`. Returns the linked path.
-pub async fn install_llama_server(progress: Progress<'_>) -> Result<PathBuf> {
-    progress("llama-server not found — installing llama.cpp (official releases)…");
+pub async fn install_llama_server(progress: &dyn Progress) -> Result<PathBuf> {
+    progress.status("llama-server not found — installing llama.cpp (official releases)…");
 
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -156,7 +149,7 @@ pub async fn install_llama_server(progress: Progress<'_>) -> Result<PathBuf> {
         match install_from_asset(&http, &url, progress).await {
             Ok(path) => return Ok(path),
             Err(error) => {
-                progress(&format!(
+                progress.status(&format!(
                     "the {variant} build did not work — trying the next variant"
                 ));
                 last_error = error;
@@ -225,10 +218,10 @@ async fn asset_url(http: &reqwest::Client, variant: &str) -> Option<String> {
 async fn install_from_asset(
     http: &reqwest::Client,
     url: &str,
-    progress: Progress<'_>,
+    progress: &dyn Progress,
 ) -> Result<PathBuf> {
     let file_name = url.rsplit('/').next().unwrap_or("llamacpp.tar.gz");
-    progress(&format!("downloading {file_name}…"));
+    progress.status(&format!("downloading {file_name}…"));
 
     let work = Config::wizard_dir()?.join("tmp-llamacpp");
     let _ = std::fs::remove_dir_all(&work);
@@ -242,19 +235,30 @@ async fn install_from_asset_in(
     http: &reqwest::Client,
     url: &str,
     work: &Path,
-    progress: Progress<'_>,
+    progress: &dyn Progress,
 ) -> Result<PathBuf> {
     let archive = work.join("llamacpp.tar.gz");
-    let bytes = http
+    let file_name = url.rsplit('/').next().unwrap_or("llamacpp.tar.gz");
+    let response = http
         .get(url)
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .with_context(|| format!("downloading {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("reading {url}"))?;
-    std::fs::write(&archive, &bytes).with_context(|| format!("writing {}", archive.display()))?;
+        .with_context(|| format!("downloading {url}"))?;
+    let total = response.content_length();
+    let mut out = std::fs::File::create(&archive)
+        .with_context(|| format!("writing {}", archive.display()))?;
+    let bar = progress.bytes(&format!("downloading {file_name}"), total);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("reading {url}"))?;
+        std::io::Write::write_all(&mut out, &chunk)
+            .with_context(|| format!("writing {}", archive.display()))?;
+        bar.inc(chunk.len() as u64);
+    }
+    std::io::Write::flush(&mut out).with_context(|| format!("writing {}", archive.display()))?;
+    drop(out);
+    bar.finish("");
 
     let extracted = work.join("extracted");
     std::fs::create_dir_all(&extracted)?;
@@ -304,7 +308,7 @@ async fn install_from_asset_in(
     #[cfg(not(unix))]
     std::fs::copy(&target, &link).with_context(|| format!("copying to {}", link.display()))?;
 
-    progress(&format!("installed llama-server to {}", dest.display()));
+    progress.status(&format!("installed llama-server to {}", dest.display()));
     Ok(link)
 }
 
