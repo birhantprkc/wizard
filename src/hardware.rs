@@ -81,14 +81,68 @@ fn sysfs_vram_gb() -> Option<u64> {
     (gb > 0).then_some(gb)
 }
 
-/// Total system RAM in GB from `/proc/meminfo` (`MemTotal`, kB).
-fn system_ram_gb() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+/// `MemTotal` in GB from `/proc/meminfo` contents.
+fn parse_meminfo_total_gb(meminfo: &str) -> Option<u64> {
     let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
     // Format: "MemTotal:       16312456 kB"
     let kb = line.split_whitespace().nth(1).and_then(parse_positive)?;
     let gb = kb / (1024 * 1024);
     (gb > 0).then_some(gb)
+}
+
+/// A cgroup memory limit in bytes from the raw file contents. `None` for
+/// "no limit": cgroup v2 spells that `max`, cgroup v1 reports
+/// `PAGE_COUNTER_MAX` (~`LONG_MAX`, far beyond any real machine).
+fn parse_cgroup_limit_bytes(contents: &str) -> Option<u64> {
+    /// Anything this large (1 EiB) is a no-limit sentinel, not a limit.
+    const NO_LIMIT: u64 = 1 << 60;
+    match contents.trim() {
+        "max" => None,
+        raw => parse_positive(raw).filter(|&bytes| bytes < NO_LIMIT),
+    }
+}
+
+/// The cgroup memory limit confining this process, in GB. Checks cgroup v2
+/// (`memory.max`) then v1 (`memory.limit_in_bytes`); `None` outside
+/// containers, or when no readable file carries a real limit.
+fn cgroup_limit_gb() -> Option<u64> {
+    [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|raw| parse_cgroup_limit_bytes(&raw))
+    .min()
+    .map(|bytes| bytes / (1024 * 1024 * 1024))
+}
+
+/// Cap a `MemTotal` reading with an optional cgroup limit. The bool is true
+/// when the limit is what set the number.
+fn cap_to_cgroup(total_gb: u64, limit_gb: Option<u64>) -> (u64, bool) {
+    match limit_gb {
+        Some(limit) if limit < total_gb => (limit, true),
+        _ => (total_gb, false),
+    }
+}
+
+/// Total system RAM in GB from `/proc/meminfo` (`MemTotal`, kB), capped by
+/// the cgroup memory limit when one is smaller — in a container `MemTotal`
+/// reports the host's RAM, not what this process may actually use. The bool
+/// is true when the cgroup limit won.
+fn system_ram_gb() -> Option<(u64, bool)> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let total_gb = parse_meminfo_total_gb(&meminfo)?;
+    let (gb, capped) = cap_to_cgroup(total_gb, cgroup_limit_gb());
+    (gb > 0).then_some((gb, capped))
+}
+
+/// System RAM usable by this process, in GB ([`system_ram_gb`] including any
+/// cgroup cap). This is what a spawned llama-server can actually allocate:
+/// [`crate::server::spawn`] passes no GPU-offload flags, so the weights load
+/// into system memory even on GPU machines.
+pub fn usable_ram_gb() -> Option<u64> {
+    system_ram_gb().map(|(gb, _)| gb)
 }
 
 /// Detect the memory budget, preferring GPU VRAM (nvidia → rocm → sysfs) and
@@ -112,10 +166,14 @@ pub fn detect_memory() -> Option<Detected> {
             source: "GPU VRAM (sysfs)".to_string(),
         });
     }
-    if let Some(gb) = system_ram_gb() {
+    if let Some((gb, capped)) = system_ram_gb() {
         return Some(Detected {
             gb,
-            source: "system RAM (no GPU detected)".to_string(),
+            source: if capped {
+                "system RAM (cgroup limit)".to_string()
+            } else {
+                "system RAM (no GPU detected)".to_string()
+            },
         });
     }
     None
@@ -173,6 +231,9 @@ pub struct GgufModel {
     pub file: &'static str,
     /// Hugging Face download URL for [`Self::file`].
     pub url: &'static str,
+    /// Approximate file size in GB, used to refuse a model that cannot fit
+    /// in RAM before downloading it.
+    pub approx_gb: u64,
 }
 
 /// GGUF tiers (largest first), the Q4_K_M counterparts of the Ollama tags in
@@ -183,16 +244,19 @@ pub const GGUF_TIERS: &[GgufModel] = &[
         name: "Qwen3.6 35B",
         file: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
         url: "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        approx_gb: 20,
     },
     GgufModel {
         name: "Qwen3.6 27B",
         file: "Qwen3.6-27B-Q4_K_M.gguf",
         url: "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
+        approx_gb: 16,
     },
     GgufModel {
         name: "Qwen3.5 9B",
         file: "Qwen3.5-9B-Q4_K_M.gguf",
         url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+        approx_gb: 6,
     },
 ];
 
@@ -214,16 +278,36 @@ pub fn suggest_gguf_model(gb: u64) -> &'static GgufModel {
     }
 }
 
+/// Memory budget for the GGUF tier choice: a GPU VRAM reading is capped by
+/// system RAM, because the spawned llama-server runs without GPU offload
+/// (no `-ngl`; [`crate::server::spawn`]) and the prebuilts are CPU/Vulkan —
+/// the weights must fit in RAM regardless of VRAM. The bool is true when
+/// the RAM cap won.
+fn gguf_budget_gb(detected: &Detected, ram_gb: Option<u64>) -> (u64, bool) {
+    match ram_gb {
+        Some(ram) if detected.source.starts_with("GPU VRAM") && ram < detected.gb => (ram, true),
+        _ => (detected.gb, false),
+    }
+}
+
 /// Run detection and return `(tier, explanation)` for llama.cpp. Falls back to
 /// the smallest tier with an explanatory note when nothing can be detected.
 pub fn suggest_gguf() -> (&'static GgufModel, String) {
     match detect_memory() {
         Some(detected) => {
-            let tier = suggest_gguf_model(detected.gb);
-            let explanation = format!(
-                "Detected {} GB of {} → {}",
-                detected.gb, detected.source, tier.file
-            );
+            let (budget, ram_capped) = gguf_budget_gb(&detected, usable_ram_gb());
+            let tier = suggest_gguf_model(budget);
+            let explanation = if ram_capped {
+                format!(
+                    "Detected {} GB of {}, capped by {budget} GB of system RAM → {}",
+                    detected.gb, detected.source, tier.file
+                )
+            } else {
+                format!(
+                    "Detected {} GB of {} → {}",
+                    detected.gb, detected.source, tier.file
+                )
+            };
             (tier, explanation)
         }
         None => {
@@ -259,6 +343,57 @@ mod tests {
         assert_eq!(parse_positive("12 kB"), None);
         assert_eq!(parse_positive("MemTotal:"), None);
         assert_eq!(parse_positive(""), None);
+    }
+
+    #[test]
+    fn parse_meminfo_total_gb_reads_memtotal() {
+        let meminfo = "MemTotal:       16312456 kB\nMemFree:         1234 kB\n";
+        assert_eq!(parse_meminfo_total_gb(meminfo), Some(15));
+        assert_eq!(parse_meminfo_total_gb("MemFree: 1234 kB\n"), None);
+        assert_eq!(parse_meminfo_total_gb("MemTotal: garbage kB\n"), None);
+        assert_eq!(parse_meminfo_total_gb(""), None);
+    }
+
+    #[test]
+    fn parse_cgroup_limit_rejects_no_limit_sentinels() {
+        // cgroup v2 spells "no limit" as the literal string `max`.
+        assert_eq!(parse_cgroup_limit_bytes("max\n"), None);
+        // cgroup v1 reports PAGE_COUNTER_MAX (~LONG_MAX) when unconfined.
+        assert_eq!(parse_cgroup_limit_bytes("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_limit_bytes(&(1u64 << 60).to_string()), None);
+        // A real limit (12 GiB, like a Colab container) is taken at face value.
+        assert_eq!(
+            parse_cgroup_limit_bytes("12884901888\n"),
+            Some(12_884_901_888)
+        );
+        assert_eq!(parse_cgroup_limit_bytes("0"), None);
+        assert_eq!(parse_cgroup_limit_bytes("not a number"), None);
+        assert_eq!(parse_cgroup_limit_bytes(""), None);
+    }
+
+    #[test]
+    fn cap_to_cgroup_only_lowers() {
+        assert_eq!(cap_to_cgroup(64, Some(12)), (12, true), "container cap");
+        assert_eq!(cap_to_cgroup(16, Some(32)), (16, false), "limit above RAM");
+        assert_eq!(cap_to_cgroup(16, Some(16)), (16, false), "equal is no cap");
+        assert_eq!(cap_to_cgroup(16, None), (16, false), "no limit");
+    }
+
+    #[test]
+    fn gguf_budget_caps_vram_by_system_ram() {
+        let gpu = Detected {
+            gb: 24,
+            source: "GPU VRAM (nvidia-smi)".to_string(),
+        };
+        // No -ngl is passed when spawning, so RAM is the binding constraint.
+        assert_eq!(gguf_budget_gb(&gpu, Some(12)), (12, true));
+        assert_eq!(gguf_budget_gb(&gpu, Some(64)), (24, false));
+        assert_eq!(gguf_budget_gb(&gpu, None), (24, false));
+        let ram = Detected {
+            gb: 12,
+            source: "system RAM (cgroup limit)".to_string(),
+        };
+        assert_eq!(gguf_budget_gb(&ram, Some(12)), (12, false));
     }
 
     #[test]
