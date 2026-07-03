@@ -17,8 +17,9 @@ use super::{TrajectoryRecord, git, trajectories_path};
 ///
 /// Infallible by design: recording is a side channel, and a full disk or odd
 /// permissions must never break the agent run itself, so every error is
-/// swallowed into a warning. A no-op when `WIZARD_BENCH` is set — bench
-/// replays must not pollute the trajectory log with their own runs.
+/// swallowed into a warning. A no-op when `WIZARD_BENCH` or `WIZARD_FLEET`
+/// is set — bench replays and fleet workers must not pollute the trajectory
+/// log with their own runs.
 pub async fn record(
     project_root: &Path,
     prompt: &str,
@@ -27,7 +28,7 @@ pub async fn record(
     model: &str,
     mode: &str,
 ) {
-    if std::env::var_os("WIZARD_BENCH").is_some() {
+    if std::env::var_os("WIZARD_BENCH").is_some() || std::env::var_os("WIZARD_FLEET").is_some() {
         return;
     }
     let (git_ref, dirty) = match git::head_and_dirty(project_root).await {

@@ -87,3 +87,42 @@ impl Tool for PublishTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn args_default_branch_to_none() {
+        let args: PublishArgs = parse_args("publish", json!({})).unwrap();
+        assert!(args.branch.is_none());
+
+        // Zero-parameter calls may pass null instead of an empty object.
+        let args: PublishArgs = parse_args("publish", Value::Null).unwrap();
+        assert!(args.branch.is_none());
+    }
+
+    #[test]
+    fn args_accept_a_branch() {
+        let args: PublishArgs = parse_args("publish", json!({ "branch": "dev" })).unwrap();
+        assert_eq!(args.branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn args_reject_a_non_string_branch() {
+        let err = parse_args::<PublishArgs>("publish", json!({ "branch": 5 }))
+            .expect_err("branch must be a string");
+        assert!(matches!(err, ToolError::InvalidArgs { tool, .. } if tool == "publish"));
+    }
+
+    #[test]
+    fn tool_name_and_schema_shape() {
+        let tool = PublishTool::new(Config::default());
+        assert_eq!(tool.name(), "publish");
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["branch"]["type"], "string");
+    }
+}

@@ -55,23 +55,50 @@ fn load_with_global(project_root: &Path, global: Option<&Path>) -> Option<String
     chain.retain(|path| files.first() != Some(path));
     files.extend(chain);
 
+    // Read everything first (still outermost-first order), then budget from
+    // the INNERMOST file outward: the project root's own instructions have
+    // the highest priority, so when TOTAL_CAP hits it is the outer files
+    // that get trimmed or dropped, never the innermost ones.
+    let mut sections: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let content = read_with_includes(&path)?;
+            let trimmed = content.trim_end();
+            (!trimmed.trim().is_empty()).then(|| (path, trimmed.to_string()))
+        })
+        .collect();
+
+    let mut budget = TOTAL_CAP;
+    let mut keep = vec![false; sections.len()];
+    for (i, (path, content)) in sections.iter_mut().enumerate().rev() {
+        let header = format!("<!-- instructions from {} -->\n", path.display());
+        let overhead = header.len() + 2; // "\n\n" separator
+        if budget <= overhead {
+            break;
+        }
+        let room = budget - overhead;
+        if content.len() > room {
+            // This (and everything further out) does not fit whole. Trim it
+            // to what remains and stop: including a smaller far-outer file
+            // while dropping a nearer one would invert the priority order.
+            *content = truncate_output(std::mem::take(content), room);
+            keep[i] = true;
+            break;
+        }
+        budget -= overhead + content.len();
+        keep[i] = true;
+    }
+
     let mut out = String::new();
-    for path in files {
-        let Some(content) = read_with_includes(&path) else {
-            continue;
-        };
-        if content.trim().is_empty() {
+    for (i, (path, content)) in sections.iter().enumerate() {
+        if !keep[i] {
             continue;
         }
         if !out.is_empty() {
             out.push_str("\n\n");
         }
         out.push_str(&format!("<!-- instructions from {} -->\n", path.display()));
-        out.push_str(content.trim_end());
-        if out.len() >= TOTAL_CAP {
-            out = truncate_output(out, TOTAL_CAP);
-            break;
-        }
+        out.push_str(content);
     }
 
     (!out.is_empty()).then_some(out)
@@ -301,13 +328,59 @@ mod tests {
         let project = tmp.0.join("a").join("b");
         write(&tmp.0.join("WIZARD.md"), &"r".repeat(TOTAL_CAP));
         write(&tmp.0.join("a").join("WIZARD.md"), &"m".repeat(TOTAL_CAP));
-        write(&project.join("WIZARD.md"), "never reached");
+        write(&project.join("WIZARD.md"), "project rules win");
         let out = load_with_global(&project, None).expect("found");
         assert!(
-            out.len() <= TOTAL_CAP + 100,
+            out.len() <= TOTAL_CAP + 200,
             "total capped: {} bytes",
             out.len()
         );
         assert!(out.contains("[output truncated]"));
+    }
+
+    #[test]
+    fn cap_trims_outer_files_and_keeps_the_project_root_intact() {
+        let tmp = TempDir::new();
+        let project = tmp.0.join("a").join("b");
+        // Outermost and middle files are each big enough to blow the cap on
+        // their own; the project root's file is small and highest priority.
+        write(
+            &tmp.0.join("WIZARD.md"),
+            &"OUTERMOST\n".repeat(TOTAL_CAP / 10),
+        );
+        write(
+            &tmp.0.join("a").join("WIZARD.md"),
+            &"MIDDLE\n".repeat(TOTAL_CAP / 7),
+        );
+        write(&project.join("WIZARD.md"), "project rules win");
+
+        let out = load_with_global(&project, None).expect("found");
+        assert!(
+            out.contains("project rules win"),
+            "the innermost file survives the cap intact"
+        );
+        // The middle file gets whatever budget remains (truncated); the
+        // outermost is dropped entirely.
+        assert!(out.contains("MIDDLE"), "middle file partially included");
+        assert!(
+            !out.contains("OUTERMOST"),
+            "outermost file dropped: no budget left"
+        );
+        // Order is still outermost-first among what was kept.
+        let mid = out.find("MIDDLE").expect("middle content present");
+        let inner = out.find("project rules win").expect("inner present");
+        assert!(mid < inner, "outer content still precedes inner content");
+    }
+
+    #[test]
+    fn small_hierarchies_are_untouched_by_the_budget() {
+        let tmp = TempDir::new();
+        let project = tmp.0.join("proj");
+        write(&tmp.0.join("WIZARD.md"), "outer rules");
+        write(&project.join("WIZARD.md"), "inner rules");
+        let out = load_with_global(&project, None).expect("found");
+        assert!(out.contains("outer rules"));
+        assert!(out.contains("inner rules"));
+        assert!(!out.contains("[output truncated]"));
     }
 }

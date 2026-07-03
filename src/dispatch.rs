@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::agent::subagent::SPAWN_SUBAGENT_TOOL_NAME;
 use crate::agent::{AgentEvent, DoneReason, emit, normalize_args};
 use crate::config::Mode;
 use crate::hooks::{HookEngine, PreToolUse};
@@ -126,34 +127,39 @@ impl Dispatcher {
         // ordinary tool error but is exempt from the failure breakers — a
         // model probing for write access mid-plan must not end the turn.
         // Unknown tools fall through so the real "unknown tool" error
-        // surfaces instead.
-        if self.plan_mode.load(Ordering::SeqCst)
-            && name != EXIT_PLAN_TOOL_NAME
-            && self
+        // surfaces instead. Delegation stays available but demoted: the
+        // spawn call is tagged so the subagent runs with a read-only scope.
+        if self.plan_mode.load(Ordering::SeqCst) && name != EXIT_PLAN_TOOL_NAME {
+            if name == SPAWN_SUBAGENT_TOOL_NAME {
+                if let Some(object) = args.as_object_mut() {
+                    object.insert("plan_mode".to_string(), Value::Bool(true));
+                }
+            } else if self
                 .registry
                 .get(&name)
                 .is_some_and(|tool| tool.access() != ToolAccess::ReadOnly)
-        {
-            let output = ToolOutput::error(
-                "blocked by plan mode: only read-only tools are allowed; finish your plan \
-                 and call exit_plan",
-            );
-            if !emit(
-                events,
-                AgentEvent::ToolFinished {
-                    name,
-                    output: output.clone(),
-                },
-            )
-            .await
             {
-                return DispatchOutcome::stopped();
+                let output = ToolOutput::error(
+                    "blocked by plan mode: only read-only tools are allowed; finish your plan \
+                     and call exit_plan",
+                );
+                if !emit(
+                    events,
+                    AgentEvent::ToolFinished {
+                        name,
+                        output: output.clone(),
+                    },
+                )
+                .await
+                {
+                    return DispatchOutcome::stopped();
+                }
+                return DispatchOutcome {
+                    output: Some(output),
+                    nudge: None,
+                    done: None,
+                };
             }
-            return DispatchOutcome {
-                output: Some(output),
-                nudge: None,
-                done: None,
-            };
         }
 
         // Pre-tool hooks: may rewrite the arguments or veto the call. A veto
@@ -187,7 +193,14 @@ impl Dispatcher {
         // Post-tool hooks: stdout becomes extra context on the tool result.
         if let Some(extra) = self
             .hooks
-            .post_tool_use(&name, &args, self.mode, Some(events))
+            .post_tool_use_with_output(
+                &name,
+                &args,
+                &output.content,
+                output.is_error,
+                self.mode,
+                Some(events),
+            )
             .await
         {
             crate::hooks::append_context(&mut output.content, &extra);

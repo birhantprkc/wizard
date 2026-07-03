@@ -9,7 +9,6 @@
 # CPU-only / undetectable systems).
 
 mode = "genie"
-auto_approve = false
 max_steps = 25
 
 # Which provider Wizard talks to. Switch live in the TUI with /provider, or

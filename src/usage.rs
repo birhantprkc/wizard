@@ -7,10 +7,11 @@
 //! its final chunk when the backend exposes usage). Backends that report
 //! nothing simply accumulate zeros and write no records.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Token counters for one agent. Atomics so the agent loop can record from
@@ -154,6 +155,145 @@ pub fn cost_usd(
     )
 }
 
+// ---------------------------------------------------------------------------
+// `wizard usage` — rollup over ~/.wizard/usage.jsonl
+// ---------------------------------------------------------------------------
+
+/// Read-side view of one usage.jsonl line. Liberal on purpose (missing
+/// fields default, unknown fields are ignored) so old and future records
+/// both roll up; `cost_usd` is summed when a writer recorded one.
+#[derive(Debug, Clone, Deserialize)]
+struct LoggedTurn {
+    ts: u64,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    cost_usd: Option<f64>,
+}
+
+/// Aggregated usage for one rollup key (a project or a provider).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Rollup {
+    turns: u64,
+    prompt: u64,
+    completion: u64,
+    /// Sum of the records that carried a cost; `None` when none did.
+    cost_usd: Option<f64>,
+}
+
+impl Rollup {
+    fn add(&mut self, turn: &LoggedTurn) {
+        self.turns += 1;
+        self.prompt += turn.prompt_tokens;
+        self.completion += turn.completion_tokens;
+        if let Some(cost) = turn.cost_usd {
+            *self.cost_usd.get_or_insert(0.0) += cost;
+        }
+    }
+}
+
+/// Parse a `--since` value: `7d`, `7D`, or a bare day count.
+fn parse_since_days(raw: &str) -> Result<u64> {
+    let days: u64 = raw
+        .trim()
+        .trim_end_matches(['d', 'D'])
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --since {raw:?} (expected a day count like 7d)"))?;
+    if days == 0 {
+        bail!("--since must be at least 1 day");
+    }
+    Ok(days)
+}
+
+/// Group turns under a key ("(unknown)" for records missing it).
+fn roll_up<'a>(
+    turns: &'a [LoggedTurn],
+    key: impl Fn(&'a LoggedTurn) -> &'a str,
+) -> BTreeMap<String, Rollup> {
+    let mut groups: BTreeMap<String, Rollup> = BTreeMap::new();
+    for turn in turns {
+        let raw = key(turn);
+        let name = if raw.is_empty() { "(unknown)" } else { raw };
+        groups.entry(name.to_string()).or_default().add(turn);
+    }
+    groups
+}
+
+/// Print one aligned rollup table.
+fn print_rollup(title: &str, groups: &BTreeMap<String, Rollup>) {
+    let name_width = groups
+        .keys()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .max(title.len());
+    println!(
+        "{title:<name_width$}  {:>6}  {:>10}  {:>10}  {:>10}",
+        "turns", "prompt", "completion", "cost"
+    );
+    for (name, rollup) in groups {
+        let cost = rollup
+            .cost_usd
+            .map_or_else(|| "-".to_string(), |usd| format!("${usd:.2}"));
+        println!(
+            "{name:<name_width$}  {:>6}  {:>10}  {:>10}  {cost:>10}",
+            rollup.turns,
+            format_tokens(rollup.prompt),
+            format_tokens(rollup.completion),
+        );
+    }
+}
+
+/// `wizard usage [--since <days>d]`: per-project and per-provider rollup of
+/// `~/.wizard/usage.jsonl`. Self-contained: no config load, no LLM.
+pub fn run_cli(since: Option<&str>) -> Result<i32> {
+    let days = since.map(parse_since_days).transpose()?;
+    let path = default_log_path().context("could not resolve ~/.wizard")?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("no usage recorded yet ({} does not exist)", path.display());
+            return Ok(0);
+        }
+        Err(err) => return Err(err).context(format!("reading {}", path.display())),
+    };
+
+    let cutoff = days.map(|d| unix_now().saturating_sub(d * 86_400));
+    let turns: Vec<LoggedTurn> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str::<LoggedTurn>(line) {
+            Ok(turn) => Some(turn),
+            Err(err) => {
+                tracing::warn!("skipping malformed usage line: {err}");
+                None
+            }
+        })
+        .filter(|turn| cutoff.is_none_or(|cutoff| turn.ts >= cutoff))
+        .collect();
+
+    if turns.is_empty() {
+        match days {
+            Some(days) => println!("no usage recorded in the last {days} day(s)"),
+            None => println!("no usage recorded yet"),
+        }
+        return Ok(0);
+    }
+
+    let window = days.map_or_else(|| "all time".to_string(), |d| format!("last {d}d"));
+    println!("usage ({window}) — {} turn(s)\n", turns.len());
+    print_rollup("project", &roll_up(&turns, |t| t.project.as_str()));
+    println!();
+    print_rollup("provider", &roll_up(&turns, |t| t.provider.as_str()));
+    Ok(0)
+}
+
 /// Compact human form of a token count for status lines: `842 tok`,
 /// `12.3k tok`, `4.2M tok`.
 pub fn format_tokens(count: u64) -> String {
@@ -243,5 +383,63 @@ mod tests {
         assert_eq!(format_tokens(842), "842 tok");
         assert_eq!(format_tokens(12_345), "12.3k tok");
         assert_eq!(format_tokens(4_200_000), "4.2M tok");
+    }
+
+    #[test]
+    fn since_parsing_accepts_day_suffix_and_rejects_junk() {
+        assert_eq!(parse_since_days("7d").unwrap(), 7);
+        assert_eq!(parse_since_days("30D").unwrap(), 30);
+        assert_eq!(parse_since_days(" 2 ").unwrap(), 2);
+        assert!(parse_since_days("0d").is_err());
+        assert!(parse_since_days("soon").is_err());
+        assert!(parse_since_days("").is_err());
+    }
+
+    #[test]
+    fn rollup_groups_by_key_and_sums_optional_cost() {
+        let turn = |project: &str, provider: &str, cost: Option<f64>| LoggedTurn {
+            ts: 1_700_000_000,
+            project: project.to_string(),
+            provider: provider.to_string(),
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cost_usd: cost,
+        };
+        let turns = vec![
+            turn("/a", "local", None),
+            turn("/a", "claude", Some(0.25)),
+            turn("/b", "claude", Some(0.50)),
+            turn("", "", None),
+        ];
+
+        let by_project = roll_up(&turns, |t| t.project.as_str());
+        assert_eq!(by_project.len(), 3);
+        let a = &by_project["/a"];
+        assert_eq!((a.turns, a.prompt, a.completion), (2, 200, 20));
+        assert_eq!(a.cost_usd, Some(0.25));
+        assert!(by_project.contains_key("(unknown)"), "empty key is labeled");
+
+        let by_provider = roll_up(&turns, |t| t.provider.as_str());
+        let claude = &by_provider["claude"];
+        assert_eq!(claude.turns, 2);
+        assert_eq!(claude.cost_usd, Some(0.75));
+        assert_eq!(
+            by_provider["local"].cost_usd, None,
+            "no cost recorded stays None, not $0"
+        );
+    }
+
+    #[test]
+    fn logged_turn_parses_current_records_and_tolerates_extras() {
+        // A record exactly as `append` writes it today (no cost_usd).
+        let line = r#"{"ts":1700000000,"project":"/p","model":"m","provider":"local","prompt_tokens":5,"completion_tokens":2,"mode":"genie"}"#;
+        let turn: LoggedTurn = serde_json::from_str(line).expect("parses");
+        assert_eq!(turn.prompt_tokens, 5);
+        assert_eq!(turn.cost_usd, None);
+
+        // Future records may carry cost_usd and new fields.
+        let line = r#"{"ts":1,"project":"/p","provider":"x","prompt_tokens":1,"completion_tokens":1,"cost_usd":0.1,"new_field":true}"#;
+        let turn: LoggedTurn = serde_json::from_str(line).expect("parses");
+        assert_eq!(turn.cost_usd, Some(0.1));
     }
 }

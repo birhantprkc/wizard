@@ -1,5 +1,5 @@
 {
-  description = "wizard — One line. Your sovereign agent. Self-extending. Fully local.";
+  description = "wizard — One line. Your sovereign agent. Self-extending. Bring any model.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -56,6 +56,11 @@
               --prefix PATH : ${lib.makeBinPath runtimeBins}
           '';
 
+          # The integration tests (tests/cli.rs, tests/bench.rs) exercise the
+          # compiled binary end-to-end: they spawn it as a subprocess, fake
+          # $HOME, probe localhost ports, and shell out to git — assumptions
+          # the Nix build sandbox doesn't satisfy. CI runs the full suite
+          # (`cargo test --locked`); the flake just builds.
           doCheck = false;
 
           meta = {
@@ -131,8 +136,15 @@
               default = { };
               example = lib.literalExpression ''
                 {
-                  provider = "ollama";
-                  model = "qwen3:0.6b";
+                  active_provider = "local";
+                  providers = [
+                    {
+                      name = "local";
+                      kind = "ollama";
+                      base_url = "http://127.0.0.1:11434";
+                      model = "qwen3:8b";
+                    }
+                  ];
                 }
               '';
               description = ''

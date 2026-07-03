@@ -655,6 +655,14 @@ impl Config {
         };
         config.apply_env();
 
+        if let Some(name) = config.active_provider_mismatch() {
+            tracing::warn!(
+                "active_provider '{name}' does not match any configured provider; \
+                 using '{}' instead",
+                config.active().name
+            );
+        }
+
         Ok(config)
     }
 
@@ -691,6 +699,20 @@ impl Config {
             gguf_path: self.gguf_path.clone(),
             usd_per_mtok_in: None,
             usd_per_mtok_out: None,
+        }
+    }
+
+    /// `Some(name)` when [`active_provider`](Self::active_provider) names no
+    /// configured provider (typo, or the provider was removed) — in that case
+    /// [`active`](Self::active) silently falls back to the first provider (or
+    /// the synthesized local one). `None` when the selection resolves or no
+    /// provider is named. Surfaced as a warning on load and by `wizard doctor`.
+    pub fn active_provider_mismatch(&self) -> Option<String> {
+        let name = self.active_provider.as_ref()?;
+        if self.providers.iter().any(|p| &p.name == name) {
+            None
+        } else {
+            Some(name.clone())
         }
     }
 
@@ -1369,6 +1391,50 @@ usd_per_mtok_out = 15.0
             ..Config::default()
         };
         assert_eq!(config.active().name, "local");
+    }
+
+    #[test]
+    fn active_provider_mismatch_flags_unknown_names_only() {
+        let provider = ProviderConfig {
+            name: "local".to_string(),
+            kind: ProviderKind::LlamaCpp,
+            base_url: DEFAULT_LLAMACPP_HOST.to_string(),
+            model: "qwen3.6:27b".to_string(),
+            api_key_env: None,
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+        };
+
+        // Resolving name / unset name: no mismatch.
+        let config = Config {
+            providers: vec![provider.clone()],
+            active_provider: Some("local".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.active_provider_mismatch(), None);
+        let config = Config {
+            providers: vec![provider.clone()],
+            active_provider: None,
+            ..Config::default()
+        };
+        assert_eq!(config.active_provider_mismatch(), None);
+
+        // Unknown name (typo / removed provider): flagged.
+        let config = Config {
+            providers: vec![provider],
+            active_provider: Some("claud".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.active_provider_mismatch().as_deref(), Some("claud"));
+
+        // A named provider with no providers configured is also a mismatch —
+        // the synthesized local default runs instead.
+        let config = Config {
+            active_provider: Some("ghost".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.active_provider_mismatch().as_deref(), Some("ghost"));
     }
 
     #[test]

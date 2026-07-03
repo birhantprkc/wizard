@@ -8,19 +8,23 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::provider::LlmProvider;
-use super::{ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, Role, ToolCall};
+use super::{
+    ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, ProviderError, Role, ToolCall,
+};
 
 /// Anthropic API version pinned in the `anthropic-version` header.
 const API_VERSION: &str = "2023-06-01";
-/// Required `max_tokens` for the Messages API (Anthropic has no implicit cap).
-const MAX_TOKENS: u32 = 8192;
+/// Required `max_tokens` for the Messages API (Anthropic has no implicit
+/// cap). Sized for long tool outputs (file writes) while staying under every
+/// current Claude model's 64k output ceiling.
+const MAX_TOKENS: u32 = 32_000;
 /// Static fallback model list when `GET /v1/models` is unavailable.
 const FALLBACK_MODELS: &[&str] = &["claude-fable-5"];
 
@@ -56,6 +60,22 @@ impl AnthropicProvider {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Typed error for a transport-level failure reaching the API.
+    fn transport_error(&self, source: reqwest::Error) -> anyhow::Error {
+        let message = format!("cannot reach {}: {source}", self.base_url);
+        anyhow::Error::new(source).context(ProviderError::transport(message))
+    }
+
+    /// Typed error for a non-success HTTP response, body included.
+    async fn status_error(&self, response: reqwest::Response) -> anyhow::Error {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::Error::new(ProviderError::http(
+            status.as_u16(),
+            format!("{} returned HTTP {status}: {body}", self.base_url),
+        ))
     }
 
     /// Attach the Anthropic auth + version headers.
@@ -179,17 +199,18 @@ impl LlmProvider for AnthropicProvider {
             .headers(self.http.get(self.url("/v1/models")))
             .send()
             .await
-            .with_context(|| format!("cannot reach {}", self.base_url))?;
+            .map_err(|source| self.transport_error(source))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!(
-                "{} rejected the API key (HTTP 401) — check the configured API key env var",
-                self.base_url
-            ));
+            return Err(anyhow::Error::new(ProviderError::http(
+                401,
+                format!(
+                    "{} rejected the API key (HTTP 401) — check the configured API key env var",
+                    self.base_url
+                ),
+            )));
         }
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{} returned HTTP {status}: {body}", self.base_url));
+            return Err(self.status_error(response).await);
         }
         Ok(())
     }
@@ -238,17 +259,17 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("chat request to {} failed", self.base_url))?;
+            .map_err(|source| self.transport_error(source))?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{} returned HTTP {status}: {body}", self.base_url));
+            return Err(self.status_error(response).await);
         }
         let bytes = response
             .bytes_stream()
             .map(|item| match item {
                 Ok(chunk) => Ok(chunk.to_vec()),
-                Err(e) => Err(anyhow!(e).context("Anthropic response stream was interrupted")),
+                Err(e) => Err(anyhow!(e).context(ProviderError::transport(
+                    "Anthropic response stream was interrupted",
+                ))),
             })
             .boxed();
         Ok(decode_sse(bytes))
@@ -303,6 +324,8 @@ enum Event {
     #[serde(rename = "message_delta")]
     MessageDelta {
         #[serde(default)]
+        delta: Option<MessageDeltaBody>,
+        #[serde(default)]
         usage: Option<UsageDelta>,
     },
     #[serde(rename = "message_stop")]
@@ -347,6 +370,13 @@ enum BlockDelta {
 }
 
 #[derive(Debug, Deserialize)]
+struct MessageDeltaBody {
+    /// "end_turn", "max_tokens", "tool_use", "stop_sequence", ...
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UsageDelta {
     #[serde(default)]
     output_tokens: Option<u64>,
@@ -366,6 +396,8 @@ struct SseState<S> {
     tool_calls: BTreeMap<u64, ToolAccum>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    /// `stop_reason` from `message_delta` ("end_turn", "max_tokens", ...).
+    done_reason: Option<String>,
     /// Saw `message_stop` or EOF — drain, then emit the final chunk.
     saw_stop: bool,
     emitted_final: bool,
@@ -403,7 +435,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
         message,
         thinking: false,
         done: true,
-        done_reason: None,
+        done_reason: state.done_reason.clone(),
         eval_count: state.eval_count,
         prompt_eval_count: state.prompt_eval_count,
     }
@@ -434,6 +466,7 @@ where
         tool_calls: BTreeMap::new(),
         prompt_eval_count: None,
         eval_count: None,
+        done_reason: None,
         saw_stop: false,
         emitted_final: false,
     };
@@ -491,7 +524,10 @@ where
                         }
                         BlockDelta::Other => {}
                     },
-                    Event::MessageDelta { usage } => {
+                    Event::MessageDelta { delta, usage } => {
+                        if let Some(reason) = delta.and_then(|d| d.stop_reason) {
+                            state.done_reason = Some(reason);
+                        }
                         if let Some(usage) = usage
                             && let Some(output) = usage.output_tokens
                         {
@@ -627,6 +663,7 @@ mod tests {
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("tool_use"));
         assert_eq!(last.prompt_eval_count, Some(9));
         assert_eq!(last.eval_count, Some(6));
         let message = last.message.expect("tool call message");

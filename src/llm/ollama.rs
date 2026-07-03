@@ -4,6 +4,8 @@
 //! small. Provides a startup health probe, a native-tool-support probe, and
 //! NDJSON streaming chat.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,7 +14,7 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 
 use super::provider::LlmProvider;
-use super::{ChatChunk, ChatRequest};
+use super::{ChatChunk, ChatOptions, ChatRequest, ProviderError};
 
 /// Boxed NDJSON chunk stream returned by [`OllamaClient::chat_stream`].
 /// Re-exported from [`crate::llm`] so existing `ollama::ChatStream` paths
@@ -24,6 +26,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overall timeout for small control requests (`/api/tags`, `/api/show`).
 /// Chat requests are exempt — generation can legitimately take minutes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Request context length when the `/api/show` probe fails. Well above
+/// Ollama's silent 4096 default, which truncates agent history server-side.
+const DEFAULT_NUM_CTX: u32 = 16_384;
+/// Cap on the probe-derived `num_ctx`: a 128k+ token KV cache can exhaust
+/// RAM on the machines Ollama typically runs on. An explicit `num_ctx` in
+/// the request is passed through untouched.
+const MAX_DERIVED_NUM_CTX: u32 = 32_768;
 
 /// Errors specific to talking to Ollama, surfaced so the TUI can render
 /// actionable messages (e.g. "is Ollama running?").
@@ -59,11 +68,32 @@ impl OllamaError {
     }
 }
 
+/// Wrap an [`OllamaError`] so callers can classify it either way:
+/// `downcast_ref::<OllamaError>()` (legacy agent retry path) or
+/// `downcast_ref::<ProviderError>()` (shared provider retry contract).
+/// The two classifications agree: `ModelMissing` maps to its originating
+/// 404 and `Unreachable` to a transport failure.
+fn typed(err: OllamaError) -> anyhow::Error {
+    let status = match &err {
+        OllamaError::Unreachable { .. } => None,
+        OllamaError::ModelMissing(_) => Some(404),
+        OllamaError::Api { status, .. } => Some(status.as_u16()),
+    };
+    let provider = ProviderError {
+        status,
+        message: err.to_string(),
+    };
+    anyhow::Error::new(err).context(provider)
+}
+
 /// Client bound to one Ollama host. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     http: reqwest::Client,
     host: String,
+    /// Per-model derived `num_ctx` (see [`OllamaClient::derived_num_ctx`]);
+    /// failed probes cache the fallback so they are not retried per request.
+    num_ctx_cache: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl OllamaClient {
@@ -77,7 +107,11 @@ impl OllamaClient {
             // Builder construction only fails when the TLS backend cannot
             // initialize; fall back to the default client rather than panic.
             .unwrap_or_default();
-        Self { http, host }
+        Self {
+            http,
+            host,
+            num_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Base URL this client talks to.
@@ -94,13 +128,13 @@ impl OllamaClient {
     /// which tells the user to run `ollama serve`.
     fn transport_error(&self, source: reqwest::Error) -> anyhow::Error {
         if source.is_connect() || source.is_timeout() {
-            OllamaError::Unreachable {
+            typed(OllamaError::Unreachable {
                 host: self.host.clone(),
                 source,
-            }
-            .into()
+            })
         } else {
-            anyhow::Error::new(source).context(format!("HTTP request to {} failed", self.host))
+            let message = format!("HTTP request to {} failed: {source}", self.host);
+            anyhow::Error::new(source).context(ProviderError::transport(message))
         }
     }
 
@@ -118,9 +152,9 @@ impl OllamaClient {
             && status == reqwest::StatusCode::NOT_FOUND
             && body.contains("not found")
         {
-            return OllamaError::ModelMissing(model.to_string()).into();
+            return typed(OllamaError::ModelMissing(model.to_string()));
         }
-        OllamaError::Api { status, body }.into()
+        typed(OllamaError::Api { status, body })
     }
 
     /// Startup health probe: `GET /api/tags`. Errors with
@@ -193,11 +227,55 @@ impl OllamaClient {
         Ok(supported)
     }
 
+    /// Effective `num_ctx` for `model` when the request does not set one:
+    /// the model's trained context length from `/api/show` (capped at
+    /// [`MAX_DERIVED_NUM_CTX`]), or [`DEFAULT_NUM_CTX`] when the probe
+    /// fails. Probed once per model per client.
+    async fn derived_num_ctx(&self, model: &str) -> u32 {
+        if let Some(&cached) = self.num_ctx_cache.lock().unwrap().get(model) {
+            return cached;
+        }
+        let derived = self
+            .model_context_length(model)
+            .await
+            .map(|n| n.min(MAX_DERIVED_NUM_CTX))
+            .unwrap_or(DEFAULT_NUM_CTX);
+        self.num_ctx_cache
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), derived);
+        derived
+    }
+
+    /// `POST /api/show` → the `"<arch>.context_length"` entry of
+    /// `model_info`. Any failure yields `None`.
+    async fn model_context_length(&self, model: &str) -> Option<u32> {
+        let response = self
+            .http
+            .post(self.url("/api/show"))
+            .timeout(PROBE_TIMEOUT)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let info: ShowResponse = response.json().await.ok()?;
+        context_length_from_model_info(info.model_info.as_ref()?)
+    }
+
     /// Start a streaming chat completion (`POST /api/chat`, NDJSON).
     /// Yields [`ChatChunk`]s until one with `done == true`; the caller
     /// accumulates `message.content` deltas and collects `tool_calls`.
-    pub async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
+    pub async fn chat_stream(&self, mut request: ChatRequest) -> Result<ChatStream> {
         let model = request.model.clone();
+        // Ollama defaults num_ctx to 4096 and silently truncates the prompt
+        // server-side, so always send an explicit value.
+        let options = request.options.get_or_insert_with(ChatOptions::default);
+        if options.num_ctx.is_none() {
+            options.num_ctx = Some(self.derived_num_ctx(&model).await);
+        }
         let response = self
             .http
             .post(self.url("/api/chat"))
@@ -212,7 +290,9 @@ impl OllamaClient {
             .bytes_stream()
             .map(|item| match item {
                 Ok(chunk) => Ok(chunk.to_vec()),
-                Err(e) => Err(anyhow!(e).context("Ollama response stream was interrupted")),
+                Err(e) => Err(anyhow!(e).context(ProviderError::transport(
+                    "Ollama response stream was interrupted",
+                ))),
             })
             .boxed();
         Ok(decode_ndjson(bytes))
@@ -235,6 +315,13 @@ impl LlmProvider for OllamaClient {
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         OllamaClient::chat_stream(self, request).await
+    }
+
+    /// The server truncates the prompt at `num_ctx`, so the effective window
+    /// is the value chat requests will carry (probe-derived and capped),
+    /// not the model's full trained context length.
+    async fn context_window(&self, model: &str) -> Option<u32> {
+        Some(self.derived_num_ctx(model).await)
     }
 
     fn label(&self) -> String {
@@ -261,6 +348,20 @@ struct ModelTag {
 struct ShowResponse {
     #[serde(default)]
     capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    model_info: Option<serde_json::Value>,
+}
+
+/// Find the `"<architecture>.context_length"` entry in `/api/show`'s
+/// `model_info` map (the key is prefixed by the model architecture,
+/// e.g. `"llama.context_length"` or `"qwen3.context_length"`).
+fn context_length_from_model_info(model_info: &serde_json::Value) -> Option<u32> {
+    model_info.as_object()?.iter().find_map(|(key, value)| {
+        if !key.ends_with(".context_length") {
+            return None;
+        }
+        value.as_u64().and_then(|n| u32::try_from(n).ok())
+    })
 }
 
 /// In-band error line Ollama can emit mid-stream: `{"error": "..."}`.
@@ -414,6 +515,70 @@ mod tests {
             .is_transient()
         );
         assert!(!OllamaError::ModelMissing("m".to_string()).is_transient());
+    }
+
+    #[test]
+    fn typed_errors_downcast_to_both_error_types() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).expect("valid status");
+        let err = typed(OllamaError::Api {
+            status: status(503),
+            body: "busy".to_string(),
+        });
+        let ollama = err.downcast_ref::<OllamaError>().expect("legacy type");
+        let provider = err.downcast_ref::<ProviderError>().expect("shared type");
+        assert_eq!(provider.status, Some(503));
+        assert_eq!(ollama.is_transient(), provider.is_transient());
+        assert!(provider.message.contains("busy"), "body surfaces");
+
+        // ModelMissing carries its originating 404 so both classifications
+        // agree that it is not retryable.
+        let err = typed(OllamaError::ModelMissing("m".to_string()));
+        let provider = err.downcast_ref::<ProviderError>().expect("shared type");
+        assert_eq!(provider.status, Some(404));
+        assert!(!provider.is_transient());
+    }
+
+    #[test]
+    fn context_length_is_read_from_model_info() {
+        let info = serde_json::json!({
+            "general.architecture": "qwen3",
+            "qwen3.context_length": 40_960,
+            "qwen3.embedding_length": 1024,
+        });
+        assert_eq!(context_length_from_model_info(&info), Some(40_960));
+        assert_eq!(
+            context_length_from_model_info(&serde_json::json!({"general.architecture": "x"})),
+            None
+        );
+        assert_eq!(
+            context_length_from_model_info(&serde_json::Value::Null),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_num_ctx_falls_back_and_caches_when_probe_fails() {
+        // Port 1 on localhost: connection refused immediately, no server needed.
+        let client = OllamaClient::new("http://127.0.0.1:1");
+        assert_eq!(client.derived_num_ctx("m").await, DEFAULT_NUM_CTX);
+        assert_eq!(
+            client.num_ctx_cache.lock().unwrap().get("m"),
+            Some(&DEFAULT_NUM_CTX),
+            "fallback is cached so the probe is not retried per request"
+        );
+        assert_eq!(client.context_window("m").await, Some(DEFAULT_NUM_CTX));
+    }
+
+    #[test]
+    fn derived_num_ctx_is_capped() {
+        // The cap keeps a huge trained context from allocating an equally
+        // huge KV cache by default.
+        let derived = context_length_from_model_info(&serde_json::json!({
+            "llama.context_length": 1_048_576u64,
+        }))
+        .map(|n| n.min(MAX_DERIVED_NUM_CTX))
+        .unwrap_or(DEFAULT_NUM_CTX);
+        assert_eq!(derived, MAX_DERIVED_NUM_CTX);
     }
 
     #[tokio::test]

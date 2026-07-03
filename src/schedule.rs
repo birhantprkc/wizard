@@ -122,6 +122,16 @@ pub async fn run(cmd: ScheduleCmd) -> Result<i32> {
             println!("removed '{name}'");
             Ok(0)
         }
+        ScheduleCmd::Enable { name } => {
+            set_enabled(&path, &name, true)?;
+            println!("enabled '{name}'");
+            Ok(0)
+        }
+        ScheduleCmd::Disable { name } => {
+            set_enabled(&path, &name, false)?;
+            println!("disabled '{name}' — kept in the file, never fired");
+            Ok(0)
+        }
         ScheduleCmd::Run { name } => run_foreground(&path, &name).await,
     }
 }
@@ -225,6 +235,19 @@ pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
     if file.entries.len() == before {
         bail!("no entry named '{name}' — see `wizard schedule list`");
     }
+    save_schedule(path, &file)
+}
+
+/// Set an entry's `enabled` flag; error when absent. Idempotent: enabling
+/// an enabled entry (or disabling a disabled one) is a no-op that succeeds.
+pub fn set_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
+    let mut file = load_schedule(path)?;
+    let entry = file
+        .entries
+        .iter_mut()
+        .find(|e| e.name == name)
+        .with_context(|| format!("no entry named '{name}' — see `wizard schedule list`"))?;
+    entry.enabled = enabled;
     save_schedule(path, &file)
 }
 
@@ -362,6 +385,8 @@ struct RunningJob {
     started: Instant,
     /// `max_hours + KILL_GRACE` from spawn; `None` = unbounded.
     deadline: Option<Instant>,
+    /// Where the job's stdout/stderr are captured.
+    log_path: PathBuf,
 }
 
 /// Pure due-detection: which enabled entries have an occurrence at or
@@ -430,16 +455,62 @@ fn log_line(path: &Path, msg: &str) {
     }
 }
 
-/// Spawn one entry's job for the daemon: stdio detached to null (the run's
-/// own transcript lives in the child's `~/.wizard` state, not here).
-fn spawn_job(entry: &ScheduleEntry) -> Result<RunningJob> {
+/// Per-job log files kept per entry name in `~/.wizard/logs/jobs/`; older
+/// ones are pruned on each spawn.
+const JOB_LOGS_KEEP: usize = 10;
+
+/// `<jobs_dir>/<name>-<timestamp>.log` for a job fired now. The timestamp
+/// sorts lexically, so pruning can just sort file names.
+fn job_log_path(jobs_dir: &Path, name: &str) -> PathBuf {
+    jobs_dir.join(format!(
+        "{name}-{}.log",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ))
+}
+
+/// Keep only the newest `keep` logs for `name` in `jobs_dir` (best-effort:
+/// pruning failures must never stop the daemon).
+fn prune_job_logs(jobs_dir: &Path, name: &str, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(jobs_dir) else {
+        return;
+    };
+    let prefix = format!("{name}-");
+    let mut logs: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".log"))
+        })
+        .collect();
+    logs.sort();
+    let excess = logs.len().saturating_sub(keep);
+    for old in &logs[..excess] {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Spawn one entry's job for the daemon: stdout/stderr go to a per-job log
+/// under `~/.wizard/logs/jobs/`, so early failures leave evidence (the
+/// run's own transcript still lives in the child's `~/.wizard` state).
+fn spawn_job(entry: &ScheduleEntry, jobs_dir: &Path) -> Result<RunningJob> {
+    std::fs::create_dir_all(jobs_dir)
+        .with_context(|| format!("creating {}", jobs_dir.display()))?;
+    let log_path = job_log_path(jobs_dir, &entry.name);
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| format!("cloning the log handle for {}", log_path.display()))?;
     let child = child_command(entry)?
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .kill_on_drop(true)
         .spawn()
         .context("spawning job")?;
+    prune_job_logs(jobs_dir, &entry.name, JOB_LOGS_KEEP);
     let now = Instant::now();
     Ok(RunningJob {
         name: entry.name.clone(),
@@ -448,6 +519,7 @@ fn spawn_job(entry: &ScheduleEntry) -> Result<RunningJob> {
         deadline: entry
             .max_hours
             .map(|hours| now + Duration::from_secs_f64(hours * 3600.0) + KILL_GRACE),
+        log_path,
     })
 }
 
@@ -460,12 +532,13 @@ async fn reap_jobs(jobs: &mut Vec<RunningJob>, log_path: &Path) {
                 log_line(
                     log_path,
                     &format!(
-                        "finished '{}' — exit {} after {:.0}s",
+                        "finished '{}' — exit {} after {:.0}s (log {})",
                         job.name,
                         status
                             .code()
                             .map_or_else(|| "signal".to_string(), |code| code.to_string()),
-                        job.started.elapsed().as_secs_f64()
+                        job.started.elapsed().as_secs_f64(),
+                        job.log_path.display()
                     ),
                 );
             }
@@ -478,9 +551,10 @@ async fn reap_jobs(jobs: &mut Vec<RunningJob>, log_path: &Path) {
                     log_line(
                         log_path,
                         &format!(
-                            "timeout '{}' — killed after {:.0}s (max_hours exceeded)",
+                            "timeout '{}' — killed after {:.0}s (max_hours exceeded; log {})",
                             job.name,
-                            job.started.elapsed().as_secs_f64()
+                            job.started.elapsed().as_secs_f64(),
+                            job.log_path.display()
                         ),
                     );
                 } else {
@@ -498,16 +572,65 @@ async fn reap_jobs(jobs: &mut Vec<RunningJob>, log_path: &Path) {
     *jobs = kept;
 }
 
+/// Take an exclusive advisory lock on `~/.wizard/scheduler.lock` so two
+/// daemons can never double-fire every job. Returns the held lock file;
+/// it stays open for the daemon's lifetime and the kernel releases the
+/// lock on process exit (including SIGKILL), so no stale-lock cleanup is
+/// ever needed.
+#[cfg(unix)]
+fn acquire_daemon_lock(wizard_dir: &Path) -> Result<std::fs::File> {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
+
+    std::fs::create_dir_all(wizard_dir)
+        .with_context(|| format!("creating {}", wizard_dir.display()))?;
+    let path = wizard_dir.join("scheduler.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let holder = std::fs::read_to_string(&path).unwrap_or_default();
+        let holder = holder.trim();
+        bail!(
+            "another `wizard scheduler` is already running{} — lock held on {}",
+            if holder.is_empty() {
+                String::new()
+            } else {
+                format!(" (pid {holder})")
+            },
+            path.display()
+        );
+    }
+    // Record the holder's pid for humans; the flock is the actual gate.
+    file.set_len(0).ok();
+    let _ = writeln!(file, "{}", std::process::id());
+    Ok(file)
+}
+
+/// Windows fallback: no flock; the daemon runs unlocked (wizard's daemon
+/// paths are Unix-first).
+#[cfg(not(unix))]
+fn acquire_daemon_lock(_wizard_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// `wizard scheduler`: the foreground daemon loop. Each pass it reaps
 /// children, reloads the schedule, fires every due entry (concurrently —
 /// one spawn each, never serialized), then sleeps until the next fire,
 /// capped at [`MAX_SLEEP`] so reloads stay timely. Ctrl-C kills running
-/// jobs and exits 0.
+/// jobs and exits 0. A second daemon instance exits immediately with an
+/// error (advisory lock on `~/.wizard/scheduler.lock`).
 pub async fn run_daemon() -> Result<i32> {
     let schedule_path = Config::schedule_path()?;
+    let _lock = acquire_daemon_lock(&Config::wizard_dir()?)?;
     let logs_dir = Config::logs_dir()?;
-    std::fs::create_dir_all(&logs_dir)
-        .with_context(|| format!("creating {}", logs_dir.display()))?;
+    let jobs_dir = logs_dir.join("jobs");
+    std::fs::create_dir_all(&jobs_dir)
+        .with_context(|| format!("creating {}", jobs_dir.display()))?;
     let log_path = logs_dir.join("scheduler.log");
 
     let started = Local::now();
@@ -539,7 +662,7 @@ pub async fn run_daemon() -> Result<i32> {
             .collect();
         for entry in due {
             last_fired.insert(entry.name.clone(), now);
-            match spawn_job(&entry) {
+            match spawn_job(&entry, &jobs_dir) {
                 Ok(job) => {
                     log_line(
                         &log_path,
@@ -682,6 +805,67 @@ mod tests {
 
         let err = remove_entry(&path, "nightly").unwrap_err();
         assert!(err.to_string().contains("no entry"), "{err}");
+    }
+
+    #[test]
+    fn set_enabled_toggles_and_errors_on_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schedule.toml");
+        add_entry(&path, entry("nightly", "0 3 * * *")).expect("add");
+
+        set_enabled(&path, "nightly", false).expect("disable");
+        assert!(!load_schedule(&path).unwrap().entries[0].enabled);
+
+        // Idempotent: disabling again still succeeds.
+        set_enabled(&path, "nightly", false).expect("disable again");
+
+        set_enabled(&path, "nightly", true).expect("enable");
+        assert!(load_schedule(&path).unwrap().entries[0].enabled);
+
+        let err = set_enabled(&path, "absent", true).unwrap_err();
+        assert!(err.to_string().contains("no entry"), "{err}");
+    }
+
+    #[test]
+    fn job_logs_are_pruned_per_entry_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        for i in 0..5 {
+            std::fs::write(jobs.join(format!("nightly-2026010{i}-000000.log")), "x").unwrap();
+        }
+        // Another entry's logs are untouched.
+        std::fs::write(jobs.join("other-20260101-000000.log"), "x").unwrap();
+        // Non-log files are untouched.
+        std::fs::write(jobs.join("nightly-notes.txt"), "x").unwrap();
+
+        prune_job_logs(&jobs, "nightly", 2);
+        let mut names: Vec<String> = std::fs::read_dir(&jobs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "nightly-20260103-000000.log",
+                "nightly-20260104-000000.log",
+                "nightly-notes.txt",
+                "other-20260101-000000.log",
+            ],
+            "keeps the newest two nightly logs"
+        );
+
+        // Pruning a missing dir is a no-op.
+        prune_job_logs(&dir.path().join("absent"), "nightly", 2);
+    }
+
+    #[test]
+    fn job_log_path_is_name_timestamped() {
+        let path = job_log_path(Path::new("/tmp/jobs"), "nightly");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("nightly-"), "{name}");
+        assert!(name.ends_with(".log"), "{name}");
     }
 
     #[test]

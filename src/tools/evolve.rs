@@ -160,3 +160,113 @@ fn describe_outcome(outcome: &EvolveOutcome) -> String {
         EvolveOutcome::Denied => "denied".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Temp project dir removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("wizard-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn ctx(&self) -> ToolContext {
+            ToolContext::new(&self.0)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn args_require_a_description() {
+        let err =
+            parse_args::<EvolveArgs>("evolve", json!({})).expect_err("description is required");
+        assert!(matches!(err, ToolError::InvalidArgs { tool, .. } if tool == "evolve"));
+    }
+
+    #[test]
+    fn args_default_deep_to_false() {
+        let args: EvolveArgs = parse_args("evolve", json!({ "description": "add x" })).unwrap();
+        assert_eq!(args.description, "add x");
+        assert!(!args.deep);
+
+        let args: EvolveArgs =
+            parse_args("evolve", json!({ "description": "add x", "deep": true })).unwrap();
+        assert!(args.deep);
+    }
+
+    #[test]
+    fn write_marker_creates_the_file_and_reports_it() {
+        let tmp = TempDir::new();
+        let note = write_marker(&tmp.ctx(), "evolve-reload");
+        assert!(tmp.0.join(".wizard").join("evolve-reload").exists());
+        assert!(note.starts_with("Wrote "), "{note}");
+        assert!(note.contains("evolve-reload"), "{note}");
+    }
+
+    #[test]
+    fn write_marker_reports_failure_instead_of_erroring() {
+        let tmp = TempDir::new();
+        // A file where the .wizard directory should go makes create_dir_all fail.
+        std::fs::write(tmp.0.join(".wizard"), b"not a dir").unwrap();
+        let note = write_marker(&tmp.ctx(), "evolve-reexec");
+        assert!(note.starts_with("(could not create"), "{note}");
+    }
+
+    #[test]
+    fn describe_outcome_covers_every_variant() {
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::SkillAdded {
+                name: "s".to_string(),
+                path: PathBuf::from("/p"),
+            }),
+            "added skill 's'"
+        );
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::McpServerRegistered {
+                name: "m".to_string(),
+            }),
+            "registered MCP server 'm'"
+        );
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::ScriptedToolAdded {
+                name: "t".to_string(),
+                path: PathBuf::from("/p"),
+            }),
+            "added scripted tool 't'"
+        );
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::SubagentAdded {
+                name: "a".to_string(),
+            }),
+            "added subagent 'a'"
+        );
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::DeepRebuilt {
+                binary: PathBuf::from("/bin/wizard"),
+            }),
+            "rebuilt binary at /bin/wizard"
+        );
+        assert_eq!(describe_outcome(&EvolveOutcome::Denied), "denied");
+        assert_eq!(
+            describe_outcome(&EvolveOutcome::FellBackToRuntime {
+                reason: "no toolchain".to_string(),
+                outcome: Box::new(EvolveOutcome::SubagentAdded {
+                    name: "a".to_string(),
+                }),
+            }),
+            "fell back (no toolchain): added subagent 'a'"
+        );
+    }
+}

@@ -54,8 +54,6 @@ fn help_prints_usage_and_documented_flags() {
     assert!(output.status.success(), "--help must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage:"), "help shows usage:\n{stdout}");
-    // `--auto` is deprecated (approval gating was removed): still parsed for
-    // compatibility but hidden from help.
     for flag in [
         "--mode",
         "--prompt",
@@ -334,6 +332,189 @@ fn schedule_add_list_remove_round_trip() {
         !output.status.success(),
         "removing a missing entry must fail"
     );
+}
+
+#[test]
+fn schedule_enable_disable_round_trip() {
+    let home = TempDir::new();
+    let cwd = home.0.to_string_lossy().to_string();
+
+    let output = run_wizard(
+        &home.0,
+        &[
+            "schedule",
+            "add",
+            "nightly",
+            "--cron",
+            "0 3 * * *",
+            "--prompt",
+            "tidy",
+            "--cwd",
+            &cwd,
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "add must succeed");
+
+    let output = run_wizard(&home.0, &["schedule", "disable", "nightly"], &[]);
+    assert!(output.status.success(), "disable must succeed");
+    let output = run_wizard(&home.0, &["schedule", "list"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no "),
+        "list must show the entry disabled:\n{stdout}"
+    );
+
+    let output = run_wizard(&home.0, &["schedule", "enable", "nightly"], &[]);
+    assert!(output.status.success(), "enable must succeed");
+    let output = run_wizard(&home.0, &["schedule", "list"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("yes"),
+        "list must show the entry enabled:\n{stdout}"
+    );
+
+    let output = run_wizard(&home.0, &["schedule", "enable", "missing"], &[]);
+    assert!(
+        !output.status.success(),
+        "enabling a missing entry must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no entry"), "stderr: {stderr}");
+}
+
+#[test]
+fn top_level_flags_with_a_subcommand_are_rejected_loudly() {
+    let home = TempDir::new();
+    let output = run_wizard(&home.0, &["--plan", "fleet", "status"], &[]);
+    assert!(
+        !output.status.success(),
+        "--plan with a subcommand must be an error, not silently dropped"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--plan"), "error names the flag:\n{stderr}");
+
+    // --cwd is honored everywhere and stays allowed.
+    let cwd = home.0.to_string_lossy().to_string();
+    let output = run_wizard(&home.0, &["--cwd", &cwd, "schedule", "list"], &[]);
+    assert!(
+        output.status.success(),
+        "--cwd with a subcommand stays allowed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn usage_reports_empty_and_rolls_up_records() {
+    let home = TempDir::new();
+    let output = run_wizard(&home.0, &["usage"], &[]);
+    assert!(output.status.success(), "usage with no log must exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no usage recorded"),
+        "empty message:\n{stdout}"
+    );
+
+    let dir = home.0.join(".wizard");
+    std::fs::create_dir_all(&dir).expect("create .wizard");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        dir.join("usage.jsonl"),
+        format!(
+            "{{\"ts\":{now},\"project\":\"/proj/a\",\"model\":\"m\",\"provider\":\"local\",\"prompt_tokens\":100,\"completion_tokens\":10,\"mode\":\"genie\"}}\n\
+             {{\"ts\":{now},\"project\":\"/proj/b\",\"model\":\"m\",\"provider\":\"claude\",\"prompt_tokens\":200,\"completion_tokens\":20,\"mode\":\"sovereign\"}}\n\
+             {{\"ts\":10,\"project\":\"/proj/old\",\"model\":\"m\",\"provider\":\"old\",\"prompt_tokens\":1,\"completion_tokens\":1,\"mode\":\"genie\"}}\n"
+        ),
+    )
+    .expect("write usage log");
+
+    let output = run_wizard(&home.0, &["usage"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("3 turn(s)"), "all time:\n{stdout}");
+    assert!(stdout.contains("/proj/a"), "per-project rows:\n{stdout}");
+    assert!(stdout.contains("claude"), "per-provider rows:\n{stdout}");
+
+    let output = run_wizard(&home.0, &["usage", "--since", "7d"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2 turn(s)"), "windowed:\n{stdout}");
+    assert!(
+        !stdout.contains("/proj/old"),
+        "ancient record filtered out:\n{stdout}"
+    );
+
+    let output = run_wizard(&home.0, &["usage", "--since", "soon"], &[]);
+    assert!(!output.status.success(), "bad --since must be rejected");
+}
+
+#[test]
+fn evolve_list_and_undo_work_against_the_history_log() {
+    let home = TempDir::new();
+    let output = run_wizard(&home.0, &["evolve", "list"], &[]);
+    assert!(output.status.success(), "empty history exits 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no evolutions recorded"),
+        "empty message:\n{stdout}"
+    );
+
+    // Two recorded evolutions: an old skill and a newer one.
+    let dir = home.0.join(".wizard");
+    let skill_dir = dir.join("skills").join("newer");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, "body").expect("write skill");
+    let event = |name: &str, path: &std::path::Path, ts: &str| {
+        format!(
+            "{{\"timestamp\":\"{ts}\",\"tier\":\"runtime\",\"description\":\"add {name}\",\
+             \"outcome\":{{\"kind\":\"skill_added\",\"name\":\"{name}\",\"path\":{}}}}}",
+            serde_json::to_string(path).unwrap()
+        )
+    };
+    std::fs::write(
+        dir.join("evolution.jsonl"),
+        format!(
+            "{}\n{}\n",
+            event(
+                "older",
+                &dir.join("skills/older/SKILL.md"),
+                "2026-01-01T00:00:00Z"
+            ),
+            event("newer", &skill_path, "2026-02-01T00:00:00Z"),
+        ),
+    )
+    .expect("write history");
+
+    let output = run_wizard(&home.0, &["evolve", "list"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("add newer"), "history listed:\n{stdout}");
+    let newer_pos = stdout.find("add newer").unwrap();
+    let older_pos = stdout.find("add older").unwrap();
+    assert!(newer_pos < older_pos, "most recent first:\n{stdout}");
+
+    // Undo #1 (the newer skill): removes its file.
+    let output = run_wizard(&home.0, &["evolve", "undo", "1"], &[]);
+    assert!(
+        output.status.success(),
+        "undo must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!skill_path.exists(), "undo deletes the skill file");
+
+    // Undo #2: its artifacts never existed — refuse clearly.
+    let output = run_wizard(&home.0, &["evolve", "undo", "2"], &[]);
+    assert!(!output.status.success(), "undo of missing artifacts fails");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already gone"), "stderr: {stderr}");
+
+    // Out-of-range index.
+    let output = run_wizard(&home.0, &["evolve", "undo", "9"], &[]);
+    assert!(!output.status.success(), "out-of-range undo fails");
 }
 
 #[test]

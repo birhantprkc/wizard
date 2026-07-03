@@ -52,13 +52,43 @@ use crate::config::Mode;
 /// limit); every other mode exits 0 on success. Hard errors surface as `Err`
 /// and exit 1 from `main`.
 pub async fn run(cli: cli::Cli) -> Result<i32> {
+    // Top-level flags are not global: the self-contained subcommands below
+    // read none of them (only --cwd). Reject the combination loudly instead
+    // of silently dropping the flags (`wizard --plan fleet run` must not run
+    // an un-planned fleet). `wizard agents` is exempt: it goes through the
+    // normal config path, where the flags do apply.
+    if let Some(command) = &cli.command
+        && !matches!(command, cli::Command::Agents)
+    {
+        let ignored = cli.ignored_top_level_flags();
+        if !ignored.is_empty() {
+            anyhow::bail!(
+                "{} cannot be combined with a `wizard` subcommand — \
+                 these top-level flags would be ignored; drop them (only --cwd applies)",
+                ignored.join(", ")
+            );
+        }
+    }
+
     // Bench is self-contained tooling: it must work with no config and no
-    // LLM, so dispatch before onboarding and before the config load.
+    // LLM, so dispatch before onboarding and before the config load. Its
+    // exit code is nonzero when any replayed case failed, so it can gate CI.
     if let Some(cli::Command::Bench { cmd }) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        return bench::run(cmd.clone()).await.map(|()| 0);
+        return bench::run(cmd.clone()).await;
+    }
+
+    // Usage rollup: reads ~/.wizard/usage.jsonl only.
+    if let Some(cli::Command::Usage { since }) = &cli.command {
+        return usage::run_cli(since.as_deref());
+    }
+
+    // Evolution history: reads ~/.wizard/evolution.jsonl and touches the
+    // recorded artifacts directly (list / undo) — no config, no LLM.
+    if let Some(cli::Command::Evolve { cmd }) = &cli.command {
+        return evolve::run_history_cli(cmd.clone());
     }
 
     // Doctor diagnoses the environment — starting with "does the config

@@ -28,6 +28,22 @@ use crate::config::{Config, Mode};
 /// Wall-clock budget for one hook when `timeout_secs` is not set.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// Cap on the `tool_output` field in `post_tool_use` payloads.
+const TOOL_OUTPUT_CAP_BYTES: usize = 32 * 1024;
+
+/// `output` capped to [`TOOL_OUTPUT_CAP_BYTES`] on a char boundary, with a
+/// marker when content was dropped.
+fn cap_tool_output(output: &str) -> String {
+    if output.len() <= TOOL_OUTPUT_CAP_BYTES {
+        return output.to_string();
+    }
+    let mut cut = TOOL_OUTPUT_CAP_BYTES;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n... [tool output truncated]", &output[..cut])
+}
+
 /// Lifecycle points a hook can attach to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,7 +287,13 @@ impl HookEngine {
         for hook in self.matching(HookEvent::PreToolUse, Some(tool)) {
             let effective = updated.as_ref().unwrap_or(args);
             let run = self
-                .run(hook, HookEvent::PreToolUse, Some((tool, effective)), mode)
+                .run(
+                    hook,
+                    HookEvent::PreToolUse,
+                    Some((tool, effective)),
+                    None,
+                    mode,
+                )
                 .await;
             match run {
                 RunResult::Exited {
@@ -324,19 +346,28 @@ impl HookEngine {
         PreToolUse::Continue(updated)
     }
 
-    /// `post_tool_use`: extra context to append to the tool result, if any
-    /// matching hook printed some.
-    pub async fn post_tool_use(
+    /// `post_tool_use` with the tool result in the payload: `tool_output`
+    /// (capped to [`TOOL_OUTPUT_CAP_BYTES`]) and `is_error`, so hooks can
+    /// react to what the tool actually did. Returns extra context to append
+    /// to the tool result, if any matching hook printed some.
+    pub async fn post_tool_use_with_output(
         &self,
         tool: &str,
         args: &Value,
+        output: &str,
+        is_error: bool,
         mode: Mode,
         events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Option<String> {
+        let extra = json!({
+            "tool_output": cap_tool_output(output),
+            "is_error": is_error,
+        });
         match self
             .fire(
                 HookEvent::PostToolUse,
                 Some((tool, args)),
+                Some(extra),
                 mode,
                 false,
                 true,
@@ -350,14 +381,78 @@ impl HookEngine {
         }
     }
 
-    /// `user_prompt_submit`: may veto the turn or add context to the message.
+    /// `post_tool_use` without the tool result: the payload omits
+    /// `tool_output`/`is_error`. Compatibility entry point for call sites not
+    /// yet passing the result; prefer [`Self::post_tool_use_with_output`].
+    pub async fn post_tool_use(
+        &self,
+        tool: &str,
+        args: &Value,
+        mode: Mode,
+        events: Option<&mpsc::Sender<AgentEvent>>,
+    ) -> Option<String> {
+        match self
+            .fire(
+                HookEvent::PostToolUse,
+                Some((tool, args)),
+                None,
+                mode,
+                false,
+                true,
+                events,
+            )
+            .await
+        {
+            FireResult::Continue(extra) => extra,
+            // Unreachable: post_tool_use is not blockable.
+            FireResult::Block(_) => None,
+        }
+    }
+
+    /// `user_prompt_submit` with the user message in the payload as `prompt`,
+    /// so hooks can block or annotate a turn based on what was asked. May
+    /// veto the turn or add context to the message.
+    pub async fn user_prompt_submit_with_prompt(
+        &self,
+        prompt: &str,
+        mode: Mode,
+        events: Option<&mpsc::Sender<AgentEvent>>,
+    ) -> PromptSubmit {
+        let extra = json!({ "prompt": prompt });
+        match self
+            .fire(
+                HookEvent::UserPromptSubmit,
+                None,
+                Some(extra),
+                mode,
+                true,
+                true,
+                events,
+            )
+            .await
+        {
+            FireResult::Continue(extra) => PromptSubmit::Continue(extra),
+            FireResult::Block(reason) => PromptSubmit::Block(reason),
+        }
+    }
+
+    /// `user_prompt_submit` without the prompt in the payload. Compatibility
+    /// entry point; prefer [`Self::user_prompt_submit_with_prompt`].
     pub async fn user_prompt_submit(
         &self,
         mode: Mode,
         events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> PromptSubmit {
         match self
-            .fire(HookEvent::UserPromptSubmit, None, mode, true, true, events)
+            .fire(
+                HookEvent::UserPromptSubmit,
+                None,
+                None,
+                mode,
+                true,
+                true,
+                events,
+            )
             .await
         {
             FireResult::Continue(extra) => PromptSubmit::Continue(extra),
@@ -373,7 +468,15 @@ impl HookEngine {
         events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Option<String> {
         match self
-            .fire(HookEvent::SessionStart, None, mode, false, true, events)
+            .fire(
+                HookEvent::SessionStart,
+                None,
+                None,
+                mode,
+                false,
+                true,
+                events,
+            )
             .await
         {
             FireResult::Continue(extra) => extra,
@@ -383,22 +486,33 @@ impl HookEngine {
 
     /// `session_end`: observational; output is ignored.
     pub async fn session_end(&self, mode: Mode, events: Option<&mpsc::Sender<AgentEvent>>) {
-        self.fire(HookEvent::SessionEnd, None, mode, false, false, events)
-            .await;
+        self.fire(
+            HookEvent::SessionEnd,
+            None,
+            None,
+            mode,
+            false,
+            false,
+            events,
+        )
+        .await;
     }
 
     /// `turn_end`: observational; output is ignored.
     pub async fn turn_end(&self, mode: Mode, events: Option<&mpsc::Sender<AgentEvent>>) {
-        self.fire(HookEvent::TurnEnd, None, mode, false, false, events)
+        self.fire(HookEvent::TurnEnd, None, None, mode, false, false, events)
             .await;
     }
 
-    /// Run the matching hooks for `event` sequentially. `blockable` honors
-    /// exit 2; `capture` collects non-empty stdout as extra context.
+    /// Run the matching hooks for `event` sequentially. `payload_extra`
+    /// carries event-specific payload fields; `blockable` honors exit 2;
+    /// `capture` collects non-empty stdout as extra context.
+    #[allow(clippy::too_many_arguments)]
     async fn fire(
         &self,
         event: HookEvent,
         tool: Option<(&str, &Value)>,
+        payload_extra: Option<Value>,
         mode: Mode,
         blockable: bool,
         capture: bool,
@@ -406,7 +520,10 @@ impl HookEngine {
     ) -> FireResult {
         let mut extra: Vec<String> = Vec::new();
         for hook in self.matching(event, tool.map(|(name, _)| name)) {
-            match self.run(hook, event, tool, mode).await {
+            match self
+                .run(hook, event, tool, payload_extra.as_ref(), mode)
+                .await
+            {
                 RunResult::Exited {
                     code: 0, stdout, ..
                 } => {
@@ -462,16 +579,17 @@ impl HookEngine {
 
     /// Run one hook to completion: payload on stdin, stdout/stderr captured,
     /// timeout enforced (dropping the wait kills the child via
-    /// `kill_on_drop`).
+    /// `kill_on_drop`). `payload_extra` fields are merged into the payload.
     async fn run(
         &self,
         hook: &CompiledHook,
         event: HookEvent,
         tool: Option<(&str, &Value)>,
+        payload_extra: Option<&Value>,
         mode: Mode,
     ) -> RunResult {
         let session_id = self.session_id.lock().unwrap().clone();
-        let payload = json!({
+        let mut payload = json!({
             "event": event.name(),
             "tool_name": tool.map(|(name, _)| name),
             "args": tool.map(|(_, args)| args),
@@ -479,6 +597,12 @@ impl HookEngine {
             "session_id": session_id,
             "mode": mode.to_string(),
         });
+        if let Some(Value::Object(fields)) = payload_extra {
+            payload
+                .as_object_mut()
+                .expect("payload is an object")
+                .extend(fields.clone());
+        }
 
         let mut child = match tokio::process::Command::new("sh")
             .arg("-c")
@@ -741,5 +865,80 @@ mod tests {
     fn block_reason_falls_back_when_stderr_is_empty() {
         assert_eq!(block_reason("  denied \n"), "denied");
         assert_eq!(block_reason(""), "hook gave no reason");
+    }
+
+    #[test]
+    fn cap_tool_output_truncates_on_char_boundaries() {
+        assert_eq!(cap_tool_output("short"), "short");
+        let long = "é".repeat(TOOL_OUTPUT_CAP_BYTES); // 2 bytes per char
+        let capped = cap_tool_output(&long);
+        assert!(capped.len() <= TOOL_OUTPUT_CAP_BYTES + 32);
+        assert!(capped.ends_with("[tool output truncated]"));
+    }
+
+    // A `cat` hook echoes the stdin payload back as appended context, so
+    // these tests observe exactly what a hook receives.
+
+    #[tokio::test]
+    async fn user_prompt_submit_with_prompt_puts_the_prompt_in_the_payload() {
+        let engine = engine(vec![def(HookEvent::UserPromptSubmit, None, "cat")]);
+        match engine
+            .user_prompt_submit_with_prompt("deploy to prod", Mode::default(), None)
+            .await
+        {
+            PromptSubmit::Continue(Some(payload)) => {
+                assert!(
+                    payload.contains(r#""event":"user_prompt_submit""#),
+                    "{payload}"
+                );
+                assert!(
+                    payload.contains(r#""prompt":"deploy to prod""#),
+                    "{payload}"
+                );
+            }
+            other => panic!("expected appended context, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_with_output_puts_the_result_in_the_payload() {
+        let engine = engine(vec![def(HookEvent::PostToolUse, None, "cat")]);
+        let payload = engine
+            .post_tool_use_with_output(
+                "execute",
+                &json!({ "command": "true" }),
+                "exit code: 3",
+                true,
+                Mode::default(),
+                None,
+            )
+            .await
+            .expect("cat echoes the payload");
+        assert!(
+            payload.contains(r#""tool_output":"exit code: 3""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""is_error":true"#), "{payload}");
+        assert!(payload.contains(r#""tool_name":"execute""#), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn legacy_entry_points_omit_the_new_fields() {
+        let engine = engine(vec![
+            def(HookEvent::PostToolUse, None, "cat"),
+            def(HookEvent::UserPromptSubmit, None, "cat"),
+        ]);
+        let payload = engine
+            .post_tool_use("execute", &json!({}), Mode::default(), None)
+            .await
+            .expect("cat echoes the payload");
+        assert!(!payload.contains("tool_output"), "{payload}");
+        assert!(!payload.contains("is_error"), "{payload}");
+        match engine.user_prompt_submit(Mode::default(), None).await {
+            PromptSubmit::Continue(Some(payload)) => {
+                assert!(!payload.contains(r#""prompt":"#), "{payload}")
+            }
+            other => panic!("expected appended context, got: {other:?}"),
+        }
     }
 }

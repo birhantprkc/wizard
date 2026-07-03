@@ -143,7 +143,7 @@ wizard -p "list files in the current directory"
 
 ## Model requirements
 
-Wizard v0.1 expects models that support:
+Wizard expects models that support:
 
 | Capability | Required | Notes |
 |------------|----------|-------|

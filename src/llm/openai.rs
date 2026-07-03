@@ -17,7 +17,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::provider::LlmProvider;
-use super::{ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, Role, ToolCall};
+use super::{
+    ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, ProviderError, Role, ToolCall,
+};
 
 /// Supplies the `Authorization: Bearer` token for each request. The plain
 /// API-key case is [`StaticToken`]; OAuth-backed providers (xAI sign-in)
@@ -152,7 +154,17 @@ impl OpenAiProvider {
             if let Some(token) = self.auth.bearer().await? {
                 request = request.bearer_auth(token);
             }
-            let response = request.send().await?;
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(source) => {
+                    let message = format!("HTTP request to {} failed: {source}", self.base_url);
+                    // Root reqwest error kept on the chain (llama.cpp reframes
+                    // connect failures); ProviderError carries the retry class.
+                    return Err(
+                        anyhow::Error::new(source).context(ProviderError::transport(message))
+                    );
+                }
+            };
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !retried
                 && self.auth.refresh_after_unauthorized().await?
@@ -175,7 +187,10 @@ impl OpenAiProvider {
         } else {
             String::new()
         };
-        anyhow!("{} returned HTTP {status}: {body}{hint}", self.base_url)
+        anyhow::Error::new(ProviderError::http(
+            status.as_u16(),
+            format!("{} returned HTTP {status}: {body}{hint}", self.base_url),
+        ))
     }
 
     /// Translate a native [`ChatRequest`] into the OpenAI Chat Completions
@@ -186,6 +201,11 @@ impl OpenAiProvider {
             "model": request.model,
             "messages": messages,
             "stream": true,
+            // Without this OpenAI omits `usage` from the SSE stream and
+            // token-aware compaction never engages. Compatible servers
+            // (llama.cpp, vLLM, OpenRouter, Groq, Ollama's /v1 shim) accept
+            // or ignore it.
+            "stream_options": { "include_usage": true },
         });
         let tools: Vec<Value> = request
             .tools
@@ -206,11 +226,23 @@ impl OpenAiProvider {
         }
         if let Some(options) = &request.options
             && let Some(temperature) = options.temperature
+            && !rejects_temperature(&request.model)
         {
             body["temperature"] = json!(temperature);
         }
         body
     }
+}
+
+/// OpenAI reasoning models (o-series, gpt-5 family) reject any non-default
+/// `temperature` with HTTP 400, so it is omitted for them. Mirrors the model
+/// families in [`context_window`].
+fn rejects_temperature(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
 }
 
 /// Translate native messages into the OpenAI `messages` array. Tool calls are
@@ -289,11 +321,14 @@ impl LlmProvider for OpenAiProvider {
             .await
             .with_context(|| format!("cannot reach {}", self.base_url))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(anyhow!(
-                "{} rejected the credentials (HTTP 401): {}",
-                self.base_url,
-                self.auth.unauthorized_hint()
-            ));
+            return Err(anyhow::Error::new(ProviderError::http(
+                401,
+                format!(
+                    "{} rejected the credentials (HTTP 401): {}",
+                    self.base_url,
+                    self.auth.unauthorized_hint()
+                ),
+            )));
         }
         if !response.status().is_success() {
             let status = response.status();
@@ -341,7 +376,9 @@ impl LlmProvider for OpenAiProvider {
             .bytes_stream()
             .map(|item| match item {
                 Ok(chunk) => Ok(chunk.to_vec()),
-                Err(e) => Err(anyhow!(e).context("OpenAI response stream was interrupted")),
+                Err(e) => Err(anyhow!(e).context(ProviderError::transport(
+                    "OpenAI response stream was interrupted",
+                ))),
             })
             .boxed();
         Ok(decode_sse(bytes))
@@ -410,6 +447,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -463,6 +502,8 @@ struct SseState<S> {
     tool_calls: BTreeMap<u64, ToolAccum>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    /// Last `finish_reason` seen ("stop", "length", "tool_calls", ...).
+    done_reason: Option<String>,
     /// Saw `data: [DONE]` or EOF — drain the buffer, then emit the final chunk.
     saw_done: bool,
     /// The synthesized `done: true` chunk has been emitted.
@@ -501,7 +542,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
         message,
         thinking: false,
         done: true,
-        done_reason: None,
+        done_reason: state.done_reason.clone(),
         eval_count: state.eval_count,
         prompt_eval_count: state.prompt_eval_count,
     }
@@ -534,6 +575,7 @@ where
         tool_calls: BTreeMap::new(),
         prompt_eval_count: None,
         eval_count: None,
+        done_reason: None,
         saw_done: false,
         emitted_final: false,
     };
@@ -572,6 +614,9 @@ where
                     }
                 }
                 if let Some(choice) = chunk.choices.into_iter().next() {
+                    if let Some(reason) = choice.finish_reason {
+                        state.done_reason = Some(reason);
+                    }
                     for delta in choice.delta.tool_calls {
                         let accum = state.tool_calls.entry(delta.index).or_default();
                         if let Some(function) = delta.function {
@@ -712,6 +757,10 @@ mod tests {
         let body = provider().build_request_body(&request);
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "usage must be requested on SSE streams"
+        );
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
 
@@ -742,6 +791,57 @@ mod tests {
         assert!((temperature - 0.7).abs() < 1e-6);
     }
 
+    #[test]
+    fn reasoning_models_omit_temperature() {
+        let options = Some(ChatOptions {
+            temperature: Some(0.2),
+            num_ctx: None,
+        });
+        for model in ["gpt-5", "gpt-5-mini", "o1", "o3-mini", "o4-mini", "O3"] {
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: Vec::new(),
+                stream: true,
+                options: options.clone(),
+            };
+            let body = provider().build_request_body(&request);
+            assert!(
+                body.get("temperature").is_none(),
+                "{model} must not receive temperature"
+            );
+        }
+        // Non-reasoning models keep it.
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            stream: true,
+            options,
+        };
+        let body = provider().build_request_body(&request);
+        assert!(body.get("temperature").is_some());
+    }
+
+    #[test]
+    fn http_failures_downcast_to_provider_error() {
+        let err = provider().http_failure(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "slow down".to_string(),
+        );
+        let provider_err = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_err.status, Some(429));
+        assert!(provider_err.is_transient());
+        assert!(provider_err.message.contains("slow down"), "body surfaces");
+
+        let err = provider().http_failure(reqwest::StatusCode::BAD_REQUEST, "bad".to_string());
+        let provider_err = err.downcast_ref::<ProviderError>().expect("typed");
+        assert_eq!(provider_err.status, Some(400));
+        assert!(!provider_err.is_transient());
+    }
+
     #[tokio::test]
     async fn decodes_sse_with_split_tool_call() {
         // A content delta, then a tool call whose arguments span two fragments.
@@ -752,7 +852,7 @@ mod tests {
                     .to_vec(),
             ),
             Ok(
-                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n"
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n"
                     .to_vec(),
             ),
             Ok(b"data: [DONE]\n\n".to_vec()),
@@ -765,6 +865,7 @@ mod tests {
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("tool_calls"));
         assert_eq!(last.eval_count, Some(4));
         assert_eq!(last.prompt_eval_count, Some(11));
         let message = last.message.expect("tool call message");
@@ -810,6 +911,7 @@ mod tests {
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("stop"));
         assert!(chunks.next().await.is_none());
     }
 
