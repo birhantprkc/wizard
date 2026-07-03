@@ -151,15 +151,12 @@ fn loadout_subagents_dir() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    for candidate in [
+    [
         dir.join("loadout/subagents"),
         dir.join("../share/wizard/loadout/subagents"),
-    ] {
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_dir())
 }
 
 /// Recursively copy `src` into `dst` (regular files and directories only).
