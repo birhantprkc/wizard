@@ -1820,6 +1820,7 @@ mod tests {
             name: "Test",
             file,
             url: "https://example.com/x.gguf",
+            approx_gb: 1,
         }
     }
 

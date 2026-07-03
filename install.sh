@@ -690,6 +690,21 @@ detect_memory() {
     if is_uint "$mem_kb" && [ "$mem_kb" -gt 0 ]; then
         MEM_GB=$((mem_kb / 1024 / 1024))
         MEM_SOURCE="system RAM (no GPU detected)"
+        # In a container MemTotal reports the host's RAM; cap it with the
+        # cgroup memory limit (v2 then v1) when one applies. "max" (v2) and
+        # huge sentinels (v1's PAGE_COUNTER_MAX, here >= 1<<60) mean no limit.
+        local cgroup_file limit_b limit_gb
+        for cgroup_file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+            [ -r "$cgroup_file" ] || continue
+            limit_b="$(cat "$cgroup_file" 2>/dev/null || true)"
+            is_uint "$limit_b" || continue
+            [ "$limit_b" -lt 1152921504606846976 ] || continue
+            limit_gb=$((limit_b / 1024 / 1024 / 1024))
+            if [ "$limit_gb" -lt "$MEM_GB" ]; then
+                MEM_GB="$limit_gb"
+                MEM_SOURCE="system RAM (cgroup limit)"
+            fi
+        done
         return
     fi
 
