@@ -33,6 +33,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a TCP connection on a single health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// RAM headroom beyond the raw weights (KV cache, compute buffers) demanded
+/// by the preflight fit check in [`ensure_running`].
+const FIT_HEADROOM_GB: u64 = 2;
+
+/// How many log lines a startup-failure error quotes.
+const LOG_TAIL_LINES: usize = 20;
+
 /// User-visible progress callback for the slow paths (spawn, model load).
 pub type Progress<'a> = &'a (dyn Fn(&str) + Send + Sync);
 
@@ -115,6 +122,22 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
              in ~/.wizard/config.toml"
         );
     };
+    // A model that cannot fit in this machine's RAM is refused up front —
+    // before a multi-GB download, and before llama-server gets OOM-killed
+    // halfway through loading it. [`spawn`] passes no GPU-offload flags, so
+    // the weights load into system memory even on GPU machines. Undetectable
+    // RAM or an unknown model size skips the check.
+    if let Some(ram_gb) = crate::hardware::usable_ram_gb()
+        && let Some(model_gb) = model_size_gb(Path::new(gguf))
+        && model_gb + FIT_HEADROOM_GB > ram_gb
+    {
+        bail!(
+            "the model {gguf} is ~{model_gb} GB but this machine has only {ram_gb} GB of usable \
+             RAM, so llama-server would be killed loading it — run `wizard --onboard` to pick a \
+             smaller model (the 9B tier), or point `gguf_path` in ~/.wizard/config.toml at one \
+             that fits"
+        );
+    }
     // A missing GGUF that names a known tier is downloaded into place (the
     // one-click local onboarding writes exactly such a path); anything else
     // stays an actionable error.
@@ -162,8 +185,8 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: Progress<'_>) -
 
 /// Poll `{base_url}/health` until the server reports ready, up to
 /// [`READY_TIMEOUT`] (GGUF loads are slow). When `pid` names a server Wizard
-/// just spawned, its early death short-circuits the wait with a pointer to
-/// the log instead of timing out.
+/// just spawned, its early death short-circuits the wait. Both failure paths
+/// quote the tail of the server log ([`diagnose`]) so the cause is visible.
 pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>) -> Result<()> {
     let started = Instant::now();
     let mut reported_loading = false;
@@ -180,16 +203,16 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: Progress<'_>
             && !process_name(pid).is_some_and(|name| is_llama_server(&name))
         {
             bail!(
-                "llama-server (PID {pid}) exited during startup — check {}",
-                log_path()?.display()
+                "llama-server (PID {pid}) exited during startup — {}",
+                diagnose(&log_path()?)
             );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     bail!(
-        "llama-server at {base_url} did not become ready within {}s — check {}",
+        "llama-server at {base_url} did not become ready within {}s — {}",
         READY_TIMEOUT.as_secs(),
-        log_path()?.display()
+        diagnose(&log_path()?)
     )
 }
 
@@ -217,6 +240,74 @@ fn server_args(gguf_path: &str, port: u16, gpu: bool) -> Vec<String> {
         args.push(GPU_OFFLOAD_ALL.to_string());
     }
     args
+}
+
+/// Approximate size of the model at `path` in GB: the file's real size when
+/// it exists, else the known tier's [`crate::hardware::GgufModel::approx_gb`]
+/// when the file name matches one. `None` for unknown missing files.
+fn model_size_gb(path: &Path) -> Option<u64> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        return Some(meta.len() / (1024 * 1024 * 1024));
+    }
+    let tier = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::hardware::gguf_tier_for_file)?;
+    Some(tier.approx_gb)
+}
+
+/// The tail of the llama-server log plus, when it smells like memory
+/// exhaustion, a pointer at onboarding. Shared by both startup-failure bails
+/// in [`wait_ready`] so the user sees the actual failure, not just a path.
+fn diagnose(log: &Path) -> String {
+    let tail = match std::fs::read_to_string(log) {
+        Ok(contents) if !contents.trim().is_empty() => tail_lines(&contents),
+        _ => "  (log is empty or unreadable)".to_string(),
+    };
+    let hint = if looks_like_oom(&tail) {
+        "\nthe log suggests the model did not fit in memory — run `wizard --onboard` to pick a \
+         smaller model"
+    } else {
+        ""
+    };
+    format!("tail of {}:\n{tail}{hint}", log.display())
+}
+
+/// Last [`LOG_TAIL_LINES`] lines of `contents`, indented two spaces, with
+/// over-long lines cut so one giant line cannot flood the error.
+fn tail_lines(contents: &str) -> String {
+    /// Per-line cap; llama-server lines are normally well under this.
+    const MAX_LINE_CHARS: usize = 200;
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(LOG_TAIL_LINES);
+    lines[start..]
+        .iter()
+        .map(|line| {
+            if line.chars().count() > MAX_LINE_CHARS {
+                let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
+                format!("  {cut}…")
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a log tail looks like llama-server died of memory exhaustion:
+/// allocator failures from llama.cpp/ggml, or the shell/kernel reporting an
+/// OOM kill.
+fn looks_like_oom(tail: &str) -> bool {
+    let lower = tail.to_lowercase();
+    [
+        "out of memory",
+        "failed to allocate",
+        "cannot allocate",
+        "ggml_aligned_malloc",
+        "killed",
+    ]
+    .iter()
+    .any(|signature| lower.contains(signature))
 }
 
 /// Start a detached `llama-server` serving `gguf_path` on `port`. The child
@@ -556,6 +647,80 @@ mod tests {
             !port_in_use(port)
         });
         assert!(freed, "a released port eventually reads as free");
+    }
+
+    #[test]
+    fn every_suggested_tier_passes_the_fit_check_at_its_boundary() {
+        // The tier table and the preflight check must agree: a machine with
+        // exactly the RAM that selects a tier must also be allowed to run it.
+        for gb in [8, 18, 24, 48] {
+            let tier = crate::hardware::suggest_gguf_model(gb);
+            assert!(
+                tier.approx_gb + FIT_HEADROOM_GB <= gb,
+                "{} (~{} GB) does not fit the {gb} GB budget that selects it",
+                tier.name,
+                tier.approx_gb
+            );
+        }
+    }
+
+    #[test]
+    fn model_size_gb_prefers_the_real_file_then_known_tiers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tiny.gguf");
+        std::fs::write(&path, b"stub").expect("write stub");
+        assert_eq!(model_size_gb(&path), Some(0), "real file: real size");
+        // Missing but a known tier: the tier's approximate size.
+        let missing = dir.path().join("Qwen3.5-9B-Q4_K_M.gguf");
+        assert_eq!(model_size_gb(&missing), Some(6));
+        // Missing and unknown: no size, the preflight check is skipped.
+        assert_eq!(model_size_gb(&dir.path().join("custom.gguf")), None);
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_last_lines_and_cuts_long_ones() {
+        let contents: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let tail = tail_lines(&contents);
+        assert!(!tail.contains("line 10"), "older lines dropped");
+        assert!(tail.starts_with("  line 11"));
+        assert!(tail.ends_with("  line 30"));
+        assert_eq!(tail.lines().count(), LOG_TAIL_LINES);
+
+        let long = "x".repeat(500);
+        let cut = tail_lines(&long);
+        assert!(cut.ends_with('…'), "over-long line is cut");
+        assert!(cut.chars().count() < 250);
+    }
+
+    #[test]
+    fn looks_like_oom_matches_llama_cpp_failure_signatures() {
+        assert!(looks_like_oom(
+            "ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate"
+        ));
+        assert!(looks_like_oom("llama_model_load: error: Out of memory"));
+        assert!(looks_like_oom("mmap: Cannot allocate memory"));
+        assert!(looks_like_oom("Killed"));
+        assert!(!looks_like_oom("main: server is listening on 127.0.0.1"));
+        assert!(!looks_like_oom(""));
+    }
+
+    #[test]
+    fn diagnose_quotes_the_log_and_hints_at_onboarding_on_oom() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("llama-server.log");
+
+        // Missing log: still a readable message, never an error.
+        assert!(diagnose(&log).contains("(log is empty or unreadable)"));
+
+        std::fs::write(&log, "loading model\nfailed to allocate 20 GiB\n").expect("write log");
+        let message = diagnose(&log);
+        assert!(message.contains("failed to allocate 20 GiB"));
+        assert!(message.contains("wizard --onboard"), "OOM hint present");
+
+        std::fs::write(&log, "wrong chat template\n").expect("write log");
+        let message = diagnose(&log);
+        assert!(message.contains("wrong chat template"));
+        assert!(!message.contains("wizard --onboard"), "no hint without OOM");
     }
 
     #[tokio::test]
