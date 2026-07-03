@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,11 +17,25 @@ use serde_json::{Value, json};
 use crate::config::{Config, Mode};
 use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::provider::LlmProvider;
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role};
-use crate::tools::{Tool, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role, ToolCall};
+use crate::tools::subagent_tasks::SubagentRunResult;
+use crate::tools::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
 
 use super::prompts;
-use super::{normalize_args, parse_json_tool_call};
+use super::{error_is_transient, normalize_args, parse_json_tool_call};
+
+/// Advertised name of the spawn tool, referenced by the dispatcher's
+/// plan-mode gate.
+pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
+
+/// Retry budget for one subagent model call (mirrors the parent loop's
+/// non-continuous budget).
+const RETRY_ATTEMPTS: u32 = 6;
+
+/// The parent agent's active model, shared with [`SpawnSubagentTool`] so
+/// mid-session `/model` switches reach subagents. `None` falls back to the
+/// configured model.
+pub type SharedActiveModel = Arc<std::sync::RwLock<Option<String>>>;
 
 /// A named, reusable subagent definition. Built-in defaults exist
 /// (a general-purpose worker); `/evolve` can add more as TOML files under
@@ -152,6 +167,55 @@ pub fn scoped_registry(parent: &ToolRegistry, scope: Option<&[String]>) -> ToolR
     registry
 }
 
+/// Keep only the read-only tools of `parent` (plan-mode delegation: the
+/// subagent may explore but not act).
+pub fn read_only_registry(parent: &ToolRegistry) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for spec in parent.specs() {
+        if let Some(tool) = parent.get(&spec.function.name)
+            && tool.access() == ToolAccess::ReadOnly
+        {
+            registry.register(Arc::clone(tool));
+        }
+    }
+    registry
+}
+
+/// Per-run overrides for [`spawn`].
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions {
+    /// Model to run the subagent on; `None` falls back to the configured
+    /// active model. The parent passes its live model so `/model` switches
+    /// apply.
+    pub model: Option<String>,
+    /// Restrict the subagent to read-only tools (plan mode).
+    pub read_only: bool,
+}
+
+/// One model round-trip: stream a completion, skipping reasoning
+/// ("thinking") chunks so they never leak into subagent history or reports.
+async fn stream_step(
+    client: &Arc<dyn LlmProvider>,
+    request: ChatRequest,
+) -> Result<(String, Vec<ToolCall>)> {
+    let mut stream = client.chat_stream(request).await?;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if let Some(message) = chunk.message {
+            if !chunk.thinking {
+                content.push_str(&message.content);
+            }
+            tool_calls.extend(message.tool_calls);
+        }
+        if chunk.done {
+            break;
+        }
+    }
+    Ok((content, tool_calls))
+}
+
 /// Run `task` in an isolated context defined by `config`: fresh history,
 /// scoped registry, own step budget. The parent's lifecycle `hooks` apply to
 /// the subagent's tool calls too (their activity is not surfaced as events —
@@ -159,15 +223,22 @@ pub fn scoped_registry(parent: &ToolRegistry, scope: Option<&[String]>) -> ToolR
 pub async fn spawn(
     config: &SubagentConfig,
     task: &str,
+    options: &SpawnOptions,
     client: &Arc<dyn LlmProvider>,
     registry: &ToolRegistry,
     hooks: &HookEngine,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
-    let model = Config::load()
-        .map(|c| c.active().model)
-        .unwrap_or_else(|_| Config::default().active().model);
-    let scoped = scoped_registry(registry, config.tool_scope.as_deref());
+    let loaded = Config::load().unwrap_or_default();
+    let model = options
+        .model
+        .clone()
+        .unwrap_or_else(|| loaded.active().model);
+    let (retry_base, retry_max) = (loaded.retry_base_secs, loaded.retry_max_secs);
+    let mut scoped = scoped_registry(registry, config.tool_scope.as_deref());
+    if options.read_only {
+        scoped = read_only_registry(&scoped);
+    }
     let native_tools = match client.supports_native_tools(&model).await {
         Ok(supported) => supported,
         Err(err) => {
@@ -221,24 +292,29 @@ pub async fn spawn(
             }),
         };
 
-        let mut stream = client
-            .chat_stream(request)
-            .await
-            .with_context(|| format!("subagent '{}' chat request failed", config.name))?;
-
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.with_context(|| format!("subagent '{}' stream failed", config.name))?;
-            if let Some(message) = chunk.message {
-                content.push_str(&message.content);
-                tool_calls.extend(message.tool_calls);
+        // Same retry policy as the parent loop: transient provider failures
+        // (transport drops, 429/5xx) back off and retry instead of killing a
+        // deep run; permanent errors (auth, bad request) fail immediately.
+        let mut attempt: u32 = 0;
+        let (content, mut tool_calls) = loop {
+            match stream_step(client, request.clone()).await {
+                Ok(completion) => break completion,
+                Err(err) => {
+                    if !error_is_transient(&err) || attempt >= RETRY_ATTEMPTS {
+                        return Err(err)
+                            .with_context(|| format!("subagent '{}' chat failed", config.name));
+                    }
+                    let secs =
+                        retry_max.min(retry_base.saturating_mul(2u64.saturating_pow(attempt)));
+                    tracing::warn!(
+                        "subagent '{}': LLM unavailable ({err:#}); retrying in {secs}s",
+                        config.name
+                    );
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    attempt += 1;
+                }
             }
-            if chunk.done {
-                break;
-            }
-        }
+        };
 
         history.push(ChatMessage {
             role: Role::Assistant,
@@ -301,7 +377,14 @@ pub async fn spawn(
                         Err(err) => ToolOutput::error(err.to_string()),
                     };
                     if let Some(extra) = hooks
-                        .post_tool_use(&name, &args, Mode::Sovereign, None)
+                        .post_tool_use_with_output(
+                            &name,
+                            &args,
+                            &output.content,
+                            output.is_error,
+                            Mode::Sovereign,
+                            None,
+                        )
                         .await
                     {
                         crate::hooks::append_context(&mut output.content, &extra);
@@ -357,6 +440,9 @@ pub struct SpawnSubagentTool {
     hooks: Arc<HookEngine>,
     /// Tool description, including the roster of available subagents.
     description: String,
+    /// The parent's active model (bound via [`Self::model_handle`] +
+    /// `Agent::bind_subagent_model`); `None` reads the configured model.
+    model: SharedActiveModel,
 }
 
 impl SpawnSubagentTool {
@@ -407,14 +493,26 @@ impl SpawnSubagentTool {
             registry,
             hooks,
             description,
+            model: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Handle the parent agent binds (see `Agent::bind_subagent_model`) so
+    /// mid-session `/model` switches reach subagent runs. Unbound, runs fall
+    /// back to the configured active model.
+    pub fn model_handle(&self) -> SharedActiveModel {
+        Arc::clone(&self.model)
+    }
+
+    fn active_model(&self) -> Option<String> {
+        self.model.read().ok().and_then(|model| model.clone())
     }
 }
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str {
-        "spawn_subagent"
+        SPAWN_SUBAGENT_TOOL_NAME
     }
 
     fn description(&self) -> &str {
@@ -445,18 +543,26 @@ impl Tool for SpawnSubagentTool {
             task: String,
             #[serde(default)]
             background: bool,
+            /// Injected by the dispatcher while plan mode is on (not
+            /// advertised in the schema): the subagent runs read-only.
+            #[serde(default)]
+            plan_mode: bool,
         }
         let args: Args = serde_json::from_value(args).map_err(|err| ToolError::InvalidArgs {
-            tool: "spawn_subagent".to_string(),
+            tool: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
             message: err.to_string(),
         })?;
+        let options = SpawnOptions {
+            model: self.active_model(),
+            read_only: args.plan_mode,
+        };
 
         let config = self
             .configs
             .iter()
             .find(|c| c.name == args.subagent)
             .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "spawn_subagent".to_string(),
+                tool: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
                 message: format!(
                     "unknown subagent '{}'; available: {}",
                     args.subagent,
@@ -476,10 +582,31 @@ impl Tool for SpawnSubagentTool {
             let registry = Arc::clone(&self.registry);
             let hooks = Arc::clone(&self.hooks);
             let fut_ctx = ctx.clone();
+            let fut_options = options.clone();
             let fut = async move {
-                match spawn(&config, &task, &client, &registry, &hooks, &fut_ctx).await {
-                    Ok(result) => (result.completed, result.output, result.steps_used),
-                    Err(err) => (false, format!("subagent failed: {err:#}"), 0),
+                match spawn(
+                    &config,
+                    &task,
+                    &fut_options,
+                    &client,
+                    &registry,
+                    &hooks,
+                    &fut_ctx,
+                )
+                .await
+                {
+                    Ok(result) => SubagentRunResult {
+                        completed: result.completed,
+                        output: result.output,
+                        steps_used: result.steps_used,
+                        error: None,
+                    },
+                    Err(err) => SubagentRunResult {
+                        completed: false,
+                        output: format!("subagent failed: {err:#}"),
+                        steps_used: 0,
+                        error: Some(format!("{err:#}")),
+                    },
                 }
             };
             let id = ctx.subagents.spawn(&name, &args.task, fut);
@@ -505,6 +632,7 @@ impl Tool for SpawnSubagentTool {
         let result = spawn(
             config,
             &args.task,
+            &options,
             &self.client,
             &self.registry,
             &self.hooks,
@@ -512,7 +640,7 @@ impl Tool for SpawnSubagentTool {
         )
         .await
         .map_err(|err| ToolError::Execution {
-            tool: "spawn_subagent".to_string(),
+            tool: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
             source: err,
         })?;
 
@@ -532,5 +660,259 @@ impl Tool for SpawnSubagentTool {
         } else {
             ToolOutput::error(summary)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use futures_util::stream;
+
+    use super::*;
+    use crate::llm::{ChatChunk, ChatStream};
+
+    /// Temp project dir removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("wizard-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Provider that replays canned chunk sequences (or a permanent error)
+    /// and records the requests it received.
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<Vec<ChatChunk>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+        /// When set, every chat_stream call fails with this HTTP status.
+        fail_status: Option<u16>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+                fail_status: None,
+            })
+        }
+
+        fn failing(status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(VecDeque::new()),
+                requests: Mutex::new(Vec::new()),
+                fail_status: Some(status),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
+            self.requests.lock().unwrap().push(request);
+            if let Some(status) = self.fail_status {
+                return Err(crate::llm::ProviderError::http(status, "scripted failure").into());
+            }
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted response available");
+            Ok(futures_util::StreamExt::boxed(stream::iter(
+                chunks.into_iter().map(Ok),
+            )))
+        }
+
+        fn label(&self) -> String {
+            "scripted:test".to_string()
+        }
+    }
+
+    fn chunk(content: &str, thinking: bool, done: bool) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage::assistant(content)),
+            thinking,
+            done,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// Minimal tool with a configurable access class.
+    struct FakeTool {
+        name: &'static str,
+        access: ToolAccess,
+    }
+
+    #[async_trait]
+    impl Tool for FakeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake tool for subagent tests"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        fn access(&self) -> ToolAccess {
+            self.access
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
+
+    fn worker() -> SubagentConfig {
+        builtin_configs()
+            .into_iter()
+            .next()
+            .expect("builtin worker")
+    }
+
+    #[test]
+    fn read_only_registry_keeps_only_read_only_tools() {
+        let mut parent = ToolRegistry::new();
+        parent.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "mutate",
+            access: ToolAccess::Edit,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "run",
+            access: ToolAccess::Execute,
+        }));
+
+        let filtered = read_only_registry(&parent);
+        assert!(filtered.get("probe").is_some());
+        assert!(filtered.get("mutate").is_none());
+        assert!(filtered.get("run").is_none());
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn scoped_registry_selects_named_tools_and_skips_unknown() {
+        let mut parent = ToolRegistry::new();
+        parent.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "run",
+            access: ToolAccess::Execute,
+        }));
+
+        let all = scoped_registry(&parent, None);
+        assert_eq!(all.len(), 2);
+        let scoped = scoped_registry(&parent, Some(&["probe".to_string(), "missing".to_string()]));
+        assert!(scoped.get("probe").is_some());
+        assert!(scoped.get("missing").is_none());
+        assert_eq!(scoped.len(), 1);
+    }
+
+    #[test]
+    fn user_configs_shadow_builtins_by_name() {
+        let tmp = TempDir::new();
+        std::fs::write(
+            tmp.0.join("worker.toml"),
+            "name = \"worker\"\ndescription = \"custom\"\nsystem_prompt = \"be custom\"\n",
+        )
+        .unwrap();
+        let configs = available_configs(&tmp.0);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].description, "custom");
+    }
+
+    #[tokio::test]
+    async fn spawn_skips_thinking_chunks_and_uses_the_model_override() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![vec![
+            chunk("secret reasoning", true, false),
+            chunk("the actual report", false, true),
+        ]]);
+        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let ctx = ToolContext::new(&tmp.0);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+
+        let options = SpawnOptions {
+            model: Some("parent-active-model".to_string()),
+            read_only: false,
+        };
+        let result = spawn(
+            &worker(),
+            "report",
+            &options,
+            &client,
+            &ToolRegistry::new(),
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+
+        assert!(result.completed);
+        assert_eq!(result.output, "the actual report", "thinking never leaks");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[0].model, "parent-active-model");
+    }
+
+    #[tokio::test]
+    async fn spawn_fails_fast_on_permanent_provider_errors() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::failing(401);
+        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let ctx = ToolContext::new(&tmp.0);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+
+        let err = spawn(
+            &worker(),
+            "report",
+            &SpawnOptions::default(),
+            &client,
+            &ToolRegistry::new(),
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect_err("permanent error fails the run");
+        assert!(format!("{err:#}").contains("scripted failure"), "{err:#}");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            1,
+            "a 401 is never retried"
+        );
     }
 }

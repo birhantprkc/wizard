@@ -111,8 +111,10 @@ pub struct RunResults {
     pub pass_rate: f64,
 }
 
-/// Dispatch a `wizard bench` subcommand.
-pub async fn run(cmd: BenchCmd) -> Result<()> {
+/// Dispatch a `wizard bench` subcommand. Returns the process exit code:
+/// `run` exits 1 when any case failed (so it can gate CI); everything else
+/// exits 0 on success.
+pub async fn run(cmd: BenchCmd) -> Result<i32> {
     match cmd {
         BenchCmd::Add {
             id,
@@ -123,20 +125,19 @@ pub async fn run(cmd: BenchCmd) -> Result<()> {
             check_timeout,
             tag,
             notes,
-        } => {
-            add(
-                id,
-                prompt,
-                check,
-                git_ref,
-                timeout,
-                check_timeout,
-                tag,
-                notes,
-            )
-            .await
-        }
-        BenchCmd::List { trajectories } => list(trajectories),
+        } => add(
+            id,
+            prompt,
+            check,
+            git_ref,
+            timeout,
+            check_timeout,
+            tag,
+            notes,
+        )
+        .await
+        .map(|()| 0),
+        BenchCmd::List { trajectories, tag } => list(trajectories, &tag).map(|()| 0),
         BenchCmd::Promote {
             trajectory,
             check,
@@ -145,14 +146,16 @@ pub async fn run(cmd: BenchCmd) -> Result<()> {
             check_timeout,
             tag,
             notes,
-        } => promote(trajectory, check, id, timeout, check_timeout, tag, notes),
+        } => promote(trajectory, check, id, timeout, check_timeout, tag, notes).map(|()| 0),
         BenchCmd::Run {
             runner,
             label,
             case,
+            tag,
             keep_worktrees,
-        } => runner::run_cases(runner, label, case, keep_worktrees).await,
-        BenchCmd::Compare { a, b } => compare(&a, &b),
+        } => runner::run_cases(runner, label, case, tag, keep_worktrees).await,
+        BenchCmd::Remove { id } => remove(&id).map(|()| 0),
+        BenchCmd::Compare { a, b } => compare(&a, &b).map(|()| 0),
     }
 }
 
@@ -164,6 +167,11 @@ pub(crate) fn cases_dir(root: &Path) -> PathBuf {
 /// `.wizard/bench/results` under `root`.
 pub(crate) fn results_dir(root: &Path) -> PathBuf {
     root.join(".wizard").join("bench").join("results")
+}
+
+/// `.wizard/bench/logs` under `root` — per-run harness/check output.
+pub(crate) fn logs_dir(root: &Path) -> PathBuf {
+    root.join(".wizard").join("bench").join("logs")
 }
 
 /// `.wizard/trajectories.jsonl` under `root`.
@@ -301,14 +309,24 @@ async fn add(
     Ok(())
 }
 
-fn list(trajectories: bool) -> Result<()> {
+fn list(trajectories: bool, tags: &[String]) -> Result<()> {
     let root = std::env::current_dir().context("determining current directory")?;
-    let cases = load_cases(&root)?;
+    let mut cases = load_cases(&root)?;
+    if !tags.is_empty() {
+        cases.retain(|case| case.tags.iter().any(|t| tags.contains(t)));
+    }
     if cases.is_empty() {
-        println!(
-            "no cases yet — record tasks by running wizard headless, then \
-             `wizard bench promote`, or create one with `wizard bench add`"
-        );
+        if tags.is_empty() {
+            println!(
+                "no cases yet — record tasks by running wizard headless, then \
+                 `wizard bench promote`, or create one with `wizard bench add`"
+            );
+        } else {
+            println!(
+                "no cases carry tag(s) {} — see `wizard bench list`",
+                tags.join(", ")
+            );
+        }
     } else {
         let id_width = cases.iter().map(|c| c.id.len()).max().unwrap_or(0);
         for case in &cases {
@@ -400,6 +418,19 @@ fn promote(
     };
     let path = write_case(&root, &case)?;
     println!("promoted trajectory {} → {}", record.id, path.display());
+    Ok(())
+}
+
+/// `wizard bench remove <id>`: delete the case file; error when absent.
+fn remove(id: &str) -> Result<()> {
+    let root = std::env::current_dir().context("determining current directory")?;
+    validate_case_id(id)?;
+    let path = cases_dir(&root).join(format!("{id}.toml"));
+    if !path.is_file() {
+        bail!("no case '{id}' — see `wizard bench list`");
+    }
+    std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    println!("removed case '{id}' ({})", path.display());
     Ok(())
 }
 

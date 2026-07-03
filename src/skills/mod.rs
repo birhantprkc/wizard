@@ -34,16 +34,27 @@ pub struct Skill {
 }
 
 /// Default skill roots, in shadowing order (later roots win on name
-/// collision): the repo checkout's `skills/` (dev builds), `skills/` next to
-/// the installed binary, then the user's `~/.wizard/skills/` where `/evolve`
+/// collision): an explicit dev root (`WIZARD_DEV_SKILLS`, or the repo
+/// checkout's `skills/` in debug builds only), `skills/` next to the
+/// installed binary, then the user's `~/.wizard/skills/` where `/evolve`
 /// writes new skills, then the active harness bundle's `skills/` (if any).
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
-    // Repo checkout (dev builds / running from the source tree).
-    let manifest_skills = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
-    if manifest_skills.is_dir() {
-        roots.push(manifest_skills);
+    // Dev-checkout skills. `env!("CARGO_MANIFEST_DIR")` bakes the build
+    // machine's checkout path into the binary, so release builds must never
+    // read it implicitly — an installed binary would silently load skills
+    // from whatever repo it happened to be compiled in. Opt in explicitly
+    // with WIZARD_DEV_SKILLS=<dir>; debug builds keep the old convenience.
+    let dev_root = std::env::var_os("WIZARD_DEV_SKILLS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            cfg!(debug_assertions).then(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("skills"))
+        });
+    if let Some(dev) = dev_root
+        && dev.is_dir()
+    {
+        roots.push(dev);
     }
 
     // Bundled alongside the installed binary.

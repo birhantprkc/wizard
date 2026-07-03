@@ -1,10 +1,13 @@
 //! Telegram bot gateway: long-poll `getUpdates`, dispatch each inbound text
 //! message to one agent turn, and reply via `sendMessage`.
 //!
-//! The bot token is read from the env var named in
+//! The bot token comes from `~/.wizard/credentials.toml` (stored under
+//! `telegram`) first, then the env var named in
 //! [`GatewayConfig::token_env`](crate::config::GatewayConfig::token_env) (or
-//! `WIZARD_TELEGRAM_TOKEN` by default) and is never persisted. Create a bot
-//! with [@BotFather](https://t.me/BotFather) to obtain a token.
+//! `WIZARD_TELEGRAM_TOKEN` by default) — the same precedence providers use
+//! for API keys, so a gateway launched from cron works without an
+//! environment. Create a bot with [@BotFather](https://t.me/BotFather) to
+//! obtain a token.
 
 use std::time::Duration;
 
@@ -31,17 +34,23 @@ pub struct Telegram {
 }
 
 impl Telegram {
-    /// Connect using the token from the env var named in `config`. A missing
-    /// or empty token is an actionable error telling the user to export it.
+    /// Connect using the stored `telegram` credential, falling back to the
+    /// env var named in `config` — provider-key precedence. A missing or
+    /// empty token is an actionable error naming both sources.
     pub fn connect(config: &GatewayConfig) -> Result<Self> {
         let env_name = config.token_env();
-        let token = std::env::var(env_name)
-            .ok()
-            .filter(|t| !t.trim().is_empty());
+        let token = crate::credentials::get("telegram")
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                std::env::var(env_name)
+                    .ok()
+                    .filter(|t| !t.trim().is_empty())
+            });
         let token = token.with_context(|| {
             format!(
-                "Telegram bot token not set: export {env_name}=<token> (create a bot via \
-                 @BotFather to obtain one)"
+                "Telegram bot token not set: export {env_name}=<token> or store it under \
+                 'telegram' in ~/.wizard/credentials.toml (create a bot via @BotFather \
+                 to obtain one)"
             )
         })?;
 

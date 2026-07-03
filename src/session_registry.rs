@@ -7,7 +7,7 @@
 //! older than [`STALE`] are treated as exited and pruned — a clean exit removes
 //! its own file, and a crash ages out.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -104,7 +104,12 @@ fn now_unix() -> u64 {
 /// errors are logged and dropped.
 pub fn write(record: &SessionRecord) {
     let Some(dir) = running_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
+    write_to(&dir, record);
+}
+
+/// [`write`] into an explicit directory (tests use a temp dir).
+fn write_to(dir: &Path, record: &SessionRecord) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let record = SessionRecord {
@@ -138,7 +143,12 @@ pub fn list() -> Vec<SessionRecord> {
     let Some(dir) = running_dir() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    list_from(&dir)
+}
+
+/// [`list`] from an explicit directory (tests use a temp dir).
+fn list_from(dir: &Path) -> Vec<SessionRecord> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let now = now_unix();
@@ -176,4 +186,137 @@ pub fn list() -> Vec<SessionRecord> {
             .then(b.updated_unix.cmp(&a.updated_unix))
     });
     records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Temp registry dir removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("wizard-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(id: &str, state: SessionState) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            name: format!("session {id}"),
+            cwd: "/tmp/project".to_string(),
+            model: "test-model".to_string(),
+            mode: "genie".to_string(),
+            state,
+            activity: "testing".to_string(),
+            pid: 4242,
+            started_unix: now_unix(),
+            updated_unix: 0,
+        }
+    }
+
+    #[test]
+    fn write_then_list_round_trips_and_stamps_the_heartbeat() {
+        let tmp = TempDir::new();
+        write_to(&tmp.0, &record("a", SessionState::Working));
+
+        let listed = list_from(&tmp.0);
+        assert_eq!(listed.len(), 1);
+        let got = &listed[0];
+        assert_eq!(got.id, "a");
+        assert_eq!(got.name, "session a");
+        assert_eq!(got.cwd, "/tmp/project");
+        assert_eq!(got.state, SessionState::Working);
+        assert_eq!(got.pid, 4242);
+        assert!(got.updated_unix > 0, "write stamps updated_unix");
+        // No stray temp files remain.
+        assert_eq!(std::fs::read_dir(&tmp.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rewrites_refresh_in_place() {
+        let tmp = TempDir::new();
+        write_to(&tmp.0, &record("a", SessionState::Working));
+        let mut updated = record("a", SessionState::Idle);
+        updated.activity = "waiting".to_string();
+        write_to(&tmp.0, &updated);
+
+        let listed = list_from(&tmp.0);
+        assert_eq!(listed.len(), 1, "one file per session id");
+        assert_eq!(listed[0].state, SessionState::Idle);
+        assert_eq!(listed[0].activity, "waiting");
+    }
+
+    #[test]
+    fn stale_non_terminal_records_are_pruned_but_terminal_ones_are_retained() {
+        let tmp = TempDir::new();
+        // Backdate a working record beyond STALE_SECS (crashed process) and a
+        // completed record inside RETAIN_SECS (finished background run).
+        let stale = SessionRecord {
+            updated_unix: now_unix() - STALE_SECS - 5,
+            ..record("crashed", SessionState::Working)
+        };
+        let finished = SessionRecord {
+            updated_unix: now_unix() - STALE_SECS - 5,
+            ..record("done", SessionState::Completed)
+        };
+        for rec in [&stale, &finished] {
+            std::fs::write(
+                tmp.0.join(format!("{}.json", rec.id)),
+                serde_json::to_vec(rec).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let listed = list_from(&tmp.0);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "done");
+        assert!(
+            !tmp.0.join("crashed.json").exists(),
+            "the stale record's file is pruned"
+        );
+    }
+
+    #[test]
+    fn list_sorts_needs_input_first_then_recency_and_skips_junk() {
+        let tmp = TempDir::new();
+        let now = now_unix();
+        for (id, state, age) in [
+            ("idle", SessionState::Idle, 2),
+            ("blocked", SessionState::NeedsInput, 4),
+            ("busy-old", SessionState::Working, 8),
+            ("busy-new", SessionState::Working, 1),
+        ] {
+            let rec = SessionRecord {
+                updated_unix: now - age,
+                ..record(id, state)
+            };
+            std::fs::write(
+                tmp.0.join(format!("{id}.json")),
+                serde_json::to_vec(&rec).unwrap(),
+            )
+            .unwrap();
+        }
+        // Junk that must be ignored: wrong extension, corrupt JSON.
+        std::fs::write(tmp.0.join("notes.txt"), "not a record").unwrap();
+        std::fs::write(tmp.0.join("corrupt.json"), "{oops").unwrap();
+
+        let ids: Vec<String> = list_from(&tmp.0).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["blocked", "busy-new", "busy-old", "idle"]);
+    }
+
+    #[test]
+    fn list_of_a_missing_dir_is_empty() {
+        let tmp = TempDir::new();
+        assert!(list_from(&tmp.0.join("missing")).is_empty());
+    }
 }

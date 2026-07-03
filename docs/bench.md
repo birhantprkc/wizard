@@ -13,9 +13,11 @@ triggers onboarding, and needs no LLM at all (the runner is just a command).
 Everything lives project-locally:
 
 ```
-.wizard/trajectories.jsonl              # append-only recorded turns
-.wizard/bench/cases/<id>.toml           # one case per file
-.wizard/bench/results/<label>-<ts>.json # one file per run
+.wizard/trajectories.jsonl                        # append-only recorded turns
+.wizard/bench/cases/<id>.toml                     # one case per file
+.wizard/bench/results/<label>-<ts>.json           # one file per run
+.wizard/bench/logs/<label>/<id>.harness.log       # harness stdout/stderr per case
+.wizard/bench/logs/<label>/<id>.check.log         # check stdout/stderr per case
 ```
 
 ## The flow
@@ -25,7 +27,8 @@ Everything lives project-locally:
    `.wizard/trajectories.jsonl`: the prompt, the HEAD sha before the turn,
    whether the repo was dirty, the done reason, duration, model, and mode.
    Recording is best-effort and silent (it can never break a run), and it is
-   suppressed inside bench replays (the runner sets `WIZARD_BENCH=1`).
+   suppressed inside bench replays (the runner sets `WIZARD_BENCH=1`) and
+   fleet workers (the coordinator sets `WIZARD_FLEET=1`).
 
 2. **Promote.** Inspect what you have, then attach a check command:
 
@@ -43,11 +46,23 @@ Everything lives project-locally:
        --check "cargo test -q -p auth" --tag rust --timeout 1200
    ```
 
-3. **Run.** Replay every case (or a `--case` subset) against a harness:
+   List and prune cases with tags:
+
+   ```bash
+   wizard bench list --tag rust     # only cases tagged rust
+   wizard bench remove fix-auth     # delete a case by id
+   ```
+
+3. **Run.** Replay every case — or a subset by `--case` id and/or `--tag`
+   (their union) — against a harness:
 
    ```bash
    wizard bench run --label baseline
+   wizard bench run --label rust-only --tag rust
    ```
+
+   The run exits 0 only when every selected case passed (1 otherwise), so
+   `wizard bench run` can gate CI directly.
 
 4. **Compare.** Diff two runs case-by-case:
 
@@ -92,7 +107,9 @@ wizard bench run --label claude \
 ```
 
 Each case runs in its own detached worktree of `base_ref` under a temp dir,
-with stdin closed, output captured, and `WIZARD_BENCH=1` in the environment.
+with stdin closed and `WIZARD_BENCH=1` in the environment. Harness and check
+output is captured to `.wizard/bench/logs/<label>/<id>.{harness,check}.log`
+(the per-case line points there on FAIL), so failures stay diagnosable.
 The harness's exit code is recorded but does not decide the outcome; only
 the check command does (some harnesses exit nonzero on benign conditions).
 A harness that overruns `timeout_secs` is killed and scored `timeout`;
@@ -110,6 +127,9 @@ Each run writes a JSON file with the resolved runner, per-case results
 touch-case  PASS  harness 0.0s  check 0.0s
 1/1 passed (100%), results: .wizard/bench/results/baseline-1781234567.json
 ```
+
+The exit code mirrors the summary: 0 when every case passed, 1 when any
+case failed, timed out, or errored.
 
 `compare` prints the union of case ids with a marker per case (`↑` a pass
 gained from A to B, `↓` a pass lost, blank unchanged, an em dash for a case

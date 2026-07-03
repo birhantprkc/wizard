@@ -30,8 +30,10 @@ planning and synthesis turns drive a real in-process agent); `status` and
    - **claiming**: the coordinator claims tasks for workers by atomically
      renaming `queue/<id>.json` into `claimed/` and spawns
      `wizard --mode sovereign -p "<task>" --cwd <worktree> --output-format json`
-     with `WIZARD_FLEET=1`, at most N children at a time. Worker prompts end
-     with: commit your changes with a descriptive message; do not push.
+     with `WIZARD_FLEET=1` (which also suppresses trajectory recording, so
+     worker runs never pollute `.wizard/trajectories.jsonl`), at most N
+     children at a time. Worker prompts end with: commit your changes with a
+     descriptive message; do not push.
    - **reaping**: when a child exits, its exit code, branch, and parsed JSON
      summary (the `--output-format json` object from stdout) are written to
      `results/<id>.json`, and the slot's worktree is reused for the next
@@ -50,7 +52,9 @@ planning and synthesis turns drive a real in-process agent); `status` and
    list and results table.
 4. **Teardown** — worktrees are removed, branches are kept (also on failure
    or stop, so no work is ever lost), `fleet.toml` flips to `done`, and the
-   final task table prints.
+   final task table prints. `fleet run` exits 0 only when the fleet completed
+   and every task exited 0; any failed, timed-out, or killed task (or a stop)
+   exits 1, so a fleet run can gate CI.
 
 ## File layout
 
@@ -89,9 +93,17 @@ fix-lints   queued   -     -                 Fix clippy lints
 2 max-steps, 3 circuit breaker, 4 time limit), `timeout` for a watchdog
 kill, or `killed` for signal death / shutdown.
 
+While the fleet is `running`, `status` also reports the coordinator's
+heartbeat age. The heartbeat is touched every supervision tick, so an age
+past ~30 s means the coordinator was killed without cleaning up
+(`stale (42s old — coordinator likely dead)`); the `running` status in
+`fleet.toml` can then no longer be trusted.
+
 `wizard fleet stop` writes the stop sentinel and returns immediately; the
 coordinator winds down on its next tick. Ctrl-c on the coordinator behaves
-the same way.
+the same way. When no fleet is live — none ever ran, the last one already
+finished, or the heartbeat shows the coordinator is dead — `stop` prints
+"no fleet is running", writes nothing, and exits 1.
 
 ## Config
 

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::shell::run_command;
+use super::shell::{render_command_result, run_command};
 use super::{
     MAX_OUTPUT_BYTES, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args,
     resolve_path, truncate_output,
@@ -605,6 +605,11 @@ impl Tool for SearchFilesTool {
             }
             Err(err) => return Err(err),
         };
+
+        // A timed-out search still reports the matches found so far.
+        if result.timed_out.is_some() {
+            return Ok(render_command_result(&result));
+        }
 
         // Both rg and grep: 0 = matches, 1 = no matches, >1 = error.
         match result.code {

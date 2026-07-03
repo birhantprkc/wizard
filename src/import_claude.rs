@@ -106,12 +106,16 @@ pub fn claude_json_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// `~/.claude/commands/*.md`, sorted; empty when the directory is absent.
-pub fn claude_command_files() -> Vec<PathBuf> {
+/// `~/.claude/commands/**/*.md` (recursive), each paired with its flattened
+/// destination filename. Claude Code namespaces commands by subdirectory
+/// (`ns/cmd.md` → `/ns:cmd`) while Wizard scans its commands directory flat,
+/// so `ns/cmd.md` imports as `ns-cmd.md`. Sorted by destination name; empty
+/// when the directory is absent.
+pub fn claude_command_files() -> Vec<(PathBuf, String)> {
     let Some(home) = claude_home() else {
         return Vec::new();
     };
-    md_files(&home.join("commands"))
+    md_files_flattened(&home.join("commands"))
 }
 
 /// How many MCP servers, command files, and spinner verbs are available to
@@ -139,9 +143,9 @@ pub fn counts() -> (usize, usize, usize) {
 ///
 /// Returns `(servers, unsupported)` where `unsupported` names servers that
 /// could not be represented — `sse` transports and entries with no usable
-/// `command`/`url` (Wizard's [`McpTransport`] has only `Stdio` and `Http`, and
-/// [`McpServerConfig`] has no `headers` field, so SSE servers and HTTP headers
-/// are dropped). Duplicate names across maps keep the first occurrence.
+/// `command`/`url` (Wizard's [`McpTransport`] has only `Stdio` and `Http`).
+/// HTTP `headers` (auth tokens) carry over. Duplicate names across maps keep
+/// the first occurrence.
 pub fn parse_mcp_servers(claude_json: &Value) -> (Vec<McpServerConfig>, Vec<String>) {
     let mut servers = Vec::new();
     let mut unsupported = Vec::new();
@@ -186,6 +190,15 @@ fn map_server(name: &str, spec: &Value) -> Option<McpServerConfig> {
     // HTTP when explicitly typed http, or when only a url is present.
     if kind == Some("http") || (command.is_none() && url.is_some()) {
         let url = url?.to_string();
+        let headers = spec
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         return Some(McpServerConfig {
             name: name.to_string(),
             transport: McpTransport::Http,
@@ -193,6 +206,7 @@ fn map_server(name: &str, spec: &Value) -> Option<McpServerConfig> {
             args: Vec::new(),
             url: Some(url),
             env: HashMap::new(),
+            headers,
         });
     }
 
@@ -223,6 +237,7 @@ fn map_server(name: &str, spec: &Value) -> Option<McpServerConfig> {
         args,
         url: None,
         env,
+        headers: HashMap::new(),
     })
 }
 
@@ -266,41 +281,57 @@ pub fn merge_mcp(
     (merged, added, skipped)
 }
 
-/// Decide which `*.md` command files to copy into `dst_dir`, **skipping any
-/// whose filename already exists there**. Returns `(to_copy, skipped_names)`.
-pub fn plan_command_copies(src_files: &[PathBuf], dst_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// Decide which `(source, destination-name)` command files to copy into
+/// `dst_dir`, **skipping any whose destination filename already exists
+/// there**. Returns `(to_copy, skipped_names)`.
+pub fn plan_command_copies(
+    src_files: &[(PathBuf, String)],
+    dst_dir: &Path,
+) -> (Vec<(PathBuf, String)>, Vec<String>) {
     let mut to_copy = Vec::new();
     let mut skipped = Vec::new();
-    for src in src_files {
-        let Some(name) = src.file_name() else {
-            continue;
-        };
-        if dst_dir.join(name).exists() {
-            skipped.push(name.to_string_lossy().into_owned());
+    for (src, dest) in src_files {
+        if dst_dir.join(dest).exists() {
+            skipped.push(dest.clone());
         } else {
-            to_copy.push(src.clone());
+            to_copy.push((src.clone(), dest.clone()));
         }
     }
     (to_copy, skipped)
 }
 
-/// List `*.md` files in `dir`, sorted by name. Empty when the directory is
-/// missing or unreadable.
-fn md_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
+/// Walk `root` for `*.md` files, pairing each with a flattened filename built
+/// from its path relative to `root` (`ns/cmd.md` → `ns-cmd.md`). Sorted by
+/// that name; missing/unreadable directories yield nothing. Depth is capped
+/// so a symlink cycle cannot spin the walk.
+fn md_files_flattened(root: &Path) -> Vec<(PathBuf, String)> {
+    const MAX_DEPTH: usize = 8;
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<(PathBuf, String)>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                walk(&path, &format!("{prefix}{name}-"), depth + 1, out);
+            } else if path.is_file()
                 && path
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-        })
-        .collect();
-    files.sort();
+            {
+                out.push((path.clone(), format!("{prefix}{name}")));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, "", 0, &mut files);
+    files.sort_by(|a, b| a.1.cmp(&b.1));
     files
 }
 
@@ -365,11 +396,9 @@ fn import_commands(outcome: &mut ImportOutcome) -> Result<()> {
     let dst_dir = Config::wizard_dir()?.join("commands");
     std::fs::create_dir_all(&dst_dir).with_context(|| format!("creating {}", dst_dir.display()))?;
     let (to_copy, skipped) = plan_command_copies(&src_files, &dst_dir);
-    for src in &to_copy {
-        if let Some(name) = src.file_name() {
-            std::fs::copy(src, dst_dir.join(name))
-                .with_context(|| format!("copying {}", src.display()))?;
-        }
+    for (src, dest) in &to_copy {
+        std::fs::copy(src, dst_dir.join(dest))
+            .with_context(|| format!("copying {}", src.display()))?;
     }
     outcome.cmds_added = to_copy.len();
     outcome.cmds_skipped = skipped;
@@ -417,6 +446,30 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert!(servers.iter().all(|s| s.transport == McpTransport::Http));
         assert_eq!(servers[0].url.as_deref(), Some("https://b.example/mcp"));
+    }
+
+    #[test]
+    fn parse_mcp_imports_http_headers() {
+        let json = json!({
+            "mcpServers": {
+                "authed": {
+                    "type": "http",
+                    "url": "https://a.example/mcp",
+                    "headers": { "Authorization": "Bearer tok-123", "X-Team": "blue" }
+                }
+            }
+        });
+        let (servers, unsupported) = parse_mcp_servers(&json);
+        assert!(unsupported.is_empty());
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok-123")
+        );
+        assert_eq!(
+            servers[0].headers.get("X-Team").map(String::as_str),
+            Some("blue")
+        );
     }
 
     #[test]
@@ -476,6 +529,7 @@ mod tests {
             args: Vec::new(),
             url: None,
             env: HashMap::new(),
+            headers: HashMap::new(),
         }
     }
 
@@ -501,8 +555,30 @@ mod tests {
         std::fs::write(&a, b"x").expect("write");
         std::fs::write(&b, b"x").expect("write");
 
-        let (to_copy, skipped) = plan_command_copies(&[a.clone(), b], dir.path());
-        assert_eq!(to_copy, vec![a]);
+        let (to_copy, skipped) = plan_command_copies(
+            &[(a.clone(), "new.md".to_string()), (b, "dup.md".to_string())],
+            dir.path(),
+        );
+        assert_eq!(to_copy, vec![(a, "new.md".to_string())]);
         assert_eq!(skipped, vec!["dup.md".to_string()]);
+    }
+
+    #[test]
+    fn md_files_flattened_walks_subdirs_and_namespaces_names() {
+        let src = tempfile::tempdir().expect("tempdir");
+        std::fs::write(src.path().join("top.md"), b"x").expect("write");
+        std::fs::write(src.path().join("notes.txt"), b"x").expect("write");
+        let ns = src.path().join("ns");
+        std::fs::create_dir_all(ns.join("deep")).expect("mkdir");
+        std::fs::write(ns.join("cmd.md"), b"x").expect("write");
+        std::fs::write(ns.join("deep").join("inner.md"), b"x").expect("write");
+
+        let files = md_files_flattened(src.path());
+        let names: Vec<&str> = files.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, vec!["ns-cmd.md", "ns-deep-inner.md", "top.md"]);
+        assert_eq!(files[0].0, ns.join("cmd.md"));
+
+        // A missing directory yields nothing.
+        assert!(md_files_flattened(&src.path().join("absent")).is_empty());
     }
 }

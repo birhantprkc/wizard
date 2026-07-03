@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::shell::{CommandResult, run_command};
+use super::shell::{CommandResult, render_command_result, run_command};
 use super::{
     MAX_OUTPUT_BYTES, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args,
     truncate_output,
@@ -31,6 +31,9 @@ where
 
 /// Model-facing error output for a failed git invocation.
 fn git_failure(result: &CommandResult, fallback: &str) -> ToolOutput {
+    if result.timed_out.is_some() {
+        return render_command_result(result);
+    }
     let stderr = result.stderr.trim_end();
     let detail = if stderr.is_empty() { fallback } else { stderr };
     ToolOutput::error(truncate_output(detail.to_string(), MAX_OUTPUT_BYTES))
@@ -141,5 +144,188 @@ impl Tool for GitDiffTool {
                 MAX_OUTPUT_BYTES,
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    /// Temp project dir removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("wizard-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn ctx(&self) -> ToolContext {
+            ToolContext::new(&self.0)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run `git <args>` for test setup, isolated from user/system git config.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit_all(dir: &Path, message: &str) {
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    #[test]
+    fn git_failure_prefers_stderr_over_fallback() {
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: "fatal: boom\n".to_string(),
+            code: Some(128),
+            timed_out: None,
+        };
+        assert_eq!(git_failure(&result, "fallback").content, "fatal: boom");
+
+        let silent = CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: Some(1),
+            timed_out: None,
+        };
+        let out = git_failure(&silent, "git status failed");
+        assert!(out.is_error);
+        assert_eq!(out.content, "git status failed");
+    }
+
+    #[test]
+    fn git_failure_renders_timeout_with_partial_output() {
+        let result = CommandResult {
+            stdout: "partial diff\n".to_string(),
+            stderr: String::new(),
+            code: None,
+            timed_out: Some(30),
+        };
+        let out = git_failure(&result, "git diff failed");
+        assert!(out.is_error);
+        assert!(out.content.contains("partial diff"), "{}", out.content);
+        assert!(
+            out.content.contains("timed out after 30s"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn diff_args_default_to_unstaged_whole_tree() {
+        let args: GitDiffArgs = parse_args("git_diff", json!({})).unwrap();
+        assert!(!args.staged);
+        assert!(args.path.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_clean_tree() {
+        let tmp = TempDir::new();
+        git(&tmp.0, &["init", "-q"]);
+        let out = GitStatusTool.execute(json!({}), &tmp.ctx()).await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.starts_with("##"), "{}", out.content);
+        assert!(
+            out.content.contains("(clean working tree)"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn status_lists_untracked_files() {
+        let tmp = TempDir::new();
+        git(&tmp.0, &["init", "-q"]);
+        std::fs::write(tmp.0.join("new.txt"), "hello\n").unwrap();
+        let out = GitStatusTool.execute(json!({}), &tmp.ctx()).await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("?? new.txt"), "{}", out.content);
+        assert!(!out.content.contains("(clean working tree)"));
+    }
+
+    #[tokio::test]
+    async fn status_outside_a_repository_is_an_error() {
+        let tmp = TempDir::new();
+        let out = GitStatusTool.execute(json!({}), &tmp.ctx()).await.unwrap();
+        assert!(out.is_error);
+        assert!(!out.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_reports_no_changes_in_fresh_repo() {
+        let tmp = TempDir::new();
+        git(&tmp.0, &["init", "-q"]);
+        let out = GitDiffTool.execute(json!({}), &tmp.ctx()).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "No changes.");
+    }
+
+    #[tokio::test]
+    async fn diff_distinguishes_unstaged_staged_and_paths() {
+        let tmp = TempDir::new();
+        git(&tmp.0, &["init", "-q"]);
+        std::fs::write(tmp.0.join("f.txt"), "old\n").unwrap();
+        commit_all(&tmp.0, "init");
+        std::fs::write(tmp.0.join("f.txt"), "new\n").unwrap();
+
+        let unstaged = GitDiffTool.execute(json!({}), &tmp.ctx()).await.unwrap();
+        assert!(unstaged.content.contains("-old"), "{}", unstaged.content);
+        assert!(unstaged.content.contains("+new"), "{}", unstaged.content);
+
+        // Not staged yet, so the staged diff is empty.
+        let staged = GitDiffTool
+            .execute(json!({ "staged": true }), &tmp.ctx())
+            .await
+            .unwrap();
+        assert_eq!(staged.content, "No changes.");
+
+        git(&tmp.0, &["add", "f.txt"]);
+        let staged = GitDiffTool
+            .execute(json!({ "staged": true }), &tmp.ctx())
+            .await
+            .unwrap();
+        assert!(staged.content.contains("+new"), "{}", staged.content);
+
+        // A path filter that matches nothing yields no changes.
+        let other = GitDiffTool
+            .execute(json!({ "staged": true, "path": "other.txt" }), &tmp.ctx())
+            .await
+            .unwrap();
+        assert_eq!(other.content, "No changes.");
     }
 }

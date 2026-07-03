@@ -95,7 +95,7 @@ The pipeline:
 
 1. **Locate source**: `~/.wizard/src`, cloned from the repo on first use.
 2. **Ensure a toolchain**: if `cargo` is absent, install it via `rustup --profile minimal` (~0.5–1 GB, first deep evolve only). The default installer ships no toolchain; you pay for the compiler only if you use this tier.
-3. **Propose a diff** over Wizard's own source.
+3. **Propose a diff** over Wizard's own source, in two model turns: a file-selection turn picks the relevant files from the repository listing (with a keyword-matching fallback when it fails), then the diff-authoring turn sees those files' actual contents (up to 8 files under a ~96 kB budget) so its hunks match the real source and survive `git apply --check`.
 4. **`cargo build --release`.**
 5. **`exec`-replace** the running process with the new binary.
 
@@ -125,7 +125,19 @@ If an MCP server or script can do it, stay in Tier 1: it's instant, reversible, 
 
 ## Logging and rollback
 
-Every evolution, tier 1 or 2, is appended to `~/.wizard/evolution.jsonl` with a timestamp, the change, and (for deep evolve) the diff and build result. Tier-1 changes are plain files under `~/.wizard/`; delete the file and `/reload` to revert. Deep evolve keeps the prior binary so you can roll back to it.
+Every evolution, tier 1 or 2, is appended to `~/.wizard/evolution.jsonl` with a timestamp, the change, and (for deep evolve) the diff and build result. Inspect and roll back from the CLI:
+
+```bash
+# Numbered history, most recent first (#1 is the newest):
+wizard evolve list
+
+# Undo entry #N from the list:
+wizard evolve undo 2
+```
+
+`undo` reverts what the entry recorded: a skill, scripted tool, or subagent undo deletes the created files (`/reload` to apply); an MCP-server undo removes its entry from `~/.wizard/mcp.toml`; a deep-evolve undo restores the `<binary>.prev` rollback copy over the installed binary (keeping the undone build beside it as `<binary>.undone`) — restart Wizard to run it. Undo is conservative: when the recorded artifacts are already gone it refuses with a clear message rather than guessing.
+
+Everything is also plain files under `~/.wizard/`, so manual cleanup keeps working: delete the file and `/reload` to revert a tier-1 change; deep evolve keeps the prior binary as `<binary>.prev`.
 
 ---
 

@@ -51,7 +51,12 @@ Each hook receives one JSON object on stdin:
 }
 ```
 
-`tool_name` and `args` are `null` for the non-tool events. A hook that does not care about the payload can simply not read stdin.
+`tool_name` and `args` are `null` for the non-tool events. Two events carry extra fields:
+
+- `user_prompt_submit`: `prompt` — the text of the user message starting the turn.
+- `post_tool_use`: `tool_output` — the text the tool returned (truncated to 32 KB), and `is_error` — `true` when the tool reported failure.
+
+A hook that does not care about the payload can simply not read stdin.
 
 ## Exit-code semantics
 
@@ -77,6 +82,15 @@ Block shell commands that mention `rm -rf`:
 event = "pre_tool_use"
 matcher = "execute"
 command = "jq -e '.args.command | test(\"rm -rf\") | not' > /dev/null || { echo 'rm -rf is not allowed' >&2; exit 2; }"
+```
+
+Append a note to every failed shell command's result:
+
+```toml
+[[hooks]]
+event = "post_tool_use"
+matcher = "execute"
+command = "jq -r 'if .is_error then \"check the error above before retrying\" else empty end'"
 ```
 
 Remind the model of the branch policy on every prompt:

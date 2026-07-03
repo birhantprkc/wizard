@@ -8,7 +8,7 @@ use clap::Parser;
 
 use crate::config::Mode;
 
-/// Wizard — your sovereign agent. Self-extending. Fully local.
+/// Wizard — your sovereign agent. Self-extending. Bring any model.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "wizard", version, about, long_about = None)]
 pub struct Cli {
@@ -107,6 +107,66 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+impl Cli {
+    /// Names of top-level flags set on this invocation that a self-contained
+    /// subcommand (bench, doctor, schedule, scheduler, fleet, usage, evolve)
+    /// would silently ignore. `--cwd` is honored everywhere and excluded.
+    /// [`crate::run`] turns a non-empty result into a hard error rather than
+    /// silently dropping the flags.
+    pub fn ignored_top_level_flags(&self) -> Vec<&'static str> {
+        let mut ignored = Vec::new();
+        if self.mode.is_some() {
+            ignored.push("--mode");
+        }
+        if self.prompt.is_some() {
+            ignored.push("--prompt");
+        }
+        if self.evolve {
+            ignored.push("--evolve");
+        }
+        if self.deep {
+            ignored.push("--deep");
+        }
+        if self.publish {
+            ignored.push("--publish");
+        }
+        if self.plan {
+            ignored.push("--plan");
+        }
+        if self.omakase {
+            ignored.push("--omakase");
+        }
+        if self.max_hours.is_some() {
+            ignored.push("--max-hours");
+        }
+        if self.loop_limit.is_some() {
+            ignored.push("--loop");
+        }
+        if self.continuous {
+            ignored.push("--continuous");
+        }
+        if self.bg {
+            ignored.push("--bg");
+        }
+        if self.output_format != crate::output::OutputFormat::Text {
+            ignored.push("--output-format");
+        }
+        if self.resume {
+            ignored.push("--resume");
+        }
+        if self.onboard {
+            ignored.push("--onboard");
+        }
+        if self.gateway {
+            ignored.push("--gateway");
+        }
+        if self.login.is_some() {
+            ignored.push("--login");
+        }
+        ignored
+    }
+}
+
 /// Top-level subcommands. Absent for the classic flag-driven modes.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
@@ -155,6 +215,38 @@ pub enum Command {
     Harness {
         #[command(subcommand)]
         cmd: HarnessCmd,
+    },
+
+    /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
+    /// project and per provider. Self-contained; never loads config.
+    Usage {
+        /// Only include turns from the last N days (e.g. `--since 7d`).
+        #[arg(long, value_name = "DAYS")]
+        since: Option<String>,
+    },
+
+    /// Inspect and roll back self-extensions recorded in
+    /// ~/.wizard/evolution.jsonl.
+    Evolve {
+        #[command(subcommand)]
+        cmd: EvolveCmd,
+    },
+}
+
+/// `wizard evolve` subcommands. Self-contained: they read
+/// `~/.wizard/evolution.jsonl` and touch the recorded artifacts directly —
+/// no config load, no LLM.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum EvolveCmd {
+    /// List recorded evolutions, most recent first (#1 is the newest).
+    List,
+
+    /// Undo evolution #N from `wizard evolve list`: delete the files a
+    /// runtime evolution created, or restore the `.prev` binary for a deep
+    /// one. Refuses when the artifacts are already gone.
+    Undo {
+        /// Entry number as shown by `wizard evolve list`.
+        n: usize,
     },
 }
 
@@ -240,6 +332,18 @@ pub enum ScheduleCmd {
         name: String,
     },
 
+    /// Enable a disabled entry (the daemon fires it again).
+    Enable {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
+    },
+
+    /// Disable an entry without removing it (kept in the file, never fired).
+    Disable {
+        /// Entry name as shown by `wizard schedule list`.
+        name: String,
+    },
+
     /// Run one entry's job immediately in the foreground (same child
     /// command the daemon would spawn); exits with the child's exit code.
     Run {
@@ -293,6 +397,10 @@ pub enum BenchCmd {
         /// Also show the last 20 recorded trajectories.
         #[arg(long)]
         trajectories: bool,
+
+        /// Show only cases carrying this tag (repeatable).
+        #[arg(long = "tag")]
+        tag: Vec<String>,
     },
 
     /// Promote a recorded trajectory into a case by attaching a check command.
@@ -340,9 +448,20 @@ pub enum BenchCmd {
         #[arg(long = "case")]
         case: Vec<String>,
 
+        /// Run only cases carrying this tag (repeatable; combines with
+        /// --case as a union).
+        #[arg(long = "tag")]
+        tag: Vec<String>,
+
         /// Keep the per-case worktrees for inspection instead of removing them.
         #[arg(long)]
         keep_worktrees: bool,
+    },
+
+    /// Remove a case by id.
+    Remove {
+        /// Case id as shown by `wizard bench list`.
+        id: String,
     },
 
     /// Compare two result files case-by-case.
@@ -648,9 +767,9 @@ mod tests {
     }
 
     #[test]
-    fn bench_run_parses_repeatable_case_filter() {
+    fn bench_run_parses_repeatable_case_and_tag_filters() {
         let cli = parse(&[
-            "bench", "run", "--runner", "true", "--case", "a", "--case", "b",
+            "bench", "run", "--runner", "true", "--case", "a", "--case", "b", "--tag", "rust",
         ])
         .expect("bench run parses");
         let Some(Command::Bench {
@@ -659,6 +778,7 @@ mod tests {
                     runner,
                     label,
                     case,
+                    tag,
                     keep_worktrees,
                 },
         }) = cli.command
@@ -668,7 +788,94 @@ mod tests {
         assert_eq!(runner.as_deref(), Some("true"));
         assert_eq!(label, "run");
         assert_eq!(case, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(tag, vec!["rust".to_string()]);
         assert!(!keep_worktrees);
+    }
+
+    #[test]
+    fn bench_list_and_remove_parse() {
+        let cli = parse(&["bench", "list", "--tag", "smoke"]).expect("bench list parses");
+        let Some(Command::Bench {
+            cmd: BenchCmd::List { trajectories, tag },
+        }) = cli.command
+        else {
+            panic!("expected bench list");
+        };
+        assert!(!trajectories);
+        assert_eq!(tag, vec!["smoke".to_string()]);
+
+        let cli = parse(&["bench", "remove", "touch-case"]).expect("bench remove parses");
+        let Some(Command::Bench {
+            cmd: BenchCmd::Remove { id },
+        }) = cli.command
+        else {
+            panic!("expected bench remove");
+        };
+        assert_eq!(id, "touch-case");
+    }
+
+    #[test]
+    fn schedule_enable_and_disable_parse() {
+        let cli = parse(&["schedule", "enable", "nightly"]).expect("schedule enable parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Enable { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule enable");
+        };
+        assert_eq!(name, "nightly");
+
+        let cli = parse(&["schedule", "disable", "nightly"]).expect("schedule disable parses");
+        let Some(Command::Schedule {
+            cmd: ScheduleCmd::Disable { name },
+        }) = cli.command
+        else {
+            panic!("expected schedule disable");
+        };
+        assert_eq!(name, "nightly");
+    }
+
+    #[test]
+    fn usage_parses_with_optional_since() {
+        let cli = parse(&["usage"]).expect("usage parses");
+        assert!(matches!(cli.command, Some(Command::Usage { since: None })));
+
+        let cli = parse(&["usage", "--since", "7d"]).expect("usage --since parses");
+        let Some(Command::Usage { since }) = cli.command else {
+            panic!("expected usage");
+        };
+        assert_eq!(since.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn evolve_list_and_undo_parse() {
+        let cli = parse(&["evolve", "list"]).expect("evolve list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Evolve {
+                cmd: EvolveCmd::List
+            })
+        ));
+
+        let cli = parse(&["evolve", "undo", "2"]).expect("evolve undo parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Evolve {
+                cmd: EvolveCmd::Undo { n: 2 }
+            })
+        ));
+    }
+
+    #[test]
+    fn ignored_top_level_flags_names_everything_but_cwd() {
+        let cli = parse(&["--cwd", "/tmp", "doctor"]).expect("parses");
+        assert!(cli.ignored_top_level_flags().is_empty(), "--cwd is honored");
+
+        let cli = parse(&["--plan", "--max-hours", "2", "fleet", "status"]).expect("parses");
+        assert_eq!(cli.ignored_top_level_flags(), vec!["--plan", "--max-hours"]);
+
+        let cli = parse(&["--output-format", "json", "bench", "list"]).expect("parses");
+        assert_eq!(cli.ignored_top_level_flags(), vec!["--output-format"]);
     }
 
     #[test]

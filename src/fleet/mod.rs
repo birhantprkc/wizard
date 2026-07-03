@@ -651,6 +651,45 @@ fn touch_heartbeat(dirs: &FleetDirs) {
     let _ = std::fs::write(dirs.heartbeat_path(), format!("{ts}\n"));
 }
 
+/// A supervising coordinator touches the heartbeat every [`TICK`]; past
+/// this many seconds without one it is presumed dead (SIGKILL, OOM, reboot).
+const STALE_HEARTBEAT_SECS: u64 = 30;
+
+/// Seconds since the coordinator last touched the heartbeat file; `None`
+/// when the file is missing or unreadable.
+pub fn heartbeat_age_secs(dirs: &FleetDirs) -> Option<u64> {
+    let raw = std::fs::read_to_string(dirs.heartbeat_path()).ok()?;
+    let ts: u64 = raw.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(ts))
+}
+
+/// True for `fleet.toml` statuses that mean a coordinator process should
+/// still be alive.
+fn fleet_is_live(status: &str) -> bool {
+    matches!(status, "planning" | "running" | "synthesizing")
+}
+
+/// Human-readable heartbeat line for `fleet status`. The heartbeat is only
+/// touched while the coordinator supervises workers, so staleness is only
+/// judged in the "running" state (planning and synthesis are single long
+/// agent turns that do not tick).
+fn heartbeat_note(status: &str, age: Option<u64>) -> Option<String> {
+    if status != "running" {
+        return None;
+    }
+    Some(match age {
+        Some(age) if age > STALE_HEARTBEAT_SECS => {
+            format!("stale ({age}s old — coordinator likely dead)")
+        }
+        Some(age) => format!("{age}s ago"),
+        None => "none recorded".to_string(),
+    })
+}
+
 /// Kill every running child and record killed-task results. Used by the
 /// stop sentinel and ctrl-c paths.
 async fn stop_all(slots: &mut [Slot], dirs: &FleetDirs) {
@@ -1075,6 +1114,9 @@ fn status_cmd() -> Result<i32> {
         "status:  {} — {} worker(s), started {}",
         state.status, state.workers, state.started
     );
+    if let Some(note) = heartbeat_note(&state.status, heartbeat_age_secs(&dirs)) {
+        println!("heartbeat: {note}");
+    }
     if !state.pids.is_empty() {
         println!(
             "pids:    {}",
@@ -1097,10 +1139,30 @@ fn status_cmd() -> Result<i32> {
 }
 
 /// `wizard fleet stop`: write the stop sentinel; the coordinator winds down
-/// on its next supervision tick.
+/// on its next supervision tick. When no fleet is live (never ran, already
+/// done/stopped, or the coordinator's heartbeat is stale), says so and
+/// exits 1 instead of leaving a stale sentinel behind.
 fn stop_cmd() -> Result<i32> {
     let root = std::env::current_dir().context("determining project root")?;
     let dirs = FleetDirs::new(&root);
+    let state = load_state(&dirs.state_path())?;
+    let live = state.as_ref().is_some_and(|s| fleet_is_live(&s.status));
+    if !live {
+        // Clear any sentinel a previous no-op stop left behind.
+        let _ = std::fs::remove_file(dirs.stop_path());
+        println!("no fleet is running in this project — nothing to stop");
+        return Ok(1);
+    }
+    if let Some(state) = &state
+        && state.status == "running"
+        && heartbeat_age_secs(&dirs).is_none_or(|age| age > STALE_HEARTBEAT_SECS)
+    {
+        println!(
+            "no fleet is running — fleet.toml says \"running\" but the coordinator's \
+             heartbeat is stale (likely killed); nothing to stop"
+        );
+        return Ok(1);
+    }
     std::fs::create_dir_all(dirs.stop_path().parent().expect("stop path has a parent"))
         .context("creating .wizard/fleet")?;
     std::fs::write(dirs.stop_path(), "stop\n").context("writing the stop sentinel")?;
@@ -1206,7 +1268,15 @@ async fn run_fleet(n: usize, mission: String) -> Result<i32> {
     if !rows.is_empty() {
         print!("{}", render_table(&rows));
     }
-    Ok(0)
+
+    // Exit nonzero when the fleet did not finish cleanly (stopped) or any
+    // task failed (nonzero exit, timeout, or kill), so `fleet run` can gate
+    // CI.
+    let failed = results.iter().filter(|r| r.exit != Some(0)).count();
+    if failed > 0 {
+        println!("fleet: {failed} task(s) failed");
+    }
+    Ok(if completed && failed == 0 { 0 } else { 1 })
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,6 +1549,59 @@ mod tests {
         save_state(&path, &state).expect("saves");
         let loaded = load_state(&path).expect("loads").expect("present");
         assert_eq!(loaded, state);
+    }
+
+    // --- heartbeat ---
+
+    #[test]
+    fn heartbeat_age_reads_the_touched_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = FleetDirs::new(dir.path());
+        dirs.ensure().expect("ensure");
+
+        assert_eq!(heartbeat_age_secs(&dirs), None, "missing file is None");
+        std::fs::write(dirs.heartbeat_path(), "not a number\n").unwrap();
+        assert_eq!(heartbeat_age_secs(&dirs), None, "garbage is None");
+
+        touch_heartbeat(&dirs);
+        let age = heartbeat_age_secs(&dirs).expect("age readable");
+        assert!(age <= 2, "freshly touched: {age}s");
+
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 120;
+        std::fs::write(dirs.heartbeat_path(), format!("{old}\n")).unwrap();
+        let age = heartbeat_age_secs(&dirs).expect("age readable");
+        assert!((115..=125).contains(&age), "two minutes old: {age}s");
+    }
+
+    #[test]
+    fn heartbeat_note_flags_staleness_only_while_running() {
+        assert_eq!(heartbeat_note("done", Some(9999)), None);
+        assert_eq!(heartbeat_note("planning", None), None);
+        assert_eq!(
+            heartbeat_note("running", Some(2)).as_deref(),
+            Some("2s ago")
+        );
+        let stale = heartbeat_note("running", Some(120)).expect("note");
+        assert!(stale.contains("stale"), "{stale}");
+        assert!(stale.contains("coordinator likely dead"), "{stale}");
+        assert_eq!(
+            heartbeat_note("running", None).as_deref(),
+            Some("none recorded")
+        );
+    }
+
+    #[test]
+    fn live_statuses() {
+        for live in ["planning", "running", "synthesizing"] {
+            assert!(fleet_is_live(live), "{live}");
+        }
+        for dead in ["done", "stopped", ""] {
+            assert!(!fleet_is_live(dead), "{dead:?}");
+        }
     }
 
     // --- stop sentinel ---

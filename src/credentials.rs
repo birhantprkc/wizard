@@ -135,6 +135,17 @@ pub fn remove(name: &str) -> Result<()> {
     remove_at(&path()?, name)
 }
 
+/// Strictly parse the store at `path` for diagnostics (`wizard doctor`),
+/// returning the number of stored keys. Unlike normal reads — which degrade a
+/// corrupt file to "no stored keys" — read and parse failures are errors here.
+pub fn parse_strict(path: &Path) -> Result<usize> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let store: Store =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(store.keys.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +183,24 @@ mod tests {
         let path = dir.path().join("credentials.toml");
         std::fs::write(&path, "this is not valid toml = = =").expect("write garbage");
         assert_eq!(get_at(&path, "openai"), None);
+    }
+
+    #[test]
+    fn parse_strict_counts_keys_and_surfaces_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("credentials.toml");
+
+        // Missing file is an error under strict parsing (doctor skips it
+        // before calling this).
+        assert!(parse_strict(&path).is_err());
+
+        store_at(&path, "openai", "sk-test").expect("store");
+        store_at(&path, "claude", "sk-ant").expect("store");
+        assert_eq!(parse_strict(&path).expect("valid store"), 2);
+
+        std::fs::write(&path, "this is not valid toml = = =").expect("write garbage");
+        let err = parse_strict(&path).expect_err("corrupt store must error");
+        assert!(format!("{err:#}").contains("parsing"), "got: {err:#}");
     }
 
     #[cfg(unix)]

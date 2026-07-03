@@ -175,18 +175,40 @@ fn run_records_pass_and_fail_results_and_compare_reports_both() {
             .expect("result parses");
     assert_eq!(pass_json["pass_rate"], 1.0, "pass_rate in {pass_json}");
 
-    // Failing run: harness does nothing, so the check fails.
+    // Failing run: harness does nothing, so the check fails — and the run
+    // exits 1 so it can gate CI.
     let output = run_wizard(
         &home.0,
         &repo,
         &["bench", "run", "--runner", "true", "--label", "fail-run"],
     );
     assert!(
-        output.status.success(),
-        "a failing case is still a clean run"
+        !output.status.success(),
+        "a run with failing cases must exit nonzero"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "failed cases exit 1, not a crash"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("0/1 passed"), "summary line:\n{stdout}");
+    assert!(
+        stdout.contains(".wizard/bench/logs/fail-run"),
+        "failure points at the captured logs:\n{stdout}"
+    );
+
+    // The harness/check output was teed to per-case logs.
+    let check_log = repo.join(".wizard/bench/logs/fail-run/touch-case.check.log");
+    let text = std::fs::read_to_string(&check_log).expect("check log written");
+    assert!(
+        text.contains("test -f marker.txt"),
+        "log records the command:\n{text}"
+    );
+    assert!(
+        text.contains("exit: Some(1)"),
+        "log records the exit:\n{text}"
+    );
 
     let fail_path = result_file(&repo, "fail-run");
     let fail_json: serde_json::Value =
@@ -238,6 +260,90 @@ fn list_shows_cases() {
         stdout.contains("touch-case"),
         "list shows the case:\n{stdout}"
     );
+}
+
+/// Add a passing case with `id` and `tags` ("true" check always passes).
+fn add_tagged_case(home: &Path, repo: &Path, id: &str, tags: &[&str]) {
+    let mut args = vec![
+        "bench", "add", "--id", id, "--prompt", "noop", "--check", "true",
+    ];
+    for tag in tags {
+        args.push("--tag");
+        args.push(tag);
+    }
+    let output = run_wizard(home, repo, &args);
+    assert!(
+        output.status.success(),
+        "bench add {id} must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tag_filters_select_cases_for_list_and_run() {
+    let home = TempDir::new("tags");
+    let (repo, _sha) = fixture_repo(&home.0);
+    add_tagged_case(&home.0, &repo, "rusty", &["rust"]);
+    add_tagged_case(&home.0, &repo, "docsy", &["docs"]);
+
+    let output = run_wizard(&home.0, &repo, &["bench", "list", "--tag", "rust"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rusty"), "tagged case listed:\n{stdout}");
+    assert!(!stdout.contains("docsy"), "other tags filtered:\n{stdout}");
+
+    let output = run_wizard(
+        &home.0,
+        &repo,
+        &[
+            "bench", "run", "--runner", "true", "--label", "tagged", "--tag", "rust",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "tag-filtered run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1/1 passed"),
+        "only the tagged case ran:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("docsy"),
+        "untagged case skipped:\n{stdout}"
+    );
+
+    let output = run_wizard(
+        &home.0,
+        &repo,
+        &["bench", "run", "--runner", "true", "--tag", "nope"],
+    );
+    assert!(!output.status.success(), "an unknown tag must be an error");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nope"), "error names the tag:\n{stderr}");
+}
+
+#[test]
+fn remove_deletes_a_case_and_rejects_unknown_ids() {
+    let home = TempDir::new("remove");
+    let (repo, _sha) = fixture_repo(&home.0);
+    add_touch_case(&home.0, &repo);
+    let case_path = repo.join(".wizard/bench/cases/touch-case.toml");
+    assert!(case_path.exists());
+
+    let output = run_wizard(&home.0, &repo, &["bench", "remove", "touch-case"]);
+    assert!(
+        output.status.success(),
+        "bench remove must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!case_path.exists(), "case file deleted");
+
+    let output = run_wizard(&home.0, &repo, &["bench", "remove", "touch-case"]);
+    assert!(!output.status.success(), "removing twice must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no case"), "stderr: {stderr}");
 }
 
 #[test]

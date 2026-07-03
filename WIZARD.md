@@ -17,9 +17,9 @@ the user owns, publishes, and installs anywhere with one line.
 When a task needs a capability Wizard does not yet have, the default is to
 **acquire it**, not to refuse. Treat "I can't browse the web", "I can't see
 images", and "I have no database tool" as work items. Refuse only after trying
-and hitting a wall you cannot pass (no network, no toolchain, a tool call
-rejected via `auto_approve = false`), and then say exactly what you tried
-and what blocked you.
+and hitting a wall you cannot pass (no network, no toolchain, a missing
+credential you cannot obtain), and then say exactly what you tried and what
+blocked you.
 
 Climb this ladder, cheapest rung first. Each rung is the `evolve` tool with a
 different channel; everything below the source rung is live after `/reload`,
@@ -37,7 +37,7 @@ with no recompile.
 5. **Deep evolve (source).** None of the above fit and the capability must
    live in Wizard's own Rust. Use `evolve` with `deep=true`: it edits the
    source checkout, rebuilds, smoke-tests, and replaces the running binary,
-   gated by approval with `wizard.prev` rollback. **Taking this rung is
+   keeping `wizard.prev` for rollback. **Taking this rung is
    expected, not exceptional.** When the user asks Wizard to change itself, or
    a task requires it, do it. A source change should usually be followed by
    **publishing a fork** (see §3).
@@ -145,11 +145,11 @@ Tier-1 runtime evolutions (skills/MCP/scripts/subagents): those live under
 
 ## 4. Guardrails
 
-- **Gates stay.** Both modes auto-approve tool calls by default; a user who
-  sets `auto_approve = false` gets a y/n gate before every tool call; never
-  route around a gate the user controls. Sovereign mode auto-approves by
-  design; that is the user's standing consent, not a license to invent new
-  authority.
+- **Gates stay.** There is no per-action approval gate, by design. The gates
+  that do exist — deep evolve's clean build and smoke test, plan mode's
+  read-only investigation until the plan is approved — are never to be routed
+  around. Running Wizard is the user's standing consent to act, not a license
+  to invent new authority.
 - **Everything is reversible and logged.** Deep evolve keeps `wizard.prev` for
   one-`mv` rollback and records every change (with its diff) to
   `~/.wizard/evolution.jsonl`. Publication is logged too. Keep it that way.

@@ -3,9 +3,10 @@
 //! Runs a battery of checks — config parses, providers reachable, MCP
 //! servers handshake, tools registered, hooks parse, state directories
 //! writable, checkpoint index sane — and prints one `✓` / `✗` / `–` line
-//! per check. Network probes are capped at [`PROBE_TIMEOUT`] so doctor can
-//! never hang. The CLI exits 0 when nothing failed, 1 otherwise; skipped
-//! (`–`) checks are not failures.
+//! per check. Provider probes are capped at [`PROBE_TIMEOUT`] and MCP
+//! handshakes at the runtime's own [`crate::mcp::CONNECT_TIMEOUT`], so
+//! doctor can never hang. The CLI exits 0 when nothing failed, 1 otherwise;
+//! skipped (`–`) checks are not failures.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,7 +16,10 @@ use anyhow::Result;
 use crate::config::{Config, ProviderConfig};
 use crate::tools::registry::ToolRegistry;
 
-/// Cap on every network probe (provider health, MCP handshake).
+/// Cap on every provider health probe. MCP handshakes use
+/// [`crate::mcp::CONNECT_TIMEOUT`] instead — the same budget the runtime
+/// allows, so a slow-starting `npx`/`uvx` server that works in the app does
+/// not fail doctor.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of one check.
@@ -191,6 +195,58 @@ pub fn check_checkpoints(project_root: &Path) -> Check {
     Check::pass(label, detail)
 }
 
+/// `active_provider` in `config.toml` names a configured provider. An unknown
+/// name (typo, removed provider) silently falls back to the first provider,
+/// so the user would run against a different backend without noticing.
+pub fn check_active_provider(config: &Config) -> Check {
+    let label = "active provider";
+    match config.active_provider_mismatch() {
+        Some(name) => Check::fail(
+            label,
+            format!(
+                "active_provider '{name}' matches no configured provider; \
+                 falling back to '{}'",
+                config.active().name
+            ),
+        ),
+        None => Check::pass(label, format!("'{}'", config.active().name)),
+    }
+}
+
+/// `credentials.toml` parses cleanly and is not group/world-accessible.
+/// Normal reads degrade a corrupt file to "no stored keys", which silently
+/// breaks every provider relying on a stored key — doctor surfaces it.
+pub fn check_credentials_file(path: &Path) -> Check {
+    let label = "credentials";
+    if !path.exists() {
+        return Check::skip(label, format!("{} absent (no stored keys)", path.display()));
+    }
+    let count = match crate::credentials::parse_strict(path) {
+        Ok(count) => count,
+        Err(err) => return Check::fail(label, format!("{err:#}")),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Check::fail(
+                        label,
+                        format!(
+                            "{} is mode {mode:03o}, expected 0600 (chmod 600 it)",
+                            path.display()
+                        ),
+                    );
+                }
+            }
+            Err(err) => return Check::fail(label, format!("{}: {err}", path.display())),
+        }
+    }
+    Check::pass(label, format!("{count} stored key(s), permissions ok"))
+}
+
 /// The native tool set is compiled in and registered.
 pub fn check_native_tools() -> Check {
     let count = ToolRegistry::with_native_tools().len();
@@ -206,13 +262,16 @@ pub fn check_native_tools() -> Check {
 // ---------------------------------------------------------------------------
 
 /// One configured provider answers its health probe within
-/// [`PROBE_TIMEOUT`]. Skipped when its API key env var is not set.
+/// [`PROBE_TIMEOUT`]. Skipped only when it has no key at all: neither the
+/// API key env var nor a stored credential (`resolved_key` checks
+/// `credentials.toml` first, so a stored key means the probe is real).
 async fn check_provider(provider: &ProviderConfig) -> Check {
     let label = format!("provider {}", provider.name);
     if let Some(env) = &provider.api_key_env
         && !std::env::var(env).is_ok_and(|value| !value.trim().is_empty())
+        && crate::credentials::get(&provider.name).is_none()
     {
-        return Check::skip(label, format!("${env} not set"));
+        return Check::skip(label, format!("${env} not set and no stored key"));
     }
     let client = match provider.build() {
         Ok(client) => client,
@@ -232,8 +291,10 @@ async fn check_provider(provider: &ProviderConfig) -> Check {
 }
 
 /// Every `[[server]]` in `mcp.toml` spawns and completes the MCP handshake
-/// within [`PROBE_TIMEOUT`].
+/// within the runtime's [`crate::mcp::CONNECT_TIMEOUT`], so a server that
+/// works in the app never fails doctor on startup time alone.
 async fn check_mcp_servers(path: &Path) -> Vec<Check> {
+    let connect_timeout = crate::mcp::CONNECT_TIMEOUT;
     let config = match crate::mcp::McpConfig::load(path) {
         Ok(config) => config,
         Err(err) => return vec![Check::fail("mcp", format!("{err:#}"))],
@@ -245,21 +306,25 @@ async fn check_mcp_servers(path: &Path) -> Vec<Check> {
     for server in config.servers {
         let label = format!("mcp {}", server.name);
         let check =
-            match tokio::time::timeout(PROBE_TIMEOUT, crate::mcp::McpConnection::connect(server))
+            match tokio::time::timeout(connect_timeout, crate::mcp::McpConnection::connect(server))
                 .await
             {
                 Ok(Ok(connection)) => {
-                    let detail =
-                        match tokio::time::timeout(PROBE_TIMEOUT, connection.list_tools()).await {
-                            Ok(Ok(tools)) => format!("handshake ok, {} tool(s)", tools.len()),
-                            _ => "handshake ok".to_string(),
-                        };
+                    let detail = match tokio::time::timeout(
+                        connect_timeout,
+                        connection.list_tools(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tools)) => format!("handshake ok, {} tool(s)", tools.len()),
+                        _ => "handshake ok".to_string(),
+                    };
                     Check::pass(label, detail)
                 }
                 Ok(Err(err)) => Check::fail(label, format!("{err:#}")),
                 Err(_) => Check::fail(
                     label,
-                    format!("no handshake within {}s", PROBE_TIMEOUT.as_secs()),
+                    format!("no handshake within {}s", connect_timeout.as_secs()),
                 ),
             };
         checks.push(check);
@@ -281,6 +346,7 @@ pub async fn run_checks(project_root: &Path) -> Vec<Check> {
 
     match Config::load() {
         Ok(config) => {
+            checks.push(check_active_provider(&config));
             // The synthesized local default counts when nothing is
             // configured explicitly.
             let providers = if config.providers.is_empty() {
@@ -296,6 +362,10 @@ pub async fn run_checks(project_root: &Path) -> Vec<Check> {
             "providers",
             format!("config unusable: {err:#}"),
         )),
+    }
+
+    if let Ok(path) = crate::credentials::path() {
+        checks.push(check_credentials_file(&path));
     }
 
     if let Ok(path) = Config::mcp_config_path() {
@@ -438,9 +508,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_check_skips_when_the_key_env_is_unset() {
+    async fn provider_check_skips_when_env_and_stored_key_are_both_absent() {
+        // The provider name must also miss the (real) credentials store for
+        // the probe to be skipped; a nonsense name guarantees that.
         let provider = ProviderConfig {
-            name: "cloud".to_string(),
+            name: "wizard-doctor-test-provider-never-stored".to_string(),
             kind: crate::config::ProviderKind::Openai,
             base_url: "https://example.invalid/v1".to_string(),
             model: "gpt-test".to_string(),
@@ -451,6 +523,78 @@ mod tests {
         };
         let check = check_provider(&provider).await;
         assert_eq!(check.status, Status::Skip);
-        assert!(check.detail.contains("not set"));
+        assert!(check.detail.contains("not set"), "{}", check.detail);
+        assert!(check.detail.contains("no stored key"), "{}", check.detail);
+    }
+
+    #[test]
+    fn active_provider_check_flags_unknown_selection() {
+        let provider = ProviderConfig {
+            name: "local".to_string(),
+            kind: crate::config::ProviderKind::LlamaCpp,
+            base_url: "http://127.0.0.1:11435".to_string(),
+            model: "qwen3.6:27b".to_string(),
+            api_key_env: None,
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+        };
+
+        let config = Config {
+            providers: vec![provider.clone()],
+            active_provider: Some("local".to_string()),
+            ..Config::default()
+        };
+        let check = check_active_provider(&config);
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+
+        let config = Config {
+            providers: vec![provider],
+            active_provider: Some("claud".to_string()),
+            ..Config::default()
+        };
+        let check = check_active_provider(&config);
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("'claud'"), "{}", check.detail);
+        assert!(
+            check.detail.contains("falling back to 'local'"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn credentials_check_skips_passes_and_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("credentials.toml");
+
+        // Absent: nothing stored, nothing to check.
+        assert_eq!(check_credentials_file(&path).status, Status::Skip);
+
+        // Valid store with tight permissions: pass.
+        std::fs::write(&path, "[keys]\nopenai = \"sk-test\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let check = check_credentials_file(&path);
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert!(check.detail.contains("1 stored key(s)"), "{}", check.detail);
+
+        // Group/world-readable: fail (the file holds plaintext secrets).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let check = check_credentials_file(&path);
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains("644"), "{}", check.detail);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Corrupt TOML: fail loudly instead of degrading to "no stored keys".
+        std::fs::write(&path, "this is not valid toml = = =").unwrap();
+        assert_eq!(check_credentials_file(&path).status, Status::Fail);
     }
 }

@@ -38,6 +38,12 @@ const PROPOSAL_ATTEMPTS: usize = 2;
 /// Cap on the repository file listing included in the deep-evolve prompt.
 const MAX_LISTED_FILES: usize = 400;
 
+/// Max files whose full contents are fed to the diff-authoring turn.
+const MAX_CONTEXT_FILES: usize = 8;
+
+/// Total byte budget for file contents in the diff-authoring prompt.
+const MAX_CONTEXT_BYTES: usize = 96_000;
+
 /// Self-extension tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -239,7 +245,17 @@ Rules:
 - Use standard unified diff format with `--- a/<path>` and `+++ b/<path>` headers (use /dev/null for created or deleted files) and correct `@@` hunk headers.
 - Paths are relative to the repository root.
 - Include at least 3 unchanged context lines around each hunk so `git apply` can locate it.
+- Hunks must match the CURRENT file contents shown to you exactly, line for line. Only modify files whose contents you were shown; other paths may only appear as newly created files.
 - Keep the change minimal, correct, and consistent with the existing code style. Proper error handling; no todo!() or unwrap() on fallible paths."#;
+
+/// System prompt for the deep-evolve file-selection turn that precedes the
+/// diff: pick which files' contents the diff author needs to see.
+const FILE_SELECT_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve navigator. Wizard is a single-binary Rust 2024 agent and you are preparing to modify its own source checkout. Given a requested change and the repository's file listing, pick the files whose CURRENT CONTENTS are needed to author the change as a unified diff (the files to modify, plus closely related ones needed for context).
+
+Respond with ONLY one JSON object — no prose, no code fences:
+{"files":["src/foo.rs","src/bar.rs"]}
+
+Rules: at most 8 files, most relevant first, and only paths that appear in the listing."#;
 
 /// Drives the evolve pipeline. Holds config and paths; the model
 /// interaction itself runs through a dedicated agent turn.
@@ -557,12 +573,39 @@ impl Evolver {
         Ok(outcome)
     }
 
-    /// One dedicated model turn (with one retry) producing a unified diff.
+    /// Diff proposal in two steps: a file-selection turn picks the files
+    /// whose contents matter (falling back to a keyword heuristic when that
+    /// turn fails), then the diff-authoring turn sees those files' actual
+    /// contents — without them the model hallucinates context lines and
+    /// `git apply --check` rejects nearly every diff.
     async fn propose_diff(&self, description: &str, source_dir: &Path) -> Result<String> {
         let listing = source_file_listing(source_dir);
+        let files = match self.select_context_files(description, &listing).await {
+            Ok(files) => files,
+            Err(err) => {
+                self.status(&format!(
+                    "File-selection turn failed ({err:#}); falling back to keyword matching."
+                ));
+                heuristic_context_files(description, &listing)
+            }
+        };
+        let context = read_context_files(source_dir, &files, MAX_CONTEXT_BYTES);
+        if !context.is_empty() {
+            self.status(&format!(
+                "Showing the diff author {} file(s): {}",
+                files.len().min(MAX_CONTEXT_FILES),
+                files
+                    .iter()
+                    .take(MAX_CONTEXT_FILES)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let user = format!(
             "Requested change to Wizard:\n{description}\n\n\
              Files in the repository (relative to its root):\n{listing}\n\n\
+             {context}\
              Reply with one unified diff implementing the change."
         );
         let messages = vec![
@@ -573,6 +616,26 @@ impl Evolver {
             messages,
             |reply| extract_diff(reply).context("no unified diff found in the reply"),
             "Reply with ONLY a unified diff inside a single ```diff fenced block.",
+        )
+        .await
+    }
+
+    /// One dedicated model turn (with one retry) picking the files whose
+    /// contents the diff author needs.
+    async fn select_context_files(&self, description: &str, listing: &str) -> Result<Vec<String>> {
+        let user = format!(
+            "Requested change to Wizard:\n{description}\n\n\
+             Files in the repository (relative to its root):\n{listing}\n\n\
+             Reply with the JSON object naming the files whose contents are needed."
+        );
+        let messages = vec![
+            ChatMessage::system(FILE_SELECT_SYSTEM_PROMPT),
+            ChatMessage::user(user),
+        ];
+        self.propose(
+            messages,
+            parse_file_selection,
+            "Reply with ONLY {\"files\":[\"path\", ...]} using paths from the listing.",
         )
         .await
     }
@@ -948,6 +1011,208 @@ pub async fn run_publish_cli(config: Config, cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// CLI entry point for `wizard evolve list|undo`: inspect and roll back the
+/// evolution history in `~/.wizard/evolution.jsonl`. Self-contained — no
+/// config load, no LLM.
+pub fn run_history_cli(cmd: crate::cli::EvolveCmd) -> Result<i32> {
+    let path = Config::evolution_log_path()?;
+    match cmd {
+        crate::cli::EvolveCmd::List => list_events(&path),
+        crate::cli::EvolveCmd::Undo { n } => undo_event(&path, n),
+    }
+}
+
+/// Read every parsable event from the evolution log; a missing file is an
+/// empty history, malformed lines are skipped with a warning.
+fn read_events(path: &Path) -> Result<Vec<EvolutionEvent>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).context(format!("reading {}", path.display())),
+    };
+    let mut events = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<EvolutionEvent>(line) {
+            Ok(event) => events.push(event),
+            Err(err) => tracing::warn!("skipping malformed evolution line: {err}"),
+        }
+    }
+    Ok(events)
+}
+
+/// Short outcome label for `evolve list`.
+fn outcome_label(outcome: &EvolveOutcome) -> String {
+    match outcome {
+        EvolveOutcome::SkillAdded { name, .. } => format!("skill '{name}'"),
+        EvolveOutcome::McpServerRegistered { name } => format!("mcp server '{name}'"),
+        EvolveOutcome::ScriptedToolAdded { name, .. } => format!("scripted tool '{name}'"),
+        EvolveOutcome::SubagentAdded { name } => format!("subagent '{name}'"),
+        EvolveOutcome::DeepRebuilt { binary } => format!("deep rebuild → {}", binary.display()),
+        EvolveOutcome::FellBackToRuntime { outcome, .. } => {
+            format!("fallback: {}", outcome_label(outcome))
+        }
+        EvolveOutcome::Denied => "denied".to_string(),
+    }
+}
+
+/// `wizard evolve list`: numbered history, most recent first (#1 newest —
+/// the number `evolve undo` takes).
+fn list_events(path: &Path) -> Result<i32> {
+    let events = read_events(path)?;
+    if events.is_empty() {
+        println!("no evolutions recorded yet ({})", path.display());
+        return Ok(0);
+    }
+    for (i, event) in events.iter().rev().enumerate() {
+        let tier = match event.tier {
+            EvolveTier::Runtime => "runtime",
+            EvolveTier::Deep => "deep",
+        };
+        println!(
+            "#{:<3} {}  {tier:<7}  {:<40}  {}",
+            i + 1,
+            event.timestamp.format("%Y-%m-%d %H:%M"),
+            outcome_label(&event.outcome),
+            truncate(&event.description, 70).replace('\n', " ")
+        );
+    }
+    Ok(0)
+}
+
+/// `wizard evolve undo <n>`: revert evolution #n from `evolve list`.
+/// Conservative: refuses with a clear message when the recorded artifacts
+/// are already gone rather than guessing.
+fn undo_event(path: &Path, n: usize) -> Result<i32> {
+    let events = read_events(path)?;
+    if n == 0 || n > events.len() {
+        bail!(
+            "no evolution #{n} — the history has {} entr{} (see `wizard evolve list`)",
+            events.len(),
+            if events.len() == 1 { "y" } else { "ies" }
+        );
+    }
+    let event = &events[events.len() - n];
+    undo_outcome(&event.outcome)?;
+    println!("undid evolution #{n}: {}", event.description);
+    Ok(0)
+}
+
+/// Revert one recorded outcome. Tier 1 = delete the created artifacts;
+/// deep = restore the `.prev` binary.
+fn undo_outcome(outcome: &EvolveOutcome) -> Result<()> {
+    match outcome {
+        EvolveOutcome::SkillAdded { name, path } => {
+            if !path.is_file() {
+                bail!(
+                    "skill '{name}' is already gone ({} does not exist)",
+                    path.display()
+                );
+            }
+            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            // The per-skill directory only held SKILL.md; drop it when empty.
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
+            println!("removed {} — /reload (or restart) to apply", path.display());
+        }
+        EvolveOutcome::McpServerRegistered { name } => {
+            let path = Config::mcp_config_path()?;
+            let mut mcp = McpConfig::load(&path)?;
+            let before = mcp.servers.len();
+            mcp.servers.retain(|server| &server.name != name);
+            if mcp.servers.len() == before {
+                bail!(
+                    "MCP server '{name}' is not registered in {} (already removed?)",
+                    path.display()
+                );
+            }
+            mcp.save(&path)?;
+            println!("unregistered MCP server '{name}' from {}", path.display());
+        }
+        EvolveOutcome::ScriptedToolAdded { name, path } => {
+            if !path.is_file() {
+                bail!(
+                    "scripted tool '{name}' is already gone ({} does not exist)",
+                    path.display()
+                );
+            }
+            // The manifest names the script file that sits beside it.
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(manifest) = toml::from_str::<ScriptManifest>(&raw)
+            {
+                let script = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&manifest.script);
+                if script.is_file() {
+                    std::fs::remove_file(&script)
+                        .with_context(|| format!("removing {}", script.display()))?;
+                    println!("removed {}", script.display());
+                }
+            }
+            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            println!("removed {} — /reload (or restart) to apply", path.display());
+        }
+        EvolveOutcome::SubagentAdded { name } => {
+            let path = Config::wizard_dir()?
+                .join("subagents")
+                .join(format!("{name}.toml"));
+            if !path.is_file() {
+                bail!(
+                    "subagent '{name}' is already gone ({} does not exist)",
+                    path.display()
+                );
+            }
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            println!("removed {} — /reload (or restart) to apply", path.display());
+        }
+        EvolveOutcome::DeepRebuilt { binary } => {
+            let file_name = binary
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("the recorded binary path has no file name")?;
+            let prev = binary.with_file_name(format!("{file_name}.prev"));
+            if !prev.is_file() {
+                bail!(
+                    "no rollback binary at {} — cannot undo this deep evolve",
+                    prev.display()
+                );
+            }
+            // Keep the evolved binary aside as .undone in case the rollback
+            // itself was a mistake.
+            let undone = binary.with_file_name(format!("{file_name}.undone"));
+            let _ = std::fs::remove_file(&undone);
+            let moved_aside = std::fs::rename(binary, &undone).is_ok();
+            if let Err(err) = std::fs::rename(&prev, binary) {
+                if moved_aside {
+                    let _ = std::fs::rename(&undone, binary); // restore on failure
+                }
+                return Err(anyhow!(err).context(format!(
+                    "restoring {} over {}",
+                    prev.display(),
+                    binary.display()
+                )));
+            }
+            println!(
+                "restored the previous binary at {} — restart wizard to run it{}",
+                binary.display(),
+                if moved_aside {
+                    format!(" (the undone build is kept at {})", undone.display())
+                } else {
+                    String::new()
+                }
+            );
+        }
+        EvolveOutcome::FellBackToRuntime { outcome, .. } => undo_outcome(outcome)?,
+        EvolveOutcome::Denied => bail!("that evolution was denied; nothing was ever applied"),
+    }
+    Ok(())
+}
+
 /// CLI entry point for `wizard --evolve [-p "..."] [--deep]`: runs one
 /// evolution without the full TUI, printing progress to stdout.
 pub async fn run_cli(config: Config, cli: Cli) -> Result<()> {
@@ -1054,6 +1319,93 @@ fn truncate(text: &str, max_chars: usize) -> String {
     } else {
         let head: String = text.chars().take(max_chars).collect();
         format!("{head}…")
+    }
+}
+
+/// Parse the file-selection reply: `{"files":[...]}` (tolerating prose and
+/// fences around the JSON, like every other proposal parse).
+fn parse_file_selection(reply: &str) -> Result<Vec<String>> {
+    let value = extract_json_object(reply)?;
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .context("the reply has no \"files\" array")?;
+    let out: Vec<String> = files
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    if out.is_empty() {
+        bail!("the \"files\" array named no usable paths");
+    }
+    Ok(out)
+}
+
+/// Fallback file selection when the model turn fails: rank listed source
+/// files by how many words of the description appear in their path.
+fn heuristic_context_files(description: &str, listing: &str) -> Vec<String> {
+    let words: Vec<String> = description
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 4)
+        .map(str::to_string)
+        .collect();
+    let mut scored: Vec<(usize, &str)> = listing
+        .lines()
+        .filter(|path| path.ends_with(".rs") || *path == "Cargo.toml")
+        .map(|path| {
+            let lower = path.to_lowercase();
+            let score = words
+                .iter()
+                .filter(|word| lower.contains(word.as_str()))
+                .count();
+            (score, path)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .take(MAX_CONTEXT_FILES)
+        .map(|(_, path)| path.to_string())
+        .collect()
+}
+
+/// Read the selected files (skipping absolute or traversal paths and
+/// anything unreadable) under a total byte budget, rendered as a prompt
+/// section. Files are included whole or not at all: a truncated file would
+/// make the model author hunks against lines it never saw.
+fn read_context_files(source_dir: &Path, files: &[String], budget: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut included = 0usize;
+    for rel in files {
+        if included == MAX_CONTEXT_FILES {
+            break;
+        }
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(source_dir.join(rel_path)) else {
+            continue;
+        };
+        if used + content.len() > budget {
+            continue;
+        }
+        used += content.len();
+        included += 1;
+        out.push_str(&format!("--- current contents of {rel} ---\n{content}\n"));
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        format!("Current contents of the most relevant files:\n\n{out}")
     }
 }
 
@@ -1482,6 +1834,166 @@ mod tests {
             diff: None,
             build_ok: None,
         }
+    }
+
+    #[test]
+    fn parses_file_selection_with_prose_and_fences() {
+        let files = parse_file_selection(
+            "Sure:\n```json\n{\"files\":[\"src/cli.rs\",\"src/lib.rs\"]}\n```",
+        )
+        .unwrap();
+        assert_eq!(files, vec!["src/cli.rs", "src/lib.rs"]);
+
+        assert!(parse_file_selection("{\"files\":[]}").is_err());
+        assert!(parse_file_selection("{\"paths\":[\"x\"]}").is_err());
+        assert!(parse_file_selection("no json").is_err());
+    }
+
+    #[test]
+    fn heuristic_selection_ranks_paths_by_description_words() {
+        let listing = "Cargo.toml\nREADME.md\nsrc/cli.rs\nsrc/schedule.rs\nsrc/usage.rs";
+        let files = heuristic_context_files("add a schedule pause command", listing);
+        assert_eq!(files, vec!["src/schedule.rs"]);
+
+        // Nothing matches: empty selection, not a panic.
+        assert!(heuristic_context_files("zzz", listing).is_empty());
+
+        // Non-source files are never selected.
+        let files = heuristic_context_files("update the readme", listing);
+        assert!(files.is_empty(), "{files:?}");
+    }
+
+    #[test]
+    fn context_files_are_read_whole_under_a_budget() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+        std::fs::write(tmp.0.join("src/small.rs"), "fn small() {}\n").unwrap();
+        std::fs::write(tmp.0.join("src/big.rs"), "x".repeat(10_000)).unwrap();
+
+        let files = vec![
+            "src/big.rs".to_string(),
+            "src/small.rs".to_string(),
+            "src/absent.rs".to_string(),
+            "/etc/passwd".to_string(),
+            "../outside.rs".to_string(),
+        ];
+        let out = read_context_files(&tmp.0, &files, 1_000);
+        assert!(out.contains("src/small.rs"), "small file fits: {out}");
+        assert!(out.contains("fn small()"));
+        assert!(
+            !out.contains("src/big.rs"),
+            "over-budget file skipped whole"
+        );
+        assert!(!out.contains("absent"), "missing file skipped");
+        assert!(!out.contains("passwd"), "absolute path rejected");
+        assert!(!out.contains("outside"), "traversal rejected");
+
+        assert_eq!(read_context_files(&tmp.0, &[], 1_000), "");
+    }
+
+    #[test]
+    fn outcome_labels_are_compact() {
+        assert_eq!(
+            outcome_label(&EvolveOutcome::SkillAdded {
+                name: "commits".to_string(),
+                path: PathBuf::from("/x"),
+            }),
+            "skill 'commits'"
+        );
+        assert_eq!(
+            outcome_label(&EvolveOutcome::FellBackToRuntime {
+                reason: "offline".to_string(),
+                outcome: Box::new(EvolveOutcome::SubagentAdded {
+                    name: "reviewer".to_string(),
+                }),
+            }),
+            "fallback: subagent 'reviewer'"
+        );
+    }
+
+    #[test]
+    fn read_events_skips_malformed_lines_and_missing_files() {
+        let tmp = TempDir::new();
+        let log = tmp.0.join("evolution.jsonl");
+        assert!(read_events(&log).unwrap().is_empty(), "missing = empty");
+
+        let good = serde_json::to_string(&sample_event("ok", EvolveOutcome::Denied)).unwrap();
+        std::fs::write(&log, format!("{good}\nnot json\n{good}\n")).unwrap();
+        let events = read_events(&log).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn undo_skill_removes_the_file_and_refuses_when_gone() {
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("skills").join("commits");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, "body").unwrap();
+
+        let outcome = EvolveOutcome::SkillAdded {
+            name: "commits".to_string(),
+            path: path.clone(),
+        };
+        undo_outcome(&outcome).expect("undo removes the skill");
+        assert!(!path.exists());
+        assert!(!dir.exists(), "empty skill dir removed too");
+
+        let err = undo_outcome(&outcome).unwrap_err();
+        assert!(err.to_string().contains("already gone"), "{err}");
+    }
+
+    #[test]
+    fn undo_scripted_tool_removes_script_and_manifest() {
+        let tmp = TempDir::new();
+        let script = tmp.0.join("hello.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let manifest = ScriptManifest {
+            name: "hello".to_string(),
+            description: "d".to_string(),
+            script: "hello.sh".to_string(),
+            interpreter: None,
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            timeout_secs: None,
+        };
+        let manifest_path = tmp.0.join("hello.toml");
+        std::fs::write(&manifest_path, toml::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        undo_outcome(&EvolveOutcome::ScriptedToolAdded {
+            name: "hello".to_string(),
+            path: manifest_path.clone(),
+        })
+        .expect("undo removes the tool");
+        assert!(!manifest_path.exists());
+        assert!(
+            !script.exists(),
+            "script referenced by the manifest removed"
+        );
+    }
+
+    #[test]
+    fn undo_deep_restores_the_prev_binary() {
+        let tmp = TempDir::new();
+        let binary = tmp.0.join("wizard");
+        let prev = tmp.0.join("wizard.prev");
+        std::fs::write(&binary, "new build").unwrap();
+        std::fs::write(&prev, "old build").unwrap();
+
+        undo_outcome(&EvolveOutcome::DeepRebuilt {
+            binary: binary.clone(),
+        })
+        .expect("undo restores .prev");
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "old build");
+        assert!(!prev.exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("wizard.undone")).unwrap(),
+            "new build",
+            "the undone build is kept aside"
+        );
+
+        // A second undo has no .prev left: refuse.
+        let err = undo_outcome(&EvolveOutcome::DeepRebuilt { binary }).unwrap_err();
+        assert!(err.to_string().contains("no rollback binary"), "{err}");
     }
 
     #[test]

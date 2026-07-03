@@ -188,19 +188,42 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Truncate `text` to at most `max_bytes` (cutting on a char boundary),
-/// appending a marker when content was dropped.
+/// Bytes reserved for the truncation marker inside the `max_bytes` budget.
+const TRUNCATION_MARKER_RESERVE: usize = 192;
+
+/// Truncate `text` to at most `max_bytes` (cutting on char boundaries),
+/// keeping the head and a larger tail — build and test failures land at the
+/// end of output — around a marker that says how much was omitted.
 pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
-    let mut cut = max_bytes;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
+    // Budgets too small for head+tail framing fall back to a plain head cut.
+    if max_bytes <= TRUNCATION_MARKER_RESERVE {
+        let mut cut = max_bytes;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n... [output truncated]");
+        return text;
     }
-    text.truncate(cut);
-    text.push_str("\n... [output truncated]");
-    text
+    let budget = max_bytes - TRUNCATION_MARKER_RESERVE;
+    let mut head_end = budget / 4;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - (budget - budget / 4);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n... [output truncated] {omitted} bytes omitted from the middle; rerun a narrower \
+         command for the full output, or task_output for a background task ...\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
 }
 
 /// A callable capability exposed to the model.
@@ -246,4 +269,54 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_text_alone() {
+        assert_eq!(truncate_output("short".to_string(), 1_000), "short");
+    }
+
+    #[test]
+    fn truncate_keeps_head_and_tail_and_counts_omitted_bytes() {
+        let text = format!("HEAD{}TAIL", "x".repeat(10_000));
+        let out = truncate_output(text, 1_000);
+        assert!(
+            out.len() <= 1_000,
+            "stays within budget: {} bytes",
+            out.len()
+        );
+        assert!(out.starts_with("HEAD"), "head preserved");
+        assert!(out.ends_with("TAIL"), "tail preserved");
+        assert!(out.contains("[output truncated]"));
+        assert!(out.contains("bytes omitted"), "{out}");
+    }
+
+    #[test]
+    fn truncate_tail_is_larger_than_head() {
+        let text = "h".repeat(500) + &"t".repeat(10_000);
+        let out = truncate_output(text, 1_000);
+        let heads = out.chars().filter(|&c| c == 'h').count();
+        let tails = out.chars().filter(|&c| c == 't').count();
+        assert!(tails > heads, "tail-weighted: {heads} head vs {tails} tail");
+    }
+
+    #[test]
+    fn truncate_cuts_on_char_boundaries() {
+        let text = "é".repeat(20_000);
+        let out = truncate_output(text, 1_001);
+        assert!(out.len() <= 1_001);
+        assert!(out.contains("[output truncated]"));
+    }
+
+    #[test]
+    fn truncate_tiny_budget_falls_back_to_head_cut() {
+        let text = "x".repeat(500);
+        let out = truncate_output(text, 100);
+        assert!(out.starts_with("xxx"));
+        assert!(out.ends_with("[output truncated]"));
+    }
 }

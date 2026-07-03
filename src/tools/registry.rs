@@ -18,6 +18,7 @@ use super::file::{EditFileTool, ListFilesTool, ReadFileTool, SearchFilesTool, Wr
 use super::git::{GitDiffTool, GitStatusTool};
 use super::memory::MemoryTool;
 use super::shell::ExecuteTool;
+use super::subagent_tasks::{SubagentKillTool, SubagentStatusTool};
 use super::tasks::{TaskKillTool, TaskOutputTool};
 use super::todo::TodoTool;
 use super::web::{WebFetchTool, WebSearchTool};
@@ -39,7 +40,8 @@ impl ToolRegistry {
     /// Registry pre-populated with all native tools
     /// (`read_file`, `write_file`, `edit_file`, `list_files`,
     /// `search_files`, `execute`, `git_status`, `git_diff`, `memory`,
-    /// `todo`, `web_fetch`, `web_search`, `task_output`, `task_kill`).
+    /// `todo`, `web_fetch`, `web_search`, `task_output`, `task_kill`,
+    /// `subagent_status`, `subagent_kill`).
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
@@ -56,6 +58,8 @@ impl ToolRegistry {
         registry.register(Arc::new(WebSearchTool));
         registry.register(Arc::new(TaskOutputTool));
         registry.register(Arc::new(TaskKillTool));
+        registry.register(Arc::new(SubagentStatusTool));
+        registry.register(Arc::new(SubagentKillTool));
         registry
     }
 
@@ -314,9 +318,11 @@ mod tests {
                 "web_search",
                 "task_output",
                 "task_kill",
+                "subagent_status",
+                "subagent_kill",
             ]
         );
-        assert_eq!(registry.len(), 14);
+        assert_eq!(registry.len(), 16);
         assert!(!registry.is_empty());
 
         for spec in registry.specs() {
@@ -345,6 +351,8 @@ mod tests {
             "web_search",
             // `task_output` only reads buffered task state.
             "task_output",
+            // `subagent_status` only reads registry state.
+            "subagent_status",
         ] {
             assert_eq!(access(read_only), ToolAccess::ReadOnly, "{read_only}");
         }
@@ -352,8 +360,8 @@ mod tests {
             assert_eq!(access(edit), ToolAccess::Edit, "{edit}");
         }
         // `execute` runs arbitrary commands; `memory` mutates its store;
-        // `task_kill` terminates processes.
-        for side_effecting in ["execute", "memory", "task_kill"] {
+        // `task_kill` and `subagent_kill` terminate running work.
+        for side_effecting in ["execute", "memory", "task_kill", "subagent_kill"] {
             assert_eq!(
                 access(side_effecting),
                 ToolAccess::Execute,
@@ -492,7 +500,7 @@ mod tests {
             registry.apply_description_overrides(&tmp.0.join("absent")),
             0
         );
-        assert_eq!(registry.len(), 14);
+        assert_eq!(registry.len(), 16);
     }
 
     #[test]

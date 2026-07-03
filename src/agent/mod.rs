@@ -292,6 +292,119 @@ pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -
     events.send(event).await.is_ok()
 }
 
+/// Whether an LLM error is worth retrying after backoff. Typed provider
+/// errors classify themselves; unknown errors (mid-stream drops surface as
+/// plain `anyhow` context chains) stay transient for robustness.
+pub(crate) fn error_is_transient(err: &anyhow::Error) -> bool {
+    if let Some(provider) = err.downcast_ref::<crate::llm::ProviderError>() {
+        return provider.is_transient();
+    }
+    if let Some(ollama) = err.downcast_ref::<crate::llm::ollama::OllamaError>() {
+        return ollama.is_transient();
+    }
+    true
+}
+
+/// Cooperative cancellation handle for a running turn. Cloneable and
+/// thread-safe: the surface keeps a clone (see [`Agent::cancel_handle`]) and
+/// calls [`CancelHandle::cancel`] (e.g. on Esc); the run loop observes it in
+/// the stream loop and between tool calls, synthesizes results for the tool
+/// calls it skips, and ends the turn with [`DoneReason::Stopped`] — without
+/// the agent (or its background tasks) being torn down. The flag auto-resets
+/// at the start of the next turn.
+#[derive(Clone, Default)]
+pub struct CancelHandle(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelHandle {
+    /// Request cancellation of the turn currently running (if any).
+    pub fn cancel(&self) {
+        self.0.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether cancellation has been requested for the current turn.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once cancellation is requested (immediately if it already
+    /// was).
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Register interest before checking the flag so a concurrent
+            // `cancel` cannot slip between the check and the await.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Arm for a new turn (a stale request must not cancel it).
+    fn clear(&self) {
+        self.0
+            .flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One streamed completion, or the turn's cancellation observed mid-stream.
+enum Completion {
+    Done {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    Cancelled,
+}
+
+/// A background completion surfaced to the model, returned by
+/// [`Agent::drain_finished_notifications`] so surfaces can render it.
+#[derive(Debug)]
+pub enum FinishedNotification {
+    /// A background shell task (`execute` with `run_in_background`).
+    Task(crate::tools::tasks::FinishedTask),
+    /// A backgrounded subagent (`spawn_subagent` with `background: true`).
+    Subagent(crate::tools::subagent_tasks::SubagentTaskResult),
+}
+
+/// History/system note announcing a finished background task.
+fn task_note(task: &crate::tools::tasks::FinishedTask) -> String {
+    let mut note = format!(
+        "[background task #{} finished ({})] {}",
+        task.id,
+        task.status.describe(),
+        task.command
+    );
+    let tail = task.tail.trim();
+    if !tail.is_empty() {
+        note.push('\n');
+        note.push_str(tail);
+    }
+    note
+}
+
+/// History/system note announcing a finished background subagent.
+fn subagent_note(task: &crate::tools::subagent_tasks::SubagentTaskResult) -> String {
+    let status = match &task.error {
+        Some(error) => format!("failed: {error}"),
+        None if task.completed => "completed".to_string(),
+        None => "hit its step budget".to_string(),
+    };
+    format!(
+        "[background subagent #{} '{}' {} after {} step(s)] {}\n\n{}",
+        task.id, task.name, status, task.steps_used, task.task, task.output
+    )
+}
+
 /// The tool-calling agent. Owns the conversation history, the model client,
 /// the tool dispatcher, and session persistence.
 pub struct Agent {
@@ -351,6 +464,13 @@ pub struct Agent {
     /// `Edit`-class targets into it; `/rewind` and perpetual rollback
     /// restore from it.
     checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+    /// Cooperative cancellation of the running turn (see
+    /// [`Agent::cancel_handle`]). Cleared at the start of every turn.
+    cancel: CancelHandle,
+    /// The spawn tool's shared model slot, when bound
+    /// ([`Agent::bind_subagent_model`]): `/model` switches write through so
+    /// subagents run on the parent's active model.
+    subagent_model: Option<subagent::SharedActiveModel>,
 }
 
 /// One row of the `/rewind` picker: a turn, the prompt that started it, and
@@ -370,6 +490,9 @@ const KEEP_RECENT: usize = 10;
 /// Fraction of the provider's context window the last prompt may fill before
 /// token-aware compaction kicks in.
 const COMPACT_WINDOW_FRACTION: f64 = 0.8;
+
+/// Chunk size (chars) fed to one rolling-summary pass during compaction.
+const COMPACT_CHUNK_CHARS: usize = 20_000;
 
 /// What a compaction pass did, reported back so callers (auto-compaction
 /// notices and the `/compact` command) can describe the outcome.
@@ -414,19 +537,16 @@ impl Agent {
         let memory_index = read_memory_index(&project_root);
         let model = config.active().model;
         let mut load_warning = None;
-        let prior = session
-            .load_messages()
-            .unwrap_or_else(|err| {
-                tracing::warn!("could not load session {}: {err}", session.path().display());
-                load_warning = Some(format!(
-                    "previous session {} could not be read ({err}); starting fresh",
-                    session.path().display()
-                ));
-                Vec::new()
-            })
-            .into_iter()
-            .filter(|message| message.role != Role::System)
-            .collect::<Vec<_>>();
+        // load_history replays persisted system notes, drops stale system
+        // prompts, and repairs dangling tool calls from interrupted runs.
+        let prior = session.load_history().unwrap_or_else(|err| {
+            tracing::warn!("could not load session {}: {err}", session.path().display());
+            load_warning = Some(format!(
+                "previous session {} could not be read ({err}); starting fresh",
+                session.path().display()
+            ));
+            Vec::new()
+        });
 
         // Plan mode: one flag shared by the dispatcher (read-only gate) and
         // the always-registered exit_plan tool (cleared on approval).
@@ -489,6 +609,8 @@ impl Agent {
             usage: crate::usage::UsageTracker::new(),
             usage_log: crate::usage::default_log_path(),
             checkpoints,
+            cancel: CancelHandle::default(),
+            subagent_model: None,
         };
         agent
             .history
@@ -577,11 +699,8 @@ impl Agent {
             .context("truncating session history")?;
         let prior: Vec<ChatMessage> = self
             .session
-            .load_messages()
-            .context("reloading session history")?
-            .into_iter()
-            .filter(|message| message.role != Role::System)
-            .collect();
+            .load_history()
+            .context("reloading session history")?;
         self.history.truncate(1);
         self.history.extend(prior);
         self.dispatcher.reset_failures();
@@ -594,13 +713,42 @@ impl Agent {
     }
 
     /// `/clear`: drop everything but the system prompt and start a fresh
-    /// session file.
+    /// session file. Background work from the old conversation is killed
+    /// and detached (fresh registries; late monitors hold the old ones, so
+    /// their notes can never reach the new conversation) and the todo list
+    /// is reset.
     pub fn clear(&mut self) -> Result<()> {
+        self.ctx.tasks.kill_all();
+        self.ctx.subagents.kill_all();
+        self.ctx.tasks = Arc::new(crate::tools::tasks::TaskRegistry::new());
+        self.ctx.subagents = Arc::new(crate::tools::subagent_tasks::SubagentTaskRegistry::new());
+        self.ctx.todos = Arc::new(std::sync::Mutex::new(Vec::new()));
         self.session = Session::create(&Config::sessions_dir()?)?;
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
         Ok(())
+    }
+
+    /// Handle for cancelling the running turn cooperatively. The surface
+    /// clones it before spawning `run_turn` and calls
+    /// [`CancelHandle::cancel`] to interrupt: the turn stops at the next
+    /// stream chunk or tool boundary, answers skipped tool calls with
+    /// "(not executed — interrupted by user)", emits
+    /// [`AgentEvent::Done`] with [`DoneReason::Stopped`], and returns —
+    /// no task aborts, no agent rebuild, background work keeps running.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
+    }
+
+    /// Bind the spawn tool's shared model slot (see
+    /// [`subagent::SpawnSubagentTool::model_handle`]) so subagents run on
+    /// this agent's active model, including after `/model` switches.
+    pub fn bind_subagent_model(&mut self, handle: subagent::SharedActiveModel) {
+        if let Ok(mut slot) = handle.write() {
+            *slot = Some(self.model.clone());
+        }
+        self.subagent_model = Some(handle);
     }
 
     /// The lifecycle-hook engine this agent fires (shared for `/reload`
@@ -726,6 +874,11 @@ impl Agent {
     /// prompt is recomposed so the JSON tool protocol section matches.
     pub fn set_model(&mut self, model: String, native_tools: bool) {
         self.config.model = model.clone();
+        if let Some(handle) = &self.subagent_model
+            && let Ok(mut slot) = handle.write()
+        {
+            *slot = Some(model.clone());
+        }
         self.model = model;
         self.native_tools = native_tools;
         self.refresh_system_prompt();
@@ -780,12 +933,17 @@ impl Agent {
         }
     }
 
-    /// Append to history and persist (system messages are not persisted —
-    /// they are recomposed on resume).
+    /// Append to history and persist. Injected system messages (background
+    /// notes, subagent reports, hook context) persist as flagged system
+    /// notes that replay on resume; the system prompt itself is never
+    /// pushed (it lives at history[0] and is recomposed fresh).
     fn push(&mut self, message: ChatMessage) {
-        if message.role != Role::System
-            && let Err(err) = self.session.append(&message)
-        {
+        let result = if message.role == Role::System {
+            self.session.append_system_note(&message)
+        } else {
+            self.session.append(&message)
+        };
+        if let Err(err) = result {
             tracing::warn!("session append failed: {err}");
         }
         self.history.push(message);
@@ -804,6 +962,9 @@ impl Agent {
         if let Some(warning) = self.load_warning.take() {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
+        // Arm cancellation for this turn; a stale request from a previous
+        // turn must not kill this one.
+        self.cancel.clear();
         self.usage.begin_turn();
         let result = match self.turn_inner(input, &events).await {
             Ok(reason) => {
@@ -861,7 +1022,11 @@ impl Agent {
         // user_prompt_submit hooks: may veto the turn before the model sees
         // the prompt (the message is never pushed to history), or append
         // extra context to it.
-        let input = match self.hooks.user_prompt_submit(self.mode, Some(events)).await {
+        let input = match self
+            .hooks
+            .user_prompt_submit_with_prompt(input, self.mode, Some(events))
+            .await
+        {
             PromptSubmit::Block(reason) => {
                 let _ = emit(
                     events,
@@ -906,7 +1071,16 @@ impl Agent {
             // system prompt's plan-mode block in step with the flag.
             self.sync_plan_prompt();
 
-            let (mut content, mut tool_calls) = self.stream_completion_with_retry(events).await?;
+            let (mut content, mut tool_calls) =
+                match self.stream_completion_with_retry(events).await? {
+                    // Cancelled mid-stream: the partial completion is discarded
+                    // (never entered history), so nothing dangles.
+                    Completion::Cancelled => return Ok(DoneReason::Stopped),
+                    Completion::Done {
+                        content,
+                        tool_calls,
+                    } => (content, tool_calls),
+                };
 
             // Some reasoning models (xAI grok-4.3 after tool results) emit
             // only reasoning and stop, leaving the visible message empty.
@@ -918,7 +1092,13 @@ impl Agent {
                 self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
                 let retried = self.stream_completion_with_retry(events).await;
                 self.history.pop();
-                let (retry_content, retry_calls) = retried?;
+                let (retry_content, retry_calls) = match retried? {
+                    Completion::Cancelled => return Ok(DoneReason::Stopped),
+                    Completion::Done {
+                        content,
+                        tool_calls,
+                    } => (content, tool_calls),
+                };
                 if completion_is_empty(&retry_content, &retry_calls) {
                     let _ = emit(
                         events,
@@ -950,10 +1130,25 @@ impl Agent {
                 return Ok(DoneReason::Completed);
             }
 
-            for call in &tool_calls {
-                match self.dispatch_call(call, events).await {
-                    None => {}
-                    Some(reason) => return Ok(reason),
+            for (index, call) in tool_calls.iter().enumerate() {
+                // Cancellation is honored between tool calls: pending calls
+                // are answered so the persisted assistant message never
+                // carries dangling tool_use.
+                if self.cancel.is_cancelled() {
+                    self.answer_skipped_calls(
+                        &tool_calls[index..],
+                        "(not executed — interrupted by user)",
+                    );
+                    return Ok(DoneReason::Stopped);
+                }
+                if let Some(reason) = self.dispatch_call(call, events).await {
+                    // dispatch_call answered `call` itself; the rest of the
+                    // batch never ran.
+                    self.answer_skipped_calls(
+                        &tool_calls[index + 1..],
+                        "(not executed — turn ended early)",
+                    );
+                    return Ok(reason);
                 }
             }
 
@@ -973,11 +1168,12 @@ impl Agent {
     }
 
     /// Stream one completion, forwarding text deltas and collecting tool
-    /// calls.
-    async fn stream_completion(
-        &self,
-        events: &mpsc::Sender<AgentEvent>,
-    ) -> Result<(String, Vec<ToolCall>)> {
+    /// calls. Observes the turn's cancel handle so an interrupt lands at the
+    /// next chunk (or immediately when the stream is idle).
+    async fn stream_completion(&self, events: &mpsc::Sender<AgentEvent>) -> Result<Completion> {
+        if self.cancel.is_cancelled() {
+            return Ok(Completion::Cancelled);
+        }
         let request = ChatRequest {
             model: self.model.clone(),
             messages: self.history.clone(),
@@ -1003,7 +1199,15 @@ impl Agent {
         let mut tool_calls = Vec::new();
         let mut prompt_tokens = None;
         let mut completion_tokens = None;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Ok(Completion::Cancelled),
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => chunk,
+                    None => break,
+                },
+            };
             let chunk = chunk.context("reading chat stream")?;
             if let Some(message) = chunk.message {
                 if !message.content.is_empty() {
@@ -1039,30 +1243,28 @@ impl Agent {
             )
             .await;
         }
-        Ok((content, tool_calls))
+        Ok(Completion::Done {
+            content,
+            tool_calls,
+        })
     }
 
     /// [`stream_completion`] with sleep-and-wake exponential backoff so a
     /// transient LLM outage (server down, rate-limited, mid-stream drop)
     /// pauses and retries instead of aborting the run. In continuous mode it
     /// retries indefinitely; otherwise it gives up after ~6 attempts. A
-    /// non-transient error (e.g. missing model) returns immediately.
+    /// non-transient error (auth, bad request, missing model) fails the turn
+    /// immediately with the provider's message — in continuous mode too.
     async fn stream_completion_with_retry(
         &self,
         events: &mpsc::Sender<AgentEvent>,
-    ) -> Result<(String, Vec<ToolCall>)> {
+    ) -> Result<Completion> {
         let mut attempt: u32 = 0;
         loop {
             match self.stream_completion(events).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
-                    // Default to transient so mid-stream interruptions (which
-                    // are not typed `OllamaError`) also retry.
-                    let transient = err
-                        .downcast_ref::<crate::llm::ollama::OllamaError>()
-                        .map(|e| e.is_transient())
-                        .unwrap_or(true);
-                    if !transient {
+                    if !error_is_transient(&err) {
                         return Err(err);
                     }
                     if !self.config.continuous && attempt >= 6 {
@@ -1081,7 +1283,12 @@ impl Agent {
                         )),
                     )
                     .await;
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    // The backoff sleep is also cancellable.
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(Completion::Cancelled),
+                        _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                    }
                     attempt += 1;
                 }
             }
@@ -1148,32 +1355,19 @@ impl Agent {
             return CompactOutcome::Nothing;
         }
         let start = 1;
-        let end = self.history.len() - KEEP_RECENT;
+        let mut end = self.history.len() - KEEP_RECENT;
+        // Never cut between an assistant tool-call message and its results:
+        // snap the boundary back so the kept tail starts at a user message
+        // (every tool-call group is preceded by one).
+        while end > start && self.history[end].role != Role::User {
+            end -= 1;
+        }
         if start >= end {
             return CompactOutcome::Nothing;
         }
         let count = end - start;
 
-        // Render the middle span as one text blob, capped to ~20k chars.
-        let mut blob = String::new();
-        for msg in &self.history[start..end] {
-            let role = match msg.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
-            blob.push_str(role);
-            blob.push_str(": ");
-            blob.push_str(&msg.content);
-            blob.push('\n');
-            if blob.len() >= 20_000 {
-                blob.truncate(20_000);
-                break;
-            }
-        }
-
-        let outcome = match self.summarize_transcript(&blob).await {
+        let outcome = match self.summarize_span(start, end).await {
             Ok(summary) => {
                 let replacement =
                     ChatMessage::system(format!("[Compacted progress summary]\n{summary}"));
@@ -1194,6 +1388,62 @@ impl Agent {
         // and must not re-trigger compaction on the next step.
         self.usage.clear_last_prompt();
         outcome
+    }
+
+    /// Summarize `history[start..end]` with a rolling per-chunk pass, so an
+    /// arbitrarily large span is fully represented instead of hard-truncated:
+    /// each chunk is summarized together with the summary of everything
+    /// before it.
+    async fn summarize_span(&self, start: usize, end: usize) -> Result<String> {
+        // Render each message and pack into ~20k-char chunks, splitting
+        // oversized messages at char boundaries.
+        let mut chunks: Vec<String> = vec![String::new()];
+        for msg in &self.history[start..end] {
+            let role = match msg.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            };
+            let rendered = format!("{role}: {}\n", msg.content);
+            let mut rest = rendered.as_str();
+            while !rest.is_empty() {
+                let chunk = chunks.last_mut().expect("at least one chunk");
+                let room = COMPACT_CHUNK_CHARS.saturating_sub(chunk.len());
+                if rest.len() <= room {
+                    chunk.push_str(rest);
+                    break;
+                }
+                if room == 0 {
+                    chunks.push(String::new());
+                    continue;
+                }
+                let mut cut = room;
+                while cut > 0 && !rest.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                if cut == 0 {
+                    chunks.push(String::new());
+                    continue;
+                }
+                chunk.push_str(&rest[..cut]);
+                rest = &rest[cut..];
+                chunks.push(String::new());
+            }
+        }
+
+        let mut summary: Option<String> = None;
+        for chunk in &chunks {
+            let blob = match &summary {
+                None => chunk.clone(),
+                Some(prev) => format!(
+                    "[Progress summary of the transcript so far]\n{prev}\n\n\
+                     [Transcript continues]\n{chunk}"
+                ),
+            };
+            summary = Some(self.summarize_transcript(&blob).await?);
+        }
+        summary.ok_or_else(|| anyhow::anyhow!("nothing to summarize"))
     }
 
     /// Summarize a transcript blob into a terse progress note via the model.
@@ -1252,13 +1502,28 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Option<DoneReason> {
         let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
-        if let Some(output) = &outcome.output {
-            self.push(self.tool_feedback(&call.function.name, output));
+        match &outcome.output {
+            Some(output) => self.push(self.tool_feedback(&call.function.name, output)),
+            // No result (event receiver gone mid-batch): answer the call
+            // anyway so the persisted history carries no dangling tool_use.
+            None => self.push(self.tool_feedback(
+                &call.function.name,
+                &ToolOutput::ok("(not executed — turn ended early)"),
+            )),
         }
         if let Some(nudge) = outcome.nudge {
             self.push(ChatMessage::system(nudge));
         }
         outcome.done
+    }
+
+    /// Answer tool calls that will never run (turn ended early, user
+    /// interrupt) with a synthesized `note`, so the already-persisted
+    /// assistant message carries no dangling tool_use.
+    fn answer_skipped_calls(&mut self, calls: &[ToolCall], note: &str) {
+        for call in calls {
+            self.push(self.tool_feedback(&call.function.name, &ToolOutput::ok(note)));
+        }
     }
 
     /// Build the message that feeds a tool result back to the model.
@@ -1308,18 +1573,7 @@ impl Agent {
     /// every agent step and every perpetual cycle.
     async fn drain_background_tasks(&mut self, events: &mpsc::Sender<AgentEvent>) {
         for task in self.ctx.tasks.drain_completed() {
-            let mut note = format!(
-                "[background task #{} finished ({})] {}",
-                task.id,
-                task.status.describe(),
-                task.command
-            );
-            let tail = task.tail.trim();
-            if !tail.is_empty() {
-                note.push('\n');
-                note.push_str(tail);
-            }
-            self.push(ChatMessage::system(note));
+            self.push(ChatMessage::system(task_note(&task)));
             let _ = emit(
                 events,
                 AgentEvent::TaskFinished {
@@ -1340,20 +1594,7 @@ impl Agent {
     /// [`Self::drain_background_tasks`].
     async fn drain_background_subagents(&mut self, events: &mpsc::Sender<AgentEvent>) {
         for task in self.ctx.subagents.drain_completed() {
-            let note = format!(
-                "[background subagent #{} '{}' {} after {} step(s)] {}\n\n{}",
-                task.id,
-                task.name,
-                if task.completed {
-                    "completed"
-                } else {
-                    "hit its step budget"
-                },
-                task.steps_used,
-                task.task,
-                task.output
-            );
-            self.push(ChatMessage::system(note));
+            self.push(ChatMessage::system(subagent_note(&task)));
             let _ = emit(
                 events,
                 AgentEvent::SubagentFinished {
@@ -1366,6 +1607,25 @@ impl Agent {
             )
             .await;
         }
+    }
+
+    /// Collect background tasks and subagents that finished since the last
+    /// check, injecting each note into history (persisted, exactly once) and
+    /// returning the batch. For surfaces to poll on their idle tick — the
+    /// same drain the turn loop runs at the top of every step — so finished
+    /// work surfaces while the agent sits between turns. Cheap when nothing
+    /// finished (two mutex-guarded scans, no I/O).
+    pub fn drain_finished_notifications(&mut self) -> Vec<FinishedNotification> {
+        let mut notifications = Vec::new();
+        for task in self.ctx.tasks.drain_completed() {
+            self.push(ChatMessage::system(task_note(&task)));
+            notifications.push(FinishedNotification::Task(task));
+        }
+        for task in self.ctx.subagents.drain_completed() {
+            self.push(ChatMessage::system(subagent_note(&task)));
+            notifications.push(FinishedNotification::Subagent(task));
+        }
+        notifications
     }
 }
 
@@ -1494,12 +1754,15 @@ pub async fn build_headless_agent(
     let subagent_configs = subagent::available_configs(&subagents_dir);
     let base = Arc::new(base);
     let mut registry = subagent::scoped_registry(&base, None);
-    registry.register(Arc::new(subagent::SpawnSubagentTool::new(
+    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
         subagent_configs,
         Arc::clone(&client),
         Arc::clone(&base),
         Arc::clone(&hooks),
-    )));
+    ));
+    // Bound to the agent below so subagents follow `/model` switches.
+    let subagent_model = spawn_tool.model_handle();
+    registry.register(spawn_tool);
     registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
         config.clone(),
     )));
@@ -1514,7 +1777,7 @@ pub async fn build_headless_agent(
         Vec::new()
     });
 
-    Agent::new(
+    let mut agent = Agent::new(
         client,
         registry,
         config.clone(),
@@ -1523,7 +1786,9 @@ pub async fn build_headless_agent(
         session,
         native_tools,
         hooks,
-    )
+    )?;
+    agent.bind_subagent_model(subagent_model);
+    Ok(agent)
 }
 
 /// `rollback_failed_cycles`: restore every checkpoint from the failed
@@ -3619,5 +3884,282 @@ mod tests {
             1,
             "the report appears exactly once in history"
         );
+    }
+
+    #[test]
+    fn error_classification_prefers_typed_provider_errors() {
+        let permanent: anyhow::Error = crate::llm::ProviderError::http(401, "bad key").into();
+        assert!(!error_is_transient(&permanent));
+        let rate_limited: anyhow::Error = crate::llm::ProviderError::http(429, "slow down").into();
+        assert!(error_is_transient(&rate_limited));
+        let server: anyhow::Error = crate::llm::ProviderError::http(500, "oops").into();
+        assert!(error_is_transient(&server));
+        let transport: anyhow::Error = crate::llm::ProviderError::transport("reset").into();
+        assert!(error_is_transient(&transport));
+        // Context wrapping must not hide the classification.
+        let wrapped = permanent.context("starting chat completion");
+        assert!(!error_is_transient(&wrapped));
+        // Unknown errors stay transient for robustness.
+        assert!(error_is_transient(&anyhow::anyhow!("mid-stream drop")));
+    }
+
+    #[test]
+    fn failed_background_subagents_are_labeled_failed() {
+        let note = subagent_note(&crate::tools::subagent_tasks::SubagentTaskResult {
+            id: 3,
+            name: "worker".to_string(),
+            task: "doomed".to_string(),
+            completed: false,
+            output: "subagent failed: connection refused".to_string(),
+            steps_used: 0,
+            error: Some("connection refused".to_string()),
+        });
+        assert!(
+            note.contains("'worker' failed: connection refused after 0 step(s)"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("step budget"),
+            "a hard error is not a budget stop: {note}"
+        );
+    }
+
+    /// Test tool that fires the agent's cancel handle when executed, to
+    /// exercise mid-batch interruption deterministically.
+    struct CancelingTool {
+        handle: Arc<Mutex<Option<CancelHandle>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CancelingTool {
+        fn name(&self) -> &str {
+            "cancel_me"
+        }
+
+        fn description(&self) -> &str {
+            "Cancel the turn (test tool)."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            self.handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("handle bound")
+                .cancel();
+            Ok(ToolOutput::ok("cancelling"))
+        }
+    }
+
+    /// `done: true` chunk carrying several tool calls in one batch.
+    fn multi_tool_chunk(names: &[&str]) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: names
+                    .iter()
+                    .map(|name| ToolCall {
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: json!({}),
+                        },
+                    })
+                    .collect(),
+                tool_name: None,
+            }),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_batch_stops_the_turn_and_answers_skipped_calls() {
+        let tmp = TempDir::new();
+        let handle_slot = Arc::new(Mutex::new(None));
+        let (mut registry, echo_calls) = recording_registry();
+        registry.register(Arc::new(CancelingTool {
+            handle: Arc::clone(&handle_slot),
+        }));
+        let (mut agent, provider) = test_agent_in(
+            &tmp,
+            // One completion: a two-call batch. The turn must stop before
+            // asking for another.
+            vec![vec![multi_tool_chunk(&["cancel_me", "echo"])]],
+            Vec::new(),
+            registry,
+        );
+        *handle_slot.lock().unwrap() = Some(agent.cancel_handle());
+
+        let (tx, _rx) = mpsc::channel(64);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Stopped);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert!(
+            echo_calls.lock().unwrap().is_empty(),
+            "the call after the cancel never ran"
+        );
+
+        // Both tool calls are answered — the second synthetically — so the
+        // persisted history carries no dangling tool_use.
+        let persisted = agent.session().load_history().expect("session readable");
+        let assistant = persisted
+            .iter()
+            .position(|m| m.role == Role::Assistant && m.tool_calls.len() == 2)
+            .expect("assistant batch persisted");
+        assert_eq!(persisted[assistant + 1].role, Role::Tool);
+        assert_eq!(persisted[assistant + 2].role, Role::Tool);
+        assert_eq!(persisted[assistant + 2].tool_name.as_deref(), Some("echo"));
+        assert!(
+            persisted[assistant + 2]
+                .content
+                .contains("interrupted by user"),
+            "{}",
+            persisted[assistant + 2].content
+        );
+
+        // The next turn is not poisoned by the stale cancel request.
+        assert!(agent.cancel_handle().is_cancelled());
+        agent.cancel.clear();
+        assert!(!agent.cancel_handle().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn compaction_never_splits_a_tool_call_group() {
+        // One scripted response: the summarization call.
+        let (mut agent, _provider, _tmp) =
+            test_agent(vec![vec![final_chunk("a terse progress note")]]);
+        // Arrange history so the naive cut (len - KEEP_RECENT) would land on
+        // a tool result, splitting it from its assistant tool-call message.
+        for i in 0..4 {
+            agent.history.push(ChatMessage::user(format!("filler {i}")));
+        }
+        let mut assistant = ChatMessage::assistant("running a tool");
+        assistant.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: "execute".to_string(),
+                arguments: json!({}),
+            },
+        });
+        agent.history.push(assistant); // index 5
+        agent
+            .history
+            .push(ChatMessage::tool_result("execute", "output")); // index 6
+        for i in 0..9 {
+            agent.history.push(ChatMessage::user(format!("tail {i}")));
+        }
+        assert_eq!(agent.history.len(), 16, "naive cut would be index 6");
+
+        let outcome = agent.compact_now().await;
+        // Snapped back to the user message at index 4: only 3 messages went.
+        assert_eq!(outcome, CompactOutcome::Summarized(3));
+        let assistant = agent
+            .history
+            .iter()
+            .position(|m| !m.tool_calls.is_empty())
+            .expect("tool-call message survived");
+        assert_eq!(
+            agent.history[assistant + 1].role,
+            Role::Tool,
+            "the tool call kept its result"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_finished_notifications_reports_and_persists_once() {
+        let (mut agent, _provider, _tmp) = test_agent(vec![]);
+        agent.ctx.subagents.spawn("worker", "doomed", async {
+            crate::tools::subagent_tasks::SubagentRunResult {
+                completed: false,
+                output: "subagent failed: boom".to_string(),
+                steps_used: 0,
+                error: Some("boom".to_string()),
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent.ctx.subagents.pending_count() > 0 {
+            assert!(Instant::now() < deadline, "background subagent finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let notifications = agent.drain_finished_notifications();
+        assert_eq!(notifications.len(), 1);
+        match &notifications[0] {
+            FinishedNotification::Subagent(task) => {
+                assert_eq!(task.error.as_deref(), Some("boom"));
+            }
+            other => panic!("expected a subagent notification, got {other:?}"),
+        }
+        let note = agent.history().last().expect("note in history");
+        assert_eq!(note.role, Role::System);
+        assert!(note.content.contains("failed: boom"), "{}", note.content);
+
+        // Persisted as a system note: a resume replays it.
+        let replayed = agent.session().load_history().expect("session readable");
+        assert!(
+            replayed
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains("failed: boom")),
+            "note persisted for resume"
+        );
+
+        assert!(
+            agent.drain_finished_notifications().is_empty(),
+            "each finish is reported exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_kills_background_work_and_resets_todos() {
+        let (mut agent, _provider, _tmp) = test_agent(vec![]);
+        agent
+            .ctx
+            .todos
+            .lock()
+            .unwrap()
+            .push(crate::tools::todo::TodoItem {
+                content: "stale item".to_string(),
+                status: crate::tools::todo::TodoStatus::Pending,
+            });
+        agent.ctx.subagents.spawn("worker", "slow", async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            crate::tools::subagent_tasks::SubagentRunResult {
+                completed: true,
+                output: "never".to_string(),
+                steps_used: 1,
+                error: None,
+            }
+        });
+        let old_session = agent.session().path().to_path_buf();
+
+        agent.clear().expect("clear ok");
+        let new_session_path = agent.session().path().to_path_buf();
+
+        assert_ne!(new_session_path, old_session, "fresh session file");
+        assert!(agent.ctx.todos.lock().unwrap().is_empty(), "todos reset");
+        assert_eq!(agent.ctx.subagents.pending_count(), 0);
+        assert!(
+            agent.ctx.subagents.list().is_empty(),
+            "old subagents detached"
+        );
+        assert!(agent.ctx.tasks.list().is_empty(), "old tasks detached");
+        assert!(
+            agent.drain_finished_notifications().is_empty(),
+            "nothing from the old conversation leaks into the new one"
+        );
+
+        // The real sessions dir was touched: clean up the empty file.
+        let _ = std::fs::remove_file(new_session_path);
     }
 }

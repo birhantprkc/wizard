@@ -10,13 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 
 use super::openai::OpenAiProvider;
 use super::provider::LlmProvider;
-use super::{ChatRequest, ChatStream};
+use super::{ChatRequest, ChatStream, ProviderError};
 
 /// How long to wait for a TCP connection before declaring llama-server down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,12 +83,13 @@ impl LlamaCppProvider {
 
     /// Actionable error for a server that cannot be reached at all.
     fn unreachable(&self, source: reqwest::Error) -> anyhow::Error {
-        anyhow!(
+        let message = format!(
             "cannot reach llama-server at {} — is the server running? Start it with \
              `llama-server -m <model.gguf> --port 11435` (or check the provider's `base_url` \
              in ~/.wizard/config.toml). Cause: {source}",
             self.base_url
-        )
+        );
+        anyhow::Error::new(source).context(ProviderError::transport(message))
     }
 
     /// Re-frame errors bubbling out of the inner OpenAI-compatible client:
@@ -129,16 +130,22 @@ impl LlmProvider for LlamaCppProvider {
             return Ok(());
         }
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(anyhow!(
-                "llama-server at {} is still loading its model (HTTP 503) — try again shortly",
-                self.base_url
-            ));
+            return Err(anyhow::Error::new(ProviderError::http(
+                503,
+                format!(
+                    "llama-server at {} is still loading its model (HTTP 503) — try again shortly",
+                    self.base_url
+                ),
+            )));
         }
         let body = response.text().await.unwrap_or_default();
-        Err(anyhow!(
-            "llama-server at {} returned HTTP {status}: {body}",
-            self.base_url
-        ))
+        Err(anyhow::Error::new(ProviderError::http(
+            status.as_u16(),
+            format!(
+                "llama-server at {} returned HTTP {status}: {body}",
+                self.base_url
+            ),
+        )))
     }
 
     async fn supports_native_tools(&self, model: &str) -> Result<bool> {
@@ -172,6 +179,8 @@ impl LlmProvider for LlamaCppProvider {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
+
     use super::*;
 
     #[test]

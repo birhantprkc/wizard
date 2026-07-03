@@ -21,6 +21,51 @@ use serde::{Deserialize, Serialize};
 /// Shared across [`llamacpp`], [`ollama`], [`openai`], and [`anthropic`].
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
+/// Typed error returned by every HTTP-based provider adapter for failed
+/// responses and transport failures. Always reachable from the `anyhow`
+/// chain via `err.downcast_ref::<ProviderError>()`, so the agent loop can
+/// classify retries uniformly across providers.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProviderError {
+    /// HTTP status of the failed response; `None` for transport failures
+    /// (connect/timeout/mid-stream drop) where no status was received.
+    pub status: Option<u16>,
+    /// Human-readable error, including a snippet of the API's response body
+    /// so users see the real API message.
+    pub message: String,
+}
+
+impl ProviderError {
+    /// Error for a non-success HTTP response `status`.
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            message: message.into(),
+        }
+    }
+
+    /// Error for a transport failure (no HTTP status was received).
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    /// Whether a retry after backoff may succeed: transport failures
+    /// (`status == None`), timeouts (408), rate limits (429), and server
+    /// errors (5xx) are transient; other 4xx (bad request, auth, missing
+    /// model) are not.
+    pub fn is_transient(&self) -> bool {
+        match self.status {
+            None => true,
+            Some(408) | Some(429) => true,
+            Some(status) => status >= 500,
+        }
+    }
+}
+
 /// Message role on the Ollama `/api/chat` wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -283,6 +328,39 @@ mod tests {
         assert_eq!(value["role"], "tool");
         assert_eq!(value["tool_name"], "read_file");
         assert_eq!(value["content"], "contents");
+    }
+
+    #[test]
+    fn provider_error_transient_classification() {
+        // No status: transport failure (connect refused, timeout, dropped
+        // stream) — retryable.
+        assert!(ProviderError::transport("connection reset").is_transient());
+        // Retryable statuses.
+        for status in [408, 429, 500, 502, 503, 529] {
+            assert!(
+                ProviderError::http(status, "x").is_transient(),
+                "HTTP {status} must be transient"
+            );
+        }
+        // Client errors: retrying the same request cannot succeed.
+        for status in [400, 401, 403, 404, 409, 413, 422] {
+            assert!(
+                !ProviderError::http(status, "x").is_transient(),
+                "HTTP {status} must not be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_downcasts_through_anyhow_context() {
+        let err = anyhow::Error::new(ProviderError::http(429, "rate limited"))
+            .context("chat request failed");
+        let provider = err
+            .downcast_ref::<ProviderError>()
+            .expect("downcast through context");
+        assert_eq!(provider.status, Some(429));
+        assert!(provider.is_transient());
+        assert_eq!(provider.message, "rate limited");
     }
 
     #[test]

@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 With `WIZARD_LOCAL=1` the installer additionally:
 
-1. Installs `llama-server` from official llama.cpp GitHub releases if it is not already on your `PATH` (Vulkan build when a GPU and Vulkan loader are present, CPU build otherwise; the release tree lands in `~/.wizard/llama.cpp/` with a symlink at `~/.wizard/bin/llama-server`)
+1. Installs `llama-server` if it is not already on your `PATH`: on an NVIDIA GPU with `nvcc` present it compiles a CUDA build from source (llama.cpp publishes no Linux CUDA binary; skip with `WIZARD_LLAMACPP_NO_CUDA=1`), otherwise it downloads an official llama.cpp release (Vulkan build when a GPU and Vulkan loader are present, CPU build as the fallback). Either way the install lands in `~/.wizard/llama.cpp/` with a symlink at `~/.wizard/bin/llama-server`
 2. Selects a model tier based on available VRAM
 3. Downloads the matching Qwen 3 GGUF (Q4_K_M) from Hugging Face into `~/.wizard/models/` (resumable; re-running picks up where it left off)
 4. Writes `~/.wizard/config.toml` (an existing config is never touched)
@@ -47,7 +47,7 @@ The same script has four mutually exclusive flavors:
 | Platform | Notes |
 |----------|-------|
 | Linux x86_64 / aarch64 | Prebuilt glibc and static-musl binaries; the installer prefers musl on NixOS |
-| macOS Apple Silicon / Intel | Same `curl … \| bash`; Metal-backed `llama-server` for the local stack. Until prebuilt Mac binaries are published for a release, the installer builds from source (needs a Rust toolchain) |
+| macOS Apple Silicon / Intel | Same `curl … \| bash`; prebuilt binaries for both architectures; Metal-backed `llama-server` for the local stack |
 | Windows | Not supported natively — use WSL2 |
 
 The installer downloads the prebuilt binary matching your OS and architecture, verifies its checksum, and falls back to a source build when no prebuilt asset is available.
@@ -82,7 +82,8 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WIZARD_INSTALL_DIR` | `/usr/local/bin` | Where to place the `wizard` binary |
+| `WIZARD_INSTALL_DIR` | `/usr/local/bin` (`~/.local/bin` on NixOS) | Where to place the `wizard` binary |
+| `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0` — pin it for reproducible installs or to roll back to an earlier release |
 | `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
 | `WIZARD_BYOM` | `0` | Set to `1` to bring your own Ollama model (conflicts with `WIZARD_MINIMAL`) |
@@ -90,9 +91,13 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | `WIZARD_MODEL` | auto-detected | Local flavors: force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, use this tag as-is and skip the interactive prompts |
 | `WIZARD_SKIP_MODEL_PULL` | `0` | Local flavors: set to `1` to skip the model download |
 | `WIZARD_SKIP_LLAMACPP_INSTALL` | `0` | With `WIZARD_LOCAL=1`: set to `1` if `llama-server` is managed elsewhere |
+| `WIZARD_LLAMACPP_NO_CUDA` | `0` | Set to `1` to never compile a CUDA `llama-server`; use the prebuilt Vulkan/CPU build instead |
 | `WIZARD_USE_OLLAMA` | `0` | Set to `1` for the Ollama variant of the local flavor (implies `WIZARD_LOCAL`) |
 | `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With Ollama flavors: Ollama is already managed elsewhere |
 | `WIZARD_WITH_TOOLCHAIN` | `0` | Set to `1` to eagerly install a Rust toolchain for deep evolve |
+| `WIZARD_REPO` | `teddytennant/wizard` | `owner/repo` to install from — how a published fork ships itself |
+| `WIZARD_REF` | latest release tag | Git ref/tag when building from source (falls back to `main` only when the repo has no release) |
+| `WIZARD_BUILD_FROM_SOURCE` | `0` | Set to `1` to build from source instead of downloading a release binary |
 
 ### Runtime environment variables
 
@@ -304,6 +309,31 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 ```
 
 To change models, download a GGUF into `~/.wizard/models/` (Hugging Face hosts Q4_K_M quants of most open models), update `model` and `gguf_path` in `~/.wizard/config.toml`, then `/server stop` and `/server start` (or restart Wizard).
+
+To install a specific release instead of the latest — or to roll back after an update — pin the tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_VERSION=v0.4.0 bash
+```
+
+## Uninstall
+
+Everything Wizard installs lives in two places: the binary and its `~/.wizard/` state directory.
+
+```bash
+# stop a running llama-server first, if Wizard started one
+kill "$(cat ~/.wizard/llama-server.pid)" 2>/dev/null
+
+# the binary (and the llama-server symlink next to it)
+sudo rm -f /usr/local/bin/wizard /usr/local/bin/wizard.prev /usr/local/bin/llama-server
+# or, if it was installed to ~/.local/bin (NixOS, or no sudo at install time):
+rm -f ~/.local/bin/wizard ~/.local/bin/wizard.prev ~/.local/bin/llama-server
+
+# the managed runtime and models (large): llama.cpp tree, GGUFs, symlinks
+rm -rf ~/.wizard/bin ~/.wizard/models ~/.wizard/llama.cpp
+```
+
+Removing the rest of `~/.wizard/` (config, credentials, sessions, loadout, evolution log) is optional — delete the whole directory with `rm -rf ~/.wizard` for a clean slate. If the installer set up Ollama (`WIZARD_USE_OLLAMA=1` / `WIZARD_BYOM=1`), that is a separate program; uninstall it per Ollama's own docs.
 
 ## Troubleshooting
 

@@ -152,7 +152,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
 | `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
 
-Both modes auto-approve tool calls by default. Genie is conversational and interactive; sovereign works continuously without human input.
+Neither mode has a per-action approval gate. Genie is conversational and interactive; sovereign works continuously without human input.
 
 Beyond these built-ins, the registry also serves scripted tools (agent-authored scripts in `~/.wizard/tools/`, run through the `execute` sandbox; the Hermes `execute_code` analog) and MCP tools (see below). All three kinds present the same interface to the agent loop, so the model calls them identically.
 
@@ -171,7 +171,8 @@ The agent can spawn isolated subagents for parallel or decomposed work:
 
 - Each subagent gets its own message history, step budget, and tool scope
 - Results return to the parent as a single tool result, so a multi-step sub-task costs the parent one turn of context
-- Sovereign mode uses these to fan out across multi-file tasks; v0.2 expands them into coordinated swarms
+- `spawn_subagent` can detach a run into the background: the parent keeps working (and the user keeps chatting) while the subagent runs, and its report lands in context when it finishes; `/subagents` monitors them live
+- Sovereign mode uses these to fan out across multi-file tasks; [fleet mode](fleet.md) coordinates parallel workers over git worktrees
 
 ### Skills (`skills/`)
 
@@ -257,15 +258,16 @@ Target release binary: **< 60 MB** (strip + LTO).
 ## Security model
 
 - Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the local option, or the configured cloud API
-- Beyond the active provider, the core loop makes no outbound API calls in v0.1 (except the GGUF/model download during install). MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
+- Beyond the active provider, the core makes outbound calls only for the things you invoke: the native web tools (`web_fetch` / `web_search`, [web.md](web.md)), the messaging gateway, the GGUF/model download during install, and deep evolve's source clone. MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
 - Both modes execute tool calls (writes, shell, git, and `/evolve` changes) directly — there is no approval gate. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run either mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training
 
 ## Roadmap additions
 
-| Version | Architecture change |
-|---------|-------------------|
-| v0.2 | Subagent swarms, deep `/evolve` source rebuild, plugin marketplace (dynamic `.so` / WASM) |
-| v0.3 | `ollama launch wizard` (Ollama-native launcher integration) |
-| Future | tree-sitter symbol search, tmux background tasks, remote subagent execution |
+Not yet built, in no particular order:
+
+- Plugin marketplace (dynamic `.so` / WASM)
+- `ollama launch wizard` (Ollama-native launcher integration)
+- tree-sitter symbol search
+- Remote subagent execution

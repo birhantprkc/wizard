@@ -4,11 +4,13 @@
 //! cannot be confined to the working directory.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::{
@@ -21,18 +23,74 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hard upper bound a model-supplied timeout is clamped to.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long to keep draining the output pipes after the child exited (or was
+/// killed). Bounds a stray descendant holding a pipe open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Captured result of a finished child process.
 pub(crate) struct CommandResult {
     pub stdout: String,
     pub stderr: String,
     /// Exit code, or `None` when the process was terminated by a signal.
     pub code: Option<i32>,
+    /// Set (to the budget in seconds) when the command was killed at the
+    /// timeout. `stdout`/`stderr` then carry whatever was produced first.
+    pub timed_out: Option<u64>,
+}
+
+/// One piped output stream read incrementally into a shared buffer, so a
+/// timeout can still report what the command produced before it was killed.
+struct Pipe {
+    buf: Arc<Mutex<Vec<u8>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Pipe {
+    fn new(stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let buf = Arc::clone(&buf);
+            async move {
+                let Some(mut stream) = stream else { return };
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }
+        });
+        Self { buf, task }
+    }
+
+    /// Wait up to `grace` for the reader to hit EOF, then take whatever is
+    /// buffered.
+    async fn finish(self, grace: Duration) -> String {
+        let mut task = self.task;
+        if tokio::time::timeout(grace, &mut task).await.is_err() {
+            task.abort();
+        }
+        let buf = self.buf.lock().unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+/// SIGKILL `child`'s whole process group and reap it. Mirrors
+/// `tasks::kill_tree`: `sh -c` may fork the command rather than exec it, and
+/// killing only the shell would leave grandchildren running.
+async fn kill_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    let _ = child.kill().await;
 }
 
 /// Spawn `command` with piped stdio, wait for it under `timeout`, and capture
-/// its output. The child is killed if the timeout elapses (via
-/// `kill_on_drop`). Shared by `execute`, the git tools, `search_files`, and
-/// scripted tools.
+/// its output. On timeout the whole process group is killed and the partial
+/// output is returned with `timed_out` set. Shared by `execute`, the git
+/// tools, `search_files`, and scripted tools.
 pub(crate) async fn run_command(
     tool: &str,
     mut command: Command,
@@ -43,38 +101,48 @@ pub(crate) async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own process group so a timeout kill reaches the whole tree (see
+    // `kill_group`).
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let child = command.spawn().map_err(|err| ToolError::Execution {
+    let mut child = command.spawn().map_err(|err| ToolError::Execution {
         tool: tool.to_string(),
         source: anyhow::Error::new(err).context("failed to spawn process"),
     })?;
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
+    let stdout = Pipe::new(child.stdout.take());
+    let stderr = Pipe::new(child.stderr.take());
+
+    let mut timed_out = None;
+    let code = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status.code(),
         Ok(Err(err)) => {
             return Err(ToolError::Execution {
                 tool: tool.to_string(),
-                source: anyhow::Error::new(err).context("failed to collect process output"),
+                source: anyhow::Error::new(err).context("failed to wait for process"),
             });
         }
         Err(_) => {
-            return Err(ToolError::Timeout {
-                tool: tool.to_string(),
-                seconds: timeout.as_secs(),
-            });
+            kill_group(&mut child).await;
+            timed_out = Some(timeout.as_secs());
+            None
         }
     };
 
+    let (stdout, stderr) = tokio::join!(stdout.finish(DRAIN_GRACE), stderr.finish(DRAIN_GRACE));
     Ok(CommandResult {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        code: output.status.code(),
+        stdout,
+        stderr,
+        code,
+        timed_out,
     })
 }
 
 /// Render a [`CommandResult`] as the model-facing tool output: stdout, then a
 /// labelled stderr section, then the exit code when non-zero. `is_error`
-/// mirrors the exit status.
+/// mirrors the exit status. A timed-out result is an error carrying the
+/// partial output.
 pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
     let stdout = result.stdout.trim_end();
     let stderr = result.stderr.trim_end();
@@ -89,6 +157,17 @@ pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
         }
         content.push_str("stderr:\n");
         content.push_str(stderr);
+    }
+
+    if let Some(secs) = result.timed_out {
+        let note = if content.is_empty() {
+            format!("command timed out after {secs}s and was killed (no output produced)")
+        } else {
+            content.push('\n');
+            format!("command timed out after {secs}s and was killed; output above is partial")
+        };
+        content.push_str(&note);
+        return ToolOutput::error(truncate_output(content, MAX_OUTPUT_BYTES));
     }
 
     match result.code {
@@ -272,20 +351,64 @@ mod tests {
     #[tokio::test]
     async fn execute_times_out_and_reports_seconds() {
         let tmp = TempDir::new();
-        let err = ExecuteTool
+        let out = ExecuteTool
             .execute(
                 json!({ "command": "sleep 5", "timeout_secs": 1 }),
                 &tmp.ctx(),
             )
             .await
-            .expect_err("must time out");
-        match err {
-            ToolError::Timeout { tool, seconds } => {
-                assert_eq!(tool, "execute");
-                assert_eq!(seconds, 1);
-            }
-            other => panic!("expected Timeout, got: {other}"),
-        }
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 1s"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_timeout_returns_partial_output() {
+        let tmp = TempDir::new();
+        let out = ExecuteTool
+            .execute(
+                json!({ "command": "echo started; echo warn >&2; sleep 5", "timeout_secs": 1 }),
+                &tmp.ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("started"), "{}", out.content);
+        assert!(out.content.contains("stderr:\nwarn"), "{}", out.content);
+        assert!(
+            out.content.contains("output above is partial"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_timeout_kills_the_whole_process_group() {
+        let tmp = TempDir::new();
+        // The subshell is a grandchild of `sh -c`; without the group kill it
+        // would survive the timeout and write the marker file.
+        let out = ExecuteTool
+            .execute(
+                json!({
+                    "command": "(sleep 2 && touch grandchild-survived) & echo spawned; sleep 30",
+                    "timeout_secs": 1
+                }),
+                &tmp.ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("spawned"), "{}", out.content);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(
+            !tmp.0.join("grandchild-survived").exists(),
+            "grandchild must be killed with the group"
+        );
     }
 
     #[tokio::test]
@@ -383,6 +506,7 @@ mod tests {
             stdout: "out line\n".to_string(),
             stderr: "err line\n".to_string(),
             code: Some(0),
+            timed_out: None,
         };
         let out = render_command_result(&result);
         assert!(!out.is_error);
@@ -395,9 +519,26 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             code: None,
+            timed_out: None,
         };
         let out = render_command_result(&result);
         assert!(out.is_error);
         assert_eq!(out.content, "terminated by signal");
+    }
+
+    #[test]
+    fn render_timeout_without_output_says_so() {
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: None,
+            timed_out: Some(30),
+        };
+        let out = render_command_result(&result);
+        assert!(out.is_error);
+        assert_eq!(
+            out.content,
+            "command timed out after 30s and was killed (no output produced)"
+        );
     }
 }

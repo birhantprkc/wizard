@@ -65,6 +65,10 @@
 #                                    (implies WIZARD_LOCAL)    (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
+#   WIZARD_VERSION               release tag to install, e.g. v0.4.0 (default: the
+#                                latest release). Pins the download to
+#                                releases/download/<tag>/ — use it for
+#                                reproducible installs or to roll back
 #   WIZARD_REPO                  owner/repo to install from   (default teddytennant/wizard)
 #   WIZARD_REF                   git ref/tag when building from source
 #                                (default: latest release tag, falling back to
@@ -105,6 +109,7 @@ WIZARD_LLAMACPP_NO_CUDA="${WIZARD_LLAMACPP_NO_CUDA:-0}"
 WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
+WIZARD_VERSION="${WIZARD_VERSION:-}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
@@ -113,7 +118,17 @@ WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
 if [ "${WIZARD_BESPOKE:-0}" = "1" ]; then WIZARD_MINIMAL=1; fi
 
 REPO="${WIZARD_REPO}"
-RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
+# WIZARD_VERSION pins the release; otherwise follow the latest. Accept the tag
+# with or without the leading v (releases are tagged v<X.Y.Z>).
+if [ -n "$WIZARD_VERSION" ]; then
+    case "$WIZARD_VERSION" in
+        v*) ;;
+        *) WIZARD_VERSION="v${WIZARD_VERSION}" ;;
+    esac
+    RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/download/${WIZARD_VERSION}"
+else
+    RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
+fi
 LLAMACPP_REPO="ggml-org/llama.cpp"
 LLAMACPP_URL="http://127.0.0.1:11435"
 LLAMA_BIN_DIR="$HOME/.wizard/bin"
@@ -918,7 +933,9 @@ download_release_asset() {
     fi
     rm -f "$out"
     if command -v gh >/dev/null 2>&1; then
-        if gh release download --repo "$REPO" --pattern "$asset" \
+        # Pass the pinned tag when set; without one gh picks the latest release.
+        if gh release download ${WIZARD_VERSION:+"$WIZARD_VERSION"} \
+            --repo "$REPO" --pattern "$asset" \
             --output "$out" 2>/dev/null; then
             return 0
         fi
@@ -1047,6 +1064,10 @@ resolve_source_ref() {
         printf '%s' "$WIZARD_REF"
         return
     fi
+    if [ -n "$WIZARD_VERSION" ]; then
+        printf '%s' "$WIZARD_VERSION"
+        return
+    fi
     tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 \
         | sed -E 's/.*"([^"]+)"$/\1/' || true)"
@@ -1130,7 +1151,6 @@ write_config() {
 # Wizard configuration — see https://github.com/${REPO}
 active_provider = "local"
 mode = "genie"
-auto_approve = false
 max_steps = 25
 
 [[providers]]
@@ -1151,7 +1171,6 @@ EOF
 # Wizard configuration — see https://github.com/${REPO}
 active_provider = "local"
 mode = "genie"
-auto_approve = false
 max_steps = 25
 
 [[providers]]

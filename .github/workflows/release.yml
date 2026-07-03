@@ -14,7 +14,10 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     strategy:
-      fail-fast: true
+      # Don't cancel sibling targets when one fails: their artifacts still
+      # upload, so re-running only the broken job completes the release
+      # instead of rebuilding every target.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -70,7 +73,7 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |

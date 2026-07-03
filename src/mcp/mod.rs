@@ -28,7 +28,9 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// Budget for spawning/dialing a server and completing `initialize`.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Public so `wizard doctor` probes with the same budget as the runtime —
+/// a slow-starting `npx`/`uvx` server must not pass here and fail there.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Budget for one `tools/list` page.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Budget for one `tools/call`.
@@ -85,6 +87,14 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
 /// transport = "stdio"
 /// command = "uvx"
 /// args = ["mcp-computer-use"]
+///
+/// [[server]]
+/// name = "remote"
+/// transport = "http"
+/// url = "https://mcp.example.com/mcp"
+/// [server.headers]
+/// Authorization = "Bearer literal-token"
+/// X-Api-Key = "env:MY_API_KEY"   # resolved from the environment at connect time
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -145,6 +155,11 @@ pub struct McpServerConfig {
     /// Extra environment variables for the spawned process (stdio transport).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
+    /// Extra HTTP headers sent on every request (http transport), e.g.
+    /// `Authorization`. A value of the form `env:VAR` is resolved from the
+    /// environment at connect time so the token never sits in `mcp.toml`.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 /// A tool as advertised by an MCP server's `tools/list`.
@@ -170,6 +185,9 @@ struct StdioIo {
 struct StdioTransport {
     child: Mutex<Child>,
     io: Mutex<StdioIo>,
+    /// Whether the one automatic respawn after a mid-session crash has been
+    /// spent (see [`McpConnection::stdio_request`]).
+    respawned: std::sync::atomic::AtomicBool,
 }
 
 /// Streamable-HTTP transport state.
@@ -226,15 +244,7 @@ impl McpConnection {
     /// MCP `initialize` request followed by the `notifications/initialized`
     /// notification.
     async fn initialize(&self) -> Result<()> {
-        let params = json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "wizard",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        });
-        let result = self.request("initialize", params).await?;
+        let result = self.request("initialize", initialize_params()).await?;
         let server_info = result
             .get("serverInfo")
             .and_then(|info| info.get("name"))
@@ -397,11 +407,35 @@ impl McpConnection {
         }
     }
 
+    /// One write-then-read round trip over the child's pipes. When the child
+    /// turns out to have crashed mid-session, respawns it once per session
+    /// (fresh process + handshake) and retries before giving up.
+    async fn stdio_request(
+        &self,
+        transport: &StdioTransport,
+        id: u64,
+        message: &Value,
+    ) -> Result<Value> {
+        match self.stdio_request_once(transport, id, message).await {
+            Err(err)
+                if is_stdio_crash(&err) && !transport.respawned.swap(true, Ordering::SeqCst) =>
+            {
+                warn!(
+                    server = %self.config.name,
+                    "MCP server crashed mid-session; respawning once: {err:#}"
+                );
+                self.respawn_stdio(transport).await?;
+                self.stdio_request_once(transport, id, message).await
+            }
+            other => other,
+        }
+    }
+
     /// One write-then-read round trip over the child's pipes. Skips
     /// notifications, junk lines, and (a bounded number of) stale responses;
     /// politely refuses server-to-client requests. The whole round trip is
     /// capped at [`STDIO_REQUEST_TIMEOUT`].
-    async fn stdio_request(
+    async fn stdio_request_once(
         &self,
         transport: &StdioTransport,
         id: u64,
@@ -421,6 +455,45 @@ impl McpConnection {
                 STDIO_REQUEST_TIMEOUT.as_secs()
             )
         })?
+    }
+
+    /// Replace a crashed stdio child with a fresh process and redo the MCP
+    /// handshake. The handshake runs directly over the fresh pipes (going
+    /// through [`Self::initialize`] would recurse back into `stdio_request`),
+    /// holding the I/O lock so no other request interleaves with it.
+    async fn respawn_stdio(&self, transport: &StdioTransport) -> Result<()> {
+        let name = &self.config.name;
+        let fresh =
+            spawn_stdio(&self.config).with_context(|| format!("respawning MCP server '{name}'"))?;
+        {
+            let mut child = transport.child.lock().await;
+            let _ = child.start_kill();
+            *child = fresh.child.into_inner();
+        }
+        let mut io = transport.io.lock().await;
+        *io = fresh.io.into_inner();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": initialize_params(),
+        });
+        write_line(&mut io.stdin, &message, name).await?;
+        timeout(CONNECT_TIMEOUT, read_stdio_response(&mut io, id, name))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "respawned MCP server '{name}' did not complete initialize within {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })??;
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        });
+        write_line(&mut io.stdin, &initialized, name).await
     }
 
     /// One streamable-HTTP round trip: POST the request, then read the
@@ -539,6 +612,30 @@ impl McpConnection {
     }
 }
 
+/// Params for the MCP `initialize` request (shared by the connect handshake
+/// and the post-crash respawn).
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {
+            "name": "wizard",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+/// Marker text identifying the "child crashed mid-session" failure; used by
+/// [`McpConnection::stdio_request`] to decide the one automatic respawn.
+const STDIO_CRASH_MARKER: &str = "closed its stdout (crashed or exited)";
+
+/// True when `err`'s chain reports the child closing its stdout — the
+/// specific failure worth one automatic respawn.
+fn is_stdio_crash(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains(STDIO_CRASH_MARKER))
+}
+
 /// Read lines from the child's stdout until the response matching `id`
 /// arrives. Skips notifications and junk lines, politely refuses
 /// server-to-client requests, and gives up after [`MAX_STALE_RESPONSES`]
@@ -554,7 +651,7 @@ async fn read_stdio_response(io: &mut StdioIo, id: u64, name: &str) -> Result<Va
             .await
             .with_context(|| format!("failed reading from MCP server '{name}'"))?;
         if read == 0 {
-            bail!("MCP server '{name}' closed its stdout (crashed or exited)");
+            bail!("MCP server '{name}' {STDIO_CRASH_MARKER}; run /reload to restart it");
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -684,10 +781,27 @@ fn spawn_stdio(config: &McpServerConfig) -> Result<StdioTransport> {
             stdin,
             stdout: BufReader::new(stdout),
         }),
+        respawned: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
-/// Build the HTTP transport for `config` (does not handshake).
+/// Resolve one configured header value: `env:VAR` reads `$VAR` at connect
+/// time (so a token never sits in `mcp.toml`); anything else is literal.
+fn resolve_header_value(raw: &str) -> Result<String> {
+    match raw.strip_prefix("env:") {
+        Some(var) => {
+            let var = var.trim();
+            std::env::var(var)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("header value references ${var}, which is not set"))
+        }
+        None => Ok(raw.to_string()),
+    }
+}
+
+/// Build the HTTP transport for `config` (does not handshake). Configured
+/// `headers` (with `env:` values resolved) are sent on every request.
 fn open_http(config: &McpServerConfig) -> Result<HttpTransport> {
     let url = config.url.clone().ok_or_else(|| {
         anyhow!(
@@ -695,7 +809,28 @@ fn open_http(config: &McpServerConfig) -> Result<HttpTransport> {
             config.name
         )
     })?;
+    let mut headers = reqwest::header::HeaderMap::with_capacity(config.headers.len());
+    for (key, raw) in &config.headers {
+        let resolved = resolve_header_value(raw)
+            .with_context(|| format!("header '{key}' on MCP server '{}'", config.name))?;
+        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).with_context(|| {
+            format!(
+                "invalid header name '{key}' on MCP server '{}'",
+                config.name
+            )
+        })?;
+        let mut value = reqwest::header::HeaderValue::from_str(&resolved).with_context(|| {
+            format!(
+                "invalid value for header '{key}' on MCP server '{}'",
+                config.name
+            )
+        })?;
+        // Headers here are typically credentials; keep them out of debug logs.
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
     let client = reqwest::Client::builder()
+        .default_headers(headers)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(CALL_TIMEOUT_SECS))
         .build()
@@ -1028,6 +1163,7 @@ mod tests {
                     args: vec!["mcp-computer-use".into()],
                     url: None,
                     env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+                    headers: HashMap::new(),
                 },
                 McpServerConfig {
                     name: "search".into(),
@@ -1036,6 +1172,10 @@ mod tests {
                     args: vec![],
                     url: Some("http://127.0.0.1:8808/mcp".into()),
                     env: HashMap::new(),
+                    headers: HashMap::from([
+                        ("Authorization".to_string(), "Bearer tok-123".to_string()),
+                        ("X-Api-Key".to_string(), "env:MY_API_KEY".to_string()),
+                    ]),
                 },
             ],
         };
@@ -1056,6 +1196,63 @@ mod tests {
             loaded.servers[1].url.as_deref(),
             Some("http://127.0.0.1:8808/mcp")
         );
+        assert_eq!(
+            loaded.servers[1]
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer tok-123")
+        );
+        assert_eq!(
+            loaded.servers[1]
+                .headers
+                .get("X-Api-Key")
+                .map(String::as_str),
+            Some("env:MY_API_KEY")
+        );
+        assert!(loaded.servers[0].headers.is_empty());
+    }
+
+    #[test]
+    fn headers_parse_from_toml_and_default_empty() {
+        let raw = r#"
+[[server]]
+name = "remote"
+transport = "http"
+url = "https://mcp.example.com/mcp"
+
+[server.headers]
+Authorization = "Bearer abc"
+"#;
+        let config: McpConfig = toml::from_str(raw).expect("valid toml");
+        assert_eq!(
+            config.servers[0]
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer abc")
+        );
+
+        // Absent table defaults to empty (older configs keep parsing).
+        let raw = "[[server]]\nname = \"plain\"\ntransport = \"http\"\nurl = \"https://x/mcp\"\n";
+        let config: McpConfig = toml::from_str(raw).expect("valid toml");
+        assert!(config.servers[0].headers.is_empty());
+    }
+
+    #[test]
+    fn header_values_resolve_env_indirection() {
+        // Literal values pass through untouched.
+        assert_eq!(
+            resolve_header_value("Bearer abc").expect("literal"),
+            "Bearer abc"
+        );
+        // `env:VAR` reads the environment (PATH is always set for tests).
+        let path = std::env::var("PATH").expect("PATH set");
+        assert_eq!(resolve_header_value("env:PATH").expect("env"), path);
+        // An unset variable is a hard error, not a silent empty header.
+        let err = resolve_header_value("env:WIZARD_MCP_TEST_HEADER_NEVER_SET")
+            .expect_err("unset var should error");
+        assert!(err.to_string().contains("not set"), "got: {err}");
     }
 
     #[test]
@@ -1134,6 +1331,7 @@ done"#
             args: vec!["-c".into(), script],
             url: None,
             env: HashMap::new(),
+            headers: HashMap::new(),
         }
     }
 
@@ -1184,6 +1382,7 @@ done"#
                     args: vec![],
                     url: None,
                     env: HashMap::new(),
+                    headers: HashMap::new(),
                 },
                 McpServerConfig {
                     name: "misconfigured".into(),
@@ -1192,6 +1391,7 @@ done"#
                     args: vec![],
                     url: None, // http transport without a url
                     env: HashMap::new(),
+                    headers: HashMap::new(),
                 },
                 fake_server_config("good", "weather"),
             ],
@@ -1245,6 +1445,7 @@ done"#;
                 ("WIZARD_MCP_TEST_OK".to_string(), "yes".to_string()),
                 ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
             ]),
+            headers: HashMap::new(),
         })
         .await
         .expect("env probe server should connect");
@@ -1276,6 +1477,7 @@ exec sleep 60"#;
             args: vec!["-c".into(), script.into()],
             url: None,
             env: HashMap::new(),
+            headers: HashMap::new(),
         })
         .await;
         let Err(err) = result else {
@@ -1284,6 +1486,63 @@ exec sleep 60"#;
         let message = format!("{err:#}");
         assert!(message.contains("flood"), "got: {message}");
         assert!(message.contains("mismatched ids"), "got: {message}");
+    }
+
+    /// A server that crashes mid-session is respawned once (fresh process +
+    /// handshake, the in-flight request retried); a second crash surfaces the
+    /// error with the `/reload` hint instead of respawning again.
+    #[tokio::test]
+    async fn stdio_crash_respawns_once_then_hints_at_reload() {
+        let marker =
+            std::env::temp_dir().join(format!("wizard-mcp-respawn-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        // Echoes each request id; on `ping`, crashes (exit before answering)
+        // unless the marker file exists, dropping the marker so the respawned
+        // incarnation answers.
+        let script = r#"while read -r line; do
+  id="${line#*\"id\":}"; id="${id%%,*}"
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"crashy","version":"0"}}}\n' "$id" ;;
+    *'"method":"ping"'*)
+      if [ -e "$MARKER" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+      else
+        : > "$MARKER"
+        exit 0
+      fi ;;
+  esac
+done"#;
+        let connection = McpConnection::connect(McpServerConfig {
+            name: "crashy".into(),
+            transport: McpTransport::Stdio,
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script.into()],
+            url: None,
+            env: HashMap::from([("MARKER".to_string(), marker.to_string_lossy().into_owned())]),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect("crashy server should connect");
+
+        // First ping crashes the child; the automatic respawn answers it.
+        let result = connection
+            .request("ping", json!({}))
+            .await
+            .expect("respawn should recover the request");
+        assert_eq!(result["ok"], true);
+
+        // Second crash: the respawn is spent, so the error surfaces with the
+        // /reload hint.
+        std::fs::remove_file(&marker).expect("clear marker");
+        let err = connection
+            .request("ping", json!({}))
+            .await
+            .expect_err("second crash should not respawn again");
+        let message = format!("{err:#}");
+        assert!(message.contains("run /reload"), "got: {message}");
+
+        let _ = std::fs::remove_file(&marker);
+        connection.close().await.ok();
     }
 
     /// A request the server never answers must hit the per-request timeout
