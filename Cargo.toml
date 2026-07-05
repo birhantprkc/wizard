@@ -69,6 +69,12 @@ tracing-appender = "0.2"
 htmd = "0.5"
 scraper = "0.27"
 
+# Self-update (`wizard update`): unpack a release tarball (gzip + tar) and
+# compare the published version against the running one. Checksums reuse sha2.
+flate2 = "1"
+tar = "0.4"
+semver = "1"
+
 # Process-group kill for background tasks (`task_kill`, timeouts)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

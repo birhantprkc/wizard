@@ -36,6 +36,7 @@ pub mod session_registry;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+pub mod update;
 pub mod usage;
 pub mod vim;
 
@@ -100,6 +101,22 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
     // recorded artifacts directly (list / undo) — no config, no LLM.
     if let Some(cli::Command::Evolve { cmd }) = &cli.command {
         return evolve::run_history_cli(cmd.clone());
+    }
+
+    // Self-update: `wizard update` downloads a release binary from GitHub,
+    // verifies its checksum, and swaps it in. Self-contained — no config, no
+    // onboarding, no LLM — so it dispatches before the config load too.
+    if let Some(cli::Command::Update {
+        check,
+        to,
+        force,
+        rollback,
+    }) = &cli.command
+    {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return update::run(*check, to.clone(), *force, *rollback).await;
     }
 
     // Doctor diagnoses the environment — starting with "does the config
@@ -201,11 +218,21 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
     // `wizard agents` always opens the TUI dashboard, regardless of the
     // configured default mode.
     if matches!(cli.command, Some(cli::Command::Agents)) {
+        // Passive self-update: print any cached "update available" notice now,
+        // before the TUI takes the alternate screen, then refresh the cache in
+        // the background (fire-and-forget, so it never delays the TUI).
+        // Sovereign is headless and skips both (handled in the match below).
+        update::print_startup_notice(&config.update);
+        update::maybe_check_on_startup(&config.update).await;
         return app::run_tui(config, cli).await;
     }
 
     match config.mode {
-        Mode::Genie => app::run_tui(config, cli).await,
+        Mode::Genie => {
+            update::print_startup_notice(&config.update);
+            update::maybe_check_on_startup(&config.update).await;
+            app::run_tui(config, cli).await
+        }
         Mode::Sovereign => agent::run_headless(config, cli).await,
     }
 }
