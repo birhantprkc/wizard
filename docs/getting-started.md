@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) — no model, no config — and the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
+Wizard installs in one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) — no model, no config — and the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Cloudflare Workers AI, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
 
 ## Install
 
@@ -116,7 +116,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks — llama.cpp (your own GGUF and server URL) and Ollama (your own model tag) — for bringing a model you already have. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks — llama.cpp (your own GGUF and server URL) and Ollama (your own model tag) — for bringing a model you already have. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
@@ -224,7 +224,7 @@ Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speak
 
 ## Using a cloud or remote provider
 
-Any OpenAI-compatible endpoint, OpenRouter, Anthropic, or xAI works. The simplest path is `/provider` inside the TUI: it opens a menu of your configured providers (Enter switches to one) with an **Add provider…** entry that walks you through each type. Pick xAI (API key or account sign-in), OpenRouter, OpenAI, Anthropic, or an OpenAI-compatible custom endpoint; you type the API key inline (hidden) and it is stored in `~/.wizard/credentials.toml` (file mode 0600). xAI account sign-in runs the OAuth flow and adds the provider for you.
+Any OpenAI-compatible endpoint, OpenRouter, Cloudflare Workers AI, Anthropic, or xAI works. The simplest path is `/provider` inside the TUI: it opens a menu of your configured providers (Enter switches to one) with an **Add provider…** entry that walks you through each type. Pick xAI (API key or account sign-in), OpenRouter, Cloudflare Workers AI, OpenAI, Anthropic, or an OpenAI-compatible custom endpoint; you type the API key inline (hidden) and it is stored in `~/.wizard/credentials.toml` (file mode 0600). xAI account sign-in runs the OAuth flow and adds the provider for you.
 
 The same thing is scriptable with explicit arguments:
 
@@ -246,6 +246,20 @@ OpenRouter serves hundreds of hosted models behind one OpenAI-compatible endpoin
 ```
 
 `openrouter/auto` is OpenRouter's Auto Router, which picks a model per prompt; any `vendor/model` tag from openrouter.ai/models works instead. Wizard sends OpenRouter's recommended attribution headers (`HTTP-Referer`, `X-Title`) on every request.
+
+### Using Cloudflare Workers AI
+
+[Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/) serves open models (GLM, Llama, Qwen, …) on serverless GPUs behind an account-scoped OpenAI-compatible endpoint. It needs two things: your **account id** (Cloudflare dashboard → Workers AI, or `wrangler whoami`) and an **API token** with the Workers AI permission. The default model is **GLM 5.2** (`@cf/zai-org/glm-5.2`).
+
+The interactive `/provider` menu is the easiest path — pick **Cloudflare Workers AI — API token**, paste the account id (folded into the endpoint URL) then the token (stored in `~/.wizard/credentials.toml`). Scripted, the account id goes in the base URL:
+
+```
+export CLOUDFLARE_API_TOKEN=...
+/provider add cloudflare cloudflare https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 @cf/zai-org/glm-5.2 CLOUDFLARE_API_TOKEN
+/provider use cloudflare
+```
+
+Any `@cf/...` text-generation tag works in place of the model (see [the catalog](https://developers.cloudflare.com/workers-ai/models/)); `/model` lists what your account can serve. Workers AI's OpenAI-compatible surface exposes only chat completions (no `/v1/models`), so Wizard discovers models and probes health against Cloudflare's native account catalog.
 
 ### Signing in with an xAI account
 

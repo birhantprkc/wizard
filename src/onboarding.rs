@@ -54,6 +54,8 @@ pub enum ProviderChoice {
     Anthropic,
     /// OpenRouter with a plain API key.
     OpenRouter,
+    /// Cloudflare Workers AI with an API token (account-scoped endpoint).
+    Cloudflare,
     /// xAI (Grok) with a plain API key.
     Xai,
     /// xAI via account sign-in (OAuth, `wizard --login xai`).
@@ -205,6 +207,10 @@ const XAI_KEY_ENV: &str = crate::llm::xai_oauth::DEFAULT_KEY_ENV;
 const OPENROUTER_KEY_ENV: &str = crate::llm::openrouter::DEFAULT_KEY_ENV;
 /// Default OpenRouter model (the Auto Router).
 const OPENROUTER_MODEL: &str = crate::llm::openrouter::DEFAULT_MODEL;
+/// Default env var name for the Cloudflare API token.
+const CLOUDFLARE_KEY_ENV: &str = crate::llm::cloudflare::DEFAULT_KEY_ENV;
+/// Default Cloudflare Workers AI model (GLM 5.2).
+const CLOUDFLARE_MODEL: &str = crate::llm::cloudflare::DEFAULT_MODEL;
 
 // ---------------------------------------------------------------------------
 // TUI entry point
@@ -297,6 +303,10 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
              private, no API key",
         ),
         Opt::new("OpenRouter", "hundreds of models via OPENROUTER_API_KEY"),
+        Opt::new(
+            "Cloudflare Workers AI",
+            "GLM 5.2 via CLOUDFLARE_API_TOKEN (+ account id)",
+        ),
         Opt::new("xAI (Grok), API key", "grok-4.3 via XAI_API_KEY"),
         Opt::new("xAI account sign-in", "grok-4.3 via OAuth, no API key"),
         Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
@@ -327,27 +337,31 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             Some(c) => c,
             None => return Ok(None),
         },
-        2 => match collect_xai(terminal)? {
+        2 => match collect_cloudflare(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        3 => match collect_xai_oauth(terminal)? {
+        3 => match collect_xai(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        4 => match collect_openai(terminal)? {
+        4 => match collect_xai_oauth(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        5 => match collect_anthropic(terminal)? {
+        5 => match collect_openai(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        6 => match collect_custom(terminal)? {
+        6 => match collect_anthropic(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        7 => match collect_llamacpp(terminal)? {
+        7 => match collect_custom(terminal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+        8 => match collect_llamacpp(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
@@ -1013,6 +1027,57 @@ fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     }))
 }
 
+fn collect_cloudflare(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    // The account id is folded into the endpoint URL (Workers AI is
+    // account-scoped); the token is read from an env var at request time.
+    let account_id = match text_input(
+        terminal,
+        "Cloudflare account ID",
+        "Dashboard → Workers AI (or `wrangler whoami`). Folded into the endpoint URL.",
+        "",
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let models: Vec<(String, String)> = vec![
+        (
+            CLOUDFLARE_MODEL.to_string(),
+            "GLM 5.2 — most capable (default)".to_string(),
+        ),
+        (
+            "@cf/zai-org/glm-4.7-flash".to_string(),
+            "GLM 4.7 Flash — cheaper, faster".to_string(),
+        ),
+    ];
+    let model = match pick_model(
+        terminal,
+        "Cloudflare Workers AI model (any @cf/... text-generation tag).",
+        &models,
+        CLOUDFLARE_MODEL,
+    )? {
+        Some(model) => model,
+        None => return Ok(None),
+    };
+    let api_key_env = match text_input(
+        terminal,
+        "API token env var",
+        "Wizard reads your Cloudflare API token from this env var (never stored on disk).",
+        CLOUDFLARE_KEY_ENV,
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    Ok(Some(ProviderAnswers {
+        provider: ProviderChoice::Cloudflare,
+        provider_name: "cloudflare".to_string(),
+        kind: ProviderKind::Cloudflare,
+        base_url: crate::llm::cloudflare::base_url(&account_id),
+        model,
+        api_key_env: Some(api_key_env),
+        gguf_path: None,
+    }))
+}
+
 fn collect_xai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     let models: Vec<(String, String)> = XAI_MODELS
         .iter()
@@ -1182,7 +1247,8 @@ fn print_summary(config: &Config) {
         ProviderKind::Openai
         | ProviderKind::Anthropic
         | ProviderKind::OpenRouter
-        | ProviderKind::Xai => {
+        | ProviderKind::Xai
+        | ProviderKind::Cloudflare => {
             if let Some(env) = provider.api_key_env.as_deref() {
                 println!("  • export your key: export {env}=...");
             }
@@ -1769,6 +1835,31 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(config.model, defaults.model);
         assert_eq!(config.ollama_host, defaults.ollama_host);
+    }
+
+    #[test]
+    fn cloudflare_answers_build_the_expected_provider() {
+        let answers = Answers {
+            provider: ProviderChoice::Cloudflare,
+            provider_name: "cloudflare".to_string(),
+            kind: ProviderKind::Cloudflare,
+            base_url: crate::llm::cloudflare::base_url("acc123"),
+            model: CLOUDFLARE_MODEL.to_string(),
+            api_key_env: Some(CLOUDFLARE_KEY_ENV.to_string()),
+            ..base_answers()
+        };
+        let config = answers.into_config();
+        assert_eq!(config.active().name, "cloudflare");
+        assert_eq!(config.active().kind, ProviderKind::Cloudflare);
+        assert_eq!(
+            config.active().base_url,
+            "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1"
+        );
+        assert_eq!(config.active().model, "@cf/zai-org/glm-5.2");
+        assert_eq!(
+            config.active().api_key_env.as_deref(),
+            Some("CLOUDFLARE_API_TOKEN")
+        );
     }
 
     #[test]

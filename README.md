@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary and a small default loadout (a Playwright browser over MCP and four subagents). The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself — no API key. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
+One command installs the `wizard` binary and a small default loadout (a Playwright browser over MCP and four subagents). The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself — no API key. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
 
 > **Other ways to install** — local-stack preinstall, minimal, bring-your-own-model, Nix, macOS — plus a first-run walkthrough are in **[Getting started](docs/getting-started.md)**.
 
@@ -18,7 +18,7 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 
 ## What it does
 
-- **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so OpenAI, Groq, vLLM, LM Studio, OpenRouter, Anthropic, xAI, and Ollama all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
+- **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so OpenAI, Groq, vLLM, LM Studio, OpenRouter, Cloudflare Workers AI, Anthropic, xAI, and Ollama all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
 - **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you — including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
 - **Model fusion (`/fusion`).** Run a panel of your providers as a debate and synthesize one tool-capable answer that tends to beat the best single model in the panel. → [Fusion](docs/fusion.md)
 - **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload` — and, gated by a clean `cargo build` and a smoke test, rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
@@ -38,7 +38,7 @@ Verified against each tool's documentation as of June 2026:
 
 | | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
 |---|---|---|---|---|
-| Providers | Any OpenAI-compatible endpoint + OpenRouter + Anthropic + xAI (API key or account sign-in), switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
+| Providers | Any OpenAI-compatible endpoint + OpenRouter + Cloudflare Workers AI + Anthropic + xAI (API key or account sign-in), switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
 | MCP | Yes: stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes: one of the earliest and deepest integrations, 70+ documented extensions | Yes: local + remote servers, OAuth for remote |
 | Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | None | Extensions and recipes via MCP | TypeScript/JS plugin system |
 | Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |

@@ -98,6 +98,9 @@ pub enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptField {
     Name,
+    /// Cloudflare account id — substituted into the base-URL template before
+    /// the provider is built (Cloudflare setup only).
+    AccountId,
     BaseUrl,
     Model,
     ApiKey,
@@ -257,7 +260,7 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
         Some("add") => {
             if args.len() < 5 {
                 return Err(
-                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth> <base_url> <model> [API_KEY_ENV]"
+                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare> <base_url> <model> [API_KEY_ENV]"
                         .to_string(),
                 );
             }
@@ -269,9 +272,10 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
                 "openrouter" => ProviderKind::OpenRouter,
                 "xai" => ProviderKind::Xai,
                 "xaioauth" => ProviderKind::XaiOauth,
+                "cloudflare" => ProviderKind::Cloudflare,
                 other => {
                     return Err(format!(
-                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth)"
+                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare)"
                     ));
                 }
             };
@@ -311,6 +315,7 @@ const PROVIDER_TYPES: &[(&str, &str)] = &[
         "stored in ~/.wizard/credentials.toml",
     ),
     ("OpenRouter — API key", "openrouter.ai"),
+    ("Cloudflare Workers AI — API token", "GLM 5.2 · account id + token"),
     ("OpenAI — API key", "api.openai.com"),
     ("Anthropic (Claude) — API key", "api.anthropic.com"),
     ("OpenAI-compatible — custom", "any base URL + key"),
@@ -361,6 +366,7 @@ fn provider_display(kind: ProviderKind) -> &'static str {
         ProviderKind::OpenRouter => "OpenRouter",
         ProviderKind::Openai => "OpenAI-compatible",
         ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::Cloudflare => "Cloudflare",
         ProviderKind::LlamaCpp => "llama.cpp",
         ProviderKind::Ollama => "Ollama",
     }
@@ -370,6 +376,9 @@ fn provider_display(kind: ProviderKind) -> &'static str {
 fn prompt_question(field: PromptField, prompt: &ProviderPrompt) -> String {
     match field {
         PromptField::Name => "Provider name (id):".to_string(),
+        PromptField::AccountId => {
+            "Cloudflare account ID (dash.cloudflare.com → Workers AI → account id):".to_string()
+        }
         PromptField::BaseUrl => "Base URL:".to_string(),
         PromptField::Model => "Model:".to_string(),
         PromptField::ApiKey => format!(
@@ -1705,6 +1714,18 @@ impl App {
         let field = prompt.queue.pop_front()?;
         match field {
             PromptField::Name => prompt.name = value,
+            PromptField::AccountId => {
+                if value.is_empty() {
+                    // No account id is treated as "never mind".
+                    self.cancel_prompt();
+                    return None;
+                }
+                // Substitute the account id into the base-URL template
+                // (e.g. `.../accounts/{account_id}/ai/v1`).
+                prompt.base_url = prompt
+                    .base_url
+                    .replace(crate::llm::cloudflare::ACCOUNT_ID_PLACEHOLDER, &value);
+            }
             PromptField::BaseUrl => prompt.base_url = value,
             PromptField::Model => prompt.model = value,
             PromptField::ApiKey => {
@@ -2858,7 +2879,7 @@ impl App {
                             )))
                         }
                         PickerKind::ProviderType => {
-                            use crate::llm::{openrouter, xai_oauth};
+                            use crate::llm::{cloudflare, openrouter, xai_oauth};
                             use std::collections::VecDeque;
                             match picker.selected {
                                 // xAI sign-in: run the OAuth flow; login()
@@ -2894,8 +2915,24 @@ impl App {
                                         ]),
                                     });
                                 }
-                                // OpenAI — model + key.
+                                // Cloudflare Workers AI — account id (folded
+                                // into the base URL) + token; model defaults to
+                                // GLM 5.2 and can be changed later via /model.
                                 3 => {
+                                    self.begin_provider_prompt(ProviderPrompt {
+                                        kind: ProviderKind::Cloudflare,
+                                        name: "cloudflare".to_string(),
+                                        base_url: cloudflare::BASE_URL_TEMPLATE.to_string(),
+                                        model: cloudflare::DEFAULT_MODEL.to_string(),
+                                        api_key: None,
+                                        queue: VecDeque::from([
+                                            PromptField::AccountId,
+                                            PromptField::ApiKey,
+                                        ]),
+                                    });
+                                }
+                                // OpenAI — model + key.
+                                4 => {
                                     self.begin_provider_prompt(ProviderPrompt {
                                         kind: ProviderKind::Openai,
                                         name: "openai".to_string(),
@@ -2909,7 +2946,7 @@ impl App {
                                     });
                                 }
                                 // Anthropic — model + key.
-                                4 => {
+                                5 => {
                                     self.begin_provider_prompt(ProviderPrompt {
                                         kind: ProviderKind::Anthropic,
                                         name: "claude".to_string(),
@@ -2924,7 +2961,7 @@ impl App {
                                 }
                                 // OpenAI-compatible custom — everything is
                                 // prompted, starting with the name.
-                                5 => {
+                                6 => {
                                     self.begin_provider_prompt(ProviderPrompt {
                                         kind: ProviderKind::Openai,
                                         name: String::new(),
@@ -6753,6 +6790,25 @@ mod tests {
             .expect("is a slash command");
         let message = parsed.expect_err("unknown kind");
         assert!(message.contains("openrouter"), "got: {message}");
+    }
+
+    #[test]
+    fn provider_add_accepts_cloudflare_kind() {
+        let parsed = SlashCommand::parse(
+            "/provider add cf cloudflare https://api.cloudflare.com/client/v4/accounts/acc/ai/v1 @cf/zai-org/glm-5.2 CLOUDFLARE_API_TOKEN",
+        )
+        .expect("is a slash command")
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            SlashCommand::Provider(ProviderAction::Add {
+                name: "cf".to_string(),
+                kind: ProviderKind::Cloudflare,
+                base_url: "https://api.cloudflare.com/client/v4/accounts/acc/ai/v1".to_string(),
+                model: "@cf/zai-org/glm-5.2".to_string(),
+                api_key_env: Some("CLOUDFLARE_API_TOKEN".to_string()),
+            })
+        );
     }
 
     #[test]
