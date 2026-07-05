@@ -109,8 +109,8 @@ pub struct Cli {
 
 impl Cli {
     /// Names of top-level flags set on this invocation that a self-contained
-    /// subcommand (bench, doctor, schedule, scheduler, fleet, usage, evolve)
-    /// would silently ignore. `--cwd` is honored everywhere and excluded.
+    /// subcommand (bench, doctor, schedule, scheduler, fleet, usage, evolve,
+    /// update) would silently ignore. `--cwd` is honored everywhere and excluded.
     /// [`crate::run`] turns a non-empty result into a hard error rather than
     /// silently dropping the flags.
     pub fn ignored_top_level_flags(&self) -> Vec<&'static str> {
@@ -230,6 +230,28 @@ pub enum Command {
     Evolve {
         #[command(subcommand)]
         cmd: EvolveCmd,
+    },
+
+    /// Update Wizard in place: download the latest release binary from GitHub,
+    /// verify its checksum against `checksums.txt`, and swap it in atomically
+    /// (the previous binary is kept as `<name>.bak`). Self-contained: never
+    /// loads config or triggers onboarding.
+    Update {
+        /// Report whether a newer release exists without installing anything.
+        #[arg(long)]
+        check: bool,
+
+        /// Install this exact tag (e.g. `v0.5.0`) instead of the latest.
+        #[arg(long, value_name = "TAG")]
+        to: Option<String>,
+
+        /// Reinstall even when the running version is already up to date.
+        #[arg(long)]
+        force: bool,
+
+        /// Restore the previous binary from the pre-update `<name>.bak` backup.
+        #[arg(long)]
+        rollback: bool,
     },
 }
 
@@ -602,6 +624,43 @@ mod tests {
     fn doctor_parses_as_a_subcommand() {
         let cli = parse(&["doctor"]).expect("doctor parses");
         assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn update_parses_as_a_subcommand() {
+        let cli = parse(&["update"]).expect("update parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: false,
+                to: None,
+                force: false,
+                rollback: false,
+            })
+        ));
+
+        let cli = parse(&[
+            "update",
+            "--check",
+            "--to",
+            "v0.5.0",
+            "--force",
+            "--rollback",
+        ])
+        .expect("update flags parse");
+        let Some(Command::Update {
+            check,
+            to,
+            force,
+            rollback,
+        }) = cli.command
+        else {
+            panic!("expected update");
+        };
+        assert!(check);
+        assert_eq!(to.as_deref(), Some("v0.5.0"));
+        assert!(force);
+        assert!(rollback);
     }
 
     #[test]

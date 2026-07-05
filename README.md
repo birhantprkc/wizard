@@ -62,7 +62,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 ## Docs
 
-- [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS), tiers, providers, first run, troubleshooting
+- [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS), tiers, providers, first run, in-place updates (`wizard update`), troubleshooting
 - [Usage](docs/usage.md): slash commands, `wizard agents`, token usage and cost, todos, project instructions
 - [Gateway](docs/gateway.md): run Wizard as a Telegram bot
 - [Modes](docs/modes.md): genie, sovereign, and continuous

@@ -316,7 +316,30 @@ Example:
 
 ## Updating
 
-Re-run the installer to get the latest binary (an existing `~/.wizard/config.toml` is left untouched):
+`wizard update` upgrades the binary in place: it downloads the latest release from GitHub, verifies its sha256 against the published `checksums.txt`, and swaps it in. The previous binary is kept as `<name>.bak`, so the change takes effect on the next `wizard` launch.
+
+```bash
+wizard update              # download and install the latest release
+wizard update --check      # report the current and latest version; install nothing
+wizard update --to v0.4.0  # install a specific tag instead of the latest
+wizard update --rollback   # restore the previous binary from <name>.bak
+```
+
+If the binary lives in a root-owned directory (e.g. `/usr/local/bin`), `wizard update` escalates the final move with `sudo` when run in a terminal; in a non-interactive context it prints the exact `sudo install` command instead.
+
+Wizard also checks for a newer release at startup (once every 24 hours, cached in `~/.wizard/update-check.json`). By default it just prints a one-line notice; nothing is downloaded until you run `wizard update`. Configure it with an `[update]` block in `~/.wizard/config.toml`:
+
+```toml
+[update]
+notify = true                 # print a one-liner when a newer release exists (default)
+auto = false                  # download + install newer releases in the background at startup
+repo = "teddytennant/wizard"  # GitHub owner/repo to check (point a fork elsewhere)
+interval_hours = 24           # hours between startup checks
+```
+
+With `auto = true` the new binary is fetched in the background and takes effect on the next launch (the running process is never hot-swapped); it is skipped when the install directory needs `sudo`, falling back to the notice.
+
+Re-running the installer still works and leaves an existing `~/.wizard/config.toml` untouched:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
@@ -324,7 +347,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 To change models, download a GGUF into `~/.wizard/models/` (Hugging Face hosts Q4_K_M quants of most open models), update `model` and `gguf_path` in `~/.wizard/config.toml`, then `/server stop` and `/server start` (or restart Wizard).
 
-To install a specific release instead of the latest — or to roll back after an update — pin the tag:
+To install a specific release via the installer instead — or to roll back after an update — pin the tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_VERSION=v0.4.0 bash

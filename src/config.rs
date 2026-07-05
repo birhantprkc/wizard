@@ -302,6 +302,58 @@ impl Default for FleetConfig {
     }
 }
 
+/// Self-update settings (`[update]` in `config.toml`); see `wizard update`.
+/// The passive startup check is a courtesy notice by default and never
+/// installs anything unless `auto` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Print a one-line notice at startup when a newer release exists
+    /// (default true). Purely informational — no download.
+    #[serde(default = "default_update_notify")]
+    pub notify: bool,
+    /// Download and swap in a newer release on startup, in the background
+    /// (default false). Never hot-swaps the running process — the new binary
+    /// takes effect on the next launch.
+    #[serde(default = "default_update_auto")]
+    pub auto: bool,
+    /// GitHub `owner/repo` to check for releases (default
+    /// `teddytennant/wizard`); point a fork elsewhere.
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// Hours between startup checks (default 24); a cache under
+    /// `~/.wizard/update-check.json` throttles network calls to this cadence.
+    #[serde(default = "default_update_interval_hours")]
+    pub interval_hours: u64,
+}
+
+fn default_update_notify() -> bool {
+    true
+}
+
+fn default_update_auto() -> bool {
+    false
+}
+
+fn default_update_repo() -> String {
+    "teddytennant/wizard".to_string()
+}
+
+fn default_update_interval_hours() -> u64 {
+    24
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            notify: default_update_notify(),
+            auto: default_update_auto(),
+            repo: default_update_repo(),
+            interval_hours: default_update_interval_hours(),
+        }
+    }
+}
+
 /// Model-fusion settings (`[fusion]` in `config.toml`); see `/fusion` and
 /// [`crate::llm::fusion`]. Panel and synthesizer reference existing
 /// [`ProviderConfig`] entries by name — each provider already binds a model, so
@@ -538,6 +590,9 @@ pub struct Config {
     /// Fleet-mode settings (`wizard fleet`).
     #[serde(default)]
     pub fleet: FleetConfig,
+    /// Self-update settings (`wizard update` + the passive startup check).
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Model-fusion settings (`/fusion`). Absent until configured; the toggle
     /// falls back to a default panel derived from `providers` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -578,6 +633,7 @@ impl Default for Config {
             web: WebConfig::default(),
             checkpoints: CheckpointConfig::default(),
             fleet: FleetConfig::default(),
+            update: UpdateConfig::default(),
             fusion: None,
         }
     }
@@ -1002,6 +1058,39 @@ mod tests {
     }
 
     #[test]
+    fn update_config_defaults() {
+        let update = UpdateConfig::default();
+        assert!(update.notify);
+        assert!(!update.auto);
+        assert_eq!(update.repo, "teddytennant/wizard");
+        assert_eq!(update.interval_hours, 24);
+    }
+
+    #[test]
+    fn config_without_update_table_deserializes_to_defaults() {
+        // Configs written before `[update]` existed must still parse.
+        let config: Config = toml::from_str("model = \"qwen3.6:27b\"").expect("valid toml");
+        assert_eq!(config.update, UpdateConfig::default());
+    }
+
+    #[test]
+    fn update_section_parses_with_partial_keys() {
+        let config: Config =
+            toml::from_str("[update]\nauto = true\ninterval_hours = 6").expect("valid toml");
+        assert!(config.update.auto);
+        assert_eq!(config.update.interval_hours, 6);
+        // Unspecified keys take their defaults.
+        assert!(config.update.notify);
+        assert_eq!(config.update.repo, "teddytennant/wizard");
+
+        let config: Config =
+            toml::from_str("[update]\nrepo = \"acme/wizard\"\nnotify = false").expect("valid toml");
+        assert_eq!(config.update.repo, "acme/wizard");
+        assert!(!config.update.notify);
+        assert!(!config.update.auto, "missing key takes the default");
+    }
+
+    #[test]
     fn mode_parameters() {
         assert_eq!(Mode::Genie.temperature(), 0.8);
         assert_eq!(Mode::Sovereign.temperature(), 0.6);
@@ -1069,6 +1158,12 @@ mod tests {
                 max_minutes: 45,
                 synthesize: false,
             },
+            update: UpdateConfig {
+                notify: false,
+                auto: true,
+                repo: "acme/wizard".to_string(),
+                interval_hours: 6,
+            },
             fusion: Some(FusionConfig {
                 panel: vec!["openai".to_string()],
                 synthesizer: "openai".to_string(),
@@ -1112,6 +1207,7 @@ mod tests {
         );
         assert_eq!(parsed.checkpoints, original.checkpoints);
         assert_eq!(parsed.fleet, original.fleet);
+        assert_eq!(parsed.update, original.update);
         assert_eq!(parsed.fusion, original.fusion);
     }
 
