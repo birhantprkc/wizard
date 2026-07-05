@@ -315,7 +315,10 @@ const PROVIDER_TYPES: &[(&str, &str)] = &[
         "stored in ~/.wizard/credentials.toml",
     ),
     ("OpenRouter — API key", "openrouter.ai"),
-    ("Cloudflare Workers AI — API token", "GLM 5.2 · account id + token"),
+    (
+        "Cloudflare Workers AI — API token",
+        "GLM 5.2 · account id + token",
+    ),
     ("OpenAI — API key", "api.openai.com"),
     ("Anthropic (Claude) — API key", "api.anthropic.com"),
     ("OpenAI-compatible — custom", "any base URL + key"),

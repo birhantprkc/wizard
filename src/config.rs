@@ -449,7 +449,9 @@ impl ProviderConfig {
                     tracing::warn!(
                         "provider '{}' has no API token (store one via /provider or set {}); requests will likely 401",
                         self.name,
-                        self.api_key_env.as_deref().unwrap_or(cloudflare::DEFAULT_KEY_ENV)
+                        self.api_key_env
+                            .as_deref()
+                            .unwrap_or(cloudflare::DEFAULT_KEY_ENV)
                     );
                 }
                 Ok(Arc::new(CloudflareProvider::new(
@@ -1349,8 +1351,7 @@ mod tests {
             providers: vec![ProviderConfig {
                 name: "cloudflare".to_string(),
                 kind: ProviderKind::Cloudflare,
-                base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1"
-                    .to_string(),
+                base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1".to_string(),
                 model: "@cf/zai-org/glm-5.2".to_string(),
                 api_key_env: Some("CLOUDFLARE_API_TOKEN".to_string()),
                 gguf_path: None,

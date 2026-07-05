@@ -159,9 +159,7 @@ impl LlmProvider for CloudflareProvider {
             )))
         })?;
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             let body = response.text().await.unwrap_or_default();
             return Err(anyhow::Error::new(ProviderError::http(
                 status.as_u16(),
