@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::Cli;
 use crate::llm::anthropic::AnthropicProvider;
+use crate::llm::cloudflare::{self, CloudflareProvider};
 use crate::llm::llamacpp::LlamaCppProvider;
 use crate::llm::ollama::OllamaClient;
 use crate::llm::openai::{OpenAiProvider, StaticToken};
@@ -84,6 +85,11 @@ pub enum ProviderKind {
     /// xAI via account sign-in: OAuth tokens from `wizard --login xai`
     /// (stored in `~/.wizard/xai_oauth.json`), no API key needed.
     XaiOauth,
+    /// Cloudflare Workers AI: serverless open models (GLM, Llama, Qwen, ...)
+    /// behind an account-scoped OpenAI-compatible endpoint
+    /// (`https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1`) with a
+    /// Cloudflare API token (default env var `CLOUDFLARE_API_TOKEN`).
+    Cloudflare,
 }
 
 impl fmt::Display for ProviderKind {
@@ -96,6 +102,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::OpenRouter => write!(f, "openrouter"),
             ProviderKind::Xai => write!(f, "xai"),
             ProviderKind::XaiOauth => write!(f, "xaioauth"),
+            ProviderKind::Cloudflare => write!(f, "cloudflare"),
         }
     }
 }
@@ -326,7 +333,8 @@ pub struct ProviderConfig {
     /// `http://127.0.0.1:11434`; openai `https://api.openai.com/v1`;
     /// anthropic `https://api.anthropic.com`; openrouter
     /// `https://openrouter.ai/api/v1`; xai / xaioauth
-    /// `https://api.x.ai/v1`.
+    /// `https://api.x.ai/v1`; cloudflare
+    /// `https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1`.
     pub base_url: String,
     /// Model tag.
     pub model: String,
@@ -430,6 +438,26 @@ impl ProviderConfig {
                     self.model.clone(),
                     Arc::new(source),
                     "xai",
+                )))
+            }
+            // Cloudflare Workers AI speaks the OpenAI-compatible Chat
+            // Completions API, but has no `/v1/models`, so it needs its own
+            // client for health/model-listing (see `CloudflareProvider`).
+            ProviderKind::Cloudflare => {
+                let key = self.resolved_key(Some(cloudflare::DEFAULT_KEY_ENV));
+                if key.is_empty() {
+                    tracing::warn!(
+                        "provider '{}' has no API token (store one via /provider or set {}); requests will likely 401",
+                        self.name,
+                        self.api_key_env
+                            .as_deref()
+                            .unwrap_or(cloudflare::DEFAULT_KEY_ENV)
+                    );
+                }
+                Ok(Arc::new(CloudflareProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                    key,
                 )))
             }
         }
@@ -1318,6 +1346,40 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_kind_round_trips_through_toml() {
+        let original = Config {
+            providers: vec![ProviderConfig {
+                name: "cloudflare".to_string(),
+                kind: ProviderKind::Cloudflare,
+                base_url: "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1".to_string(),
+                model: "@cf/zai-org/glm-5.2".to_string(),
+                api_key_env: Some("CLOUDFLARE_API_TOKEN".to_string()),
+                gguf_path: None,
+                usd_per_mtok_in: None,
+                usd_per_mtok_out: None,
+            }],
+            active_provider: Some("cloudflare".to_string()),
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&original).expect("serialize");
+        // The serde name is what the /provider parser and Display use.
+        assert!(raw.contains("kind = \"cloudflare\""), "raw: {raw}");
+        let parsed: Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(parsed.providers[0].kind, ProviderKind::Cloudflare);
+        assert_eq!(parsed.providers[0].model, "@cf/zai-org/glm-5.2");
+        assert_eq!(
+            parsed.providers[0].api_key_env.as_deref(),
+            Some("CLOUDFLARE_API_TOKEN")
+        );
+        assert_eq!(parsed.active().kind, ProviderKind::Cloudflare);
+
+        // build() dispatches to the Cloudflare client (labeled by vendor+model),
+        // proving the wiring from config to provider.
+        let client = parsed.active().build().expect("builds a cloudflare client");
+        assert_eq!(client.label(), "cloudflare:@cf/zai-org/glm-5.2");
+    }
+
+    #[test]
     fn provider_cost_rates_parse_and_round_trip() {
         let raw = "\
 [[providers]]
@@ -1356,6 +1418,7 @@ usd_per_mtok_out = 15.0
             (ProviderKind::OpenRouter, "openrouter"),
             (ProviderKind::Xai, "xai"),
             (ProviderKind::XaiOauth, "xaioauth"),
+            (ProviderKind::Cloudflare, "cloudflare"),
         ] {
             assert_eq!(kind.to_string(), name);
             let json = serde_json::to_value(kind).expect("serialize kind");
