@@ -27,7 +27,7 @@ Query a search backend and return a numbered markdown list of results (title, ur
 
 - **Arguments:** `query` (required), `count` (optional, default 5, max 10)
 
-Web search is **not** auto-configured. Configure it interactively — pick a backend, and for the keyed backends paste an API key — during onboarding or any time with **`/settings` → Web search backend**. The picker writes `search_backend` to config and stores pasted keys in `~/.wizard/credentials.toml` (0600). Backends, selected by `search_backend`:
+Web search is **not** auto-configured. Configure it interactively (pick a backend, and for the keyed backends paste an API key) during onboarding or any time via **`/settings` → Web search backend**. The picker writes `search_backend` to config and stores pasted keys in `~/.wizard/credentials.toml` (0600). Backends, selected by `search_backend`:
 
 | Backend | Key needed | How |
 |---------|-----------|-----|
@@ -42,7 +42,7 @@ A key pasted via `/settings`/onboarding is stored under the backend name in `~/.
 
 ### xAI Grok web search
 
-The `xai` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider) — **if you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`. Because the search runs remotely it is slower than a scrape — the request timeout is 120 s.
+The `xai` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider). **If you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`. Because the search runs remotely, it is slower than a scrape: the request timeout is 120 s.
 
 ## Configuration
 
@@ -54,4 +54,4 @@ search_backend = "duckduckgo"     # duckduckgo | brave | tavily | exa | serper |
 search_api_key_env = "BRAVE_API_KEY"  # optional env-var fallback when no key was pasted
 ```
 
-Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand — it also handles the API key.
+Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand: it also handles the API key.

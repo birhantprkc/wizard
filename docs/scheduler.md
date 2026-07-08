@@ -4,7 +4,7 @@ Cron-style scheduled runs. Entries live in `~/.wizard/schedule.toml`; the
 `wizard scheduler` daemon fires each one as a headless wizard child process
 at its cron times. Like `bench` and `doctor`, the schedule commands are
 self-contained: they never load `~/.wizard/config.toml`, never trigger
-onboarding, and need no LLM in this process — the spawned jobs load their
+onboarding, and need no LLM in this process. The spawned jobs load their
 own config exactly like a user-invoked `wizard --mode sovereign -p "..."`.
 
 ## schedule.toml
@@ -20,8 +20,8 @@ max_hours = 2.0                 # optional wall-clock cap for the spawned run
 enabled = true                  # optional, default true
 ```
 
-Cron expressions are strict 5-field (`minute hour day month weekday`) —
-no seconds or year fields — and are validated on `add` and on every load.
+Cron expressions are strict 5-field (`minute hour day month weekday`),
+no seconds or year fields, and are validated on `add` and on every load.
 Aliases like `MON-FRI` and `@daily` work.
 
 ## CLI
@@ -45,7 +45,7 @@ wizard schedule remove nightly-cleanup
 wizard schedule disable nightly-cleanup
 wizard schedule enable nightly-cleanup
 
-# Run one entry's job right now, in the foreground, with inherited stdio —
+# Run one entry's job right now, in the foreground, with inherited stdio:
 # the same child command the daemon would spawn. Exits with the child's
 # exit code (0 completed, 2 max-steps, 3 circuit breaker, 4 time limit):
 wizard schedule run nightly-cleanup
@@ -67,14 +67,14 @@ a second instance exits immediately with an error naming the lock (the lock
 is released by the kernel on any exit, including SIGKILL, so it can never go
 stale). Each pass (at least once a minute) it:
 
-1. Reaps finished jobs and kills any past `max_hours` (plus a short grace —
+1. Reaps finished jobs and kills any past `max_hours` (plus a short grace:
    the child also receives `--max-hours`, so the normal path is a graceful
    self-stop; the kill is the backstop).
 2. Reloads `schedule.toml`, so edits apply without a restart.
 3. Fires every due entry: `current_exe()` spawned as
    `wizard --mode sovereign -p "<prompt>" --cwd <cwd> [--max-hours H]`
    (`--continuous` for `mode = "continuous"`). Entries due at the same time
-   all spawn concurrently — runs are never serialized.
+   all spawn concurrently; runs are never serialized.
 4. Sleeps until the next fire, capped at 60 s.
 
 Semantics worth knowing:

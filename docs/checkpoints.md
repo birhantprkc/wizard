@@ -1,14 +1,14 @@
 # Checkpoints and /rewind
 
 Wizard snapshots every file it is about to edit, per turn, so a turn (or a run of
-turns) can be rewound — files restored to their before-state and the conversation
+turns) can be rewound: files restored to their before-state and the conversation
 truncated to match. There are no approval prompts anywhere in this: every tool call
 still executes directly; checkpoints are the undo, not a gate.
 
 ## How it works
 
-Before an edit-class tool (`write_file`, `edit_file`) runs — after pre-tool hooks have
-had their chance to rewrite the arguments — the dispatcher copies the target file's
+Before an edit-class tool (`write_file`, `edit_file`) runs, and after pre-tool hooks have
+had their chance to rewrite the arguments, the dispatcher copies the target file's
 current content into the project's checkpoint store. Subagent edits go through the same
 seam, snapshotted under the parent's current turn. The first snapshot of a path within a
 turn wins: that is the turn's before-state, no matter how many times the turn rewrites
@@ -49,8 +49,8 @@ Esc cancels.
 
 Rewinding to turn N:
 
-- restores every snapshot from turn N onward — the earliest before-state of each file
-  wins, and files that did not exist before are deleted;
+- restores every snapshot from turn N onward (the earliest before-state of each file
+  wins), and files that did not exist before are deleted;
 - truncates the session file at turn N's marker and reloads the in-memory conversation,
   so the model no longer remembers the rewound turns;
 - prunes the rewound turns from the checkpoint store.

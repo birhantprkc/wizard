@@ -60,7 +60,7 @@ The baked-in base personality prompt can be replaced at runtime by a file: `~/.w
 
 ### Harness bundles
 
-The full evolvable surface — not just the prompt — can be externalized as a *harness bundle*: a directory activated with `--harness-dir <dir>` (or `$WIZARD_HARNESS_DIR`) whose files shadow the compiled defaults per component:
+The full evolvable surface, not just the prompt, can be externalized as a *harness bundle*: a directory activated with `--harness-dir <dir>` (or `$WIZARD_HARNESS_DIR`) whose files shadow the compiled defaults per component:
 
 ```
 <bundle>/
@@ -71,7 +71,7 @@ The full evolvable surface — not just the prompt — can be externalized as a 
   HARNESS.md                  # generated guide for evolution agents
 ```
 
-Any missing or empty file falls back to the compiled default, so a partial or broken bundle degrades gracefully and deleting a file reverts that component. `wizard harness export <dir>` dumps the current compiled defaults as a bundle — the seed an external harness-evolution loop (e.g. AHE) edits, measures, and hands back for review. Winning changes get baked into the source as new defaults and re-exported, which is what makes the loop recursive. Methodology credit: [Agentic Harness Engineering](https://github.com/china-qijizhifeng/agentic-harness-engineering) (arXiv:2604.25850).
+Any missing or empty file falls back to the compiled default, so a partial or broken bundle degrades gracefully and deleting a file reverts that component. `wizard harness export <dir>` dumps the current compiled defaults as a bundle: the seed an external harness-evolution loop (e.g. AHE) edits, measures, and hands back for review. Winning changes get baked into the source as new defaults and re-exported, which is what makes the loop recursive. Methodology credit: [Agentic Harness Engineering](https://github.com/china-qijizhifeng/agentic-harness-engineering) (arXiv:2604.25850).
 
 ### Subagents
 
@@ -135,7 +135,7 @@ wizard evolve list
 wizard evolve undo 2
 ```
 
-`undo` reverts what the entry recorded: a skill, scripted tool, or subagent undo deletes the created files (`/reload` to apply); an MCP-server undo removes its entry from `~/.wizard/mcp.toml`; a deep-evolve undo restores the `<binary>.prev` rollback copy over the installed binary (keeping the undone build beside it as `<binary>.undone`) — restart Wizard to run it. Undo is conservative: when the recorded artifacts are already gone it refuses with a clear message rather than guessing.
+`undo` reverts what the entry recorded: a skill, scripted tool, or subagent undo deletes the created files (`/reload` to apply); an MCP-server undo removes its entry from `~/.wizard/mcp.toml`; a deep-evolve undo restores the `<binary>.prev` rollback copy over the installed binary (keeping the undone build beside it as `<binary>.undone`). Restart Wizard to run it. Undo is conservative: when the recorded artifacts are already gone it refuses with a clear message rather than guessing.
 
 Everything is also plain files under `~/.wizard/`, so manual cleanup keeps working: delete the file and `/reload` to revert a tier-1 change; deep evolve keeps the prior binary as `<binary>.prev`.
 
@@ -143,4 +143,4 @@ Everything is also plain files under `~/.wizard/`, so manual cleanup keeps worki
 
 ## Safety
 
-`/evolve` widens what the agent can do to your machine, so review what it adds. MCP servers and scripted tools run with your privileges and can make their own network and system calls. **Both modes apply `/evolve` changes directly — there is no approval gate**; only run unattended evolution on machines and tasks where that's acceptable. See the [security model](architecture.md#security-model).
+`/evolve` widens what the agent can do to your machine, so review what it adds. MCP servers and scripted tools run with your privileges and can make their own network and system calls. **Both modes apply `/evolve` changes directly: there is no approval gate.** Only run unattended evolution on machines and tasks where that's acceptable. See the [security model](architecture.md#security-model).

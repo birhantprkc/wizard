@@ -10,7 +10,7 @@ The command is spawned detached and registered as a background task; the call re
 
 ## Lifecycle
 
-- Each task captures combined stdout/stderr into a per-task buffer capped at ~200 KB — when output exceeds the cap, only the most recent tail is kept
+- Each task captures combined stdout/stderr into a per-task buffer capped at ~200 KB; once output exceeds the cap, only the most recent tail is kept
 - Background tasks are killed after **30 minutes**; the status reflects the timeout
 - At the top of every agent step (and every `--continuous` cycle), finished tasks are reported to the model exactly once, as a history note like:
 
@@ -30,7 +30,7 @@ Two companion tools:
 
 | Tool | Arguments | Does |
 |------|-----------|------|
-| `task_output` | `id`, `tail_bytes` (optional, default 20 000) | Return the task's status and the tail of its buffered output. Read-only — works in plan mode. |
+| `task_output` | `id`, `tail_bytes` (optional, default 20 000) | Return the task's status and the tail of its buffered output. Read-only, works in plan mode. |
 | `task_kill` | `id` | Terminate a running task. |
 
 Statuses: `running`, `exit <code>`, `killed`, `timed out`.

@@ -1,8 +1,8 @@
 # The default loadout
 
-A fresh Wizard install is already equipped. Besides the binary, the installer lays down a default loadout: a browser (Playwright MCP) and a roster of four subagents. The binary is unchanged; the loadout is *configuration*, plain TOML files under `~/.wizard/` that you can edit, extend, or delete. Everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
+A fresh Wizard install comes equipped already. Besides the binary, the installer lays down a default loadout: a browser (Playwright MCP) and a roster of four subagents. The binary itself is unchanged; the loadout is *configuration*, plain TOML files under `~/.wizard/` that you can edit, extend, or delete. Everything in [Self-extension](evolve.md), [Modes](modes.md), and [Fork and distribute](market.md) works exactly as documented.
 
-The loadout is installed in every flavor except `WIZARD_MINIMAL=1`, which skips it. Each file is written only if it does not already exist: nothing under `~/.wizard/` that you already have is ever overwritten, so re-running the installer on an existing setup adds only what is missing.
+The loadout is installed in every flavor except `WIZARD_MINIMAL=1`, which skips it. Each file is written only if it does not already exist, so nothing under `~/.wizard/` that you already have is ever overwritten: re-running the installer on an existing setup adds only what is missing.
 
 > Historical note: this loadout used to ship as a separate distribution called Wizard Arsenal. It has been absorbed into Wizard's default install; there is nothing extra to add on.
 
@@ -20,7 +20,7 @@ command = "npx"
 args = ["-y", "@playwright/mcp@latest"]
 ```
 
-This is exactly the browser recipe from [WIZARD.md §2](../WIZARD.md), shipped ready instead of acquired via `/evolve`. When Wizard starts (or after `/reload`), the server's navigate / click / type / snapshot tools merge into the registry, and the agent can read pages, fill forms, and do computer-use style tasks.
+This is the same browser recipe from [WIZARD.md §2](../WIZARD.md), shipped ready instead of acquired via `/evolve`. When Wizard starts (or after `/reload`), the server's navigate / click / type / snapshot tools merge into the registry, and the agent can read pages, fill forms, and do computer-use style tasks.
 
 It requires **Node and `npx`** on your PATH. If Node is missing, the server is skipped with a warning at startup and the rest of Wizard works normally; install Node, then `/reload`.
 

@@ -104,7 +104,7 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 
 When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:11435` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry).
 
-At TUI startup, a local backend that is missing or cannot start is not fatal: Wizard falls back to bring-your-own-provider: first any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and finally the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
+At TUI startup, a missing or unstartable local backend isn't fatal. Wizard falls back in order: any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
 
 ### LLM clients (`llm/`)
 
@@ -235,7 +235,7 @@ Ratatui + crossterm terminal UI:
 
 ### `install.sh` (the one installer)
 
-By default it installs the binary and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`) — no model, no config, no Rust toolchain; the first `wizard` run opens onboarding to pick a provider. Flavors: `WIZARD_LOCAL=1` preinstalls the local stack non-interactively (llama.cpp's `llama-server` from official ggml-org releases, a VRAM-tiered Qwen 3 GGUF, and `config.toml`; no server is started at install time — Wizard spawns it on first run), `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor and implies it, `WIZARD_BYOM=1` sets up Ollama with a model of your choice, and `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias). The toolchain required for deep evolve (Tier 2) is installed via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+By default it installs the binary and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`): no model, no config, no Rust toolchain. The first `wizard` run opens onboarding to pick a provider. Flavors: `WIZARD_LOCAL=1` preinstalls the local stack non-interactively (llama.cpp's `llama-server` from official ggml-org releases, a VRAM-tiered Qwen 3 GGUF, and `config.toml`; no server starts at install time, Wizard spawns it on first run), `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor and implies it, `WIZARD_BYOM=1` sets up Ollama with a model of your choice, and `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias). The toolchain required for deep evolve (Tier 2) installs via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
 
 ### `install-byom.sh` (back-compat shim)
 
@@ -260,7 +260,7 @@ Target release binary: **< 60 MB** (strip + LTO).
 - Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the local option, or the configured cloud API
 - Beyond the active provider, the core makes outbound calls only for the things you invoke: the native web tools (`web_fetch` / `web_search`, [web.md](web.md)), the messaging gateway, the GGUF/model download during install, and deep evolve's source clone. MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
 - The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
-- Both modes execute tool calls (writes, shell, git, and `/evolve` changes) directly — there is no approval gate. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run either mode only on tasks and repos where unattended local command execution is acceptable
+- Both modes execute tool calls (writes, shell, git, and `/evolve` changes) directly: there is no approval gate. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run either mode only on tasks and repos where unattended local command execution is acceptable
 - Official Qwen 3.6 models retain their safety training
 
 ## Roadmap additions

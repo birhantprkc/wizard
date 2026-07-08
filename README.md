@@ -10,25 +10,25 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary and a small default loadout (a Playwright browser over MCP and four subagents). The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself — no API key. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
+One command installs the `wizard` binary and a small default loadout (a Playwright browser over MCP and four subagents). The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
 
-> **Other ways to install** — local-stack preinstall, minimal, bring-your-own-model, Nix, macOS — plus a first-run walkthrough are in **[Getting started](docs/getting-started.md)**.
+> **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
 
 ---
 
 ## What it does
 
 - **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so OpenAI, Groq, vLLM, LM Studio, OpenRouter, Cloudflare Workers AI, Anthropic, xAI, and Ollama all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
-- **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you — including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
+- **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you, including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
 - **Model fusion (`/fusion`).** Run a panel of your providers as a debate and synthesize one tool-capable answer that tends to beat the best single model in the panel. → [Fusion](docs/fusion.md)
-- **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload` — and, gated by a clean `cargo build` and a smoke test, rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
-- **Runtime MCP.** stdio and HTTP MCP servers merge into the tool registry without a rebuild — the path for computer use, browser control, and databases. → [Self-extension](docs/evolve.md)
+- **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload`. Gated by a clean `cargo build` and a smoke test, it can also rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
+- **Runtime MCP.** stdio and HTTP MCP servers merge into the tool registry without a rebuild: the path for computer use, browser control, and databases. → [Self-extension](docs/evolve.md)
 - **Genie / Sovereign modes, plus `--continuous`.** An interactive direct-action TUI, a headless self-directing mode, or a perpetual mission that compacts its own context and self-heals through outages. → [Modes](docs/modes.md)
-- **`wizard bench`.** Records your real tasks as trajectories and replays them in isolated git worktrees to score builds and models against each other — "the new model is better" becomes a number. → [Bench](docs/bench.md)
+- **`wizard bench`.** Records your real tasks as trajectories and replays them in isolated git worktrees to score builds and models against each other. "The new model is better" becomes a number. → [Bench](docs/bench.md)
 - **Messaging gateway.** Run headless as a bot you talk to from your phone (Telegram), each inbound message a sovereign agent turn in your project. → [Gateway](docs/gateway.md)
 - **Make it your own.** After a deep evolve modifies its source, `/publish` forks upstream to your GitHub and hands out a one-line installer for your variant. → [Fork and distribute](docs/market.md)
 
-**Smaller attack surface by construction.** A single memory-safe Rust binary — no interpreter to inject into, no garbage-collected runtime — and because every install converges on a different `/evolve` loadout, there is no uniform tool surface to target. Read [SECURITY.md](SECURITY.md) before autonomous runs; tools execute with your privileges.
+**Smaller attack surface by construction.** A single memory-safe Rust binary: no interpreter to inject into, no garbage-collected runtime. Every install also converges on a different `/evolve` loadout, so there's no uniform tool surface to target. Read [SECURITY.md](SECURITY.md) before autonomous runs; tools execute with your privileges.
 
 ---
 
@@ -53,7 +53,7 @@ Wizard's bet is narrower: one binary, any model you choose, an onboarding that s
 
 ## Limitations
 
-- **Platforms.** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel). Windows isn't supported — run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet.
+- **Platforms.** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel). Windows isn't supported; run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet.
 - **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude- or GPT-class models. Wizard mitigates with native tool-call probing, a JSON fallback, and retry prompts; the 27B+ tiers make much better agents than the 9B tier.
 - **No sandbox.** Tools run with your privileges, with no per-action approval gate in either mode. Read [SECURITY.md](SECURITY.md) before running on anything you don't trust, and prefer a container/VM for autonomous or continuous work.
 - **Context windows are finite.** Wizard searches and reads selectively rather than ingesting the whole repo, but long sessions eventually push out early context.

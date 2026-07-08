@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs in one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) — no model, no config — and the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Cloudflare Workers AI, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
+Wizard installs in one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) (no model, no config); the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Cloudflare Workers AI, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
 
 ## Install
 
@@ -35,12 +35,12 @@ The same script has four mutually exclusive flavors:
 
 | Install | What you get |
 |---------|--------------|
-| (default) | binary + loadout; no model, no config — the first `wizard` run starts [onboarding](#first-run) |
+| (default) | binary + loadout; no model, no config. The first `wizard` run starts [onboarding](#first-run) |
 | `WIZARD_LOCAL=1` | the default plus a preinstalled local stack: llama.cpp runtime + VRAM-tiered Qwen GGUF + `config.toml` |
 | `WIZARD_MINIMAL=1` | binary only: no loadout either; onboarding on first run as with the default |
 | `WIZARD_BYOM=1` | Ollama runtime + a model of your choice (interactive, or `WIZARD_MODEL=<tag>`) + binary + config + loadout; see [byom.md](byom.md) |
 
-`WIZARD_USE_OLLAMA=1` is the Ollama variant of the local flavor (installs Ollama, starts it, pulls the same auto-tiered model) and implies it — no need to also set `WIZARD_LOCAL`. Combining `WIZARD_LOCAL`, `WIZARD_MINIMAL`, or `WIZARD_BYOM` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; note it is stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
+`WIZARD_USE_OLLAMA=1` is the Ollama variant of the local flavor (installs Ollama, starts it, pulls the same auto-tiered model) and implies it: no need to also set `WIZARD_LOCAL`. Combining `WIZARD_LOCAL`, `WIZARD_MINIMAL`, or `WIZARD_BYOM` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; it's stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
 
 ### Platforms
 
@@ -48,7 +48,7 @@ The same script has four mutually exclusive flavors:
 |----------|-------|
 | Linux x86_64 / aarch64 | Prebuilt glibc and static-musl binaries; the installer prefers musl on NixOS |
 | macOS Apple Silicon / Intel | Same `curl … \| bash`; prebuilt binaries for both architectures; Metal-backed `llama-server` for the local stack |
-| Windows | Not supported natively — use WSL2 |
+| Windows | Not supported natively; use WSL2 |
 
 The installer downloads the prebuilt binary matching your OS and architecture, verifies its checksum, and falls back to a source build when no prebuilt asset is available.
 
@@ -61,7 +61,7 @@ nix run github:teddytennant/wizard              # run without installing
 nix profile install github:teddytennant/wizard  # add to your profile
 ```
 
-The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard), `overlays.default`, and `homeManagerModules.default` for wiring it into a Home Manager config. On NixOS the curl installer detects the system, points you at these commands, and — if you run it anyway — installs the static musl binary into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there).
+The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard), `overlays.default`, and `homeManagerModules.default` for wiring it into a Home Manager config. On NixOS the curl installer detects the system, points you at these commands, and, if you run it anyway, installs the static musl binary into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there).
 
 ### Model tiers (automatic)
 
@@ -83,7 +83,7 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WIZARD_INSTALL_DIR` | `/usr/local/bin` (`~/.local/bin` on NixOS) | Where to place the `wizard` binary |
-| `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0` — pin it for reproducible installs or to roll back to an earlier release |
+| `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0`; pin it for reproducible installs or to roll back to an earlier release |
 | `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
 | `WIZARD_BYOM` | `0` | Set to `1` to bring your own Ollama model (conflicts with `WIZARD_MINIMAL`) |
@@ -95,7 +95,7 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | `WIZARD_USE_OLLAMA` | `0` | Set to `1` for the Ollama variant of the local flavor (implies `WIZARD_LOCAL`) |
 | `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With Ollama flavors: Ollama is already managed elsewhere |
 | `WIZARD_WITH_TOOLCHAIN` | `0` | Set to `1` to eagerly install a Rust toolchain for deep evolve |
-| `WIZARD_REPO` | `teddytennant/wizard` | `owner/repo` to install from — how a published fork ships itself |
+| `WIZARD_REPO` | `teddytennant/wizard` | `owner/repo` to install from: how a published fork ships itself |
 | `WIZARD_REF` | latest release tag | Git ref/tag when building from source (falls back to `main` only when the repo has no release) |
 | `WIZARD_BUILD_FROM_SOURCE` | `0` | Set to `1` to build from source instead of downloading a release binary |
 
@@ -116,7 +116,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step — Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks — llama.cpp (your own GGUF and server URL) and Ollama (your own model tag) — for bringing a model you already have. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (your own model tag), for bringing a model you already have. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
@@ -144,7 +144,7 @@ Type a task in natural language:
 
 Wizard reads files, applies changes, runs tests, and shows git diffs.
 
-**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol — Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing.
+**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol. Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing.
 
 ## Configuration
 
@@ -210,7 +210,7 @@ To switch an existing install to llama.cpp, add a provider from the TUI and poin
 /provider use local-llamacpp
 ```
 
-Then set `gguf_path` on that provider in `~/.wizard/config.toml` so Wizard can start the server for you. Or simply re-run onboarding: `wizard --onboard`.
+Then set `gguf_path` on that provider in `~/.wizard/config.toml` so Wizard can start the server for you. Or re-run onboarding: `wizard --onboard`.
 
 ## Using Ollama instead
 
@@ -234,7 +234,7 @@ The same thing is scriptable with explicit arguments:
 /provider use openai
 ```
 
-With `/provider add`, the last argument names the environment variable holding your API key (export it before launching, `export OPENAI_API_KEY=sk-...`); the key itself is never written to disk. The interactive menu instead stores the key in `~/.wizard/credentials.toml`. Onboarding offers the same choices interactively — the default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
+With `/provider add`, the last argument names the environment variable holding your API key (export it before launching, `export OPENAI_API_KEY=sk-...`); the key itself is never written to disk. The interactive menu instead stores the key in `~/.wizard/credentials.toml`. Onboarding offers the same choices interactively. The default install puts down no local stack, so picking a cloud provider on first run is all there is to it.
 
 ### Using OpenRouter
 
@@ -251,7 +251,7 @@ OpenRouter serves hundreds of hosted models behind one OpenAI-compatible endpoin
 
 [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/) serves open models (GLM, Llama, Qwen, …) on serverless GPUs behind an account-scoped OpenAI-compatible endpoint. It needs two things: your **account id** (Cloudflare dashboard → Workers AI, or `wrangler whoami`) and an **API token** with the Workers AI permission. The default model is **GLM 5.2** (`@cf/zai-org/glm-5.2`).
 
-The interactive `/provider` menu is the easiest path — pick **Cloudflare Workers AI — API token**, paste the account id (folded into the endpoint URL) then the token (stored in `~/.wizard/credentials.toml`). Scripted, the account id goes in the base URL:
+The interactive `/provider` menu is the easiest path: pick **Cloudflare Workers AI (API token)**, paste the account id (folded into the endpoint URL) then the token (stored in `~/.wizard/credentials.toml`). Scripted, the account id goes in the base URL:
 
 ```
 export CLOUDFLARE_API_TOKEN=...
@@ -263,13 +263,13 @@ Any `@cf/...` text-generation tag works in place of the model (see [the catalog]
 
 ### Signing in with an xAI account
 
-You can use xAI without an API key by signing in with your xAI account (OAuth 2.0 with PKCE). Pick **Add provider… → xAI (Grok) — sign in** from the `/provider` menu, or run it directly:
+You can use xAI without an API key by signing in with your xAI account (OAuth 2.0 with PKCE). Pick **Add provider… → xAI (Grok) sign-in** from the `/provider` menu, or run it directly:
 
 ```bash
 wizard --login xai     # or /login xai from inside the TUI
 ```
 
-Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. On success it adds the `xai-oauth` provider and switches the live agent to it — no `/provider add` needed.
+Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. On success it adds the `xai-oauth` provider and switches the live agent to it; no `/provider add` needed.
 
 Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come back with HTTP 403, use the API-key flavor (`kind = "xai"` with `XAI_API_KEY`) instead.
 
@@ -347,7 +347,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 To change models, download a GGUF into `~/.wizard/models/` (Hugging Face hosts Q4_K_M quants of most open models), update `model` and `gguf_path` in `~/.wizard/config.toml`, then `/server stop` and `/server start` (or restart Wizard).
 
-To install a specific release via the installer instead — or to roll back after an update — pin the tag:
+To install a specific release via the installer instead, or to roll back after an update, pin the tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_VERSION=v0.4.0 bash
@@ -370,7 +370,7 @@ rm -f ~/.local/bin/wizard ~/.local/bin/wizard.prev ~/.local/bin/llama-server
 rm -rf ~/.wizard/bin ~/.wizard/models ~/.wizard/llama.cpp
 ```
 
-Removing the rest of `~/.wizard/` (config, credentials, sessions, loadout, evolution log) is optional — delete the whole directory with `rm -rf ~/.wizard` for a clean slate. If the installer set up Ollama (`WIZARD_USE_OLLAMA=1` / `WIZARD_BYOM=1`), that is a separate program; uninstall it per Ollama's own docs.
+Removing the rest of `~/.wizard/` (config, credentials, sessions, loadout, evolution log) is optional: delete the whole directory with `rm -rf ~/.wizard` for a clean slate. If the installer set up Ollama (`WIZARD_USE_OLLAMA=1` / `WIZARD_BYOM=1`), that is a separate program; uninstall it per Ollama's own docs.
 
 ## Troubleshooting
 

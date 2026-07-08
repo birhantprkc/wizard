@@ -53,8 +53,8 @@ Everything lives project-locally:
    wizard bench remove fix-auth     # delete a case by id
    ```
 
-3. **Run.** Replay every case — or a subset by `--case` id and/or `--tag`
-   (their union) — against a harness:
+3. **Run.** Replay every case, or a subset by `--case` id and/or `--tag`
+   (their union), against a harness:
 
    ```bash
    wizard bench run --label baseline

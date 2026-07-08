@@ -9,7 +9,7 @@ wizard
 wizard --mode genie
 ```
 
-Genie is the interactive, conversational mode. It is eager and creative ("your wish is my command", hence the name) and acts without asking: it bypasses permissions and executes file writes, shell commands, git commits, and evolutions directly, narrating briefly as it goes.
+Genie is the interactive, conversational mode. It's eager and creative ("your wish is my command", hence the name) and acts without asking: it bypasses permissions and executes file writes, shell commands, git commits, and evolutions directly, narrating briefly as it goes.
 
 ### Behavior
 
@@ -93,10 +93,10 @@ wizard --continuous -p "keep hardening this codebase: tests, docs, performance"
 ```
 
 `--continuous` turns sovereign mode into a perpetual, self-directing agent. Given an
-initial goal, it does not stop when a sub-task completes: it records the cycle,
-re-examines the project, and chooses the next most valuable action. When the mission is
-done it moves on to high-value improvements (tests, docs, robustness) or extends its own
-capabilities via the `evolve` tool. There is no human in the loop; the automated rails
+initial goal, it doesn't stop when a sub-task completes: it records the cycle,
+re-examines the project, and picks the next most valuable action. Once the mission is
+done, it moves on to high-value improvements (tests, docs, hardening) or extends its own
+capabilities via the `evolve` tool. There's no human in the loop, so the automated rails
 below keep it safe.
 
 ### What makes it run forever
@@ -146,18 +146,18 @@ Plan mode is an overlay that works in every mode (genie, sovereign, continuous, 
 
 While plan mode is on:
 
-- Only read-only tools run (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, ...). Every other tool — including `execute`, file writes, scripted/MCP tools, and `spawn_subagent` — returns a "blocked by plan mode" error to the model. These blocks are fed back as ordinary tool errors (not fatal) and are exempt from the circuit breakers.
+- Only read-only tools run (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, ...). Every other tool, including `execute`, file writes, scripted/MCP tools, and `spawn_subagent`, returns a "blocked by plan mode" error to the model. These blocks are fed back as ordinary tool errors (not fatal) and are exempt from the circuit breakers.
 - The one way out is the `exit_plan` tool: the model calls it with the finished plan as markdown. The plan is saved to `<project>/.wizard/plan.md` and presented for a verdict.
 - Approval ends plan mode and the model executes the plan in the same turn. Rejection (with optional feedback) keeps plan mode on; the feedback is fed back so the model can revise and call `exit_plan` again.
 - Before finishing, the model can call the read-only `interview` tool to ask a short batch of clarifying questions (see below) when answers would change the plan.
 
 ### Interview
 
-When the agent has explored enough to understand the shape of the task but still has genuine open questions whose answers would change the plan (scope, trade-offs, ambiguous intent), it calls the `interview` tool with a short batch of questions — each optionally offering suggested answers. In the TUI an interview modal opens: type a free-text answer, or press `1`–`9` to fill in a suggested option (then edit or accept it), `Enter` commits the current answer and advances, `Esc` dismisses the whole interview. The answers are fed back to the model, which folds them into the plan before calling `exit_plan`. Headless runs, the gateway, and the fleet have no interactive user, so the interview is declined automatically and the model proceeds on its best judgment. The tool is read-only, so it works mid-plan without tripping the gate.
+When the agent has explored enough to understand the shape of the task but still has genuine open questions whose answers would change the plan (scope, trade-offs, ambiguous intent), it calls the `interview` tool with a short batch of questions, each optionally offering suggested answers. In the TUI an interview modal opens: type a free-text answer, or press `1`–`9` to fill in a suggested option (then edit or accept it); `Enter` commits the current answer and advances; `Esc` dismisses the whole interview. The answers are fed back to the model, which folds them into the plan before calling `exit_plan`. Headless runs, the gateway, and the fleet have no interactive user, so the interview is declined automatically and the model proceeds on its best judgment. The tool is read-only, so it works mid-plan without tripping the gate.
 
 ### Omakase (chef's choice)
 
-Omakase is the chef's-choice flavor of plan mode, going beyond a simple review gate: the agent still explores read-only, but then it **decides the approach itself and auto-approves its own plan** — no interview, no human review. It is for when you want the result, not the deliberation. The plan it commits to is written to `<project>/.wizard/plan.md` and surfaced (in the TUI as a "chef's choice" card; headless prints it) before execution begins, so the chosen approach is never a black box. Because the agent is told there is no review gate, its `exit_plan` plan is self-justifying: it states the approach picked, the alternatives weighed, and the assumptions made. The `interview` tool declines to ask in omakase — the chef decides.
+Omakase is the chef's-choice flavor of plan mode: it goes beyond a simple review gate. The agent still explores read-only, but then it **decides the approach itself and auto-approves its own plan**, with no interview and no human review. It's for when you want the result, not the deliberation. The plan it commits to is written to `<project>/.wizard/plan.md` and surfaced (in the TUI as a "chef's choice" card; headless prints it) before execution begins, so the chosen approach is never a black box. Because the agent is told there's no review gate, its `exit_plan` plan is self-justifying: it states the approach picked, the alternatives weighed, and the assumptions made. The `interview` tool declines to ask in omakase; the chef decides.
 
 ```
 /omakase       # toggle omakase mode (implies plan mode)
@@ -186,7 +186,7 @@ wizard --mode sovereign --plan -p "refactor the config loader"
 | `omakase = true` (config) | Every session starts in omakase mode (implies `plan_first`) |
 | `plan_each_cycle = true` (config) | Continuous mode re-enters plan mode at the top of every cycle |
 
-With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute — a natural two-phase plan-then-execute turn. (Omakase makes this explicit: the agent always decides for itself, with or without a human present.) The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
+With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute, a natural two-phase plan-then-execute turn. (Omakase makes this explicit: the agent always decides for itself, with or without a human present.) The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
 
 The last presented plan is always available at `<project>/.wizard/plan.md`.
 

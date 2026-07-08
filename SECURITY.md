@@ -23,7 +23,7 @@ Wizard has no per-action confirmation, in either mode (genie or sovereign). Ever
 
 Read-only tools (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`) are always non-destructive.
 
-There is no config key that restores a y/n gate. Earlier releases had an `auto_approve` flag; it was removed, and a config that still carries it loads fine — the key is ignored and never written back.
+There is no config key that restores a y/n gate. Earlier releases had an `auto_approve` flag; it was removed, and a config that still carries it loads fine: the key is ignored and never written back.
 
 **Sovereign mode** adds non-interactive continuous operation on top of this: it completes the task then keeps going, self-directing and self-improving via `evolve` with no human in the loop, persisting a durable mission. A confused or prompt-injected model (in either mode) can run arbitrary commands as you. Only run Wizard on tasks and machines where that is acceptable, and prefer a container or VM for anything you would not run by hand (see "No sandbox" below).
 
@@ -46,7 +46,7 @@ The same applies to scripted tools: they are scripts under `~/.wizard/tools/` th
 
 ## Deep `/evolve` (self-recompilation)
 
-`/evolve --deep` is the unusual one: the agent proposes a diff to Wizard's own Rust source, builds it, and replaces the running binary. There is no approval step — the gates are mechanical, in order:
+`/evolve --deep` is the unusual one: the agent proposes a diff to Wizard's own Rust source, builds it, and replaces the running binary. There is no approval step; the gates are mechanical, in order:
 
 1. **Build.** `cargo build --release` must succeed. On failure, the diff is reverted and the running binary is untouched.
 2. **Smoke test.** The freshly built binary is executed with `--version` and must exit 0 and print a `wizard` version string. On failure, the diff is reverted and the current binary is kept.

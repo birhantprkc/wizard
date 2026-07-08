@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/wizard/<ref>/install.sh | W
 |---------|---------|---------|
 | `WIZARD_REPO` | `teddytennant/wizard` | GitHub repo to install from, as `owner/repo`. |
 | `WIZARD_REF` | `main` | Branch or tag to clone and build. |
-| `WIZARD_BUILD_FROM_SOURCE` | `0` | Set to `1` to build the binary from source rather than downloading a release asset. Fork installers always set this to `1` because forks do not ship prebuilt release binaries unless you cut releases yourself. |
+| `WIZARD_BUILD_FROM_SOURCE` | `0` | Set to `1` to build the binary from source instead of downloading a release asset. Fork installers always set this to `1`, since forks don't ship prebuilt release binaries unless you cut releases yourself. |
 
 The installer clones your fork at `WIZARD_REF`, ensures a Rust toolchain (installs via `rustup --profile minimal` if `cargo` is absent), runs `cargo build --release`, and places the resulting binary. It works on any machine with internet access and a supported OS (currently Linux x86_64/aarch64). Build time is a few minutes the first time.
 
@@ -62,9 +62,7 @@ Tier-1 evolutions (skills, MCP server registrations, scripted tools, subagents) 
 
 ## Gated and logged
 
-Like deep evolve, publish is logged:
-
-Both modes run `/publish` directly — there is no approval gate. Genie narrates the fork target, branch, and source commit as it proceeds; sovereign publishes as part of its unattended flow.
+Publish is logged like deep evolve, and both run `/publish` directly with no approval gate. Genie narrates the fork target, branch, and source commit as it proceeds; sovereign publishes as part of its unattended flow.
 
 Every publication is appended to `~/.wizard/evolution.jsonl` alongside deep-evolve records, with the fork repo, branch, and the short commit SHA that was pushed.
 

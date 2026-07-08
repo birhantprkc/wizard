@@ -17,7 +17,7 @@ inline hints.
 | `/model [tag]` | Show the current model, or switch to `tag` |
 | `/mode [genie\|sovereign]` | Show or switch personality mode (`/genie` and `/sovereign` are shortcuts) |
 | `/plan` | Toggle plan mode (also Shift+Tab): read-only investigation until a plan is approved |
-| `/omakase` | Toggle omakase: chef's-choice plan mode — the agent decides and auto-approves its own plan ([modes.md](modes.md)) |
+| `/omakase` | Toggle omakase: chef's-choice plan mode, the agent decides and auto-approves its own plan ([modes.md](modes.md)) |
 | `/evolve [--deep] <desc>` | Self-extend: add a skill, MCP server, scripted tool, or subagent; `--deep` rebuilds the binary ([evolve.md](evolve.md)) |
 | `/reload` | Reload skills, scripted tools, and MCP servers without a restart |
 | `/rewind [turn]` | Restore file checkpoints and truncate history; no argument opens the turn picker ([checkpoints.md](checkpoints.md)) |
@@ -25,7 +25,7 @@ inline hints.
 | `/compact` | Summarize older history into a progress note now, instead of waiting for the automatic threshold |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
 | `/subagents` | Toggle the in-session subagent monitor: every subagent run this session, with live status |
-| `/dashboard` | Toggle the machine-wide session manager — same view as `wizard agents` (below) |
+| `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
 | `/goal [text]` | Show or set the standing mission goal (drives sovereign/continuous mode; persists to `.wizard/mission.toml`) |
 | `/diff` | Toggle the git diff sidebar |
@@ -33,7 +33,7 @@ inline hints.
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
 | `/memory` | Show the saved project memories |
 | `/status` | Session status: model, provider, mode, session id, usage, todo progress, background tasks |
-| `/doctor` | Environment diagnostics — same checks as `wizard doctor` ([doctor.md](doctor.md)) |
+| `/doctor` | Environment diagnostics, same checks as `wizard doctor` ([doctor.md](doctor.md)) |
 | `/provider …` | Add, remove, or switch LLM providers; no arguments opens the interactive menu |
 | `/fusion [config]` | Toggle model fusion, or configure the panel ([fusion.md](fusion.md)) |
 | `/server [status\|start\|stop]` | Manage the local llama-server |
@@ -43,13 +43,13 @@ inline hints.
 | `/vim` | Toggle modal (vim-style) editing of the input composer |
 | `/quit` | Exit (`/q` and `/exit` work too) |
 
-Your own commands — markdown files that expand into prompts — sit alongside
+Your own commands (markdown files that expand into prompts) sit alongside
 these; see [commands.md](commands.md), which also covers `@path` file
 references.
 
 ## `wizard agents` and background subagents
 
-`wizard agents` opens the agent dashboard from the shell — the same view as
+`wizard agents` opens the agent dashboard from the shell, the same view as
 `/dashboard` inside a session. Every running Wizard session heartbeats a
 record to `~/.wizard/running/`, so the dashboard lists every live session on
 the machine, grouped by state (working / needs input / idle / completed /
@@ -76,7 +76,7 @@ on its final stream chunk.
 - **TUI**: the status bar shows a compact session total (`12.3k tok`);
   `/cost` prints the full prompt/completion breakdown.
 - **Headless**: the final summary line includes the run's totals:
-  `[run finished: Completed — 1234 prompt + 567 completion tokens]`.
+  `[run finished: Completed (1234 prompt + 567 completion tokens)]`.
 - **Log**: every turn appends one JSON line to `~/.wizard/usage.jsonl`:
 
   ```json
@@ -123,14 +123,14 @@ the plan gate, so the agent can draft its list while planning.
 
 - **TUI**: a side panel mirrors the list (`/todos` toggles it; it auto-shows
   on the first update).
-- **Headless**: each update prints `≡ todo: 2/5 done — current: <item>`.
+- **Headless**: each update prints `≡ todo: 2/5 done (current: <item>)`.
 - **Subagents** get the tool too, with their own isolated list.
 
 ## Project instructions hierarchy
 
 The system prompt's project-instructions section is assembled from every
-directory between the filesystem root and the project root — in each
-directory the first of `WIZARD.md` > `AGENTS.md` > `CLAUDE.md` wins — plus
+directory between the filesystem root and the project root. In each
+directory the first of `WIZARD.md` > `AGENTS.md` > `CLAUDE.md` wins, plus
 the global `~/.wizard/WIZARD.md`. Files are concatenated outermost-first
 (the project root's file has the last word), each prefixed with a comment
 naming its path.

@@ -20,15 +20,15 @@ Diagnoses the environment and prints one line per check:
 
 Checks:
 
-- **config** — `~/.wizard/config.toml` parses (missing file is fine: defaults apply)
-- **provider \<name\>** — each configured LLM provider answers its health probe; skipped (`–`) when its API key env var is unset
-- **mcp \<name\>** — each `[[server]]` in `~/.wizard/mcp.toml` spawns and completes the MCP handshake (with tool count)
-- **native tools** — the compiled-in tool set is registered
-- **hooks** — global and project `hooks.toml` parse
-- **writable** — `~/.wizard`, the project's `.wizard/`, and the sessions dir accept writes
-- **checkpoints** — the snapshot index parses; stale snapshot directories are counted
+- **config**: `~/.wizard/config.toml` parses (missing file is fine: defaults apply)
+- **provider \<name\>**: each configured LLM provider answers its health probe; skipped (`–`) when its API key env var is unset
+- **mcp \<name\>**: each `[[server]]` in `~/.wizard/mcp.toml` spawns and completes the MCP handshake (with tool count)
+- **native tools**: the compiled-in tool set is registered
+- **hooks**: global and project `hooks.toml` parse
+- **writable**: `~/.wizard`, the project's `.wizard/`, and the sessions dir accept writes
+- **checkpoints**: the snapshot index parses; stale snapshot directories are counted
 
-Every network probe is capped at 5 seconds, so doctor never hangs. Exit code: 0 when no check failed (`–` skips are not failures), 1 otherwise — usable as a preflight in scripts:
+Every network probe is capped at 5 seconds, so doctor never hangs. Exit code: 0 when no check failed (`–` skips are not failures), 1 otherwise. Use it as a preflight in scripts:
 
 ```sh
 wizard doctor && wizard --mode sovereign -p "task"

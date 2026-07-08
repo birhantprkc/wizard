@@ -40,7 +40,7 @@ One JSON object per line (JSONL) as events arrive, always terminated by a `done`
 
 Other line types you may see: `thinking_delta`, `todo`, `task_finished`, `plan` (auto-approved, with the plan text), `hook`, and `error`. `turn_done` closes each agent turn; the final `done` line carries the run outcome and total usage.
 
-In both structured formats the spinner and decorative headers are suppressed — stdout is pure JSON; diagnostics go to stderr.
+In both structured formats the spinner and decorative headers are suppressed: stdout is pure JSON, diagnostics go to stderr.
 
 ## Exit codes
 
