@@ -32,25 +32,6 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 
 ---
 
-## How it compares
-
-Verified against each tool's documentation as of June 2026:
-
-| | **Wizard** | **aider** | **goose** (Block / AAIF) | **opencode** |
-|---|---|---|---|---|
-| Providers | Any OpenAI-compatible endpoint + OpenRouter + Cloudflare Workers AI + Anthropic + xAI (API key or account sign-in), switchable at runtime via `/provider`; local llama.cpp with Wizard managing `llama-server` itself; Ollama | Ollama + any OpenAI-compatible endpoint; top results come from cloud models | 15+ providers incl. Ollama | 75+ providers incl. Ollama |
-| MCP | Yes: stdio + HTTP, registerable at runtime via `/evolve` | No native support (open RFC) | Yes: one of the earliest and deepest integrations, 70+ documented extensions | Yes: local + remote servers, OAuth for remote |
-| Self-extension | Tiered `/evolve`, up to and including rebuilding its own binary (gated + rollback) | None | Extensions and recipes via MCP | TypeScript/JS plugin system |
-| Interface | Ratatui TUI | Terminal chat CLI | CLI + native desktop app (macOS/Linux/Windows) | Polished TUI |
-| Language | Rust | Python | Rust (TS desktop app) | TypeScript |
-| License | MIT | Apache-2.0 | Apache-2.0 | MIT |
-
-aider's git workflow (clean auto-commits per change) is still the reference; goose has the broadest MCP ecosystem and is now vendor-neutral under the Linux Foundation's Agentic AI Foundation; opencode has the widest provider support and a polished TUI.
-
-Wizard's bet is narrower: one binary, any model you choose, an onboarding that starts from your choices rather than someone's defaults, and an agent that grows its own capabilities through audited, reversible steps.
-
----
-
 ## Limitations
 
 - **Platforms.** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel). Windows isn't supported; run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet.
