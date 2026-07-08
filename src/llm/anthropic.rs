@@ -49,7 +49,7 @@ impl AnthropicProvider {
         api_key: impl Into<String>,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let http = reqwest::Client::builder().build().unwrap_or_default();
+        let http = crate::llm::cloud_http_builder().build().unwrap_or_default();
         Self {
             http,
             base_url,

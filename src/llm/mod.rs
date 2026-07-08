@@ -22,6 +22,24 @@ use serde::{Deserialize, Serialize};
 /// Shared across [`llamacpp`], [`ollama`], [`openai`], and [`anthropic`].
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
+/// HTTP client builder for the cloud chat backends. A generation can
+/// legitimately stream for many minutes, so there is no overall request
+/// timeout; instead the client fails fast when it can't connect, errors out
+/// of a stream that has gone completely silent (a live SSE stream never goes
+/// minutes without a frame — even keep-alive comments count as reads), and
+/// keepalive-probes idle connections so a dead peer is noticed. A stream
+/// read that times out surfaces as a transient error, which the agent's
+/// backoff-retry loop picks up — instead of the turn hanging forever on a
+/// stalled connection. Local backends (llama.cpp, Ollama) keep their own
+/// clients: a big model can silently prefill for a long time on weak
+/// hardware, which this would misread as a stall.
+pub(crate) fn cloud_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+}
+
 /// Typed error returned by every HTTP-based provider adapter for failed
 /// responses and transport failures. Always reachable from the `anyhow`
 /// chain via `err.downcast_ref::<ProviderError>()`, so the agent loop can

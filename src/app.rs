@@ -3637,6 +3637,12 @@ impl App {
                 self.flush_streaming();
                 self.notice(format!("error: {message}"));
             }
+            AgentEvent::StreamRetrying => {
+                // The partial completion is being re-generated from scratch;
+                // flushing it would double the text once the retry streams.
+                self.streaming.clear();
+                self.streaming_thinking.clear();
+            }
             AgentEvent::HookFired {
                 event,
                 command,
@@ -7570,6 +7576,31 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn stream_retry_discards_the_partial_streamed_text() {
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::TextDelta("half an ans".to_string()));
+        app.handle_agent_event(AgentEvent::StreamRetrying);
+        app.handle_agent_event(AgentEvent::Error(
+            "LLM unavailable (stream stalled); sleeping 5s then retrying (attempt 1)".to_string(),
+        ));
+        assert!(
+            app.streaming.is_empty(),
+            "the doomed attempt's partial text is dropped, not flushed"
+        );
+        assert!(
+            !app
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant(text) if text.contains("half an ans"))),
+            "no assistant entry made of the discarded partial"
+        );
+
+        // The retry streams the full answer; only that lands.
+        app.handle_agent_event(AgentEvent::TextDelta("the full answer".to_string()));
+        assert_eq!(app.streaming, "the full answer");
     }
 
     #[test]

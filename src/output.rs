@@ -117,6 +117,12 @@ impl EventSink for TextSink {
             AgentEvent::StepCompleted { step } => {
                 tracing::debug!("step {step} completed");
             }
+            AgentEvent::StreamRetrying => {
+                // Text already printed can't be unprinted; mark the cut so
+                // the re-generated response below isn't read as a duplicate.
+                self.spinner.hide();
+                println!("\x1b[2m\n… stream interrupted — the response restarts below …\x1b[0m");
+            }
             AgentEvent::Error(message) => {
                 self.spinner.hide();
                 eprintln!("\nwizard error: {message}");
@@ -231,6 +237,9 @@ struct ToolCallsEntry {
 pub struct JsonSink<W: Write + Send> {
     out: W,
     result: String,
+    /// Length of `result` at the last completed step — the truncation point
+    /// when a mid-stream retry discards the current attempt's partial text.
+    committed: usize,
     turns: u64,
     steps: u64,
     prompt_tokens: u64,
@@ -250,6 +259,7 @@ impl<W: Write + Send> JsonSink<W> {
         Self {
             out,
             result: String::new(),
+            committed: 0,
             turns: 0,
             steps: 0,
             prompt_tokens: 0,
@@ -281,8 +291,16 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                     entry.errors += 1;
                 }
             }
-            AgentEvent::StepCompleted { .. } => self.steps += 1,
+            AgentEvent::StepCompleted { .. } => {
+                self.steps += 1;
+                self.committed = self.result.len();
+            }
             AgentEvent::Error(message) => self.errors.push(message),
+            AgentEvent::StreamRetrying => {
+                // The attempt's partial text never entered history; the retry
+                // re-streams it, so keeping it would double the text.
+                self.result.truncate(self.committed);
+            }
             AgentEvent::PlanReady { respond, .. } => {
                 // No human in the loop: approve so the turn executes.
                 let _ = respond.send(PlanVerdict::approve());
@@ -391,6 +409,9 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
             }
             AgentEvent::Error(message) => {
                 self.emit(json!({"type": "error", "message": message}));
+            }
+            AgentEvent::StreamRetrying => {
+                self.emit(json!({"type": "stream_retrying"}));
             }
             AgentEvent::HookFired {
                 event,
@@ -609,6 +630,22 @@ pub(crate) mod tests {
         assert_eq!(value["tool_calls"][0]["calls"], 2);
         assert_eq!(value["tool_calls"][0]["errors"], 1);
         assert_eq!(value["errors"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn json_sink_drops_a_retried_attempts_partial_text() {
+        let buf = SharedBuf::default();
+        let mut sink = JsonSink::new(buf.clone());
+        sink.event(AgentEvent::TextDelta("looked around. ".to_string()));
+        sink.event(AgentEvent::StepCompleted { step: 1 });
+        // A second completion streams half an answer, dies, and is retried.
+        sink.event(AgentEvent::TextDelta("the ans".to_string()));
+        sink.event(AgentEvent::StreamRetrying);
+        sink.event(AgentEvent::TextDelta("the answer is 42".to_string()));
+        sink.finish(DoneReason::Completed);
+        let value: serde_json::Value =
+            serde_json::from_str(buf.contents().trim()).expect("valid JSON");
+        assert_eq!(value["result"], "looked around. the answer is 42");
     }
 
     #[test]
