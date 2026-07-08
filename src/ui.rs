@@ -518,7 +518,7 @@ fn tool_label(name: &str, args: &serde_json::Value) -> (String, String) {
 
 /// Render one tool invocation as a compact single-line card: status glyph,
 /// tool name in accent, truncated args in dim. Output expands below only
-/// when relevant (errors, or Ctrl-T).
+/// when relevant (short successful outputs, or Ctrl-T).
 fn tool_card_lines(
     lines: &mut Vec<Line<'static>>,
     name: &str,
