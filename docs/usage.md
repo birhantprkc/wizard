@@ -16,6 +16,7 @@ inline hints.
 | `/clear` | Clear the conversation |
 | `/model [tag]` | Show the current model, or switch to `tag` |
 | `/mode [genie\|sovereign]` | Show or switch personality mode (`/genie` and `/sovereign` are shortcuts) |
+| `/effort [low\|medium\|high\|default]` | Set reasoning effort for models that support it (xAI Grok 4.x, OpenAI o-series/gpt-5); no argument opens the picker, `default` clears to the provider default |
 | `/plan` | Toggle plan mode (also Shift+Tab): read-only investigation until a plan is approved |
 | `/omakase` | Toggle omakase: chef's-choice plan mode, the agent decides and auto-approves its own plan ([modes.md](modes.md)) |
 | `/evolve [--deep] <desc>` | Self-extend: add a skill, MCP server, scripted tool, or subagent; `--deep` rebuilds the binary ([evolve.md](evolve.md)) |

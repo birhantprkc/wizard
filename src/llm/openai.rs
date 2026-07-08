@@ -230,8 +230,26 @@ impl OpenAiProvider {
         {
             body["temperature"] = json!(temperature);
         }
+        if let Some(options) = &request.options
+            && let Some(effort) = &options.reasoning_effort
+            && supports_reasoning_effort(&request.model)
+        {
+            body["reasoning_effort"] = json!(effort);
+        }
         body
     }
+}
+
+/// Models that accept a `reasoning_effort` request field: xAI Grok 4.x and
+/// OpenAI's reasoning families (o-series, gpt-5). Anything else 400s on it, so
+/// it is sent only for these. Mirrors the families in [`context_window`].
+fn supports_reasoning_effort(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("grok-4")
+        || model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
 }
 
 /// OpenAI reasoning models (o-series, gpt-5 family) reject any non-default
@@ -754,6 +772,7 @@ mod tests {
             options: Some(ChatOptions {
                 temperature: Some(0.7),
                 num_ctx: None,
+                reasoning_effort: None,
             }),
         };
 
@@ -799,6 +818,7 @@ mod tests {
         let options = Some(ChatOptions {
             temperature: Some(0.2),
             num_ctx: None,
+            reasoning_effort: None,
         });
         for model in ["gpt-5", "gpt-5-mini", "o1", "o3-mini", "o4-mini", "O3"] {
             let request = ChatRequest {
@@ -824,6 +844,59 @@ mod tests {
         };
         let body = provider().build_request_body(&request);
         assert!(body.get("temperature").is_some());
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_for_supporting_models() {
+        let options = Some(ChatOptions {
+            temperature: Some(0.7),
+            num_ctx: None,
+            reasoning_effort: Some("high".to_string()),
+        });
+        // Forwarded for xAI Grok 4.x and OpenAI reasoning families.
+        for model in ["grok-4.5", "grok-4.3", "gpt-5", "o3-mini", "o4-mini"] {
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: Vec::new(),
+                stream: true,
+                options: options.clone(),
+            };
+            let body = provider().build_request_body(&request);
+            assert_eq!(
+                body["reasoning_effort"], "high",
+                "{model} must receive reasoning_effort"
+            );
+        }
+        // Omitted for models that would 400 on it.
+        for model in ["gpt-4o", "grok-code-fast-1", "grok-3", "qwen3-8b"] {
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: Vec::new(),
+                stream: true,
+                options: options.clone(),
+            };
+            let body = provider().build_request_body(&request);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{model} must not receive reasoning_effort"
+            );
+        }
+        // Absent when unset, even on a supporting model.
+        let request = ChatRequest {
+            model: "grok-4.5".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            stream: true,
+            options: Some(ChatOptions {
+                temperature: Some(0.7),
+                num_ctx: None,
+                reasoning_effort: None,
+            }),
+        };
+        let body = provider().build_request_body(&request);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

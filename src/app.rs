@@ -23,7 +23,7 @@ use crate::agent::{
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
-use crate::config::{Config, Mode, ProviderConfig, ProviderKind};
+use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
@@ -129,6 +129,10 @@ pub enum SlashCommand {
     Model(Option<String>),
     /// `/mode [genie|sovereign]` — show or switch mode.
     Mode(Option<Mode>),
+    /// `/effort [low|medium|high|default]` — set the reasoning effort sent to
+    /// models that support it. `None` opens the picker; `Some(None)` clears
+    /// back to the provider default; `Some(Some(e))` sets the level.
+    Effort(Option<Option<ReasoningEffort>>),
     /// `/evolve [--deep] <description>`.
     Evolve {
         deep: bool,
@@ -439,6 +443,16 @@ impl SlashCommand {
             },
             "genie" => Ok(Self::Mode(Some(Mode::Genie))),
             "sovereign" => Ok(Self::Mode(Some(Mode::Sovereign))),
+            "effort" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                None => Ok(Self::Effort(None)),
+                Some("low") => Ok(Self::Effort(Some(Some(ReasoningEffort::Low)))),
+                Some("medium") | Some("med") => Ok(Self::Effort(Some(Some(ReasoningEffort::Medium)))),
+                Some("high") => Ok(Self::Effort(Some(Some(ReasoningEffort::High)))),
+                Some("default") | Some("off") | Some("none") => Ok(Self::Effort(Some(None))),
+                Some(other) => Err(format!(
+                    "unknown effort '{other}' (low|medium|high|default)"
+                )),
+            },
             "evolve" => {
                 let deep = args.first() == Some(&"--deep");
                 let description = if deep { &args[1..] } else { &args[..] }.join(" ");
@@ -540,6 +554,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "sovereign",
         args: "",
         description: "switch to sovereign mode",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "effort",
+        args: "[low|medium|high|default]",
+        description: "set reasoning effort (Grok 4.x, OpenAI o-series / gpt-5)",
         takes_args: false,
     },
     CommandSpec {
@@ -773,6 +793,8 @@ fn is_builtin_command(name: &str) -> bool {
 pub enum PickerKind {
     Model,
     Mode,
+    /// Reasoning-effort level (item values are `low`/`medium`/`high`/`default`).
+    Effort,
     /// A turn to rewind to (item values are turn ids).
     Rewind,
     /// A past session to resume (item values are session ids).
@@ -2790,6 +2812,15 @@ impl App {
                             };
                             AppAction::Command(SlashCommand::Mode(Some(mode)))
                         }
+                        PickerKind::Effort => {
+                            let effort = match item.value.as_str() {
+                                "low" => Some(ReasoningEffort::Low),
+                                "medium" => Some(ReasoningEffort::Medium),
+                                "high" => Some(ReasoningEffort::High),
+                                _ => None,
+                            };
+                            AppAction::Command(SlashCommand::Effort(Some(effort)))
+                        }
                         PickerKind::Rewind => {
                             // Item values are always turn ids we formatted.
                             let Ok(turn) = item.value.parse::<u64>() else {
@@ -4076,6 +4107,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /model [tag]                pick a model interactively, or switch directly\n  \
 /mode [genie|sovereign]     pick or switch personality mode\n  \
 /genie · /sovereign         switch mode directly\n  \
+/effort [low|med|high]      set reasoning effort (Grok 4.x, OpenAI o-series/gpt-5)\n  \
 /plan                       toggle plan mode (read-only until a plan is approved)\n  \
 /omakase                    toggle omakase: chef's-choice plan mode, the agent decides\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
@@ -4856,6 +4888,8 @@ impl CommandContext<'_> {
             SlashCommand::Model(Some(tag)) => self.switch_model(tag),
             SlashCommand::Mode(None) => self.open_mode_picker(),
             SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
+            SlashCommand::Effort(None) => self.open_effort_picker(),
+            SlashCommand::Effort(Some(effort)) => self.set_effort(effort),
             SlashCommand::Plan => self.toggle_plan(),
             SlashCommand::Omakase => self.toggle_omakase(),
             SlashCommand::Rewind(None) => self.open_rewind_picker(),
@@ -5006,8 +5040,14 @@ impl CommandContext<'_> {
     /// session id, usage, todo progress, background tasks, plan mode.
     fn status(&mut self) {
         let provider = self.app.config.active();
+        let effort = self
+            .app
+            .config
+            .reasoning_effort
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "default".to_string());
         let mut text = format!(
-            "model: {}\nprovider: {} ({:?} @ {})\nmode: {}",
+            "model: {}\nprovider: {} ({:?} @ {})\nmode: {}\neffort: {effort}",
             self.app.status.model, provider.name, provider.kind, provider.base_url, self.app.mode,
         );
         match self.agent_slot.as_ref() {
@@ -5513,6 +5553,55 @@ impl CommandContext<'_> {
         // Persist so the mode survives a restart (consistent with /provider).
         self.persist_config();
         self.app.notice(format!("switched to {mode} mode"));
+    }
+
+    /// Open the interactive reasoning-effort picker (`/effort`).
+    fn open_effort_picker(&mut self) {
+        if self.agent_unavailable("change effort") {
+            return;
+        }
+        let current = self.app.config.reasoning_effort;
+        let rows = [
+            ("high", "most reasoning — slowest, best on hard tasks", Some(ReasoningEffort::High)),
+            ("medium", "balanced reasoning", Some(ReasoningEffort::Medium)),
+            ("low", "least reasoning — fastest, cheapest", Some(ReasoningEffort::Low)),
+            ("default", "leave the provider default (e.g. Grok 4.5 → high)", None),
+        ];
+        let items: Vec<PickerItem> = rows
+            .iter()
+            .map(|(value, detail, effort)| PickerItem {
+                value: (*value).to_string(),
+                detail: (*detail).to_string(),
+                current: *effort == current,
+            })
+            .collect();
+        let selected = items.iter().position(|item| item.current).unwrap_or(0);
+        self.app.picker = Some(Picker {
+            kind: PickerKind::Effort,
+            title: " reasoning effort ".to_string(),
+            items,
+            selected,
+        });
+    }
+
+    /// Set the reasoning effort (`/effort <level>`): applies to the live agent
+    /// and persists so it survives a restart. Only reaches providers whose
+    /// models accept a `reasoning_effort` field; others ignore it.
+    fn set_effort(&mut self, effort: Option<ReasoningEffort>) {
+        if self.agent_unavailable("change effort") {
+            return;
+        }
+        if let Some(agent) = self.agent_slot.as_mut() {
+            agent.set_reasoning_effort(effort);
+        }
+        self.app.config.reasoning_effort = effort;
+        self.persist_config();
+        match effort {
+            Some(effort) => self.app.notice(format!("reasoning effort: {effort}")),
+            None => self
+                .app
+                .notice("reasoning effort: provider default".to_string()),
+        }
     }
 
     async fn reload(&mut self) {
@@ -6693,6 +6782,33 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/sovereign"),
             Some(Ok(SlashCommand::Mode(Some(Mode::Sovereign))))
+        );
+    }
+
+    #[test]
+    fn effort_parses_levels_default_and_bare() {
+        assert_eq!(
+            SlashCommand::parse("/effort"),
+            Some(Ok(SlashCommand::Effort(None))),
+            "bare /effort opens the picker"
+        );
+        assert_eq!(
+            SlashCommand::parse("/effort low"),
+            Some(Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::Low)))))
+        );
+        assert_eq!(
+            SlashCommand::parse("/effort HIGH"),
+            Some(Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::High))))),
+            "level is case-insensitive"
+        );
+        assert_eq!(
+            SlashCommand::parse("/effort default"),
+            Some(Ok(SlashCommand::Effort(Some(None)))),
+            "default clears back to the provider default"
+        );
+        assert!(
+            matches!(SlashCommand::parse("/effort turbo"), Some(Err(_))),
+            "unknown level is an error"
         );
     }
 

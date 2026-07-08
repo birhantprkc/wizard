@@ -955,6 +955,7 @@ impl Evolver {
                 // Low temperature: we want a parseable artifact, not prose.
                 temperature: Some(0.3),
                 num_ctx: None,
+                reasoning_effort: None,
             }),
         };
         let mut stream = client.chat_stream(request).await?;

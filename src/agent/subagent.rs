@@ -289,6 +289,9 @@ pub async fn spawn(
             options: Some(ChatOptions {
                 temperature: Some(Mode::Sovereign.temperature()),
                 num_ctx: None,
+                reasoning_effort: loaded
+                    .reasoning_effort
+                    .map(|effort| effort.as_str().to_string()),
             }),
         };
 

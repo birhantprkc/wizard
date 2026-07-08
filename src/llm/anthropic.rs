@@ -593,6 +593,7 @@ mod tests {
             options: Some(crate::llm::ChatOptions {
                 temperature: Some(0.5),
                 num_ctx: None,
+                reasoning_effort: None,
             }),
         };
 

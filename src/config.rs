@@ -61,6 +61,36 @@ impl fmt::Display for Mode {
     }
 }
 
+/// Reasoning effort forwarded as the `reasoning_effort` request field to models
+/// that expose the knob (xAI Grok 4.x, OpenAI's o-series and gpt-5). Providers
+/// without one ignore it. `None` in [`Config`] leaves the provider default
+/// (Grok 4.5, for one, defaults to high).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// Wire value sent as the `reasoning_effort` request field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which backend a [`ProviderConfig`] talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -535,6 +565,11 @@ pub struct Config {
     pub gguf_path: Option<String>,
     /// Default personality mode.
     pub mode: Mode,
+    /// Reasoning effort forwarded to models that support a `reasoning_effort`
+    /// request field (xAI Grok 4.x, OpenAI o-series / gpt-5); set with
+    /// `/effort`. `None` leaves the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Agent loop limit per turn (genie). Sovereign uses its own default
     /// unless this is explicitly raised above it.
     pub max_steps: u32,
@@ -616,6 +651,7 @@ impl Default for Config {
             llamacpp_host: DEFAULT_LLAMACPP_HOST.to_string(),
             gguf_path: None,
             mode: Mode::Genie,
+            reasoning_effort: None,
             max_steps: 25,
             continuous: false,
             plan_first: false,
@@ -1117,6 +1153,7 @@ mod tests {
             llamacpp_host: "http://10.0.0.5:8080".to_string(),
             gguf_path: Some("/models/qwen3-8b-q4_k_m.gguf".to_string()),
             mode: Mode::Sovereign,
+            reasoning_effort: Some(ReasoningEffort::High),
             max_steps: 200,
             continuous: true,
             plan_first: true,
@@ -1177,6 +1214,7 @@ mod tests {
         assert_eq!(parsed.llamacpp_host, original.llamacpp_host);
         assert_eq!(parsed.gguf_path, original.gguf_path);
         assert_eq!(parsed.mode, original.mode);
+        assert_eq!(parsed.reasoning_effort, original.reasoning_effort);
         assert_eq!(parsed.max_steps, original.max_steps);
         assert_eq!(parsed.continuous, original.continuous);
         assert_eq!(parsed.plan_first, original.plan_first);

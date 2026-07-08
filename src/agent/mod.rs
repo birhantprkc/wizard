@@ -633,6 +633,13 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
+    /// Set the reasoning effort (`/effort`) forwarded on subsequent turns.
+    /// `None` leaves the provider default. Only reaches models that accept a
+    /// `reasoning_effort` request field; others ignore it.
+    pub fn set_reasoning_effort(&mut self, effort: Option<crate::config::ReasoningEffort>) {
+        self.config.reasoning_effort = effort;
+    }
+
     /// Conversation history (system prompt included).
     pub fn history(&self) -> &[ChatMessage] {
         &self.history
@@ -1186,6 +1193,10 @@ impl Agent {
             options: Some(ChatOptions {
                 temperature: Some(self.mode.temperature()),
                 num_ctx: None,
+                reasoning_effort: self
+                    .config
+                    .reasoning_effort
+                    .map(|effort| effort.as_str().to_string()),
             }),
         };
 
@@ -1467,6 +1478,9 @@ impl Agent {
             options: Some(ChatOptions {
                 temperature: Some(0.2),
                 num_ctx: None,
+                // Internal summarization stays at the provider default; the
+                // user's `/effort` applies to real turns, not compaction.
+                reasoning_effort: None,
             }),
         };
 

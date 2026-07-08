@@ -191,6 +191,12 @@ pub struct ChatOptions {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+    /// Reasoning effort (`"low"`/`"medium"`/`"high"`) for models that accept a
+    /// `reasoning_effort` request field. Carried as a string so this module
+    /// stays decoupled from [`crate::config::ReasoningEffort`]; the
+    /// OpenAI-compatible client forwards it only for supporting models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Request body for `POST /api/chat`.
@@ -251,6 +257,7 @@ mod tests {
             options: Some(ChatOptions {
                 temperature: Some(0.8),
                 num_ctx: None,
+                reasoning_effort: None,
             }),
         };
 
