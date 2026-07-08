@@ -59,6 +59,13 @@ pub enum TranscriptEntry {
     Notice(String),
 }
 
+/// Whether a finished tool's output is long enough to start collapsed: more
+/// than six source lines, or a payload that would wrap well past that (one
+/// giant minified line counts as 1 by `lines()` but fills the screen anyway).
+fn collapse_long(content: &str) -> bool {
+    content.lines().count() > 6 || content.chars().count() > 600
+}
+
 /// Outcome of a background agent rebuild (model switch, crash recovery),
 /// delivered to the main loop via [`Event::AgentRebuilt`].
 pub struct AgentRebuild {
@@ -1070,6 +1077,11 @@ pub struct App {
     /// Active or just-completed mouse text selection, if any. Drives the
     /// highlight overlay and clipboard copy.
     pub selection: Option<Selection>,
+    /// Screen rows of tool-card header lines visible in the last-drawn frame,
+    /// as `(row, transcript index)` — the click-to-toggle hit map. Rebuilt by
+    /// [`crate::ui::draw`] every frame (hence the interior mutability: draw
+    /// takes `&App`) and emptied while an overlay covers the transcript.
+    pub card_hits: std::cell::RefCell<Vec<(u16, usize)>>,
     pub should_quit: bool,
     /// Tick counter driving the busy spinner.
     pub tick: u64,
@@ -1212,6 +1224,7 @@ impl App {
             peek_lines: Vec::new(),
             scroll: 0,
             selection: None,
+            card_hits: std::cell::RefCell::new(Vec::new()),
             should_quit: false,
             tick: 0,
             suggestions: Vec::new(),
@@ -2590,6 +2603,27 @@ impl App {
         }
     }
 
+    /// Toggle the tool card whose header line was drawn on screen row `row`
+    /// in the last frame (a plain click on it). No-op off-card, on a
+    /// still-running card, or while an overlay covers the transcript (the
+    /// hit map is empty then — see `card_hits`).
+    fn toggle_card_at(&mut self, row: u16) {
+        let hit = self
+            .card_hits
+            .borrow()
+            .iter()
+            .find(|(y, _)| *y == row)
+            .map(|(_, index)| *index);
+        if let Some(index) = hit
+            && let Some(TranscriptEntry::ToolCard {
+                output, collapsed, ..
+            }) = self.transcript.get_mut(index)
+            && output.is_some()
+        {
+            *collapsed = !*collapsed;
+        }
+    }
+
     /// Dispatch one event from the merged stream. Returns the user action
     /// the main loop must perform (start a turn, run a slash command, ...).
     pub fn handle_event(&mut self, event: Event) -> Result<Option<AppAction>> {
@@ -2625,9 +2659,11 @@ impl App {
                             sel.head = cell;
                             sel.dragging = false;
                             if sel.is_empty() {
-                                // A plain click (no drag) just clears any
-                                // previous selection.
+                                // A plain click (no drag) clears any previous
+                                // selection, and on a tool-card header line
+                                // toggles that card's output.
                                 self.selection = None;
+                                self.toggle_card_at(cell.1);
                             } else {
                                 // Hand off to the main loop: it owns the
                                 // terminal, so it reads the rendered cells and
@@ -3576,19 +3612,20 @@ impl App {
                         *is_error = output.is_error;
                         // Long successful outputs start collapsed, and so do
                         // errors — the ✗ glyph carries the signal without
-                        // dumping the payload; Ctrl-T expands it on demand.
-                        *collapsed = output.is_error || output.content.lines().count() > 6;
+                        // dumping the payload; a click or Ctrl-T expands it.
+                        *collapsed = output.is_error || collapse_long(&output.content);
                         *slot = Some(output.content);
                     }
                     None => {
                         // No matching running card (e.g. denied before start
                         // was emitted) — record the result standalone.
+                        let collapsed = output.is_error || collapse_long(&output.content);
                         self.transcript.push(TranscriptEntry::ToolCard {
                             name,
                             args: Value::Null,
                             output: Some(output.content),
                             is_error: output.is_error,
-                            collapsed: output.is_error,
+                            collapsed,
                         });
                     }
                 }
@@ -4204,6 +4241,7 @@ Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
 PgUp/PgDn · wheel           scroll the transcript\n  \
 drag                        select text — copied to the clipboard on release\n  \
+click a tool card           expand / collapse its output\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-C                      quit";
@@ -7529,6 +7567,90 @@ mod tests {
             Some(TranscriptEntry::ToolCard {
                 is_error: false,
                 collapsed: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn long_outputs_start_collapsed_by_lines_or_length() {
+        assert!(!collapse_long("short output"));
+        assert!(!collapse_long(&"line\n".repeat(6)));
+        assert!(collapse_long(&"line\n".repeat(7)), "more than six lines");
+        assert!(
+            collapse_long(&"x".repeat(601)),
+            "a giant single line wraps to fill the screen just the same"
+        );
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        use crossterm::event::MouseEvent;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let _ = app.handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+    }
+
+    #[test]
+    fn clicking_a_tool_card_header_toggles_its_output() {
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "execute".to_string(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "execute".to_string(),
+            output: crate::tools::ToolOutput::ok("a\nb\nc\nd\ne\nf\ng\nh"),
+        });
+        let index = app.transcript.len() - 1;
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::ToolCard {
+                collapsed: true,
+                ..
+            })
+        ));
+
+        // Render a frame so the click hit map is populated.
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &app))
+            .unwrap();
+        let (row, hit_index) = *app
+            .card_hits
+            .borrow()
+            .first()
+            .expect("the card header should be clickable");
+        assert_eq!(hit_index, index);
+
+        // A plain click on the header expands the card...
+        click(&mut app, 2, row);
+        assert!(matches!(
+            app.transcript.get(index),
+            Some(TranscriptEntry::ToolCard {
+                collapsed: false,
+                ..
+            })
+        ));
+
+        // ...and a second click (at its possibly-shifted row) collapses it.
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &app))
+            .unwrap();
+        let row = app.card_hits.borrow().first().map(|(y, _)| *y).unwrap();
+        click(&mut app, 2, row);
+        assert!(matches!(
+            app.transcript.get(index),
+            Some(TranscriptEntry::ToolCard {
+                collapsed: true,
                 ..
             })
         ));
