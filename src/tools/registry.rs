@@ -14,6 +14,7 @@ use crate::llm::ToolSpec;
 use crate::mcp::McpManager;
 use crate::tools::{Tool, ToolAccess, ToolContext, ToolError, ToolKind, ToolOutput};
 
+use super::command::RunCommandTool;
 use super::file::{EditFileTool, ListFilesTool, ReadFileTool, SearchFilesTool, WriteFileTool};
 use super::git::{GitDiffTool, GitStatusTool};
 use super::memory::MemoryTool;
@@ -41,7 +42,7 @@ impl ToolRegistry {
     /// (`read_file`, `write_file`, `edit_file`, `list_files`,
     /// `search_files`, `execute`, `git_status`, `git_diff`, `memory`,
     /// `todo`, `web_fetch`, `web_search`, `task_output`, `task_kill`,
-    /// `subagent_status`, `subagent_kill`).
+    /// `subagent_status`, `subagent_kill`, `run_command`).
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(ReadFileTool));
@@ -60,6 +61,7 @@ impl ToolRegistry {
         registry.register(Arc::new(TaskKillTool));
         registry.register(Arc::new(SubagentStatusTool));
         registry.register(Arc::new(SubagentKillTool));
+        registry.register(Arc::new(RunCommandTool));
         registry
     }
 
@@ -320,9 +322,10 @@ mod tests {
                 "task_kill",
                 "subagent_status",
                 "subagent_kill",
+                "run_command",
             ]
         );
-        assert_eq!(registry.len(), 16);
+        assert_eq!(registry.len(), 17);
         assert!(!registry.is_empty());
 
         for spec in registry.specs() {
@@ -500,7 +503,7 @@ mod tests {
             registry.apply_description_overrides(&tmp.0.join("absent")),
             0
         );
-        assert_eq!(registry.len(), 16);
+        assert_eq!(registry.len(), 17);
     }
 
     #[test]

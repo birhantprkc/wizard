@@ -34,9 +34,19 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// to wait a little longer than the passive check.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The compiled version of this binary (`CARGO_PKG_VERSION`).
+/// The compiled version of this binary (`CARGO_PKG_VERSION`). Always a full
+/// three-component semver — release tags and self-update comparison depend on
+/// it parsing.
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// The version as shown to the user (`wizard --version`, the welcome banner):
+/// a trailing `.0` patch is dropped, so `0.7.0` reads as `0.7` while
+/// `0.7.1` stays `0.7.1`. Cosmetic only — never used for version comparison.
+pub fn display_version() -> &'static str {
+    let version = current_version();
+    version.strip_suffix(".0").unwrap_or(version)
 }
 
 /// User-Agent the GitHub API requires (`wizard/<version>`).
@@ -693,6 +703,17 @@ mod tests {
         // Unparseable versions degrade to "no update".
         assert!(!is_newer("latest", "0.5.0"));
         assert!(!is_newer("v0.5.1", "not-a-version"));
+    }
+
+    #[test]
+    fn display_version_drops_a_trailing_zero_patch_only() {
+        assert_eq!("0.7.0".strip_suffix(".0").unwrap_or("0.7.0"), "0.7");
+        assert_eq!("0.7.1".strip_suffix(".0").unwrap_or("0.7.1"), "0.7.1");
+        assert_eq!("0.10.0".strip_suffix(".0").unwrap_or("0.10.0"), "0.10");
+        // The compiled version stays a full, parseable semver for comparison.
+        assert!(semver::Version::parse(current_version()).is_ok());
+        // The display never adds a component the real version lacks.
+        assert!(current_version().starts_with(display_version()));
     }
 
     #[test]

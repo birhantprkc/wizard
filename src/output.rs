@@ -187,6 +187,13 @@ impl EventSink for TextSink {
                     }
                 ));
             }
+            AgentEvent::CommandRequested(line) => {
+                // No interactive menu to drive in a headless run: report the
+                // request but make clear it isn't applied.
+                self.spinner.println(&format!(
+                    "~ agent requested {line} (slash commands apply only in the interactive TUI)"
+                ));
+            }
             AgentEvent::Done { reason } => {
                 self.spinner.hide();
                 println!("\n[turn done: {reason:?}]");
@@ -299,7 +306,8 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             | AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished { .. }
             | AgentEvent::SubagentStarted { .. }
-            | AgentEvent::SubagentFinished { .. } => {}
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::CommandRequested(_) => {}
         }
     }
 
@@ -471,6 +479,9 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "completed": completed,
                     "output": output,
                 }));
+            }
+            AgentEvent::CommandRequested(line) => {
+                self.emit(json!({"type": "command_requested", "command": line}));
             }
             AgentEvent::Done { reason } => {
                 self.emit(json!({"type": "turn_done", "reason": reason_str(reason)}));

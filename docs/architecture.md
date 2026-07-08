@@ -151,6 +151,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `web_search` | Web search via DuckDuckGo (default), Brave, Tavily, or xAI Grok ([web.md](web.md)) |
 | `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
 | `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
+| `run_command` | Run one of Wizard's own slash commands (e.g. `/effort high`, `/model`, `/compact`); dispatched by the TUI after the turn ([usage.md](usage.md#agent-run-slash-commands)) |
 
 Neither mode has a per-action approval gate. Genie is conversational and interactive; sovereign works continuously without human input.
 

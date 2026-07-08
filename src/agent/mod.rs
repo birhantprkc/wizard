@@ -179,6 +179,12 @@ pub enum AgentEvent {
         completed: bool,
         output: String,
     },
+    /// The agent asked to run one of Wizard's own slash commands via the
+    /// `run_command` tool. Carries the raw command line (e.g. `/effort high`).
+    /// The interactive surface validates and dispatches it once the turn ends
+    /// and the agent is back in its slot; other surfaces ignore it (there is
+    /// no menu to drive).
+    CommandRequested(String),
     /// The turn is over.
     Done { reason: DoneReason },
 }
@@ -638,6 +644,15 @@ impl Agent {
     /// `reasoning_effort` request field; others ignore it.
     pub fn set_reasoning_effort(&mut self, effort: Option<crate::config::ReasoningEffort>) {
         self.config.reasoning_effort = effort;
+    }
+
+    /// Mark this agent as running on a surface that drains slash commands the
+    /// agent queues via `run_command` — the interactive TUI. Only then is the
+    /// `run_command` tool useful; headless and gateway runs leave it off so the
+    /// tool refuses rather than report success for a command nothing applies.
+    /// Preserved across per-turn context clones (`ToolContext::with_events`).
+    pub fn set_command_dispatch(&mut self, on: bool) {
+        self.ctx.dispatches_commands = on;
     }
 
     /// Conversation history (system prompt included).

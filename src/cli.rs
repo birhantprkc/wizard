@@ -10,7 +10,7 @@ use crate::config::Mode;
 
 /// Wizard — your sovereign agent. Self-extending. Bring any model.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "wizard", version, about, long_about = None)]
+#[command(name = "wizard", version = crate::update::display_version(), about, long_about = None)]
 pub struct Cli {
     /// Personality mode: genie (interactive TUI) or sovereign (autonomous).
     #[arg(long, value_enum)]

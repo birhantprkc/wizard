@@ -3,6 +3,7 @@
 //! MCP tools (`crate::mcp`). All three present a uniform interface through
 //! [`registry::ToolRegistry`], so the model calls them identically.
 
+pub mod command;
 pub mod evolve;
 pub mod file;
 pub mod git;
@@ -73,6 +74,13 @@ pub struct ToolContext {
     /// it before execution. `None` outside an agent (direct registry
     /// execution in tests).
     pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
+    /// True only on the interactive TUI surface, which drains and dispatches
+    /// slash commands the agent queues via `run_command`. A live `events`
+    /// channel alone does not imply this — headless and gateway runs stream
+    /// events to a printer that cannot apply a command — so the `run_command`
+    /// tool gates on this flag to avoid reporting success for work that would
+    /// never run. Set by the TUI's agent builder; false everywhere else.
+    pub dispatches_commands: bool,
 }
 
 impl ToolContext {
@@ -85,7 +93,15 @@ impl ToolContext {
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
+            dispatches_commands: false,
         }
+    }
+
+    /// Mark this context as belonging to a surface that drains queued slash
+    /// commands (the interactive TUI). Enables the `run_command` tool.
+    pub fn with_command_dispatch(mut self, on: bool) -> Self {
+        self.dispatches_commands = on;
+        self
     }
 
     /// This context with `web` tool settings applied (agent construction).

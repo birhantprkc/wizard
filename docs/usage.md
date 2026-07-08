@@ -48,6 +48,24 @@ Your own commands (markdown files that expand into prompts) sit alongside
 these; see [commands.md](commands.md), which also covers `@path` file
 references.
 
+### Agent-run slash commands
+
+The agent can run these same commands itself with the native `run_command`
+tool — it passes a command line exactly as you would type it (e.g.
+`/effort high`, `/model claude-sonnet-5`, `/compact`, `/reload`). So the agent
+can raise its own reasoning effort for a hard task, switch models, compact its
+context, or reload skills without you stepping in.
+
+Because a turn already in flight can't be reconfigured, a queued command runs
+the moment that turn finishes — effort, model, and mode changes therefore take
+effect on the **next** turn. Commands that need you at an interactive picker
+(`/effort` with no argument), that end or rewind the session (`/quit`,
+`/clear`, `/rewind`, `/resume`), or that set up providers (`/provider`,
+`/login`, `/publish`, `/evolve`) stay your call and are refused with a note the
+agent sees. Only the interactive TUI applies these commands, so the tool is
+refused outright in headless `-p` runs, the gateway, and subagents — nothing is
+silently dropped.
+
 ## `wizard agents` and background subagents
 
 `wizard agents` opens the agent dashboard from the shell, the same view as

@@ -9,7 +9,7 @@ Diagnoses the environment and prints one line per check:
 ✓ provider local    llamacpp @ http://127.0.0.1:11435 (qwen3-30b) reachable
 – provider openai   $OPENAI_API_KEY not set
 ✗ mcp playwright    spawn failed: No such file or directory (os error 2)
-✓ native tools      14 tools registered
+✓ native tools      17 tools registered
 – hooks (global)    /home/you/.wizard/hooks.toml absent (no hooks)
 ✓ hooks (project)   2 hook(s) in .wizard/hooks.toml
 ✓ ~/.wizard         /home/you/.wizard writable

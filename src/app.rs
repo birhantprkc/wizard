@@ -515,6 +515,53 @@ impl SlashCommand {
         };
         Some(parsed)
     }
+
+    /// Whether the agent may invoke this command itself (via the `run_command`
+    /// tool), and if not, the reason to report back to the model.
+    ///
+    /// Allowed: read-only status/info commands and state changes the agent can
+    /// sensibly apply to its own session (effort, model, mode, goal, planning
+    /// modes, reload, compact, and the UI toggles). Refused: commands that need
+    /// a human at an interactive picker (the no-argument forms), that end or
+    /// rewind the session, or that reach outside it to set up providers.
+    pub fn agent_runnable(&self) -> Result<(), String> {
+        use SlashCommand::*;
+        match self {
+            // State the agent can set on itself, plus read-only info toggles.
+            Model(Some(_)) | Mode(Some(_)) | Effort(Some(_)) | Goal(_) | Diff | Todos
+            | Subagents | Dashboard | Cost | Memory | Doctor | Status | Bashes | Compact
+            | Reload | Plan | Omakase | Settings | Vim | Help | Fusion(FusionAction::Toggle) => {
+                Ok(())
+            }
+
+            // Interactive pickers: there is no human at the keyboard mid-turn,
+            // so require the argument that names the choice directly.
+            Model(None) => Err("name a model, e.g. `/model claude-sonnet-5`".into()),
+            Mode(None) => Err("name a mode, e.g. `/mode sovereign`".into()),
+            Effort(None) => Err("name a level, e.g. `/effort high`".into()),
+            Fusion(FusionAction::Config) => {
+                Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
+            }
+            Agents => {
+                Err("`/agents` opens a picker for the user; spawn subagents with the spawn tool".into())
+            }
+
+            // Session-ending, destructive, or external-setup commands are off
+            // limits to the agent.
+            Quit => Err("refusing to quit the session on the user's behalf".into()),
+            Clear => Err("refusing to clear the conversation on the user's behalf".into()),
+            Rewind(_) => Err("`/rewind` restores checkpoints and is the user's call".into()),
+            Resume(_) => Err("`/resume` switches sessions and is the user's call".into()),
+            Evolve { .. } => Err("`/evolve` is a heavyweight self-edit; leave it to the user".into()),
+            Publish { .. } => Err("`/publish` forks the tool; leave it to the user".into()),
+            Provider(_) | ProviderSetup { .. } => {
+                Err("provider setup is the user's call; use `/model` to switch models".into())
+            }
+            Server(_) => Err("`/server` manages the local model server; leave it to the user".into()),
+            Login(_) => Err("`/login` is an interactive sign-in; leave it to the user".into()),
+            ImportClaude(_) => Err("`/settings` import is driven from a picker; leave it to the user".into()),
+        }
+    }
 }
 
 /// One entry in the slash-command completion table. Drives the suggestion
@@ -1095,6 +1142,11 @@ pub struct App {
     /// yet). The main loop merges the MCP tools once the turn returns the
     /// agent. Cleared then.
     pub mcp_merge_pending: bool,
+    /// Slash commands the agent asked to run via the `run_command` tool during
+    /// the current turn (raw command lines, e.g. `/effort high`). A turn in
+    /// flight cannot be reconfigured, so the main loop drains and dispatches
+    /// these once the turn ends and the agent is back in its slot.
+    pub pending_agent_commands: Vec<String>,
     /// True while the background MCP connect is in flight (servers spawning,
     /// `initialize` round-trips). Drives a transient status-bar indicator so a
     /// message sent before the tools arrive isn't a silent surprise. Cleared on
@@ -1185,6 +1237,7 @@ impl App {
             pending_compact: false,
             compacting: false,
             mcp_merge_pending: false,
+            pending_agent_commands: Vec::new(),
             mcp_connecting: false,
             provider_health_error: None,
         }
@@ -3654,6 +3707,12 @@ impl App {
                     self.show_todos = true;
                 }
             }
+            AgentEvent::CommandRequested(line) => {
+                // A turn in flight can't be reconfigured, so queue the command;
+                // the main loop drains it once the agent is back in its slot.
+                self.notice(format!("agent requested {line} (runs after this turn)"));
+                self.pending_agent_commands.push(line);
+            }
             AgentEvent::Done { reason } => {
                 self.flush_streaming();
                 self.status.busy = false;
@@ -3968,7 +4027,7 @@ async fn build_agent(
             false
         }
     };
-    Agent::new(
+    let mut agent = Agent::new(
         Arc::clone(client),
         registry,
         config.clone(),
@@ -3977,7 +4036,11 @@ async fn build_agent(
         session,
         native_tools,
         hooks,
-    )
+    )?;
+    // The TUI is the one surface that drains queued slash commands, so its
+    // agent is the only one where `run_command` does anything.
+    agent.set_command_dispatch(true);
+    Ok(agent)
 }
 
 /// Run `git <args>` in `root` and return stdout.
@@ -4527,6 +4590,20 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
+            // A `/model` in the queue triggered this rebuild and deferred the
+            // rest of the queued commands; drain them now the agent is back.
+            drain_agent_commands(
+                &mut app,
+                &mut client,
+                &mut agent_slot,
+                &manager,
+                &mut skills,
+                &project_root,
+                &mcp_path,
+                genie_max_steps,
+                &events,
+            )
+            .await;
             continue;
         }
 
@@ -4840,6 +4917,23 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             }
         }
 
+        // Dispatch any slash commands the agent queued via `run_command` during
+        // the turn, now that it's back in its slot and can be reconfigured. A
+        // crashed turn leaves the slot empty (a rebuild is in flight); the queue
+        // then waits for that rebuild, or the next completed turn.
+        drain_agent_commands(
+            &mut app,
+            &mut client,
+            &mut agent_slot,
+            &manager,
+            &mut skills,
+            &project_root,
+            &mcp_path,
+            genie_max_steps,
+            &events,
+        )
+        .await;
+
         if app.should_quit {
             break;
         }
@@ -4871,6 +4965,45 @@ struct CommandContext<'a> {
     mcp_path: &'a Path,
     genie_max_steps: u32,
     events: &'a EventLoop,
+}
+
+/// Dispatch the slash commands the agent queued via `run_command`, in order,
+/// now that the turn has ended and the agent is back in its slot. A command
+/// that starts a background rebuild (e.g. `/model`) empties the slot; draining
+/// stops there and leaves the rest queued, so the `AgentRebuilt` handler drains
+/// them once the agent returns. Called both after a turn completes and after a
+/// rebuild restores the slot, so no queued command is silently dropped.
+#[allow(clippy::too_many_arguments)]
+async fn drain_agent_commands(
+    app: &mut App,
+    client: &mut Arc<dyn LlmProvider>,
+    agent_slot: &mut Option<Agent>,
+    manager: &Arc<Mutex<McpManager>>,
+    skills: &mut Vec<Skill>,
+    project_root: &Path,
+    mcp_path: &Path,
+    genie_max_steps: u32,
+    events: &EventLoop,
+) {
+    while agent_slot.is_some() && !app.pending_agent_commands.is_empty() {
+        let line = app.pending_agent_commands.remove(0);
+        let Some(Ok(command)) = SlashCommand::parse(&line) else {
+            continue;
+        };
+        CommandContext {
+            app: &mut *app,
+            client: &mut *client,
+            agent_slot: &mut *agent_slot,
+            manager,
+            skills: &mut *skills,
+            project_root,
+            mcp_path,
+            genie_max_steps,
+            events,
+        }
+        .run(command)
+        .await;
+    }
 }
 
 impl CommandContext<'_> {
@@ -7533,6 +7666,68 @@ mod tests {
             SlashCommand::parse("/omakase"),
             Some(Ok(SlashCommand::Omakase))
         );
+    }
+
+    /// Parse `input` and return the agent-runnable verdict, asserting it is a
+    /// well-formed command first.
+    fn runnable(input: &str) -> Result<(), String> {
+        match SlashCommand::parse(input) {
+            Some(Ok(command)) => command.agent_runnable(),
+            other => panic!("{input} did not parse to a command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_runnable_allows_self_config_and_info_commands() {
+        for input in [
+            "/effort high",
+            "/model claude-sonnet-5",
+            "/mode sovereign",
+            "/goal ship it",
+            "/goal",
+            "/status",
+            "/diff",
+            "/compact",
+            "/reload",
+            "/settings",
+            "/fusion",
+        ] {
+            assert!(runnable(input).is_ok(), "{input} should be runnable");
+        }
+    }
+
+    #[test]
+    fn command_requested_event_queues_for_post_turn_dispatch() {
+        let mut app = app();
+        assert!(app.pending_agent_commands.is_empty());
+        app.handle_agent_event(AgentEvent::CommandRequested("/effort high".into()));
+        assert_eq!(app.pending_agent_commands, vec!["/effort high".to_string()]);
+        // A second request accumulates rather than replacing.
+        app.handle_agent_event(AgentEvent::CommandRequested("/compact".into()));
+        assert_eq!(
+            app.pending_agent_commands,
+            vec!["/effort high".to_string(), "/compact".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_runnable_refuses_pickers_and_dangerous_commands() {
+        for input in [
+            "/effort",   // interactive picker without an argument
+            "/model",    // interactive picker without an argument
+            "/mode",     // interactive picker without an argument
+            "/quit",     // ends the session
+            "/clear",    // wipes the conversation
+            "/rewind 2", // restores checkpoints
+            "/resume",   // switches sessions
+            "/login xai",
+            "/provider list",
+            "/publish",
+            "/agents",
+            "/fusion config",
+        ] {
+            assert!(runnable(input).is_err(), "{input} should be refused");
+        }
     }
 
     #[test]

@@ -267,6 +267,9 @@ pub async fn spawn(
     let ctx = ToolContext {
         todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
         events: None,
+        // A subagent has no surface to drive; it must never dispatch the
+        // parent's slash commands even if the parent's ctx enabled it.
+        dispatches_commands: false,
         ..ctx.clone()
     };
 
