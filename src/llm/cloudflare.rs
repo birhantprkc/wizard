@@ -87,7 +87,7 @@ impl CloudflareProvider {
             .to_string();
         Self {
             inner,
-            http: reqwest::Client::builder().build().unwrap_or_default(),
+            http: crate::llm::cloud_http_builder().build().unwrap_or_default(),
             account_base,
             api_key,
             model,

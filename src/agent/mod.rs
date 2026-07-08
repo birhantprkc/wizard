@@ -102,6 +102,11 @@ pub enum AgentEvent {
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
     Error(String),
+    /// A completion stream died mid-response and is about to be retried from
+    /// scratch. Whatever partial text was streamed so far never entered
+    /// history and will be re-generated — consumers rendering deltas must
+    /// discard their partial buffer or the retry duplicates it.
+    StreamRetrying,
     /// A lifecycle hook did something worth surfacing (rewrote arguments,
     /// appended context, blocked, or failed). Plain successes are silent.
     /// Rendered as a dim log line.
@@ -1302,6 +1307,9 @@ impl Agent {
                             .saturating_mul(2u64.saturating_pow(attempt)),
                     );
                     let n = attempt + 1;
+                    // The retry re-generates the response from the top; tell
+                    // consumers to drop any partial text this attempt streamed.
+                    let _ = emit(events, AgentEvent::StreamRetrying).await;
                     let _ = emit(
                         events,
                         AgentEvent::Error(format!(
