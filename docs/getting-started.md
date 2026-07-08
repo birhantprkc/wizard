@@ -230,7 +230,7 @@ The same thing is scriptable with explicit arguments:
 
 ```
 /provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
-/provider add xai xai https://api.x.ai/v1 grok-4.3 XAI_API_KEY
+/provider add xai xai https://api.x.ai/v1 grok-4.5 XAI_API_KEY
 /provider use openai
 ```
 

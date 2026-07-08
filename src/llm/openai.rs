@@ -400,6 +400,9 @@ impl LlmProvider for OpenAiProvider {
 pub(crate) fn context_window(model: &str) -> Option<u32> {
     let model = model.to_ascii_lowercase();
     // xAI Grok (served through this provider with vendor "xai").
+    if model.starts_with("grok-4.5") {
+        return Some(500_000);
+    }
     if model.starts_with("grok-4") {
         return Some(256_000);
     }
@@ -969,6 +972,7 @@ mod tests {
         assert_eq!(context_window("o3-mini"), Some(200_000));
         assert_eq!(context_window("grok-3"), Some(131_072));
         assert_eq!(context_window("grok-4.3"), Some(256_000));
+        assert_eq!(context_window("grok-4.5"), Some(500_000));
         assert_eq!(context_window("qwen3-8b"), None, "local tags stay unknown");
         assert_eq!(context_window(""), None);
     }

@@ -181,7 +181,7 @@ const ANTHROPIC_MODELS: &[&str] = &[
     "claude-haiku-4-5",
 ];
 /// xAI (Grok) model options offered in the picker (first is the default).
-const XAI_MODELS: &[&str] = &["grok-4.3", "grok-code-fast-1"];
+const XAI_MODELS: &[&str] = &["grok-4.5", "grok-4.3", "grok-code-fast-1"];
 /// Ollama tier options offered alongside the hardware-suggested default.
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
@@ -307,8 +307,8 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             "Cloudflare Workers AI",
             "GLM 5.2 via CLOUDFLARE_API_TOKEN (+ account id)",
         ),
-        Opt::new("xAI (Grok), API key", "grok-4.3 via XAI_API_KEY"),
-        Opt::new("xAI account sign-in", "grok-4.3 via OAuth, no API key"),
+        Opt::new("xAI (Grok), API key", "grok-4.5 via XAI_API_KEY"),
+        Opt::new("xAI account sign-in", "grok-4.5 via OAuth, no API key"),
         Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
         Opt::new("Anthropic (Claude)", "claude-fable-5"),
         Opt::new("Custom OpenAI-compatible endpoint", "any base URL"),
