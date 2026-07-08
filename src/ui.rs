@@ -128,6 +128,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_subagents(frame, app);
     }
 
+    // With any overlay floating above the transcript, a click belongs to the
+    // overlay — drop the card hit map so it can't toggle a card underneath.
+    if app.picker.is_some()
+        || app.plan_review.is_some()
+        || app.interview.is_some()
+        || app.show_dashboard
+        || app.show_subagents
+    {
+        app.card_hits.borrow_mut().clear();
+    }
+
     // The selection highlight paints last so it reverses whatever ended up on
     // screen — transcript, sidebar, or an overlay the user dragged across.
     if let Some(selection) = app.selection {
@@ -200,6 +211,10 @@ pub fn selection_text(buf: &Buffer, selection: &Selection) -> String {
 /// collapsible tool cards. Borderless; a one-column side margin keeps the
 /// text off the terminal edge. Shows the welcome screen while empty.
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
+    // Rebuilt from scratch every frame; cleared up front so the early
+    // returns below can't leave stale clickable rows behind.
+    app.card_hits.borrow_mut().clear();
+
     // Stay on the welcome screen until the conversation actually begins (see
     // `App::has_conversation`: early system notices alone don't dismiss it).
     if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
@@ -227,13 +242,32 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let inner_width = inner.width as usize;
     let inner_height = inner.height as usize;
 
-    let lines = wrap_lines(transcript_text(app), inner_width);
+    // Wrap each source line separately, fanning its tag out over the rows it
+    // becomes, so a click on any wrapped row still traces back to its card.
+    let (text, line_tags) = transcript_text(app);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_tags: Vec<Option<usize>> = Vec::new();
+    for (line, tag) in text.lines.into_iter().zip(line_tags) {
+        let before = lines.len();
+        lines.append(&mut wrap_lines(Text::from(vec![line]), inner_width));
+        row_tags.extend(std::iter::repeat_n(tag, lines.len() - before));
+    }
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_height);
     let scroll = (app.scroll as usize).min(max_scroll);
     let start = max_scroll - scroll;
     let end = (start + inner_height).min(total);
     let visible: Vec<Line<'static>> = lines[start..end].to_vec();
+
+    // Record where card headers landed on screen for click-to-toggle.
+    {
+        let mut hits = app.card_hits.borrow_mut();
+        for (offset, tag) in row_tags[start..end].iter().enumerate() {
+            if let Some(index) = tag {
+                hits.push((inner.y + offset as u16, *index));
+            }
+        }
+    }
 
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
 
@@ -373,14 +407,17 @@ fn thinking_text(message: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-/// Build the full (unwrapped) transcript text from app state.
-fn transcript_text(app: &App) -> Text<'static> {
+/// Build the full (unwrapped) transcript text from app state, plus a
+/// parallel per-line tag holding the transcript index of the tool card
+/// whose header the line is — the click-to-toggle targets.
+fn transcript_text(app: &App) -> (Text<'static>, Vec<Option<usize>>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut tags: Vec<Option<usize>> = Vec::new();
     let mut prev_tool = false;
     let mut prev_notice = false;
     let mut first = true;
 
-    for entry in &app.transcript {
+    for (index, entry) in app.transcript.iter().enumerate() {
         let is_tool = matches!(entry, TranscriptEntry::ToolCard { .. });
         let is_notice = matches!(entry, TranscriptEntry::Notice(_));
         // Comfortable spacing between turns; runs of tool cards or notices
@@ -392,6 +429,9 @@ fn transcript_text(app: &App) -> Text<'static> {
         first = false;
         prev_tool = is_tool;
         prev_notice = is_notice;
+
+        // A tool card's first pushed line is its header (glyph + name).
+        let header_at = lines.len();
 
         match entry {
             TranscriptEntry::User(message) => {
@@ -450,6 +490,13 @@ fn transcript_text(app: &App) -> Text<'static> {
                 }
             }
         }
+
+        // Keep the tags in lockstep with whatever the entry pushed; only a
+        // tool card's header line is clickable.
+        tags.resize(lines.len(), None);
+        if is_tool && header_at < lines.len() {
+            tags[header_at] = Some(index);
+        }
     }
 
     if !app.streaming_thinking.is_empty() {
@@ -489,7 +536,8 @@ fn transcript_text(app: &App) -> Text<'static> {
         ]));
     }
 
-    Text::from(lines)
+    tags.resize(lines.len(), None);
+    (Text::from(lines), tags)
 }
 
 /// Human label + one-line summary for a tool call. `spawn_subagent` reads as
