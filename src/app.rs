@@ -3521,9 +3521,10 @@ impl App {
                 match card {
                     Some((slot, is_error, collapsed)) => {
                         *is_error = output.is_error;
-                        // Long, successful outputs start collapsed; errors
-                        // stay expanded so they are visible.
-                        *collapsed = !output.is_error && output.content.lines().count() > 6;
+                        // Long successful outputs start collapsed, and so do
+                        // errors — the ✗ glyph carries the signal without
+                        // dumping the payload; Ctrl-T expands it on demand.
+                        *collapsed = output.is_error || output.content.lines().count() > 6;
                         *slot = Some(output.content);
                     }
                     None => {
@@ -3534,7 +3535,7 @@ impl App {
                             args: Value::Null,
                             output: Some(output.content),
                             is_error: output.is_error,
-                            collapsed: false,
+                            collapsed: output.is_error,
                         });
                     }
                 }
@@ -4707,13 +4708,19 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     }
                 }
                 AppAction::CopySelection => {
-                    // The drag finished: read the just-rendered cells under the
-                    // selection straight from the terminal's current buffer and
-                    // copy their text. The highlight stays on screen until the
-                    // next keystroke / click / scroll.
+                    // The drag finished: re-render and read the cells under the
+                    // selection from the fresh frame. (After a completed
+                    // `Terminal::draw` the swapped-in current buffer is reset,
+                    // so reading `current_buffer_mut` here would find only
+                    // blanks — clearing the selection the moment the button is
+                    // released.) The highlight stays on screen until the next
+                    // keystroke / click / scroll.
                     if let Some(selection) = app.selection {
-                        let text =
-                            crate::ui::selection_text(terminal.current_buffer_mut(), &selection);
+                        let mut text = String::new();
+                        terminal.draw(|frame| {
+                            crate::ui::draw(frame, &app);
+                            text = crate::ui::selection_text(frame.buffer_mut(), &selection);
+                        })?;
                         if text.is_empty() {
                             app.selection = None;
                         } else if let Err(err) = copy_to_clipboard(&text) {
@@ -7350,6 +7357,48 @@ mod tests {
             app.status.background_tasks, 0,
             "marker clears once all finish"
         );
+    }
+
+    #[test]
+    fn failed_tool_cards_start_collapsed() {
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "web_fetch".to_string(),
+            args: serde_json::json!({"url": "https://example.com"}),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "web_fetch".to_string(),
+            output: crate::tools::ToolOutput::error("HTTP 403 Forbidden\n<!DOCTYPE html>\n..."),
+        });
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(TranscriptEntry::ToolCard {
+                    is_error: true,
+                    collapsed: true,
+                    ..
+                })
+            ),
+            "errors show only the ✗ card line until expanded via Ctrl-T"
+        );
+
+        // Short successful outputs still arrive expanded.
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "a.txt"}),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "read_file".to_string(),
+            output: crate::tools::ToolOutput::ok("one line"),
+        });
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::ToolCard {
+                is_error: false,
+                collapsed: false,
+                ..
+            })
+        ));
     }
 
     #[test]
