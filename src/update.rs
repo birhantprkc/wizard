@@ -154,8 +154,9 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// sha256 of a byte slice, lowercase hex.
-fn sha256_hex(bytes: &[u8]) -> String {
+/// sha256 of a byte slice, lowercase hex. Shared with `crate::sync`, which
+/// hashes bundle payload files the same way.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);

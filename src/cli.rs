@@ -110,7 +110,8 @@ pub struct Cli {
 impl Cli {
     /// Names of top-level flags set on this invocation that a self-contained
     /// subcommand (bench, doctor, schedule, scheduler, fleet, usage, evolve,
-    /// update) would silently ignore. `--cwd` is honored everywhere and excluded.
+    /// update, sync) would silently ignore. `--cwd` is honored everywhere and
+    /// excluded.
     /// [`crate::run`] turns a non-empty result into a hard error rather than
     /// silently dropping the flags.
     pub fn ignored_top_level_flags(&self) -> Vec<&'static str> {
@@ -253,6 +254,57 @@ pub enum Command {
         #[arg(long)]
         rollback: bool,
     },
+
+    /// Sync config and skills across machines: pack the portable parts of
+    /// ~/.wizard into a signed bundle, pull and verify one from a file or
+    /// URL. Self-contained: never loads config or triggers onboarding.
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
+    },
+}
+
+/// `wizard sync` subcommands. Self-contained like update: no config load
+/// (pull reads `[sync].source` from config.toml directly), no onboarding,
+/// no LLM. Bundles are ed25519-signed; trust is pinned on first use in
+/// `~/.wizard/sync/trusted_keys` (compare fingerprints via `wizard sync key`).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum SyncCmd {
+    /// Create a signed bundle of portable ~/.wizard state: config.toml,
+    /// mcp.toml, system_prompt.md, and the skills/, commands/, subagents/,
+    /// and tools/ directories. Credentials stay out unless explicitly
+    /// included.
+    Pack {
+        /// Output path (default: `wizard-sync-<YYYYMMDD>.tar.gz` in the
+        /// current directory).
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+
+        /// Also pack credentials.toml and xai_oauth.json. The bundle then
+        /// contains API keys — transfer it privately. The bundle file is
+        /// written with 0600 permissions.
+        #[arg(long)]
+        include_credentials: bool,
+    },
+
+    /// Fetch, verify, and apply a bundle (file path or http(s) URL). Falls
+    /// back to `[sync].source` in config.toml when no source is given.
+    /// Additive only: replaced files are backed up under
+    /// ~/.wizard/sync/backups/, nothing is deleted.
+    Pull {
+        /// Bundle to pull: a local file path (`~` expands) or an http(s) URL.
+        source: Option<String>,
+
+        /// Verify the bundle and show what would change without writing
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Print this machine's sync public key and fingerprint (generating the
+    /// keypair on first use). Compare the fingerprint against what `pull`
+    /// reports on the other machine.
+    Key,
 }
 
 /// `wizard evolve` subcommands. Self-contained: they read
@@ -661,6 +713,76 @@ mod tests {
         assert_eq!(to.as_deref(), Some("v0.5.0"));
         assert!(force);
         assert!(rollback);
+    }
+
+    #[test]
+    fn sync_subcommands_parse() {
+        let cli = parse(&["sync", "pack"]).expect("sync pack parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sync {
+                cmd: SyncCmd::Pack {
+                    out: None,
+                    include_credentials: false,
+                }
+            })
+        ));
+
+        let cli = parse(&[
+            "sync",
+            "pack",
+            "--out",
+            "/tmp/b.tar.gz",
+            "--include-credentials",
+        ])
+        .expect("sync pack flags parse");
+        let Some(Command::Sync {
+            cmd:
+                SyncCmd::Pack {
+                    out,
+                    include_credentials,
+                },
+        }) = cli.command
+        else {
+            panic!("expected sync pack");
+        };
+        assert_eq!(out, Some(PathBuf::from("/tmp/b.tar.gz")));
+        assert!(include_credentials);
+
+        let cli = parse(&["sync", "pull"]).expect("sync pull without a source parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sync {
+                cmd: SyncCmd::Pull {
+                    source: None,
+                    dry_run: false,
+                }
+            })
+        ));
+
+        let cli = parse(&["sync", "pull", "~/b.tar.gz", "--dry-run"])
+            .expect("sync pull with a source parses");
+        let Some(Command::Sync {
+            cmd: SyncCmd::Pull { source, dry_run },
+        }) = cli.command
+        else {
+            panic!("expected sync pull");
+        };
+        assert_eq!(source.as_deref(), Some("~/b.tar.gz"));
+        assert!(dry_run);
+
+        let cli = parse(&["sync", "key"]).expect("sync key parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sync { cmd: SyncCmd::Key })
+        ));
+
+        let err = parse(&["sync"]).expect_err("bare sync requires a subcommand");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "got: {err}"
+        );
     }
 
     #[test]

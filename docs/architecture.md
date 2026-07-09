@@ -228,6 +228,9 @@ Ratatui + crossterm terminal UI:
 | `~/.wizard/src/` | Source checkout for deep evolve (created on demand) |
 | `~/.wizard/sessions/*.jsonl` | Chat history |
 | `~/.wizard/evolution.jsonl` | Self-extension log |
+| `~/.wizard/sync/key` | Ed25519 signing-key seed for `wizard sync` (mode 0600; see [sync.md](sync.md)) |
+| `~/.wizard/sync/trusted_keys` | Public keys `wizard sync pull` accepts, one per line, pinned on first use |
+| `~/.wizard/sync/backups/` | Timestamped backups of files overwritten by `wizard sync pull` |
 | `~/.wizard/logs/` | Debug traces |
 | `.wizard/loop-control` | Sovereign-mode run control (per project) |
 | `.wizard/checkpoints/` | Per-file edit snapshots powering `/rewind` (per project; see [checkpoints.md](checkpoints.md)) |

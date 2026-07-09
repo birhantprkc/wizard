@@ -75,6 +75,10 @@ flate2 = "1"
 tar = "0.4"
 semver = "1"
 
+# Config/skills sync (`wizard sync`): ed25519 signatures over the bundle
+# manifest. Keys are seeded from getrandom — no rand/rand_core dependency.
+ed25519-dalek = "2"
+
 # Process-group kill for background tasks (`task_kill`, timeouts)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

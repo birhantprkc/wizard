@@ -57,6 +57,7 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 - [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
 - [Scheduler](docs/scheduler.md): cron-scheduled headless runs
 - [Fleet](docs/fleet.md): parallel workers over git worktrees
+- [Sync](docs/sync.md): `wizard sync` moves config, skills, and custom tooling between machines as a signed bundle
 - [Fork and distribute](docs/market.md): publish your evolved Wizard
 - [Architecture](docs/architecture.md): how it's built
 - [Security](SECURITY.md): threat model
