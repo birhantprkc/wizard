@@ -3225,6 +3225,10 @@ impl App {
                     // Esc closes the diff sidebar before touching the input.
                     self.show_diff = false;
                     self.diff_scroll = 0;
+                } else if self.show_todos {
+                    // Then the todo sidebar (it auto-opens on the first todo
+                    // update, so it needs a way out that isn't `/todos`).
+                    self.show_todos = false;
                 } else if self.scroll > 0 {
                     self.scroll = 0;
                 } else {
@@ -7514,6 +7518,28 @@ mod tests {
         app.handle_agent_event(AgentEvent::TodoUpdated(items.clone()));
         assert!(!app.show_todos, "auto-show happens only once");
         assert_eq!(app.todos, items, "the list still updates");
+    }
+
+    #[test]
+    fn esc_dismisses_the_todo_panel_after_the_diff_sidebar() {
+        let mut app = app();
+        app.show_todos = true;
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_todos, "Esc dismisses the todo panel");
+
+        // With both sidebars open, Esc closes the diff first, todos second,
+        // and only then falls through to the input.
+        app.show_todos = true;
+        app.show_diff = true;
+        app.input = "draft".to_string();
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_diff, "diff closes first");
+        assert!(app.show_todos, "todos stay open until the next Esc");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_todos);
+        assert_eq!(app.input, "draft", "input untouched while panels close");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.input, "", "Esc finally clears the input");
     }
 
     #[test]
