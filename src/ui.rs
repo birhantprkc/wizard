@@ -18,7 +18,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment as MdAlignment, CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
@@ -2302,12 +2304,16 @@ fn render_markdown_inner(source: &str, highlight: bool) -> Text<'static> {
         highlight,
         ..MarkdownRenderer::default()
     };
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
     for event in Parser::new_ext(source, options) {
         renderer.event(event);
     }
     renderer.finish()
 }
+
+/// One table cell's styled inline spans.
+type CellSpans = Vec<Span<'static>>;
 
 #[derive(Default)]
 struct MarkdownRenderer {
@@ -2328,6 +2334,12 @@ struct MarkdownRenderer {
     lists: Vec<Option<u64>>,
     quote_depth: usize,
     link: Option<String>,
+    in_table: bool,
+    /// Whether the open table closed a header row (always its first row).
+    table_header: bool,
+    table_aligns: Vec<MdAlignment>,
+    table_rows: Vec<Vec<CellSpans>>,
+    table_row: Vec<CellSpans>,
 }
 
 impl MarkdownRenderer {
@@ -2418,6 +2430,8 @@ impl MarkdownRenderer {
                 self.current
                     .push(Span::styled(code.to_string(), Style::default().fg(CODE)));
             }
+            // Table cells are single-line: fold breaks into a space.
+            MdEvent::SoftBreak | MdEvent::HardBreak if self.in_table => self.push_text(" "),
             MdEvent::SoftBreak | MdEvent::HardBreak => {
                 self.end_line();
                 self.line_prefix();
@@ -2486,6 +2500,12 @@ impl MarkdownRenderer {
                 };
                 self.current.push(Span::styled(bullet, dim()));
             }
+            Tag::Table(aligns) => {
+                self.flush();
+                self.in_table = true;
+                self.table_aligns = aligns;
+            }
+            Tag::TableHead => self.bold += 1,
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
@@ -2496,6 +2516,7 @@ impl MarkdownRenderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
+            TagEnd::Paragraph if self.in_table => {}
             TagEnd::Paragraph => {
                 self.flush();
                 if self.lists.is_empty() {
@@ -2535,6 +2556,17 @@ impl MarkdownRenderer {
                 }
             }
             TagEnd::Item => self.flush(),
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.current);
+                self.table_row.push(cell);
+            }
+            TagEnd::TableHead => {
+                self.bold = self.bold.saturating_sub(1);
+                self.table_header = true;
+                self.table_rows.push(std::mem::take(&mut self.table_row));
+            }
+            TagEnd::TableRow => self.table_rows.push(std::mem::take(&mut self.table_row)),
+            TagEnd::Table => self.end_table(),
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
@@ -2548,6 +2580,59 @@ impl MarkdownRenderer {
         }
     }
 
+    /// Emit the buffered table as an aligned grid: cells padded to their
+    /// column's display width, dim `│` rules between columns, a dim `─┼─`
+    /// rule after the header. Rows may be ragged (mid-stream truncation);
+    /// missing cells pad as empty.
+    fn end_table(&mut self) {
+        self.in_table = false;
+        let has_header = std::mem::take(&mut self.table_header);
+        let aligns = std::mem::take(&mut self.table_aligns);
+        let rows = std::mem::take(&mut self.table_rows);
+        let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 {
+            return;
+        }
+        let mut widths = vec![0usize; cols];
+        for row in &rows {
+            for (col, cell) in row.iter().enumerate() {
+                widths[col] = widths[col].max(spans_width(cell));
+            }
+        }
+        for (index, mut row) in rows.into_iter().enumerate() {
+            row.resize_with(cols, Vec::new);
+            let mut spans = Vec::new();
+            for (col, cell) in row.into_iter().enumerate() {
+                if col > 0 {
+                    spans.push(Span::styled(" │ ", dim()));
+                }
+                let pad = widths[col].saturating_sub(spans_width(&cell));
+                let (left, right) = match aligns.get(col) {
+                    Some(MdAlignment::Right) => (pad, 0),
+                    Some(MdAlignment::Center) => (pad / 2, pad - pad / 2),
+                    _ => (0, pad),
+                };
+                if left > 0 {
+                    spans.push(Span::raw(" ".repeat(left)));
+                }
+                spans.extend(cell);
+                if right > 0 {
+                    spans.push(Span::raw(" ".repeat(right)));
+                }
+            }
+            self.lines.push(Line::from(spans));
+            if index == 0 && has_header {
+                let rule = widths
+                    .iter()
+                    .map(|width| "─".repeat(*width))
+                    .collect::<Vec<_>>()
+                    .join("─┼─");
+                self.lines.push(Line::from(Span::styled(rule, dim())));
+            }
+        }
+        self.blank_line();
+    }
+
     fn finish(mut self) -> Text<'static> {
         self.flush();
         while matches!(self.lines.last(), Some(line) if line.spans.is_empty()) {
@@ -2555,6 +2640,13 @@ impl MarkdownRenderer {
         }
         Text::from(self.lines)
     }
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 #[cfg(test)]
@@ -2764,5 +2856,57 @@ mod tests {
     fn truncate_line_leaves_fitting_lines_alone() {
         let line = Line::raw("short");
         assert_eq!(truncate_line(line.clone(), 10), line);
+    }
+
+    const TABLE: &str = "| Field | Value |\n|---|---:|\n\
+                         | **Capital** | N'Djamena |\n| Population | ~19-20 million |\n";
+
+    fn span_style(line: &Line, content: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.as_ref() == content)
+            .unwrap_or_else(|| panic!("no span {content:?} in {:?}", flat(line)))
+            .style
+    }
+
+    #[test]
+    fn markdown_table_renders_as_aligned_grid() {
+        let text = render_markdown(TABLE);
+        assert_eq!(
+            flats(&text.lines),
+            vec![
+                "Field      │          Value",
+                "───────────┼───────────────",
+                "Capital    │      N'Djamena",
+                "Population │ ~19-20 million",
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_table_right_aligns_column_by_padding_left() {
+        let text = render_markdown("| a | num |\n|---|--:|\n| b | 7 |\n");
+        assert_eq!(flats(&text.lines), vec!["a │ num", "──┼────", "b │   7"]);
+    }
+
+    #[test]
+    fn markdown_table_preserves_inline_styling() {
+        let text = render_markdown(TABLE);
+        let header = span_style(&text.lines[0], "Field");
+        assert!(header.add_modifier.contains(Modifier::BOLD));
+        let strong = span_style(&text.lines[2], "Capital");
+        assert!(strong.add_modifier.contains(Modifier::BOLD));
+        let plain = span_style(&text.lines[2], "N'Djamena");
+        assert!(!plain.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_table_pads_ragged_rows_as_empty_cells() {
+        let text = render_markdown("| a | b | c |\n|---|---|---|\n| long-cell |\n");
+        let widths: Vec<usize> = flats(&text.lines)
+            .iter()
+            .map(|line| UnicodeWidthStr::width(line.as_str()))
+            .collect();
+        assert_eq!(widths, vec![17, 17, 17]);
     }
 }
