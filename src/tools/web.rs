@@ -156,6 +156,193 @@ fn web_client(allow_local: bool) -> Result<reqwest::Client, reqwest::Error> {
 }
 
 // ---------------------------------------------------------------------------
+// HTML → readable markdown
+// ---------------------------------------------------------------------------
+
+/// Tags dropped wholesale before markdown conversion: non-content machinery
+/// (htmd 0.5 does not strip `<style>`/`<script>` text on its own) and page
+/// chrome that only pads the output.
+const SKIP_TAGS: &[&str] = &[
+    "script", "style", "noscript", "template", "svg", "iframe", "form", "nav", "header", "footer",
+    "aside", "button", "select", "canvas", "video", "audio", "object", "embed", "link", "meta",
+];
+
+/// A converted page smaller than this is checked for bot-challenge markers:
+/// challenge interstitials sanitize down to almost nothing, real pages don't.
+const CHALLENGE_MAX_CONVERTED_BYTES: usize = 2_000;
+
+/// Convert fetched HTML to readable markdown: convert only the
+/// `<main>`/`<article>` region when the page marks one, skip noise tags, and
+/// tidy the result. `None` when htmd fails (the caller falls back to the raw
+/// body).
+fn html_to_markdown(html: &str) -> Option<String> {
+    let converter = htmd::HtmlToMarkdown::builder()
+        .skip_tags(SKIP_TAGS.to_vec())
+        .build();
+    let markdown = converter.convert(content_region(html)).ok()?;
+    Some(tidy_markdown(&markdown))
+}
+
+/// The subtree worth converting: the first `<main>` element if the page has
+/// one, else the first `<article>`, else the whole document.
+fn content_region(html: &str) -> &str {
+    extract_element(html, "main")
+        .or_else(|| extract_element(html, "article"))
+        .unwrap_or(html)
+}
+
+/// Extract the first `<{tag} ...>...</{tag}>` subtree (tags included) from
+/// `html`, matching case-insensitively and accounting for nested elements of
+/// the same name. Returns `None` — meaning "convert the whole document" —
+/// when the tag is absent, self-closing, or never closed.
+fn extract_element<'a>(html: &'a str, tag: &str) -> Option<&'a str> {
+    let bytes = html.as_bytes();
+    let tag = tag.as_bytes();
+    let mut start: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let closing = bytes.get(i + 1) == Some(&b'/');
+        let name_start = if closing { i + 2 } else { i + 1 };
+        let name_end = name_start + tag.len();
+        let named = bytes
+            .get(name_start..name_end)
+            .is_some_and(|name| name.eq_ignore_ascii_case(tag))
+            && bytes
+                .get(name_end)
+                .is_some_and(|&next| next == b'>' || next == b'/' || next.is_ascii_whitespace());
+        if !named {
+            i += 1;
+            continue;
+        }
+        // The tag runs to the next `>`; a tag truncated mid-document means
+        // the structure is off, so fall back to the whole document.
+        let gt = name_end + bytes[name_end..].iter().position(|&byte| byte == b'>')?;
+        if closing {
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&html[start?..=gt]);
+                }
+            }
+        } else if bytes[gt - 1] != b'/' {
+            // Self-closing tags (`<main/>`) carry no subtree; skip them.
+            if start.is_none() {
+                start = Some(i);
+            }
+            depth += 1;
+        }
+        i = gt + 1;
+    }
+    None
+}
+
+/// Tidy converted markdown: drop image syntax (keeping alt text), trim
+/// trailing whitespace per line, and collapse runs of 3+ newlines to 2.
+fn tidy_markdown(markdown: &str) -> String {
+    let stripped = strip_images(markdown);
+    let mut out = String::with_capacity(stripped.len());
+    let mut blank_pending = false;
+    for line in stripped.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank_pending = true;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            if blank_pending {
+                out.push('\n');
+            }
+        }
+        blank_pending = false;
+        out.push_str(line);
+    }
+    out
+}
+
+/// Remove markdown image syntax `![alt](url)`, keeping non-empty alt text.
+/// Anything that does not parse as a complete image is left untouched.
+fn strip_images(markdown: &str) -> String {
+    let bytes = markdown.as_bytes();
+    let mut out = String::with_capacity(markdown.len());
+    let mut copied_to = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'!'
+            && bytes.get(i + 1) == Some(&b'[')
+            && let Some((alt, end)) = parse_image(markdown, i)
+        {
+            out.push_str(&markdown[copied_to..i]);
+            out.push_str(alt.trim());
+            i = end;
+            copied_to = end;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&markdown[copied_to..]);
+    out
+}
+
+/// Parse one `![alt](url)` whose `!` sits at byte `start`. Returns the alt
+/// text and the offset just past the closing `)`, or `None` if the syntax is
+/// incomplete. Nested brackets in the alt and balanced parentheses in the
+/// url are tolerated.
+fn parse_image(markdown: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = markdown.as_bytes();
+    let alt_start = start + 2;
+    let mut depth = 1usize;
+    let mut i = alt_start;
+    let alt_end = loop {
+        match bytes.get(i)? {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    };
+    if bytes.get(alt_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = alt_end + 2;
+    loop {
+        match bytes.get(i)? {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&markdown[alt_start..alt_end], i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Whether raw HTML is a JavaScript bot-challenge interstitial (Cloudflare
+/// and similar) rather than real content.
+fn is_challenge_page(html: &str) -> bool {
+    let html = html.to_lowercase();
+    html.contains("_cf_chl_opt")
+        || html.contains("cf-browser-verification")
+        || html.contains("attention required! | cloudflare")
+        || html.contains("checking if the site connection is secure")
+        || (html.contains("just a moment") && html.contains("enable javascript and cookies"))
+}
+
+// ---------------------------------------------------------------------------
 // web_fetch
 // ---------------------------------------------------------------------------
 
@@ -250,8 +437,23 @@ impl Tool for WebFetchTool {
 
         let text = String::from_utf8_lossy(&body).into_owned();
         let mut content = if content_type.contains("html") {
-            // HTML → markdown; fall back to the raw HTML if conversion fails.
-            htmd::convert(&text).unwrap_or(text)
+            // HTML → readable markdown; fall back to the raw HTML if
+            // conversion fails.
+            match html_to_markdown(&text) {
+                Some(markdown) => {
+                    // A page that sanitizes down to almost nothing and carries
+                    // challenge markers is a bot-protection interstitial, not
+                    // content.
+                    if markdown.len() < CHALLENGE_MAX_CONVERTED_BYTES && is_challenge_page(&text) {
+                        return Ok(ToolOutput::error(format!(
+                            "fetch of {url} was blocked by bot protection (JavaScript challenge \
+                             page); the page content is not accessible to a plain HTTP client"
+                        )));
+                    }
+                    markdown
+                }
+                None => text,
+            }
         } else if is_texty(&content_type) {
             text
         } else {
@@ -1328,6 +1530,213 @@ mod tests {
             .await
             .expect_err("invalid url");
         assert!(matches!(err, ToolError::InvalidArgs { tool, .. } if tool == "web_fetch"));
+    }
+
+    // -- HTML → readable markdown ----------------------------------------------
+
+    /// Trimmed-down Cloudflare "Just a moment..." interstitial, cut from a
+    /// real capture of https://www.britannica.com/place/Chad: title, inline
+    /// CSS, the noscript hint, and the `_cf_chl_opt` challenge script.
+    const CF_CHALLENGE_FIXTURE: &str = r#"<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta name="robots" content="noindex,nofollow"><style>*{box-sizing:border-box;margin:0;padding:0}html{line-height:1.15;-webkit-text-size-adjust:100%;color:#313131;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}body{display:flex;flex-direction:column;height:100vh;min-height:100vh}.main-content{margin:8rem auto;padding-left:1.5rem;max-width:60rem}@media (width <= 720px){.main-content{margin-top:4rem}}#challenge-error-text{background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgZmlsbD0ibm9uZSI+PC9zdmc+");background-repeat:no-repeat;background-size:contain;padding-left:34px}</style><meta http-equiv="refresh" content="360"></head><body><div class="main-wrapper" role="main"><div class="main-content"><noscript><div class="h2"><span id="challenge-error-text">Enable JavaScript and cookies to continue</span></div></noscript></div></div><script nonce="7VqN6B2znfxOt1sma6oiIH">(function(){window._cf_chl_opt = {cFPWv: 'b',cITimeS: '1783599881',cType: 'managed',cZone: 'www.britannica.com',cUPMDTk:"/place/Chad?__cf_chl_tk=O0KNo0DbPl4",cvId: '3'};var trkjs = document.createElement('img');trkjs.setAttribute('src', '/cdn-cgi/images/trace/managed/nojs/transparent.gif?ray=a1874e9c5b7abaf2');}());</script></body></html>"#;
+
+    #[test]
+    fn style_and_script_content_never_reach_the_markdown() {
+        // Regression for the user-reported bug: htmd 0.5 emits the text of
+        // <style>/<script>/<noscript>/<svg> unless the tags are skipped.
+        let html = "<html><head><style>body{color:red;font-family:Arial}</style></head><body>\
+                    <script>var tracker = 1;</script><p>Real content.</p>\
+                    <noscript>Enable JavaScript</noscript>\
+                    <svg><path d=\"M0 0L1 1\"/></svg></body></html>";
+        let md = html_to_markdown(html).unwrap();
+        assert!(md.contains("Real content."), "{md}");
+        assert!(!md.contains("color:red"), "style stripped: {md}");
+        assert!(!md.contains("var tracker"), "script stripped: {md}");
+        assert!(!md.contains("Enable JavaScript"), "noscript stripped: {md}");
+        assert!(!md.contains("M0 0"), "svg stripped: {md}");
+    }
+
+    #[test]
+    fn page_chrome_is_dropped_from_the_markdown() {
+        let html = "<body><nav><a href=\"/a\">Home</a></nav><header>Site header</header>\
+                    <p>Body text.</p><form><button>Subscribe</button></form>\
+                    <footer>Copyright</footer><aside>Related links</aside></body>";
+        let md = html_to_markdown(html).unwrap();
+        assert!(md.contains("Body text."), "{md}");
+        for junk in [
+            "Home",
+            "Site header",
+            "Subscribe",
+            "Copyright",
+            "Related links",
+        ] {
+            assert!(!md.contains(junk), "'{junk}' leaked into: {md}");
+        }
+    }
+
+    #[test]
+    fn content_region_prefers_main_then_article_then_whole_document() {
+        let html = "<body><article>from article</article><main id=\"m\">from main</main></body>";
+        assert_eq!(content_region(html), "<main id=\"m\">from main</main>");
+        let html = "<body><p>pre</p><article>from article</article><p>post</p></body>";
+        assert_eq!(content_region(html), "<article>from article</article>");
+        let html = "<body><p>no landmark here</p></body>";
+        assert_eq!(content_region(html), html);
+    }
+
+    #[test]
+    fn extract_element_is_case_insensitive_and_tracks_nesting() {
+        let html = "<MAIN class=\"a\"><p>x</p><main>inner</main>tail</MAIN>rest";
+        assert_eq!(
+            extract_element(html, "main"),
+            Some("<MAIN class=\"a\"><p>x</p><main>inner</main>tail</MAIN>")
+        );
+    }
+
+    #[test]
+    fn extract_element_ignores_lookalike_names() {
+        // Neither a longer tag name nor attribute values may match.
+        let html = "<mainframe>no</mainframe><div class=\"main\" data-main=\"x\">no</div>";
+        assert_eq!(extract_element(html, "main"), None);
+    }
+
+    #[test]
+    fn extract_element_survives_malformed_html_without_matching() {
+        for html in [
+            "",
+            "<",
+            "</",
+            "<main",
+            "<main ",
+            "<main class=", // truncated inside the opening tag
+            "<main>never closed",
+            "<main><main>closed once</main>",
+            "</main>close before open",
+            "<main/>", // self-closing: no subtree
+            "<main attr=\"</main>\"",
+            "<main\u{2192}>unicode after name</main\u{2192}>",
+        ] {
+            assert_eq!(extract_element(html, "main"), None, "{html:?}");
+        }
+        // A stray close does not stop a later real element from matching.
+        assert_eq!(
+            extract_element("</main><main>real</main>", "main"),
+            Some("<main>real</main>")
+        );
+        // A self-closing lookalike does not stop a later real element.
+        assert_eq!(
+            extract_element("<main/><main>real</main>", "main"),
+            Some("<main>real</main>")
+        );
+    }
+
+    #[test]
+    fn image_syntax_is_removed_keeping_alt_text() {
+        assert_eq!(
+            strip_images("before ![a chart](https://x/y.png) after"),
+            "before a chart after"
+        );
+        assert_eq!(strip_images("![](https://x/decorative.png)text"), "text");
+        // Balanced parentheses inside the url are consumed.
+        assert_eq!(
+            strip_images("![x](https://en.wikipedia.org/wiki/Chad_(country))!"),
+            "x!"
+        );
+        // A linked image keeps the link, dropping only the image part.
+        assert_eq!(
+            strip_images("[![logo](https://x/l.svg)](https://x/)"),
+            "[logo](https://x/)"
+        );
+        // Incomplete syntax is left untouched.
+        assert_eq!(strip_images("![dangling](no-close"), "![dangling](no-close");
+        assert_eq!(strip_images("![no-url]"), "![no-url]");
+        assert_eq!(
+            strip_images("plain ! bang [link](url)"),
+            "plain ! bang [link](url)"
+        );
+        assert_eq!(strip_images("!["), "![");
+    }
+
+    #[test]
+    fn markdown_blank_runs_and_trailing_whitespace_are_collapsed() {
+        assert_eq!(tidy_markdown("a\n\n\n\nb"), "a\n\nb");
+        assert_eq!(tidy_markdown("a\n\nb"), "a\n\nb", "double newline kept");
+        assert_eq!(tidy_markdown("a  \nb\t\nc"), "a\nb\nc");
+        assert_eq!(tidy_markdown("\n\na\n\n"), "a");
+        assert_eq!(tidy_markdown(""), "");
+    }
+
+    #[test]
+    fn challenge_markers_are_detected() {
+        assert!(is_challenge_page(CF_CHALLENGE_FIXTURE));
+        assert!(is_challenge_page(
+            "<title>Attention Required! | Cloudflare</title>"
+        ));
+        assert!(is_challenge_page(
+            "checking if the site connection is secure"
+        ));
+        assert!(is_challenge_page("<div class=\"cf-browser-verification\">"));
+        // "just a moment" alone is not enough.
+        assert!(!is_challenge_page("<p>Just a moment while I check</p>"));
+        assert!(!is_challenge_page(
+            "<main>Chad is a landlocked country in Africa.</main>"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_challenge_pages_as_a_one_line_error() {
+        let addr = serve(http_response(
+            "text/html; charset=utf-8",
+            CF_CHALLENGE_FIXTURE,
+        ))
+        .await;
+        let out = WebFetchTool
+            .execute(json!({ "url": format!("http://{addr}/") }), &local_ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            out.content,
+            format!(
+                "fetch of http://{addr}/ was blocked by bot protection (JavaScript challenge \
+                 page); the page content is not accessible to a plain HTTP client"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_extracts_the_main_region_and_drops_junk() {
+        let html = "<html><head><title>T</title><style>.junk{display:none}</style></head>\
+            <body><nav><a href=\"/one\">Elsewhere</a></nav>\
+            <main><h1>Chad</h1><p>Chad is a landlocked country.</p>\
+            <img src=\"/map.png\" alt=\"Map of Chad\"></main>\
+            <footer>Cookie banner. Sign up!</footer>\
+            <script>analytics();</script></body></html>";
+        let addr = serve(http_response("text/html", html)).await;
+        let out = WebFetchTool
+            .execute(json!({ "url": format!("http://{addr}/") }), &local_ctx())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("# Chad"), "{}", out.content);
+        assert!(
+            out.content.contains("Chad is a landlocked country."),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Map of Chad"),
+            "image alt text kept: {}",
+            out.content
+        );
+        for junk in [
+            "display:none",
+            "Elsewhere",
+            "Cookie banner",
+            "analytics()",
+            "map.png",
+        ] {
+            assert!(!out.content.contains(junk), "'{junk}' in: {}", out.content);
+        }
     }
 
     // -- web_search -----------------------------------------------------------

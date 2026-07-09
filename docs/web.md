@@ -8,6 +8,7 @@ Fetch a URL over HTTP(S) and return its content.
 
 - **Arguments:** `url` (required), `max_bytes` (optional cap on response bytes read; clamped to the config cap)
 - HTML pages are converted to markdown; other text content types (plain text, JSON, XML, ...) are returned as-is; binary content is summarized, not dumped
+- Conversion keeps the readable content: the `<main>`/`<article>` region when the page marks one, with script/style/nav/footer chrome and image syntax stripped; JavaScript bot-challenge interstitials (e.g. Cloudflare's "Just a moment...") return a one-line error instead of challenge markup
 - Sends a desktop browser user agent, follows redirects (max 10), 30-second timeout
 - The response body is read up to `fetch_max_bytes` (default 100 000) and marked when capped
 
