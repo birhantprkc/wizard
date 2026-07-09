@@ -165,7 +165,7 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 
 `gguf_path` is what lets Wizard start `llama-server` for you; without it (e.g. a server you run yourself, or on another machine) Wizard just connects to `base_url`. `gguf_path` only applies to `kind = "llamacpp"` providers, which never use an API key.
 
-The installer also lays down `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/` (a four-subagent roster), each file only if absent; see [the default loadout](loadout.md).
+The installer also lays down `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/` (a four-subagent roster), each file only if absent; see [the default loadout](loadout.md). To move this state (config, skills, commands, subagents, scripted tools) to another machine, see [Sync](sync.md).
 
 ### Spinner verbs (`[ui]`)
 
@@ -432,4 +432,5 @@ RUST_LOG=wizard=debug wizard
 - [Personality modes](modes.md): genie vs sovereign
 - [Self-extension](evolve.md): how `/evolve` adds capabilities
 - [Bring your own model](byom.md): any GGUF, or custom Ollama models
+- [Sync](sync.md): move your config and skills to another machine as a signed bundle
 - [Architecture](architecture.md): how Wizard works under the hood

@@ -34,6 +34,7 @@ pub mod schedule;
 pub mod server;
 pub mod session_registry;
 pub mod skills;
+pub mod sync;
 pub mod tools;
 pub mod ui;
 pub mod update;
@@ -117,6 +118,17 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return update::run(*check, to.clone(), *force, *rollback).await;
+    }
+
+    // Config/skills sync: `wizard sync` packs and pulls signed bundles of
+    // portable ~/.wizard state. Self-contained — no config load (pull reads
+    // `[sync].source` from config.toml directly), no onboarding, no LLM — so
+    // it dispatches before the config load like `update`.
+    if let Some(cli::Command::Sync { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return sync::run(cmd.clone()).await;
     }
 
     // Doctor diagnoses the environment — starting with "does the config

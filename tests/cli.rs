@@ -12,8 +12,12 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // A per-process counter so one test can hold several dirs at once
+        // (e.g. two fake homes for a sync round trip).
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wizard-itest-{}-{:?}",
+            "wizard-itest-{}-{:?}-{seq}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -604,6 +608,113 @@ fn e2e_inference_with_auto_spawned_llama_server() {
         "wizard must report the server it spawned:\n{stdout}"
     );
     assert!(!stderr.contains("panicked"), "must not panic:\n{stderr}");
+}
+
+#[test]
+fn sync_key_prints_public_key_and_fingerprint() {
+    let home = TempDir::new();
+    let output = run_wizard(&home.0, &["sync", "key"], &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sync key must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("public key:"), "{stdout}");
+    assert!(stdout.contains("SHA256:"), "fingerprint printed:\n{stdout}");
+    assert!(
+        home.0.join(".wizard/sync/key").is_file(),
+        "the keypair is generated on first use"
+    );
+
+    // A second invocation reuses the key: identical output.
+    let again = run_wizard(&home.0, &["sync", "key"], &[]);
+    assert!(again.status.success());
+    assert_eq!(output.stdout, again.stdout, "the key is stable");
+}
+
+#[test]
+fn sync_pack_and_pull_round_trip_across_homes() {
+    let home_a = TempDir::new();
+    let home_b = TempDir::new();
+
+    // Seed machine A with portable state.
+    write_config(&home_a.0, "model = \"qwen3.6:27b\"\n");
+    let skill = home_a.0.join(".wizard/skills/demo/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).expect("create skill dir");
+    std::fs::write(&skill, "# demo skill\n").expect("write skill");
+
+    // Pack on A.
+    let bundle = home_a.0.join("bundle.tar.gz");
+    let bundle_str = bundle.to_string_lossy().to_string();
+    let output = run_wizard(&home_a.0, &["sync", "pack", "--out", &bundle_str], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pack must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("packed"), "pack summary:\n{stdout}");
+    assert!(stdout.contains("SHA256:"), "signing fingerprint:\n{stdout}");
+    assert!(
+        stdout.contains("not included"),
+        "credentials excluded by default:\n{stdout}"
+    );
+    assert!(bundle.is_file(), "the bundle file exists");
+
+    // Dry-run pull on B: verified, reported, nothing written.
+    let output = run_wizard(&home_b.0, &["sync", "pull", &bundle_str, "--dry-run"], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dry-run pull must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("signature: OK"), "{stdout}");
+    assert!(stdout.contains("dry run"), "{stdout}");
+    assert!(
+        !home_b.0.join(".wizard/config.toml").exists(),
+        "dry run writes nothing"
+    );
+    assert!(
+        !home_b.0.join(".wizard/sync/trusted_keys").exists(),
+        "dry run pins nothing"
+    );
+
+    // Real pull on B: files arrive, the key is pinned (TOFU).
+    let output = run_wizard(&home_b.0, &["sync", "pull", &bundle_str], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pull must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("applied"), "apply summary:\n{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(home_b.0.join(".wizard/config.toml")).expect("config arrived"),
+        "model = \"qwen3.6:27b\"\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home_b.0.join(".wizard/skills/demo/SKILL.md"))
+            .expect("skill arrived"),
+        "# demo skill\n"
+    );
+    let pinned = std::fs::read_to_string(home_b.0.join(".wizard/sync/trusted_keys"))
+        .expect("trusted_keys pinned");
+    assert!(pinned.contains("# pinned"), "pin comment present: {pinned}");
+}
+
+#[test]
+fn sync_pull_without_a_source_is_an_actionable_error() {
+    let home = TempDir::new();
+    let output = run_wizard(&home.0, &["sync", "pull"], &[]);
+    assert!(!output.status.success(), "no source anywhere must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[sync]") && stderr.contains("source"),
+        "error points at the config key:\n{stderr}"
+    );
 }
 
 #[test]

@@ -384,6 +384,16 @@ impl Default for UpdateConfig {
     }
 }
 
+/// Cross-machine sync settings (`[sync]` in `config.toml`); see `wizard sync`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Default source for `wizard sync pull`: a bundle file path or http(s)
+    /// URL, used when no positional source is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// Model-fusion settings (`[fusion]` in `config.toml`); see `/fusion` and
 /// [`crate::llm::fusion`]. Panel and synthesizer reference existing
 /// [`ProviderConfig`] entries by name — each provider already binds a model, so
@@ -628,6 +638,9 @@ pub struct Config {
     /// Self-update settings (`wizard update` + the passive startup check).
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Cross-machine sync settings (`wizard sync`).
+    #[serde(default)]
+    pub sync: SyncConfig,
     /// Model-fusion settings (`/fusion`). Absent until configured; the toggle
     /// falls back to a default panel derived from `providers` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,6 +683,7 @@ impl Default for Config {
             checkpoints: CheckpointConfig::default(),
             fleet: FleetConfig::default(),
             update: UpdateConfig::default(),
+            sync: SyncConfig::default(),
             fusion: None,
         }
     }
@@ -1201,6 +1215,9 @@ mod tests {
                 repo: "acme/wizard".to_string(),
                 interval_hours: 6,
             },
+            sync: SyncConfig {
+                source: Some("https://example.com/wizard-sync.tar.gz".to_string()),
+            },
             fusion: Some(FusionConfig {
                 panel: vec!["openai".to_string()],
                 synthesizer: "openai".to_string(),
@@ -1246,7 +1263,19 @@ mod tests {
         assert_eq!(parsed.checkpoints, original.checkpoints);
         assert_eq!(parsed.fleet, original.fleet);
         assert_eq!(parsed.update, original.update);
+        assert_eq!(parsed.sync, original.sync);
         assert_eq!(parsed.fusion, original.fusion);
+    }
+
+    #[test]
+    fn sync_defaults_when_section_missing() {
+        let config: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert_eq!(config.sync, SyncConfig::default());
+        assert!(config.sync.source.is_none());
+
+        let config: Config =
+            toml::from_str("[sync]\nsource = \"~/bundles/w.tar.gz\"").expect("valid toml");
+        assert_eq!(config.sync.source.as_deref(), Some("~/bundles/w.tar.gz"));
     }
 
     #[test]

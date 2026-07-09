@@ -61,6 +61,17 @@ mv /usr/local/bin/wizard.prev /usr/local/bin/wizard
 
 Be clear about what the smoke test is: it proves the new binary launches and reports a version, nothing more. It does not prove the change is correct, safe, or what you asked for. Deep evolve is the model rewriting its own agent loop, checked only by the compiler and the smoke test. The record and the rollback are the safety net: every deep evolution is logged with its diff to `~/.wizard/evolution.jsonl`, the source checkout at `~/.wizard/src` keeps the change as a git commit, and the prior binary stays one `mv` away.
 
+## `wizard sync` bundles
+
+`wizard sync` moves config, skills, commands, subagents, and scripted tools between machines as a signed bundle ([sync.md](docs/sync.md)). The mechanics:
+
+- **Signed manifest.** Bundles are ed25519-signed: the manifest lists the sha256 of every file, `manifest.sig` signs the manifest, and the bundle embeds the sender's public key. Each machine's key seed lives at `~/.wizard/sync/key` (mode 0600).
+- **All-or-nothing verification.** `pull` checks the signature, then the trust list, then every file hash; nothing is written to `~/.wizard/` unless all of it passes.
+- **Trust on first use.** Like SSH: the first pull pins the sender's public key into `~/.wizard/sync/trusted_keys` and prints its fingerprint for out-of-band comparison (`wizard sync key` on the source machine). Later pulls reject bundles signed by unknown keys.
+- **Signed, not encrypted.** Anyone who obtains a bundle can read it. Credentials (`credentials.toml`, `xai_oauth.json`) are excluded by default; `--include-credentials` opts them in, writes the bundle file 0600, and prints a warning. Transfer such a bundle privately (`scp`), never over a public URL.
+
+Be clear about what pinning a key means: a bundle carries commands, subagents, and scripted tools, which later run with your privileges. Trusting a machine's key in `trusted_keys` trusts whoever controls that machine to ship that state to this one.
+
 ## No sandbox
 
 All tools run directly with your user's privileges. The `execute` tool runs real shell commands and cannot be confined to the working directory: absolute paths, `cd ..`, pipes, and network access are all reachable. The same is true of MCP servers and scripted tools. Treat tool execution as full local access, because it is.
