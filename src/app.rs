@@ -4846,9 +4846,10 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             app.selection = None;
                         } else if let Err(err) = copy_to_clipboard(&text) {
                             app.notice(format!("could not copy selection: {err:#}"));
-                        } else {
-                            app.notice(format!("copied {} chars", text.chars().count()));
                         }
+                        // Success is silent: the persistent highlight is the
+                        // feedback, and an unchanged transcript keeps the
+                        // highlight aligned with the selected rows.
                     }
                 }
             }
