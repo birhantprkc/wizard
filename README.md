@@ -86,13 +86,3 @@ MIT; see [LICENSE](LICENSE).
 ## Author
 
 Teddy Tennant ([github.com/teddytennant](https://github.com/teddytennant))
-
-## Star history
-
-<a href="https://www.star-history.com/#teddytennant/wizard&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=teddytennant/wizard&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=teddytennant/wizard&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=teddytennant/wizard&type=Date" />
-  </picture>
-</a>
