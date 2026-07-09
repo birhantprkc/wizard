@@ -453,7 +453,9 @@ impl SlashCommand {
             "effort" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
                 None => Ok(Self::Effort(None)),
                 Some("low") => Ok(Self::Effort(Some(Some(ReasoningEffort::Low)))),
-                Some("medium") | Some("med") => Ok(Self::Effort(Some(Some(ReasoningEffort::Medium)))),
+                Some("medium") | Some("med") => {
+                    Ok(Self::Effort(Some(Some(ReasoningEffort::Medium))))
+                }
                 Some("high") => Ok(Self::Effort(Some(Some(ReasoningEffort::High)))),
                 Some("default") | Some("off") | Some("none") => Ok(Self::Effort(Some(None))),
                 Some(other) => Err(format!(
@@ -535,11 +537,27 @@ impl SlashCommand {
         use SlashCommand::*;
         match self {
             // State the agent can set on itself, plus read-only info toggles.
-            Model(Some(_)) | Mode(Some(_)) | Effort(Some(_)) | Goal(_) | Diff | Todos
-            | Subagents | Dashboard | Cost | Memory | Doctor | Status | Bashes | Compact
-            | Reload | Plan | Omakase | Settings | Vim | Help | Fusion(FusionAction::Toggle) => {
-                Ok(())
-            }
+            Model(Some(_))
+            | Mode(Some(_))
+            | Effort(Some(_))
+            | Goal(_)
+            | Diff
+            | Todos
+            | Subagents
+            | Dashboard
+            | Cost
+            | Memory
+            | Doctor
+            | Status
+            | Bashes
+            | Compact
+            | Reload
+            | Plan
+            | Omakase
+            | Settings
+            | Vim
+            | Help
+            | Fusion(FusionAction::Toggle) => Ok(()),
 
             // Interactive pickers: there is no human at the keyboard mid-turn,
             // so require the argument that names the choice directly.
@@ -549,9 +567,9 @@ impl SlashCommand {
             Fusion(FusionAction::Config) => {
                 Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
             }
-            Agents => {
-                Err("`/agents` opens a picker for the user; spawn subagents with the spawn tool".into())
-            }
+            Agents => Err(
+                "`/agents` opens a picker for the user; spawn subagents with the spawn tool".into(),
+            ),
 
             // Session-ending, destructive, or external-setup commands are off
             // limits to the agent.
@@ -559,14 +577,20 @@ impl SlashCommand {
             Clear => Err("refusing to clear the conversation on the user's behalf".into()),
             Rewind(_) => Err("`/rewind` restores checkpoints and is the user's call".into()),
             Resume(_) => Err("`/resume` switches sessions and is the user's call".into()),
-            Evolve { .. } => Err("`/evolve` is a heavyweight self-edit; leave it to the user".into()),
+            Evolve { .. } => {
+                Err("`/evolve` is a heavyweight self-edit; leave it to the user".into())
+            }
             Publish { .. } => Err("`/publish` forks the tool; leave it to the user".into()),
             Provider(_) | ProviderSetup { .. } => {
                 Err("provider setup is the user's call; use `/model` to switch models".into())
             }
-            Server(_) => Err("`/server` manages the local model server; leave it to the user".into()),
+            Server(_) => {
+                Err("`/server` manages the local model server; leave it to the user".into())
+            }
             Login(_) => Err("`/login` is an interactive sign-in; leave it to the user".into()),
-            ImportClaude(_) => Err("`/settings` import is driven from a picker; leave it to the user".into()),
+            ImportClaude(_) => {
+                Err("`/settings` import is driven from a picker; leave it to the user".into())
+            }
         }
     }
 }
@@ -5747,10 +5771,26 @@ impl CommandContext<'_> {
         }
         let current = self.app.config.reasoning_effort;
         let rows = [
-            ("high", "most reasoning — slowest, best on hard tasks", Some(ReasoningEffort::High)),
-            ("medium", "balanced reasoning", Some(ReasoningEffort::Medium)),
-            ("low", "least reasoning — fastest, cheapest", Some(ReasoningEffort::Low)),
-            ("default", "leave the provider default (e.g. Grok 4.5 → high)", None),
+            (
+                "high",
+                "most reasoning — slowest, best on hard tasks",
+                Some(ReasoningEffort::High),
+            ),
+            (
+                "medium",
+                "balanced reasoning",
+                Some(ReasoningEffort::Medium),
+            ),
+            (
+                "low",
+                "least reasoning — fastest, cheapest",
+                Some(ReasoningEffort::Low),
+            ),
+            (
+                "default",
+                "leave the provider default (e.g. Grok 4.5 → high)",
+                None,
+            ),
         ];
         let items: Vec<PickerItem> = rows
             .iter()
@@ -7653,9 +7693,7 @@ mod tests {
         // Render a frame so the click hit map is populated.
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| crate::ui::draw(frame, &app))
-            .unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
         let (row, hit_index) = *app
             .card_hits
             .borrow()
@@ -7674,9 +7712,7 @@ mod tests {
         ));
 
         // ...and a second click (at its possibly-shifted row) collapses it.
-        terminal
-            .draw(|frame| crate::ui::draw(frame, &app))
-            .unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
         let row = app.card_hits.borrow().first().map(|(y, _)| *y).unwrap();
         click(&mut app, 2, row);
         assert!(matches!(
