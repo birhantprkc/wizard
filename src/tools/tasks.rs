@@ -369,8 +369,9 @@ impl Tool for TaskOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Return the status and buffered output (stdout+stderr tail) of a background task \
-         started with execute run_in_background."
+        r#"Return the status and buffered output (stdout+stderr tail) of a background task started with execute run_in_background.
+
+For services that must outlive the agent (web servers, VMs), prefer `nohup ... &` and check logs with ordinary shell commands rather than this tool."#
     }
 
     fn parameters(&self) -> Value {
@@ -432,7 +433,9 @@ impl Tool for TaskKillTool {
     }
 
     fn description(&self) -> &str {
-        "Kill a running background task started with execute run_in_background."
+        r#"Kill a running background task started with execute run_in_background.
+
+Note: only use this for agent-managed jobs. Do not start long-lived services (HTTP, QEMU, daemons that verifiers need after the session) via run_in_background — use `nohup ... &` instead so they are not tied to the agent task registry."#
     }
 
     fn parameters(&self) -> Value {

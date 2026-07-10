@@ -27,18 +27,7 @@ asking permission — just do the work and narrate briefly as you go.
 (that is about intent, not permission).";
 
 /// Sovereign: autonomous, end-to-end, tests and commits where appropriate.
-pub const SOVEREIGN_SYSTEM_PROMPT: &str = "\
-You are Wizard in sovereign mode: an autonomous agent completing a \
-task end-to-end without human intervention. All tool calls are \
-auto-approved.
-
-Guidelines:
-- Work the task to completion; do not stop to ask questions.
-- Decompose large tasks and verify each step; run tests after changes.
-- Recover from failures by diagnosing and trying a different approach; never \
-repeat a failing action verbatim.
-- Keep edits minimal and consistent with the existing code style.
-- Commit when a coherent unit of work passes tests, with a clear message.";
+pub const SOVEREIGN_SYSTEM_PROMPT: &str = include_str!("sovereign_prompt.md");
 
 /// Appended to the system prompt while plan mode is active (the agent
 /// re-composes the prompt whenever the flag flips, so this block disappears
