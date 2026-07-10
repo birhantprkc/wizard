@@ -67,9 +67,12 @@ fn accent() -> Style {
 /// Render one frame. The only entry point the main loop calls; everything
 /// else in this module is a helper.
 pub fn draw(frame: &mut Frame, app: &App) {
-    // The composer grows with its content (one row per hard line break) up to
-    // MAX_INPUT_ROWS, then scrolls internally. +2 for the rules above/below.
-    let input_rows = (app.input.split('\n').count() as u16).clamp(1, MAX_INPUT_ROWS);
+    // The composer grows with its content (hard line breaks plus soft-wrapped
+    // continuations) up to MAX_INPUT_ROWS, then scrolls vertically. +2 for the
+    // rules above/below.
+    let budget = composer_budget(frame.area().width);
+    let input_rows =
+        (wrap_rows(&composer_chars(app), budget).len() as u16).clamp(1, MAX_INPUT_ROWS);
     let [main_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(input_rows + 2),
@@ -894,9 +897,75 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Columns available for composer text: one of left padding, two for the
+/// prompt glyph, and one spare so the caret can sit just past a full row.
+fn composer_budget(width: u16) -> usize {
+    (width as usize).saturating_sub(4).max(1)
+}
+
+/// The composer buffer as chars for layout. In the inline provider-setup
+/// prompt the API-key field is masked: each typed character renders as a
+/// width-1 bullet (so the cursor math is unaffected) and the real key never
+/// reaches the screen.
+fn composer_chars(app: &App) -> Vec<char> {
+    if app.prompt_is_masked() {
+        vec!['•'; app.input.chars().count()]
+    } else {
+        app.input.chars().collect()
+    }
+}
+
+/// Soft-wrap the composer buffer at `budget` display columns. Each visual row
+/// is the half-open char range `[start, end)`: the buffer splits on hard line
+/// breaks (a '\n' belongs to no row), then each logical line packs greedily by
+/// display width. Wide chars never split across rows, and every row keeps at
+/// least one char so a pathological budget cannot loop.
+fn wrap_rows(chars: &[char], budget: usize) -> Vec<(usize, usize)> {
+    let budget = budget.max(1);
+    let breaks = chars
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c == '\n')
+        .map(|(i, _)| i);
+    let mut rows = Vec::new();
+    let mut ls = 0usize;
+    for le in breaks.chain(std::iter::once(chars.len())) {
+        let mut rs = ls;
+        let mut used = 0usize;
+        for (i, c) in chars.iter().enumerate().take(le).skip(ls) {
+            let w = c.width().unwrap_or(0);
+            if i > rs && used + w > budget {
+                rows.push((rs, i));
+                rs = i;
+                used = 0;
+            }
+            used += w;
+        }
+        rows.push((rs, le));
+        ls = le + 1;
+    }
+    rows
+}
+
+/// Map a cursor (char offset) to its visual (row, column-in-chars) position
+/// in `rows` from [`wrap_rows`]. A cursor exactly on a soft-wrap boundary
+/// belongs to the start of the next visual row (that is where the next char
+/// would land); at a hard break or end of text it stays at the end of its row.
+fn cursor_visual(rows: &[(usize, usize)], cursor: usize) -> (usize, usize) {
+    for (ri, &(rs, re)) in rows.iter().enumerate() {
+        // The next row continues this logical line iff it starts where this
+        // row ends (a hard break consumes the '\n', leaving a gap of one).
+        let continues = rows.get(ri + 1).is_some_and(|&(ns, _)| ns == re);
+        if cursor < re || (cursor == re && !continues) {
+            return (ri, cursor.saturating_sub(rs));
+        }
+    }
+    (rows.len().saturating_sub(1), 0)
+}
+
 /// Input: a clean accent prompt bracketed by dim rules above and below — no
-/// box. Handles cursor-aware horizontal scrolling and inline ghost-text
-/// completion.
+/// box. Soft-wraps long lines onto continuation rows and handles inline
+/// ghost-text completion.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     if area.height < 3 || area.width < 6 {
         return;
@@ -907,43 +976,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     // transcript margin.
     let pad = 1usize;
     let prompt_width = 2usize;
-    let budget = (area.width as usize)
-        .saturating_sub(pad + prompt_width + 1)
-        .max(1);
+    let budget = composer_budget(area.width);
 
-    // In the inline provider-setup prompt the API-key field is masked: each
-    // typed character renders as a width-1 bullet (so the cursor math is
-    // unaffected) and the real key never reaches the screen.
-    let chars: Vec<char> = if app.prompt_is_masked() {
-        vec!['•'; app.input.chars().count()]
-    } else {
-        app.input.chars().collect()
-    };
+    let chars = composer_chars(app);
     let cursor = app.cursor.min(chars.len());
     let normal = app.vim.is_normal();
 
-    // Split the buffer into logical rows on hard line breaks; each row is the
-    // half-open char range `[rs, re)` (the '\n' itself is not part of a row).
-    let mut rows: Vec<(usize, usize)> = Vec::new();
-    let mut start_char = 0usize;
-    for (i, &c) in chars.iter().enumerate() {
-        if c == '\n' {
-            rows.push((start_char, i));
-            start_char = i + 1;
-        }
-    }
-    rows.push((start_char, chars.len()));
-
-    // Locate the cursor (row, column-in-chars). `cursor <= re` puts an
-    // end-of-row cursor (just before the break) on that row, not the next.
-    let (mut crow, mut ccol) = (0usize, 0usize);
-    for (ri, &(rs, re)) in rows.iter().enumerate() {
-        if cursor <= re {
-            crow = ri;
-            ccol = cursor - rs;
-            break;
-        }
-    }
+    let rows = wrap_rows(&chars, budget);
+    let (crow, ccol) = cursor_visual(&rows, cursor);
 
     // Vertical window: show a block of rows that keeps the cursor row in view.
     let content_h = (area.height as usize).saturating_sub(2).max(1);
@@ -964,24 +1004,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         let widths: Vec<usize> = row.iter().map(|c| c.width().unwrap_or(0)).collect();
         let is_cursor_row = ri == crow;
 
-        // Only the cursor's row scrolls horizontally to keep the caret visible;
-        // other rows render from their start and truncate at the budget.
-        let mut hstart = 0usize;
-        if is_cursor_row {
-            let mut cols: usize = widths[..ccol.min(widths.len())].iter().sum();
-            while hstart < ccol && cols > budget - 1 {
-                cols -= widths[hstart];
-                hstart += 1;
-            }
-        }
-        let mut hend = hstart;
-        let mut used = 0usize;
-        while hend < row.len() && used + widths[hend] <= budget {
-            used += widths[hend];
-            hend += 1;
-        }
-
-        // First row carries the prompt glyph; continuation rows indent to match.
+        // First row carries the prompt glyph; continuation rows (wrapped or
+        // hard-broken) indent to match.
         let leading = if ri == 0 {
             Span::styled("❯ ", accent().bold())
         } else {
@@ -992,27 +1016,22 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         if normal && is_cursor_row {
             // Vim Normal mode paints its own block cursor (reversed cell) so the
             // mode is legible without a hardware caret.
-            let rel = ccol.saturating_sub(hstart).min(hend - hstart);
-            spans.push(Span::raw(
-                row[hstart..hstart + rel].iter().collect::<String>(),
-            ));
-            if hstart + rel < hend {
-                spans.push(Span::styled(row[hstart + rel].to_string(), block));
-                spans.push(Span::raw(
-                    row[hstart + rel + 1..hend].iter().collect::<String>(),
-                ));
+            let rel = ccol.min(row.len());
+            spans.push(Span::raw(row[..rel].iter().collect::<String>()));
+            if rel < row.len() {
+                spans.push(Span::styled(row[rel].to_string(), block));
+                spans.push(Span::raw(row[rel + 1..].iter().collect::<String>()));
             } else {
                 spans.push(Span::styled(" ", block));
             }
         } else {
-            spans.push(Span::raw(row[hstart..hend].iter().collect::<String>()));
+            spans.push(Span::raw(row.iter().collect::<String>()));
 
             // Ghost text (command completion) only makes sense on a single-row
             // line with the cursor at the very end, where → can accept it.
             if is_cursor_row
                 && !normal
                 && rows.len() == 1
-                && hstart == 0
                 && cursor == chars.len()
                 && app.picker.is_none()
                 && app.input_mode == InputMode::Command
@@ -1025,6 +1044,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
                         ghost.push(' ');
                         ghost.push_str(&spec.args);
                     }
+                    let used: usize = widths.iter().sum();
                     let room = budget.saturating_sub(used);
                     if !ghost.is_empty() && room > 0 {
                         let ghost: String = ghost.chars().take(room).collect();
@@ -1034,7 +1054,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             }
 
             if is_cursor_row && !normal {
-                let cols: usize = widths[hstart..ccol.min(widths.len())].iter().sum();
+                let cols: usize = widths[..ccol.min(widths.len())].iter().sum();
                 let x = area.x + (pad + prompt_width) as u16 + cols as u16;
                 let y = area.y + 1 + (ri - voff) as u16;
                 cursor_xy = Some((x, y));
@@ -2908,5 +2928,86 @@ mod tests {
             .map(|line| UnicodeWidthStr::width(line.as_str()))
             .collect();
         assert_eq!(widths, vec![17, 17, 17]);
+    }
+
+    fn cs(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn composer_wrap_keeps_short_lines_whole() {
+        assert_eq!(wrap_rows(&cs("hello"), 10), vec![(0, 5)]);
+        assert_eq!(wrap_rows(&cs(""), 10), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn composer_wrap_splits_long_lines_at_the_budget() {
+        // "abcdef" at 3 columns: two full rows; at 4: 4 + 2.
+        assert_eq!(wrap_rows(&cs("abcdef"), 3), vec![(0, 3), (3, 6)]);
+        assert_eq!(wrap_rows(&cs("abcdef"), 4), vec![(0, 4), (4, 6)]);
+    }
+
+    #[test]
+    fn composer_wrap_respects_hard_breaks_and_trailing_newline() {
+        // The '\n' belongs to no row; a trailing one yields an empty last row.
+        assert_eq!(wrap_rows(&cs("ab\ncd"), 10), vec![(0, 2), (3, 5)]);
+        assert_eq!(wrap_rows(&cs("ab\n"), 10), vec![(0, 2), (3, 3)]);
+        assert_eq!(wrap_rows(&cs("a\n\nb"), 10), vec![(0, 1), (2, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn composer_wrap_never_splits_a_wide_char() {
+        // '你' is 2 columns; at budget 3 it doesn't fit after "ab" and moves
+        // whole to the next row.
+        assert_eq!(wrap_rows(&cs("ab你c"), 3), vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn composer_cursor_maps_through_soft_wraps() {
+        let rows = wrap_rows(&cs("abcdef"), 3); // (0,3) (3,6)
+        assert_eq!(cursor_visual(&rows, 2), (0, 2));
+        // Exactly on the wrap boundary: start of the next visual row.
+        assert_eq!(cursor_visual(&rows, 3), (1, 0));
+        // End of text: end of the last row.
+        assert_eq!(cursor_visual(&rows, 6), (1, 3));
+    }
+
+    #[test]
+    fn composer_cursor_stays_on_its_row_at_hard_breaks() {
+        let rows = wrap_rows(&cs("ab\ncd"), 10); // (0,2) (3,5)
+        // On the '\n' itself: end of the row before it.
+        assert_eq!(cursor_visual(&rows, 2), (0, 2));
+        assert_eq!(cursor_visual(&rows, 3), (1, 0));
+        assert_eq!(cursor_visual(&rows, 5), (1, 2));
+    }
+
+    #[test]
+    fn composer_cursor_on_empty_input_is_origin() {
+        let rows = wrap_rows(&cs(""), 10);
+        assert_eq!(cursor_visual(&rows, 0), (0, 0));
+    }
+
+    #[test]
+    fn long_input_soft_wraps_instead_of_scrolling() {
+        let mut app = App::new(crate::config::Config::default());
+        app.input = "x".repeat(100);
+        app.cursor = 100;
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        // 80 columns leave 76 for text, so 100 chars fill one row and wrap 24
+        // onto a continuation row. The composer sits above the status line:
+        // rule (19), two text rows (20–21), rule (22).
+        let buffer = terminal.backend().buffer().clone();
+        let row =
+            |y: u16| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>() };
+        assert_eq!(row(20).trim_end(), format!(" ❯ {}", "x".repeat(76)));
+        assert_eq!(row(21).trim_end(), format!("   {}", "x".repeat(24)));
+        // The caret follows onto the wrapped row instead of the old
+        // horizontal scroll keeping everything on one line.
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (3 + 24, 21));
     }
 }
