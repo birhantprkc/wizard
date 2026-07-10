@@ -1167,6 +1167,9 @@ pub struct App {
     /// the terminal) suspends the TUI, opens `$EDITOR` on the config file, then
     /// reloads config. Cleared once handled.
     pub pending_edit_config: bool,
+    /// Set by Ctrl-G; the main loop suspends the TUI, opens the composer draft
+    /// in `$EDITOR`, and reads the result back. Cleared once handled.
+    pub pending_edit_prompt: bool,
     /// Set by `/compact`; the main loop takes the agent and runs compaction in
     /// the background. Cleared once the task is spawned.
     pub pending_compact: bool,
@@ -1271,6 +1274,7 @@ impl App {
             spinner_verb,
             verb_rolls: 0,
             pending_edit_config: false,
+            pending_edit_prompt: false,
             pending_compact: false,
             compacting: false,
             mcp_merge_pending: false,
@@ -2129,6 +2133,20 @@ impl App {
         self.cursor = 0;
         self.history_pos = None;
         self.sync_input_mode();
+    }
+
+    /// Replace the composer with text edited externally (Ctrl-G). Editors
+    /// append a trailing newline, so at most one line ending is trimmed; the
+    /// cursor lands at the end.
+    fn set_input_from_editor(&mut self, mut text: String) {
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        self.history_pos = None;
+        self.set_input(text);
     }
 
     fn insert_char(&mut self, c: char) {
@@ -3281,6 +3299,15 @@ impl App {
                 }
                 None
             }
+            // Ctrl-G drafts the prompt in an external editor (handled by the
+            // main loop, which owns the terminal). Masked key entry stays
+            // inline — a secret must not land in a temp file.
+            KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.prompt_is_masked() =>
+            {
+                self.pending_edit_prompt = true;
+                None
+            }
             KeyCode::Char(c) => {
                 // Unbound Ctrl/Alt chords must not insert their literal char.
                 if !key
@@ -3864,33 +3891,35 @@ fn setup_terminal() -> Result<Tui> {
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
 }
 
-/// Suspend the TUI, open `$VISUAL`/`$EDITOR` on `~/.wizard/config.toml`, then
-/// restore the TUI and reload the edited config. Driven by the `/settings`
-/// "Open config file" row; runs from the main loop because it owns `terminal`.
-/// Falls back to a path notice when no editor is configured.
-fn edit_config_file(app: &mut App, terminal: &mut Tui) {
-    let path = match Config::path() {
-        Ok(path) => path,
-        Err(err) => {
-            app.notice(format!("could not locate config: {err:#}"));
-            return;
+/// Resolve the external editor: `$VISUAL`, then `$EDITOR`, then `nvim` when
+/// it's on PATH. `None` means nothing usable is configured.
+fn resolve_editor() -> Option<String> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(editor) = std::env::var(var)
+            && !editor.trim().is_empty()
+        {
+            return Some(editor);
         }
-    };
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_default();
-    if editor.trim().is_empty() {
-        app.notice(format!(
-            "no $EDITOR set — edit {} by hand, then /reload",
-            path.display()
-        ));
-        return;
     }
+    let nvim_on_path = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("nvim").is_file()));
+    nvim_on_path.then(|| "nvim".to_string())
+}
 
+/// Suspend the TUI, run `editor` on `path`, then restore the TUI. Returns the
+/// editor's exit status, or `None` when the TUI could not be suspended or
+/// restored (a notice is posted either way; an unrestored terminal is fatal
+/// to the session, so the caller must not continue).
+fn run_editor_suspended(
+    app: &mut App,
+    terminal: &mut Tui,
+    editor: &str,
+    path: &std::path::Path,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
     // Leave the alternate screen so the editor draws on the real terminal.
     if let Err(err) = restore_terminal() {
         app.notice(format!("could not suspend the TUI: {err:#}"));
-        return;
+        return None;
     }
     // `sh -c` so editors with flags ("code --wait", "emacsclient -t") work.
     let status = std::process::Command::new("sh")
@@ -3903,15 +3932,40 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
         Ok(new_terminal) => {
             *terminal = new_terminal;
             let _ = terminal.clear();
+            Some(status)
         }
         Err(err) => {
             app.notice(format!(
                 "could not restore the TUI: {err:#} — /quit and relaunch"
             ));
-            return;
+            None
         }
     }
+}
 
+/// Suspend the TUI, open the external editor on `~/.wizard/config.toml`, then
+/// restore the TUI and reload the edited config. Driven by the `/settings`
+/// "Open config file" row; runs from the main loop because it owns `terminal`.
+/// Falls back to a path notice when no editor is configured.
+fn edit_config_file(app: &mut App, terminal: &mut Tui) {
+    let path = match Config::path() {
+        Ok(path) => path,
+        Err(err) => {
+            app.notice(format!("could not locate config: {err:#}"));
+            return;
+        }
+    };
+    let Some(editor) = resolve_editor() else {
+        app.notice(format!(
+            "no $EDITOR set — edit {} by hand, then /reload",
+            path.display()
+        ));
+        return;
+    };
+
+    let Some(status) = run_editor_suspended(app, terminal, &editor, &path) else {
+        return;
+    };
     match status {
         Ok(status) if status.success() => match Config::load() {
             Ok(config) => {
@@ -3926,6 +3980,36 @@ fn edit_config_file(app: &mut App, terminal: &mut Tui) {
         Ok(_) => app.notice("editor exited without success — config not reloaded"),
         Err(err) => app.notice(format!("could not launch editor: {err:#}")),
     }
+}
+
+/// Suspend the TUI and open the composer draft in the external editor
+/// (Ctrl-G); on a clean exit the edited file replaces the input with the
+/// cursor at the end. A nonzero exit leaves the composer untouched. Runs from
+/// the main loop because it owns `terminal`.
+fn edit_prompt_in_editor(app: &mut App, terminal: &mut Tui) {
+    let Some(editor) = resolve_editor() else {
+        app.notice("no $VISUAL/$EDITOR set and nvim not on PATH — cannot edit the prompt");
+        return;
+    };
+
+    let path = std::env::temp_dir().join(format!("wizard-prompt-{}.md", std::process::id()));
+    if let Err(err) = std::fs::write(&path, &app.input) {
+        app.notice(format!("could not stage the prompt: {err:#}"));
+        return;
+    }
+
+    let Some(status) = run_editor_suspended(app, terminal, &editor, &path) else {
+        return;
+    };
+    match status {
+        Ok(status) if status.success() => match std::fs::read_to_string(&path) {
+            Ok(text) => app.set_input_from_editor(text),
+            Err(err) => app.notice(format!("could not read the edited prompt: {err:#}")),
+        },
+        Ok(_) => app.notice("editor exited without success — prompt unchanged"),
+        Err(err) => app.notice(format!("could not launch editor: {err:#}")),
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Copy `text` to the system clipboard with the OSC 52 terminal escape. This
@@ -4278,6 +4362,7 @@ drag                        select text — copied to the clipboard on release\n
 click a tool card           expand / collapse its output\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
+Ctrl-G                      edit the prompt in $EDITOR\n  \
 Ctrl-C                      quit";
 
 // ---------------------------------------------------------------------------
@@ -4888,6 +4973,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         if app.pending_edit_config {
             app.pending_edit_config = false;
             edit_config_file(&mut app, &mut terminal);
+        }
+
+        // Ctrl-G: same suspend/restore dance, on the composer draft.
+        if app.pending_edit_prompt {
+            app.pending_edit_prompt = false;
+            edit_prompt_in_editor(&mut app, &mut terminal);
         }
 
         // `/compact`: take the agent and summarize history off the event loop
@@ -8138,6 +8229,47 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
             .expect("key handled");
         assert_eq!(app.input, "abc");
+    }
+
+    #[test]
+    fn ctrl_g_requests_external_prompt_edit() {
+        let mut app = app();
+        type_str(&mut app, "draft in progress");
+        let action = press_ctrl(&mut app, 'g');
+        assert!(action.is_none());
+        assert!(app.pending_edit_prompt);
+        // The buffer is only replaced after the editor exits cleanly.
+        assert_eq!(app.input, "draft in progress");
+    }
+
+    #[test]
+    fn ctrl_g_is_inert_during_masked_key_entry() {
+        // An API key being typed must never be staged into a temp file.
+        let mut app = app();
+        app.web_key_backend = Some("brave".to_string());
+        type_str(&mut app, "sk-secret");
+        press_ctrl(&mut app, 'g');
+        assert!(!app.pending_edit_prompt);
+        assert_eq!(app.input, "sk-secret", "chord must not insert a literal g");
+    }
+
+    #[test]
+    fn editor_text_replaces_input_with_cursor_at_end() {
+        let mut app = app();
+        type_str(&mut app, "old draft");
+        app.set_input_from_editor("hello\nworld\n".to_string());
+        // Exactly one trailing newline (the editor's) is trimmed.
+        assert_eq!(app.input, "hello\nworld");
+        assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn editor_text_trims_at_most_one_line_ending() {
+        let mut app = app();
+        app.set_input_from_editor("two\n\n".to_string());
+        assert_eq!(app.input, "two\n");
+        app.set_input_from_editor("crlf\r\n".to_string());
+        assert_eq!(app.input, "crlf");
     }
 
     #[test]
