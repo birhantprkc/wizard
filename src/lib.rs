@@ -18,6 +18,7 @@ pub mod event;
 pub mod evolve;
 pub mod fleet;
 pub mod gateway;
+pub mod gui;
 pub mod hardware;
 pub mod harness;
 pub mod hooks;
@@ -96,6 +97,24 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
     // Usage rollup: reads ~/.wizard/usage.jsonl only.
     if let Some(cli::Command::Usage { since }) = &cli.command {
         return usage::run_cli(since.as_deref());
+    }
+
+    // The browser GUI serves existing sessions and builds agents lazily per
+    // task, so it loads config directly (defaults on a fresh install) and
+    // never onboards — startup must not depend on a reachable provider.
+    if let Some(cli::Command::Gui {
+        port,
+        no_open,
+        assets,
+    }) = &cli.command
+    {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        let config = config::Config::load()?;
+        return gui::run(config, *port, *no_open, assets.clone())
+            .await
+            .map(|()| 0);
     }
 
     // Evolution history: reads ~/.wizard/evolution.jsonl and touches the

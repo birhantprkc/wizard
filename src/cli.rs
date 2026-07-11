@@ -218,6 +218,25 @@ pub enum Command {
         cmd: HarnessCmd,
     },
 
+    /// Serve the browser GUI: a local web app (task sidebar, streaming
+    /// conversation, git panel) over the same agent core as the TUI. Binds
+    /// 127.0.0.1 only; agents are built lazily per task, so the server
+    /// starts fine without a reachable provider.
+    Gui {
+        /// Port to bind on 127.0.0.1. Fails when the port is taken.
+        #[arg(long, default_value_t = 4680)]
+        port: u16,
+
+        /// Do not open the browser after binding.
+        #[arg(long)]
+        no_open: bool,
+
+        /// Serve GUI assets from this directory instead of the embedded
+        /// copies (dev mode: edit gui/assets/ and reload).
+        #[arg(long, value_name = "DIR")]
+        assets: Option<PathBuf>,
+    },
+
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
     /// project and per provider. Self-contained; never loads config.
     Usage {

@@ -1727,6 +1727,26 @@ pub async fn build_headless_agent(
     project_root: &Path,
     resume: bool,
 ) -> Result<Agent> {
+    build_headless_agent_inner(config, project_root, resume, None).await
+}
+
+/// [`build_headless_agent`] with an explicit session instead of the
+/// latest-or-new resolution — the GUI server manages one session per task
+/// (created for a chosen workspace, or reopened by id) and hands it in.
+pub async fn build_headless_agent_for_session(
+    config: &Config,
+    project_root: &Path,
+    session: Session,
+) -> Result<Agent> {
+    build_headless_agent_inner(config, project_root, false, Some(session)).await
+}
+
+async fn build_headless_agent_inner(
+    config: &Config,
+    project_root: &Path,
+    resume: bool,
+    session: Option<Session>,
+) -> Result<Agent> {
     let active = config.active();
     let model = active.model.clone();
     let client = active
@@ -1759,15 +1779,21 @@ pub async fn build_headless_agent(
         println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
     }
 
-    // Session first: the hook engine carries its id in every payload.
-    let sessions_dir = Config::sessions_dir()?;
-    let session = if resume {
-        match Session::open_latest(&sessions_dir)? {
-            Some(session) => session,
-            None => Session::create(&sessions_dir)?,
+    // Session first: the hook engine carries its id in every payload. An
+    // explicit session (GUI) wins; otherwise resolve latest-or-new here.
+    let session = match session {
+        Some(session) => session,
+        None => {
+            let sessions_dir = Config::sessions_dir()?;
+            if resume {
+                match Session::open_latest(&sessions_dir)? {
+                    Some(session) => session,
+                    None => Session::create(&sessions_dir)?,
+                }
+            } else {
+                Session::create(&sessions_dir)?
+            }
         }
-    } else {
-        Session::create(&sessions_dir)?
     };
 
     // Lifecycle hooks, shared by the agent's dispatcher and the subagent
