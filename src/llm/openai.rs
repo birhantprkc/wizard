@@ -243,8 +243,13 @@ impl OpenAiProvider {
 /// Models that accept a `reasoning_effort` request field: xAI Grok 4.x and
 /// OpenAI's reasoning families (o-series, gpt-5). Anything else 400s on it, so
 /// it is sent only for these. Mirrors the families in [`context_window`].
+/// Tags marked "non-reasoning" (e.g. xAI's `grok-4.20-*-non-reasoning`)
+/// reject the field even inside a supporting family.
 fn supports_reasoning_effort(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
+    if model.contains("non-reasoning") {
+        return false;
+    }
     model.starts_with("grok-4")
         || model.starts_with("gpt-5")
         || model.starts_with("o1")
@@ -868,8 +873,16 @@ mod tests {
                 "{model} must receive reasoning_effort"
             );
         }
-        // Omitted for models that would 400 on it.
-        for model in ["gpt-4o", "grok-code-fast-1", "grok-3", "qwen3-8b"] {
+        // Omitted for models that would 400 on it — including non-reasoning
+        // tags inside an otherwise supporting family.
+        for model in [
+            "gpt-4o",
+            "grok-code-fast-1",
+            "grok-3",
+            "qwen3-8b",
+            "grok-4.20-0309-non-reasoning",
+            "GROK-4.20-0309-NON-REASONING",
+        ] {
             let request = ChatRequest {
                 model: model.to_string(),
                 messages: vec![ChatMessage::user("hi")],
