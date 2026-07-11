@@ -127,6 +127,9 @@ impl EventSink for TextSink {
                 self.spinner.hide();
                 eprintln!("\nwizard error: {message}");
             }
+            AgentEvent::Notice(message) => {
+                self.spinner.println(&format!("~ {message}"));
+            }
             AgentEvent::HookFired {
                 event,
                 command,
@@ -318,6 +321,7 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             }
             AgentEvent::Done { .. } => self.turns += 1,
             AgentEvent::ThinkingDelta(_)
+            | AgentEvent::Notice(_)
             | AgentEvent::HookFired { .. }
             | AgentEvent::OmakaseProceeding { .. }
             | AgentEvent::TodoUpdated(_)
@@ -409,6 +413,9 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
             }
             AgentEvent::Error(message) => {
                 self.emit(json!({"type": "error", "message": message}));
+            }
+            AgentEvent::Notice(message) => {
+                self.emit(json!({"type": "notice", "message": message}));
             }
             AgentEvent::StreamRetrying => {
                 self.emit(json!({"type": "stream_retrying"}));

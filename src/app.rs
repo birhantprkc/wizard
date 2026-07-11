@@ -18,8 +18,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, CompactOutcome, DoneReason, InterviewQuestion, PlanVerdict,
-    session::Session, subagent,
+    Agent, AgentEvent, DoneReason, InterviewQuestion, PlanVerdict, session::Session, subagent,
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
@@ -1057,6 +1056,10 @@ pub struct App {
     /// flushed to the transcript alongside `streaming`.
     pub streaming_thinking: String,
     pub status: StatusLine,
+    /// Latched once the user submits anything — a slash command dispatches
+    /// without adding transcript entries, so `has_conversation` alone would
+    /// leave the welcome screen up after it.
+    pub welcome_dismissed: bool,
     /// Git diff sidebar visibility and cached contents.
     pub show_diff: bool,
     pub diff_text: String,
@@ -1233,6 +1236,7 @@ impl App {
             streaming: String::new(),
             streaming_thinking: String::new(),
             status,
+            welcome_dismissed: false,
             show_diff: false,
             diff_text: String::new(),
             diff_scroll: 0,
@@ -1292,6 +1296,16 @@ impl App {
         self.transcript
             .iter()
             .any(|entry| !matches!(entry, TranscriptEntry::Notice(_)))
+    }
+
+    /// True while the welcome screen should render: the conversation hasn't
+    /// begun, nothing was ever submitted (a slash command counts even though
+    /// it adds no transcript entries), and no turn is in flight.
+    pub fn welcome_visible(&self) -> bool {
+        !self.has_conversation()
+            && !self.welcome_dismissed
+            && self.streaming.is_empty()
+            && !self.status.busy
     }
 
     /// Pick a fresh spinner verb for a new busy period. The verb stays fixed
@@ -2569,13 +2583,19 @@ impl App {
                     self.vim.count = None;
                     self.cursor = self.cursor.saturating_sub(1);
                 }
-                // Esc keeps wizard's escape hatches (close diff, reset scroll)
-                // since Normal-mode Esc would otherwise be a no-op.
+                // Esc keeps wizard's escape hatches (close diff, dismiss
+                // todos, reset scroll) since Normal-mode Esc would otherwise
+                // be a no-op.
                 KeyCode::Esc => {
                     self.vim.clear_pending();
                     if self.show_diff {
                         self.show_diff = false;
                         self.diff_scroll = 0;
+                    } else if self.show_todos {
+                        // Then the todo sidebar (it auto-opens on the first
+                        // todo update, so it needs a way out that isn't
+                        // `/todos`).
+                        self.show_todos = false;
                     } else if self.scroll > 0 {
                         self.scroll = 0;
                     }
@@ -3236,8 +3256,12 @@ impl App {
                 }
                 None
             }
-            // Shift+Tab toggles plan mode (same as /plan).
-            KeyCode::BackTab => Some(AppAction::Command(SlashCommand::Plan)),
+            // Shift+Tab toggles plan mode (same as /plan, welcome screen
+            // included).
+            KeyCode::BackTab => {
+                self.welcome_dismissed = true;
+                Some(AppAction::Command(SlashCommand::Plan))
+            }
             KeyCode::Esc => {
                 if self.show_diff {
                     // Esc closes the diff sidebar before touching the input.
@@ -3364,6 +3388,9 @@ impl App {
         }
         match SlashCommand::parse(&input) {
             Some(Ok(command)) => {
+                // A dispatched command counts as activity even though it adds
+                // no transcript entries; drop the welcome screen.
+                self.welcome_dismissed = true;
                 self.push_history(&input);
                 self.clear_input();
                 Some(AppAction::Command(command))
@@ -3380,6 +3407,7 @@ impl App {
                 // custom commands and unknown `/words` go to the model (the
                 // custom expansion happens in `submit_prompt`).
                 if is_builtin_command(word) {
+                    self.welcome_dismissed = true;
                     self.push_history(&input);
                     self.clear_input();
                     self.notice(message);
@@ -3691,6 +3719,10 @@ impl App {
             AgentEvent::Error(message) => {
                 self.flush_streaming();
                 self.notice(format!("error: {message}"));
+            }
+            AgentEvent::Notice(message) => {
+                self.flush_streaming();
+                self.notice(message);
             }
             AgentEvent::StreamRetrying => {
                 // The partial completion is being re-generated from scratch;
@@ -4991,15 +5023,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     app.compacting = true;
                     let notify = events.sender();
                     tokio::spawn(async move {
-                        let notice = match agent.compact_now().await {
-                            CompactOutcome::Nothing => "nothing to compact yet".to_string(),
-                            CompactOutcome::Summarized(count) => {
-                                format!("compacted {count} messages into a summary")
-                            }
-                            CompactOutcome::Truncated { count, error } => format!(
-                                "compacted {count} messages by truncation (summary failed: {error})"
-                            ),
-                        };
+                        let notice = agent.compact_now().await.describe();
                         let rebuild = AgentRebuild {
                             agent: Some(agent),
                             model: None,
@@ -6822,6 +6846,26 @@ mod tests {
     }
 
     #[test]
+    fn slash_command_dismisses_the_welcome_screen() {
+        let mut app = app();
+        assert!(app.welcome_visible());
+
+        // Startup notices land before anything is submitted; they alone must
+        // leave the welcome screen up.
+        app.notice("error: 1 of 2 MCP servers failed to connect (see logs)");
+        assert!(app.welcome_visible());
+
+        // A slash command dispatches without adding transcript entries, but
+        // it still begins the session.
+        type_str(&mut app, "/effort high");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            !app.welcome_visible(),
+            "a slash command dismisses the welcome screen"
+        );
+    }
+
+    #[test]
     fn welcome_dismisses_once_real_entries_appear() {
         for entry in [
             TranscriptEntry::User("hi".to_string()),
@@ -7631,6 +7675,13 @@ mod tests {
         assert_eq!(app.input, "draft", "input untouched while panels close");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.input, "", "Esc finally clears the input");
+
+        // Vim Normal mode keeps the same escape hatch.
+        let mut app = vim_app();
+        press(&mut app, KeyCode::Esc); // insert -> normal
+        app.show_todos = true;
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_todos, "Normal-mode Esc dismisses the todo panel");
     }
 
     #[test]

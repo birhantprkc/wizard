@@ -945,6 +945,7 @@ async fn run_collect_text(agent: &mut Agent, prompt: &str) -> Result<String> {
                     println!("← {name} [{status}]");
                 }
                 AgentEvent::Error(message) => eprintln!("\nwizard error: {message}"),
+                AgentEvent::Notice(message) => eprintln!("\nwizard: {message}"),
                 AgentEvent::PlanReady { respond, .. } => {
                     let _ = respond.send(PlanVerdict::approve());
                 }

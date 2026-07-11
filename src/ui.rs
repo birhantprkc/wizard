@@ -221,8 +221,9 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     app.card_hits.borrow_mut().clear();
 
     // Stay on the welcome screen until the conversation actually begins (see
-    // `App::has_conversation`: early system notices alone don't dismiss it).
-    if !app.has_conversation() && app.streaming.is_empty() && !app.status.busy {
+    // `App::welcome_visible`: early system notices alone don't dismiss it,
+    // but any submission — even a slash command — does).
+    if app.welcome_visible() {
         // A slash-command menu (e.g. `/provider`) or other modal floats over a
         // small centered area; the welcome card would show through around it.
         // Drop the card while any overlay is open so there's no text overlay.
@@ -633,6 +634,7 @@ fn draw_todo_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 format!("todos {done}/{total}"),
                 Style::default().fg(TEXT_DIM),
             ),
+            Span::styled(" · esc closes", dim()),
         ]));
     let inner_width = block.inner(area).width as usize;
     let lines: Vec<Line<'static>> = if app.todos.is_empty() {
@@ -670,6 +672,7 @@ fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .title(Line::from(vec![
             Span::styled(" ± ", accent()),
             Span::styled("git diff", Style::default().fg(TEXT_DIM)),
+            Span::styled(" · esc closes", dim()),
         ]));
     let inner = block.inner(area);
     let inner_width = inner.width as usize;

@@ -271,6 +271,8 @@ async fn run_one_turn(agent: &mut Agent, text: &str) -> String {
                 AgentEvent::TextDelta(delta) => reply.push_str(&delta),
                 AgentEvent::ToolStarted { name, .. } => tools.push(name),
                 AgentEvent::Error(message) => error = Some(message),
+                // Progress notices (e.g. compaction) aren't part of a reply.
+                AgentEvent::Notice(_) => {}
                 AgentEvent::PlanReady { plan, respond } => {
                     // No human reviews a gateway plan: include it in the
                     // reply and approve so the turn proceeds to execute.

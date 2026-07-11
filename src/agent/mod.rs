@@ -102,6 +102,9 @@ pub enum AgentEvent {
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
     Error(String),
+    /// Informational progress notice (e.g. history compaction); never an
+    /// error.
+    Notice(String),
     /// A completion stream died mid-response and is about to be retried from
     /// scratch. Whatever partial text was streamed so far never entered
     /// history and will be re-generated — consumers rendering deltas must
@@ -515,6 +518,30 @@ pub enum CompactOutcome {
     Summarized(usize),
     /// The summary LLM failed, so `count` middle messages were dropped.
     Truncated { count: usize, error: String },
+}
+
+impl CompactOutcome {
+    /// One-line notice describing what the pass did, shared by the
+    /// auto-compaction events and the `/compact` command.
+    pub fn describe(&self) -> String {
+        fn messages(count: usize) -> String {
+            if count == 1 {
+                "1 message".to_string()
+            } else {
+                format!("{count} messages")
+            }
+        }
+        match self {
+            CompactOutcome::Nothing => "nothing to compact yet".to_string(),
+            CompactOutcome::Summarized(count) => {
+                format!("compacted {} into a summary", messages(*count))
+            }
+            CompactOutcome::Truncated { count, error } => format!(
+                "compacted {} by truncation (summary failed: {error})",
+                messages(*count)
+            ),
+        }
+    }
 }
 
 /// User-role nudge injected (in memory only) when a completion comes back
@@ -1359,21 +1386,13 @@ impl Agent {
         }
         match self.compact_now().await {
             CompactOutcome::Nothing => {}
-            CompactOutcome::Summarized(count) => {
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!("compacted {count} messages → summary")),
-                )
-                .await;
+            // Success is informational; only a truncation (the summary LLM
+            // genuinely failed) is an error.
+            outcome @ CompactOutcome::Summarized(_) => {
+                let _ = emit(events, AgentEvent::Notice(outcome.describe())).await;
             }
-            CompactOutcome::Truncated { count, error } => {
-                let _ = emit(
-                    events,
-                    AgentEvent::Error(format!(
-                        "compacted {count} messages by truncation (summary LLM failed: {error})"
-                    )),
-                )
-                .await;
+            outcome @ CompactOutcome::Truncated { .. } => {
+                let _ = emit(events, AgentEvent::Error(outcome.describe())).await;
             }
         }
     }
@@ -2392,18 +2411,20 @@ mod tests {
         agent
     }
 
-    /// Drain a finished turn's events into (text, errors).
-    fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> (String, Vec<String>) {
+    /// Drain a finished turn's events into (text, errors, notices).
+    fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> (String, Vec<String>, Vec<String>) {
         let mut text = String::new();
         let mut errors = Vec::new();
+        let mut notices = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event {
                 AgentEvent::TextDelta(delta) => text.push_str(&delta),
                 AgentEvent::Error(message) => errors.push(message),
+                AgentEvent::Notice(message) => notices.push(message),
                 _ => {}
             }
         }
-        (text, errors)
+        (text, errors, notices)
     }
 
     /// Test tool that records the arguments of every call it receives.
@@ -2512,7 +2533,7 @@ mod tests {
         let reason = agent.run_turn("hi", tx).await.expect("turn ok");
         assert_eq!(reason, DoneReason::Completed);
 
-        let (text, errors) = drain_events(&mut rx);
+        let (text, errors, _notices) = drain_events(&mut rx);
         assert_eq!(text, "Here are my findings.");
         assert!(errors.is_empty(), "no notice on a successful retry");
 
@@ -2555,7 +2576,7 @@ mod tests {
         let reason = agent.run_turn("hi", tx).await.expect("turn ok");
         assert_eq!(reason, DoneReason::Completed);
 
-        let (text, errors) = drain_events(&mut rx);
+        let (text, errors, _notices) = drain_events(&mut rx);
         assert!(text.is_empty());
         assert!(
             errors.iter().any(|e| e.contains("empty response")),
@@ -2792,7 +2813,7 @@ mod tests {
         assert!(provider.requests.lock().unwrap().is_empty());
         assert_eq!(agent.history().len(), 1, "the prompt never entered history");
 
-        let (_text, errors) = drain_events(&mut rx);
+        let (_text, errors, _notices) = drain_events(&mut rx);
         assert!(
             errors
                 .iter()
@@ -3396,10 +3417,11 @@ mod tests {
                 .any(|m| m.content.contains("[Compacted progress summary]")),
             "token threshold compacted the history"
         );
-        let (_text, errors) = drain_events(&mut rx);
+        let (_text, errors, notices) = drain_events(&mut rx);
+        assert!(errors.is_empty(), "a successful compaction is not an error");
         assert!(
-            errors.iter().any(|e| e.contains("compacted")),
-            "compaction surfaced: {errors:?}"
+            notices.iter().any(|n| n.contains("compacted")),
+            "compaction surfaced: {notices:?}"
         );
         assert_eq!(
             agent.usage().last_prompt_tokens(),
