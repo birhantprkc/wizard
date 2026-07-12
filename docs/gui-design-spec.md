@@ -5,19 +5,21 @@ copy of a reference screenshot (`~/.claude/image-cache/83725a5a-…/1.png`); wha
 described below, and where the two disagree, this wins.
 
 The thing it should feel like is an instrument, not a product page. That means: dense but
-breathing, hairlines instead of boxes inside boxes, one accent used sparingly, and no
-sentence of copy that is not load-bearing. A settings screen made of eight cards, each with a
-tagline under it, is the failure mode — it reads as filler, because it is.
+breathing, hairlines instead of boxes inside boxes, no colour that is not carrying meaning,
+and no sentence of copy that is not load-bearing. A settings screen made of eight cards, each
+with a tagline under it and a blue button at the bottom, is the failure mode — it reads as
+filler, because it is.
 
 ## Global
 
 - Canvas `#0c0c0e`. Surfaces `#141416` / `#191a1d`. Hairlines `#26262a`, and `#1f1f23` for
   separators *inside* a surface (a section divider should be felt, not seen).
 - Text: primary `#ececee`, mid `#b6b6bd`, muted `#86868e`, faint `#5c5c64`.
-- One accent — blue `#4b8dfa` — for the active/selected state and the single primary button
-  per view. Green `#3fb96a` (additions), red `#e5484d` (deletions, errors), amber `#d8a13a`
-  (a state needing attention, e.g. a provider with no key). Color carries meaning; nothing is
-  colored for decoration.
+- **No brand hue.** Emphasis is brightness, not colour: the active state is simply lighter,
+  and the one primary button per view inverts to light-on-dark (`#ececee` on `#0c0c0e`).
+  Colour is reserved for meaning — green `#3fb96a` (additions), red `#e5484d` (deletions,
+  errors), amber `#d8a13a` (a state needing attention, e.g. a provider with no key). If a
+  pixel is coloured, it is saying something.
 - **Sans for prose, mono for literals.** A path, model tag, provider kind, base URL, branch
   name or config location is a thing you could paste into a terminal — it is set in mono
   (12px). Everything else is system sans, 13px UI / 14.5px transcript body.
@@ -66,11 +68,13 @@ clickable and isn't is worse than no control.
    `zcode-desktop`), each with indented rows:
    - single-line truncated title (e.g. "Create an intelligent Go…")
    - right-aligned muted relative age (`2m`, `9m`, `14m`, `27m`, `51m`, `1h`, `2h`, `5h`)
-   - selected row: lighter pill background + small blue dot on the left of the title
+   - selected row: lighter background + a small dot on the left of the title (bright while
+     the agent is working there, amber when it needs input, red when it failed)
 
 ## Center: conversation
 
-- The user's prompt renders as a full-width rounded quote card at top (lighter bg `#232327`).
+- The user's prompt renders as a quiet block with a rule down its left edge — a quoted
+  instruction in a log, not a chat bubble.
 - `Worked for 3m 1s ⌄` collapsible section header (muted) with hairline rule.
 - Agent narration: plain paragraphs of body text.
 - Tool-call rows, inline with icons, muted single-line summaries:
@@ -82,8 +86,8 @@ clickable and isn't is worse than no control.
   - placeholder `Ask wizard to change something`
   - bottom row: `✦ Sovereign` mode chip (static — wizard has no permission gating, so there is
     no mode dropdown) · spacer · stop button (present **only** while a turn runs — an idle
-    spinner just reads as "loading forever") · `GLM-5.2 ⌄` model picker · circular blue send
-    button `↑` (right).
+    spinner just reads as "loading forever") · `GLM-5.2 ⌄` model picker · circular send button
+    `↑`, light-on-dark (right).
 
 ## Settings and onboarding (one sheet, one list shape)
 
@@ -91,7 +95,7 @@ Both are the same surface: a sheet with a hairline-separated stack of blocks. No
 it, no grid of tiles, no tagline under anything.
 
 - The **provider list** is the one list shape, used twice: to show what is configured
-  (`xai` · `xaioauth · grok-4.5 · signed in`, active marked by an accent rule down its left
+  (`xai` · `xaioauth · grok-4.5 · signed in`, active marked by a light rule down its left
   edge, actions as quiet text on the right) and, one step in, to pick what to add (provider
   name, its endpoint host in mono, right-aligned). A provider is a name and where it points;
   that is all a row says.
@@ -117,12 +121,12 @@ with dead air beneath it.
    - row: `⊞ Changes` … right-aligned `+734` (green) `-7` (red)
    - row: `⎇ feat/gomoku-ai` (current branch, static)
    - row: `-o- Commit ⌄` — expands the commit-message editor
-2. **Goal** card:
-   - header row: `Goal` … right-aligned status `Complete` (muted)
+2. **Goal** group:
+   - label `GOAL` … right-aligned status `Complete` (muted)
    - `◎` target icon + goal text ("Gomoku vs. AI — implement computer moves with a heuristic algorithm")
    - meta line, muted: `5/5 · 2m · 89K tokens`
-3. **Progress** card:
-   - header `Progress`
+3. **Progress** group:
+   - label `PROGRESS`
    - checklist: green circled-check icon + item text; completed items are struck through and dimmed.
      5 items in the reference (e.g. "Initialize board, piece rendering, and the 15×15 grid layout").
 

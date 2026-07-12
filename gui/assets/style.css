@@ -15,8 +15,12 @@
   --text-mid: #b6b6bd;
   --text-muted: #86868e;
   --text-faint: #5c5c64;
-  --accent: #4b8dfa;
-  --accent-hover: #6ba1fb;
+  /* No brand hue. Emphasis is brightness: the "accent" is simply light on
+     dark, and the one filled button per view inverts to it. Colour is reserved
+     for meaning — additions, deletions, errors, a state needing attention. */
+  --accent: #ececee;
+  --accent-hover: #ffffff;
+  --on-accent: #0c0c0e;
   --green: #3fb96a;
   --red: #e5484d;
   --amber: #d8a13a;
@@ -70,11 +74,11 @@ button {
 }
 
 ::selection {
-  background: rgba(75, 141, 250, 0.32);
+  background: rgba(236, 236, 238, 0.18);
 }
 
 :focus-visible {
-  outline: 1px solid rgba(75, 141, 250, 0.6);
+  outline: 1px solid rgba(236, 236, 238, 0.45);
   outline-offset: 1px;
 }
 
@@ -317,10 +321,10 @@ button {
   justify-content: center;
 }
 .task-dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--text-muted);
 }
 .task-title {
   flex: 1;
@@ -661,7 +665,7 @@ button.ghost-chip:hover {
   height: 30px;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -823,7 +827,7 @@ button.ghost-chip:hover {
 }
 
 .task-dot.working {
-  background: var(--accent);
+  background: var(--text);
   animation: pulse 1.4s ease-in-out infinite;
 }
 .task-dot.attn {
@@ -1071,7 +1075,8 @@ button.ghost-chip:hover {
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
+  font-weight: 600;
 }
 .btn.primary:hover {
   background: var(--accent-hover);
@@ -1229,7 +1234,7 @@ span.mode-chip {
 }
 .menu-check {
   display: inline-flex;
-  color: var(--accent);
+  color: var(--text-mid);
 }
 .menu-check svg {
   width: 13px;
@@ -1344,7 +1349,7 @@ span.mode-chip {
 }
 
 .check-icon.active {
-  color: var(--accent);
+  color: var(--text-soft);
 }
 .progress-list {
   display: flex;
@@ -1496,7 +1501,7 @@ span.mode-chip {
   margin-top: 3px;
 }
 .row-provider.is-active {
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: inset 2px 0 0 var(--text-mid);
 }
 .row-status {
   margin-top: 5px;
@@ -1518,7 +1523,7 @@ span.mode-chip {
 }
 
 .tag {
-  color: var(--accent);
+  color: var(--text-muted);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.06em;
@@ -1584,6 +1589,12 @@ span.mode-chip {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 .setting-name {
   color: var(--text-soft);

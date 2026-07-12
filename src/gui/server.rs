@@ -72,7 +72,7 @@ const ASSETS: [Asset; 5] = [
 
 /// The favicon, served at `/favicon.ico` for clients that probe the classic
 /// path; `index.html` inlines the same glyph as a data URI.
-const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="#3b82f6" d="M8 0C8.6 4.2 11.8 7.4 16 8C11.8 8.6 8.6 11.8 8 16C7.4 11.8 4.2 8.6 0 8C4.2 7.4 7.4 4.2 8 0Z"/></svg>"##;
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="#ececee" d="M8 0C8.6 4.2 11.8 7.4 16 8C11.8 8.6 8.6 11.8 8 16C7.4 11.8 4.2 8.6 0 8C4.2 7.4 7.4 4.2 8 0Z"/></svg>"##;
 
 /// Build the GUI router over the shared state. Every route — the WebSocket
 /// upgrade included — sits behind [`local_guard`].
@@ -180,6 +180,11 @@ impl IntoResponse for ApiError {
 
 /// Static assets: the embedded copies, or (dev mode) the same names read
 /// from the `--assets` directory on every request.
+///
+/// Served `no-store`. The assets carry no version in their URL, so a browser
+/// that heuristically caches `/app.js` keeps showing an old build of the GUI
+/// after an upgrade — which looks exactly like the new build not working. They
+/// are a few KB off localhost; there is nothing to gain by caching them.
 async fn serve_asset(State(state): State<Arc<GuiState>>, uri: Uri) -> Response {
     let name = match uri.path() {
         "/" | "/index.html" => "index.html",
@@ -188,12 +193,16 @@ async fn serve_asset(State(state): State<Arc<GuiState>>, uri: Uri) -> Response {
     let Some(asset) = ASSETS.iter().find(|asset| asset.name == name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let headers = [
+        (header::CONTENT_TYPE, asset.mime),
+        (header::CACHE_CONTROL, "no-store"),
+    ];
     if let Some(dir) = &state.assets_dir
         && let Ok(body) = tokio::fs::read_to_string(dir.join(asset.name)).await
     {
-        return ([(header::CONTENT_TYPE, asset.mime)], body).into_response();
+        return (headers, body).into_response();
     }
-    ([(header::CONTENT_TYPE, asset.mime)], asset.body).into_response()
+    (headers, asset.body).into_response()
 }
 
 /// `GET /favicon.ico`: the embedded SVG sparkle (see [`FAVICON_SVG`]).

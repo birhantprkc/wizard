@@ -1374,7 +1374,7 @@ function providerForm(preset, { submitLabel = 'Save', onSaved, onCancel } = {}) 
       !editing && preset.custom && field('Name', nameInput),
       (preset.needs_base_url || preset.custom || editing) && field('Base URL', baseInput),
       field('Model', modelInput),
-      needsKey && field('API key', keyInput, '→ ~/.wizard/credentials.toml'),
+      needsKey && field('API key', keyInput, 'stored in ~/.wizard/credentials.toml'),
     ].filter(Boolean),
     note,
     h('div', { class: 'form-actions' },
@@ -1563,21 +1563,27 @@ function renderSettings(body, foot) {
   };
   resetAdd();
 
+  // Persists when the field is left, or on Enter. A number with a Save button
+  // beside it is one control more than the job needs.
   const steps = h('input', {
     class: 'input num', type: 'number', min: '1', max: '1000', value: String(s.max_steps),
   });
   const agentNote = h('span', { class: 'note inline hidden' });
-  const saveAgent = async () => {
-    agentNote.className = 'note inline hidden';
+  steps.addEventListener('keydown', (e) => { if (e.key === 'Enter') steps.blur(); });
+  steps.addEventListener('change', async () => {
+    const value = Number(steps.value);
+    if (!value || value === s.max_steps) return;
     try {
-      state.settings = await api.saveSettings({ max_steps: Number(steps.value) || s.max_steps });
+      state.settings = await api.saveSettings({ max_steps: value });
+      s.max_steps = state.settings.max_steps;
       agentNote.className = 'note inline';
       agentNote.textContent = 'Saved';
     } catch (err) {
+      steps.value = String(s.max_steps);
       agentNote.className = 'note inline error';
       agentNote.textContent = String((err && err.message) || err);
     }
-  };
+  });
 
   fillWith(body,
     h('div', { class: 'block' },
@@ -1592,10 +1598,7 @@ function renderSettings(body, foot) {
         h('div', { class: 'setting-main' },
           h('div', { class: 'setting-name' }, 'Step limit'),
           h('div', { class: 'setting-help' }, 'Tool calls one chat may make per turn.')),
-        steps),
-      h('div', { class: 'form-actions' },
-        h('button', { class: 'btn', type: 'button', onclick: saveAgent }, 'Save'),
-        agentNote)),
+        h('div', { class: 'setting-control' }, agentNote, steps))),
   );
   foot.textContent = s.config_path;
 
