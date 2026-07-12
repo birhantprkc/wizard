@@ -20,9 +20,13 @@ filler, because it is.
   Colour is reserved for meaning — green `#3fb96a` (additions), red `#e5484d` (deletions,
   errors), amber `#d8a13a` (a state needing attention, e.g. a provider with no key). If a
   pixel is coloured, it is saying something.
+- **Type is bundled, not hoped for**: Inter (UI) and JetBrains Mono (literals), variable-weight
+  latin subsets under the OFL, embedded in the binary and served from `/fonts/`. The system
+  fallback on a plain Linux box is DejaVu Sans, and it shows. Tabular figures throughout, so
+  ages, token counts and diffstats do not shift width as they tick.
 - **Sans for prose, mono for literals.** A path, model tag, provider kind, base URL, branch
-  name or config location is a thing you could paste into a terminal — it is set in mono
-  (12px). Everything else is system sans, 13px UI / 14.5px transcript body.
+  name, directory or config location is a thing you could paste into a terminal — it is set in
+  mono. Everything else is Inter: 13px UI, 14px transcript body.
 - Section labels are 10.5px uppercase, letterspaced, faint. Same label in the sidebar
   (`CHATS`), the rail (`GIT TOOLS`), and Settings (`PROVIDERS`) — one idiom, used everywhere.
 - Radii 6/10/14px. One filled button per view; every other action is an outline button or a
@@ -73,8 +77,10 @@ clickable and isn't is worse than no control.
 
 ## Center: conversation
 
-- The user's prompt renders as a quiet block with a rule down its left edge — a quoted
-  instruction in a log, not a chat bubble.
+- **Your messages are bubbles**: right-aligned, hugging their own text (max 78% of the
+  column), rounded with the corner nearest the composer clipped. What the *agent* says is not
+  a bubble — it is long-form prose interleaved with tool rows, and boxing it would fight with
+  them. The asymmetry is the point: one side is speech, the other is work.
 - `Worked for 3m 1s ⌄` collapsible section header (muted) with hairline rule.
 - Agent narration: plain paragraphs of body text.
 - Tool-call rows, inline with icons, muted single-line summaries:
@@ -85,9 +91,11 @@ clickable and isn't is worse than no control.
 - Composer (bottom, floating rounded-2xl card with border):
   - placeholder `Ask wizard to change something`
   - bottom row: `✦ Sovereign` mode chip (static — wizard has no permission gating, so there is
-    no mode dropdown) · spacer · stop button (present **only** while a turn runs — an idle
-    spinner just reads as "loading forever") · `GLM-5.2 ⌄` model picker · circular send button
-    `↑`, light-on-dark (right).
+    no mode dropdown) · spacer · `GLM-5.2 ⌄` model picker · the send button (right).
+  - **The send button is the stop button.** Idle it is a light-on-dark `↑`; while the agent is
+    working it becomes a square with a ring turning around it, and pressing it cancels the
+    turn. One control, in the place your hand already is — and it doubles as the "something is
+    running" indicator, so no idle spinner sits around reading as "loading forever".
 
 ## Settings and onboarding (one sheet, one list shape)
 

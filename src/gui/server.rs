@@ -40,6 +40,26 @@ struct Asset {
     body: &'static str,
 }
 
+/// The bundled typefaces (see `gui/assets/fonts/README.md`): Inter for the UI,
+/// JetBrains Mono for literals, both variable-weight latin subsets under the
+/// OFL. Embedded rather than assumed, because a machine with neither installed
+/// falls back to DejaVu Sans and the GUI looks like a 1998 dialog box.
+struct FontAsset {
+    name: &'static str,
+    body: &'static [u8],
+}
+
+const FONTS: [FontAsset; 2] = [
+    FontAsset {
+        name: "inter.woff2",
+        body: include_bytes!("../../gui/assets/fonts/inter.woff2"),
+    },
+    FontAsset {
+        name: "jetbrains-mono.woff2",
+        body: include_bytes!("../../gui/assets/fonts/jetbrains-mono.woff2"),
+    },
+];
+
 /// The GUI's five assets, embedded at compile time so the binary stays
 /// self-contained.
 const ASSETS: [Asset; 5] = [
@@ -84,6 +104,7 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/app.js", get(serve_asset))
         .route("/api.js", get(serve_asset))
         .route("/icons.js", get(serve_asset))
+        .route("/fonts/{name}", get(serve_font))
         .route("/favicon.ico", get(favicon))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/{id}", get(get_task))
@@ -203,6 +224,28 @@ async fn serve_asset(State(state): State<Arc<GuiState>>, uri: Uri) -> Response {
         return (headers, body).into_response();
     }
     (headers, asset.body).into_response()
+}
+
+/// `GET /fonts/{name}`: a bundled woff2. Unlike the code assets these never
+/// change within a build, so they are cached hard — the alternative is
+/// re-sending 80 KB on every page load.
+async fn serve_font(
+    Path(name): Path<String>,
+    State(state): State<Arc<GuiState>>,
+) -> Result<Response, ApiError> {
+    let Some(font) = FONTS.iter().find(|font| font.name == name) else {
+        return Err(ApiError::not_found(format!("no font '{name}'")));
+    };
+    let headers = [
+        (header::CONTENT_TYPE, "font/woff2"),
+        (header::CACHE_CONTROL, "public, max-age=604800, immutable"),
+    ];
+    if let Some(dir) = &state.assets_dir
+        && let Ok(body) = tokio::fs::read(dir.join("fonts").join(font.name)).await
+    {
+        return Ok((headers, body).into_response());
+    }
+    Ok((headers, font.body).into_response())
 }
 
 /// `GET /favicon.ico`: the embedded SVG sparkle (see [`FAVICON_SVG`]).

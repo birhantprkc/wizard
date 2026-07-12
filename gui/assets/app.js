@@ -717,7 +717,7 @@ function onStatus(status) {
   }
   state.taskState = wire;
   if (status.elapsedLabel) state.lastWorked = status.elapsedLabel;
-  updateSpinner();
+  updateSendButton();
   updateTaskSummary(state.selectedTaskId, {
     status: wire,
     bump: wire === 'working' || wire === 'needs_input',
@@ -748,7 +748,7 @@ function onRetrying(attempt) {
 
 function onDone(reason) {
   finalizeLiveTurn(reason);
-  updateSpinner();
+  updateSendButton();
   updateTaskSummary(state.selectedTaskId, { bump: true });
   updateGoal();
   refreshGit();
@@ -1196,15 +1196,31 @@ function openBranchMenu(anchor) {
   });
 }
 
-/** The stop button exists only while a turn runs — an idle spinner just reads
- *  as "something is loading forever". */
-function updateSpinner() {
-  const btn = document.querySelector('.spinner-btn');
-  if (!btn) return;
+/** Composer refs for the send/stop button. */
+let sendBtn = null;
+
+/**
+ * One button, two jobs: send while idle, stop while the agent is working. The
+ * thing you want to press mid-turn is exactly where you last pressed send, and
+ * an idle spinner sitting next to it only ever read as "loading forever".
+ */
+function updateSendButton() {
+  if (!sendBtn) return;
   const working = state.taskState === 'working';
-  btn.classList.toggle('hidden', !working);
-  const spin = btn.querySelector('.spinner-icon');
-  if (spin) spin.classList.toggle('spinning', working);
+  sendBtn.classList.toggle('working', working);
+  sendBtn.title = working ? 'Stop the agent' : 'Send';
+  sendBtn.setAttribute('aria-label', sendBtn.title);
+  sendBtn.replaceChildren(icon(working ? 'stop' : 'sendArrow'));
+}
+
+function stopTurn() {
+  if (state.taskState !== 'working' || !state.selectedTaskId) return;
+  try {
+    api.cancel(state.selectedTaskId);
+    appendSystemRow('Stopping…');
+  } catch {
+    /* the socket is gone; the turn is not ours to stop */
+  }
 }
 
 function focusComposer() {
@@ -1236,6 +1252,12 @@ function renderComposer() {
       onclick: (e) => { e.stopPropagation(); openModelMenu(modelAnchor); },
     }, modelLabelEl, icon('chevronDown', 'icon chip-caret')));
 
+  // Not a submit button: while the agent is working this same button stops it.
+  sendBtn = h('button', {
+    class: 'send-btn', type: 'button', title: 'Send', 'aria-label': 'Send',
+    onclick: () => (state.taskState === 'working' ? stopTurn() : form.requestSubmit()),
+  }, icon('sendArrow'));
+
   form.replaceChildren(
     input,
     h('div', { class: 'composer-row' },
@@ -1243,24 +1265,17 @@ function renderComposer() {
       h('span', { class: 'chip ghost-chip mode-chip', title: 'Agent mode — GUI sessions run autonomously' },
         icon('wand', 'icon chip-icon'), h('span', { class: 'chip-label' }, 'Sovereign')),
       h('span', { class: 'composer-spacer' }),
-      h('button', {
-        class: 'icon-btn spinner-btn hidden', type: 'button',
-        title: 'Stop the current turn', 'aria-label': 'Stop the current turn',
-        onclick: () => {
-          if (state.taskState === 'working' && state.selectedTaskId) {
-            try { api.cancel(state.selectedTaskId); } catch { /* not connected */ }
-          }
-        },
-      }, h('span', { class: 'spinner-icon', html: icons.spinner, 'aria-hidden': 'true' })),
       modelAnchor,
-      h('button', { class: 'send-btn', type: 'submit', title: 'Send', 'aria-label': 'Send' }, icon('sendArrow')),
+      sendBtn,
     ),
   );
+  updateSendButton();
 
   form.onsubmit = (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    if (!text || !state.task) return;
+    // One turn at a time: the backend refuses a second, so do not pretend.
+    if (!text || !state.task || state.taskState === 'working') return;
     input.value = '';
     input.style.height = 'auto';
     send(text);

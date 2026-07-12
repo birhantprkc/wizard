@@ -41,6 +41,7 @@ export const icons = {
   magnifier: s('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/>'),
   pencil: s('<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>'),
   sendArrow: s('<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/>', 'stroke-width="2"'),
+  stop: s('<rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/>'),
   chevronDown: s('<path d="m6 9 6 6 6-6"/>'),
   panelLeft: s('<rect x="3" y="4" width="18" height="16" rx="3.5"/><path d="M9.5 4.5v15"/>'),
   panelRight: s('<rect x="3" y="4" width="18" height="16" rx="3.5"/><path d="M14.5 4.5v15"/>'),
