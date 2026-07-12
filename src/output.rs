@@ -196,6 +196,43 @@ impl EventSink for TextSink {
                     }
                 ));
             }
+            // Run-scoped subagent activity: the TUI demuxes these into panes.
+            // Headless text mode keeps a one-line breadcrumb so the user can
+            // still see nested work without drowning the parent stream.
+            AgentEvent::SubagentRunStarted { name, task, bg, .. } => {
+                let id = bg.map(|id| format!(" #{id}")).unwrap_or_default();
+                self.spinner
+                    .println(&format!("▷ subagent{id} '{name}': {task}"));
+            }
+            AgentEvent::SubagentRunText { .. } => {}
+            AgentEvent::SubagentRunToolStarted { name, .. } => {
+                self.spinner.println(&format!("  → {name}"));
+            }
+            AgentEvent::SubagentRunToolFinished { name, output, .. } => {
+                let status = if output.is_error { "error" } else { "ok" };
+                self.spinner.println(&format!("  ← {name} [{status}]"));
+            }
+            AgentEvent::SubagentRunStep { .. } => {}
+            AgentEvent::SubagentRunDone {
+                completed,
+                error,
+                steps_used,
+                ..
+            } => {
+                let _ = steps_used;
+                if let Some(error) = error {
+                    self.spinner.println(&format!("▷ subagent failed: {error}"));
+                } else {
+                    self.spinner.println(&format!(
+                        "▷ subagent {}",
+                        if completed {
+                            "finished"
+                        } else {
+                            "hit its step budget"
+                        }
+                    ));
+                }
+            }
             AgentEvent::CommandRequested(line) => {
                 // No interactive menu to drive in a headless run: report the
                 // request but make clear it isn't applied.
@@ -329,6 +366,12 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             | AgentEvent::TaskFinished { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::SubagentRunStarted { .. }
+            | AgentEvent::SubagentRunText { .. }
+            | AgentEvent::SubagentRunToolStarted { .. }
+            | AgentEvent::SubagentRunToolFinished { .. }
+            | AgentEvent::SubagentRunStep { .. }
+            | AgentEvent::SubagentRunDone { .. }
             | AgentEvent::CommandRequested(_) => {}
         }
     }
@@ -506,6 +549,67 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "task": task,
                     "completed": completed,
                     "output": output,
+                }));
+            }
+            AgentEvent::SubagentRunStarted {
+                run,
+                bg,
+                name,
+                task,
+            } => {
+                self.emit(json!({
+                    "type": "subagent_run_started",
+                    "run": run,
+                    "bg": bg,
+                    "name": name,
+                    "task": task,
+                }));
+            }
+            AgentEvent::SubagentRunText { run, text } => {
+                self.emit(json!({
+                    "type": "subagent_run_text",
+                    "run": run,
+                    "text": text,
+                }));
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, args } => {
+                self.emit(json!({
+                    "type": "subagent_run_tool_call",
+                    "run": run,
+                    "name": name,
+                    "args": args,
+                }));
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                self.emit(json!({
+                    "type": "subagent_run_tool_result",
+                    "run": run,
+                    "name": name,
+                    "is_error": output.is_error,
+                    "output": output.content,
+                }));
+            }
+            AgentEvent::SubagentRunStep { run, step } => {
+                self.emit(json!({
+                    "type": "subagent_run_step",
+                    "run": run,
+                    "step": step,
+                }));
+            }
+            AgentEvent::SubagentRunDone {
+                run,
+                completed,
+                output,
+                steps_used,
+                error,
+            } => {
+                self.emit(json!({
+                    "type": "subagent_run_done",
+                    "run": run,
+                    "completed": completed,
+                    "output": output,
+                    "steps_used": steps_used,
+                    "error": error,
                 }));
             }
             AgentEvent::CommandRequested(line) => {

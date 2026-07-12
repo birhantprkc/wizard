@@ -25,7 +25,7 @@ inline hints.
 | `/resume [id]` | Reopen a past session and continue it; no argument opens the session picker |
 | `/compact` | Summarize older history into a progress note now, instead of waiting for the automatic threshold |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
-| `/subagents` | Toggle the in-session subagent monitor: every subagent run this session, with live status |
+| `/subagents` | Focus the subagent rail (live dots under the composer); Enter opens a run's own chat pane |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
 | `/goal [text]` | Show or set the standing mission goal (drives sovereign/continuous mode; persists to `.wizard/mission.toml`) |
@@ -83,9 +83,11 @@ failed). From it you can:
 Within a session, the agent delegates long-horizon work to subagents via
 `spawn_subagent`, and by default detaches them (`background: true`): the
 turn returns immediately, you keep chatting, and the subagent's report lands
-in context when it finishes. `/subagents` monitors them live, and the status
-bar shows a `⏵ N bg task(s)` marker while background `execute` tasks run
-(`/bashes` lists those).
+in context when it finishes. Each run gets its own pane on a rail under the
+composer — ↓ from an empty prompt focuses it, Enter opens that run's own
+chat view (Esc backs out), and `x` kills a background run. `/subagents`
+jumps to the rail. The status bar shows a `⏵ N bg task(s)` marker while
+background `execute` tasks run (`/bashes` lists those).
 
 ## Token usage and cost
 

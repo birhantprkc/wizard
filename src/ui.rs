@@ -35,7 +35,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, InputMode, Selection, TranscriptEntry};
+use crate::app::{App, InputMode, PaneStatus, Selection, SubagentPane, TranscriptEntry};
 use crate::config::Mode;
 use crate::session_registry::SessionState;
 use crate::vim::VimMode;
@@ -69,18 +69,31 @@ fn accent() -> Style {
 pub fn draw(frame: &mut Frame, app: &App) {
     // The composer grows with its content (hard line breaks plus soft-wrapped
     // continuations) up to MAX_INPUT_ROWS, then scrolls vertically. +2 for the
-    // rules above/below.
+    // rules above/below. The subagent rail sits between the composer and the
+    // status bar whenever any run has been delegated this session.
     let budget = composer_budget(frame.area().width);
     let input_rows =
         (wrap_rows(&composer_chars(app), budget).len() as u16).clamp(1, MAX_INPUT_ROWS);
-    let [main_area, input_area, status_area] = Layout::vertical([
+    let rail_rows = if app.panes.is_empty() {
+        0
+    } else {
+        // One header + one row per pane, capped so a long session still leaves
+        // room for the chat.
+        (1 + app.panes.len() as u16).min(6)
+    };
+    let [main_area, input_area, rail_area, status_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(input_rows + 2),
+        Constraint::Length(rail_rows),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
-    if app.show_diff || app.show_todos {
+    // Attached to a subagent pane: its transcript replaces the main chat.
+    // Diff/todo sidebars stay parent-scoped and hide while attached.
+    if app.attached.is_some() {
+        draw_attached_pane(frame, app, main_area);
+    } else if app.show_diff || app.show_todos {
         let [chat_area, side_area] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(main_area);
@@ -104,6 +117,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     draw_input(frame, app, input_area);
+    if rail_rows > 0 {
+        draw_rail(frame, app, rail_area);
+    }
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
@@ -111,7 +127,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         && app.plan_review.is_none()
         && app.interview.is_none()
         && !app.show_dashboard
-        && !app.show_subagents
+        && app.attached.is_none()
     {
         draw_suggestions(frame, app, input_area);
     }
@@ -124,13 +140,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.interview.is_some() {
         draw_interview(frame, app);
     }
-    // The dashboard and subagent monitor are modal and full-screen, so they
-    // paint last (on top). Only one is ever open at a time.
+    // The dashboard is modal and full-screen, so it paints last (on top).
     if app.show_dashboard {
         draw_dashboard(frame, app);
-    }
-    if app.show_subagents {
-        draw_subagents(frame, app);
     }
 
     // With any overlay floating above the transcript, a click belongs to the
@@ -139,7 +151,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         || app.plan_review.is_some()
         || app.interview.is_some()
         || app.show_dashboard
-        || app.show_subagents
     {
         app.card_hits.borrow_mut().clear();
     }
@@ -230,8 +241,7 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
         let overlay_open = app.picker.is_some()
             || app.plan_review.is_some()
             || app.interview.is_some()
-            || app.show_dashboard
-            || app.show_subagents;
+            || app.show_dashboard;
         if !overlay_open {
             draw_welcome(frame, app, area);
         }
@@ -881,10 +891,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         "↑↓ move · Enter select · Esc cancel"
     } else if !app.suggestions.is_empty() {
         "↑↓ select · Tab complete · Enter run"
+    } else if app.rail_focus.is_some() {
+        "↑↓ move · Enter open · x kill · Esc back"
+    } else if app.attached.is_some() {
+        "↑↓ scroll · Esc back"
     } else if app.show_diff {
         "PgUp/PgDn diff · Esc close"
     } else if app.status.busy {
         "PgUp/PgDn scroll"
+    } else if !app.panes.is_empty() {
+        "/ commands · ↓ subagents"
     } else {
         "/ commands · ↑ history"
     };
@@ -1455,150 +1471,260 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)), pinner);
 }
 
-/// In-session subagent monitor (`/subagents`): the subagents that have run or
-/// are running this session, with live status. Modal — Esc/Enter/q close it —
-/// and reconstructed from the transcript each frame: a `spawn_subagent` card is
-/// one run, and the `<name> ▸ <tool>` cards that follow it are its steps.
-fn draw_subagents(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    frame.render_widget(Clear, area);
-
-    // Walk the transcript once, grouping nested `▸` steps under their run.
-    struct Run {
-        name: String,
-        task: String,
-        /// 0 = running, 1 = completed, 2 = failed / hit budget.
-        state: u8,
-        steps: usize,
-        current: Option<String>,
-    }
-    let mut runs: Vec<Run> = Vec::new();
-    for entry in &app.transcript {
-        let TranscriptEntry::ToolCard {
-            name,
-            args,
-            output,
-            is_error,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        if name == "spawn_subagent" {
-            let who = args
-                .get("subagent")
-                .and_then(|v| v.as_str())
-                .unwrap_or("subagent");
-            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-            let state = match output {
-                None => 0,
-                Some(_) if *is_error => 2,
-                Some(_) => 1,
-            };
-            runs.push(Run {
-                name: who.to_string(),
-                task: task.to_string(),
-                state,
-                steps: 0,
-                current: None,
-            });
-        } else if let Some(tool) = name.split(" ▸ ").nth(1) {
-            // A nested subagent step belongs to the most recent run.
-            if let Some(run) = runs.last_mut() {
-                run.steps += 1;
-                run.current = if output.is_none() {
-                    Some(tool.to_string())
-                } else {
-                    None
-                };
-            }
-        }
-    }
-
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(dim())
-        .title(Line::from(vec![
-            Span::styled(" ✦ ", accent()),
-            Span::styled(
-                "subagents · this session",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .title_bottom(Line::from(Span::styled(" Esc close · refreshes live ", dim())).centered());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width < 8 || inner.height < 4 {
+/// Subagent rail under the composer: one row per run this session. Focused
+/// with ↓ from an empty composer; Enter opens the selected run as a full chat
+/// view (see [`draw_attached_pane`]).
+fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || app.panes.is_empty() {
         return;
     }
-    let width = inner.width as usize;
-    let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
-
+    let width = area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if runs.is_empty() {
-        lines.push(dash_bullet(
-            "no subagents have run this session",
-            dim().italic(),
-        ));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "the agent delegates via spawn_subagent · /agents to browse the roster",
-            dim().italic(),
-        )));
+
+    let running = app.running_panes();
+    let header = if app.rail_focus.is_some() {
+        format!(" subagents · {running} running · ↑↓ move · Enter open · x kill · Esc back ")
     } else {
-        // Running first (there is at most one at a time), then finished newest
-        // first so the latest result is on top.
-        let mut order: Vec<usize> = (0..runs.len()).filter(|&i| runs[i].state == 0).collect();
-        order.extend((0..runs.len()).filter(|&i| runs[i].state != 0).rev());
-        for i in order {
-            let run = &runs[i];
-            let (glyph, style) = match run.state {
-                0 => (spinner.to_string(), accent()),
-                1 => ("✓".to_string(), Style::default().fg(TEXT_DIM)),
-                _ => ("✗".to_string(), Style::default().fg(Color::White).bold()),
-            };
-            let suffix = match run.state {
-                0 => format!(" · step {}", run.steps.max(1)),
-                2 => format!(" · stopped at {} steps", run.steps),
-                _ => format!(" · {} steps", run.steps),
-            };
-            lines.push(truncate_line(
-                Line::from(vec![
-                    Span::styled(format!("{glyph} "), style),
-                    Span::styled(
-                        run.name.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(suffix, dim()),
-                ]),
-                width,
-            ));
-            if !run.task.is_empty() {
-                lines.push(truncate_line(
-                    Line::from(Span::styled(
-                        format!("    {}", run.task),
-                        Style::default().fg(TEXT_DIM),
-                    )),
-                    width,
-                ));
-            }
-            if let Some(current) = &run.current {
-                lines.push(truncate_line(
-                    Line::from(vec![
-                        Span::styled("    ▸ ", accent()),
-                        Span::styled(current.clone(), dim()),
-                    ]),
-                    width,
-                ));
+        format!(" subagents · {running} running · ↓ focus · /subagents ")
+    };
+    lines.push(Line::from(Span::styled(
+        truncate_width(&header, width),
+        dim(),
+    )));
+
+    // Prefer showing the end of the list (newest runs) when there are more
+    // panes than rows.
+    let capacity = area.height.saturating_sub(1) as usize;
+    let start = app.panes.len().saturating_sub(capacity);
+    for (offset, pane) in app.panes[start..].iter().enumerate() {
+        let index = start + offset;
+        let focused = app.rail_focus == Some(index) || app.attached == Some(index);
+        let glyph = pane.glyph(app.tick);
+        let elapsed = format_secs(pane.elapsed().as_secs());
+        let unread = if pane.unread > 0 {
+            format!(" · +{}", pane.unread)
+        } else {
+            String::new()
+        };
+        let activity = truncate_width(pane.activity(), 48);
+        let label = format!(
+            " {glyph} {} · step {} · {elapsed}{unread}  {activity}",
+            pane.name,
+            pane.steps.max(1)
+        );
+        let style = if focused {
+            accent().bold()
+        } else if pane.status == PaneStatus::Failed {
+            Style::default().fg(Color::White).bold()
+        } else if pane.status == PaneStatus::Done {
+            Style::default().fg(TEXT_DIM)
+        } else {
+            Style::default()
+        };
+        let marker = if focused { "›" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), accent()),
+            Span::styled(truncate_width(&label, width.saturating_sub(1)), style),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Full-screen view of one subagent run: its own transcript, same cards as the
+/// main chat. Esc detaches (handled in [`App`]).
+fn draw_attached_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(pane) = app.attached_pane() else {
+        return;
+    };
+    app.card_hits.borrow_mut().clear();
+
+    let header_height: u16 = 1;
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).areas(area);
+
+    let elapsed = format_secs(pane.elapsed().as_secs());
+    let status = match pane.status {
+        PaneStatus::Running => "running",
+        PaneStatus::Done => "done",
+        PaneStatus::Failed => "failed",
+    };
+    let kill_hint = if pane.bg.is_some() { " · x kill" } else { "" };
+    let header = format!(
+        " ✦ {} · {status} · step {} · {elapsed} · Esc back{kill_hint} ",
+        pane.name,
+        pane.steps.max(1)
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_width(&header, header_area.width as usize),
+            accent().bold(),
+        ))),
+        header_area,
+    );
+
+    let inner = body_area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let inner_width = inner.width as usize;
+    let inner_height = inner.height as usize;
+
+    let (text, line_tags) = pane_transcript_text(pane, app.tick);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_tags: Vec<Option<usize>> = Vec::new();
+    for (line, tag) in text.lines.into_iter().zip(line_tags) {
+        let before = lines.len();
+        lines.append(&mut wrap_lines(Text::from(vec![line]), inner_width));
+        row_tags.extend(std::iter::repeat_n(tag, lines.len() - before));
+    }
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(inner_height);
+    let scroll = (pane.scroll as usize).min(max_scroll);
+    let start = max_scroll - scroll;
+    let end = (start + inner_height).min(total);
+    let visible: Vec<Line<'static>> = lines[start..end].to_vec();
+
+    {
+        let mut hits = app.card_hits.borrow_mut();
+        for (offset, tag) in row_tags[start..end].iter().enumerate() {
+            if let Some(index) = tag {
+                hits.push((inner.y + offset as u16, *index));
             }
         }
     }
 
-    let max = inner.height as usize;
-    if lines.len() > max {
-        lines.truncate(max);
+    frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+
+    if scroll > 0 {
+        let label = format!("↓ {scroll} more ");
+        let width = (label.width() as u16).min(inner.width);
+        let hint = Rect {
+            x: inner.right().saturating_sub(width),
+            y: inner.y,
+            width,
+            height: 1,
+        };
+        frame.render_widget(Clear, hint);
+        frame.render_widget(Paragraph::new(Span::styled(label, dim())), hint);
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Same layout as [`transcript_text`], but for a subagent pane (no parent
+/// streaming state).
+fn pane_transcript_text(pane: &SubagentPane, tick: u64) -> (Text<'static>, Vec<Option<usize>>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut tags: Vec<Option<usize>> = Vec::new();
+    let mut prev_tool = false;
+    let mut prev_notice = false;
+
+    // Task banner so an empty pane still says what it was handed.
+    lines.push(Line::from(Span::styled(
+        format!("task · {}", pane.task),
+        dim().italic(),
+    )));
+
+    for (index, entry) in pane.transcript.iter().enumerate() {
+        let is_tool = matches!(entry, TranscriptEntry::ToolCard { .. });
+        let is_notice = matches!(entry, TranscriptEntry::Notice(_));
+        let tight = (is_tool && prev_tool) || (is_notice && prev_notice);
+        // Always leave a blank after the task banner before the first entry,
+        // and between non-tight groups afterwards.
+        if !tight {
+            lines.push(Line::raw(""));
+        }
+        prev_tool = is_tool;
+        prev_notice = is_notice;
+
+        let header_at = lines.len();
+        match entry {
+            TranscriptEntry::User(message) => {
+                let mut user_lines: Vec<Line<'static>> = Vec::new();
+                for line in message.lines() {
+                    user_lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(TEXT_DIM),
+                    )));
+                }
+                gutter_block(
+                    &mut lines,
+                    Text::from(user_lines),
+                    Span::styled("❯ ", dim().bold()),
+                );
+            }
+            TranscriptEntry::Assistant(message) => {
+                gutter_block(
+                    &mut lines,
+                    render_markdown(message),
+                    Span::styled("· ", accent()),
+                );
+            }
+            TranscriptEntry::Thinking(message) => {
+                gutter_block(
+                    &mut lines,
+                    thinking_text(message),
+                    Span::styled("· ", dim()),
+                );
+            }
+            TranscriptEntry::ToolCard {
+                name,
+                args,
+                output,
+                is_error,
+                collapsed,
+            } => {
+                tool_card_lines(
+                    &mut lines,
+                    name,
+                    args,
+                    output.as_deref(),
+                    *is_error,
+                    *collapsed,
+                    tick,
+                );
+            }
+            TranscriptEntry::Notice(message) => {
+                let style = if message.starts_with("error") || message.starts_with("failed") {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    dim().italic()
+                };
+                for line in message.lines() {
+                    lines.push(Line::from(Span::styled(format!("  {line}"), style)));
+                }
+            }
+        }
+        tags.resize(lines.len(), None);
+        if is_tool && header_at < lines.len() {
+            tags[header_at] = Some(index);
+        }
+    }
+
+    if pane.status == PaneStatus::Running && pane.transcript.is_empty() {
+        lines.push(Line::raw(""));
+        let spinner = SPINNER[(tick as usize) % SPINNER.len()];
+        lines.push(Line::from(vec![
+            Span::styled(format!("{spinner} "), accent()),
+            Span::styled("working…", dim().italic()),
+        ]));
+    }
+
+    tags.resize(lines.len(), None);
+    (Text::from(lines), tags)
+}
+
+/// Compact elapsed clock for the rail and attached header (`3s`, `1m12s`, …).
+fn format_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 /// Plan-review modal (plan mode): the plan markdown with a verdict footer.

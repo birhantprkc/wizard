@@ -32,6 +32,16 @@ pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 /// non-continuous budget).
 const RETRY_ATTEMPTS: u32 = 6;
 
+/// Session-unique id for one subagent run, minted by [`next_run_id`]. Every
+/// `AgentEvent::SubagentRun*` event carries it so a surface can demux
+/// concurrent runs — including two runs of the same subagent — into separate
+/// panes.
+pub fn next_run_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The parent agent's active model, shared with [`SpawnSubagentTool`] so
 /// mid-session `/model` switches reach subagents. `None` falls back to the
 /// configured model.
@@ -218,9 +228,16 @@ async fn stream_step(
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
 /// scoped registry, own step budget. The parent's lifecycle `hooks` apply to
-/// the subagent's tool calls too (their activity is not surfaced as events —
-/// the subagent reports back as one tool result).
+/// the subagent's tool calls too.
+///
+/// The subagent reports back to the parent model as one tool result, but its
+/// step-by-step activity streams to the surface as `AgentEvent::SubagentRun*`
+/// events scoped to `run` (see [`next_run_id`]), which the TUI renders as that
+/// subagent's own pane. The caller emits `SubagentRunStarted` (it knows the
+/// background id); this function emits everything after it, including the
+/// terminal `SubagentRunDone`.
 pub async fn spawn(
+    run: u64,
     config: &SubagentConfig,
     task: &str,
     options: &SpawnOptions,
@@ -259,10 +276,10 @@ pub async fn spawn(
     ];
 
     // The subagent reports back to the model as one tool result, but its
-    // individual tool calls are surfaced to the UI (prefixed with the
-    // subagent's name) on the parent's event channel so the user can watch
-    // what it's doing. Nested tools run with `events: None` so they don't
-    // double-emit (todos, background tasks); we emit our own start/finish pair.
+    // step-by-step activity streams to the surface as run-scoped events so the
+    // user can open its pane and watch it work. Nested tools run with
+    // `events: None` so they don't double-emit (todos, background tasks) or
+    // leak into the parent's transcript; we emit our own run-scoped pair.
     let progress = ctx.events.clone();
     let ctx = ToolContext {
         todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
@@ -307,8 +324,24 @@ pub async fn spawn(
                 Ok(completion) => break completion,
                 Err(err) => {
                     if !error_is_transient(&err) || attempt >= RETRY_ATTEMPTS {
-                        return Err(err)
-                            .with_context(|| format!("subagent '{}' chat failed", config.name));
+                        let err = Err::<(), _>(err)
+                            .with_context(|| format!("subagent '{}' chat failed", config.name))
+                            .expect_err("Err mapped to Err");
+                        // Close the pane out, or it sits at "running" forever.
+                        if let Some(events) = &progress {
+                            super::emit(
+                                events,
+                                crate::agent::AgentEvent::SubagentRunDone {
+                                    run,
+                                    completed: false,
+                                    output: String::new(),
+                                    steps_used,
+                                    error: Some(format!("{err:#}")),
+                                },
+                            )
+                            .await;
+                        }
+                        return Err(err);
                     }
                     let secs =
                         retry_max.min(retry_base.saturating_mul(2u64.saturating_pow(attempt)));
@@ -342,20 +375,32 @@ pub async fn spawn(
             break;
         }
         if !content.trim().is_empty() {
-            last_text = content;
+            last_text = content.clone();
+        }
+
+        // The subagent's own message for this step, into its pane.
+        if let Some(events) = &progress
+            && !content.trim().is_empty()
+        {
+            super::emit(
+                events,
+                crate::agent::AgentEvent::SubagentRunText {
+                    run,
+                    text: content.clone(),
+                },
+            )
+            .await;
         }
 
         for call in tool_calls {
             let name = call.function.name.clone();
             let mut args = normalize_args(&call.function.arguments);
-            // Surface this call to the UI as `<subagent> ▸ <tool>` so the user
-            // sees what the subagent is doing while it runs.
-            let label = format!("{} ▸ {}", config.name, name);
             if let Some(events) = &progress {
                 super::emit(
                     events,
-                    crate::agent::AgentEvent::ToolStarted {
-                        name: label.clone(),
+                    crate::agent::AgentEvent::SubagentRunToolStarted {
+                        run,
+                        name: name.clone(),
                         args: args.clone(),
                     },
                 )
@@ -401,8 +446,9 @@ pub async fn spawn(
             if let Some(events) = &progress {
                 super::emit(
                     events,
-                    crate::agent::AgentEvent::ToolFinished {
-                        name: label.clone(),
+                    crate::agent::AgentEvent::SubagentRunToolFinished {
+                        run,
+                        name: name.clone(),
                         output: output.clone(),
                     },
                 )
@@ -419,15 +465,38 @@ pub async fn spawn(
                 ChatMessage::user(format!("Tool result for `{name}`:\n{body}"))
             });
         }
+
+        if let Some(events) = &progress {
+            super::emit(
+                events,
+                crate::agent::AgentEvent::SubagentRunStep { run, step },
+            )
+            .await;
+        }
+    }
+
+    let output = if last_text.trim().is_empty() {
+        "(subagent produced no final text)".to_string()
+    } else {
+        last_text
+    };
+    if let Some(events) = &progress {
+        super::emit(
+            events,
+            crate::agent::AgentEvent::SubagentRunDone {
+                run,
+                completed,
+                output: output.clone(),
+                steps_used,
+                error: None,
+            },
+        )
+        .await;
     }
 
     Ok(SubagentResult {
         name: config.name.clone(),
-        output: if last_text.trim().is_empty() {
-            "(subagent produced no final text)".to_string()
-        } else {
-            last_text
-        },
+        output,
         steps_used,
         completed,
     })
@@ -580,6 +649,8 @@ impl Tool for SpawnSubagentTool {
                 ),
             })?;
 
+        let run = next_run_id();
+
         if args.background {
             let name = config.name.clone();
             let config = config.clone();
@@ -591,6 +662,7 @@ impl Tool for SpawnSubagentTool {
             let fut_options = options.clone();
             let fut = async move {
                 match spawn(
+                    run,
                     &config,
                     &task,
                     &fut_options,
@@ -615,8 +687,21 @@ impl Tool for SpawnSubagentTool {
                     },
                 }
             };
-            let id = ctx.subagents.spawn(&name, &args.task, fut);
+            // Reserve the id and announce the run *before* attaching the
+            // driver, so the pane exists by the time the subagent's first
+            // event lands in it.
+            let id = ctx.subagents.reserve(&name, &args.task);
             if let Some(events) = &ctx.events {
+                super::emit(
+                    events,
+                    crate::agent::AgentEvent::SubagentRunStarted {
+                        run,
+                        bg: Some(id),
+                        name: name.clone(),
+                        task: args.task.clone(),
+                    },
+                )
+                .await;
                 super::emit(
                     events,
                     crate::agent::AgentEvent::SubagentStarted {
@@ -627,6 +712,7 @@ impl Tool for SpawnSubagentTool {
                 )
                 .await;
             }
+            ctx.subagents.attach(id, fut);
             return Ok(ToolOutput::ok(format!(
                 "Delegated to subagent '{name}' (#{id}): {}.\nRunning in the background — \
                  you'll see its progress as it works, and the report lands in your context \
@@ -635,7 +721,21 @@ impl Tool for SpawnSubagentTool {
             )));
         }
 
+        if let Some(events) = &ctx.events {
+            super::emit(
+                events,
+                crate::agent::AgentEvent::SubagentRunStarted {
+                    run,
+                    bg: None,
+                    name: config.name.clone(),
+                    task: args.task.clone(),
+                },
+            )
+            .await;
+        }
+
         let result = spawn(
+            run,
             config,
             &args.task,
             &options,
@@ -878,6 +978,7 @@ mod tests {
             read_only: false,
         };
         let result = spawn(
+            next_run_id(),
             &worker(),
             "report",
             &options,
@@ -904,6 +1005,7 @@ mod tests {
         let client: Arc<dyn LlmProvider> = provider.clone();
 
         let err = spawn(
+            next_run_id(),
             &worker(),
             "report",
             &SpawnOptions::default(),

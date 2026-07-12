@@ -143,6 +143,19 @@ impl SubagentTaskRegistry {
         task: &str,
         fut: impl Future<Output = SubagentRunResult> + Send + 'static,
     ) -> u32 {
+        let id = self.reserve(name, task);
+        self.attach(id, fut);
+        id
+    }
+
+    /// Register `name`/`task` as running and return its id *without* starting
+    /// anything. Pair with [`SubagentTaskRegistry::attach`].
+    ///
+    /// The split exists so the caller can announce the run (emit
+    /// `AgentEvent::SubagentRunStarted`, which carries this id) *before* the
+    /// subagent starts emitting into it — `attach` may begin executing the
+    /// future on another worker thread the instant it is called.
+    pub fn reserve(&self, name: &str, task: &str) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.lock().insert(
             id,
@@ -154,6 +167,17 @@ impl SubagentTaskRegistry {
                 handle: None,
             },
         );
+        id
+    }
+
+    /// Detach `fut` as the driver for a run already [`reserve`]d under `id`.
+    ///
+    /// [`reserve`]: SubagentTaskRegistry::reserve
+    pub fn attach(
+        self: &Arc<Self>,
+        id: u32,
+        fut: impl Future<Output = SubagentRunResult> + Send + 'static,
+    ) {
         let registry = Arc::clone(self);
         let handle = tokio::spawn(async move {
             let result = fut.await;
@@ -161,14 +185,13 @@ impl SubagentTaskRegistry {
         });
         if let Some(entry) = self.lock().get_mut(&id) {
             // A kill can only race this while the entry is unresolved; if it
-            // already resolved (kill_all between spawn and here), abort now.
+            // already resolved (kill_all between reserve and here), abort now.
             if entry.result.is_some() {
                 handle.abort();
             } else {
                 entry.handle = Some(handle);
             }
         }
-        id
     }
 
     fn finish(&self, id: u32, result: SubagentRunResult) {
