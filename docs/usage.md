@@ -1,9 +1,9 @@
 # Usage
 
 Day-to-day reference: the TUI's slash commands, the `wizard agents`
-dashboard, and the core mechanics (token usage, todos, project
-instructions) that work identically in every mode (genie TUI, sovereign
-headless, perpetual, gateway).
+dashboard, the subagent rail, and the core mechanics (token usage, todos,
+project instructions) that work identically in every mode (genie TUI,
+sovereign headless, perpetual, gateway).
 
 ## Slash commands
 
@@ -25,7 +25,7 @@ inline hints.
 | `/resume [id]` | Reopen a past session and continue it; no argument opens the session picker |
 | `/compact` | Summarize older history into a progress note now, instead of waiting for the automatic threshold |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
-| `/subagents` | Toggle the in-session subagent monitor: every subagent run this session, with live status |
+| `/subagents` | Focus the subagent rail below the composer (same as ↓); from inside a subagent's pane, back out to the chat |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
 | `/goal [text]` | Show or set the standing mission goal (drives sovereign/continuous mode; persists to `.wizard/mission.toml`) |
@@ -83,9 +83,61 @@ failed). From it you can:
 Within a session, the agent delegates long-horizon work to subagents via
 `spawn_subagent`, and by default detaches them (`background: true`): the
 turn returns immediately, you keep chatting, and the subagent's report lands
-in context when it finishes. `/subagents` monitors them live, and the status
-bar shows a `⏵ N bg task(s)` marker while background `execute` tasks run
-(`/bashes` lists those).
+in context when it finishes. The status bar shows a `⏵ N bg subagent(s)`
+marker while detached subagents run, and a `⏵ N bg task(s)` marker while
+background `execute` tasks run (`/bashes` lists those).
+
+## The subagent rail
+
+Every subagent run — foreground or background — gets a row on the rail, which
+sits between the composer and the status bar. It costs no screen space until
+something has been delegated.
+
+```text
+ ❯ ◉ researcher   web_fetch                            0:12
+   ● reviewer     auditing the diff                    0:04 +3
+   ✔ tester       all 214 tests pass                   1:31
+```
+
+A row is a status dot (pulsing while running, `✔` done, `✗` failed), the
+subagent's name, what it is doing right now (the tool in flight by name, else
+its latest message), the elapsed clock, and `+N`: how much it has done since
+you last looked at it. Five rows show at most, then a `+N more` marker.
+
+Enter opens the selected run: that subagent's own conversation replaces the
+main chat — its messages and its collapsible tool cards, drawn by the same
+renderer — under a header naming the run.
+
+```text
+ ▌ researcher · running · 0:42 · 6 steps
+   find the latest Tokio release notes  esc back · shift+↑↓ next agent
+```
+
+A foreground run is marked `· foreground` there: the parent turn is blocked
+until it reports. The composer stays live while a pane is open, so you can
+keep talking to the main agent while you watch one work.
+
+| Key | What it does |
+|-----|--------------|
+| ↓ (in the composer) | Focus the rail, on the first running run (the last run if none is running) |
+| ↑ / ↓ | Move between runs; ↑ off the top row returns focus to the composer |
+| Enter | Open the selected run |
+| Esc | Leave the rail; in a pane, back to the main chat |
+| Shift+↑ / Shift+↓ (in a pane) | Flip to the previous / next run without backing out |
+| PageUp / PageDown (in a pane) | Scroll the pane |
+| Ctrl-X | Kill the selected run (background runs only) |
+| Any other key | Focus returns to the composer and the key is typed there |
+
+↓ only enters the rail when you are not part-way through input history, where
+it keeps walking history. Any key the rail does not use returns focus to the
+composer *and* is typed there, so a keystroke is never lost. Ctrl-X refuses a
+foreground run, since the parent turn is blocked on it; Ctrl-C interrupts that
+turn instead.
+
+A subagent's own steps stay in its pane, so the main transcript holds only the
+parent's `spawn_subagent` card and, for a detached run, the notice when it
+reports back. Headless (`-p`) has no rail: there, subagent tool calls print
+inline as `<name> ▸ <tool>` ([headless.md](headless.md)).
 
 ## Token usage and cost
 

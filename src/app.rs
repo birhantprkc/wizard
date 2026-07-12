@@ -38,7 +38,7 @@ use crate::tools::todo::TodoItem;
 use crate::vim::{self, Pending, VimMode, VimOp, VimState};
 
 /// One rendered entry in the chat transcript.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TranscriptEntry {
     User(String),
     Assistant(String),
@@ -56,6 +56,125 @@ pub enum TranscriptEntry {
     },
     /// System notice (mode switch, reload result, errors).
     Notice(String),
+}
+
+/// Lifecycle of one subagent run, as shown on its rail dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneStatus {
+    /// The sub-loop is still going.
+    Running,
+    /// The sub-loop finished on its own and reported back.
+    Done,
+    /// The run hit its step budget, errored out, or was killed.
+    Failed,
+}
+
+impl PaneStatus {
+    /// The rail's status glyph. Running panes animate via
+    /// [`SubagentPane::glyph`]; these are the resting shapes.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            PaneStatus::Running => "●",
+            PaneStatus::Done => "✔",
+            PaneStatus::Failed => "✗",
+        }
+    }
+}
+
+/// Frames for a running pane's dot, cycled off the app tick so an active
+/// subagent visibly pulses on the rail.
+const PANE_SPINNER: [&str; 4] = ["●", "◉", "○", "◉"];
+
+/// One subagent run, surfaced on the rail below the composer and openable as
+/// a full chat view.
+///
+/// This is the faithful record the old transcript-scraping monitor could not
+/// build: the subagent's own messages and tool cards, streamed live off the
+/// `AgentEvent::SubagentRun*` events and keyed by [`SubagentPane::run`].
+#[derive(Debug, Clone)]
+pub struct SubagentPane {
+    /// Session-unique run id (`agent::subagent::next_run_id`).
+    pub run: u64,
+    /// Background-registry id, when the run was detached. `None` for a
+    /// foreground run — which cannot be killed independently, since the
+    /// parent turn is blocked on it.
+    pub bg: Option<u32>,
+    /// Subagent name (`researcher`, `reviewer`, …).
+    pub name: String,
+    /// The task it was handed.
+    pub task: String,
+    pub status: PaneStatus,
+    /// The subagent's own conversation, rendered exactly like the main chat.
+    pub transcript: Vec<TranscriptEntry>,
+    /// Steps (model round-trips) completed so far.
+    pub steps: u32,
+    pub started: Instant,
+    /// Set once the run ends; freezes the elapsed clock on the rail.
+    pub finished: Option<Instant>,
+    /// Entries appended since the user last had this pane open. Drives the
+    /// unread badge, so you can tell which agent did something while you were
+    /// looking elsewhere.
+    pub unread: usize,
+    /// Scroll offset while attached, in rendered lines from the bottom.
+    pub scroll: u16,
+}
+
+impl SubagentPane {
+    fn new(run: u64, bg: Option<u32>, name: String, task: String) -> Self {
+        Self {
+            run,
+            bg,
+            name,
+            task,
+            status: PaneStatus::Running,
+            transcript: Vec::new(),
+            steps: 0,
+            started: Instant::now(),
+            finished: None,
+            unread: 0,
+            scroll: 0,
+        }
+    }
+
+    /// How long the run has been going, frozen once it ends.
+    pub fn elapsed(&self) -> Duration {
+        self.finished.unwrap_or_else(Instant::now) - self.started
+    }
+
+    /// The rail dot: a pulsing glyph while running, a resting one once done.
+    pub fn glyph(&self, tick: u64) -> &'static str {
+        match self.status {
+            PaneStatus::Running => PANE_SPINNER[(tick / 2) as usize % PANE_SPINNER.len()],
+            other => other.glyph(),
+        }
+    }
+
+    /// One-line summary of what the subagent is doing right now: the tool it
+    /// is in the middle of, else its latest message, else the task.
+    pub fn activity(&self) -> &str {
+        if self.status != PaneStatus::Running {
+            return match self.transcript.iter().rev().find_map(|entry| match entry {
+                TranscriptEntry::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            }) {
+                Some(text) => text,
+                None => self.task.as_str(),
+            };
+        }
+        for entry in self.transcript.iter().rev() {
+            match entry {
+                // A card still running is the most specific thing to show.
+                TranscriptEntry::ToolCard {
+                    name, output: None, ..
+                } => return name.as_str(),
+                TranscriptEntry::Assistant(text) if !text.trim().is_empty() => {
+                    return text.as_str();
+                }
+                _ => {}
+            }
+        }
+        self.task.as_str()
+    }
 }
 
 /// Whether a finished tool's output is long enough to start collapsed: more
@@ -1078,8 +1197,19 @@ pub struct App {
     todos_seen: bool,
     /// Full-screen agent dashboard visibility (toggled by `/dashboard`).
     pub show_dashboard: bool,
-    /// In-session subagent monitor visibility (toggled by `/subagents`).
-    pub show_subagents: bool,
+    /// Every subagent run this session, oldest first — the rail below the
+    /// composer. Fed by the `AgentEvent::SubagentRun*` events.
+    pub panes: Vec<SubagentPane>,
+    /// Background-subagent registry, so the rail can kill a detached run even
+    /// while a turn holds the agent. `None` until the agent is built.
+    pub subagents: Option<Arc<crate::tools::subagent_tasks::SubagentTaskRegistry>>,
+    /// Selected rail row while the rail has keyboard focus (↓ from the
+    /// composer). `None` means the composer has focus and the rail is just
+    /// on display. Indexes [`App::panes`].
+    pub rail_focus: Option<usize>,
+    /// The pane the user is *inside*: its transcript replaces the main chat
+    /// until Esc. Indexes [`App::panes`].
+    pub attached: Option<usize>,
     /// This session's id (heartbeat filename + dashboard identity).
     pub session_id: String,
     /// This session's display name (from the first prompt, or the id).
@@ -1244,7 +1374,10 @@ impl App {
             todos: Vec::new(),
             todos_seen: false,
             show_dashboard: false,
-            show_subagents: false,
+            panes: Vec::new(),
+            subagents: None,
+            rail_focus: None,
+            attached: None,
             session_id: String::new(),
             session_name: String::new(),
             session_started_unix: 0,
@@ -1923,6 +2056,134 @@ impl App {
             }
         }
         format!("{}…", self.spinner_verb)
+    }
+
+    // ---- Subagent rail -------------------------------------------------
+    //
+    // The rail is the row of dots under the composer, one per subagent run.
+    // ↓ from the composer focuses it, ↑/↓ move between dots, Enter opens the
+    // selected one as a full chat view, Esc backs out.
+
+    /// Index of the pane for `run`, if it is still on the rail.
+    fn pane_index(&self, run: u64) -> Option<usize> {
+        self.panes.iter().position(|pane| pane.run == run)
+    }
+
+    /// Append to a pane's transcript and bump its unread badge — unless the
+    /// user is currently watching that pane, in which case they have already
+    /// seen it.
+    fn push_pane(&mut self, run: u64, entry: TranscriptEntry) {
+        let Some(index) = self.pane_index(run) else {
+            return;
+        };
+        let attached = self.attached == Some(index);
+        let pane = &mut self.panes[index];
+        pane.transcript.push(entry);
+        if attached {
+            // Watching live: stay pinned to the bottom.
+            pane.scroll = 0;
+        } else {
+            pane.unread += 1;
+        }
+    }
+
+    /// The pane the user is inside, if any.
+    pub fn attached_pane(&self) -> Option<&SubagentPane> {
+        self.attached.and_then(|index| self.panes.get(index))
+    }
+
+    /// Number of runs still going — the count shown on the rail header.
+    pub fn running_panes(&self) -> usize {
+        self.panes
+            .iter()
+            .filter(|pane| pane.status == PaneStatus::Running)
+            .count()
+    }
+
+    /// Move the rail selection by `delta`, clamped at both ends. Moving up off
+    /// the top row returns focus to the composer, which is what makes ↑/↓ feel
+    /// continuous between the two.
+    fn rail_select(&mut self, delta: isize) {
+        let Some(current) = self.rail_focus else {
+            return;
+        };
+        let next = current as isize + delta;
+        if next < 0 {
+            self.rail_focus = None;
+            return;
+        }
+        self.rail_focus = Some((next as usize).min(self.panes.len().saturating_sub(1)));
+    }
+
+    /// Give the rail keyboard focus, selecting the first running pane if there
+    /// is one (that is the one you almost always want) and the last pane
+    /// otherwise. No-op when nothing has been delegated yet.
+    pub fn focus_rail(&mut self) -> bool {
+        if self.panes.is_empty() {
+            return false;
+        }
+        let target = self
+            .panes
+            .iter()
+            .position(|pane| pane.status == PaneStatus::Running)
+            .unwrap_or(self.panes.len() - 1);
+        self.rail_focus = Some(target);
+        true
+    }
+
+    /// Open a pane as the main chat view: its transcript takes over the
+    /// screen until Esc. Clears the unread badge — you are looking at it now.
+    pub fn attach_pane(&mut self, index: usize) {
+        let Some(pane) = self.panes.get_mut(index) else {
+            return;
+        };
+        pane.unread = 0;
+        pane.scroll = 0;
+        self.attached = Some(index);
+        self.rail_focus = Some(index);
+    }
+
+    /// Leave the attached pane and go back to the main chat, with the rail
+    /// still focused on the pane you were just in.
+    pub fn detach_pane(&mut self) {
+        if let Some(index) = self.attached.take()
+            && let Some(pane) = self.panes.get_mut(index)
+        {
+            pane.unread = 0;
+        }
+    }
+
+    /// Kill the selected run. Only background runs can be killed — a
+    /// foreground run has the parent turn blocked on it, so the way to stop it
+    /// is to interrupt the turn (Ctrl-C).
+    fn kill_pane(&mut self, index: usize) {
+        let Some(pane) = self.panes.get(index) else {
+            return;
+        };
+        let (name, bg) = (pane.name.clone(), pane.bg);
+        let Some(bg) = bg else {
+            self.notice(format!(
+                "subagent '{name}' is running in the foreground — Ctrl-C interrupts the turn it \
+                 is blocking"
+            ));
+            return;
+        };
+        let Some(registry) = self.subagents.clone() else {
+            return;
+        };
+        if registry.kill(bg) {
+            // Aborting the driver task means the run emits no closing event of
+            // its own, so retire the pane here.
+            if let Some(pane) = self.panes.get_mut(index) {
+                pane.status = PaneStatus::Failed;
+                pane.finished = Some(Instant::now());
+                pane.transcript
+                    .push(TranscriptEntry::Notice("killed on request".to_string()));
+            }
+            self.notice(format!("killed subagent '{name}' (#{bg})"));
+        } else {
+            self.notice(format!("subagent '{name}' (#{bg}) already finished"));
+        }
     }
 
     /// Build this session's heartbeat record from current state.
@@ -2892,13 +3153,85 @@ impl App {
             return Ok(None);
         }
 
-        // The subagent monitor is modal too: Esc / Enter / q close it; other
-        // keys are swallowed. It refreshes from live App state each frame.
-        if self.show_subagents {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                self.show_subagents = false;
+        // Inside a subagent's pane. Its transcript has taken over the screen,
+        // so navigation keys scroll *it* — but the composer stays live
+        // underneath, so anything else falls through to normal typing and you
+        // can keep driving the main conversation while you watch.
+        if let Some(index) = self.attached {
+            match key.code {
+                KeyCode::Esc => {
+                    self.detach_pane();
+                    return Ok(None);
+                }
+                // ↑/↓ walk the rail *inside* the pane view: you flip straight
+                // from one subagent to the next without backing out first.
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if index > 0 {
+                        self.attach_pane(index - 1);
+                    }
+                    return Ok(None);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if index + 1 < self.panes.len() {
+                        self.attach_pane(index + 1);
+                    }
+                    return Ok(None);
+                }
+                KeyCode::PageUp => {
+                    if let Some(pane) = self.panes.get_mut(index) {
+                        pane.scroll = pane.scroll.saturating_add(10);
+                    }
+                    return Ok(None);
+                }
+                KeyCode::PageDown => {
+                    if let Some(pane) = self.panes.get_mut(index) {
+                        pane.scroll = pane.scroll.saturating_sub(10);
+                    }
+                    return Ok(None);
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.kill_pane(index);
+                    return Ok(None);
+                }
+                _ => {}
             }
-            return Ok(None);
+        }
+
+        // The rail has keyboard focus: ↑/↓ move between subagent dots, Enter
+        // opens the selected one, Esc drops back to the composer.
+        if let Some(index) = self.rail_focus
+            && self.attached.is_none()
+        {
+            match key.code {
+                // Arrows only — no j/k. The rail is a focus you land in from a
+                // live text composer, so every letter has to fall through and
+                // be typed; binding letters here would eat the first character
+                // of "just do X".
+                KeyCode::Up => {
+                    self.rail_select(-1);
+                    return Ok(None);
+                }
+                KeyCode::Down => {
+                    self.rail_select(1);
+                    return Ok(None);
+                }
+                KeyCode::Enter => {
+                    self.attach_pane(index);
+                    return Ok(None);
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.kill_pane(index);
+                    return Ok(None);
+                }
+                KeyCode::Esc => {
+                    self.rail_focus = None;
+                    return Ok(None);
+                }
+                // Anything else means the user is done browsing and wants to
+                // type: hand focus back to the composer and let the key land
+                // there, so you never lose a keystroke to the rail.
+                _ => self.rail_focus = None,
+            }
         }
 
         // An open plan review captures all keys: the turn is paused inside
@@ -3318,7 +3651,12 @@ impl App {
                     } else {
                         self.suggestion_index + 1
                     };
-                } else {
+                } else if self.history_pos.is_some() {
+                    // Mid-history: ↓ keeps walking forward through it.
+                    self.history_next();
+                } else if !self.focus_rail() {
+                    // Past the end of history with no subagents to drop into:
+                    // ↓ is a no-op, which is what history_next already does.
                     self.history_next();
                 }
                 None
@@ -3827,6 +4165,111 @@ impl App {
                         "hit its step budget"
                     }
                 ));
+            }
+            // ---- The subagent rail --------------------------------------
+            //
+            // These carry a `run` id, so concurrent runs (even two of the same
+            // subagent) each land in their own pane instead of interleaving
+            // into the parent transcript.
+            AgentEvent::SubagentRunStarted {
+                run,
+                bg,
+                name,
+                task,
+            } => {
+                self.panes.push(SubagentPane::new(run, bg, name, task));
+            }
+            AgentEvent::SubagentRunText { run, text } => {
+                self.push_pane(run, TranscriptEntry::Assistant(text));
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, args } => {
+                self.push_pane(
+                    run,
+                    TranscriptEntry::ToolCard {
+                        name,
+                        args,
+                        output: None,
+                        is_error: false,
+                        collapsed: false,
+                    },
+                );
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                let Some(index) = self.pane_index(run) else {
+                    return;
+                };
+                let card = self.panes[index]
+                    .transcript
+                    .iter_mut()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        TranscriptEntry::ToolCard {
+                            name: card_name,
+                            output: slot,
+                            is_error,
+                            collapsed,
+                            ..
+                        } if *card_name == name && slot.is_none() => {
+                            Some((slot, is_error, collapsed))
+                        }
+                        _ => None,
+                    });
+                // Same collapse policy as the main transcript: errors and long
+                // payloads land folded, so a pane stays skimmable.
+                if let Some((slot, is_error, collapsed)) = card {
+                    *is_error = output.is_error;
+                    *collapsed = output.is_error || collapse_long(&output.content);
+                    *slot = Some(output.content);
+                }
+            }
+            AgentEvent::SubagentRunStep { run, step } => {
+                if let Some(index) = self.pane_index(run) {
+                    self.panes[index].steps = step;
+                }
+            }
+            AgentEvent::SubagentRunDone {
+                run,
+                completed,
+                output,
+                error,
+                ..
+            } => {
+                let Some(index) = self.pane_index(run) else {
+                    return;
+                };
+                let attached = self.attached == Some(index);
+                let pane = &mut self.panes[index];
+                pane.status = if completed {
+                    PaneStatus::Done
+                } else {
+                    PaneStatus::Failed
+                };
+                pane.finished = Some(Instant::now());
+                // The subagent's final message is the step that made no tool
+                // call, so the sub-loop ends on it without streaming it — it
+                // arrives here, as the report. Without this the pane would show
+                // all of the work and none of the conclusion.
+                if !output.trim().is_empty() {
+                    let already_last = matches!(
+                        pane.transcript.last(),
+                        Some(TranscriptEntry::Assistant(text)) if text == &output
+                    );
+                    if !already_last {
+                        pane.transcript.push(TranscriptEntry::Assistant(output));
+                    }
+                }
+                match error {
+                    Some(error) => pane
+                        .transcript
+                        .push(TranscriptEntry::Notice(format!("failed: {error}"))),
+                    None if !completed => pane
+                        .transcript
+                        .push(TranscriptEntry::Notice("hit its step budget".to_string())),
+                    None => {}
+                }
+                if !attached {
+                    pane.unread += 1;
+                }
             }
             AgentEvent::TodoUpdated(items) => {
                 self.todos = items;
@@ -4639,6 +5082,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     app.custom_commands = crate::commands::load(&project_root);
     app.session_id = session_id.clone();
     app.session_name = session_name;
+    // The rail kills background subagents through this, so it must be reachable
+    // while a turn holds the agent — hence a cloned Arc, not the agent itself.
+    app.subagents = agent_slot.as_ref().map(|agent| agent.subagent_registry());
     app.session_started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4776,6 +5222,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 if app.plan_mode {
                     agent.set_plan_mode(true);
                 }
+                // A rebuild brings a fresh tool context, so the old registry
+                // handle is dead — re-point the rail at the live one.
+                app.subagents = Some(agent.subagent_registry());
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -5292,18 +5741,22 @@ impl CommandContext<'_> {
     fn toggle_dashboard(&mut self) {
         self.app.show_dashboard = !self.app.show_dashboard;
         if self.app.show_dashboard {
-            self.app.show_subagents = false;
             self.app.refresh_sessions();
             self.app.refresh_peek();
         }
     }
 
-    /// `/subagents`: toggle the in-session subagent monitor.
+    /// `/subagents`: jump to the rail. The rail is always on screen while
+    /// subagents exist, so this is a shortcut for ↓ — it takes you straight
+    /// to the first running one.
     fn toggle_subagents(&mut self) {
-        self.app.show_subagents = !self.app.show_subagents;
-        // Mutually exclusive with the dashboard so only one modal is up.
-        if self.app.show_subagents {
-            self.app.show_dashboard = false;
+        if self.app.attached.is_some() {
+            self.app.detach_pane();
+            return;
+        }
+        if !self.app.focus_rail() {
+            self.app
+                .notice("no subagents yet — the agent spawns them with `spawn_subagent`");
         }
     }
 
@@ -6713,6 +7166,20 @@ mod tests {
     fn press_ctrl(app: &mut App, c: char) -> Option<AppAction> {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
             .expect("key handled")
+    }
+
+    /// An app with `n` subagent runs on the rail, all still running.
+    fn app_with_panes(n: u64) -> App {
+        let mut app = app();
+        for i in 0..n {
+            app.handle_agent_event(AgentEvent::SubagentRunStarted {
+                run: i,
+                bg: Some(i as u32),
+                name: format!("agent{i}"),
+                task: format!("task {i}"),
+            });
+        }
+        app
     }
 
     fn press_mod(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<AppAction> {
@@ -8537,5 +9004,295 @@ mod tests {
         assert!(action.is_none());
         assert!(app.input.contains('\n'));
         assert_eq!(app.input.chars().filter(|c| !c.is_whitespace()).count(), 2);
+    }
+
+    // ---- Subagent rail ---------------------------------------------------
+
+    #[test]
+    fn subagent_run_events_build_a_pane() {
+        let mut app = app_with_panes(1);
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].name, "agent0");
+        assert_eq!(app.panes[0].status, PaneStatus::Running);
+
+        app.handle_agent_event(AgentEvent::SubagentRunToolStarted {
+            run: 0,
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "src/app.rs"}),
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 0,
+            text: "found it".to_string(),
+        });
+
+        // The subagent's work lands in *its* pane, not the main transcript.
+        assert_eq!(app.panes[0].transcript.len(), 2);
+        assert!(app.transcript.is_empty());
+        // …and it is flagged as unread, since the user is not watching it.
+        assert_eq!(app.panes[0].unread, 2);
+    }
+
+    #[test]
+    fn concurrent_runs_of_one_subagent_stay_in_separate_panes() {
+        let mut app = app();
+        for run in [7, 9] {
+            app.handle_agent_event(AgentEvent::SubagentRunStarted {
+                run,
+                bg: None,
+                name: "worker".to_string(),
+                task: format!("task {run}"),
+            });
+        }
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 9,
+            text: "from the second".to_string(),
+        });
+
+        assert_eq!(app.panes.len(), 2);
+        assert!(app.panes[0].transcript.is_empty());
+        assert_eq!(app.panes[1].transcript.len(), 1);
+    }
+
+    #[test]
+    fn tool_output_lands_on_the_panes_open_card() {
+        let mut app = app_with_panes(1);
+        app.handle_agent_event(AgentEvent::SubagentRunToolStarted {
+            run: 0,
+            name: "read_file".to_string(),
+            args: Value::Null,
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunToolFinished {
+            run: 0,
+            name: "read_file".to_string(),
+            output: crate::tools::ToolOutput::ok("contents"),
+        });
+
+        assert_eq!(app.panes[0].transcript.len(), 1);
+        let TranscriptEntry::ToolCard { output, .. } = &app.panes[0].transcript[0] else {
+            panic!("expected a tool card");
+        };
+        assert_eq!(output.as_deref(), Some("contents"));
+    }
+
+    #[test]
+    fn down_from_the_composer_focuses_the_rail_then_enter_attaches() {
+        let mut app = app_with_panes(2);
+        assert_eq!(app.rail_focus, None);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(0));
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(1));
+        // Clamped at the bottom rather than wrapping — you cannot fall off.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(1));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.attached, Some(1));
+        assert_eq!(
+            app.attached_pane().map(|pane| pane.name.as_str()),
+            Some("agent1")
+        );
+
+        // Esc backs out to the main chat, rail still parked on that run.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.attached, None);
+        assert_eq!(app.rail_focus, Some(1));
+    }
+
+    #[test]
+    fn up_off_the_top_of_the_rail_returns_to_the_composer() {
+        let mut app = app_with_panes(2);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(0));
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.rail_focus, None);
+
+        // Focus really is back in the composer: typing goes to the input.
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn down_still_walks_history_when_there_are_no_subagents() {
+        let mut app = app();
+        app.history.push("earlier".to_string());
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "earlier");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, None);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn typing_on_the_rail_hands_focus_back_to_the_composer() {
+        let mut app = app_with_panes(1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(0));
+
+        // The keystroke must not be swallowed by the rail.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.rail_focus, None);
+        assert_eq!(app.input, "x");
+    }
+
+    #[test]
+    fn attaching_clears_the_unread_badge_and_live_entries_stay_read() {
+        let mut app = app_with_panes(1);
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 0,
+            text: "one".to_string(),
+        });
+        assert_eq!(app.panes[0].unread, 1);
+
+        app.attach_pane(0);
+        assert_eq!(app.panes[0].unread, 0);
+
+        // While you are watching, new work is not "unread".
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 0,
+            text: "two".to_string(),
+        });
+        assert_eq!(app.panes[0].unread, 0);
+    }
+
+    #[test]
+    fn run_done_retires_the_pane() {
+        let mut app = app_with_panes(1);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "report".to_string(),
+            steps_used: 3,
+            error: None,
+        });
+        assert_eq!(app.panes[0].status, PaneStatus::Done);
+        assert!(app.panes[0].finished.is_some());
+        assert_eq!(app.running_panes(), 0);
+    }
+
+    #[test]
+    fn the_final_report_lands_in_the_pane() {
+        let mut app = app_with_panes(1);
+        // The report is the step that made no tool call, so the sub-loop ends
+        // on it and never streams it as text — it only arrives on the Done
+        // event. The pane must still show it.
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "the auth flow starts in login.rs".to_string(),
+            steps_used: 2,
+            error: None,
+        });
+        let TranscriptEntry::Assistant(text) = app.panes[0].transcript.last().unwrap() else {
+            panic!("expected the report as an assistant message");
+        };
+        assert_eq!(text, "the auth flow starts in login.rs");
+        assert_eq!(app.panes[0].activity(), "the auth flow starts in login.rs");
+    }
+
+    #[test]
+    fn the_report_is_not_duplicated_when_it_also_streamed() {
+        let mut app = app_with_panes(1);
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 0,
+            text: "all done".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "all done".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+        assert_eq!(app.panes[0].transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_run_shows_its_error_in_the_pane() {
+        let mut app = app_with_panes(1);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: false,
+            output: String::new(),
+            steps_used: 1,
+            error: Some("provider is down".to_string()),
+        });
+        assert_eq!(app.panes[0].status, PaneStatus::Failed);
+        let TranscriptEntry::Notice(text) = &app.panes[0].transcript[0] else {
+            panic!("expected a notice");
+        };
+        assert!(text.contains("provider is down"));
+    }
+
+    #[test]
+    fn focus_rail_prefers_a_running_pane_over_a_finished_one() {
+        let mut app = app_with_panes(2);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "done".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+        // agent0 has finished; ↓ should land on the one still working.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rail_focus, Some(1));
+    }
+
+    #[test]
+    fn shift_arrows_flip_between_panes_without_backing_out() {
+        let mut app = app_with_panes(3);
+        app.attach_pane(0);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(1));
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(2));
+        // Clamped at the last pane.
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(2));
+
+        press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(1));
+    }
+
+    #[test]
+    fn the_composer_stays_live_while_attached() {
+        let mut app = app_with_panes(1);
+        app.attach_pane(0);
+        // Better than a modal: you can keep driving the main conversation
+        // while you watch a subagent work.
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.input, "hi");
+        assert_eq!(app.attached, Some(0));
+    }
+
+    #[test]
+    fn activity_reports_the_tool_in_flight_then_the_last_message() {
+        let mut app = app_with_panes(1);
+        // Nothing yet: fall back to the task.
+        assert_eq!(app.panes[0].activity(), "task 0");
+
+        app.handle_agent_event(AgentEvent::SubagentRunToolStarted {
+            run: 0,
+            name: "grep".to_string(),
+            args: Value::Null,
+        });
+        assert_eq!(app.panes[0].activity(), "grep");
+
+        app.handle_agent_event(AgentEvent::SubagentRunToolFinished {
+            run: 0,
+            name: "grep".to_string(),
+            output: crate::tools::ToolOutput::ok("hit"),
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunText {
+            run: 0,
+            text: "narrowing it down".to_string(),
+        });
+        assert_eq!(app.panes[0].activity(), "narrowing it down");
     }
 }

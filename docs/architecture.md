@@ -172,7 +172,8 @@ The agent can spawn isolated subagents for parallel or decomposed work:
 
 - Each subagent gets its own message history, step budget, and tool scope
 - Results return to the parent as a single tool result, so a multi-step sub-task costs the parent one turn of context
-- `spawn_subagent` can detach a run into the background: the parent keeps working (and the user keeps chatting) while the subagent runs, and its report lands in context when it finishes; `/subagents` monitors them live
+- `spawn_subagent` can detach a run into the background: the parent keeps working (and the user keeps chatting) while the subagent runs, and its report lands in context when it finishes
+- Every run emits `SubagentRun*` events keyed by a run id; the TUI demuxes them into one pane per run on the [subagent rail](usage.md#the-subagent-rail), headless surfaces print them inline as `<name> ▸ <tool>`
 - Sovereign mode uses these to fan out across multi-file tasks; [fleet mode](fleet.md) coordinates parallel workers over git worktrees
 
 ### Skills (`skills/`)
@@ -210,6 +211,7 @@ Ratatui + crossterm terminal UI:
 - Chat panel with streaming markdown
 - Tool invocation cards (collapsible)
 - Git diff sidebar
+- Subagent rail under the composer: one row per run, openable as a full chat view of that subagent's own transcript
 - Status bar: model, mode, step count
 - Command mode for `/slash` commands
 
