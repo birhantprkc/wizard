@@ -95,8 +95,34 @@ copy must never be what lands on disk.
 ### PATCH /api/settings
 `{ "max_steps": 100 }` → the same shape as `GET`.
 
+## Subscription sign-in (OAuth)
+
+An API key is a string the user can paste; a subscription is not. One sign-in may be in
+flight at a time — a person signs in to one account at a time, and a second attempt replaces
+the first rather than racing it.
+
+### POST /api/login/{provider}
+`{ "authorize_url": "https://auth.x.ai/oauth2/authorize?…" }` — start the flow. The browser
+opens that URL (from a window opened *synchronously* on the click, or browsers block it).
+The redirect_uri handed to the provider is `http://127.0.0.1:<gui port>/callback`: the GUI
+already is a server, so it serves its own redirect. The terminal flows
+(`wizard --login xai`) bind a listener of their own instead; both end at the same exchange.
+
+### GET /callback?code=…&state=…
+Where the *provider* sends the browser back. Not an API call — a page a human is looking at,
+so it answers in HTML. It never renders the code or the tokens, only whether it worked, and
+it closes its own tab. A `state` that does not match the one minted at the start is refused
+before any exchange. `?error=access_denied` (the user said no) is reported, not swallowed.
+On success the provider is written to config and made active — a sign-in that leaves you
+without a usable provider was pointless.
+
+### GET /api/login
+`{ "state": "idle|pending|done|failed", "provider": "xai", "error": "…" }` — what the
+sign-in in flight is doing. The tab the user *started* from polls this, because the tab that
+finishes the flow is the provider's redirect, which closes itself.
+
 ### POST /api/providers
-`{ "name": "…", "kind": "openai|anthropic|xai|openrouter|cloudflare|ollama|llamacpp",
+`{ "name": "…", "kind": "openai|anthropic|xai|xaioauth|openrouter|cloudflare|ollama|llamacpp",
    "base_url": "…", "model": "…", "api_key": "… (optional)", "activate": true }`
 → `{ "settings": {…}, "probe": { "ok": true, "models": ["…"] } }`
 

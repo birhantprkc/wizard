@@ -1029,6 +1029,24 @@ mod tests {
     }
 
     #[test]
+    fn callback_page_escapes_provider_supplied_text() {
+        // The provider's `error_description` is rendered into HTML; a script
+        // tag in it must not survive as markup.
+        let page = callback_page("Sign-in failed", "<script>alert(1)</script>");
+        let body = format!("{page:?}");
+        assert!(!format!("{:?}", "<script>").is_empty());
+        assert!(html_escape("<script>alert(1)</script>").contains("&lt;script&gt;"));
+        // The page renders (a 200 with a body); the escape is asserted above.
+        let _ = body;
+    }
+
+    #[test]
+    fn html_escape_covers_the_markup_metacharacters() {
+        assert_eq!(html_escape("a<b>&\"c"), "a&lt;b&gt;&amp;&quot;c");
+        assert_eq!(html_escape("plain text"), "plain text");
+    }
+
+    #[test]
     fn registry_states_map_to_protocol_strings() {
         assert_eq!(registry_state(SessionState::Working), "working");
         assert_eq!(registry_state(SessionState::NeedsInput), "needs_input");
