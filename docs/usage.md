@@ -120,13 +120,20 @@ keep talking to the main agent while you watch one work.
 | Key | What it does |
 |-----|--------------|
 | ↓ (in the composer) | Focus the rail, on the first running run (the last run if none is running) |
-| ↑ / ↓ | Move between runs; ↑ off the top row returns focus to the composer |
+| ↑ / ↓ (on the rail) | Move between runs; ↑ off the top row returns focus to the composer |
 | Enter | Open the selected run |
-| Esc | Leave the rail; in a pane, back to the main chat |
+| Esc (in a pane) | Back to the main chat, focus in the composer |
+| ↑ / ↓ (in a pane) | Scroll the pane |
 | Shift+↑ / Shift+↓ (in a pane) | Flip to the previous / next run without backing out |
-| PageUp / PageDown (in a pane) | Scroll the pane |
+| PageUp / PageDown (in a pane) | Scroll the pane by ten lines |
 | Ctrl-X | Kill the selected run (background runs only) |
 | Any other key | Focus returns to the composer and the key is typed there |
+
+A finished run rests on the rail for a few seconds and then retires, so the rail
+stays a picture of live work rather than a log of every subagent the session
+ever ran. Nothing is lost: a run's report is the output of the `spawn_subagent`
+card in the main chat, which a background run writes back to when it lands. A
+run you are watching never retires under you — its clock starts when you leave.
 
 ↓ only enters the rail when you are not part-way through input history, where
 it keeps walking history. Any key the rail does not use returns focus to the

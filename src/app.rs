@@ -85,6 +85,11 @@ impl PaneStatus {
 /// subagent visibly pulses on the rail.
 const PANE_SPINNER: [&str; 4] = ["●", "◉", "○", "◉"];
 
+/// How long a finished run rests on the rail before it retires: long enough to
+/// see it land, short enough that the rail stays a picture of live work. Its
+/// report stays in the main chat either way.
+const PANE_LINGER: Duration = Duration::from_secs(8);
+
 /// One subagent run, surfaced on the rail below the composer and openable as
 /// a full chat view.
 ///
@@ -2143,13 +2148,99 @@ impl App {
         self.rail_focus = Some(index);
     }
 
-    /// Leave the attached pane and go back to the main chat, with the rail
-    /// still focused on the pane you were just in.
+    /// Leave the attached pane and go all the way back to the main chat, with
+    /// focus in the composer — one Esc, and you are typing again. (Leaving
+    /// focus parked on the rail meant a second Esc to actually get out, which
+    /// is one too many for the way back.)
     pub fn detach_pane(&mut self) {
         if let Some(index) = self.attached.take()
             && let Some(pane) = self.panes.get_mut(index)
         {
             pane.unread = 0;
+        }
+        self.rail_focus = None;
+        // A run that finished while you were watching it has been sitting on
+        // the rail with its linger clock stopped; let it retire now.
+        self.retire_finished_panes();
+    }
+
+    /// Scroll the pane at `index` by `delta` lines (positive scrolls back into
+    /// history, like the main transcript).
+    fn scroll_pane(&mut self, index: usize, delta: i16) {
+        let Some(pane) = self.panes.get_mut(index) else {
+            return;
+        };
+        pane.scroll = if delta >= 0 {
+            pane.scroll.saturating_add(delta as u16)
+        } else {
+            pane.scroll.saturating_sub(delta.unsigned_abs())
+        };
+    }
+
+    /// Drop finished runs off the rail once they have been resting long enough
+    /// to notice, so the rail shows live work instead of accumulating every
+    /// subagent the session ever ran.
+    ///
+    /// Nothing is lost: a foreground run's report is the output of its
+    /// `spawn_subagent` card in the main chat, and a background run's report is
+    /// written back into that same card when it lands (see
+    /// [`App::record_subagent_report`]).
+    ///
+    /// The pane you are *inside* never retires under you — its clock starts
+    /// when you leave it.
+    pub fn retire_finished_panes(&mut self) {
+        if self.panes.is_empty() {
+            return;
+        }
+        // Selections are indices, and retiring shifts them — remember what they
+        // point *at*, then re-find it afterwards.
+        let attached_run = self.attached.and_then(|i| self.panes.get(i)).map(|p| p.run);
+        let focus_run = self
+            .rail_focus
+            .and_then(|i| self.panes.get(i))
+            .map(|p| p.run);
+
+        let now = Instant::now();
+        let before = self.panes.len();
+        self.panes.retain(|pane| match pane.finished {
+            _ if Some(pane.run) == attached_run => true,
+            Some(at) => now.duration_since(at) < PANE_LINGER,
+            None => true,
+        });
+        if self.panes.len() == before {
+            return;
+        }
+
+        self.attached = attached_run.and_then(|run| self.pane_index(run));
+        // If the run the rail was sitting on just retired, focus falls back to
+        // the composer rather than silently jumping to some other subagent.
+        self.rail_focus = focus_run.and_then(|run| self.pane_index(run));
+    }
+
+    /// Write a finished background run's report into the `spawn_subagent` card
+    /// that launched it, replacing the "delegated, running in the background"
+    /// placeholder. The card is the durable record of the run once its pane
+    /// retires off the rail.
+    fn record_subagent_report(&mut self, name: &str, task: &str, report: &str, is_error: bool) {
+        let card = self.transcript.iter_mut().rev().find(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::ToolCard { name: card, args, .. }
+                    if card == "spawn_subagent"
+                        && args.get("subagent").and_then(|v| v.as_str()) == Some(name)
+                        && args.get("task").and_then(|v| v.as_str()) == Some(task)
+            )
+        });
+        if let Some(TranscriptEntry::ToolCard {
+            output,
+            is_error: card_error,
+            collapsed,
+            ..
+        }) = card
+        {
+            *output = Some(report.to_string());
+            *card_error = is_error;
+            *collapsed = true;
         }
     }
 
@@ -3018,6 +3109,9 @@ impl App {
                         self.refresh_peek();
                     }
                 }
+                // Age finished runs off the rail (the tick is ~100ms, so this
+                // is a cheap retain over a handful of panes).
+                self.retire_finished_panes();
                 Ok(None)
             }
             Event::Agent(agent_event) => {
@@ -3158,13 +3252,17 @@ impl App {
         // underneath, so anything else falls through to normal typing and you
         // can keep driving the main conversation while you watch.
         if let Some(index) = self.attached {
+            // Every navigation key is captured here. Letting an arrow fall
+            // through to the composer underneath would scroll the *main*
+            // chat's history while the user is plainly looking at a pane —
+            // the keys have to belong to what is on screen.
             match key.code {
                 KeyCode::Esc => {
                     self.detach_pane();
                     return Ok(None);
                 }
-                // ↑/↓ walk the rail *inside* the pane view: you flip straight
-                // from one subagent to the next without backing out first.
+                // Shift+↑/↓ flips straight to the next subagent without
+                // backing out to the rail first.
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     if index > 0 {
                         self.attach_pane(index - 1);
@@ -3177,16 +3275,21 @@ impl App {
                     }
                     return Ok(None);
                 }
+                // Plain ↑/↓ scroll the pane you are reading.
+                KeyCode::Up => {
+                    self.scroll_pane(index, 1);
+                    return Ok(None);
+                }
+                KeyCode::Down => {
+                    self.scroll_pane(index, -1);
+                    return Ok(None);
+                }
                 KeyCode::PageUp => {
-                    if let Some(pane) = self.panes.get_mut(index) {
-                        pane.scroll = pane.scroll.saturating_add(10);
-                    }
+                    self.scroll_pane(index, 10);
                     return Ok(None);
                 }
                 KeyCode::PageDown => {
-                    if let Some(pane) = self.panes.get_mut(index) {
-                        pane.scroll = pane.scroll.saturating_sub(10);
-                    }
+                    self.scroll_pane(index, -10);
                     return Ok(None);
                 }
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4255,10 +4358,11 @@ impl App {
                         Some(TranscriptEntry::Assistant(text)) if text == &output
                     );
                     if !already_last {
-                        pane.transcript.push(TranscriptEntry::Assistant(output));
+                        pane.transcript
+                            .push(TranscriptEntry::Assistant(output.clone()));
                     }
                 }
-                match error {
+                match &error {
                     Some(error) => pane
                         .transcript
                         .push(TranscriptEntry::Notice(format!("failed: {error}"))),
@@ -4269,6 +4373,26 @@ impl App {
                 }
                 if !attached {
                     pane.unread += 1;
+                }
+
+                // The pane retires off the rail shortly; fold its report back
+                // into the `spawn_subagent` card in the main chat so the run is
+                // still there to read afterwards. A foreground run's card
+                // already carries the report (it is the tool's own result), so
+                // only a detached one needs writing back.
+                let (name, task, bg) = (pane.name.clone(), pane.task.clone(), pane.bg);
+                if bg.is_some() {
+                    let report = match &error {
+                        Some(error) => format!("failed: {error}"),
+                        None if !completed => {
+                            format!(
+                                "hit its step budget after {} step(s).\n\n{output}",
+                                pane.steps
+                            )
+                        }
+                        None => output,
+                    };
+                    self.record_subagent_report(&name, &task, &report, !completed);
                 }
             }
             AgentEvent::TodoUpdated(items) => {
@@ -9095,10 +9219,10 @@ mod tests {
             Some("agent1")
         );
 
-        // Esc backs out to the main chat, rail still parked on that run.
+        // Esc backs out to the main chat, all the way to the composer.
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.attached, None);
-        assert_eq!(app.rail_focus, Some(1));
+        assert_eq!(app.rail_focus, None);
     }
 
     #[test]
@@ -9257,6 +9381,141 @@ mod tests {
 
         press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(app.attached, Some(1));
+    }
+
+    #[test]
+    fn arrows_in_a_pane_scroll_it_instead_of_recalling_history() {
+        let mut app = app_with_panes(1);
+        app.history.push("an earlier prompt".to_string());
+        app.attach_pane(0);
+
+        // The bug: ↑/↓ fell through to the composer and walked the main chat's
+        // history while the user was plainly looking at a subagent.
+        press(&mut app, KeyCode::Up);
+        assert!(app.input.is_empty(), "↑ must not recall history in a pane");
+        assert_eq!(app.panes[0].scroll, 1);
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.panes[0].scroll, 2);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panes[0].scroll, 1);
+        // Pinned at the live tail; it cannot scroll past the bottom.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panes[0].scroll, 0);
+        assert!(app.input.is_empty());
+        assert_eq!(app.attached, Some(0));
+    }
+
+    #[test]
+    fn esc_from_a_pane_lands_in_the_composer_in_one_press() {
+        let mut app = app_with_panes(2);
+        app.attach_pane(1);
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.attached, None);
+        // Focus is all the way back in the composer, not parked on the rail —
+        // one Esc, and you are typing again.
+        assert_eq!(app.rail_focus, None);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn a_finished_run_retires_off_the_rail() {
+        let mut app = app_with_panes(2);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "report".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+        // It lingers first, so you actually see it land.
+        app.retire_finished_panes();
+        assert_eq!(app.panes.len(), 2);
+
+        // Once its linger is up it drops off, leaving the rail showing live work.
+        app.panes[0].finished = Some(Instant::now() - PANE_LINGER - Duration::from_secs(1));
+        app.retire_finished_panes();
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].name, "agent1");
+        assert_eq!(app.running_panes(), 1);
+    }
+
+    #[test]
+    fn the_pane_you_are_watching_never_retires_under_you() {
+        let mut app = app_with_panes(1);
+        app.attach_pane(0);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "report".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+        app.panes[0].finished = Some(Instant::now() - PANE_LINGER - Duration::from_secs(1));
+
+        // Long past its linger, but you are reading it.
+        app.retire_finished_panes();
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.attached, Some(0));
+
+        // Esc lets it go, and lands you back in the composer.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.panes.is_empty());
+        assert_eq!(app.attached, None);
+        assert_eq!(app.rail_focus, None);
+    }
+
+    #[test]
+    fn retiring_keeps_the_selection_on_the_run_it_pointed_at() {
+        let mut app = app_with_panes(3);
+        // Focus the third run, then retire the first.
+        app.rail_focus = Some(2);
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "done".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+        app.panes[0].finished = Some(Instant::now() - PANE_LINGER - Duration::from_secs(1));
+        app.retire_finished_panes();
+
+        // Indices shifted, but the selection still points at the same run.
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.rail_focus, Some(1));
+        assert_eq!(app.panes[1].name, "agent2");
+    }
+
+    #[test]
+    fn a_background_report_survives_its_pane_retiring() {
+        let mut app = app_with_panes(1);
+        // The card the model got back when it delegated: a placeholder.
+        app.transcript.push(TranscriptEntry::ToolCard {
+            name: "spawn_subagent".to_string(),
+            args: serde_json::json!({"subagent": "agent0", "task": "task 0"}),
+            output: Some("Delegated to subagent 'agent0' (#0)".to_string()),
+            is_error: false,
+            collapsed: false,
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "the auth flow starts in login.rs".to_string(),
+            steps_used: 4,
+            error: None,
+        });
+        app.panes[0].finished = Some(Instant::now() - PANE_LINGER - Duration::from_secs(1));
+        app.retire_finished_panes();
+        assert!(app.panes.is_empty());
+
+        // The pane is gone, but the run is still readable in the main chat.
+        let TranscriptEntry::ToolCard { output, .. } = &app.transcript[0] else {
+            panic!("expected the spawn card");
+        };
+        assert_eq!(output.as_deref(), Some("the auth flow starts in login.rs"));
     }
 
     #[test]
