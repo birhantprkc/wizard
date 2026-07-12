@@ -268,13 +268,28 @@ struct TokenResponse {
     token_type: Option<String>,
 }
 
-/// Run the full browser login: discovery, PKCE, localhost callback, code
-/// exchange, and token storage. `report` receives human-readable progress
-/// lines (stdout for the CLI flag, transcript notices for the slash command).
-pub async fn login<F>(report: F) -> Result<()>
-where
-    F: Fn(&str) + Send + Sync,
-{
+/// A sign-in in flight: everything the caller must hold between sending the
+/// user to `authorize_url` and receiving the redirect back.
+///
+/// The GUI owns its own HTTP server, so it drives the two halves itself
+/// ([`begin_login`] / [`complete_login`]); the terminal flows have no server
+/// and let [`login`] bind a listener for them. Both end at the same exchange.
+#[derive(Debug)]
+pub struct PendingLogin {
+    /// Send the user here.
+    pub authorize_url: String,
+    /// Compare against the `state` on the callback: a mismatch is a forgery.
+    pub state: String,
+    /// Must be byte-identical at authorize and at exchange, so it is kept here
+    /// rather than rebuilt.
+    redirect_uri: String,
+    pkce: Pkce,
+    token_endpoint: String,
+}
+
+/// Discover the endpoints, mint PKCE + state, and build the authorize URL for a
+/// `redirect_uri` the **caller** serves.
+pub async fn begin_login(redirect_uri: &str) -> Result<PendingLogin> {
     let http = reqwest::Client::new();
     let discovery = discover(&http).await?;
 
@@ -282,20 +297,13 @@ where
     let state = random_hex(16)?;
     let nonce = random_hex(16)?;
 
-    let listener = bind_callback_listener()?;
-    let port = listener
-        .local_addr()
-        .context("reading listener port")?
-        .port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-
     let mut authorize_url = reqwest::Url::parse(&discovery.authorization_endpoint)
         .context("parsing the authorization endpoint")?;
     authorize_url
         .query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", SCOPE)
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", "S256")
@@ -305,24 +313,33 @@ where
         .append_pair("plan", "generic")
         .append_pair("referrer", "wizard");
 
-    report(&format!(
-        "open this URL to sign in with your xAI account:\n{authorize_url}"
-    ));
-    open_browser(authorize_url.as_str());
-    report("waiting for the browser callback (5 minute timeout)...");
+    Ok(PendingLogin {
+        authorize_url: authorize_url.to_string(),
+        state,
+        redirect_uri: redirect_uri.to_string(),
+        pkce,
+        token_endpoint: discovery.token_endpoint,
+    })
+}
 
-    let expected_state = state.clone();
-    let code = tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected_state))
-        .await
-        .context("callback listener task panicked")??;
-
-    report("exchanging the authorization code for tokens...");
+/// Exchange the callback's `code` for tokens and persist them. The `state` from
+/// the callback must match the one minted by [`begin_login`].
+pub async fn complete_login(
+    pending: PendingLogin,
+    code: &str,
+    state: &str,
+) -> Result<StoredTokens> {
+    anyhow::ensure!(
+        state == pending.state,
+        "the sign-in state did not match — start again"
+    );
+    let http = reqwest::Client::new();
     let token = exchange_code(
         &http,
-        &discovery.token_endpoint,
-        &code,
-        &redirect_uri,
-        &pkce,
+        &pending.token_endpoint,
+        code,
+        &pending.redirect_uri,
+        &pending.pkce,
     )
     .await?;
 
@@ -330,13 +347,60 @@ where
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
-        token_endpoint: discovery.token_endpoint,
+        token_endpoint: pending.token_endpoint,
     };
-    let path = token_path()?;
-    save_tokens(&path, &stored)?;
+    save_tokens(&token_path()?, &stored)?;
+    Ok(stored)
+}
+
+/// The provider entry a completed sign-in earns: no key, no env var — the token
+/// store is the credential.
+pub fn provider_config() -> crate::config::ProviderConfig {
+    crate::config::ProviderConfig {
+        name: "xai-oauth".to_string(),
+        kind: crate::config::ProviderKind::XaiOauth,
+        base_url: DEFAULT_BASE_URL.to_string(),
+        model: DEFAULT_MODEL.to_string(),
+        api_key_env: None,
+        gguf_path: None,
+        usd_per_mtok_in: None,
+        usd_per_mtok_out: None,
+    }
+}
+
+/// Run the full browser login for a caller with no server of its own: bind a
+/// localhost listener, send the user to the authorize URL, wait for the
+/// redirect, exchange. `report` receives human-readable progress lines (stdout
+/// for the CLI flag, transcript notices for the slash command).
+pub async fn login<F>(report: F) -> Result<()>
+where
+    F: Fn(&str) + Send + Sync,
+{
+    let listener = bind_callback_listener()?;
+    let port = listener
+        .local_addr()
+        .context("reading listener port")?
+        .port();
+    let pending = begin_login(&format!("http://127.0.0.1:{port}/callback")).await?;
+
+    report(&format!(
+        "open this URL to sign in with your xAI account:\n{}",
+        pending.authorize_url
+    ));
+    open_browser(&pending.authorize_url);
+    report("waiting for the browser callback (5 minute timeout)...");
+
+    let expected_state = pending.state.clone();
+    let code = tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected_state))
+        .await
+        .context("callback listener task panicked")??;
+
+    report("exchanging the authorization code for tokens...");
+    let state = pending.state.clone();
+    complete_login(pending, &code, &state).await?;
     report(&format!(
         "signed in to xAI; tokens saved to {}",
-        path.display()
+        token_path()?.display()
     ));
     Ok(())
 }

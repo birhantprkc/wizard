@@ -13,6 +13,7 @@
 //! interface.
 
 mod git;
+mod oauth;
 mod server;
 mod settings;
 mod tasks;
@@ -36,6 +37,11 @@ pub(crate) struct GuiState {
     pub manager: tasks::TaskManager,
     pub cwd: PathBuf,
     pub assets_dir: Option<PathBuf>,
+    /// The port this server is on, so an OAuth redirect can be pointed back at
+    /// a route we serve ourselves.
+    pub port: u16,
+    /// The subscription sign-in in flight, if any.
+    pub sign_in: oauth::SignIn,
 }
 
 /// Entry point for `wizard gui`: bind 127.0.0.1:`port` (an occupied port is
@@ -57,6 +63,8 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
         config: store,
         cwd,
         assets_dir: assets,
+        port,
+        sign_in: oauth::SignIn::default(),
     });
     let router = server::router(state);
 

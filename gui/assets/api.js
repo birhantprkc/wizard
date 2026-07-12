@@ -626,6 +626,20 @@ export class RealApi {
     return this._json('/api/settings');
   }
 
+  /**
+   * POST /api/login/{provider}: begin a subscription sign-in.
+   * @returns {Promise<string>} the URL to send the user to
+   */
+  async beginSignIn(provider) {
+    const out = await this._post(`/api/login/${encodeURIComponent(provider)}`, {});
+    return out.authorize_url;
+  }
+
+  /** GET /api/login: `{state: idle|pending|done|failed, provider?, error?}`. */
+  async signInStatus() {
+    return this._json('/api/login');
+  }
+
   /** PATCH /api/settings: `{mode?, max_steps?}` → the new settings. */
   async saveSettings(patch) {
     return this._json('/api/settings', {

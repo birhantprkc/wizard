@@ -1545,6 +1545,27 @@ span.mode-chip {
 .row-add {
   color: var(--text-muted);
 }
+/* A sign-in is a different kind of act from picking an endpoint: it goes out to
+   the provider and comes back with an account. It reads a little louder. */
+.row-signin .row-name {
+  font-weight: 600;
+}
+.row-signin .row-meta {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+.block-title.with-rule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 10px;
+}
+.block-title.with-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hairline-soft);
+}
 .row-add .row-name {
   color: var(--text-muted);
   font-weight: 400;

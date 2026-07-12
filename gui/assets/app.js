@@ -1435,6 +1435,58 @@ function presetList(presets, onPick) {
     row(CUSTOM_PRESET, 'OpenAI-compatible'));
 }
 
+/* --- Subscription sign-in (OAuth) ----------------------------------------- */
+
+/** The plans you can sign in to, rather than paste a key for. */
+const SIGN_INS = [
+  { id: 'xai', label: 'xAI', plan: 'SuperGrok subscription' },
+];
+
+/**
+ * Sign in to a subscription: the browser goes to the provider, the provider
+ * redirects back to a route this server owns, and we watch for the outcome.
+ *
+ * The popup is opened synchronously from the click — a browser blocks a window
+ * opened after an await — and pointed at the authorize URL once we have it.
+ */
+function signInRow(id, label, plan, { onDone, onStatus }) {
+  const say = onStatus || (() => {});
+  return h('button', {
+    class: 'row row-pick row-signin', type: 'button',
+    onclick: async () => {
+      const tab = window.open('', '_blank');
+      try {
+        const url = await api.beginSignIn(id);
+        if (tab) tab.location = url;
+        else window.location = url; // popups blocked: use this tab
+        say(`Waiting for ${label} in the other tab…`);
+        await waitForSignIn();
+        say(null);
+        if (onDone) onDone();
+      } catch (err) {
+        if (tab) tab.close();
+        say(String((err && err.message) || err), true);
+      }
+    },
+  },
+    h('span', { class: 'row-name' }, `Sign in with ${label}`),
+    h('span', { class: 'row-meta' }, plan));
+}
+
+/** Poll until the sign-in in flight finishes, one way or the other. */
+async function waitForSignIn({ timeoutMs = 5 * 60 * 1000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const status = await api.signInStatus();
+    if (status.state === 'done') return status;
+    if (status.state === 'failed') throw new Error(status.error || 'sign-in failed');
+    // `idle` means the flow was dropped (server restarted, or it expired).
+    if (status.state === 'idle') throw new Error('the sign-in was not completed');
+    if (Date.now() > deadline) throw new Error('the sign-in timed out');
+  }
+}
+
 /* --- Onboarding ----------------------------------------------------------- */
 
 /** First run: no provider is configured, so wizard cannot answer anything yet. */
@@ -1453,7 +1505,23 @@ function openOnboarding(settings) {
   }, label);
 
   const pickStep = () => {
+    const note = h('div', { class: 'note hidden' });
+    const say = (text, bad) => {
+      note.textContent = text || '';
+      note.className = `note${bad ? ' error' : ''}${text ? '' : ' hidden'}`;
+    };
+    const signedIn = async () => {
+      state.settings = await api.settings();
+      closeOverlay();
+      bootChat();
+    };
     fillWith(body,
+      // A subscription first: it is what most people already have, and it needs
+      // no key to paste.
+      h('div', { class: 'rows' },
+        ...SIGN_INS.map((s) => signInRow(s.id, s.label, s.plan, { onDone: signedIn, onStatus: say }))),
+      note,
+      h('div', { class: 'block-title with-rule' }, 'or use an API key'),
       presetList(settings.presets, formStep),
       h('div', { class: 'form-actions end' }, skip('Skip')),
     );
@@ -1568,8 +1636,24 @@ function renderSettings(body, foot) {
   const resetAdd = () => {
     fillWith(add, h('button', {
       class: 'row row-add', type: 'button',
-      onclick: () => fillWith(add, presetList(s.presets, pickPreset)),
+      onclick: () => showChoices(),
     }, h('span', { class: 'row-name' }, '+  Add provider')));
+  };
+  const showChoices = () => {
+    const note = h('div', { class: 'note hidden' });
+    const say = (text, bad) => {
+      note.textContent = text || '';
+      note.className = `note${bad ? ' error' : ''}${text ? '' : ' hidden'}`;
+    };
+    fillWith(add,
+      h('div', { class: 'rows' },
+        ...SIGN_INS.map((si) => signInRow(si.id, si.label, si.plan, { onDone: rerender, onStatus: say }))),
+      note,
+      h('div', { class: 'block-title with-rule' }, 'or use an API key'),
+      presetList(s.presets, pickPreset),
+      h('div', { class: 'form-actions end' },
+        h('button', { class: 'btn quiet', type: 'button', onclick: resetAdd }, 'Cancel')),
+    );
   };
   const pickPreset = (preset) => {
     fillWith(add,
