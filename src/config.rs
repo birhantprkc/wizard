@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -719,9 +719,47 @@ impl Default for Config {
     }
 }
 
+/// Relocates `~/.wizard` for this process: set from `WIZARD_HOME`, or by
+/// [`use_wizard_dir`] — which the test suite calls, so that a test exercising
+/// something that persists config (the TUI's `/vim` toggle, say) writes to a
+/// temp directory instead of the developer's real config file.
+static WIZARD_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point this process at `dir` instead of `~/.wizard`. First call wins, so
+/// parallel tests all land in the same temp dir.
+pub fn use_wizard_dir(dir: PathBuf) {
+    let _ = WIZARD_DIR.set(dir);
+}
+
+/// Send this test binary's `~/.wizard` to a temp directory of its own.
+#[cfg(test)]
+fn use_temp_wizard_dir() {
+    if WIZARD_DIR.get().is_some() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("wizard-test-home-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    use_wizard_dir(dir);
+}
+
 impl Config {
-    /// `~/.wizard` — root of all Wizard state on disk.
+    /// `~/.wizard` — root of all Wizard state on disk. `WIZARD_HOME` (or a
+    /// [`use_wizard_dir`] override) relocates it wholesale.
     pub fn wizard_dir() -> Result<PathBuf> {
+        // Every path into `~/.wizard` — config, credentials, sessions — comes
+        // through here, so redirecting it under `cfg(test)` is what keeps the
+        // suite off the developer's real state. It is not hypothetical: the
+        // TUI's `/vim` toggle persists config, and the vim tests exercise it,
+        // which used to overwrite the real config.toml with a default one —
+        // silently deleting the developer's providers on every `cargo test`.
+        #[cfg(test)]
+        use_temp_wizard_dir();
+        if let Some(dir) = WIZARD_DIR.get() {
+            return Ok(dir.clone());
+        }
+        if let Some(dir) = std::env::var_os("WIZARD_HOME").filter(|dir| !dir.is_empty()) {
+            return Ok(PathBuf::from(dir));
+        }
         let home = dirs::home_dir().context("could not determine home directory")?;
         Ok(home.join(".wizard"))
     }
@@ -1093,6 +1131,22 @@ mod tests {
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("wizard").chain(args.iter().copied()))
             .expect("valid args")
+    }
+
+    #[test]
+    fn tests_never_write_to_the_real_wizard_dir() {
+        // The suite exercises code that persists config (the TUI's `/vim`
+        // toggle, provider setup). If this ever points at $HOME again, running
+        // `cargo test` silently overwrites the developer's own config.toml —
+        // providers and all. It did, once.
+        let dir = Config::wizard_dir().expect("a wizard dir");
+        let home = dirs::home_dir().expect("a home dir");
+        assert_ne!(dir, home.join(".wizard"));
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "tests must use a temp wizard dir, got {}",
+            dir.display()
+        );
     }
 
     #[test]
