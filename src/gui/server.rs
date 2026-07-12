@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::agent::session::{self, Session};
 use crate::config::{Config, ProviderConfig, ProviderKind};
+use crate::gui::tasks::TaskState;
 use crate::gui::{GuiState, git, settings, transcript, ws};
 use crate::session_registry::{self, SessionState};
 
@@ -94,8 +95,11 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/providers/{name}", delete(delete_provider))
         .route("/api/providers/{name}/active", post(activate_provider))
         .route("/api/providers/{name}/test", post(test_provider))
+        .route("/api/workspaces", get(workspaces))
         .route("/api/git", get(git_status))
         .route("/api/git/commit", post(git_commit))
+        .route("/api/git/branches", get(git_branches))
+        .route("/api/git/checkout", post(git_checkout))
         .layer(middleware::from_fn(local_guard))
         .with_state(state)
 }
@@ -712,6 +716,112 @@ async fn git_commit(
         .await
         .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     Ok(axum::Json(json!({ "ok": true, "sha": sha })))
+}
+
+/// `GET /api/git/branches?cwd=...`: local branches of the workspace.
+async fn git_branches(
+    Query(query): Query<GitQuery>,
+) -> Result<axum::Json<git::Branches>, ApiError> {
+    let root = PathBuf::from(&query.cwd);
+    if !root.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "cwd '{}' is not a directory",
+            query.cwd
+        )));
+    }
+    let branches = git::branches(&root)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    Ok(axum::Json(branches))
+}
+
+/// `POST /api/git/checkout` body.
+#[derive(Debug, Deserialize)]
+struct CheckoutBody {
+    cwd: String,
+    branch: String,
+    /// Create the branch from the current HEAD (`git checkout -b`).
+    #[serde(default)]
+    create: bool,
+    /// The chat whose workspace this is, when the switch comes from one. A
+    /// running turn is mid-edit in this working tree, so its branch is not
+    /// something to change under it.
+    #[serde(default)]
+    task: Option<String>,
+}
+
+async fn git_checkout(
+    State(state): State<Arc<GuiState>>,
+    axum::Json(body): axum::Json<CheckoutBody>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let root = PathBuf::from(&body.cwd);
+    if !root.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "cwd '{}' is not a directory",
+            body.cwd
+        )));
+    }
+    if let Some(id) = &body.task
+        && let Some(task) = state.manager.get(id)
+        && task.state() == TaskState::Working
+    {
+        return Err(ApiError::bad_request(
+            "the agent is working in this branch — stop the turn first",
+        ));
+    }
+    let branch = git::checkout(&root, &body.branch, body.create)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    Ok(axum::Json(json!({ "ok": true, "branch": branch })))
+}
+
+/// One row of `GET /api/workspaces`: a directory the GUI can open a chat in.
+#[derive(Debug, Serialize)]
+struct WorkspaceRow {
+    cwd: String,
+    name: String,
+    task_count: usize,
+    /// The directory `wizard gui` itself runs in.
+    home: bool,
+}
+
+/// `GET /api/workspaces`: the directories of every known chat (sessions on
+/// disk + the live registry) plus the server's own, busiest first — what the
+/// topbar's folder chip offers.
+async fn workspaces(
+    State(state): State<Arc<GuiState>>,
+) -> Result<axum::Json<Vec<WorkspaceRow>>, ApiError> {
+    let sessions_dir = Config::sessions_dir()?;
+    let mut by_cwd: HashMap<String, HashSet<String>> = HashMap::new();
+    for summary in session::summaries(&sessions_dir) {
+        if let Some(cwd) = summary.cwd {
+            by_cwd.entry(cwd).or_default().insert(summary.id);
+        }
+    }
+    for record in session_registry::list() {
+        by_cwd.entry(record.cwd).or_default().insert(record.id);
+    }
+    let home = state.cwd.display().to_string();
+    by_cwd.entry(home.clone()).or_default();
+    let mut rows: Vec<WorkspaceRow> = by_cwd
+        .into_iter()
+        // A directory that has since been deleted or renamed cannot host a
+        // chat, and offering it would only produce a 400 on click.
+        .filter(|(cwd, _)| FsPath::new(cwd).is_dir())
+        .map(|(cwd, ids)| WorkspaceRow {
+            name: basename(&cwd),
+            home: cwd == home,
+            cwd,
+            task_count: ids.len(),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.home
+            .cmp(&a.home)
+            .then(b.task_count.cmp(&a.task_count))
+            .then(a.cwd.cmp(&b.cwd))
+    });
+    Ok(axum::Json(rows))
 }
 
 /// The `/api/tasks` state string for a registry record.

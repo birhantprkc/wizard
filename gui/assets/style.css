@@ -1185,13 +1185,34 @@ span.mode-chip {
   width: 13px;
   height: 13px;
 }
+/* Composer menus open upward (see .menu); the topbar's open downward. */
+.topbar .menu {
+  top: calc(100% + 8px);
+  bottom: auto;
+  left: 0;
+  right: auto;
+}
+
 .menu-note {
   color: var(--text-faint);
   font-size: 12.5px;
   padding: 8px 9px;
+  line-height: 1.45;
 }
 .menu-note.error {
   color: var(--red);
+}
+.menu-foot {
+  border-top: 1px solid var(--hairline);
+  margin-top: 4px;
+  padding: 6px 4px 2px;
+}
+.menu-input {
+  font-size: 12.5px;
+  padding: 5px 8px;
+}
+.menu-item .menu-item-label {
+  font-family: inherit;
 }
 .menu-manage {
   border-top: 1px solid var(--hairline);

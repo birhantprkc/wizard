@@ -27,8 +27,19 @@ with slightly lighter raised cards and 10–14px corner radii.
 ```
 
 Top bar spans center+right: sidebar toggle + chat title (truncated, bold) + repo chip
-(`gomoku-ai` with folder icon) + branch chip (`upgrade/v3.0` with branch icon), and the
+(`gomoku-ai`, folder icon) + branch chip (`upgrade/v3.0`, branch icon), and the
 context-panel toggle on the right.
+
+Both chips are dropdowns, and both act:
+- **Repo chip** → the directories wizard knows about (plus a field for any absolute path);
+  picking one opens a **new chat** there. A chat's working directory is fixed when its
+  session is created — it is written into the session file, and it is where everything the
+  chat has already run took effect — so this cannot retroactively move the open chat, and
+  does not pretend to.
+- **Branch chip** → the workspace's local branches (most recent first) plus a field to create
+  one. Picking one is a real `git checkout` in that working tree. It is refused while the
+  agent is working (it is mid-edit in those files), and git's own refusal — uncommitted
+  changes the switch would overwrite — is shown verbatim rather than forced through.
 
 Every control in the chrome does something. The reference design's decorative bits — macOS
 traffic lights (the real window already has them, on macOS), back/forward arrows, notes and

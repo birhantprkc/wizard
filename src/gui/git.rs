@@ -100,6 +100,63 @@ pub async fn commit(root: &Path, message: &str) -> Result<String> {
     Ok(sha.trim().to_string())
 }
 
+/// Response shape of `GET /api/git/branches`.
+#[derive(Debug, Serialize)]
+pub struct Branches {
+    /// The checked-out branch, or `None` on a detached HEAD.
+    pub current: Option<String>,
+    /// Local branches, most recently committed on first — the ones you are
+    /// likely to want are the ones you touched last.
+    pub branches: Vec<String>,
+}
+
+/// Local branches of `root`.
+pub async fn branches(root: &Path) -> Result<Branches> {
+    let listing = git_output(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ],
+    )
+    .await?;
+    let current = git_output(root, &["branch", "--show-current"]).await?;
+    let current = current.trim();
+    Ok(Branches {
+        current: (!current.is_empty()).then(|| current.to_string()),
+        branches: listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+/// Check `branch` out in `root`, creating it from the current HEAD when
+/// `create` is set.
+///
+/// Git's own refusals are the point: an uncommitted change that the switch
+/// would overwrite makes this fail, and that error is handed to the user
+/// verbatim rather than being papered over with a force-checkout or a stash
+/// they did not ask for.
+pub async fn checkout(root: &Path, branch: &str, create: bool) -> Result<String> {
+    let branch = branch.trim();
+    anyhow::ensure!(!branch.is_empty(), "no branch given");
+    // A leading dash would be read as a flag; other shapes git validates itself.
+    anyhow::ensure!(!branch.starts_with('-'), "'{branch}' is not a branch name");
+    let args: Vec<&str> = if create {
+        vec!["checkout", "-b", branch]
+    } else {
+        vec!["checkout", branch]
+    };
+    git_output(root, &args).await?;
+    let current = git_output(root, &["branch", "--show-current"]).await?;
+    Ok(current.trim().to_string())
+}
+
 /// Run `git <args>` in `root` and return stdout; a nonzero exit is an error
 /// carrying git's stderr.
 async fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -231,6 +288,70 @@ fn added_lines(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway repo with one commit on `main`.
+    async fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        git_output(root, &["init", "-q", "-b", "main"])
+            .await
+            .unwrap();
+        git_output(root, &["config", "user.email", "t@example.test"])
+            .await
+            .unwrap();
+        git_output(root, &["config", "user.name", "Test"])
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_output(root, &["add", "-A"]).await.unwrap();
+        git_output(root, &["commit", "-qm", "init"]).await.unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn branches_lists_locals_and_names_the_current_one() {
+        let dir = repo().await;
+        let root = dir.path();
+        git_output(root, &["branch", "feat/one"]).await.unwrap();
+
+        let listing = branches(root).await.unwrap();
+        assert_eq!(listing.current.as_deref(), Some("main"));
+        assert!(listing.branches.contains(&"main".to_string()));
+        assert!(listing.branches.contains(&"feat/one".to_string()));
+    }
+
+    #[tokio::test]
+    async fn checkout_switches_and_creates() {
+        let dir = repo().await;
+        let root = dir.path();
+        git_output(root, &["branch", "feat/one"]).await.unwrap();
+
+        assert_eq!(checkout(root, "feat/one", false).await.unwrap(), "feat/one");
+        assert_eq!(checkout(root, "wip/new", true).await.unwrap(), "wip/new");
+        assert_eq!(
+            branches(root).await.unwrap().current.as_deref(),
+            Some("wip/new")
+        );
+
+        // Git's refusals are the guard rail: an uncommitted change the switch
+        // would overwrite must fail, not be forced or stashed behind the user.
+        std::fs::write(root.join("a.txt"), "uncommitted\n").unwrap();
+        git_output(root, &["add", "-A"]).await.unwrap();
+        git_output(root, &["commit", "-qm", "on wip"])
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+        let err = checkout(root, "main", false).await.unwrap_err().to_string();
+        assert!(err.contains("would be overwritten"), "unexpected: {err}");
+        assert_eq!(
+            branches(root).await.unwrap().current.as_deref(),
+            Some("wip/new"),
+            "a refused checkout leaves the branch alone"
+        );
+
+        assert!(checkout(root, "", false).await.is_err());
+        assert!(checkout(root, "--force", false).await.is_err());
+    }
 
     #[test]
     fn porcelain_parses_branch_and_entries() {

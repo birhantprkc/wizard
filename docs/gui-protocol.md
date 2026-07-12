@@ -59,8 +59,13 @@ replays them); without one the chat opens empty and the first `user_message` fra
 starts it.
 
 ### GET /api/workspace
-The directory the server runs in — where a new chat opens.
+The directory the server runs in — where a new chat opens by default.
 `{ "cwd": "/abs/path", "name": "wizard" }`
+
+### GET /api/workspaces
+Directories a chat can be opened in — the cwds of every known session plus the server's
+own — for the topbar's folder chip. Directories that no longer exist are omitted.
+`[{ "cwd": "...", "name": "wizard", "task_count": 12, "home": true }]`
 
 ### GET /api/models
 `{ "active": "anthropic", "providers": [{ "name": "anthropic", "kind": "anthropic",
@@ -119,6 +124,18 @@ as additions, matching `git_diff_text` semantics; skip `.wizard/` paths).
 
 ### POST /api/git/commit
 `{ "cwd": "...", "message": "..." }` → `{ "ok": true, "sha": "..." }`. Runs `git add -A && git commit`.
+
+### GET /api/git/branches?cwd=/abs/path
+`{ "current": "feat/gui", "branches": ["feat/gui", "main", "..."] }` — local branches, most
+recently committed first. `current` is null on a detached HEAD.
+
+### POST /api/git/checkout
+`{ "cwd": "...", "branch": "main", "create": false, "task": "<id> (optional)" }`
+→ `{ "ok": true, "branch": "main" }`. `create` means `git checkout -b`.
+
+Refused (400) while `task` has a turn running — the agent is mid-edit in that working tree.
+Git's own refusals (uncommitted changes the switch would overwrite) come back as the error
+text: no force-checkout, no stash the user did not ask for.
 
 ## WebSocket /api/tasks/{id}/ws
 

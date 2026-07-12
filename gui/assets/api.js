@@ -581,12 +581,44 @@ export class RealApi {
   }
 
   /**
-   * POST /api/tasks with no prompt: an empty chat in the directory the
-   * server runs in. The first `user_message` starts its first turn.
+   * POST /api/tasks with no prompt: an empty chat, in `cwd` or (without one)
+   * the directory the server runs in. The first `user_message` starts its
+   * first turn.
+   * @param {string} [cwd] absolute path of the workspace
    */
-  async newChat() {
-    const out = await this._post('/api/tasks', {});
+  async newChat(cwd) {
+    const out = await this._post('/api/tasks', cwd ? { cwd } : {});
     return { id: out.id, cwd: out.cwd || '', workspace: out.workspace || pathBasename(out.cwd || '') };
+  }
+
+  /** GET /api/workspaces: directories a chat can be opened in. */
+  async workspaces() {
+    const rows = (await this._json('/api/workspaces')) || [];
+    return rows.map((row) => ({
+      cwd: row.cwd,
+      name: row.name || pathBasename(row.cwd),
+      taskCount: row.task_count || 0,
+      home: !!row.home,
+    }));
+  }
+
+  /** GET /api/git/branches: local branches of the chat's workspace. */
+  async branches(task) {
+    const out = await this._json(`/api/git/branches?cwd=${encodeURIComponent(task.path)}`);
+    return { current: out.current || null, branches: out.branches || [] };
+  }
+
+  /**
+   * POST /api/git/checkout: `git checkout [-b] <branch>` in the workspace.
+   * Git's refusals (an uncommitted change the switch would overwrite) surface
+   * as the error text.
+   * @returns {Promise<string>} the branch now checked out
+   */
+  async checkout(task, branch, create = false) {
+    const out = await this._post('/api/git/checkout', {
+      cwd: task.path, branch, create, task: task.id,
+    });
+    return out.branch;
   }
 
   /** GET /api/settings: providers, key sources, presets, first-run flag. */
@@ -1016,6 +1048,28 @@ export class MockApi {
     void task;
     void message;
     return { ok: true, sha: 'mock0000' };
+  }
+
+  /** @returns {Promise<WorkspaceRef[]>} */
+  async workspaces() {
+    return this._data.workspaces.map((ws, i) => ({
+      cwd: ws.path,
+      name: ws.name,
+      taskCount: ws.tasks.length,
+      home: i === 0,
+    }));
+  }
+
+  async branches(task) {
+    const detail = this._data.tasks.get(task.id);
+    const current = (detail && detail.git && detail.git.branch) || 'main';
+    return { current, branches: [current, 'main', 'feat/gui', 'fix/stream-timeouts'].filter((b, i, all) => all.indexOf(b) === i) };
+  }
+
+  async checkout(task, branch) {
+    const detail = this._data.tasks.get(task.id);
+    if (detail && detail.git) detail.git.branch = branch;
+    return branch;
   }
 
   /** @returns {Promise<ModelInfo[]>} */

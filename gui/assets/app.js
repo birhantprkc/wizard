@@ -62,7 +62,8 @@ let selectSeq = 0;
 /** Composer refs. */
 let composerInput = null;
 let modelLabelEl = null;
-let modelMenuEl = null;
+/** The one open dropdown (model / directory / branch), if any. */
+let menuEl = null;
 
 /* ------------------------------------------------------------------------ */
 /* DOM helpers                                                               */
@@ -173,7 +174,7 @@ function renderSidebar() {
   );
 
   $('sidebar-actions').replaceChildren(
-    h('button', { class: 'side-row', type: 'button', onclick: () => newChat() },
+    h('button', { class: 'side-row', type: 'button', onclick: () => newChatHere() },
       icon('plusSquare', 'icon side-row-icon'),
       h('span', { class: 'side-row-label' }, 'New Chat'),
       h('span', { class: 'side-row-hint' }, `${MOD_KEY}N`)),
@@ -208,14 +209,33 @@ function renderSidebar() {
 function renderTopbar() {
   const t = state.task;
   const branch = state.git && state.git.branch;
+
+  const dirAnchor = h('span', { class: 'menu-anchor' });
+  dirAnchor.append(h('button', {
+    class: 'chip chip-repo', type: 'button',
+    title: `${t ? t.path : ''}\nOpen a chat in another directory`,
+    onclick: (e) => { e.stopPropagation(); openDirMenu(dirAnchor); },
+  },
+    icon('folder', 'icon chip-icon'),
+    h('span', { class: 'chip-label' }, t ? t.workspace : '—'),
+    icon('chevronDown', 'icon chip-caret')));
+
+  const branchAnchor = h('span', { class: 'menu-anchor' });
+  branchAnchor.append(h('button', {
+    class: 'chip chip-branch', type: 'button', title: 'Switch branch',
+    onclick: (e) => { e.stopPropagation(); openBranchMenu(branchAnchor); },
+  },
+    icon('branch', 'icon chip-icon'),
+    h('span', { class: 'chip-label' }, branch),
+    icon('chevronDown', 'icon chip-caret')));
+
   $('topbar').replaceChildren(
     h('div', { class: 'topbar-left' },
       iconBtn('panelLeft', 'Toggle chat list', () => $('app').classList.toggle('sidebar-collapsed')),
       h('h1', { class: 'topbar-title' }, t ? t.title : 'Wizard'),
-      t && h('span', { class: 'chip chip-repo', title: t.path },
-        icon('folder', 'icon chip-icon'), h('span', { class: 'chip-label' }, t.workspace)),
-      t && branch && h('span', { class: 'chip chip-branch', title: 'Current branch' },
-        icon('branch', 'icon chip-icon'), h('span', { class: 'chip-label' }, branch)),
+      t && dirAnchor,
+      // No branch chip outside a git repo: there is nothing to switch.
+      t && branch && branchAnchor,
     ),
     h('div', { class: 'topbar-right' },
       iconBtn('panelRight', 'Toggle context panel', () => $('app').classList.toggle('panel-collapsed')),
@@ -961,45 +981,72 @@ function updateModelChip() {
   if (modelLabelEl) modelLabelEl.textContent = state.modelLabel || defaultModelLabel();
 }
 
-function closeModelMenu() {
-  if (modelMenuEl) {
-    modelMenuEl.remove();
-    modelMenuEl = null;
+function closeMenu() {
+  if (menuEl) {
+    menuEl.remove();
+    menuEl = null;
     document.removeEventListener('click', onDocClickForMenu, true);
   }
 }
 
 function onDocClickForMenu(e) {
-  if (modelMenuEl && !modelMenuEl.contains(e.target) && !e.target.closest('.model-select')) closeModelMenu();
+  if (menuEl && !menuEl.contains(e.target) && !e.target.closest('.menu-anchor')) closeMenu();
+}
+
+/** `replaceChildren` renders a `null` child as the text "null"; `h()` drops it.
+ *  Menus are built conditionally, so they go through this. */
+function fillWith(node, ...children) {
+  node.replaceChildren(...children.flat(Infinity).filter(Boolean));
 }
 
 /**
- * Open the model menu and (re)load the list while it is open: providers can
- * be added in Settings, and a local backend that was down when the page
- * loaded may be up now — a menu built once at boot goes stale either way.
+ * Open a dropdown under `anchor` and let `fill` populate it — possibly after
+ * an await, so every menu here can load what it offers at open time rather
+ * than trusting whatever was fetched at boot. A menu the user has closed (or
+ * replaced with another) in the meantime is never written into: `fill` gets a
+ * `live()` predicate to check after each await.
+ *
+ * Clicking the same chip again toggles the menu shut.
  */
-async function toggleModelMenu(anchor) {
-  if (modelMenuEl) {
-    closeModelMenu();
-    return;
-  }
-  const menu = h('div', { class: 'menu model-menu', role: 'menu' },
-    h('div', { class: 'menu-note' }, 'Loading models…'));
+async function openMenu(anchor, cls, loading, fill) {
+  const wasOpen = menuEl && anchor.contains(menuEl);
+  closeMenu();
+  if (wasOpen) return;
+  const menu = h('div', { class: `menu ${cls}`, role: 'menu' }, h('div', { class: 'menu-note' }, loading));
   anchor.append(menu);
-  modelMenuEl = menu;
+  menuEl = menu;
   document.addEventListener('click', onDocClickForMenu, true);
-
-  let models;
+  const live = () => menuEl === menu;
   try {
-    models = await api.listModels();
+    await fill(menu, live);
   } catch (err) {
-    if (modelMenuEl !== menu) return;
-    menu.replaceChildren(h('div', { class: 'menu-note error' }, String((err && err.message) || err)));
-    return;
+    if (live()) menu.replaceChildren(h('div', { class: 'menu-note error' }, String((err && err.message) || err)));
   }
-  if (modelMenuEl !== menu) return; // closed while the request was in flight
-  state.models = models;
-  fillModelMenu(menu);
+}
+
+/** A menu row. */
+function menuItem(label, { hint, title, selected, onclick } = {}) {
+  return h('button', {
+    class: 'menu-item' + (selected ? ' selected' : ''),
+    type: 'button', role: 'menuitem', title, onclick,
+  },
+    h('span', { class: 'menu-item-label' }, label),
+    hint && h('span', { class: 'menu-item-hint' }, hint),
+    selected && h('span', { class: 'menu-check', html: icons.check, 'aria-hidden': 'true' }));
+}
+
+/**
+ * The model menu, reloaded on open: providers can be added in Settings, and a
+ * local backend that was down when the page loaded may be up now — a menu
+ * built once at boot goes stale either way.
+ */
+function openModelMenu(anchor) {
+  return openMenu(anchor, 'model-menu', 'Loading models…', async (menu, live) => {
+    const models = await api.listModels();
+    if (!live()) return;
+    state.models = models;
+    fillModelMenu(menu);
+  });
 }
 
 function fillModelMenu(menu) {
@@ -1007,11 +1054,11 @@ function fillModelMenu(menu) {
     state.modelId = m.value;
     state.modelLabel = m.label;
     updateModelChip();
-    closeModelMenu();
+    closeMenu();
   };
   const manage = h('button', {
     class: 'menu-item menu-manage', type: 'button', role: 'menuitem',
-    onclick: () => { closeModelMenu(); openSettings(); },
+    onclick: () => { closeMenu(); openSettings(); },
   }, h('span', { class: 'menu-item-label' }, 'Manage providers…'));
 
   if (!state.models.length) {
@@ -1030,16 +1077,123 @@ function fillModelMenu(menu) {
       lastProvider = m.provider;
     }
     const selected = state.modelId === m.value || (state.modelId == null && m.isDefault);
-    menu.append(h('button', {
-      class: 'menu-item' + (selected ? ' selected' : ''),
-      type: 'button', role: 'menuitem',
+    menu.append(menuItem(m.label, {
+      hint: m.isDefault ? 'default' : null,
+      selected,
       onclick: () => choose(m),
-    },
-      h('span', { class: 'menu-item-label' }, m.label),
-      m.isDefault && h('span', { class: 'menu-item-hint' }, 'default'),
-      selected && h('span', { class: 'menu-check', html: icons.check, 'aria-hidden': 'true' })));
+    }));
   }
   menu.append(manage);
+}
+
+/* --- Workspace + branch menus (the topbar chips) --------------------------- */
+
+/** The directory a new chat opens in: the one you are looking at, else the
+ *  directory `wizard gui` runs in. */
+function activeDir() {
+  return (state.task && state.task.path) || state.home.cwd;
+}
+
+/**
+ * The folder chip: open a chat in another directory. A chat's working
+ * directory is fixed when its session is created — it is written into the
+ * session file and is where every command it has run took effect — so this
+ * starts a new chat there rather than pretending to move this one.
+ */
+function openDirMenu(anchor) {
+  return openMenu(anchor, 'dir-menu', 'Loading directories…', async (menu, live) => {
+    const dirs = await api.workspaces();
+    if (!live()) return;
+    const here = activeDir();
+
+    const pathInput = h('input', {
+      class: 'text-input menu-input', type: 'text', spellcheck: 'false',
+      placeholder: '/absolute/path', 'aria-label': 'Open a chat in this directory',
+    });
+    const err = h('div', { class: 'menu-note error hidden' });
+    const open = async (cwd) => {
+      err.classList.add('hidden');
+      try {
+        await newChat(cwd);
+        closeMenu();
+      } catch (e) {
+        // The menu stays open on failure — a mistyped path is worth fixing in
+        // place rather than starting over.
+        err.textContent = String((e && e.message) || e);
+        err.classList.remove('hidden');
+      }
+    };
+    pathInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const cwd = pathInput.value.trim();
+      if (cwd) open(cwd);
+    });
+
+    fillWith(menu,
+      h('div', { class: 'menu-head' }, 'New chat in'),
+      dirs.map((d) => menuItem(d.name, {
+        hint: d.home ? 'here' : null,
+        title: d.cwd,
+        selected: d.cwd === here,
+        onclick: () => open(d.cwd),
+      })),
+      h('div', { class: 'menu-foot' }, pathInput),
+      err,
+    );
+  });
+}
+
+/** The branch chip: check a branch out in this chat's workspace. */
+function openBranchMenu(anchor) {
+  return openMenu(anchor, 'branch-menu', 'Loading branches…', async (menu, live) => {
+    const task = state.task;
+    if (!task) return;
+    const { current, branches } = await api.branches(task);
+    if (!live()) return;
+
+    const err = h('div', { class: 'menu-note error hidden' });
+    const fail = (e) => {
+      err.textContent = String((e && e.message) || e);
+      err.classList.remove('hidden');
+    };
+    const switchTo = async (branch, create) => {
+      err.classList.add('hidden');
+      try {
+        const now = await api.checkout(task, branch, create);
+        closeMenu();
+        appendSystemRow(`Switched to ${now}`);
+        await refreshGit();
+        renderTopbar();
+      } catch (e) {
+        fail(e);
+      }
+    };
+
+    const newInput = h('input', {
+      class: 'text-input menu-input', type: 'text', spellcheck: 'false',
+      placeholder: 'new branch name', 'aria-label': 'Create and check out a branch',
+    });
+    newInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const name = newInput.value.trim();
+      if (name) switchTo(name, true);
+    });
+
+    fillWith(menu,
+      h('div', { class: 'menu-head' }, 'Branch'),
+      // The backend refuses this too; saying so up front beats a failed click.
+      state.taskState === 'working'
+        && h('div', { class: 'menu-note' }, 'The agent is working in this tree — stop the turn to switch.'),
+      branches.map((b) => menuItem(b, {
+        selected: b === current,
+        onclick: () => switchTo(b, false),
+      })),
+      h('div', { class: 'menu-foot' }, newInput),
+      err,
+    );
+  });
 }
 
 /** The stop button exists only while a turn runs — an idle spinner just reads
@@ -1079,7 +1233,7 @@ function renderComposer() {
   const modelAnchor = h('span', { class: 'menu-anchor' },
     h('button', {
       class: 'chip ghost-chip model-select', type: 'button', title: 'Model for the next message',
-      onclick: (e) => { e.stopPropagation(); toggleModelMenu(modelAnchor); },
+      onclick: (e) => { e.stopPropagation(); openModelMenu(modelAnchor); },
     }, modelLabelEl, icon('chevronDown', 'icon chip-caret')));
 
   form.replaceChildren(
@@ -1466,16 +1620,17 @@ function renderSettings(body) {
 /* New chat                                                                  */
 /* ------------------------------------------------------------------------ */
 
-/** Open an empty chat in the directory `wizard gui` runs in; the first
- *  message from the composer starts the first turn. */
-async function newChat() {
-  let created;
-  try {
-    created = await api.newChat();
-  } catch (err) {
-    appendSystemRow(`Could not start a new chat: ${String((err && err.message) || err)}`, 'error');
-    return;
-  }
+/**
+ * Open an empty chat and focus the composer; the first message starts the
+ * first turn. Without a `cwd` it lands in the directory you are already in
+ * (the open chat's, else the one `wizard gui` runs in).
+ *
+ * Errors are raised, not swallowed: the folder chip's menu shows a bad path
+ * in place, while the sidebar button reports it in the transcript.
+ * @param {string} [cwd] absolute path of the workspace to open it in
+ */
+async function newChat(cwd) {
+  const created = await api.newChat(cwd || activeDir());
   draft = {
     id: created.id,
     title: NEW_CHAT_TITLE,
@@ -1485,6 +1640,13 @@ async function newChat() {
   mergeDraft();
   await selectTask(created.id);
   focusComposer();
+}
+
+/** `newChat` for the buttons that have nowhere better to show a failure. */
+function newChatHere() {
+  newChat().catch((err) => {
+    appendSystemRow(`Could not start a new chat: ${String((err && err.message) || err)}`, 'error');
+  });
 }
 
 /** A chat the backend does not list yet: `/api/tasks` only reports sessions
@@ -1641,7 +1803,7 @@ async function selectTask(id, { reload = false } = {}) {
 async function bootChat() {
   const here = state.workspaces.find((ws) => ws.path === state.home.cwd);
   if (here && here.tasks.length) await selectTask(here.tasks[0].id);
-  else await newChat();
+  else newChatHere();
 }
 
 async function init() {
@@ -1674,7 +1836,7 @@ async function init() {
   window.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n') {
       e.preventDefault();
-      newChat();
+      newChatHere();
     }
   });
 
