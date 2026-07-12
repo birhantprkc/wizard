@@ -12,12 +12,13 @@
 //! engineering around: a person signs in to one account at a time, and a second
 //! attempt should replace the first rather than race it.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::llm::xai_oauth;
+use crate::gui::settings::ConfigStore;
+use crate::llm::{chatgpt_oauth, xai_oauth};
 
 /// A sign-in that has been started but not yet completed. Dropped when it is
 /// finished, replaced, or [`EXPIRY`] passes — an authorization code the user
@@ -81,7 +82,8 @@ impl SignIn {
         inner.status.clone()
     }
 
-    /// Start an xAI sign-in against a redirect this server serves.
+    /// Start an xAI sign-in against a redirect this server serves. The GUI's
+    /// own `/callback` route finishes it via [`Self::complete`].
     pub async fn begin_xai(&self, redirect_uri: &str) -> anyhow::Result<String> {
         let pending = xai_oauth::begin_login(redirect_uri).await?;
         let url = pending.authorize_url.clone();
@@ -90,6 +92,52 @@ impl SignIn {
         inner.status = Status::Pending {
             provider: "xai".to_string(),
         };
+        Ok(url)
+    }
+
+    /// Start a ChatGPT sign-in. Its redirect is a fixed address registered with
+    /// OpenAI (`localhost:1455/auth/callback`), not this server's, so the flow
+    /// binds that listener itself and finishes in a spawned task — the GUI only
+    /// hands out the URL and then watches [`Status`]. `store` receives the
+    /// provider once the tokens land.
+    pub async fn begin_chatgpt(
+        self: &Arc<Self>,
+        store: Arc<ConfigStore>,
+    ) -> anyhow::Result<String> {
+        let pending = chatgpt_oauth::begin_login()?;
+        let url = pending.authorize_url.clone();
+        {
+            let mut inner = self.lock();
+            // A ChatGPT flow owns its own listener; nothing for `complete` to do.
+            inner.flow = None;
+            inner.status = Status::Pending {
+                provider: "chatgpt".to_string(),
+            };
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            match chatgpt_oauth::wait_and_complete(pending).await {
+                Ok(_) => {
+                    let provider = chatgpt_oauth::provider_config();
+                    let name = provider.name.clone();
+                    let saved = store.update(move |config| {
+                        crate::gui::settings::upsert_provider(config, provider, true);
+                        Ok(())
+                    });
+                    match saved {
+                        Ok(_) => this.finish(Status::Done { provider: name }),
+                        Err(err) => this.finish(Status::Failed {
+                            provider: "chatgpt".to_string(),
+                            error: format!("signed in, but saving failed: {err:#}"),
+                        }),
+                    }
+                }
+                Err(err) => this.finish(Status::Failed {
+                    provider: "chatgpt".to_string(),
+                    error: format!("{err:#}"),
+                }),
+            }
+        });
         Ok(url)
     }
 

@@ -40,8 +40,9 @@ pub(crate) struct GuiState {
     /// The port this server is on, so an OAuth redirect can be pointed back at
     /// a route we serve ourselves.
     pub port: u16,
-    /// The subscription sign-in in flight, if any.
-    pub sign_in: oauth::SignIn,
+    /// The subscription sign-in in flight, if any. `Arc` because a ChatGPT
+    /// sign-in finishes in a spawned task that outlives the request.
+    pub sign_in: Arc<oauth::SignIn>,
 }
 
 /// Entry point for `wizard gui`: bind 127.0.0.1:`port` (an occupied port is
@@ -64,7 +65,7 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
         cwd,
         assets_dir: assets,
         port,
-        sign_in: oauth::SignIn::default(),
+        sign_in: Arc::new(oauth::SignIn::default()),
     });
     let router = server::router(state);
 

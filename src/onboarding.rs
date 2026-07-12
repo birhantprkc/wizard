@@ -1256,6 +1256,9 @@ fn print_summary(config: &Config) {
         ProviderKind::XaiOauth => {
             println!("  • sign in to xAI:  wizard --login xai");
         }
+        ProviderKind::ChatgptOauth => {
+            println!("  • sign in to ChatGPT:  wizard --login chatgpt");
+        }
     }
 
     if config.gateway.kind == GatewayKind::Telegram {

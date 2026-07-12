@@ -137,7 +137,7 @@ fn default_key_env(kind: ProviderKind) -> Option<&'static str> {
 pub fn key_source(provider: &ProviderConfig) -> KeySource {
     match provider.kind {
         ProviderKind::LlamaCpp | ProviderKind::Ollama => return KeySource::NotNeeded,
-        ProviderKind::XaiOauth => return KeySource::Oauth,
+        ProviderKind::XaiOauth | ProviderKind::ChatgptOauth => return KeySource::Oauth,
         _ => {}
     }
     if credentials::get(&provider.name).is_some_and(|key| !key.is_empty()) {

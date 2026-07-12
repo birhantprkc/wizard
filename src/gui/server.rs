@@ -480,9 +480,17 @@ async fn begin_sign_in(
 ) -> Result<axum::Json<Value>, ApiError> {
     // The redirect must be an address the provider will actually send a browser
     // to, and one we serve: our own origin.
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", state.port);
     let url = match provider.as_str() {
-        "xai" => state.sign_in.begin_xai(&redirect_uri).await?,
+        "xai" => {
+            let redirect_uri = format!("http://127.0.0.1:{}/callback", state.port);
+            state.sign_in.begin_xai(&redirect_uri).await?
+        }
+        "chatgpt" => {
+            state
+                .sign_in
+                .begin_chatgpt(Arc::clone(&state.config))
+                .await?
+        }
         other => {
             return Err(ApiError::bad_request(format!(
                 "cannot sign in to '{other}'"

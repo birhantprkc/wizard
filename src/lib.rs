@@ -195,7 +195,12 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"))
                 .await
                 .map(|()| 0),
-            other => anyhow::bail!("unknown login provider '{other}' (supported: xai)"),
+            "chatgpt" => llm::chatgpt_oauth::login(|line: &str| println!("{line}"))
+                .await
+                .map(|()| 0),
+            other => {
+                anyhow::bail!("unknown login provider '{other}' (supported: xai, chatgpt)")
+            }
         };
     }
 

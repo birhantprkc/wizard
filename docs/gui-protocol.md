@@ -102,11 +102,17 @@ flight at a time — a person signs in to one account at a time, and a second at
 the first rather than racing it.
 
 ### POST /api/login/{provider}
-`{ "authorize_url": "https://auth.x.ai/oauth2/authorize?…" }` — start the flow. The browser
+`provider` is `xai` or `chatgpt`. → `{ "authorize_url": "…" }` — start the flow. The browser
 opens that URL (from a window opened *synchronously* on the click, or browsers block it).
-The redirect_uri handed to the provider is `http://127.0.0.1:<gui port>/callback`: the GUI
-already is a server, so it serves its own redirect. The terminal flows
-(`wizard --login xai`) bind a listener of their own instead; both end at the same exchange.
+
+Two redirect shapes, because the providers register different ones:
+- **xai** redirects to `http://127.0.0.1:<gui port>/callback` — the GUI serves its own redirect
+  (`GET /callback`) and finishes the exchange there. xAI's client allows a floating loopback port.
+- **chatgpt** redirects to the fixed `http://localhost:1455/auth/callback` (fallback 1457) that
+  OpenAI's Codex client is registered with — so the flow binds *that* listener itself, in a
+  spawned task, and writes the provider when it completes. The GUI only watches `GET /api/login`.
+
+The terminal flows (`wizard --login xai|chatgpt`) bind their own listener the same way.
 
 ### GET /callback?code=…&state=…
 Where the *provider* sends the browser back. Not an API call — a page a human is looking at,
@@ -122,7 +128,7 @@ sign-in in flight is doing. The tab the user *started* from polls this, because 
 finishes the flow is the provider's redirect, which closes itself.
 
 ### POST /api/providers
-`{ "name": "…", "kind": "openai|anthropic|xai|xaioauth|openrouter|cloudflare|ollama|llamacpp",
+`{ "name": "…", "kind": "openai|anthropic|xai|xaioauth|chatgptoauth|openrouter|cloudflare|ollama|llamacpp",
    "base_url": "…", "model": "…", "api_key": "… (optional)", "activate": true }`
 → `{ "settings": {…}, "probe": { "ok": true, "models": ["…"] } }`
 

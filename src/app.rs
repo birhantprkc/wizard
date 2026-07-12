@@ -376,6 +376,7 @@ fn xai_oauth_session_present() -> bool {
 fn provider_display(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Xai | ProviderKind::XaiOauth => "xAI",
+        ProviderKind::ChatgptOauth => "ChatGPT",
         ProviderKind::OpenRouter => "OpenRouter",
         ProviderKind::Openai => "OpenAI-compatible",
         ProviderKind::Anthropic => "Anthropic",

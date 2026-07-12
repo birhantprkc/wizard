@@ -1439,6 +1439,7 @@ function presetList(presets, onPick) {
 
 /** The plans you can sign in to, rather than paste a key for. */
 const SIGN_INS = [
+  { id: 'chatgpt', label: 'ChatGPT', plan: 'Plus / Pro / Team subscription' },
   { id: 'xai', label: 'xAI', plan: 'SuperGrok subscription' },
 ];
 

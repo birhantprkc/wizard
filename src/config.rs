@@ -115,6 +115,10 @@ pub enum ProviderKind {
     /// xAI via account sign-in: OAuth tokens from `wizard --login xai`
     /// (stored in `~/.wizard/xai_oauth.json`), no API key needed.
     XaiOauth,
+    /// ChatGPT subscription via account sign-in: OAuth tokens from
+    /// `wizard --login chatgpt` (stored in `~/.wizard/chatgpt_oauth.json`),
+    /// calling the Responses API at `chatgpt.com/backend-api/codex`.
+    ChatgptOauth,
     /// Cloudflare Workers AI: serverless open models (GLM, Llama, Qwen, ...)
     /// behind an account-scoped OpenAI-compatible endpoint
     /// (`https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1`) with a
@@ -132,6 +136,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::OpenRouter => write!(f, "openrouter"),
             ProviderKind::Xai => write!(f, "xai"),
             ProviderKind::XaiOauth => write!(f, "xaioauth"),
+            ProviderKind::ChatgptOauth => write!(f, "chatgptoauth"),
             ProviderKind::Cloudflare => write!(f, "cloudflare"),
         }
     }
@@ -558,6 +563,15 @@ impl ProviderConfig {
                     "xai",
                 )))
             }
+            // A ChatGPT subscription is not the Chat Completions API — it is the
+            // Responses API behind account tokens, so it has its own client.
+            ProviderKind::ChatgptOauth => Ok(Arc::new(
+                crate::llm::chatgpt::ChatgptProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                )
+                .context("setting up ChatGPT OAuth token storage")?,
+            )),
             // Cloudflare Workers AI speaks the OpenAI-compatible Chat
             // Completions API, but has no `/v1/models`, so it needs its own
             // client for health/model-listing (see `CloudflareProvider`).

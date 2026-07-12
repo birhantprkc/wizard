@@ -91,8 +91,9 @@ pub struct Cli {
     #[arg(long)]
     pub gateway: bool,
 
-    /// Sign in to a provider account instead of starting the TUI. Currently
-    /// `xai`: OAuth in the browser, tokens stored in ~/.wizard/xai_oauth.json.
+    /// Sign in to a provider account instead of starting the TUI: `xai`
+    /// (SuperGrok) or `chatgpt` (Plus/Pro/Team). OAuth in the browser; tokens
+    /// are stored under ~/.wizard/.
     #[arg(long, value_name = "PROVIDER")]
     pub login: Option<String>,
 
