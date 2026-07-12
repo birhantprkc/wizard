@@ -3,7 +3,7 @@
 // through the Api seam (api.js): RealApi (HTTP + one WebSocket per open
 // task) by default, MockApi with `?mock=1`.
 
-import { createApi } from './api.js';
+import { NEW_CHAT_TITLE, createApi } from './api.js';
 import { icons, fileIconSvg } from './icons.js';
 
 const api = createApi();
@@ -11,6 +11,8 @@ const api = createApi();
 const state = {
   /** @type {import('./api.js').Workspace[]} */
   workspaces: [],
+  /** The directory `wizard gui` was launched from; a new chat opens there. */
+  home: { cwd: '', name: '' },
   /** @type {import('./api.js').ModelInfo[]} */
   models: [],
   /** Model override sent with the next user_message; null = task default. */
@@ -28,7 +30,6 @@ const state = {
   git: null,
   /** Elapsed label of the last finished turn ("3m 1s"). */
   lastWorked: null,
-  user: { name: 'Teddy', initial: 'T' },
 };
 
 /** @type {import('./api.js').StreamHandle | null} */
@@ -56,9 +57,8 @@ let transientNote = null;
 let gitPoll = null;
 let gitSeq = 0;
 let selectSeq = 0;
-/** Prompt of a just-created task, until the backend persists it. */
-let pendingPrompt = null;
 /** Composer refs. */
+let composerInput = null;
 let modelLabelEl = null;
 let modelMenuEl = null;
 
@@ -67,6 +67,9 @@ let modelMenuEl = null;
 /* ------------------------------------------------------------------------ */
 
 const $ = (id) => document.getElementById(id);
+
+/** Shortcut hints follow the platform: ⌘N on macOS, Ctrl-N everywhere else. */
+const MOD_KEY = /mac/i.test(navigator.userAgentData?.platform || navigator.platform || '') ? '⌘' : 'Ctrl-';
 
 /**
  * Hyperscript-style element builder.
@@ -139,11 +142,12 @@ function resortWorkspaces() {
 }
 
 /** Patch a sidebar summary in place and re-render (live state dot / re-sort). */
-function updateTaskSummary(id, { status, bump } = {}) {
+function updateTaskSummary(id, { status, bump, title } = {}) {
   for (const ws of state.workspaces) {
     const task = ws.tasks.find((t) => t.id === id);
     if (!task) continue;
     if (status) task.status = status;
+    if (title) task.title = title;
     if (bump) task.updatedAt = Date.now();
     break;
   }
@@ -159,28 +163,20 @@ function taskDot(t, selected) {
 }
 
 function renderSidebar() {
-  $('sidebar-nav').replaceChildren(
-    iconBtn('panelLeft', 'Toggle sidebar'),
-    iconBtn('arrowLeft', 'Back'),
-    iconBtn('arrowRight', 'Forward'),
+  $('sidebar-top').replaceChildren(
+    h('span', { class: 'home-dir', title: state.home.cwd || 'Working directory' },
+      icon('folder', 'icon home-icon'),
+      h('span', { class: 'home-name' }, state.home.name || 'Wizard')),
   );
-
-  const sideRow = (name, label, hint, onclick) =>
-    h('button', { class: 'side-row', type: 'button', onclick },
-      icon(name, 'icon side-row-icon'),
-      h('span', { class: 'side-row-label' }, label),
-      hint && h('span', { class: 'side-row-hint' }, hint));
 
   $('sidebar-actions').replaceChildren(
-    sideRow('plusSquare', 'New Task', '⌘N', () => openNewTaskModal()),
-    sideRow('folder', 'Open Workspace', null, () => openNewTaskModal()),
-    sideRow('wand', 'Skills'),
+    h('button', { class: 'side-row', type: 'button', onclick: () => newChat() },
+      icon('plusSquare', 'icon side-row-icon'),
+      h('span', { class: 'side-row-label' }, 'New Chat'),
+      h('span', { class: 'side-row-hint' }, `${MOD_KEY}N`)),
   );
 
-  $('tasks-header').replaceChildren(
-    h('span', { class: 'tasks-title' }, 'Tasks'),
-    iconBtn('filter', 'Filter tasks', null, 'tasks-filter'),
-  );
+  $('tasks-header').replaceChildren(h('span', { class: 'tasks-title' }, 'Chats'));
 
   $('task-tree').replaceChildren(
     ...state.workspaces.map((ws) =>
@@ -200,12 +196,6 @@ function renderSidebar() {
               h('span', { class: 'task-age' }, relAge(t.updatedAt)));
           })))),
   );
-
-  $('user-row').replaceChildren(
-    h('span', { class: 'avatar' }, state.user.initial),
-    h('span', { class: 'user-name' }, state.user.name),
-    iconBtn('gear', 'Settings', null, 'user-gear'),
-  );
 }
 
 /* ------------------------------------------------------------------------ */
@@ -217,18 +207,14 @@ function renderTopbar() {
   const branch = state.git && state.git.branch;
   $('topbar').replaceChildren(
     h('div', { class: 'topbar-left' },
+      iconBtn('panelLeft', 'Toggle chat list', () => $('app').classList.toggle('sidebar-collapsed')),
       h('h1', { class: 'topbar-title' }, t ? t.title : 'Wizard'),
       t && h('span', { class: 'chip chip-repo', title: t.path },
         icon('folder', 'icon chip-icon'), h('span', { class: 'chip-label' }, t.workspace)),
       t && branch && h('span', { class: 'chip chip-branch', title: 'Current branch' },
         icon('branch', 'icon chip-icon'), h('span', { class: 'chip-label' }, branch)),
-      iconBtn('ellipsis', 'More actions'),
     ),
     h('div', { class: 'topbar-right' },
-      h('button', { class: 'model-chip', type: 'button', title: t && t.model ? `Model: ${t.model}` : 'Agent' },
-        h('span', { class: 'model-avatar', html: icons.sparkles }), icon('chevronDown', 'icon chip-caret')),
-      iconBtn('notesPanel', 'Notes'),
-      iconBtn('terminal', 'Terminal'),
       iconBtn('panelRight', 'Toggle context panel', () => $('app').classList.toggle('panel-collapsed')),
     ),
   );
@@ -799,8 +785,7 @@ function renderContextPanel() {
       icon('diff', 'icon ctx-icon'), h('span', { class: 'ctx-label' }, 'Changes'), ctx.gitCount,
       h('span', { class: 'ctx-right' }, ctx.gitAdd, ctx.gitDel)),
     ctx.gitFileList,
-    h('div', { class: 'ctx-row static' },
-      icon('branch', 'icon ctx-icon'), ctx.gitBranch, icon('chevronDown', 'icon ctx-caret')),
+    h('div', { class: 'ctx-row static' }, icon('branch', 'icon ctx-icon'), ctx.gitBranch),
     h('button', {
       class: 'ctx-row', type: 'button', title: 'Commit all changes',
       onclick: () => {
@@ -810,7 +795,7 @@ function renderContextPanel() {
       },
     },
       icon('commitNode', 'icon ctx-icon'), h('span', { class: 'ctx-label' }, 'Commit'),
-      icon('ellipsis', 'icon ctx-caret')),
+      icon('chevronDown', 'icon ctx-caret')),
     ctx.commitBox,
     ctx.commitNote);
 
@@ -1030,12 +1015,17 @@ function updateSpinner() {
   }
 }
 
+function focusComposer() {
+  if (composerInput) composerInput.focus();
+}
+
 function renderComposer() {
   const form = $('composer');
   const input = h('textarea', {
     class: 'composer-input', rows: '1',
-    placeholder: 'Ask for follow-up changes', 'aria-label': 'Ask for follow-up changes',
+    placeholder: 'Ask wizard to change something', 'aria-label': 'Message wizard',
   });
+  composerInput = input;
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
@@ -1057,7 +1047,6 @@ function renderComposer() {
   form.replaceChildren(
     input,
     h('div', { class: 'composer-row' },
-      iconBtn('plus', 'Attach', null, 'composer-plus'),
       // Wizard has no permission gating: this chip states the agent mode.
       h('span', { class: 'chip ghost-chip mode-chip', title: 'Agent mode — GUI sessions run autonomously' },
         icon('wand', 'icon chip-icon'), h('span', { class: 'chip-label' }, 'Sovereign')),
@@ -1085,10 +1074,24 @@ function renderComposer() {
   };
 }
 
+/** A chat's title: its first message, one line, bounded. */
+function titleFrom(text) {
+  const line = text.split('\n', 1)[0].trim() || text.trim();
+  return line.length > 90 ? `${line.slice(0, 89)}…` : line;
+}
+
 async function send(text) {
   appendPromptCard(text);
   pendingTurnStart = Date.now();
   autoScroll(true);
+  // The first message in an empty chat names it, everywhere it is shown.
+  if (state.task && state.task.title === NEW_CHAT_TITLE) {
+    state.task.title = titleFrom(text);
+    if (draft && draft.id === state.task.id) draft.title = state.task.title;
+    updateTaskSummary(state.task.id, { title: state.task.title });
+    renderTopbar();
+    updateGoal();
+  }
   try {
     await api.sendMessage(state.task.id, text, { model: state.modelId || undefined });
   } catch (err) {
@@ -1097,112 +1100,53 @@ async function send(text) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* New Task modal                                                            */
+/* New chat                                                                  */
 /* ------------------------------------------------------------------------ */
 
-function closeModal() {
-  $('modal-root').replaceChildren();
-  document.removeEventListener('keydown', onModalKeydown);
-}
-
-function onModalKeydown(e) {
-  if (e.key === 'Escape') closeModal();
-}
-
-async function openNewTaskModal() {
-  const root = $('modal-root');
-  if (root.childElementCount) return;
-
-  const wsSelect = h('select', { class: 'text-input select' });
-  const pathInput = h('input', {
-    class: 'text-input', type: 'text', spellcheck: 'false',
-    placeholder: '/absolute/path/to/workspace',
-  });
-  const promptInput = h('textarea', { class: 'text-input', rows: '4', placeholder: 'What should the agent do?' });
-  const modelSelect = h('select', { class: 'text-input select' });
-  const errEl = h('div', { class: 'card-note error hidden' });
-  const createBtn = h('button', { class: 'btn primary', type: 'submit' }, 'Create task');
-
-  wsSelect.append(h('option', { value: '' }, 'Custom path…'));
-  wsSelect.addEventListener('change', () => {
-    if (wsSelect.value) pathInput.value = wsSelect.value;
-  });
-  modelSelect.append(h('option', { value: '' }, 'Default model'));
-  for (const m of state.models) {
-    if (m.isDefault) continue;
-    modelSelect.append(h('option', { value: m.value || '' }, `${m.label} (${m.provider})`));
-  }
-
-  const form = h('form', { class: 'modal-form' },
-    h('div', { class: 'form-row' }, h('label', { class: 'form-label' }, 'Workspace'), wsSelect, pathInput),
-    h('div', { class: 'form-row' }, h('label', { class: 'form-label' }, 'Prompt'), promptInput),
-    h('div', { class: 'form-row' }, h('label', { class: 'form-label' }, 'Model'), modelSelect),
-    errEl,
-    h('div', { class: 'card-actions modal-actions' },
-      createBtn,
-      h('button', { class: 'btn ghost', type: 'button', onclick: closeModal }, 'Cancel')));
-
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    const cwd = pathInput.value.trim();
-    const prompt = promptInput.value.trim();
-    errEl.classList.add('hidden');
-    if (!cwd.startsWith('/')) {
-      errEl.textContent = 'The workspace must be an absolute path.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-    if (!prompt) {
-      errEl.textContent = 'The prompt must not be empty.';
-      errEl.classList.remove('hidden');
-      return;
-    }
-    createBtn.setAttribute('disabled', '');
-    createBtn.textContent = 'Creating…';
-    try {
-      const { id } = await api.newTask({ cwd, prompt, model: modelSelect.value || undefined });
-      pendingPrompt = { id, text: prompt };
-      closeModal();
-      await refreshTaskList();
-      await selectTask(id);
-    } catch (err) {
-      errEl.textContent = String((err && err.message) || err);
-      errEl.classList.remove('hidden');
-      createBtn.removeAttribute('disabled');
-      createBtn.textContent = 'Create task';
-    }
-  };
-
-  const overlay = h('div', {
-    class: 'modal-overlay',
-    onclick: (e) => { if (e.target === overlay) closeModal(); },
-  },
-    h('div', { class: 'modal', role: 'dialog', 'aria-label': 'New Task' },
-      h('div', { class: 'modal-head' },
-        h('span', { class: 'modal-title' }, 'New Task'),
-        iconBtn('close', 'Close', closeModal)),
-      form));
-  root.append(overlay);
-  document.addEventListener('keydown', onModalKeydown);
-  promptInput.focus();
-
+/** Open an empty chat in the directory `wizard gui` runs in; the first
+ *  message from the composer starts the first turn. */
+async function newChat() {
+  let created;
   try {
-    const workspaces = await api.workspaces();
-    for (const ws of workspaces) {
-      wsSelect.append(h('option', { value: ws.cwd }, `${ws.name} — ${ws.cwd}`));
-    }
-    if (workspaces.length) {
-      wsSelect.value = workspaces[0].cwd;
-      if (!pathInput.value) pathInput.value = workspaces[0].cwd;
-    }
-  } catch {
-    /* workspaces are a convenience; the path field still works */
+    created = await api.newChat();
+  } catch (err) {
+    appendSystemRow(`Could not start a new chat: ${String((err && err.message) || err)}`, 'error');
+    return;
   }
+  draft = {
+    id: created.id,
+    title: NEW_CHAT_TITLE,
+    path: created.cwd || state.home.cwd,
+    workspace: created.workspace || state.home.name,
+  };
+  mergeDraft();
+  await selectTask(created.id);
+  focusComposer();
+}
+
+/** A chat the backend does not list yet: `/api/tasks` only reports sessions
+ *  that have messages, so an untouched new chat lives here until it does. */
+let draft = null;
+
+/** Splice `draft` into the sidebar until the backend knows about it. */
+function mergeDraft() {
+  if (!draft) return;
+  if (state.workspaces.some((ws) => ws.tasks.some((t) => t.id === draft.id))) {
+    draft = null;
+    return;
+  }
+  let ws = state.workspaces.find((w) => w.path === draft.path);
+  if (!ws) {
+    ws = { name: draft.workspace, path: draft.path, tasks: [] };
+    state.workspaces.push(ws);
+  }
+  ws.tasks.push({ id: draft.id, title: draft.title, updatedAt: Date.now(), status: 'idle' });
 }
 
 async function refreshTaskList() {
   try {
     state.workspaces = await api.listTasks();
+    mergeDraft();
     resortWorkspaces();
     renderSidebar();
   } catch {
@@ -1314,19 +1258,6 @@ async function selectTask(id, { reload = false } = {}) {
   }
   if (seq !== selectSeq) return; // stale response; user moved on
 
-  // A just-created task may not have persisted its first prompt yet.
-  if (pendingPrompt && pendingPrompt.id === id) {
-    if (!task.transcript.some((i) => i.type === 'user')) {
-      task.transcript = [{ type: 'user', text: pendingPrompt.text }, ...task.transcript];
-      if (!task.title || task.title === id) {
-        task.title = pendingPrompt.text.length > 90 ? `${pendingPrompt.text.slice(0, 89)}…` : pendingPrompt.text;
-      }
-      pendingTurnStart = pendingTurnStart || Date.now();
-    } else {
-      pendingPrompt = null;
-    }
-  }
-
   state.task = task;
   state.taskState = task.status || 'idle';
   renderTopbar();
@@ -1347,9 +1278,10 @@ async function init() {
   renderSidebar();
   renderTopbar();
   try {
-    const [workspaces, models] = await Promise.all([api.listTasks(), api.listModels()]);
+    const [workspaces, models, home] = await Promise.all([api.listTasks(), api.listModels(), api.home()]);
     state.workspaces = workspaces;
     state.models = models;
+    state.home = home;
   } catch (err) {
     const scroller = $('transcript');
     const inner = h('div', { class: 'transcript-inner' });
@@ -1361,8 +1293,12 @@ async function init() {
   resortWorkspaces();
   renderSidebar();
   updateModelChip();
-  const mostRecent = state.workspaces.flatMap((ws) => ws.tasks).sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  if (mostRecent) await selectTask(mostRecent.id);
+
+  // Land in the newest chat of the directory wizard runs in; with none, open
+  // a fresh one there — `wizard gui` in a repo is about that repo.
+  const here = state.workspaces.find((ws) => ws.path === state.home.cwd);
+  if (here && here.tasks.length) await selectTask(here.tasks[0].id);
+  else await newChat();
 
   // Keep the relative ages in the sidebar fresh.
   setInterval(() => renderSidebar(), 60000);
@@ -1370,7 +1306,7 @@ async function init() {
   window.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n') {
       e.preventDefault();
-      openNewTaskModal();
+      newChat();
     }
   });
 }

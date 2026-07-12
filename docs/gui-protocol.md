@@ -43,14 +43,19 @@ single-line tool rows and can expand. There is no `thinking` replay item: thinki
 not persisted to the session JSONL, so it exists only as live `thinking_delta` frames.
 
 ### POST /api/tasks
-`{ "cwd": "/abs/path", "prompt": "...", "model": "provider-or-model-name (optional)" }`
-→ `201 { "id": "..." }`. Creates the session and starts the first turn immediately;
-the client should open the WebSocket right away to catch the stream (server buffers
-events from turn start until the first WS attach, then replays them).
+`{ "cwd": "/abs/path (optional)", "prompt": "... (optional)",
+   "model": "provider-or-model-name (optional)" }`
+→ `201 { "id": "...", "cwd": "/abs/path", "workspace": "wizard" }`. Creates the
+session. Without `cwd` it opens in the directory `wizard gui` was launched from —
+this is what the GUI's "New Chat" posts (an empty body). With a `prompt` the first
+turn starts immediately, and the client should open the WebSocket right away to catch
+the stream (the server buffers events from turn start until the first WS attach, then
+replays them); without one the chat opens empty and the first `user_message` frame
+starts it.
 
-### GET /api/workspaces
-Directories to offer in "New Task": distinct cwds of existing sessions + registry.
-`[{ "cwd": "...", "name": "wizard", "task_count": 12 }]`
+### GET /api/workspace
+The directory the server runs in — where a new chat opens.
+`{ "cwd": "/abs/path", "name": "wizard" }`
 
 ### GET /api/models
 `{ "active": "anthropic", "providers": [{ "name": "anthropic", "kind": "anthropic",

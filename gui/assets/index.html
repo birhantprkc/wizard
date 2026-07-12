@@ -12,18 +12,10 @@
   <div id="app" class="app">
     <!-- Left: sidebar -->
     <aside id="sidebar" class="sidebar" aria-label="Navigation">
-      <div id="sidebar-top" class="sidebar-top">
-        <div class="traffic-lights" aria-hidden="true">
-          <span class="tl tl-red"></span>
-          <span class="tl tl-yellow"></span>
-          <span class="tl tl-green"></span>
-        </div>
-        <div id="sidebar-nav" class="sidebar-nav"></div>
-      </div>
+      <div id="sidebar-top" class="sidebar-top"></div>
       <nav id="sidebar-actions" class="sidebar-actions" aria-label="Actions"></nav>
       <div id="tasks-header" class="tasks-header"></div>
-      <nav id="task-tree" class="task-tree" aria-label="Tasks"></nav>
-      <footer id="user-row" class="user-row"></footer>
+      <nav id="task-tree" class="task-tree" aria-label="Chats"></nav>
     </aside>
 
     <!-- Center + right -->
@@ -36,12 +28,10 @@
             <form id="composer" class="composer"></form>
           </div>
         </main>
-        <aside id="context-panel" class="context-panel" aria-label="Task context"></aside>
+        <aside id="context-panel" class="context-panel" aria-label="Chat context"></aside>
       </div>
     </div>
   </div>
-
-  <div id="modal-root"></div>
 
   <noscript>Wizard GUI requires JavaScript.</noscript>
   <script type="module" src="./app.js"></script>

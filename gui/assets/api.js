@@ -31,9 +31,8 @@
 
 /**
  * @typedef {Object} WorkspaceRef
- * @property {string} cwd
- * @property {string} name
- * @property {number} taskCount
+ * @property {string} cwd   Absolute path of the directory the server runs in.
+ * @property {string} name  Its basename, for display.
  */
 
 /**
@@ -141,6 +140,9 @@
  * @property {string} provider
  * @property {boolean} [isDefault]
  */
+
+/** Title of a chat with no messages yet, in the sidebar and the topbar. */
+export const NEW_CHAT_TITLE = 'New chat';
 
 /* ------------------------------------------------------------------------ */
 /* Tool taxonomy: wire tool names → display buckets                          */
@@ -386,14 +388,10 @@ export class RealApi {
     return Array.from(groups.values());
   }
 
-  /** GET /api/workspaces for the New Task picker. */
-  async workspaces() {
-    const rows = (await this._json('/api/workspaces')) || [];
-    return rows.map((row) => ({
-      cwd: row.cwd,
-      name: row.name || pathBasename(row.cwd),
-      taskCount: row.task_count || 0,
-    }));
+  /** GET /api/workspace: the directory the server runs in. */
+  async home() {
+    const row = (await this._json('/api/workspace')) || {};
+    return { cwd: row.cwd || '', name: row.name || pathBasename(row.cwd || '') };
   }
 
   /** GET /api/tasks/{id}: replay items normalized to transcript items. */
@@ -454,7 +452,7 @@ export class RealApi {
     if (title.length > 90) title = `${title.slice(0, 89)}…`;
     return {
       id: raw.id,
-      title: title || raw.id,
+      title: title || NEW_CHAT_TITLE,
       workspace: raw.workspace || pathBasename(raw.cwd || ''),
       path: raw.cwd || '',
       model: raw.model || '',
@@ -582,12 +580,13 @@ export class RealApi {
     return models;
   }
 
-  /** POST /api/tasks: create the session and start the first turn. */
-  async newTask({ cwd, prompt, model }) {
-    const payload = { cwd, prompt };
-    if (model) payload.model = model;
-    const out = await this._post('/api/tasks', payload);
-    return { id: out.id };
+  /**
+   * POST /api/tasks with no prompt: an empty chat in the directory the
+   * server runs in. The first `user_message` starts its first turn.
+   */
+  async newChat() {
+    const out = await this._post('/api/tasks', {});
+    return { id: out.id, cwd: out.cwd || '', workspace: out.workspace || pathBasename(out.cwd || '') };
   }
 }
 
@@ -857,13 +856,10 @@ export class MockApi {
     return this._data.workspaces;
   }
 
-  /** @returns {Promise<WorkspaceRef[]>} */
-  async workspaces() {
-    return this._data.workspaces.map((ws) => ({
-      cwd: ws.path,
-      name: ws.name,
-      taskCount: ws.tasks.length,
-    }));
+  /** @returns {Promise<WorkspaceRef>} */
+  async home() {
+    const ws = this._data.workspaces[0];
+    return { cwd: ws.path, name: ws.name };
   }
 
   /**
@@ -981,32 +977,23 @@ export class MockApi {
   }
 
   /**
-   * @param {{cwd: string, prompt: string, model?: string}} params
-   * @returns {Promise<{id: string}>}
+   * An empty chat in the mock's own workspace, mirroring `RealApi.newChat`.
+   * @returns {Promise<{id: string, cwd: string, workspace: string}>}
    */
-  async newTask({ cwd, prompt, model }) {
-    const ws =
-      this._data.workspaces.find((w) => w.path === cwd) ||
-      this._data.workspaces.find((w) => cwd && cwd.endsWith(w.name));
-    if (!ws) throw new Error(`unknown workspace: ${cwd}`);
-    const id = nextId('task');
-    const title = prompt.length > 64 ? `${prompt.slice(0, 61)}…` : prompt;
-    ws.tasks.unshift({ id, title, updatedAt: Date.now(), status: 'working' });
+  async newChat() {
+    const ws = this._data.workspaces[0];
+    const id = nextId('chat');
     this._data.tasks.set(id, {
       id,
-      title,
+      title: NEW_CHAT_TITLE,
       workspace: ws.name,
       path: ws.path,
-      model: model || 'glm-5.2',
-      status: 'working',
+      model: 'glm-5.2',
+      status: 'idle',
       git: { branch: 'main', additions: 0, deletions: 0, files: [] },
-      transcript: [{ type: 'user', text: prompt }],
-      tailEvents: [
-        { type: 'status', status: { state: 'working' } },
-        ...textEvents('Starting on this now — reading the workspace layout before making changes.'),
-      ],
+      transcript: [],
     });
-    return { id };
+    return { id, cwd: ws.path, workspace: ws.name };
   }
 
   /**

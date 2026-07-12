@@ -26,24 +26,26 @@ with slightly lighter raised cards and 10–14px corner radii.
 +-------------+--------------------------------------+------------------+
 ```
 
-Top bar spans center+right: task title (truncated, bold) + repo chip (`gomoku-ai` with folder icon)
-+ branch chip (`upgrade/v3.0` with branch icon, dropdown caret) + `...` overflow + right-side icon
-cluster (model avatar dropdown, panel toggles). macOS traffic lights top-left of the sidebar
-(decorative in our case).
+Top bar spans center+right: sidebar toggle + chat title (truncated, bold) + repo chip
+(`gomoku-ai` with folder icon) + branch chip (`upgrade/v3.0` with branch icon), and the
+context-panel toggle on the right.
+
+Every control in the chrome does something. The reference design's decorative bits — macOS
+traffic lights (the real window already has them, on macOS), back/forward arrows, notes and
+terminal buttons, an attach button, a settings gear — are not drawn: a control that looks
+clickable and isn't is worse than no control.
 
 ## Left sidebar (~240px)
 
-1. Action rows (icon + label, hover highlight):
-   - `New Task` (plus-in-square icon, `⌘N` shortcut hint right-aligned)
-   - `Open Workspace` (folder icon)
-   - `Skills` (wand icon)
-2. `Tasks` section header (muted, small caps feel) with a filter/archive icon on the right.
-3. Task tree grouped by workspace/repo (folder icon + name, e.g. `gomoku-ai`, `zcode-website`,
-   `zcode-desktop`), each with indented task rows:
+1. Header: folder icon + the directory `wizard gui` runs in — where a new chat opens.
+2. Action row (icon + label, hover highlight): `New Chat` (plus-in-square icon, `⌘N` /
+   `Ctrl-N` shortcut hint right-aligned, matching the platform).
+3. `Chats` section header (muted, small caps feel).
+4. Chat tree grouped by workspace/repo (folder icon + name, e.g. `gomoku-ai`, `zcode-website`,
+   `zcode-desktop`), each with indented rows:
    - single-line truncated title (e.g. "Create an intelligent Go…")
    - right-aligned muted relative age (`2m`, `9m`, `14m`, `27m`, `51m`, `1h`, `2h`, `5h`)
    - selected row: lighter pill background + small blue dot on the left of the title
-4. Bottom: user row — circular avatar, display name (`Ryan Bot`), settings gear right-aligned.
 
 ## Center: conversation
 
@@ -56,9 +58,9 @@ cluster (model avatar dropdown, panel toggles). macOS traffic lights top-left of
   - `✎ Wrote  index.html  app.js  styles.css  +733` (file chips with filetype icons, green diffstat)
 - Streaming text continues below; content area scrolls, fading under the composer.
 - Composer (bottom, floating rounded-2xl card with border):
-  - placeholder `Ask for follow-up changes`
-  - bottom row: `+` attach button (left) · `✋ Ask before changes ⌄` (permission-mode dropdown) ·
-    spacer · circular spinner-ish icon · `GLM-5.2 ⌄` model picker · `⛭ Max` effort chip ·
+  - placeholder `Ask wizard to change something`
+  - bottom row: `✦ Sovereign` mode chip (static — wizard has no permission gating, so there is
+    no mode dropdown) · spacer · spinner / stop button · `GLM-5.2 ⌄` model picker ·
     circular blue send button `↑` (right).
 
 ## Right context panel (~300px), stack of rounded cards
@@ -66,8 +68,8 @@ cluster (model avatar dropdown, panel toggles). macOS traffic lights top-left of
 1. **Git tools** card:
    - header `Git tools` (muted small)
    - row: `⊞ Changes` … right-aligned `+734` (green) `-7` (red)
-   - row: `⎇ feat/gomoku-ai ⌄` (branch selector)
-   - row: `-o- Commit …` with ellipsis menu
+   - row: `⎇ feat/gomoku-ai` (current branch, static)
+   - row: `-o- Commit ⌄` — expands the commit-message editor
 2. **Goal** card:
    - header row: `Goal` … right-aligned status `Complete` (muted)
    - `◎` target icon + goal text ("Gomoku vs. AI — implement computer moves with a heuristic algorithm")
@@ -79,8 +81,10 @@ cluster (model avatar dropdown, panel toggles). macOS traffic lights top-left of
 
 ## Behavior to wire (backend-dependent, confirm against survey)
 
-- Sidebar tasks = wizard sessions on disk, grouped by workspace/repo, sorted by recency.
-- New Task: pick workspace dir + prompt → spawns a wizard agent session; output streams into center pane.
+- Sidebar chats = wizard sessions on disk, grouped by workspace/repo, sorted by recency.
+- New Chat: opens an empty session in the directory `wizard gui` runs in and focuses the
+  composer; the first message starts the first turn and names the chat. On launch the GUI lands
+  in the newest chat of that directory, or a new one when it has none.
 - Tool calls stream as structured rows (explore/run/write) rather than raw text where possible.
 - Composer sends follow-up user messages to the running session; model picker lists configured providers/models.
 - Git card: live diffstat of the task's workspace, current branch, commit action.

@@ -26,11 +26,13 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 
-/// Shared server state: the loaded config, the in-process task manager, and
-/// the optional on-disk assets override (`--assets`, dev mode).
+/// Shared server state: the loaded config, the in-process task manager, the
+/// directory the server was launched from (where a new chat opens), and the
+/// optional on-disk assets override (`--assets`, dev mode).
 pub(crate) struct GuiState {
     pub config: Config,
     pub manager: tasks::TaskManager,
+    pub cwd: PathBuf,
     pub assets_dir: Option<PathBuf>,
 }
 
@@ -46,9 +48,11 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
         );
     }
 
+    let cwd = std::env::current_dir().context("reading the working directory")?;
     let state = Arc::new(GuiState {
         manager: tasks::TaskManager::new(config.clone()),
         config,
+        cwd,
         assets_dir: assets,
     });
     let router = server::router(state);

@@ -82,7 +82,7 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/{id}", get(get_task))
         .route("/api/tasks/{id}/ws", get(task_ws))
-        .route("/api/workspaces", get(workspaces))
+        .route("/api/workspace", get(workspace))
         .route("/api/models", get(models))
         .route("/api/git", get(git_status))
         .route("/api/git/commit", post(git_commit))
@@ -282,34 +282,47 @@ async fn get_task(
     }))
 }
 
-/// `POST /api/tasks` body.
-#[derive(Debug, Deserialize)]
+/// `POST /api/tasks` body. Both fields are optional: no `cwd` means the
+/// directory `wizard gui` was launched from, and no `prompt` opens an empty
+/// chat whose first `user_message` starts the first turn.
+#[derive(Debug, Deserialize, Default)]
 struct CreateTask {
-    cwd: String,
-    prompt: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
     #[serde(default)]
     model: Option<String>,
 }
 
-/// `POST /api/tasks`: create the session and start the first turn
-/// immediately; the client opens the WebSocket to catch the stream (frames
-/// are buffered until it attaches).
+/// `POST /api/tasks`: create the session, and start the first turn when a
+/// prompt came with it; the client opens the WebSocket to catch the stream
+/// (frames are buffered until it attaches).
 async fn create_task(
     State(state): State<Arc<GuiState>>,
-    axum::Json(body): axum::Json<CreateTask>,
+    body: Option<axum::Json<CreateTask>>,
 ) -> Result<(StatusCode, axum::Json<Value>), ApiError> {
-    let cwd = PathBuf::from(&body.cwd);
+    let body = body.map(|axum::Json(body)| body).unwrap_or_default();
+    let cwd = match &body.cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => state.cwd.clone(),
+    };
     if !cwd.is_absolute() || !cwd.is_dir() {
         return Err(ApiError::bad_request(format!(
             "cwd '{}' is not an absolute path to a directory",
-            body.cwd
+            cwd.display()
         )));
     }
-    if body.prompt.trim().is_empty() {
-        return Err(ApiError::bad_request("prompt must not be empty"));
-    }
-    let id = state.manager.create_task(&cwd, body.prompt, body.model)?;
-    Ok((StatusCode::CREATED, axum::Json(json!({ "id": id }))))
+    let prompt = body.prompt.filter(|prompt| !prompt.trim().is_empty());
+    let id = state.manager.create_task(&cwd, prompt, body.model)?;
+    Ok((
+        StatusCode::CREATED,
+        axum::Json(json!({
+            "id": id,
+            "cwd": cwd.display().to_string(),
+            "workspace": basename(&cwd.display().to_string()),
+        })),
+    ))
 }
 
 /// `GET /api/tasks/{id}/ws`: upgrade to the task's event stream. An unknown
@@ -326,39 +339,11 @@ async fn task_ws(
     Ok(upgrade.on_upgrade(move |socket| ws::serve(socket, shared, state)))
 }
 
-/// One row of `GET /api/workspaces`.
-#[derive(Debug, Serialize)]
-struct WorkspaceRow {
-    cwd: String,
-    name: String,
-    task_count: usize,
-}
-
-/// `GET /api/workspaces`: the distinct working directories of every known
-/// task (sessions on disk + live registry), busiest first.
-async fn workspaces(
-    State(_): State<Arc<GuiState>>,
-) -> Result<axum::Json<Vec<WorkspaceRow>>, ApiError> {
-    let sessions_dir = Config::sessions_dir()?;
-    let mut by_cwd: HashMap<String, HashSet<String>> = HashMap::new();
-    for summary in session::summaries(&sessions_dir) {
-        if let Some(cwd) = summary.cwd {
-            by_cwd.entry(cwd).or_default().insert(summary.id);
-        }
-    }
-    for record in session_registry::list() {
-        by_cwd.entry(record.cwd).or_default().insert(record.id);
-    }
-    let mut rows: Vec<WorkspaceRow> = by_cwd
-        .into_iter()
-        .map(|(cwd, ids)| WorkspaceRow {
-            name: basename(&cwd),
-            cwd,
-            task_count: ids.len(),
-        })
-        .collect();
-    rows.sort_by(|a, b| b.task_count.cmp(&a.task_count).then(a.cwd.cmp(&b.cwd)));
-    Ok(axum::Json(rows))
+/// `GET /api/workspace`: the directory `wizard gui` was launched from — the
+/// one a new chat opens in.
+async fn workspace(State(state): State<Arc<GuiState>>) -> axum::Json<Value> {
+    let cwd = state.cwd.display().to_string();
+    axum::Json(json!({ "name": basename(&cwd), "cwd": cwd }))
 }
 
 /// `GET /api/models` response.

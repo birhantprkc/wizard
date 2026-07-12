@@ -595,20 +595,23 @@ impl TaskManager {
     }
 
     /// `POST /api/tasks`: create the session for `cwd`, spawn its worker,
-    /// and queue the first turn. Returns the new task id.
-    pub fn create_task(&self, cwd: &Path, prompt: String, model: Option<String>) -> Result<String> {
+    /// and queue the first turn when the request carries a prompt. Without
+    /// one the chat opens empty and the first `user_message` starts it.
+    /// Returns the new task id.
+    pub fn create_task(
+        &self,
+        cwd: &Path,
+        prompt: Option<String>,
+        model: Option<String>,
+    ) -> Result<String> {
         let sessions_dir = Config::sessions_dir()?;
         let session = Session::create_in(&sessions_dir, cwd)?;
         let id = session.id.clone();
         self.spawn(id.clone(), cwd.to_path_buf(), session);
-        self.submit_turn(
-            &id,
-            TurnRequest {
-                text: prompt,
-                model,
-            },
-        )
-        .map_err(|message| anyhow::anyhow!(message))?;
+        if let Some(text) = prompt {
+            self.submit_turn(&id, TurnRequest { text, model })
+                .map_err(|message| anyhow::anyhow!(message))?;
+        }
         Ok(id)
     }
 
