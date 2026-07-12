@@ -527,9 +527,9 @@ function onPlan(plan) {
   const id = state.selectedTaskId;
   const body = h('div', { class: 'plan-body' });
   renderMarkdownInto(body, plan);
-  const note = h('div', { class: 'card-note hidden' });
+  const note = h('div', { class: 'note hidden' });
   const feedback = h('textarea', {
-    class: 'text-input plan-feedback hidden', rows: '2',
+    class: 'input plan-feedback hidden', rows: '2',
     placeholder: 'What should change? (sent back to the agent)',
   });
   const approveBtn = h('button', { class: 'btn primary', type: 'button' }, 'Approve');
@@ -569,10 +569,10 @@ function onInterview(questions) {
   breakFlow();
   const id = state.selectedTaskId;
   const inputs = questions.map((q) =>
-    h('textarea', { class: 'text-input iv-answer', rows: '1', placeholder: 'Your answer (optional)', 'aria-label': q }));
+    h('textarea', { class: 'input iv-answer', rows: '1', placeholder: 'Your answer (optional)', 'aria-label': q }));
   const rows = questions.map((q, i) =>
     h('div', { class: 'iv-q' }, h('div', { class: 'iv-question' }, q), inputs[i]));
-  const note = h('div', { class: 'card-note hidden' });
+  const note = h('div', { class: 'note hidden' });
   const sendBtn = h('button', { class: 'btn primary', type: 'button' }, 'Send answers');
   const skipBtn = h('button', { class: 'btn ghost', type: 'button' }, 'Skip');
   const actions = h('div', { class: 'card-actions' }, sendBtn, skipBtn);
@@ -784,11 +784,11 @@ function renderContextPanel() {
   ctx.gitBranch = h('span', { class: 'ctx-label' }, '—');
   ctx.gitFileList = h('div', { class: 'git-files hidden' });
   ctx.commitInput = h('input', {
-    class: 'text-input commit-input', type: 'text', placeholder: 'Commit message',
+    class: 'input commit-input', type: 'text', placeholder: 'Commit message',
     onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); doCommit(); } },
   });
   ctx.commitGo = h('button', { class: 'btn primary btn-sm', type: 'button', onclick: () => doCommit() }, 'Commit');
-  ctx.commitErr = h('div', { class: 'card-note error hidden' });
+  ctx.commitErr = h('div', { class: 'note error hidden' });
   ctx.commitBox = h('div', { class: 'commit-editor hidden' },
     ctx.commitInput,
     h('div', { class: 'card-actions' },
@@ -798,7 +798,7 @@ function renderContextPanel() {
         onclick: () => { ctx.commitBox.classList.add('hidden'); ctx.commitErr.classList.add('hidden'); },
       }, 'Cancel')),
     ctx.commitErr);
-  ctx.commitNote = h('div', { class: 'card-note hidden' });
+  ctx.commitNote = h('div', { class: 'note hidden' });
   ctx.gitSection = h('section', { class: 'ctx-section hidden' },
     h('div', { class: 'ctx-header' }, h('span', {}, 'Git tools')),
     h('button', {
@@ -1107,7 +1107,7 @@ function openDirMenu(anchor) {
     const here = activeDir();
 
     const pathInput = h('input', {
-      class: 'text-input menu-input', type: 'text', spellcheck: 'false',
+      class: 'input menu-input', type: 'text', spellcheck: 'false',
       placeholder: '/absolute/path', 'aria-label': 'Open a chat in this directory',
     });
     const err = h('div', { class: 'menu-note error hidden' });
@@ -1171,7 +1171,7 @@ function openBranchMenu(anchor) {
     };
 
     const newInput = h('input', {
-      class: 'text-input menu-input', type: 'text', spellcheck: 'false',
+      class: 'input menu-input', type: 'text', spellcheck: 'false',
       placeholder: 'new branch name', 'aria-label': 'Create and check out a branch',
     });
     newInput.addEventListener('keydown', (e) => {
@@ -1296,13 +1296,22 @@ async function send(text) {
 /* Overlays: Settings and first-run onboarding                               */
 /* ------------------------------------------------------------------------ */
 
-const KEY_BADGE = {
-  stored: { label: 'key stored', cls: 'ok' },
-  env: { label: 'key from env', cls: 'ok' },
-  oauth: { label: 'signed in', cls: 'ok' },
-  not_needed: { label: 'no key needed', cls: 'muted' },
-  missing: { label: 'no key', cls: 'warn' },
+/** Where a provider's key comes from, as one plain phrase. Only the state that
+ *  needs acting on is colored. */
+const KEY_STATE = {
+  stored: { text: 'key stored' },
+  env: { text: 'key from env' },
+  oauth: { text: 'signed in' },
+  not_needed: { text: 'local' },
+  missing: { text: 'no key', tone: 'warn' },
 };
+
+/** The host of a base URL — enough to tell providers apart, and short enough
+ *  not to wrap (Cloudflare's is a path template with an account-id slot). */
+function endpointHost(url) {
+  const bare = String(url || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  return bare.split('/', 1)[0];
+}
 
 function closeOverlay() {
   $('overlay-root').replaceChildren();
@@ -1325,51 +1334,56 @@ function showOverlay(panel, { dismissable = true } = {}) {
   return overlay;
 }
 
+/** A labelled field: micro-label above the input. */
+function field(label, input, hint) {
+  return h('label', { class: 'field' },
+    h('span', { class: 'field-label' }, label),
+    input,
+    hint && h('span', { class: 'field-hint' }, hint));
+}
+
+const textInput = (attrs) => h('input', { class: 'input mono', type: 'text', spellcheck: 'false', ...attrs });
+
+/** The custom-provider pseudo-preset: any OpenAI-compatible endpoint. */
+const CUSTOM_PRESET = {
+  name: '', label: 'Custom', kind: 'openai', base_url: '', model: '',
+  needs_key: true, custom: true,
+};
+
 /**
  * The provider form, shared by onboarding and Settings.
- * @param {Object} preset  a preset row, or an existing provider to edit
- * @param {(saved: Object) => void} onSaved
+ * @param {Object} preset  a preset, or an existing provider to edit
  */
-function providerForm(preset, { submitLabel = 'Connect', onSaved, onCancel } = {}) {
+function providerForm(preset, { submitLabel = 'Save', onSaved, onCancel } = {}) {
   const editing = !!preset.editing;
-  const needsKey = preset.needs_key !== false && preset.kind !== 'ollama' && preset.kind !== 'llamacpp';
-  const nameInput = h('input', {
-    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.name || '',
-    placeholder: 'provider name', readonly: editing || null,
-  });
-  const baseInput = h('input', {
-    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.base_url || '',
-    placeholder: 'https://…',
-  });
-  const modelInput = h('input', {
-    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.model || '',
-    placeholder: 'model tag',
-  });
+  const local = preset.kind === 'ollama' || preset.kind === 'llamacpp';
+  const needsKey = preset.needs_key !== false && !local;
+
+  const nameInput = textInput({ value: preset.name || '', placeholder: 'name', readonly: editing || null });
+  const baseInput = textInput({ value: preset.base_url || '', placeholder: 'https://…' });
+  const modelInput = textInput({ value: preset.model || '', placeholder: 'model tag' });
   const keyInput = h('input', {
-    class: 'text-input', type: 'password', spellcheck: 'false', autocomplete: 'off',
-    placeholder: editing ? 'leave blank to keep the stored key' : 'API key',
+    class: 'input mono', type: 'password', spellcheck: 'false', autocomplete: 'off',
+    placeholder: editing ? 'unchanged' : 'sk-…',
   });
-  const note = h('div', { class: 'card-note hidden' });
+  const note = h('div', { class: 'note error hidden' });
   const submit = h('button', { class: 'btn primary', type: 'submit' }, submitLabel);
 
-  const rows = [
-    !editing && preset.custom && field('Name', nameInput),
-    (preset.needs_base_url || preset.custom || editing) && field('Base URL', baseInput),
-    field('Model', modelInput),
-    needsKey && field('API key', keyInput,
-      'Stored in ~/.wizard/credentials.toml, readable only by you.'),
-  ];
-
-  const form = h('form', { class: 'provider-form' },
-    ...rows.filter(Boolean),
+  const form = h('form', { class: 'form' },
+    ...[
+      !editing && preset.custom && field('Name', nameInput),
+      (preset.needs_base_url || preset.custom || editing) && field('Base URL', baseInput),
+      field('Model', modelInput),
+      needsKey && field('API key', keyInput, '→ ~/.wizard/credentials.toml'),
+    ].filter(Boolean),
     note,
-    h('div', { class: 'card-actions' },
+    h('div', { class: 'form-actions' },
       submit,
-      onCancel && h('button', { class: 'btn ghost', type: 'button', onclick: onCancel }, 'Cancel')));
+      onCancel && h('button', { class: 'btn quiet', type: 'button', onclick: onCancel }, 'Cancel')));
 
   form.onsubmit = async (e) => {
     e.preventDefault();
-    note.className = 'card-note hidden';
+    note.className = 'note error hidden';
     submit.setAttribute('disabled', '');
     submit.textContent = 'Checking…';
     try {
@@ -1385,7 +1399,7 @@ function providerForm(preset, { submitLabel = 'Connect', onSaved, onCancel } = {
       // keeping on the page so its key or URL can be fixed.
       if (onSaved) onSaved({ settings, probe });
     } catch (err) {
-      note.className = 'card-note error';
+      note.className = 'note error';
       note.textContent = String((err && err.message) || err);
     } finally {
       submit.removeAttribute('disabled');
@@ -1395,215 +1409,195 @@ function providerForm(preset, { submitLabel = 'Connect', onSaved, onCancel } = {
   return form;
 }
 
-function field(label, input, hint) {
-  return h('label', { class: 'field' },
-    h('span', { class: 'field-label' }, label),
-    input,
-    hint && h('span', { class: 'field-hint' }, hint));
-}
-
-/** The preset grid both overlays open with. */
-function presetGrid(presets, onPick) {
-  return h('div', { class: 'preset-grid' },
-    ...presets.map((p) =>
-      h('button', { class: 'preset', type: 'button', onclick: () => onPick(p) },
-        h('span', { class: 'preset-name' }, p.label),
-        h('span', { class: 'preset-hint' }, p.hint))),
-    h('button', {
-      class: 'preset', type: 'button',
-      onclick: () => onPick({
-        name: '', label: 'Custom', kind: 'openai', base_url: '', model: '',
-        needs_key: true, custom: true, hint: '',
-      }),
-    },
-      h('span', { class: 'preset-name' }, 'Custom'),
-      h('span', { class: 'preset-hint' }, 'Any OpenAI-compatible endpoint.')));
+/** The provider list both overlays choose from: a name and where it points. */
+function presetList(presets, onPick) {
+  const row = (p, endpoint) =>
+    h('button', { class: 'row row-pick', type: 'button', onclick: () => onPick(p) },
+      h('span', { class: 'row-name' }, p.label),
+      h('span', { class: 'row-meta mono' }, endpoint));
+  return h('div', { class: 'rows' },
+    ...presets.map((p) => row(p, endpointHost(p.base_url))),
+    row(CUSTOM_PRESET, 'OpenAI-compatible'));
 }
 
 /* --- Onboarding ----------------------------------------------------------- */
 
 /** First run: no provider is configured, so wizard cannot answer anything yet. */
 function openOnboarding(settings) {
-  const body = h('div', { class: 'onboard-body' });
-  const panel = h('div', { class: 'panel onboard', role: 'dialog', 'aria-label': 'Set up wizard' },
-    h('div', { class: 'onboard-head' },
-      h('h2', { class: 'onboard-title' }, 'Set up wizard'),
-      h('p', { class: 'onboard-sub' },
-        'Pick a provider for the agent to run on. You can add more, or change this, in Settings.')),
+  const body = h('div', { class: 'sheet-body' });
+  const sheet = h('div', { class: 'sheet onboard', role: 'dialog', 'aria-label': 'Set up wizard' },
+    h('div', { class: 'sheet-head' },
+      h('h2', { class: 'sheet-title' }, 'Set up wizard'),
+      h('p', { class: 'sheet-sub' }, 'Pick a provider to run the agent on.')),
     body);
 
+  const skip = (label) => h('button', {
+    class: 'btn quiet', type: 'button',
+    title: 'Wizard cannot answer until a provider is configured',
+    onclick: () => { closeOverlay(); bootChat(); },
+  }, label);
+
   const pickStep = () => {
-    body.replaceChildren(
-      presetGrid(settings.presets, formStep),
-      h('div', { class: 'onboard-foot' },
-        h('button', {
-          class: 'btn ghost btn-sm', type: 'button',
-          title: 'Wizard cannot answer until a provider is configured',
-          onclick: () => { closeOverlay(); bootChat(); },
-        }, 'Skip for now')),
+    fillWith(body,
+      presetList(settings.presets, formStep),
+      h('div', { class: 'form-actions end' }, skip('Skip')),
     );
   };
 
   const formStep = (preset) => {
     const done = ({ probe }) => {
       if (!probe.ok) {
-        body.replaceChildren(
-          h('div', { class: 'card-note error' },
+        fillWith(body,
+          h('div', { class: 'note error' },
             `Saved, but ${preset.label} did not answer: ${probe.error || 'unknown error'}`),
-          h('div', { class: 'card-actions' },
+          h('div', { class: 'form-actions' },
             h('button', { class: 'btn primary', type: 'button', onclick: () => formStep(preset) }, 'Try again'),
-            h('button', {
-              class: 'btn ghost', type: 'button',
-              onclick: () => { closeOverlay(); bootChat(); },
-            }, 'Continue anyway')),
+            skip('Continue anyway')),
         );
         return;
       }
       closeOverlay();
       bootChat();
     };
-    body.replaceChildren(
-      h('div', { class: 'onboard-picked' }, preset.label),
+    fillWith(body,
+      h('div', { class: 'block-title' }, preset.label),
       providerForm(preset, { submitLabel: 'Connect', onSaved: done, onCancel: pickStep }),
     );
   };
 
   pickStep();
-  showOverlay(panel, { dismissable: false });
+  showOverlay(sheet, { dismissable: false });
 }
 
 /* --- Settings ------------------------------------------------------------- */
 
 async function openSettings() {
-  const body = h('div', { class: 'settings-body' });
-  const panel = h('div', { class: 'panel settings', role: 'dialog', 'aria-label': 'Settings' },
-    h('div', { class: 'panel-head' },
-      h('span', { class: 'panel-title' }, 'Settings'),
+  const body = h('div', { class: 'sheet-body' });
+  const foot = h('div', { class: 'sheet-foot mono' });
+  const sheet = h('div', { class: 'sheet settings', role: 'dialog', 'aria-label': 'Settings' },
+    h('div', { class: 'sheet-head row-between' },
+      h('h2', { class: 'sheet-title' }, 'Settings'),
       iconBtn('close', 'Close', closeOverlay)),
-    body);
-  showOverlay(panel);
-  body.append(h('div', { class: 'card-note' }, 'Loading…'));
+    body, foot);
+  showOverlay(sheet);
+  body.append(h('div', { class: 'note' }, 'Loading…'));
   try {
     state.settings = await api.settings();
   } catch (err) {
-    body.replaceChildren(h('div', { class: 'card-note error' }, String((err && err.message) || err)));
+    body.replaceChildren(h('div', { class: 'note error' }, String((err && err.message) || err)));
     return;
   }
-  renderSettings(body);
+  renderSettings(body, foot);
 }
 
-function renderSettings(body) {
+function renderSettings(body, foot) {
   const s = state.settings;
-  const rerender = () => renderSettings(body);
+  const rerender = () => renderSettings(body, foot);
 
   const providerRow = (p) => {
-    const badge = KEY_BADGE[p.key] || KEY_BADGE.missing;
-    const status = h('span', { class: 'provider-status' });
+    const key = KEY_STATE[p.key] || KEY_STATE.missing;
+    const status = h('div', { class: 'row-status hidden' });
+    const say = (text, bad) => {
+      status.textContent = text;
+      status.classList.remove('hidden');
+      status.classList.toggle('error', !!bad);
+    };
     const act = async (fn) => {
-      status.textContent = '…';
       try {
         const out = await fn();
         if (out && out.providers) state.settings = out;
         rerender();
       } catch (err) {
-        status.textContent = String((err && err.message) || err);
-        status.classList.add('error');
+        say(String((err && err.message) || err), true);
       }
     };
-    return h('div', { class: 'provider-row' + (p.active ? ' active' : '') },
-      h('div', { class: 'provider-main' },
-        h('div', { class: 'provider-line' },
-          h('span', { class: 'provider-name' }, p.name),
-          p.active && h('span', { class: 'pill' }, 'active'),
-          h('span', { class: `pill ${badge.cls}` }, badge.label)),
-        h('div', { class: 'provider-sub' }, `${p.kind} · ${p.model}`),
+    const test = async () => {
+      say('Testing…');
+      try {
+        const probe = await api.testProvider(p.name);
+        say(probe.ok ? `Answered — ${probe.models.length || 'no'} models` : probe.error || 'no answer', !probe.ok);
+      } catch (err) {
+        say(String((err && err.message) || err), true);
+      }
+    };
+    const edit = () => {
+      fillWith(body,
+        h('div', { class: 'block' },
+          h('div', { class: 'block-title' }, p.name),
+          providerForm({ ...p, editing: true, needs_key: p.key !== 'not_needed' }, {
+            onSaved: rerender, onCancel: rerender,
+          })));
+    };
+    const action = (label, onclick, cls = '') =>
+      h('button', { class: `link ${cls}`.trim(), type: 'button', onclick }, label);
+
+    return h('div', { class: 'row row-provider' + (p.active ? ' is-active' : '') },
+      h('div', { class: 'row-main' },
+        h('div', { class: 'row-line' },
+          h('span', { class: 'row-name' }, p.name),
+          p.active && h('span', { class: 'tag' }, 'active')),
+        h('div', { class: 'row-meta mono' },
+          `${p.kind} · ${p.model} · `,
+          h('span', { class: key.tone || '' }, key.text)),
         status),
-      h('div', { class: 'provider-actions' },
-        !p.active && h('button', {
-          class: 'btn ghost btn-sm', type: 'button',
-          onclick: () => act(() => api.activateProvider(p.name)),
-        }, 'Use'),
-        h('button', {
-          class: 'btn ghost btn-sm', type: 'button',
-          onclick: async () => {
-            status.classList.remove('error');
-            status.textContent = 'Testing…';
-            try {
-              const probe = await api.testProvider(p.name);
-              status.textContent = probe.ok
-                ? `Answered — ${probe.models.length || 'no'} models listed`
-                : `Failed: ${probe.error || 'unknown error'}`;
-              status.classList.toggle('error', !probe.ok);
-            } catch (err) {
-              status.textContent = String((err && err.message) || err);
-              status.classList.add('error');
-            }
-          },
-        }, 'Test'),
-        h('button', {
-          class: 'btn ghost btn-sm', type: 'button',
-          onclick: () => {
-            body.replaceChildren(
-              h('div', { class: 'settings-section' },
-                h('div', { class: 'section-head' }, `Edit ${p.name}`),
-                providerForm({ ...p, editing: true, needs_key: p.key !== 'not_needed' }, {
-                  submitLabel: 'Save',
-                  onSaved: rerender,
-                  onCancel: rerender,
-                })),
-            );
-          },
-        }, 'Edit'),
-        h('button', {
-          class: 'btn ghost btn-sm danger', type: 'button',
-          onclick: () => act(() => api.removeProvider(p.name)),
-        }, 'Remove')));
+      h('div', { class: 'row-actions' },
+        !p.active && action('Use', () => act(() => api.activateProvider(p.name))),
+        action('Test', test),
+        action('Edit', edit),
+        action('Remove', () => act(() => api.removeProvider(p.name)), 'danger')));
   };
 
-  const addBox = h('div', { class: 'settings-section' });
+  // The picker lives inside the Providers block: it is the same list, one
+  // step further in, not a second section competing with it.
+  const add = h('div', { class: 'add-provider' });
   const resetAdd = () => {
-    addBox.replaceChildren(
-      h('div', { class: 'section-head' }, 'Add a provider'),
-      presetGrid(s.presets, (preset) => {
-        addBox.replaceChildren(
-          h('div', { class: 'section-head' }, `Add ${preset.label}`),
-          providerForm(preset, { submitLabel: 'Save', onSaved: rerender, onCancel: resetAdd }),
-        );
-      }),
-    );
+    fillWith(add, h('button', {
+      class: 'row row-add', type: 'button',
+      onclick: () => fillWith(add, presetList(s.presets, pickPreset)),
+    }, h('span', { class: 'row-name' }, '+  Add provider')));
+  };
+  const pickPreset = (preset) => {
+    fillWith(add,
+      h('div', { class: 'block-title' }, `Add ${preset.label}`),
+      providerForm(preset, { onSaved: rerender, onCancel: resetAdd }));
   };
   resetAdd();
 
-  const stepsInput = h('input', { class: 'text-input', type: 'number', min: '1', max: '1000', value: String(s.max_steps) });
-  const agentNote = h('div', { class: 'card-note hidden' });
+  const steps = h('input', {
+    class: 'input num', type: 'number', min: '1', max: '1000', value: String(s.max_steps),
+  });
+  const agentNote = h('span', { class: 'note inline hidden' });
   const saveAgent = async () => {
-    agentNote.className = 'card-note hidden';
+    agentNote.className = 'note inline hidden';
     try {
-      state.settings = await api.saveSettings({ max_steps: Number(stepsInput.value) || s.max_steps });
-      agentNote.className = 'card-note';
-      agentNote.textContent = 'Saved.';
+      state.settings = await api.saveSettings({ max_steps: Number(steps.value) || s.max_steps });
+      agentNote.className = 'note inline';
+      agentNote.textContent = 'Saved';
     } catch (err) {
-      agentNote.className = 'card-note error';
+      agentNote.className = 'note inline error';
       agentNote.textContent = String((err && err.message) || err);
     }
   };
 
-  body.replaceChildren(
-    h('div', { class: 'settings-section' },
-      h('div', { class: 'section-head' }, 'Providers'),
+  fillWith(body,
+    h('div', { class: 'block' },
+      h('div', { class: 'block-title' }, 'Providers'),
       s.providers.length
-        ? h('div', { class: 'provider-list' }, ...s.providers.map(providerRow))
-        : h('div', { class: 'card-note' }, 'No provider is configured — wizard cannot answer until one is.')),
-    addBox,
-    h('div', { class: 'settings-section' },
-      h('div', { class: 'section-head' }, 'Agent'),
-      field('Step limit', stepsInput,
-        'Tool calls one chat may make per turn. Chats here run autonomously — there is no terminal to ask.'),
-      h('div', { class: 'card-actions' },
-        h('button', { class: 'btn primary btn-sm', type: 'button', onclick: saveAgent }, 'Save')),
-      agentNote),
-    h('div', { class: 'settings-foot' }, s.config_path),
+        ? h('div', { class: 'rows' }, ...s.providers.map(providerRow))
+        : h('div', { class: 'note' }, 'None configured — wizard cannot answer until one is.'),
+      add),
+    h('div', { class: 'block' },
+      h('div', { class: 'block-title' }, 'Agent'),
+      h('div', { class: 'setting' },
+        h('div', { class: 'setting-main' },
+          h('div', { class: 'setting-name' }, 'Step limit'),
+          h('div', { class: 'setting-help' }, 'Tool calls one chat may make per turn.')),
+        steps),
+      h('div', { class: 'form-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: saveAgent }, 'Save'),
+        agentNote)),
   );
+  foot.textContent = s.config_path;
 
   // The composer's model chip reflects whatever the active provider is now.
   api.listModels().then((models) => {

@@ -34,8 +34,6 @@ pub struct Preset {
     /// The base URL is a template the user must complete (Cloudflare's
     /// account id); the UI keeps the field editable and shows the placeholder.
     pub needs_base_url: bool,
-    /// One line on what this is, shown under the name.
-    pub hint: &'static str,
 }
 
 /// The providers the GUI can set up. `xaioauth` is deliberately absent: it
@@ -50,7 +48,6 @@ pub const PRESETS: &[Preset] = &[
         model: "claude-fable-5",
         needs_key: true,
         needs_base_url: false,
-        hint: "Claude models, straight from Anthropic.",
     },
     Preset {
         name: "openai",
@@ -60,7 +57,6 @@ pub const PRESETS: &[Preset] = &[
         model: "gpt-5.2",
         needs_key: true,
         needs_base_url: false,
-        hint: "GPT models, or any OpenAI-compatible endpoint.",
     },
     Preset {
         name: "xai",
@@ -70,7 +66,6 @@ pub const PRESETS: &[Preset] = &[
         model: xai_oauth::DEFAULT_MODEL,
         needs_key: true,
         needs_base_url: false,
-        hint: "Grok, with an API key.",
     },
     Preset {
         name: "openrouter",
@@ -80,7 +75,6 @@ pub const PRESETS: &[Preset] = &[
         model: openrouter::DEFAULT_MODEL,
         needs_key: true,
         needs_base_url: false,
-        hint: "One key, most models.",
     },
     Preset {
         name: "cloudflare",
@@ -90,7 +84,6 @@ pub const PRESETS: &[Preset] = &[
         model: cloudflare::DEFAULT_MODEL,
         needs_key: true,
         needs_base_url: true,
-        hint: "Put your account id in the base URL.",
     },
     Preset {
         name: "ollama",
@@ -100,7 +93,6 @@ pub const PRESETS: &[Preset] = &[
         model: "qwen3:8b",
         needs_key: false,
         needs_base_url: false,
-        hint: "A local model served by Ollama. No key needed.",
     },
     Preset {
         name: "llamacpp",
@@ -110,7 +102,6 @@ pub const PRESETS: &[Preset] = &[
         model: "qwen3.6:27b",
         needs_key: false,
         needs_base_url: false,
-        hint: "A local llama-server. No key needed.",
     },
 ];
 

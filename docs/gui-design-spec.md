@@ -1,21 +1,30 @@
 # Wizard GUI — Design Spec
 
-Target look: reference screenshot at
-`/home/gradient/.claude/image-cache/83725a5a-d06f-43f8-8deb-b25461061e9a/1.png`
-(read it with the Read tool — it renders as an image).
+A dark, three-pane agent workspace: chat list, conversation, git/goal rail. It began as a
+copy of a reference screenshot (`~/.claude/image-cache/83725a5a-…/1.png`); what it is now is
+described below, and where the two disagree, this wins.
 
-A dark, rounded, three-pane desktop-style agent workspace. Overall feel: Claude-Code-style
-task manager + conversation + git/plan side panel. Everything lives on a near-black canvas
-with slightly lighter raised cards and 10–14px corner radii.
+The thing it should feel like is an instrument, not a product page. That means: dense but
+breathing, hairlines instead of boxes inside boxes, one accent used sparingly, and no
+sentence of copy that is not load-bearing. A settings screen made of eight cards, each with a
+tagline under it, is the failure mode — it reads as filler, because it is.
 
 ## Global
 
-- Canvas: `#0d0d0f` (near-black). Cards/panels: `#161619` to `#1c1c20`. Hairline borders `#2a2a2e`.
-- Text: primary `#e8e8ea`, secondary/muted `#8a8a90`, faint `#5a5a60`.
-- Accent blue `#3b82f6` (send button, selected-task dot), green `#22c55e` (+ diffstat, check icons),
-  red `#ef4444` (- diffstat), amber/strikethrough gray for completed items.
-- Font: system UI sans (Inter-like), 13–14px base; monospace for commands/code.
-- Rounded cards everywhere; no hard 90° panels. Subtle 1px borders, no drop shadows except composer.
+- Canvas `#0c0c0e`. Surfaces `#141416` / `#191a1d`. Hairlines `#26262a`, and `#1f1f23` for
+  separators *inside* a surface (a section divider should be felt, not seen).
+- Text: primary `#ececee`, mid `#b6b6bd`, muted `#86868e`, faint `#5c5c64`.
+- One accent — blue `#4b8dfa` — for the active/selected state and the single primary button
+  per view. Green `#3fb96a` (additions), red `#e5484d` (deletions, errors), amber `#d8a13a`
+  (a state needing attention, e.g. a provider with no key). Color carries meaning; nothing is
+  colored for decoration.
+- **Sans for prose, mono for literals.** A path, model tag, provider kind, base URL, branch
+  name or config location is a thing you could paste into a terminal — it is set in mono
+  (12px). Everything else is system sans, 13px UI / 14.5px transcript body.
+- Section labels are 10.5px uppercase, letterspaced, faint. Same label in the sidebar
+  (`CHATS`), the rail (`GIT TOOLS`), and Settings (`PROVIDERS`) — one idiom, used everywhere.
+- Radii 6/10/14px. One filled button per view; every other action is an outline button or a
+  plain text action that only gains a background on hover.
 
 ## Layout (3 columns)
 
@@ -76,25 +85,35 @@ clickable and isn't is worse than no control.
     spinner just reads as "loading forever") · `GLM-5.2 ⌄` model picker · circular blue send
     button `↑` (right).
 
-## Settings and onboarding (overlays)
+## Settings and onboarding (one sheet, one list shape)
 
+Both are the same surface: a sheet with a hairline-separated stack of blocks. No cards inside
+it, no grid of tiles, no tagline under anything.
+
+- The **provider list** is the one list shape, used twice: to show what is configured
+  (`xai` · `xaioauth · grok-4.5 · signed in`, active marked by an accent rule down its left
+  edge, actions as quiet text on the right) and, one step in, to pick what to add (provider
+  name, its endpoint host in mono, right-aligned). A provider is a name and where it points;
+  that is all a row says.
 - **Onboarding** opens instead of a chat when no provider is configured — there is nothing to
-  send a message to yet. A grid of presets (Anthropic, OpenAI, xAI, OpenRouter, Cloudflare,
-  Ollama, llama.cpp, Custom) → one short form (model, API key, base URL where it matters) →
-  save, probe, and drop the user into a chat. "Skip for now" is available and honest about
-  the consequence. `wizard login xai` (OAuth) is a terminal flow; such a provider simply
-  appears here once it exists.
+  send a message to yet. Pick → one short form (model, API key, base URL where it matters) →
+  save, probe, chat. "Skip" is available and honest about the consequence. `wizard login xai`
+  (OAuth) is a terminal flow; such a provider simply appears here once it exists.
 - **Settings** (gear, sidebar header) manages the same providers afterwards: which is active,
-  test one, edit it, remove it, add another — plus the GUI's step limit. Each provider row
-  states where its key comes from (stored / from env / signed in / none), so "why is it 401ing"
-  is answerable from the page.
+  test, edit, remove, add — plus the GUI's step limit. Each row states where its key comes
+  from (stored / from env / signed in / local / none), so "why is it 401ing" is answerable
+  from the page. The config path sits in the footer, in mono, because that is where the truth
+  lives.
 - A provider that fails its probe is still saved: a typo'd key should leave an editable row,
   not vanish.
 
-## Right context panel (~300px), stack of rounded cards
+## Right context rail (~300px)
 
-1. **Git tools** card:
-   - header `Git tools` (muted small)
+A rail against the window edge — a hairline and groups of rows, not a card floating in space
+with dead air beneath it.
+
+1. **Git tools** group:
+   - label `GIT TOOLS`
    - row: `⊞ Changes` … right-aligned `+734` (green) `-7` (red)
    - row: `⎇ feat/gomoku-ai` (current branch, static)
    - row: `-o- Commit ⌄` — expands the commit-message editor
