@@ -186,6 +186,32 @@ impl GatewayConfig {
     }
 }
 
+/// Browser-GUI settings (`[gui]` in `config.toml`), edited from the GUI's own
+/// Settings page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiConfig {
+    /// Tool calls one GUI turn may make. Separate from the top-level
+    /// `max_steps` (which the TUI uses): a GUI chat runs with nobody at a
+    /// terminal to nudge it along, so it gets the roomier autonomous budget by
+    /// default.
+    #[serde(default = "GuiConfig::default_max_steps")]
+    pub max_steps: u32,
+}
+
+impl GuiConfig {
+    fn default_max_steps() -> u32 {
+        Mode::Sovereign.default_max_steps()
+    }
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: Self::default_max_steps(),
+        }
+    }
+}
+
 /// Cosmetic TUI settings (`[ui]` in `config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -626,6 +652,9 @@ pub struct Config {
     /// Cosmetic TUI settings (spinner verbs).
     #[serde(default)]
     pub ui: UiConfig,
+    /// Browser-GUI settings (`wizard gui`).
+    #[serde(default)]
+    pub gui: GuiConfig,
     /// Native web tool settings (`web_fetch` / `web_search`).
     #[serde(default)]
     pub web: WebConfig,
@@ -679,6 +708,7 @@ impl Default for Config {
             active_provider: None,
             gateway: GatewayConfig::default(),
             ui: UiConfig::default(),
+            gui: GuiConfig::default(),
             web: WebConfig::default(),
             checkpoints: CheckpointConfig::default(),
             fleet: FleetConfig::default(),
@@ -1198,6 +1228,7 @@ mod tests {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
                 vim: true,
             },
+            gui: GuiConfig { max_steps: 250 },
             web: WebConfig {
                 fetch_max_bytes: 250_000,
                 allow_local: true,

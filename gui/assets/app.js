@@ -13,6 +13,8 @@ const state = {
   workspaces: [],
   /** The directory `wizard gui` was launched from; a new chat opens there. */
   home: { cwd: '', name: '' },
+  /** Last `GET /api/settings`: providers, presets, first-run flag. */
+  settings: null,
   /** @type {import('./api.js').ModelInfo[]} */
   models: [],
   /** Model override sent with the next user_message; null = task default. */
@@ -167,6 +169,7 @@ function renderSidebar() {
     h('span', { class: 'home-dir', title: state.home.cwd || 'Working directory' },
       icon('folder', 'icon home-icon'),
       h('span', { class: 'home-name' }, state.home.name || 'Wizard')),
+    iconBtn('gear', 'Settings', () => openSettings()),
   );
 
   $('sidebar-actions').replaceChildren(
@@ -970,20 +973,57 @@ function onDocClickForMenu(e) {
   if (modelMenuEl && !modelMenuEl.contains(e.target) && !e.target.closest('.model-select')) closeModelMenu();
 }
 
-function toggleModelMenu(anchor) {
+/**
+ * Open the model menu and (re)load the list while it is open: providers can
+ * be added in Settings, and a local backend that was down when the page
+ * loaded may be up now — a menu built once at boot goes stale either way.
+ */
+async function toggleModelMenu(anchor) {
   if (modelMenuEl) {
     closeModelMenu();
     return;
   }
-  if (!state.models.length) return;
-  const menu = h('div', { class: 'menu model-menu', role: 'menu' });
-  let lastProvider = null;
+  const menu = h('div', { class: 'menu model-menu', role: 'menu' },
+    h('div', { class: 'menu-note' }, 'Loading models…'));
+  anchor.append(menu);
+  modelMenuEl = menu;
+  document.addEventListener('click', onDocClickForMenu, true);
+
+  let models;
+  try {
+    models = await api.listModels();
+  } catch (err) {
+    if (modelMenuEl !== menu) return;
+    menu.replaceChildren(h('div', { class: 'menu-note error' }, String((err && err.message) || err)));
+    return;
+  }
+  if (modelMenuEl !== menu) return; // closed while the request was in flight
+  state.models = models;
+  fillModelMenu(menu);
+}
+
+function fillModelMenu(menu) {
   const choose = (m) => {
     state.modelId = m.value;
     state.modelLabel = m.label;
     updateModelChip();
     closeModelMenu();
   };
+  const manage = h('button', {
+    class: 'menu-item menu-manage', type: 'button', role: 'menuitem',
+    onclick: () => { closeModelMenu(); openSettings(); },
+  }, h('span', { class: 'menu-item-label' }, 'Manage providers…'));
+
+  if (!state.models.length) {
+    menu.replaceChildren(
+      h('div', { class: 'menu-note' }, 'No provider is configured.'),
+      manage,
+    );
+    return;
+  }
+
+  menu.replaceChildren();
+  let lastProvider = null;
   for (const m of state.models) {
     if (m.provider !== lastProvider) {
       menu.append(h('div', { class: 'menu-head' }, m.provider));
@@ -999,20 +1039,18 @@ function toggleModelMenu(anchor) {
       m.isDefault && h('span', { class: 'menu-item-hint' }, 'default'),
       selected && h('span', { class: 'menu-check', html: icons.check, 'aria-hidden': 'true' })));
   }
-  anchor.append(menu);
-  modelMenuEl = menu;
-  document.addEventListener('click', onDocClickForMenu, true);
+  menu.append(manage);
 }
 
+/** The stop button exists only while a turn runs — an idle spinner just reads
+ *  as "something is loading forever". */
 function updateSpinner() {
-  const spin = document.querySelector('.spinner-icon.composer-spin');
   const btn = document.querySelector('.spinner-btn');
+  if (!btn) return;
   const working = state.taskState === 'working';
+  btn.classList.toggle('hidden', !working);
+  const spin = btn.querySelector('.spinner-icon');
   if (spin) spin.classList.toggle('spinning', working);
-  if (btn) {
-    btn.classList.toggle('active', working);
-    btn.title = working ? 'Stop the current turn' : 'Idle';
-  }
 }
 
 function focusComposer() {
@@ -1052,13 +1090,14 @@ function renderComposer() {
         icon('wand', 'icon chip-icon'), h('span', { class: 'chip-label' }, 'Sovereign')),
       h('span', { class: 'composer-spacer' }),
       h('button', {
-        class: 'icon-btn spinner-btn', type: 'button', title: 'Idle',
+        class: 'icon-btn spinner-btn hidden', type: 'button',
+        title: 'Stop the current turn', 'aria-label': 'Stop the current turn',
         onclick: () => {
           if (state.taskState === 'working' && state.selectedTaskId) {
             try { api.cancel(state.selectedTaskId); } catch { /* not connected */ }
           }
         },
-      }, h('span', { class: 'spinner-icon composer-spin', html: icons.spinner, 'aria-hidden': 'true' })),
+      }, h('span', { class: 'spinner-icon', html: icons.spinner, 'aria-hidden': 'true' })),
       modelAnchor,
       h('button', { class: 'send-btn', type: 'submit', title: 'Send', 'aria-label': 'Send' }, icon('sendArrow')),
     ),
@@ -1097,6 +1136,330 @@ async function send(text) {
   } catch (err) {
     appendSystemRow(String((err && err.message) || err), 'error');
   }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Overlays: Settings and first-run onboarding                               */
+/* ------------------------------------------------------------------------ */
+
+const KEY_BADGE = {
+  stored: { label: 'key stored', cls: 'ok' },
+  env: { label: 'key from env', cls: 'ok' },
+  oauth: { label: 'signed in', cls: 'ok' },
+  not_needed: { label: 'no key needed', cls: 'muted' },
+  missing: { label: 'no key', cls: 'warn' },
+};
+
+function closeOverlay() {
+  $('overlay-root').replaceChildren();
+  document.removeEventListener('keydown', onOverlayKeydown);
+}
+
+function onOverlayKeydown(e) {
+  if (e.key === 'Escape') closeOverlay();
+}
+
+/** Mount `panel` in a dimmed overlay. `dismissable` false = onboarding, which
+ *  has nothing behind it worth clicking. */
+function showOverlay(panel, { dismissable = true } = {}) {
+  const overlay = h('div', {
+    class: 'overlay',
+    onclick: dismissable ? (e) => { if (e.target === overlay) closeOverlay(); } : null,
+  }, panel);
+  $('overlay-root').replaceChildren(overlay);
+  if (dismissable) document.addEventListener('keydown', onOverlayKeydown);
+  return overlay;
+}
+
+/**
+ * The provider form, shared by onboarding and Settings.
+ * @param {Object} preset  a preset row, or an existing provider to edit
+ * @param {(saved: Object) => void} onSaved
+ */
+function providerForm(preset, { submitLabel = 'Connect', onSaved, onCancel } = {}) {
+  const editing = !!preset.editing;
+  const needsKey = preset.needs_key !== false && preset.kind !== 'ollama' && preset.kind !== 'llamacpp';
+  const nameInput = h('input', {
+    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.name || '',
+    placeholder: 'provider name', readonly: editing || null,
+  });
+  const baseInput = h('input', {
+    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.base_url || '',
+    placeholder: 'https://…',
+  });
+  const modelInput = h('input', {
+    class: 'text-input', type: 'text', spellcheck: 'false', value: preset.model || '',
+    placeholder: 'model tag',
+  });
+  const keyInput = h('input', {
+    class: 'text-input', type: 'password', spellcheck: 'false', autocomplete: 'off',
+    placeholder: editing ? 'leave blank to keep the stored key' : 'API key',
+  });
+  const note = h('div', { class: 'card-note hidden' });
+  const submit = h('button', { class: 'btn primary', type: 'submit' }, submitLabel);
+
+  const rows = [
+    !editing && preset.custom && field('Name', nameInput),
+    (preset.needs_base_url || preset.custom || editing) && field('Base URL', baseInput),
+    field('Model', modelInput),
+    needsKey && field('API key', keyInput,
+      'Stored in ~/.wizard/credentials.toml, readable only by you.'),
+  ];
+
+  const form = h('form', { class: 'provider-form' },
+    ...rows.filter(Boolean),
+    note,
+    h('div', { class: 'card-actions' },
+      submit,
+      onCancel && h('button', { class: 'btn ghost', type: 'button', onclick: onCancel }, 'Cancel')));
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    note.className = 'card-note hidden';
+    submit.setAttribute('disabled', '');
+    submit.textContent = 'Checking…';
+    try {
+      const { settings, probe } = await api.saveProvider({
+        name: (nameInput.value || preset.name).trim(),
+        kind: preset.kind,
+        baseUrl: baseInput.value.trim() || preset.base_url,
+        model: modelInput.value.trim(),
+        apiKey: keyInput.value.trim() || undefined,
+      });
+      state.settings = settings;
+      // Saved either way: a provider that does not answer is still worth
+      // keeping on the page so its key or URL can be fixed.
+      if (onSaved) onSaved({ settings, probe });
+    } catch (err) {
+      note.className = 'card-note error';
+      note.textContent = String((err && err.message) || err);
+    } finally {
+      submit.removeAttribute('disabled');
+      submit.textContent = submitLabel;
+    }
+  };
+  return form;
+}
+
+function field(label, input, hint) {
+  return h('label', { class: 'field' },
+    h('span', { class: 'field-label' }, label),
+    input,
+    hint && h('span', { class: 'field-hint' }, hint));
+}
+
+/** The preset grid both overlays open with. */
+function presetGrid(presets, onPick) {
+  return h('div', { class: 'preset-grid' },
+    ...presets.map((p) =>
+      h('button', { class: 'preset', type: 'button', onclick: () => onPick(p) },
+        h('span', { class: 'preset-name' }, p.label),
+        h('span', { class: 'preset-hint' }, p.hint))),
+    h('button', {
+      class: 'preset', type: 'button',
+      onclick: () => onPick({
+        name: '', label: 'Custom', kind: 'openai', base_url: '', model: '',
+        needs_key: true, custom: true, hint: '',
+      }),
+    },
+      h('span', { class: 'preset-name' }, 'Custom'),
+      h('span', { class: 'preset-hint' }, 'Any OpenAI-compatible endpoint.')));
+}
+
+/* --- Onboarding ----------------------------------------------------------- */
+
+/** First run: no provider is configured, so wizard cannot answer anything yet. */
+function openOnboarding(settings) {
+  const body = h('div', { class: 'onboard-body' });
+  const panel = h('div', { class: 'panel onboard', role: 'dialog', 'aria-label': 'Set up wizard' },
+    h('div', { class: 'onboard-head' },
+      h('h2', { class: 'onboard-title' }, 'Set up wizard'),
+      h('p', { class: 'onboard-sub' },
+        'Pick a provider for the agent to run on. You can add more, or change this, in Settings.')),
+    body);
+
+  const pickStep = () => {
+    body.replaceChildren(
+      presetGrid(settings.presets, formStep),
+      h('div', { class: 'onboard-foot' },
+        h('button', {
+          class: 'btn ghost btn-sm', type: 'button',
+          title: 'Wizard cannot answer until a provider is configured',
+          onclick: () => { closeOverlay(); bootChat(); },
+        }, 'Skip for now')),
+    );
+  };
+
+  const formStep = (preset) => {
+    const done = ({ probe }) => {
+      if (!probe.ok) {
+        body.replaceChildren(
+          h('div', { class: 'card-note error' },
+            `Saved, but ${preset.label} did not answer: ${probe.error || 'unknown error'}`),
+          h('div', { class: 'card-actions' },
+            h('button', { class: 'btn primary', type: 'button', onclick: () => formStep(preset) }, 'Try again'),
+            h('button', {
+              class: 'btn ghost', type: 'button',
+              onclick: () => { closeOverlay(); bootChat(); },
+            }, 'Continue anyway')),
+        );
+        return;
+      }
+      closeOverlay();
+      bootChat();
+    };
+    body.replaceChildren(
+      h('div', { class: 'onboard-picked' }, preset.label),
+      providerForm(preset, { submitLabel: 'Connect', onSaved: done, onCancel: pickStep }),
+    );
+  };
+
+  pickStep();
+  showOverlay(panel, { dismissable: false });
+}
+
+/* --- Settings ------------------------------------------------------------- */
+
+async function openSettings() {
+  const body = h('div', { class: 'settings-body' });
+  const panel = h('div', { class: 'panel settings', role: 'dialog', 'aria-label': 'Settings' },
+    h('div', { class: 'panel-head' },
+      h('span', { class: 'panel-title' }, 'Settings'),
+      iconBtn('close', 'Close', closeOverlay)),
+    body);
+  showOverlay(panel);
+  body.append(h('div', { class: 'card-note' }, 'Loading…'));
+  try {
+    state.settings = await api.settings();
+  } catch (err) {
+    body.replaceChildren(h('div', { class: 'card-note error' }, String((err && err.message) || err)));
+    return;
+  }
+  renderSettings(body);
+}
+
+function renderSettings(body) {
+  const s = state.settings;
+  const rerender = () => renderSettings(body);
+
+  const providerRow = (p) => {
+    const badge = KEY_BADGE[p.key] || KEY_BADGE.missing;
+    const status = h('span', { class: 'provider-status' });
+    const act = async (fn) => {
+      status.textContent = '…';
+      try {
+        const out = await fn();
+        if (out && out.providers) state.settings = out;
+        rerender();
+      } catch (err) {
+        status.textContent = String((err && err.message) || err);
+        status.classList.add('error');
+      }
+    };
+    return h('div', { class: 'provider-row' + (p.active ? ' active' : '') },
+      h('div', { class: 'provider-main' },
+        h('div', { class: 'provider-line' },
+          h('span', { class: 'provider-name' }, p.name),
+          p.active && h('span', { class: 'pill' }, 'active'),
+          h('span', { class: `pill ${badge.cls}` }, badge.label)),
+        h('div', { class: 'provider-sub' }, `${p.kind} · ${p.model}`),
+        status),
+      h('div', { class: 'provider-actions' },
+        !p.active && h('button', {
+          class: 'btn ghost btn-sm', type: 'button',
+          onclick: () => act(() => api.activateProvider(p.name)),
+        }, 'Use'),
+        h('button', {
+          class: 'btn ghost btn-sm', type: 'button',
+          onclick: async () => {
+            status.classList.remove('error');
+            status.textContent = 'Testing…';
+            try {
+              const probe = await api.testProvider(p.name);
+              status.textContent = probe.ok
+                ? `Answered — ${probe.models.length || 'no'} models listed`
+                : `Failed: ${probe.error || 'unknown error'}`;
+              status.classList.toggle('error', !probe.ok);
+            } catch (err) {
+              status.textContent = String((err && err.message) || err);
+              status.classList.add('error');
+            }
+          },
+        }, 'Test'),
+        h('button', {
+          class: 'btn ghost btn-sm', type: 'button',
+          onclick: () => {
+            body.replaceChildren(
+              h('div', { class: 'settings-section' },
+                h('div', { class: 'section-head' }, `Edit ${p.name}`),
+                providerForm({ ...p, editing: true, needs_key: p.key !== 'not_needed' }, {
+                  submitLabel: 'Save',
+                  onSaved: rerender,
+                  onCancel: rerender,
+                })),
+            );
+          },
+        }, 'Edit'),
+        h('button', {
+          class: 'btn ghost btn-sm danger', type: 'button',
+          onclick: () => act(() => api.removeProvider(p.name)),
+        }, 'Remove')));
+  };
+
+  const addBox = h('div', { class: 'settings-section' });
+  const resetAdd = () => {
+    addBox.replaceChildren(
+      h('div', { class: 'section-head' }, 'Add a provider'),
+      presetGrid(s.presets, (preset) => {
+        addBox.replaceChildren(
+          h('div', { class: 'section-head' }, `Add ${preset.label}`),
+          providerForm(preset, { submitLabel: 'Save', onSaved: rerender, onCancel: resetAdd }),
+        );
+      }),
+    );
+  };
+  resetAdd();
+
+  const stepsInput = h('input', { class: 'text-input', type: 'number', min: '1', max: '1000', value: String(s.max_steps) });
+  const agentNote = h('div', { class: 'card-note hidden' });
+  const saveAgent = async () => {
+    agentNote.className = 'card-note hidden';
+    try {
+      state.settings = await api.saveSettings({ max_steps: Number(stepsInput.value) || s.max_steps });
+      agentNote.className = 'card-note';
+      agentNote.textContent = 'Saved.';
+    } catch (err) {
+      agentNote.className = 'card-note error';
+      agentNote.textContent = String((err && err.message) || err);
+    }
+  };
+
+  body.replaceChildren(
+    h('div', { class: 'settings-section' },
+      h('div', { class: 'section-head' }, 'Providers'),
+      s.providers.length
+        ? h('div', { class: 'provider-list' }, ...s.providers.map(providerRow))
+        : h('div', { class: 'card-note' }, 'No provider is configured — wizard cannot answer until one is.')),
+    addBox,
+    h('div', { class: 'settings-section' },
+      h('div', { class: 'section-head' }, 'Agent'),
+      field('Step limit', stepsInput,
+        'Tool calls one chat may make per turn. Chats here run autonomously — there is no terminal to ask.'),
+      h('div', { class: 'card-actions' },
+        h('button', { class: 'btn primary btn-sm', type: 'button', onclick: saveAgent }, 'Save')),
+      agentNote),
+    h('div', { class: 'settings-foot' }, s.config_path),
+  );
+
+  // The composer's model chip reflects whatever the active provider is now.
+  api.listModels().then((models) => {
+    state.models = models;
+    if (state.modelId && !models.some((m) => m.value === state.modelId)) {
+      state.modelId = null;
+      state.modelLabel = null;
+    }
+    updateModelChip();
+  }).catch(() => { /* the chip keeps its last label */ });
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1273,15 +1636,26 @@ async function selectTask(id, { reload = false } = {}) {
 /* Boot                                                                      */
 /* ------------------------------------------------------------------------ */
 
+/** Land in the newest chat of the directory wizard runs in; with none, open a
+ *  fresh one there — `wizard gui` in a repo is about that repo. */
+async function bootChat() {
+  const here = state.workspaces.find((ws) => ws.path === state.home.cwd);
+  if (here && here.tasks.length) await selectTask(here.tasks[0].id);
+  else await newChat();
+}
+
 async function init() {
   renderComposer();
   renderSidebar();
   renderTopbar();
   try {
-    const [workspaces, models, home] = await Promise.all([api.listTasks(), api.listModels(), api.home()]);
+    const [workspaces, models, home, settings] = await Promise.all([
+      api.listTasks(), api.listModels(), api.home(), api.settings(),
+    ]);
     state.workspaces = workspaces;
     state.models = models;
     state.home = home;
+    state.settings = settings;
   } catch (err) {
     const scroller = $('transcript');
     const inner = h('div', { class: 'transcript-inner' });
@@ -1294,12 +1668,6 @@ async function init() {
   renderSidebar();
   updateModelChip();
 
-  // Land in the newest chat of the directory wizard runs in; with none, open
-  // a fresh one there — `wizard gui` in a repo is about that repo.
-  const here = state.workspaces.find((ws) => ws.path === state.home.cwd);
-  if (here && here.tasks.length) await selectTask(here.tasks[0].id);
-  else await newChat();
-
   // Keep the relative ages in the sidebar fresh.
   setInterval(() => renderSidebar(), 60000);
 
@@ -1309,6 +1677,10 @@ async function init() {
       newChat();
     }
   });
+
+  // Nothing to send a message to yet: set up a provider before opening a chat.
+  if (state.settings.first_run) openOnboarding(state.settings);
+  else await bootChat();
 }
 
 init();

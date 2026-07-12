@@ -588,6 +588,46 @@ export class RealApi {
     const out = await this._post('/api/tasks', {});
     return { id: out.id, cwd: out.cwd || '', workspace: out.workspace || pathBasename(out.cwd || '') };
   }
+
+  /** GET /api/settings: providers, key sources, presets, first-run flag. */
+  async settings() {
+    return this._json('/api/settings');
+  }
+
+  /** PATCH /api/settings: `{mode?, max_steps?}` → the new settings. */
+  async saveSettings(patch) {
+    return this._json('/api/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  }
+
+  /**
+   * POST /api/providers: add or edit a provider (same name = edit), storing
+   * `apiKey` in ~/.wizard/credentials.toml when given.
+   * @returns {Promise<{settings: Object, probe: {ok: boolean, error?: string, models: string[]}}>}
+   */
+  async saveProvider({ name, kind, baseUrl, model, apiKey, activate = true }) {
+    const payload = { name, kind, base_url: baseUrl, model, activate };
+    if (apiKey) payload.api_key = apiKey;
+    return this._post('/api/providers', payload);
+  }
+
+  /** POST /api/providers/{name}/test: does this provider answer? */
+  async testProvider(name) {
+    return this._post(`/api/providers/${encodeURIComponent(name)}/test`, {});
+  }
+
+  /** POST /api/providers/{name}/active: switch the active provider. */
+  async activateProvider(name) {
+    return this._post(`/api/providers/${encodeURIComponent(name)}/active`, {});
+  }
+
+  /** DELETE /api/providers/{name}: forget the provider and its stored key. */
+  async removeProvider(name) {
+    return this._json(`/api/providers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -842,6 +882,13 @@ function textEvents(text) {
 let idCounter = 0;
 const nextId = (prefix) => `${prefix}-${Date.now().toString(36)}-${++idCounter}`;
 
+/** The presets the mock's Settings page offers (a subset of the real ones). */
+const MOCK_PRESETS = [
+  { name: 'anthropic', label: 'Anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-fable-5', needs_key: true, needs_base_url: false, hint: 'Claude models, straight from Anthropic.' },
+  { name: 'openai', label: 'OpenAI', kind: 'openai', base_url: 'https://api.openai.com/v1', model: 'gpt-5.2', needs_key: true, needs_base_url: false, hint: 'GPT models, or any OpenAI-compatible endpoint.' },
+  { name: 'ollama', label: 'Ollama', kind: 'ollama', base_url: 'http://127.0.0.1:11434', model: 'qwen3:8b', needs_key: false, needs_base_url: false, hint: 'A local model served by Ollama. No key needed.' },
+];
+
 export class MockApi {
   constructor() {
     this._data = buildMockData();
@@ -849,6 +896,10 @@ export class MockApi {
     this._streams = new Map();
     /** @type {Set<number>} */
     this._timers = new Set();
+    this._mockProviders = [
+      { name: 'zai', kind: 'openai', base_url: 'https://api.z.ai/v1', model: 'GLM-5.2', key: 'stored' },
+      { name: 'anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-5', key: 'env' },
+    ];
   }
 
   /** @returns {Promise<Workspace[]>} */
@@ -974,6 +1025,46 @@ export class MockApi {
       { value: 'claude-sonnet-4-5', label: 'Sonnet 4.5', provider: 'anthropic' },
       { value: 'grok-4', label: 'Grok 4', provider: 'xai' },
     ];
+  }
+
+  /** Mock settings; `?mock=1&first-run=1` exercises the onboarding path. */
+  async settings() {
+    const firstRun = new URLSearchParams(window.location.search).has('first-run');
+    return {
+      first_run: firstRun || this._mockProviders.length === 0,
+      config_path: '/home/you/.wizard/config.toml',
+      credentials_path: '/home/you/.wizard/credentials.toml',
+      active: this._mockProviders[0] ? this._mockProviders[0].name : null,
+      max_steps: 100,
+      providers: this._mockProviders.map((p, i) => ({ ...p, active: i === 0 })),
+      presets: MOCK_PRESETS,
+    };
+  }
+
+  async saveSettings() {
+    return this.settings();
+  }
+
+  async saveProvider({ name, kind, baseUrl, model }) {
+    this._mockProviders = this._mockProviders.filter((p) => p.name !== name);
+    this._mockProviders.unshift({ name, kind, base_url: baseUrl, model, key: 'stored' });
+    return { settings: await this.settings(), probe: { ok: true, models: [model, `${model}-mini`] } };
+  }
+
+  async testProvider(name) {
+    void name;
+    return { ok: true, models: ['mock-model'] };
+  }
+
+  async activateProvider(name) {
+    const i = this._mockProviders.findIndex((p) => p.name === name);
+    if (i > 0) this._mockProviders.unshift(...this._mockProviders.splice(i, 1));
+    return this.settings();
+  }
+
+  async removeProvider(name) {
+    this._mockProviders = this._mockProviders.filter((p) => p.name !== name);
+    return this.settings();
   }
 
   /**

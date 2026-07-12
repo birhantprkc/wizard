@@ -14,6 +14,7 @@
 
 mod git;
 mod server;
+mod settings;
 mod tasks;
 mod transcript;
 mod ws;
@@ -26,11 +27,12 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 
-/// Shared server state: the loaded config, the in-process task manager, the
-/// directory the server was launched from (where a new chat opens), and the
-/// optional on-disk assets override (`--assets`, dev mode).
+/// Shared server state: the config store (re-read per request, so Settings
+/// edits and TUI edits both take effect without a restart), the in-process
+/// task manager, the directory the server was launched from (where a new chat
+/// opens), and the optional on-disk assets override (`--assets`, dev mode).
 pub(crate) struct GuiState {
-    pub config: Config,
+    pub config: Arc<settings::ConfigStore>,
     pub manager: tasks::TaskManager,
     pub cwd: PathBuf,
     pub assets_dir: Option<PathBuf>,
@@ -49,9 +51,10 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
     }
 
     let cwd = std::env::current_dir().context("reading the working directory")?;
+    let store = Arc::new(settings::ConfigStore::new(config));
     let state = Arc::new(GuiState {
-        manager: tasks::TaskManager::new(config.clone()),
-        config,
+        manager: tasks::TaskManager::new(Arc::clone(&store)),
+        config: store,
         cwd,
         assets_dir: assets,
     });

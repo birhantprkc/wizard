@@ -42,6 +42,11 @@ Tool output in the replay may be summarized (first line / counts); the GUI rende
 single-line tool rows and can expand. There is no `thinking` replay item: thinking is
 not persisted to the session JSONL, so it exists only as live `thinking_delta` frames.
 
+`session_start` hook output is persisted as a system note but is **not** replayed: it is
+context written for the model, not conversation (the TUI drops it the same way when it
+reloads a transcript). The hook still shows as its one-line `hook session_start: appended
+context (…)` notice while it fires.
+
 ### POST /api/tasks
 `{ "cwd": "/abs/path (optional)", "prompt": "... (optional)",
    "model": "provider-or-model-name (optional)" }`
@@ -61,7 +66,48 @@ The directory the server runs in — where a new chat opens.
 `{ "active": "anthropic", "providers": [{ "name": "anthropic", "kind": "anthropic",
    "model": "claude-fable-5", "models": ["...", "..."] }] }`
 `models` from `LlmProvider::list_models()` where cheap; empty array is fine (picker
-then shows just the configured model).
+then shows just the configured model). Read per request, not cached: a provider added
+in Settings shows up without a restart.
+
+## Settings
+
+Every write re-reads `~/.wizard/config.toml` first and mutates *that* — the TUI and other
+GUI servers write the same file, and `Config::save` rewrites it whole, so a stale in-memory
+copy must never be what lands on disk.
+
+### GET /api/settings
+```json
+{ "first_run": false, "config_path": "…/.wizard/config.toml",
+  "credentials_path": "…/.wizard/credentials.toml", "active": "anthropic", "max_steps": 100,
+  "providers": [{ "name": "anthropic", "kind": "anthropic", "base_url": "…", "model": "…",
+                  "key": "stored|env|oauth|not_needed|missing", "active": true }],
+  "presets": [{ "name": "anthropic", "label": "Anthropic", "kind": "anthropic", "base_url": "…",
+                "model": "…", "needs_key": true, "needs_base_url": false, "hint": "…" }] }
+```
+`first_run` = no provider configured: the GUI onboards instead of opening a chat.
+`max_steps` is `[gui] max_steps` — the GUI's own step budget, not the TUI's top-level one.
+
+### PATCH /api/settings
+`{ "max_steps": 100 }` → the same shape as `GET`.
+
+### POST /api/providers
+`{ "name": "…", "kind": "openai|anthropic|xai|openrouter|cloudflare|ollama|llamacpp",
+   "base_url": "…", "model": "…", "api_key": "… (optional)", "activate": true }`
+→ `{ "settings": {…}, "probe": { "ok": true, "models": ["…"] } }`
+
+Reusing a name is an edit. `api_key` is stored in `~/.wizard/credentials.toml` (0600) under
+the provider's name; omit it on an edit to keep the stored key. The provider is saved even
+when the probe fails — a bad key should leave an editable row, not vanish.
+
+### POST /api/providers/{name}/test
+→ `{ "ok": false, "error": "…", "models": [] }`. Builds the client and lists models.
+
+### POST /api/providers/{name}/active
+Switch the active provider → the `GET /api/settings` shape.
+
+### DELETE /api/providers/{name}
+Forget the provider and its stored key; removing the active one hands `active` to a
+survivor. → the `GET /api/settings` shape.
 
 ### GET /api/git?cwd=/abs/path
 ```json

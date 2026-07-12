@@ -13,19 +13,24 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::session::{self, Session};
-use crate::config::Config;
-use crate::gui::{GuiState, git, transcript, ws};
+use crate::config::{Config, ProviderConfig, ProviderKind};
+use crate::gui::{GuiState, git, settings, transcript, ws};
 use crate::session_registry::{self, SessionState};
 
 /// How long `/api/models` waits on one provider's model listing before
 /// falling back to an empty list (the picker then shows just the configured
 /// model).
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a Settings "test provider" probe waits. Longer than
+/// [`LIST_MODELS_TIMEOUT`]: the user is watching this one and wants a verdict,
+/// not a shrug.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One embedded static asset.
 struct Asset {
@@ -84,6 +89,11 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/tasks/{id}/ws", get(task_ws))
         .route("/api/workspace", get(workspace))
         .route("/api/models", get(models))
+        .route("/api/settings", get(get_settings).patch(patch_settings))
+        .route("/api/providers", post(save_provider))
+        .route("/api/providers/{name}", delete(delete_provider))
+        .route("/api/providers/{name}/active", post(activate_provider))
+        .route("/api/providers/{name}/test", post(test_provider))
         .route("/api/git", get(git_status))
         .route("/api/git/commit", post(git_commit))
         .layer(middleware::from_fn(local_guard))
@@ -272,7 +282,7 @@ async fn get_task(
     let model = state
         .manager
         .model_of(&id)
-        .unwrap_or_else(|| state.config.active().model);
+        .unwrap_or_else(|| state.config.current().active().model);
     Ok(axum::Json(TaskDetail {
         workspace: basename(&cwd),
         cwd,
@@ -365,34 +375,297 @@ struct ProviderRow {
 /// listing each (bounded by [`LIST_MODELS_TIMEOUT`]; unreachable backends
 /// report an empty list rather than an error).
 async fn models(State(state): State<Arc<GuiState>>) -> axum::Json<ModelsResponse> {
-    let config = &state.config;
+    let config = state.config.current();
     let providers = if config.providers.is_empty() {
         vec![config.active()]
     } else {
         config.providers.clone()
     };
-    let rows = futures_util::future::join_all(providers.iter().map(|provider| async {
-        let models = match provider.build() {
-            Ok(client) => {
-                match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
-                    Ok(Ok(models)) => models,
-                    _ => Vec::new(),
-                }
-            }
-            Err(_) => Vec::new(),
-        };
-        ProviderRow {
-            name: provider.name.clone(),
-            kind: provider.kind.to_string(),
-            model: provider.model.clone(),
-            models,
-        }
-    }))
-    .await;
+    let rows = futures_util::future::join_all(providers.iter().map(list_provider_models)).await;
     axum::Json(ModelsResponse {
         active: config.active().name,
         providers: rows,
     })
+}
+
+/// One provider's models, best-effort: an unreachable backend or a bad key
+/// yields an empty list rather than failing the request.
+async fn list_provider_models(provider: &ProviderConfig) -> ProviderRow {
+    let models = match provider.build() {
+        Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
+            Ok(Ok(models)) => models,
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    ProviderRow {
+        name: provider.name.clone(),
+        kind: provider.kind.to_string(),
+        model: provider.model.clone(),
+        models,
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Settings                                                               */
+/* ---------------------------------------------------------------------- */
+
+/// `GET /api/settings`: everything the Settings page and onboarding render.
+#[derive(Debug, Serialize)]
+struct SettingsResponse {
+    /// No provider is configured: the GUI onboards instead of opening a chat.
+    first_run: bool,
+    config_path: String,
+    credentials_path: Option<String>,
+    active: Option<String>,
+    /// Tool calls one GUI chat may make per turn (`[gui] max_steps`). The
+    /// top-level `max_steps` belongs to the TUI and is left alone: a control
+    /// here that silently governed a different surface would be a lie.
+    max_steps: u32,
+    providers: Vec<SettingsProvider>,
+    presets: &'static [settings::Preset],
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsProvider {
+    name: String,
+    kind: String,
+    base_url: String,
+    model: String,
+    key: settings::KeySource,
+    active: bool,
+}
+
+fn settings_response(config: &Config) -> SettingsResponse {
+    let active = config.active().name;
+    SettingsResponse {
+        first_run: config.providers.is_empty(),
+        config_path: settings::config_path(),
+        credentials_path: settings::credentials_path().map(|p| p.display().to_string()),
+        active: config.active_provider.clone(),
+        max_steps: config.gui.max_steps,
+        providers: config
+            .providers
+            .iter()
+            .map(|provider| SettingsProvider {
+                name: provider.name.clone(),
+                kind: provider.kind.to_string(),
+                base_url: provider.base_url.clone(),
+                model: provider.model.clone(),
+                key: settings::key_source(provider),
+                active: provider.name == active,
+            })
+            .collect(),
+        presets: settings::PRESETS,
+    }
+}
+
+async fn get_settings(State(state): State<Arc<GuiState>>) -> axum::Json<SettingsResponse> {
+    axum::Json(settings_response(&state.config.current()))
+}
+
+/// `PATCH /api/settings`: the GUI's own step budget.
+#[derive(Debug, Deserialize)]
+struct PatchSettings {
+    #[serde(default)]
+    max_steps: Option<u32>,
+}
+
+async fn patch_settings(
+    State(state): State<Arc<GuiState>>,
+    axum::Json(body): axum::Json<PatchSettings>,
+) -> Result<axum::Json<SettingsResponse>, ApiError> {
+    if let Some(steps) = body.max_steps
+        && !(1..=1000).contains(&steps)
+    {
+        return Err(ApiError::bad_request(
+            "the step limit must be between 1 and 1000",
+        ));
+    }
+    let config = state.config.update(|config| {
+        if let Some(steps) = body.max_steps {
+            config.gui.max_steps = steps;
+        }
+        Ok(())
+    })?;
+    Ok(axum::Json(settings_response(&config)))
+}
+
+/// `POST /api/providers` body: add a provider, or edit one by reusing its
+/// name. An `api_key` is stored in `~/.wizard/credentials.toml`; omitting it
+/// on an edit keeps the key already there.
+#[derive(Debug, Deserialize)]
+struct SaveProvider {
+    name: String,
+    kind: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Make this the active provider (default: yes — you configured it to use it).
+    #[serde(default = "yes")]
+    activate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What a save/test tells the user about whether the provider actually works.
+#[derive(Debug, Serialize)]
+struct ProviderProbe {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveProviderResponse {
+    settings: SettingsResponse,
+    probe: ProviderProbe,
+}
+
+/// `POST /api/providers`: persist the provider (and its key), then probe it.
+///
+/// The provider is saved even when the probe fails — a typo'd key should
+/// leave an editable row, not vanish — and the probe result says so plainly.
+async fn save_provider(
+    State(state): State<Arc<GuiState>>,
+    axum::Json(body): axum::Json<SaveProvider>,
+) -> Result<axum::Json<SaveProviderResponse>, ApiError> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("the provider needs a name"));
+    }
+    let kind: ProviderKind = parse_kind(&body.kind)?;
+    let base_url = body.base_url.trim().to_string();
+    let model = body.model.trim().to_string();
+    if base_url.is_empty() {
+        return Err(ApiError::bad_request("the provider needs a base URL"));
+    }
+    if model.is_empty() {
+        return Err(ApiError::bad_request("the provider needs a model"));
+    }
+    if let Some(key) = &body.api_key {
+        settings::store_key(&name, key)?;
+    }
+
+    let provider = ProviderConfig {
+        name: name.clone(),
+        kind,
+        base_url,
+        model,
+        // The key lives in the credential file under this provider's name;
+        // an env var would be a second source of truth for the same secret.
+        api_key_env: None,
+        gguf_path: None,
+        usd_per_mtok_in: None,
+        usd_per_mtok_out: None,
+    };
+    let config = state.config.update({
+        let provider = provider.clone();
+        move |config| {
+            settings::upsert_provider(config, provider, body.activate);
+            Ok(())
+        }
+    })?;
+
+    Ok(axum::Json(SaveProviderResponse {
+        probe: probe(&provider).await,
+        settings: settings_response(&config),
+    }))
+}
+
+/// `POST /api/providers/{name}/test`: does this saved provider answer?
+async fn test_provider(
+    Path(name): Path<String>,
+    State(state): State<Arc<GuiState>>,
+) -> Result<axum::Json<ProviderProbe>, ApiError> {
+    let config = state.config.current();
+    let provider = config
+        .providers
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| ApiError::not_found(format!("no provider named '{name}'")))?;
+    Ok(axum::Json(probe(provider).await))
+}
+
+/// `POST /api/providers/{name}/active`: switch the active provider.
+async fn activate_provider(
+    Path(name): Path<String>,
+    State(state): State<Arc<GuiState>>,
+) -> Result<axum::Json<SettingsResponse>, ApiError> {
+    let config = state.config.update(|config| {
+        anyhow::ensure!(
+            config.providers.iter().any(|p| p.name == name),
+            "no provider named '{name}'"
+        );
+        config.active_provider = Some(name.clone());
+        Ok(())
+    })?;
+    Ok(axum::Json(settings_response(&config)))
+}
+
+/// `DELETE /api/providers/{name}`: forget the provider and its stored key.
+async fn delete_provider(
+    Path(name): Path<String>,
+    State(state): State<Arc<GuiState>>,
+) -> Result<axum::Json<SettingsResponse>, ApiError> {
+    let config = state
+        .config
+        .update(|config| settings::remove_provider(config, &name))?;
+    // Best-effort: a leftover key is harmless, but leaving it behind would
+    // silently reattach to a provider re-added under the same name later.
+    if let Err(err) = crate::credentials::remove(&name) {
+        tracing::warn!("could not remove the stored key for '{name}': {err:#}");
+    }
+    Ok(axum::Json(settings_response(&config)))
+}
+
+/// Build the provider's client and ask it for its models: the cheapest call
+/// that proves the base URL, the key, and the network all work.
+async fn probe(provider: &ProviderConfig) -> ProviderProbe {
+    let client = match provider.build() {
+        Ok(client) => client,
+        Err(err) => {
+            return ProviderProbe {
+                ok: false,
+                error: Some(format!("{err:#}")),
+                models: Vec::new(),
+            };
+        }
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, client.list_models()).await {
+        Ok(Ok(models)) => ProviderProbe {
+            ok: true,
+            error: None,
+            models,
+        },
+        Ok(Err(err)) => ProviderProbe {
+            ok: false,
+            error: Some(format!("{err:#}")),
+            models: Vec::new(),
+        },
+        Err(_) => ProviderProbe {
+            ok: false,
+            error: Some(format!(
+                "the provider did not answer within {}s",
+                PROBE_TIMEOUT.as_secs()
+            )),
+            models: Vec::new(),
+        },
+    }
+}
+
+fn parse_kind(kind: &str) -> Result<ProviderKind, ApiError> {
+    #[derive(Deserialize)]
+    struct Probe {
+        kind: ProviderKind,
+    }
+    toml::from_str::<Probe>(&format!("kind = {kind:?}"))
+        .map(|probe| probe.kind)
+        .map_err(|_| ApiError::bad_request(format!("unknown provider kind '{kind}'")))
 }
 
 /// `GET /api/git?cwd=...` query.

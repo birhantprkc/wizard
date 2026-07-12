@@ -4,6 +4,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::agent::SESSION_START_HOOK_NOTE;
 use crate::agent::session::SessionEntry;
 use crate::llm::Role;
 
@@ -78,6 +79,14 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
             Role::System => {
                 // Only flagged system notes are persisted mid-conversation
                 // (stale system prompts from old files render the same way).
+                // Hook context is not one of them: it is a payload written for
+                // the model — often long, often about the repo rather than the
+                // conversation — so it is dropped here, exactly as the TUI
+                // drops it when reloading a transcript. The hook still shows up
+                // as its one-line `hook session_start: …` notice.
+                if message.content.starts_with(SESSION_START_HOOK_NOTE) {
+                    continue;
+                }
                 items.push(Item::Notice {
                     text: message.content.clone(),
                 });

@@ -37,7 +37,8 @@ clickable and isn't is worse than no control.
 
 ## Left sidebar (~240px)
 
-1. Header: folder icon + the directory `wizard gui` runs in — where a new chat opens.
+1. Header: folder icon + the directory `wizard gui` runs in — where a new chat opens —
+   with the Settings gear on the right.
 2. Action row (icon + label, hover highlight): `New Chat` (plus-in-square icon, `⌘N` /
    `Ctrl-N` shortcut hint right-aligned, matching the platform).
 3. `Chats` section header (muted, small caps feel).
@@ -60,8 +61,24 @@ clickable and isn't is worse than no control.
 - Composer (bottom, floating rounded-2xl card with border):
   - placeholder `Ask wizard to change something`
   - bottom row: `✦ Sovereign` mode chip (static — wizard has no permission gating, so there is
-    no mode dropdown) · spacer · spinner / stop button · `GLM-5.2 ⌄` model picker ·
-    circular blue send button `↑` (right).
+    no mode dropdown) · spacer · stop button (present **only** while a turn runs — an idle
+    spinner just reads as "loading forever") · `GLM-5.2 ⌄` model picker · circular blue send
+    button `↑` (right).
+
+## Settings and onboarding (overlays)
+
+- **Onboarding** opens instead of a chat when no provider is configured — there is nothing to
+  send a message to yet. A grid of presets (Anthropic, OpenAI, xAI, OpenRouter, Cloudflare,
+  Ollama, llama.cpp, Custom) → one short form (model, API key, base URL where it matters) →
+  save, probe, and drop the user into a chat. "Skip for now" is available and honest about
+  the consequence. `wizard login xai` (OAuth) is a terminal flow; such a provider simply
+  appears here once it exists.
+- **Settings** (gear, sidebar header) manages the same providers afterwards: which is active,
+  test one, edit it, remove it, add another — plus the GUI's step limit. Each provider row
+  states where its key comes from (stored / from env / signed in / none), so "why is it 401ing"
+  is answerable from the page.
+- A provider that fails its probe is still saved: a typo'd key should leave an editable row,
+  not vanish.
 
 ## Right context panel (~300px), stack of rounded cards
 
@@ -86,6 +103,9 @@ clickable and isn't is worse than no control.
   composer; the first message starts the first turn and names the chat. On launch the GUI lands
   in the newest chat of that directory, or a new one when it has none.
 - Tool calls stream as structured rows (explore/run/write) rather than raw text where possible.
-- Composer sends follow-up user messages to the running session; model picker lists configured providers/models.
+- Composer sends follow-up user messages to the running session; the model picker reloads
+  `/api/models` each time it opens (providers change, local backends come up) and offers
+  "Manage providers…" when there is nothing to pick.
+- Chats run sovereign (no terminal to prompt at) on `[gui] max_steps`, which Settings edits.
 - Git card: live diffstat of the task's workspace, current branch, commit action.
 - Goal/Progress: map to wizard's plan/todo state if available (plan.md / todo tool), else hide gracefully.

@@ -176,7 +176,13 @@ pub fn summaries(dir: &Path) -> Vec<SessionSummary> {
             }
             match serde_json::from_str::<SessionLine>(&line) {
                 Ok(SessionLine::Message(record)) => {
-                    messages += 1;
+                    // System notes (hook context, background-task notes) are
+                    // not conversation: a session holding nothing else has had
+                    // nothing said in it, and listing it as "(no prompt)" is
+                    // noise in both the /resume picker and the GUI sidebar.
+                    if record.message.role != Role::System {
+                        messages += 1;
+                    }
                     if first_user.is_none() && record.message.role == Role::User {
                         first_user = record.message.content.lines().next().map(str::to_string);
                     }

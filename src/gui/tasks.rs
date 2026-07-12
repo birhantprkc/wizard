@@ -24,6 +24,7 @@ use crate::agent::{
     Agent, AgentEvent, CancelHandle, DoneReason, PlanVerdict, build_headless_agent_for_session,
 };
 use crate::config::{Config, Mode};
+use crate::gui::settings::ConfigStore;
 use crate::gui::transcript::summarize_tool;
 use crate::tools::todo::{TodoItem, TodoStatus};
 
@@ -572,7 +573,9 @@ fn resume_after_gate(state: &mut SharedState, notice: &str) {
 
 /// The in-process registry of managed tasks, keyed by session id.
 pub struct TaskManager {
-    config: Config,
+    /// Read at agent-build time rather than cloned at startup, so a provider
+    /// added on the Settings page is live for the very next turn.
+    config: Arc<ConfigStore>,
     tasks: Mutex<HashMap<String, ManagedTask>>,
 }
 
@@ -583,7 +586,7 @@ struct ManagedTask {
 }
 
 impl TaskManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Arc<ConfigStore>) -> Self {
         Self {
             config,
             tasks: Mutex::new(HashMap::new()),
@@ -679,10 +682,10 @@ impl TaskManager {
             return existing.shared.clone();
         }
         evict_lru(&mut tasks);
-        let shared = TaskShared::new(id.clone(), cwd, self.config.active().model);
+        let shared = TaskShared::new(id.clone(), cwd, self.config.current().active().model);
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_worker(
-            self.config.clone(),
+            Arc::clone(&self.config),
             Arc::clone(&shared),
             session,
             turn_rx,
@@ -724,16 +727,15 @@ fn evict_lru(tasks: &mut HashMap<String, ManagedTask>) {
     }
 }
 
-/// Per-task agent config: sovereign posture (there is no terminal behind
-/// the GUI) with the sovereign step budget, plus the optional model
-/// override — a configured provider name switches the active provider,
-/// anything else is a model tag on the active provider.
+/// Per-task agent config: sovereign posture (there is no terminal behind the
+/// GUI to prompt at) on the GUI's own step budget (`[gui] max_steps`, which
+/// the Settings page edits), plus the optional model override — a configured
+/// provider name switches the active provider, anything else is a model tag on
+/// the active provider.
 fn agent_config(base: &Config, model: Option<&str>) -> Config {
     let mut config = base.clone();
     config.mode = Mode::Sovereign;
-    if config.max_steps < Mode::Sovereign.default_max_steps() {
-        config.max_steps = Mode::Sovereign.default_max_steps();
-    }
+    config.max_steps = config.gui.max_steps;
     if let Some(want) = model {
         if config.providers.iter().any(|p| p.name == want) {
             config.active_provider = Some(want.to_string());
@@ -755,7 +757,7 @@ fn agent_config(base: &Config, model: Option<&str>) -> Config {
 /// turns one at a time, draining each turn's events into `shared`. Ends
 /// when the manager drops the turn sender (eviction or shutdown).
 async fn run_worker(
-    base_config: Config,
+    store: Arc<ConfigStore>,
     shared: Arc<TaskShared>,
     session: Session,
     mut requests: mpsc::UnboundedReceiver<TurnRequest>,
@@ -767,6 +769,9 @@ async fn run_worker(
 
     while let Some(request) = requests.recv().await {
         shared.begin_turn();
+        // Read the config per turn: a build that failed for want of a provider
+        // must succeed on the next turn once Settings has configured one.
+        let base_config = store.current();
 
         if agent.is_none() {
             let config = agent_config(&base_config, request.model.as_deref());
@@ -1163,7 +1168,6 @@ mod tests {
         // Sovereign posture always applies.
         let config = agent_config(&base, None);
         assert_eq!(config.mode, Mode::Sovereign);
-        assert!(config.max_steps >= Mode::Sovereign.default_max_steps());
 
         // A provider name switches the active provider.
         let config = agent_config(&base, Some("claude"));
@@ -1174,5 +1178,15 @@ mod tests {
         let config = agent_config(&base, Some("qwen3.6:32b"));
         assert_eq!(config.active().name, "local");
         assert_eq!(config.active().model, "qwen3.6:32b");
+    }
+
+    #[test]
+    fn gui_turns_run_on_the_step_limit_settings_shows() {
+        // The Settings page edits `[gui] max_steps`; if a turn ran on anything
+        // else, that control would be decoration.
+        let mut base = Config::default();
+        base.gui.max_steps = 7;
+        base.max_steps = 25; // the TUI's, and none of the GUI's business
+        assert_eq!(agent_config(&base, None).max_steps, 7);
     }
 }

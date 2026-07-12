@@ -498,6 +498,14 @@ pub struct RewindCandidate {
     pub files: Vec<PathBuf>,
 }
 
+/// Prefix of the system note carrying `session_start` hook output.
+///
+/// The note is context for the model, not conversation: surfaces that replay a
+/// session from disk (the GUI transcript) match on this to drop it, the way the
+/// TUI drops every system message when it reloads a transcript. Hook *events*
+/// are still reported, as one-line [`AgentEvent::HookFired`] notices.
+pub const SESSION_START_HOOK_NOTE: &str = "[session_start hook]";
+
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
 
@@ -816,7 +824,7 @@ impl Agent {
     pub async fn fire_session_start(&mut self, events: &mpsc::Sender<AgentEvent>) {
         if let Some(extra) = self.hooks.session_start(self.mode, Some(events)).await {
             self.push(ChatMessage::system(format!(
-                "[session_start hook]\n{extra}"
+                "{SESSION_START_HOOK_NOTE}\n{extra}"
             )));
         }
     }
