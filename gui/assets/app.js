@@ -175,9 +175,7 @@ function taskDot(t, selected) {
 
 function renderSidebar() {
   $('sidebar-top').replaceChildren(
-    h('span', { class: 'home-dir', title: state.home.cwd || 'Working directory' },
-      icon('folder', 'icon home-icon'),
-      h('span', { class: 'home-name' }, state.home.name || 'Wizard')),
+    h('span', { class: 'brand' }, 'wizard'),
     iconBtn('gear', 'Settings', () => openSettings()),
   );
 

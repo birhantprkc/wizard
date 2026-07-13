@@ -190,28 +190,14 @@ button {
   padding: 0 4px 0 8px;
   flex-shrink: 0;
 }
-.home-dir {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+.brand {
   min-width: 0;
-  color: var(--text-soft);
+  padding-left: 4px;
+  color: var(--text);
+  font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: -0.01em;
-}
-.home-icon {
-  color: var(--text-muted);
-  flex-shrink: 0;
-}
-.home-icon svg {
-  width: 15px;
-  height: 15px;
-}
-.home-name {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
