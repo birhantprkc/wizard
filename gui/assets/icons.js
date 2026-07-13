@@ -43,6 +43,7 @@ export const icons = {
   sendArrow: s('<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/>', 'stroke-width="2"'),
   stop: s('<rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/>'),
   chevronDown: s('<path d="m6 9 6 6 6-6"/>'),
+  chevronLeft: s('<path d="m15 6-6 6 6 6"/>'),
   panelLeft: s('<rect x="3" y="4" width="18" height="16" rx="3.5"/><path d="M9.5 4.5v15"/>'),
   panelRight: s('<rect x="3" y="4" width="18" height="16" rx="3.5"/><path d="M14.5 4.5v15"/>'),
   spinner: s('<path d="M12 3a9 9 0 1 0 9 9"/>'),

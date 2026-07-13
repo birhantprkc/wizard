@@ -188,6 +188,12 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 { "type": "interview", "questions": ["..."] }
 { "type": "task_event", "phase": "started|finished", "label": "..." }
 { "type": "subagent", "phase": "started|finished", "name": "...", "task": "..." }
+{ "type": "subagent_run_started", "run": 3, "bg": 1, "name": "researcher", "task": "..." }
+{ "type": "subagent_run_text", "run": 3, "text": "one of its own messages" }
+{ "type": "subagent_run_tool_started", "run": 3, "call_id": 12, "name": "read_file", "args": { } }
+{ "type": "subagent_run_tool_finished", "run": 3, "call_id": 12, "name": "read_file", "ok": true, "summary": "src/app.rs (120 lines)" }
+{ "type": "subagent_run_step", "run": 3, "step": 2 }
+{ "type": "subagent_run_done", "run": 3, "completed": true, "output": "its report", "steps_used": 4, "error": null }
 { "type": "notice", "text": "..." }
 { "type": "error", "message": "..." }
 { "type": "retrying", "attempt": 2 }
@@ -198,6 +204,28 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 started/finished frames. `summary` for tool_finished: short human line (file names,
 counts, first output line) — GUI shows it muted next to the tool name; full output
 not shipped in v1.
+
+### Subagent runs
+
+`subagent` is the one-liner a background delegation shows in the chat. The `subagent_run_*`
+frames are the run itself: one subagent's own messages and tool calls, streamed live, which
+the GUI lists in the context panel and opens as that run's own pane.
+
+Every frame after `subagent_run_started` carries the same `run` — a session-unique id — so
+concurrent runs (even two of the same subagent) demux into separate panes instead of
+interleaving. `bg` is the background-registry id when the run was detached, and null when
+the parent turn is blocked on it. Tool calls pair by `call_id` within their run, and their
+`summary` is built exactly like the parent's tool cards'.
+
+`subagent_run_done` distinguishes the three endings: `completed: true` (it reported back),
+`completed: false` with `error: null` (it spent its step budget), and `error` set (it died).
+`output` is its final report — the step that made no tool call, which therefore never
+streamed as a `subagent_run_text`.
+
+A run's lifecycle is not the turn's: a background subagent outlives the turn that spawned
+it and keeps streaming after that turn's `done`/`state` frames. So subagent state is not
+cleared at turn start, and a run still going when a client attaches is announced to it —
+after the replay, and only when the replay does not already carry its `started` frame.
 
 `done` reason `cancelled` means the client asked for the stop (a `cancel` frame); a
 turn the agent stopped after emitting an `error` frame — e.g. a provider failure —

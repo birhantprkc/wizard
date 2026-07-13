@@ -885,6 +885,155 @@ button.ghost-chip:hover {
 }
 
 /* ------------------------------------------------------------------ */
+/* Subagents: a row per run in the panel, and the run's own pane        */
+/* ------------------------------------------------------------------ */
+
+/* Three lines to a row — name, what it is doing, how far it has got — so the
+   row must hang from its top, not center on it. */
+.subagent-row {
+  align-items: flex-start;
+  gap: 9px;
+}
+.subagent-row.open {
+  background: #1e1e22;
+}
+
+/* The status dot. Running pulses, exactly as the TUI's rail dot does; the
+   resting colors are the ones the rest of the GUI already uses for a good
+   outcome, a bad one, and one that needs a second look. */
+.sub-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+.sub-dot.running {
+  background: var(--text);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.sub-dot.done {
+  background: var(--green);
+}
+.sub-dot.failed {
+  background: var(--red);
+}
+.sub-dot.budget {
+  background: var(--amber);
+}
+
+.sub-main {
+  min-width: 0;
+  flex: 1;
+}
+.sub-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sub-name {
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.sub-badge {
+  margin-left: auto;
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--text-mid);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 15px;
+  text-align: center;
+}
+.sub-activity,
+.sub-meta {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sub-activity {
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+.sub-meta {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+/* The pane: the run's own transcript, where the chat's would be. */
+.subagent-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pane-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.pane-head {
+  flex-shrink: 0;
+  padding: 12px 32px 12px;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+.pane-head-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+.pane-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-right: 4px;
+}
+.pane-back-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.pane-icon {
+  color: var(--text-muted);
+}
+.pane-name {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.pane-status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.pane-status.failed {
+  color: var(--red);
+}
+.pane-status.budget {
+  color: var(--amber);
+}
+.pane-spacer {
+  flex: 1;
+}
+.pane-meta {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.pane-task {
+  max-width: var(--content-max);
+  margin: 5px auto 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ */
 /* Live streaming: state dots, thinking, tool groups, system rows       */
 /* ------------------------------------------------------------------ */
 

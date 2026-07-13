@@ -82,6 +82,51 @@ pub enum Frame {
         name: String,
         task: String,
     },
+    /// A subagent run began. Every `subagent_run_*` frame below carries the
+    /// same `run`, so concurrent runs — even two of the same subagent — demux
+    /// into separate panes instead of interleaving. `bg` is the
+    /// background-registry id of a detached run.
+    SubagentRunStarted {
+        run: u64,
+        bg: Option<u32>,
+        name: String,
+        task: String,
+    },
+    /// One of the subagent's own messages (its narration between tool calls).
+    SubagentRunText {
+        run: u64,
+        text: String,
+    },
+    /// The subagent started a tool call. `call_id` pairs it with its
+    /// `subagent_run_tool_finished`, exactly as the parent's tool frames pair.
+    SubagentRunToolStarted {
+        run: u64,
+        call_id: u64,
+        name: String,
+        args: Value,
+    },
+    SubagentRunToolFinished {
+        run: u64,
+        call_id: u64,
+        name: String,
+        ok: bool,
+        summary: String,
+    },
+    /// The subagent completed one step (model round-trip), 1-based.
+    SubagentRunStep {
+        run: u64,
+        step: u32,
+    },
+    /// The run ended. `completed` is false when it hit its step budget;
+    /// `error` is set when it died — so a failed run is distinguishable from
+    /// one that merely ran out of steps.
+    SubagentRunDone {
+        run: u64,
+        completed: bool,
+        output: String,
+        steps_used: u32,
+        error: Option<String>,
+    },
     Notice {
         text: String,
     },
@@ -187,6 +232,16 @@ struct SharedState {
     /// frames — which carry no id of their own — with their `tool_started`
     /// call id and arguments.
     open_calls: HashMap<String, VecDeque<(u64, Value)>>,
+    /// The same, per subagent run: a subagent's calls pair among themselves,
+    /// never with the parent's or another run's. Not cleared at turn start —
+    /// a background run's calls can straddle the end of the turn that spawned
+    /// it — but dropped when its run ends.
+    open_subagent_calls: HashMap<(u64, String), VecDeque<(u64, Value)>>,
+    /// The subagent runs still going, in start order (see [`LiveRun`]).
+    live_runs: Vec<LiveRun>,
+    /// Bumped per turn, so [`TaskShared::attach`] can tell which live runs the
+    /// replay buffer still carries the `started` frame of.
+    turn_seq: u64,
     /// Stream retries within the current turn (`retrying` frame's attempt
     /// counter).
     retries: u32,
@@ -201,6 +256,20 @@ struct SharedState {
     /// [`TaskShared::finish_turn`] ends it failed rather than idle.
     turn_failed: bool,
     model: String,
+}
+
+/// One subagent run that has not reported back yet. A background run outlives
+/// the turn that spawned it, and the next turn clears its `started` frame out
+/// of the replay buffer — so the frame is kept here, and [`TaskShared::attach`]
+/// re-announces the runs the replay it just sent does not cover. Without it a
+/// client that reconnects mid-run has no row to stream the run into.
+struct LiveRun {
+    run: u64,
+    /// The turn it started in, i.e. the buffer generation its `started` frame
+    /// belongs to.
+    turn: u64,
+    /// Its serialized `subagent_run_started` frame.
+    frame: String,
 }
 
 impl TaskShared {
@@ -219,6 +288,9 @@ impl TaskShared {
                 cancel: None,
                 next_call_id: 0,
                 open_calls: HashMap::new(),
+                open_subagent_calls: HashMap::new(),
+                live_runs: Vec::new(),
+                turn_seq: 0,
                 retries: 0,
                 turn_error_seen: false,
                 turn_cancel_requested: false,
@@ -287,11 +359,13 @@ impl TaskShared {
     }
 
     /// Turn start: reset the replay buffer and per-turn counters, go
-    /// working.
+    /// working. Subagent state is *not* per-turn: a background run outlives
+    /// the turn that spawned it, and keeps streaming into the panel.
     fn begin_turn(&self) {
         let mut state = self.lock();
         state.buffer.clear();
         state.open_calls.clear();
+        state.turn_seq += 1;
         state.retries = 0;
         state.turn_error_seen = false;
         state.turn_cancel_requested = false;
@@ -328,9 +402,13 @@ impl TaskShared {
     /// A replay that already opens with the turn's own `state` frame carries
     /// every later transition too, so the snapshot would only duplicate it.
     /// Returns a generation token for [`TaskShared::detach`].
+    ///
+    /// Subagent runs still going are announced last, unless the replay just
+    /// sent already carries their `started` frame (see [`LiveRun`]).
     pub fn attach(&self, tx: mpsc::UnboundedSender<String>) -> u64 {
         let mut state = self.lock();
         let mut replayed_state = false;
+        let mut replayed_turn = None;
         if state.turn_active {
             replayed_state = state
                 .buffer
@@ -339,12 +417,18 @@ impl TaskShared {
             for frame in &state.buffer {
                 let _ = tx.send(frame.clone());
             }
+            replayed_turn = Some(state.turn_seq);
         }
         if !replayed_state {
             let current = serialize(&Frame::State {
                 state: state.task_state.as_str(),
             });
             let _ = tx.send(current);
+        }
+        for live in &state.live_runs {
+            if replayed_turn != Some(live.turn) {
+                let _ = tx.send(live.frame.clone());
+            }
         }
         state.subscriber = Some(tx);
         state.subscriber_gen += 1;
@@ -501,6 +585,101 @@ impl TaskShared {
                 name,
                 task,
             }),
+            AgentEvent::SubagentRunStarted {
+                run,
+                bg,
+                name,
+                task,
+            } => {
+                let mut state = self.lock();
+                let text = serialize(&Frame::SubagentRunStarted {
+                    run,
+                    bg,
+                    name,
+                    task,
+                });
+                let turn = state.turn_seq;
+                state.live_runs.push(LiveRun {
+                    run,
+                    turn,
+                    frame: text.clone(),
+                });
+                push_text_locked(&mut state, text);
+            }
+            AgentEvent::SubagentRunText { run, text } => {
+                self.push(Frame::SubagentRunText { run, text })
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, args } => {
+                let mut state = self.lock();
+                let call_id = state.next_call_id;
+                state.next_call_id += 1;
+                state
+                    .open_subagent_calls
+                    .entry((run, name.clone()))
+                    .or_default()
+                    .push_back((call_id, args.clone()));
+                push_locked(
+                    &mut state,
+                    Frame::SubagentRunToolStarted {
+                        run,
+                        call_id,
+                        name,
+                        args,
+                    },
+                );
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                let mut state = self.lock();
+                let open = state
+                    .open_subagent_calls
+                    .get_mut(&(run, name.clone()))
+                    .and_then(VecDeque::pop_front);
+                let (call_id, args) = match open {
+                    Some(pair) => pair,
+                    None => {
+                        let call_id = state.next_call_id;
+                        state.next_call_id += 1;
+                        (call_id, Value::Null)
+                    }
+                };
+                // The parent's own tool cards are summarized the same way, so
+                // a subagent's read the same as the chat's.
+                let summary = summarize_tool(&name, &args, &output.content);
+                push_locked(
+                    &mut state,
+                    Frame::SubagentRunToolFinished {
+                        run,
+                        call_id,
+                        name,
+                        ok: !output.is_error,
+                        summary,
+                    },
+                );
+            }
+            AgentEvent::SubagentRunStep { run, step } => {
+                self.push(Frame::SubagentRunStep { run, step })
+            }
+            AgentEvent::SubagentRunDone {
+                run,
+                completed,
+                output,
+                steps_used,
+                error,
+            } => {
+                let mut state = self.lock();
+                state.live_runs.retain(|live| live.run != run);
+                state.open_subagent_calls.retain(|(id, _), _| *id != run);
+                push_locked(
+                    &mut state,
+                    Frame::SubagentRunDone {
+                        run,
+                        completed,
+                        output,
+                        steps_used,
+                        error,
+                    },
+                );
+            }
             AgentEvent::StreamRetrying => {
                 let mut state = self.lock();
                 state.retries += 1;
@@ -542,7 +721,12 @@ fn serialize(frame: &Frame) -> String {
 }
 
 fn push_locked(state: &mut SharedState, frame: Frame) {
-    let text = serialize(&frame);
+    push_text_locked(state, serialize(&frame));
+}
+
+/// [`push_locked`] for a frame already serialized (one the task keeps a copy
+/// of, so it is not serialized twice).
+fn push_text_locked(state: &mut SharedState, text: String) {
     if state.buffer.len() >= MAX_BUFFERED_FRAMES {
         state.buffer.pop_front();
     }
@@ -764,8 +948,6 @@ async fn run_worker(
 ) {
     let mut agent: Option<Agent> = None;
     let mut task_config: Option<Config> = None;
-    // Retained until a build succeeds so a failed build can retry.
-    let session = session;
 
     while let Some(request) = requests.recv().await {
         shared.begin_turn();
@@ -773,45 +955,50 @@ async fn run_worker(
         // must succeed on the next turn once Settings has configured one.
         let base_config = store.current();
 
-        if agent.is_none() {
-            let config = agent_config(&base_config, request.model.as_deref());
-            match build_headless_agent_for_session(&config, &shared.cwd, session.clone()).await {
-                Ok(mut built) => {
-                    if config.plan_first {
-                        built.set_plan_mode(true);
-                    }
-                    if config.omakase {
-                        built.set_omakase(true);
-                    }
-                    shared.set_cancel(built.cancel_handle());
-                    shared.set_model(&config.active().model);
-                    fire_start_hooks(&mut built, &shared).await;
-                    agent = Some(built);
-                    task_config = Some(config);
+        // The agent is taken out for the turn and put back when it ends: an
+        // agent that has not been built yet is built here (the session is
+        // retained, so a failed build retries on the next turn), and a model
+        // override on a *later* turn switches the live agent in place — the
+        // first turn's override is already baked into its config.
+        let mut agent_for_turn = match agent.take() {
+            Some(mut live) => {
+                if let Some(model) = request.model.as_deref()
+                    && model != shared.model()
+                {
+                    let config = task_config.as_ref().unwrap_or(&base_config);
+                    switch_model(&mut live, config, model, &shared).await;
                 }
-                Err(err) => {
-                    shared.push(Frame::Error {
-                        message: format!("could not start the agent: {err:#}"),
-                    });
-                    shared.push(Frame::Done { reason: "error" });
-                    shared.finish_turn(true);
-                    continue;
+                live
+            }
+            None => {
+                let config = agent_config(&base_config, request.model.as_deref());
+                match build_headless_agent_for_session(&config, &shared.cwd, session.clone()).await
+                {
+                    Ok(mut built) => {
+                        if config.plan_first {
+                            built.set_plan_mode(true);
+                        }
+                        if config.omakase {
+                            built.set_omakase(true);
+                        }
+                        shared.set_cancel(built.cancel_handle());
+                        shared.set_model(&config.active().model);
+                        fire_start_hooks(&mut built, &shared).await;
+                        task_config = Some(config);
+                        built
+                    }
+                    Err(err) => {
+                        shared.push(Frame::Error {
+                            message: format!("could not start the agent: {err:#}"),
+                        });
+                        shared.push(Frame::Done { reason: "error" });
+                        shared.finish_turn(true);
+                        continue;
+                    }
                 }
             }
-        } else if let Some(model) = request.model.as_deref()
-            && model != shared.model()
-        {
-            let config = task_config.as_ref().unwrap_or(&base_config);
-            switch_model(
-                agent.as_mut().expect("agent is live"),
-                config,
-                model,
-                &shared,
-            )
-            .await;
-        }
+        };
 
-        let agent = agent.as_mut().expect("agent built above");
         let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
         // Drain events concurrently with the turn: the turn owns the sender
         // (dropped on completion, ending the collector), the collector owns
@@ -821,12 +1008,14 @@ async fn run_worker(
                 shared.handle_event(event);
             }
         };
-        let (result, ()) = tokio::join!(agent.run_turn(&request.text, events_tx), collector);
+        let (result, ()) =
+            tokio::join!(agent_for_turn.run_turn(&request.text, events_tx), collector);
         if let Err(err) = result {
             // The turn already emitted `error` + `done` frames; the task
             // itself stays usable.
             tracing::warn!("gui task {}: turn failed: {err:#}", shared.id);
         }
+        agent = Some(agent_for_turn);
         shared.finish_turn(false);
     }
 
@@ -929,6 +1118,152 @@ mod tests {
         assert_eq!(finished[0]["call_id"], started[0]["call_id"]);
         assert_eq!(finished[0]["ok"], true);
         assert_eq!(finished[0]["summary"], "src/app.rs (1 line)");
+    }
+
+    #[test]
+    fn subagent_run_frames_demux_by_run_and_pair_their_own_tool_calls() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        for (run, name) in [(1_u64, "researcher"), (2, "reviewer")] {
+            shared.handle_event(AgentEvent::SubagentRunStarted {
+                run,
+                bg: None,
+                name: name.to_string(),
+                task: format!("{name}'s task"),
+            });
+        }
+        // Two runs read a file at once: each finish must pair with its own
+        // run's call, not the other's.
+        shared.handle_event(AgentEvent::SubagentRunToolStarted {
+            run: 1,
+            name: "read_file".to_string(),
+            args: json!({ "path": "src/app.rs" }),
+        });
+        shared.handle_event(AgentEvent::SubagentRunToolStarted {
+            run: 2,
+            name: "read_file".to_string(),
+            args: json!({ "path": "src/lib.rs" }),
+        });
+        shared.handle_event(AgentEvent::SubagentRunToolFinished {
+            run: 2,
+            name: "read_file".to_string(),
+            output: ToolOutput::ok("line\n"),
+        });
+        shared.handle_event(AgentEvent::SubagentRunStep { run: 1, step: 2 });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let frames = frames(&mut rx);
+        let of_type =
+            |kind: &str| -> Vec<&Value> { frames.iter().filter(|f| f["type"] == kind).collect() };
+        let started = of_type("subagent_run_started");
+        assert_eq!(started.len(), 2, "one row per run");
+        assert_eq!(started[0]["run"], 1);
+        assert_eq!(started[0]["name"], "researcher");
+        assert_eq!(started[1]["task"], "reviewer's task");
+
+        let tools = of_type("subagent_run_tool_started");
+        let finished = of_type("subagent_run_tool_finished");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["run"], 2);
+        assert_eq!(
+            finished[0]["call_id"], tools[1]["call_id"],
+            "the finish pairs with run 2's call, not run 1's"
+        );
+        assert_eq!(
+            finished[0]["summary"], "src/lib.rs (1 line)",
+            "summarized with its own call's arguments"
+        );
+        assert_eq!(finished[0]["ok"], true);
+        assert_eq!(of_type("subagent_run_step")[0]["step"], 2);
+    }
+
+    #[test]
+    fn subagent_done_tells_a_failure_from_a_spent_step_budget() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        shared.handle_event(AgentEvent::SubagentRunDone {
+            run: 1,
+            completed: false,
+            output: "as far as I got".to_string(),
+            steps_used: 12,
+            error: None,
+        });
+        shared.handle_event(AgentEvent::SubagentRunDone {
+            run: 2,
+            completed: false,
+            output: "subagent failed: boom".to_string(),
+            steps_used: 3,
+            error: Some("boom".to_string()),
+        });
+
+        let done: Vec<Value> = frames(&mut rx)
+            .into_iter()
+            .filter(|f| f["type"] == "subagent_run_done")
+            .collect();
+        assert_eq!(done[0]["completed"], false);
+        assert_eq!(done[0]["steps_used"], 12);
+        assert_eq!(done[0]["error"], Value::Null, "it ran out of steps");
+        assert_eq!(done[0]["output"], "as far as I got");
+        assert_eq!(done[1]["error"], "boom", "it died");
+    }
+
+    #[test]
+    fn a_background_run_outlives_the_turn_that_spawned_it() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let generation = shared.attach(tx);
+        shared.handle_event(AgentEvent::SubagentRunStarted {
+            run: 7,
+            bg: Some(1),
+            name: "researcher".to_string(),
+            task: "read the docs".to_string(),
+        });
+        shared.handle_event(AgentEvent::Done {
+            reason: DoneReason::Completed,
+        });
+        shared.finish_turn(false);
+        let _ = frames(&mut rx); // the turn's own frames
+
+        // The parent turn is over; the detached run keeps streaming.
+        shared.handle_event(AgentEvent::SubagentRunText {
+            run: 7,
+            text: "still going".to_string(),
+        });
+        let live = frames(&mut rx);
+        assert_eq!(live.len(), 1, "the panel keeps updating: {live:?}");
+        assert_eq!(live[0]["type"], "subagent_run_text");
+
+        // A client that reconnects now — the run's `started` frame is in no
+        // buffer it will ever see — still gets a row to stream it into.
+        shared.detach(generation);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let replayed = frames(&mut rx);
+        assert_eq!(replayed[0]["type"], "state", "idle: no turn to replay");
+        assert_eq!(replayed[1]["type"], "subagent_run_started");
+        assert_eq!(replayed[1]["run"], 7);
+        assert_eq!(replayed[1]["bg"], 1);
+
+        // Once it ends, it is announced no more.
+        shared.handle_event(AgentEvent::SubagentRunDone {
+            run: 7,
+            completed: true,
+            output: "done".to_string(),
+            steps_used: 2,
+            error: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let replayed = frames(&mut rx);
+        assert_eq!(replayed.len(), 1, "just the state snapshot: {replayed:?}");
     }
 
     #[test]
@@ -1141,29 +1476,31 @@ mod tests {
 
     #[test]
     fn agent_config_resolves_provider_names_and_model_tags() {
-        let mut base = Config::default();
-        base.providers = vec![
-            crate::config::ProviderConfig {
-                name: "local".to_string(),
-                kind: crate::config::ProviderKind::LlamaCpp,
-                base_url: "http://127.0.0.1:11435".to_string(),
-                model: "qwen3.6:27b".to_string(),
-                api_key_env: None,
-                gguf_path: None,
-                usd_per_mtok_in: None,
-                usd_per_mtok_out: None,
-            },
-            crate::config::ProviderConfig {
-                name: "claude".to_string(),
-                kind: crate::config::ProviderKind::Anthropic,
-                base_url: "https://api.anthropic.com".to_string(),
-                model: "claude-fable-5".to_string(),
-                api_key_env: None,
-                gguf_path: None,
-                usd_per_mtok_in: None,
-                usd_per_mtok_out: None,
-            },
-        ];
+        let base = Config {
+            providers: vec![
+                crate::config::ProviderConfig {
+                    name: "local".to_string(),
+                    kind: crate::config::ProviderKind::LlamaCpp,
+                    base_url: "http://127.0.0.1:11435".to_string(),
+                    model: "qwen3.6:27b".to_string(),
+                    api_key_env: None,
+                    gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
+                },
+                crate::config::ProviderConfig {
+                    name: "claude".to_string(),
+                    kind: crate::config::ProviderKind::Anthropic,
+                    base_url: "https://api.anthropic.com".to_string(),
+                    model: "claude-fable-5".to_string(),
+                    api_key_env: None,
+                    gguf_path: None,
+                    usd_per_mtok_in: None,
+                    usd_per_mtok_out: None,
+                },
+            ],
+            ..Default::default()
+        };
 
         // Sovereign posture always applies.
         let config = agent_config(&base, None);

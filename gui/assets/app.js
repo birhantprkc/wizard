@@ -3,7 +3,7 @@
 // through the Api seam (api.js): RealApi (HTTP + one WebSocket per open
 // task) by default, MockApi with `?mock=1`.
 
-import { NEW_CHAT_TITLE, createApi } from './api.js';
+import { NEW_CHAT_TITLE, applyToolSummary, createApi } from './api.js';
 import { icons, fileIconSvg } from './icons.js';
 
 const api = createApi();
@@ -32,16 +32,13 @@ const state = {
   git: null,
   /** Elapsed label of the last finished turn ("3m 1s"). */
   lastWorked: null,
+  /** This task's subagent runs, oldest first (the panel lists them the other
+   *  way up). @type {SubagentRunView[]} */
+  subagents: [],
 };
 
 /** @type {import('./api.js').StreamHandle | null} */
 let streamHandle = null;
-/** Element new streamed content is appended into (live worked-body or transcript root). */
-let appendTarget = null;
-/** Paragraph currently receiving streamed text deltas. */
-let streamPara = null;
-/** Thinking block currently receiving thinking deltas: {block, body}. */
-let streamThink = null;
 /** The in-flight turn's collapsible section: {section, body, labelEl, startedAt}. */
 let liveTurn = null;
 /** Turn start captured when the user hits send (beats the state frame). */
@@ -50,10 +47,6 @@ let pendingTurnStart = null;
  *  marks the start of a mid-turn buffer replay. */
 let replayPending = false;
 const reconnect = { attempts: 0, timer: null };
-/** call_id -> row updater for live tool_finished frames. */
-let toolRows = new Map();
-/** Active aggregation group for consecutive explore/write calls. */
-let toolGroup = null;
 /** Transient "Retrying…" row, removed on the next frame. */
 let transientNote = null;
 let gitPoll = null;
@@ -249,31 +242,46 @@ function renderTopbar() {
 
 const transcriptInner = () => $('transcript').querySelector('.transcript-inner');
 
-function autoScroll(force = false) {
-  const scroller = $('transcript');
+/**
+ * One streaming surface: where new content lands, plus the live refs a later
+ * frame patches — the paragraph mid-stream, the tool group being aggregated,
+ * the rows waiting on their result. The main chat is one flow; an open
+ * subagent pane is another, so a subagent's rows never land in — or aggregate
+ * with — the parent's.
+ * @param {HTMLElement} scroller the element this flow scrolls in
+ */
+function newFlow(scroller) {
+  return { scroller, target: null, para: null, think: null, group: null, rows: new Map() };
+}
+
+/** The main chat's flow: the center transcript. */
+const chat = newFlow($('transcript'));
+
+function autoScroll(flow, force = false) {
+  const scroller = flow.scroller;
   const nearBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 180;
   if (force || nearBottom) scroller.scrollTop = scroller.scrollHeight;
 }
 
 /** Break the streaming text/thinking/tool-group flow (before a new block). */
-function breakFlow() {
-  streamPara = null;
-  toolGroup = null;
-  collapseThinking();
+function breakFlow(flow) {
+  flow.para = null;
+  flow.group = null;
+  collapseThinking(flow);
 }
 
-function collapseThinking() {
-  if (streamThink) {
-    streamThink.block.classList.add('collapsed');
-    streamThink = null;
+function collapseThinking(flow) {
+  if (flow.think) {
+    flow.think.block.classList.add('collapsed');
+    flow.think = null;
   }
 }
 
 function appendPromptCard(text) {
-  breakFlow();
+  breakFlow(chat);
   const inner = transcriptInner();
   inner.append(h('div', { class: 'prompt-card' }, text));
-  appendTarget = inner;
+  chat.target = inner;
 }
 
 /** Collapsible "Worked …" divider; returns its body (the new append target). */
@@ -288,11 +296,18 @@ function appendWorkedSection(label, live = false) {
     h('div', { class: 'worked-rule' }),
     body);
   transcriptInner().append(section);
-  appendTarget = body;
+  chat.target = body;
   return { section, body, labelEl };
 }
 
-function appendThinkingBlock(text, collapsed) {
+/** One whole assistant message: a replayed one, or a subagent's — which
+ *  arrive per step rather than as deltas. */
+function appendMessage(flow, text) {
+  breakFlow(flow);
+  flow.target.append(h('p', { class: 'msg-text' }, text));
+}
+
+function appendThinkingBlock(flow, text, collapsed) {
   const body = h('div', { class: 'thinking-body' }, text || '');
   const block = h('div', { class: 'thinking-block' + (collapsed ? ' collapsed' : '') },
     h('button', {
@@ -300,17 +315,17 @@ function appendThinkingBlock(text, collapsed) {
       onclick: () => block.classList.toggle('collapsed'),
     }, icon('chevronDown', 'icon thinking-caret'), h('span', {}, 'Thinking')),
     body);
-  appendTarget.append(block);
+  flow.target.append(block);
   return { block, body };
 }
 
-function appendSystemRow(text, cls = '') {
-  streamPara = null;
-  toolGroup = null;
-  collapseThinking();
+function appendSystemRow(flow, text, cls = '') {
+  flow.para = null;
+  flow.group = null;
+  collapseThinking(flow);
   const row = h('div', { class: `system-row ${cls}`.trim() }, text);
-  appendTarget.append(row);
-  autoScroll();
+  flow.target.append(row);
+  autoScroll(flow);
   return row;
 }
 
@@ -324,7 +339,7 @@ function countsText(counts) {
     .join(', ');
 }
 
-function startExploreGroup() {
+function startExploreGroup(flow) {
   const counts = new Map();
   const sublist = h('div', { class: 'tool-sublist hidden' });
   const detail = h('span', { class: 'tool-args' }, '');
@@ -333,11 +348,11 @@ function startExploreGroup() {
     class: 'tool-row tool-row-btn', type: 'button', title: 'Show the individual calls',
     onclick: () => sublist.classList.toggle('hidden'),
   }, icon('magnifier', 'icon tool-icon'), h('span', { class: 'tool-name' }, 'Explored'), detail, status);
-  appendTarget.append(h('div', { class: 'tool-group' }, row, sublist));
-  return { kind: 'explore', parent: appendTarget, counts, sublist, detail, status };
+  flow.target.append(h('div', { class: 'tool-group' }, row, sublist));
+  return { kind: 'explore', parent: flow.target, counts, sublist, detail, status };
 }
 
-function addExploreCall(group, call) {
+function addExploreCall(flow, group, call) {
   const textEl = h('span', { class: 'subline-text' }, call.detail || '');
   const line = h('div', {
     class: 'tool-subline' + (call.status === 'pending' ? ' pending' : '') + (call.status === 'failed' ? ' failed' : ''),
@@ -346,7 +361,7 @@ function addExploreCall(group, call) {
   group.counts.set(call.noun, (group.counts.get(call.noun) || 0) + 1);
   group.detail.textContent = countsText(group.counts);
   if (call.status === 'failed') group.status.classList.remove('hidden');
-  toolRows.set(call.id, {
+  flow.rows.set(call.id, {
     update(result) {
       line.classList.remove('pending');
       if (result.summary) textEl.textContent = result.summary;
@@ -358,14 +373,14 @@ function addExploreCall(group, call) {
   });
 }
 
-function startWriteGroup() {
+function startWriteGroup(flow) {
   const addEl = h('span', { class: 'diffstat-add hidden' });
   const delEl = h('span', { class: 'diffstat-del hidden' });
   const status = h('span', { class: 'tool-status hidden' }, 'Failed');
   const row = h('div', { class: 'tool-row' },
     icon('pencil', 'icon tool-icon'), h('span', { class: 'tool-name' }, 'Wrote'), addEl, delEl, status);
-  appendTarget.append(row);
-  const group = { kind: 'write', parent: appendTarget, row, addEl, delEl, status, totals: { add: 0, del: 0 } };
+  flow.target.append(row);
+  const group = { kind: 'write', parent: flow.target, row, addEl, delEl, status, totals: { add: 0, del: 0 } };
   group.bump = (diffstat) => {
     if (!diffstat) return;
     group.totals.add += diffstat.additions || 0;
@@ -376,7 +391,7 @@ function startWriteGroup() {
   return group;
 }
 
-function addWriteCall(group, call) {
+function addWriteCall(flow, group, call) {
   const files = call.files && call.files.length ? call.files : [{ name: call.name || 'file' }];
   const chips = files.map((f) =>
     h('button', {
@@ -388,7 +403,7 @@ function addWriteCall(group, call) {
   for (const chip of chips) group.status.before(chip);
   group.bump(call.diffstat);
   if (call.status === 'failed') group.status.classList.remove('hidden');
-  toolRows.set(call.id, {
+  flow.rows.set(call.id, {
     update(result) {
       for (const chip of chips) chip.classList.remove('pending');
       if (result.status === 'failed') {
@@ -399,7 +414,7 @@ function addWriteCall(group, call) {
   });
 }
 
-function appendStandaloneTool(call) {
+function appendStandaloneTool(flow, call) {
   const row = h('div', { class: 'tool-row' + (call.status === 'pending' ? ' pending' : ''), dataset: { callId: call.id || '' } });
   let detailEl = null;
   if (call.tool === 'run') {
@@ -427,8 +442,8 @@ function appendStandaloneTool(call) {
   }
   const status = h('span', { class: 'tool-status' + (call.status === 'failed' ? '' : ' hidden') }, 'Failed');
   row.append(status);
-  appendTarget.append(row);
-  toolRows.set(call.id, {
+  flow.target.append(row);
+  flow.rows.set(call.id, {
     update(result) {
       row.classList.remove('pending');
       if (detailEl && result.summary) detailEl.textContent = result.summary;
@@ -441,30 +456,31 @@ function appendStandaloneTool(call) {
  * Append one tool call, aggregating consecutive explore calls into a single
  * "Explored" row (counts + expandable sublist) and consecutive writes into a
  * single "Wrote" row (file chips + running diffstat).
+ * @param {Object} flow
  * @param {import('./api.js').ToolCall} call
  */
-function appendToolCall(call) {
-  collapseThinking();
-  streamPara = null;
+function appendToolCall(flow, call) {
+  collapseThinking(flow);
+  flow.para = null;
   if (call.tool === 'explore' && call.noun) {
-    if (!(toolGroup && toolGroup.kind === 'explore' && toolGroup.parent === appendTarget)) {
-      toolGroup = startExploreGroup();
+    if (!(flow.group && flow.group.kind === 'explore' && flow.group.parent === flow.target)) {
+      flow.group = startExploreGroup(flow);
     }
-    addExploreCall(toolGroup, call);
+    addExploreCall(flow, flow.group, call);
   } else if (call.tool === 'write' && call.name) {
-    if (!(toolGroup && toolGroup.kind === 'write' && toolGroup.parent === appendTarget)) {
-      toolGroup = startWriteGroup();
+    if (!(flow.group && flow.group.kind === 'write' && flow.group.parent === flow.target)) {
+      flow.group = startWriteGroup(flow);
     }
-    addWriteCall(toolGroup, call);
+    addWriteCall(flow, flow.group, call);
   } else {
-    toolGroup = null;
-    appendStandaloneTool(call);
+    flow.group = null;
+    appendStandaloneTool(flow, call);
   }
-  autoScroll();
+  autoScroll(flow);
 }
 
-function onToolResult(result) {
-  const row = toolRows.get(result.callId);
+function onToolResult(flow, result) {
+  const row = flow.rows.get(result.callId);
   if (row) row.update(result);
 }
 
@@ -523,7 +539,7 @@ function renderMarkdownInto(root, md) {
 }
 
 function onPlan(plan) {
-  breakFlow();
+  breakFlow(chat);
   const id = state.selectedTaskId;
   const body = h('div', { class: 'plan-body' });
   renderMarkdownInto(body, plan);
@@ -561,12 +577,12 @@ function onPlan(plan) {
     }
     try { api.planVerdict(id, false, feedback.value.trim()); resolve('Plan rejected'); } catch (err) { fail(err); }
   };
-  appendTarget.append(card);
-  autoScroll(true);
+  chat.target.append(card);
+  autoScroll(chat, true);
 }
 
 function onInterview(questions) {
-  breakFlow();
+  breakFlow(chat);
   const id = state.selectedTaskId;
   const inputs = questions.map((q) =>
     h('textarea', { class: 'input iv-answer', rows: '1', placeholder: 'Your answer (optional)', 'aria-label': q }));
@@ -596,46 +612,50 @@ function onInterview(questions) {
   skipBtn.onclick = () => {
     try { api.interviewAnswers(id, null); resolve('Interview skipped'); } catch (err) { fail(err); }
   };
-  appendTarget.append(card);
-  autoScroll(true);
+  chat.target.append(card);
+  autoScroll(chat, true);
 }
 
 /* ------------------------------------------------------------------------ */
 /* Transcript: replay + live turn                                            */
 /* ------------------------------------------------------------------------ */
 
+/** Reset the chat flow onto a fresh transcript body. */
+function resetChatFlow(inner) {
+  chat.target = inner;
+  chat.para = null;
+  chat.think = null;
+  chat.group = null;
+  chat.rows = new Map();
+  liveTurn = null;
+}
+
 function renderTranscript() {
   const scroller = $('transcript');
   const inner = h('div', { class: 'transcript-inner' });
   scroller.replaceChildren(inner);
-  streamPara = null;
-  streamThink = null;
-  toolGroup = null;
-  liveTurn = null;
-  toolRows = new Map();
-  appendTarget = inner;
+  resetChatFlow(inner);
   if (!state.task) return;
 
   for (const item of state.task.transcript) {
     if (item.type === 'user') {
       appendPromptCard(item.text);
     } else if (item.type === 'worked') {
-      breakFlow();
+      breakFlow(chat);
       appendWorkedSection(item.label || 'Worked');
     } else if (item.type === 'text') {
-      breakFlow();
-      appendTarget.append(h('p', { class: 'msg-text' }, item.text));
+      appendMessage(chat, item.text);
     } else if (item.type === 'thinking') {
-      streamPara = null;
-      toolGroup = null;
-      appendThinkingBlock(item.text, true);
+      chat.para = null;
+      chat.group = null;
+      appendThinkingBlock(chat, item.text, true);
     } else if (item.type === 'tool') {
-      appendToolCall(item);
+      appendToolCall(chat, item);
     } else if (item.type === 'notice') {
-      appendSystemRow(item.text);
+      appendSystemRow(chat, item.text);
     }
   }
-  breakFlow();
+  breakFlow(chat);
   scroller.scrollTop = scroller.scrollHeight;
 }
 
@@ -651,22 +671,17 @@ function truncateAfterLastPrompt() {
   } else {
     while (last.nextSibling) last.nextSibling.remove();
   }
-  appendTarget = inner;
-  streamPara = null;
-  streamThink = null;
-  toolGroup = null;
-  liveTurn = null;
-  toolRows = new Map();
+  resetChatFlow(inner);
 }
 
 function beginLiveTurn() {
   liveTurn = null; // any previous section was finalized or truncated
-  breakFlow();
+  breakFlow(chat);
   const { section, body, labelEl } = appendWorkedSection('Working…', true);
   liveTurn = { section, body, labelEl, startedAt: pendingTurnStart || Date.now() };
   pendingTurnStart = null;
-  toolRows = new Map();
-  autoScroll(true);
+  chat.rows = new Map();
+  autoScroll(chat, true);
 }
 
 const DONE_SUFFIX = { cancelled: ' (cancelled)', max_steps: ' (step limit)', error: ' (error)' };
@@ -683,24 +698,24 @@ function finalizeLiveTurn(reason) {
 /* --- Stream callbacks ------------------------------------------------------ */
 
 function onText(delta) {
-  collapseThinking();
-  toolGroup = null;
-  if (!streamPara || !streamPara.isConnected) {
-    streamPara = h('p', { class: 'msg-text streaming' });
-    appendTarget.append(streamPara);
+  collapseThinking(chat);
+  chat.group = null;
+  if (!chat.para || !chat.para.isConnected) {
+    chat.para = h('p', { class: 'msg-text streaming' });
+    chat.target.append(chat.para);
   }
-  streamPara.textContent += delta;
-  autoScroll();
+  chat.para.textContent += delta;
+  autoScroll(chat);
 }
 
 function onThinking(delta) {
-  streamPara = null;
-  toolGroup = null;
-  if (!streamThink || !streamThink.body.isConnected) {
-    streamThink = appendThinkingBlock('', false);
+  chat.para = null;
+  chat.group = null;
+  if (!chat.think || !chat.think.body.isConnected) {
+    chat.think = appendThinkingBlock(chat, '', false);
   }
-  streamThink.body.textContent += delta;
-  autoScroll();
+  chat.think.body.textContent += delta;
+  autoScroll(chat);
 }
 
 function onStatus(status) {
@@ -742,8 +757,8 @@ function onRetrying(attempt) {
   transientNote = h('div', { class: 'system-row retrying' },
     h('span', { class: 'spinner-icon spinning', html: icons.spinner, 'aria-hidden': 'true' }),
     ` Retrying (attempt ${attempt})…`);
-  appendTarget.append(transientNote);
-  autoScroll();
+  chat.target.append(transientNote);
+  autoScroll(chat);
 }
 
 function onDone(reason) {
@@ -832,15 +847,25 @@ function renderContextPanel() {
       icon('target', 'icon goal-icon'),
       h('div', { class: 'goal-main' }, ctx.goalText, ctx.goalMeta)));
 
+  // --- Subagents ---
+  ctx.subagentList = h('div', { class: 'subagent-list' });
+  ctx.subagentSection = h('section', { class: 'ctx-section hidden' },
+    h('div', { class: 'ctx-header' }, h('span', {}, 'Subagents')),
+    ctx.subagentList);
+  /** run id -> the row's live refs, patched as the run streams. */
+  ctx.subagentRows = new Map();
+
   // --- Progress ---
   ctx.progressList = h('div', { class: 'progress-list' });
   ctx.progressSection = h('section', { class: 'ctx-section hidden' },
     h('div', { class: 'ctx-header' }, h('span', {}, 'Progress')),
     ctx.progressList);
 
-  root.append(h('div', { class: 'context-card' }, ctx.gitSection, goalSection, ctx.progressSection));
+  root.append(h('div', { class: 'context-card' },
+    ctx.gitSection, goalSection, ctx.subagentSection, ctx.progressSection));
   updateGitCard();
   updateGoal();
+  renderSubagentList();
   updateProgress();
 }
 
@@ -963,6 +988,303 @@ function syncGitPoll() {
     clearInterval(gitPoll);
     gitPoll = null;
   }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Subagents: the panel's list of runs, and one run's own pane               */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * One subagent run, in the vocabulary the TUI's rail already uses for the same
+ * events — run, name, task, status, transcript, steps, unread — so the two
+ * surfaces describe a run the same way.
+ * @typedef {Object} SubagentRunView
+ * @property {number} run              Session-unique run id (frames are scoped to it).
+ * @property {number|null} bg          Background-registry id; null when the parent waits on it.
+ * @property {string} name
+ * @property {string} task
+ * @property {'running'|'done'|'failed'|'budget'} status
+ * @property {RunEntry[]} transcript   Its own messages and tool cards.
+ * @property {number} steps            Model round-trips completed.
+ * @property {number} startedAt
+ * @property {number|null} finishedAt  Set when it ends; freezes the elapsed clock.
+ * @property {number} unread           Entries appended since its pane was last open.
+ */
+
+/**
+ * One entry of a run's transcript: a message it wrote, a tool card, or a
+ * closing notice.
+ * @typedef {Object} RunEntry
+ * @property {'text'|'tool'|'notice'} type
+ * @property {string} [text]
+ * @property {string} [cls]                          Row modifier for a notice ('error').
+ * @property {import('./api.js').ToolCall} [call]
+ */
+
+/** The run whose pane is open in the main content area: {view, flow, ...refs}. */
+let openPane = null;
+/** Ticks the elapsed clock of the runs still going. */
+let paneClock = null;
+
+/** What the pane header calls each status; the dot is colored by it too. */
+const RUN_STATUS = { running: 'Running', done: 'Done', failed: 'Failed', budget: 'Step limit' };
+
+const findRun = (id) => state.subagents.find((run) => run.run === id);
+
+/** A tool card as one line: what it did, to what. */
+function callLine(call) {
+  const subject = call.command || call.detail || (call.files || []).map((f) => f.name).join(', ');
+  return subject ? `${call.title} ${subject}` : call.title;
+}
+
+/** What the subagent is doing right now: the tool it is in the middle of, else
+ *  its latest message, else the task it was handed. */
+function runActivity(run) {
+  for (let i = run.transcript.length - 1; i >= 0; i -= 1) {
+    const entry = run.transcript[i];
+    // A call still running is the most specific thing to say — but only while
+    // the run is going; a finished run is described by what it concluded.
+    if (run.status === 'running' && entry.type === 'tool' && entry.call.status === 'pending') {
+      return callLine(entry.call);
+    }
+    if (entry.type === 'text' && entry.text.trim()) return entry.text;
+  }
+  return run.task;
+}
+
+/** "3 steps · 12s" — the clock frozen once the run ends. */
+function runMeta(run) {
+  const secs = Math.max(1, Math.round(((run.finishedAt || Date.now()) - run.startedAt) / 1000));
+  return `${run.steps} ${run.steps === 1 ? 'step' : 'steps'} · ${fmtDur(secs)}`;
+}
+
+/**
+ * Rebuild the list of runs, most recent first. Called when a run starts (or a
+ * task loads) — never per streamed frame: what a run is *doing* is patched
+ * into the row it already has, through the refs kept here.
+ */
+function renderSubagentList() {
+  if (!ctx) return;
+  ctx.subagentRows = new Map();
+  // No box when there is nothing in it.
+  ctx.subagentSection.classList.toggle('hidden', !state.subagents.length);
+
+  const rows = [];
+  for (const run of [...state.subagents].reverse()) {
+    const dot = h('span', { class: 'sub-dot' });
+    const badge = h('span', { class: 'sub-badge hidden' });
+    const activity = h('div', { class: 'sub-activity' });
+    const meta = h('div', { class: 'sub-meta' });
+    const row = h('button', {
+      class: 'ctx-row subagent-row', type: 'button', title: `${run.name} — ${run.task}`,
+      onclick: () => openSubagentPane(run.run),
+    },
+      dot,
+      h('div', { class: 'sub-main' },
+        h('div', { class: 'sub-line' }, h('span', { class: 'sub-name' }, run.name), badge),
+        activity,
+        meta));
+    ctx.subagentRows.set(run.run, { row, dot, badge, activity, meta });
+    rows.push(row);
+  }
+  ctx.subagentList.replaceChildren(...rows);
+  for (const run of state.subagents) updateSubagentRow(run);
+  syncPaneClock();
+}
+
+/** Patch one run's row in place: its dot, what it is doing, steps and time. */
+function updateSubagentRow(run) {
+  const row = ctx && ctx.subagentRows.get(run.run);
+  if (!row) return;
+  row.dot.className = `sub-dot ${run.status}`;
+  row.activity.textContent = runActivity(run);
+  row.meta.textContent = runMeta(run);
+  row.badge.textContent = String(run.unread);
+  row.badge.classList.toggle('hidden', !run.unread);
+  row.row.classList.toggle('open', !!openPane && openPane.view === run);
+}
+
+/** A run changed: patch its row, and its pane's header when it is the open one. */
+function touchRun(run) {
+  updateSubagentRow(run);
+  if (openPane && openPane.view === run) updatePaneHead();
+}
+
+/** Keep the elapsed time honest while a run is going; stop when none is. */
+function syncPaneClock() {
+  const wants = state.subagents.some((run) => run.status === 'running');
+  if (wants && !paneClock) {
+    paneClock = setInterval(() => {
+      for (const run of state.subagents) {
+        if (run.status === 'running') touchRun(run);
+      }
+    }, 1000);
+  } else if (!wants && paneClock) {
+    clearInterval(paneClock);
+    paneClock = null;
+  }
+}
+
+/* --- The run's stream ------------------------------------------------------ */
+
+/** `subagent_run_started`. A run already listed was re-announced on attach —
+ *  a background run outliving the turn that spawned it — so its row stands. */
+function onSubagentRun(info) {
+  if (findRun(info.run)) return;
+  state.subagents.push({
+    ...info,
+    status: 'running',
+    transcript: [],
+    steps: 0,
+    startedAt: Date.now(),
+    finishedAt: null,
+    unread: 0,
+  });
+  renderSubagentList();
+}
+
+/** Render one entry with the components the main chat uses, so a subagent's
+ *  messages and tool cards read exactly like the parent's. */
+function renderRunEntry(flow, entry) {
+  if (entry.type === 'text') appendMessage(flow, entry.text);
+  else if (entry.type === 'tool') appendToolCall(flow, entry.call);
+  else appendSystemRow(flow, entry.text, entry.cls || '');
+}
+
+/** Append to a run: into its transcript always, into its pane when open —
+ *  and onto its unread badge when the user is looking somewhere else. */
+function appendToRun(run, entry) {
+  run.transcript.push(entry);
+  if (openPane && openPane.view === run) {
+    renderRunEntry(openPane.flow, entry);
+    autoScroll(openPane.flow);
+  } else {
+    run.unread += 1;
+  }
+}
+
+function onSubagentText(id, text) {
+  const run = findRun(id);
+  if (!run || !text.trim()) return;
+  appendToRun(run, { type: 'text', text });
+  touchRun(run);
+}
+
+function onSubagentToolCall(id, call) {
+  const run = findRun(id);
+  if (!run) return;
+  appendToRun(run, { type: 'tool', call });
+  touchRun(run);
+}
+
+function onSubagentToolResult(id, result) {
+  const run = findRun(id);
+  if (!run) return;
+  const entry = run.transcript.find((e) => e.type === 'tool' && e.call.id === result.callId);
+  if (entry) {
+    entry.call.status = result.status;
+    applyToolSummary(entry.call, result.summary);
+  }
+  if (openPane && openPane.view === run) onToolResult(openPane.flow, result);
+  touchRun(run);
+}
+
+function onSubagentStep(id, step) {
+  const run = findRun(id);
+  if (!run) return;
+  run.steps = step;
+  touchRun(run);
+}
+
+function onSubagentDone(id, result) {
+  const run = findRun(id);
+  if (!run) return;
+  run.status = result.error ? 'failed' : result.completed ? 'done' : 'budget';
+  run.finishedAt = Date.now();
+  if (result.stepsUsed) run.steps = result.stepsUsed;
+  // The subagent's final message is the step that made no tool call, so the
+  // sub-loop ends on it without streaming it: it arrives here, as the report.
+  // Without this the pane would show all of the work and none of the outcome.
+  const last = run.transcript[run.transcript.length - 1];
+  const reported = last && last.type === 'text' && last.text === result.output;
+  if (result.output.trim() && !reported) {
+    appendToRun(run, { type: 'text', text: result.output });
+  }
+  if (result.error) {
+    appendToRun(run, { type: 'notice', text: `failed: ${result.error}`, cls: 'error' });
+  } else if (!result.completed) {
+    appendToRun(run, { type: 'notice', text: 'hit its step budget' });
+  }
+  touchRun(run);
+  syncPaneClock();
+}
+
+/* --- The pane --------------------------------------------------------------- */
+
+/**
+ * Open one run's own view in the main content area: its messages and its tool
+ * cards, streaming on while it runs. The chat is only hidden, never torn down,
+ * so it keeps streaming behind this and is one press away — the back control,
+ * or Escape.
+ */
+function openSubagentPane(id) {
+  const run = findRun(id);
+  if (!run) return;
+  const body = h('div', { class: 'transcript-inner' });
+  const scroll = h('div', { class: 'transcript pane-scroll' }, body);
+  const flow = newFlow(scroll);
+  flow.target = body;
+
+  const status = h('span', { class: 'pane-status' });
+  const meta = h('span', { class: 'pane-meta' });
+  const head = h('header', { class: 'pane-head' },
+    h('div', { class: 'pane-head-row' },
+      h('button', {
+        class: 'btn quiet btn-sm pane-back', type: 'button', title: 'Back to the chat (Esc)',
+        onclick: () => closeSubagentPane(),
+      }, icon('chevronLeft', 'icon pane-back-icon'), 'Chat'),
+      icon('agents', 'icon pane-icon'),
+      h('span', { class: 'pane-name' }, run.name),
+      status,
+      h('span', { class: 'pane-spacer' }),
+      meta),
+    h('div', { class: 'pane-task' }, run.task));
+
+  const view = $('subagent-view');
+  view.replaceChildren(head, scroll);
+  view.classList.remove('hidden');
+  $('transcript').classList.add('hidden');
+  openPane = { view: run, flow, status, meta };
+
+  for (const entry of run.transcript) renderRunEntry(flow, entry);
+  breakFlow(flow);
+  run.unread = 0;
+  updatePaneHead();
+  updateSubagentRow(run);
+  scroll.scrollTop = scroll.scrollHeight;
+}
+
+/** The pane's header: what the run is, and where it has got to. */
+function updatePaneHead() {
+  if (!openPane) return;
+  const run = openPane.view;
+  openPane.status.className = `pane-status ${run.status}`;
+  openPane.status.textContent = RUN_STATUS[run.status];
+  openPane.meta.textContent = runMeta(run);
+}
+
+/** Back to the chat — the pane's DOM goes with it, so no two panes ever share
+ *  a row or a tool group. */
+function closeSubagentPane() {
+  if (!openPane) return;
+  const run = openPane.view;
+  openPane = null;
+  const view = $('subagent-view');
+  view.replaceChildren();
+  view.classList.add('hidden');
+  $('transcript').classList.remove('hidden');
+  updateSubagentRow(run);
+  autoScroll(chat, true);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1162,7 +1484,7 @@ function openBranchMenu(anchor) {
       try {
         const now = await api.checkout(task, branch, create);
         closeMenu();
-        appendSystemRow(`Switched to ${now}`);
+        appendSystemRow(chat, `Switched to ${now}`);
         await refreshGit();
         renderTopbar();
       } catch (e) {
@@ -1217,7 +1539,7 @@ function stopTurn() {
   if (state.taskState !== 'working' || !state.selectedTaskId) return;
   try {
     api.cancel(state.selectedTaskId);
-    appendSystemRow('Stopping…');
+    appendSystemRow(chat, 'Stopping…');
   } catch {
     /* the socket is gone; the turn is not ours to stop */
   }
@@ -1291,7 +1613,7 @@ function titleFrom(text) {
 async function send(text) {
   appendPromptCard(text);
   pendingTurnStart = Date.now();
-  autoScroll(true);
+  autoScroll(chat, true);
   // The first message in an empty chat names it, everywhere it is shown.
   if (state.task && state.task.title === NEW_CHAT_TITLE) {
     state.task.title = titleFrom(text);
@@ -1303,7 +1625,7 @@ async function send(text) {
   try {
     await api.sendMessage(state.task.id, text, { model: state.modelId || undefined });
   } catch (err) {
-    appendSystemRow(String((err && err.message) || err), 'error');
+    appendSystemRow(chat, String((err && err.message) || err), 'error');
   }
 }
 
@@ -1744,7 +2066,7 @@ async function newChat(cwd) {
 /** `newChat` for the buttons that have nowhere better to show a failure. */
 function newChatHere() {
   newChat().catch((err) => {
-    appendSystemRow(`Could not start a new chat: ${String((err && err.message) || err)}`, 'error');
+    appendSystemRow(chat, `Could not start a new chat: ${String((err && err.message) || err)}`, 'error');
   });
 }
 
@@ -1828,26 +2150,37 @@ function makeCallbacks(id) {
     },
     onText: content(onText),
     onThinking: content(onThinking),
-    onToolCall: content(appendToolCall),
-    onToolResult: content(onToolResult),
+    onToolCall: content((call) => appendToolCall(chat, call)),
+    onToolResult: content((result) => onToolResult(chat, result)),
     onStatus: guard(onStatus), // reads + clears replayPending itself
     onTodo: content(onTodo),
     onUsage: content(onUsage),
     onPlan: content(onPlan),
     onInterview: content(onInterview),
-    onNotice: content((text) => appendSystemRow(text)),
-    onError: content((message) => appendSystemRow(message, 'error')),
+    onNotice: content((text) => appendSystemRow(chat, text)),
+    onError: content((message) => appendSystemRow(chat, message, 'error')),
     onRetrying: content(onRetrying),
     onDone: content(onDone),
+    onSubagentRun: content(onSubagentRun),
+    onSubagentText: content(onSubagentText),
+    onSubagentToolCall: content(onSubagentToolCall),
+    onSubagentToolResult: content(onSubagentToolResult),
+    onSubagentStep: content(onSubagentStep),
+    onSubagentDone: content(onSubagentDone),
   };
 }
 
 async function selectTask(id, { reload = false } = {}) {
   const seq = ++selectSeq;
   closeStream();
+  closeSubagentPane();
   if (gitPoll) {
     clearInterval(gitPoll);
     gitPoll = null;
+  }
+  if (paneClock) {
+    clearInterval(paneClock);
+    paneClock = null;
   }
   const sameTask = reload && state.task && state.task.id === id;
   state.selectedTaskId = id;
@@ -1855,6 +2188,7 @@ async function selectTask(id, { reload = false } = {}) {
   state.usage = { prompt: 0, completion: 0 };
   state.git = null;
   state.lastWorked = null;
+  state.subagents = [];
   state.taskState = 'connecting';
   if (!sameTask) {
     state.modelId = null;
@@ -1873,8 +2207,8 @@ async function selectTask(id, { reload = false } = {}) {
       const scroller = $('transcript');
       const inner = h('div', { class: 'transcript-inner' });
       scroller.replaceChildren(inner);
-      appendTarget = inner;
-      appendSystemRow(`Could not load the task: ${String((err && err.message) || err)}`, 'error');
+      resetChatFlow(inner);
+      appendSystemRow(chat, `Could not load the task: ${String((err && err.message) || err)}`, 'error');
       renderContextPanel();
     }
     scheduleReconnect(id); // the backend may just be restarting
@@ -1921,8 +2255,8 @@ async function init() {
     const scroller = $('transcript');
     const inner = h('div', { class: 'transcript-inner' });
     scroller.replaceChildren(inner);
-    appendTarget = inner;
-    appendSystemRow(`Could not reach the wizard backend: ${String((err && err.message) || err)}`, 'error');
+    resetChatFlow(inner);
+    appendSystemRow(chat, `Could not reach the wizard backend: ${String((err && err.message) || err)}`, 'error');
     return;
   }
   resortWorkspaces();
@@ -1936,6 +2270,12 @@ async function init() {
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n') {
       e.preventDefault();
       newChatHere();
+    }
+    // One press back out of a subagent pane — unless an overlay is up, whose
+    // own Escape closes it first.
+    if (e.key === 'Escape' && openPane && !$('overlay-root').firstChild) {
+      e.preventDefault();
+      closeSubagentPane();
     }
   });
 

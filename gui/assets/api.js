@@ -71,6 +71,26 @@
  */
 
 /**
+ * One subagent run, announced by a `subagent_run_started` frame. Every later
+ * `subagent_run_*` frame carries the same `run`, so concurrent runs demux
+ * into their own panes.
+ * @typedef {Object} SubagentRun
+ * @property {number} run           Session-unique run id.
+ * @property {number|null} bg       Background-registry id; null when the parent waits on it.
+ * @property {string} name          Subagent name ("researcher", "reviewer", ...).
+ * @property {string} task          The task it was handed.
+ */
+
+/**
+ * How a subagent run ended.
+ * @typedef {Object} SubagentResult
+ * @property {boolean} completed    False when it hit its step budget.
+ * @property {string} output        Its final report (the step that made no tool call).
+ * @property {number} stepsUsed
+ * @property {string|null} error    Set when it died on a hard error.
+ */
+
+/**
  * One item of a task transcript, discriminated by `type`:
  *  - {type:'user',     text}                    user prompt quote card
  *  - {type:'worked',   label}                   collapsible "Worked ..." divider
@@ -126,6 +146,12 @@
  * @property {(message: string) => void} [onError]
  * @property {(attempt: number) => void} [onRetrying]
  * @property {(reason: string) => void} [onDone]
+ * @property {(run: SubagentRun) => void} [onSubagentRun]                      A run started.
+ * @property {(run: number, text: string) => void} [onSubagentText]            One of its messages.
+ * @property {(run: number, call: ToolCall) => void} [onSubagentToolCall]
+ * @property {(run: number, result: ToolResult) => void} [onSubagentToolResult]
+ * @property {(run: number, step: number) => void} [onSubagentStep]
+ * @property {(run: number, result: SubagentResult) => void} [onSubagentDone]
  */
 
 /**
@@ -317,6 +343,45 @@ function dispatchFrame(frame, cb) {
       cb.onNotice && cb.onNotice(
         `subagent ${frame.name || ''} ${frame.phase}${frame.task ? `: ${firstLine(frame.task)}` : ''}`,
       );
+      break;
+    // The run-scoped stream: one subagent's own messages and tool calls, which
+    // the panel lists as a row and the pane renders as its own chat.
+    case 'subagent_run_started':
+      cb.onSubagentRun && cb.onSubagentRun({
+        run: frame.run,
+        bg: frame.bg == null ? null : frame.bg,
+        name: frame.name || 'subagent',
+        task: frame.task || '',
+      });
+      break;
+    case 'subagent_run_text':
+      cb.onSubagentText && cb.onSubagentText(frame.run, frame.text || '');
+      break;
+    case 'subagent_run_tool_started': {
+      const call = classifyTool(frame.name || 'tool', frame.args || {});
+      call.id = String(frame.call_id);
+      call.status = 'pending';
+      if (!call.hidden) cb.onSubagentToolCall && cb.onSubagentToolCall(frame.run, call);
+      break;
+    }
+    case 'subagent_run_tool_finished':
+      cb.onSubagentToolResult && cb.onSubagentToolResult(frame.run, {
+        callId: String(frame.call_id),
+        name: frame.name,
+        status: frame.ok ? 'ok' : 'failed',
+        summary: frame.summary || '',
+      });
+      break;
+    case 'subagent_run_step':
+      cb.onSubagentStep && cb.onSubagentStep(frame.run, frame.step || 0);
+      break;
+    case 'subagent_run_done':
+      cb.onSubagentDone && cb.onSubagentDone(frame.run, {
+        completed: !!frame.completed,
+        output: frame.output || '',
+        stepsUsed: frame.steps_used || 0,
+        error: frame.error || null,
+      });
       break;
     case 'notice':
       cb.onNotice && cb.onNotice(frame.text || '');
