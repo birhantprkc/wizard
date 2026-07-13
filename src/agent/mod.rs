@@ -187,6 +187,41 @@ pub enum AgentEvent {
         completed: bool,
         output: String,
     },
+    /// A subagent run started, foreground or background. `run` scopes every
+    /// later `SubagentRun*` event below to this run, so a surface can demux
+    /// concurrent runs of the same subagent into separate panes. `bg` carries
+    /// the background-registry id when the run was detached, so the surface
+    /// can kill it.
+    SubagentRunStarted {
+        run: u64,
+        bg: Option<u32>,
+        name: String,
+        task: String,
+    },
+    /// A subagent produced assistant text (its own message, between tool
+    /// calls). Scoped to a run.
+    SubagentRunText { run: u64, text: String },
+    /// A subagent started a tool call. Scoped to a run; the tool name is bare
+    /// (the pane supplies the subagent's name).
+    SubagentRunToolStarted { run: u64, name: String, args: Value },
+    /// A subagent's tool call finished. Scoped to a run.
+    SubagentRunToolFinished {
+        run: u64,
+        name: String,
+        output: ToolOutput,
+    },
+    /// A subagent completed one step (model round-trip). 1-based, scoped to a
+    /// run.
+    SubagentRunStep { run: u64, step: u32 },
+    /// A subagent run ended. Scoped to a run. `error` is set when it died on a
+    /// hard error; `completed` is false when it hit its step budget.
+    SubagentRunDone {
+        run: u64,
+        completed: bool,
+        output: String,
+        steps_used: u32,
+        error: Option<String>,
+    },
     /// The agent asked to run one of Wizard's own slash commands via the
     /// `run_command` tool. Carries the raw command line (e.g. `/effort high`).
     /// The interactive surface validates and dispatches it once the turn ends
@@ -871,6 +906,14 @@ impl Agent {
     /// and finished), oldest first, for `/bashes`.
     pub fn tasks(&self) -> Vec<crate::tools::tasks::Task> {
         self.ctx.tasks.list()
+    }
+
+    /// Shared handle on the background-subagent registry, so a surface can
+    /// kill a detached run. Cloned out rather than borrowed through the agent
+    /// because the TUI parks the whole `Agent` elsewhere while a turn is in
+    /// flight — which is exactly when you want to kill a runaway subagent.
+    pub fn subagent_registry(&self) -> Arc<crate::tools::subagent_tasks::SubagentTaskRegistry> {
+        Arc::clone(&self.ctx.subagents)
     }
 
     /// Redirect (or disable) the per-turn usage JSONL log. Defaults to

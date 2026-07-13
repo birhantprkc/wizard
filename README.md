@@ -44,7 +44,7 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 ## Docs
 
 - [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS), tiers, providers, first run, in-place updates (`wizard update`), troubleshooting
-- [Usage](docs/usage.md): slash commands, `wizard agents`, token usage and cost, todos, project instructions
+- [Usage](docs/usage.md): slash commands, `wizard agents`, the subagent rail, token usage and cost, todos, project instructions
 - [Gateway](docs/gateway.md): run Wizard as a Telegram bot
 - [Modes](docs/modes.md): genie, sovereign, and continuous
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback

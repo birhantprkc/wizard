@@ -6,6 +6,8 @@ A sovereign run (`wizard --mode sovereign -p "task"`, or any `-p` run without a 
 
 The human-readable stream you get today: assistant deltas as they arrive, dimmed reasoning, `→ tool` / `← tool [ok]` one-liners, a busy spinner on terminals, and a `[run finished: ...]` trailer with token totals.
 
+A subagent's tool calls print inline under the subagent's name (`→ researcher ▸ web_fetch {…}` / `← researcher ▸ web_fetch [ok]`); the TUI puts them on its [subagent rail](usage.md#the-subagent-rail) instead. The structured formats below label them the same way in their `name` fields.
+
 ## `json`
 
 Silent until the run ends, then exactly one JSON object on stdout:

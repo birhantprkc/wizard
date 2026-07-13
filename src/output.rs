@@ -13,6 +13,7 @@
 //! The run outcome also becomes the process exit code (see [`exit_code`]),
 //! so scripts can branch on *why* a run ended without parsing output.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -77,6 +78,10 @@ pub struct TextSink {
     spinner: Arc<TurnSpinner>,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Run id -> subagent name, so a subagent's tool calls can still be
+    /// printed as `<name> ▸ <tool>`. The TUI routes these into the run's pane
+    /// instead; headless has no rail, so it keeps the inline log.
+    subagents: HashMap<u64, String>,
 }
 
 impl TextSink {
@@ -85,7 +90,18 @@ impl TextSink {
             spinner,
             prompt_tokens: 0,
             completion_tokens: 0,
+            subagents: HashMap::new(),
         }
+    }
+
+    /// Name of the subagent driving `run`. Falls back to `"subagent"` if the
+    /// start event was missed (it never should be — it is emitted before the
+    /// run can produce anything).
+    fn subagent_name(&self, run: u64) -> &str {
+        self.subagents
+            .get(&run)
+            .map(String::as_str)
+            .unwrap_or("subagent")
     }
 }
 
@@ -114,6 +130,27 @@ impl EventSink for TextSink {
                 // Back to the model: it is thinking about the result.
                 self.spinner.show();
             }
+            AgentEvent::SubagentRunStarted { run, name, .. } => {
+                self.subagents.insert(run, name);
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, args } => {
+                let who = self.subagent_name(run);
+                self.spinner.println(&format!("\n→ {who} ▸ {name} {args}"));
+                self.spinner.show();
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                let who = self.subagent_name(run);
+                let status = if output.is_error { "error" } else { "ok" };
+                self.spinner
+                    .println(&format!("← {who} ▸ {name} [{status}]"));
+                self.spinner.show();
+            }
+            AgentEvent::SubagentRunDone { run, .. } => {
+                self.subagents.remove(&run);
+            }
+            // The subagent's intermediate messages and step ticks stay quiet:
+            // its report is printed when it lands in the parent's context.
+            AgentEvent::SubagentRunText { .. } | AgentEvent::SubagentRunStep { .. } => {}
             AgentEvent::StepCompleted { step } => {
                 tracing::debug!("step {step} completed");
             }
@@ -249,6 +286,10 @@ pub struct JsonSink<W: Write + Send> {
     completion_tokens: u64,
     tool_calls: Vec<ToolCallsEntry>,
     errors: Vec<String>,
+    /// Run id -> subagent name, so a subagent's tool calls aggregate under
+    /// `<name> ▸ <tool>` in the summary, as they did when they were emitted on
+    /// the parent's tool events.
+    subagents: HashMap<u64, String>,
 }
 
 impl JsonSink<std::io::Stdout> {
@@ -269,7 +310,19 @@ impl<W: Write + Send> JsonSink<W> {
             completion_tokens: 0,
             tool_calls: Vec::new(),
             errors: Vec::new(),
+            subagents: HashMap::new(),
         }
+    }
+
+    /// `<subagent> ▸ <tool>` for a subagent's tool call, matching the label
+    /// these calls carried when they rode the parent's tool events.
+    fn subagent_label(&self, run: u64, tool: &str) -> String {
+        let who = self
+            .subagents
+            .get(&run)
+            .map(String::as_str)
+            .unwrap_or("subagent");
+        format!("{who} ▸ {tool}")
     }
 }
 
@@ -294,6 +347,34 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                     entry.errors += 1;
                 }
             }
+            AgentEvent::SubagentRunStarted { run, name, .. } => {
+                self.subagents.insert(run, name);
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, .. } => {
+                let label = self.subagent_label(run, &name);
+                match self.tool_calls.iter_mut().find(|entry| entry.name == label) {
+                    Some(entry) => entry.calls += 1,
+                    None => self.tool_calls.push(ToolCallsEntry {
+                        name: label,
+                        calls: 1,
+                        errors: 0,
+                    }),
+                }
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                if output.is_error {
+                    let label = self.subagent_label(run, &name);
+                    if let Some(entry) =
+                        self.tool_calls.iter_mut().find(|entry| entry.name == label)
+                    {
+                        entry.errors += 1;
+                    }
+                }
+            }
+            AgentEvent::SubagentRunDone { run, .. } => {
+                self.subagents.remove(&run);
+            }
+            AgentEvent::SubagentRunText { .. } | AgentEvent::SubagentRunStep { .. } => {}
             AgentEvent::StepCompleted { .. } => {
                 self.steps += 1;
                 self.committed = self.result.len();
@@ -365,6 +446,8 @@ pub struct StreamJsonSink<W: Write + Send> {
     out: W,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Run id -> subagent name; see [`JsonSink::subagents`].
+    subagents: HashMap<u64, String>,
 }
 
 impl StreamJsonSink<std::io::Stdout> {
@@ -379,7 +462,18 @@ impl<W: Write + Send> StreamJsonSink<W> {
             out,
             prompt_tokens: 0,
             completion_tokens: 0,
+            subagents: HashMap::new(),
         }
+    }
+
+    /// See [`JsonSink::subagent_label`].
+    fn subagent_label(&self, run: u64, tool: &str) -> String {
+        let who = self
+            .subagents
+            .get(&run)
+            .map(String::as_str)
+            .unwrap_or("subagent");
+        format!("{who} ▸ {tool}")
     }
 
     fn emit(&mut self, value: serde_json::Value) {
@@ -400,6 +494,26 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
             AgentEvent::ToolStarted { name, args } => {
                 self.emit(json!({"type": "tool_call", "name": name, "args": args}));
             }
+            AgentEvent::SubagentRunStarted { run, name, .. } => {
+                self.subagents.insert(run, name);
+            }
+            AgentEvent::SubagentRunToolStarted { run, name, args } => {
+                let label = self.subagent_label(run, &name);
+                self.emit(json!({"type": "tool_call", "name": label, "args": args}));
+            }
+            AgentEvent::SubagentRunToolFinished { run, name, output } => {
+                let label = self.subagent_label(run, &name);
+                self.emit(json!({
+                    "type": "tool_result",
+                    "name": label,
+                    "is_error": output.is_error,
+                    "output": output.content,
+                }));
+            }
+            AgentEvent::SubagentRunDone { run, .. } => {
+                self.subagents.remove(&run);
+            }
+            AgentEvent::SubagentRunText { .. } | AgentEvent::SubagentRunStep { .. } => {}
             AgentEvent::ToolFinished { name, output } => {
                 self.emit(json!({
                     "type": "tool_result",
