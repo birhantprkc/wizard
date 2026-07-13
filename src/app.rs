@@ -131,8 +131,17 @@ pub struct SubagentPane {
     /// unread badge, so you can tell which agent did something while you were
     /// looking elsewhere.
     pub unread: usize,
-    /// Scroll offset while attached, in rendered lines from the bottom.
+    /// First visible line of the pane transcript, measured from the top of the
+    /// rendered content. Only consulted while [`Self::scroll_follow`] is false;
+    /// when following, the live tail is always in view.
     pub scroll: u16,
+    /// When true the pane sticks to the bottom as new output arrives. Scrolling
+    /// up clears it; scrolling back to the bottom (or Ctrl-End) restores it.
+    pub scroll_follow: bool,
+    /// Last-drawn max scroll for this pane (content lines past the viewport).
+    /// Written by the renderer so key handlers can convert a follow-tail view
+    /// into a stable top-anchored offset without re-wrapping the transcript.
+    pub max_scroll: std::cell::Cell<u16>,
 }
 
 impl SubagentPane {
@@ -149,6 +158,8 @@ impl SubagentPane {
             finished: None,
             unread: 0,
             scroll: 0,
+            scroll_follow: true,
+            max_scroll: std::cell::Cell::new(0),
         }
     }
 
@@ -1281,8 +1292,18 @@ pub struct App {
     /// Recent transcript of the selected session (role, text), shown in the
     /// dashboard's peek panel; refreshed as the selection moves.
     pub peek_lines: Vec<(String, String)>,
-    /// Transcript scroll offset from the bottom (0 = pinned to latest).
+    /// First visible line of the main transcript, measured from the top of the
+    /// rendered content. Only consulted while [`Self::scroll_follow`] is false;
+    /// when following, the live tail is always in view.
     pub scroll: u16,
+    /// When true the transcript sticks to the bottom as new output streams in.
+    /// Scrolling up (wheel, PgUp) clears it so the viewport stays put; scrolling
+    /// back down to the bottom, Esc, or Ctrl-End restores follow.
+    pub scroll_follow: bool,
+    /// Last-drawn max scroll for the main transcript (content lines past the
+    /// viewport). Written by [`crate::ui::draw`] so key handlers can turn a
+    /// follow-tail view into a stable top-anchored offset without re-wrapping.
+    pub transcript_max_scroll: std::cell::Cell<u16>,
     /// Active or just-completed mouse text selection, if any. Drives the
     /// highlight overlay and clipboard copy.
     pub selection: Option<Selection>,
@@ -1451,6 +1472,8 @@ impl App {
             dashboard_input: String::new(),
             peek_lines: Vec::new(),
             scroll: 0,
+            scroll_follow: true,
+            transcript_max_scroll: std::cell::Cell::new(0),
             selection: None,
             card_hits: std::cell::RefCell::new(Vec::new()),
             images: std::cell::RefCell::new(ImageCache::fallback()),
@@ -1861,7 +1884,7 @@ impl App {
         }
         self.streaming.clear();
         self.streaming_thinking.clear();
-        self.scroll = 0;
+        self.scroll_to_bottom();
     }
 
     /// Open the provider picker (level 1): the configured providers (Enter
@@ -2158,7 +2181,8 @@ impl App {
 
     /// Append to a pane's transcript and bump its unread badge — unless the
     /// user is currently watching that pane, in which case they have already
-    /// seen it.
+    /// seen it. Scroll position is left alone: a following pane stays pinned
+    /// by its follow flag, a scrolled-up pane keeps its top-anchored offset.
     fn push_pane(&mut self, run: u64, entry: TranscriptEntry) {
         let Some(index) = self.pane_index(run) else {
             return;
@@ -2166,10 +2190,7 @@ impl App {
         let attached = self.attached == Some(index);
         let pane = &mut self.panes[index];
         pane.transcript.push(entry);
-        if attached {
-            // Watching live: stay pinned to the bottom.
-            pane.scroll = 0;
-        } else {
+        if !attached {
             pane.unread += 1;
         }
     }
@@ -2220,12 +2241,15 @@ impl App {
 
     /// Open a pane as the main chat view: its transcript takes over the
     /// screen until Esc. Clears the unread badge — you are looking at it now.
+    /// Starts following the live tail so opening a running agent shows the
+    /// newest work rather than whatever offset it last held.
     pub fn attach_pane(&mut self, index: usize) {
         let Some(pane) = self.panes.get_mut(index) else {
             return;
         };
         pane.unread = 0;
         pane.scroll = 0;
+        pane.scroll_follow = true;
         self.attached = Some(index);
         self.rail_focus = Some(index);
     }
@@ -2262,17 +2286,71 @@ impl App {
         self.retire_finished_panes();
     }
 
-    /// Scroll the pane at `index` by `delta` lines (positive scrolls back into
-    /// history, like the main transcript).
+    /// Scroll the pane at `index` by `delta` lines. Positive moves toward older
+    /// content (up); negative toward the live tail (down). Leaving the bottom
+    /// clears follow so new output does not yank the view; returning to the
+    /// bottom re-enables it. `scroll` is the first visible line from the top.
     fn scroll_pane(&mut self, index: usize, delta: i16) {
         let Some(pane) = self.panes.get_mut(index) else {
             return;
         };
-        pane.scroll = if delta >= 0 {
-            pane.scroll.saturating_add(delta as u16)
+        let max = pane.max_scroll.get();
+        let current = if pane.scroll_follow {
+            max
         } else {
-            pane.scroll.saturating_sub(delta.unsigned_abs())
+            pane.scroll.min(max)
         };
+        // Top-anchored: older content is a smaller start offset.
+        let next = if delta >= 0 {
+            current.saturating_sub(delta as u16)
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(max)
+        };
+        if next >= max {
+            pane.scroll = 0;
+            pane.scroll_follow = true;
+        } else {
+            pane.scroll = next;
+            pane.scroll_follow = false;
+        }
+    }
+
+    /// Jump a pane (or the main transcript when no pane is attached) to the
+    /// live tail and re-enable stick-to-bottom.
+    fn scroll_to_bottom(&mut self) {
+        if let Some(index) = self.attached {
+            if let Some(pane) = self.panes.get_mut(index) {
+                pane.scroll = 0;
+                pane.scroll_follow = true;
+            }
+            return;
+        }
+        self.scroll = 0;
+        self.scroll_follow = true;
+    }
+
+    /// Scroll the main transcript by `delta` lines. Positive moves toward older
+    /// content (up); negative toward the live tail (down). Same stick-to-bottom
+    /// rule as [`Self::scroll_pane`].
+    fn scroll_transcript(&mut self, delta: i16) {
+        let max = self.transcript_max_scroll.get();
+        let current = if self.scroll_follow {
+            max
+        } else {
+            self.scroll.min(max)
+        };
+        let next = if delta >= 0 {
+            current.saturating_sub(delta as u16)
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(max)
+        };
+        if next >= max {
+            self.scroll = 0;
+            self.scroll_follow = true;
+        } else {
+            self.scroll = next;
+            self.scroll_follow = false;
+        }
     }
 
     /// Drop finished runs off the rail once they have been resting long enough
@@ -3046,12 +3124,12 @@ impl App {
                         // todo update, so it needs a way out that isn't
                         // `/todos`).
                         self.show_todos = false;
-                    } else if self.scroll > 0 {
-                        self.scroll = 0;
+                    } else if !self.scroll_follow {
+                        self.scroll_to_bottom();
                     }
                 }
-                KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
-                KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+                KeyCode::PageUp => self.scroll_transcript(10),
+                KeyCode::PageDown => self.scroll_transcript(-10),
                 _ => self.vim.count = None,
             }
         }
@@ -3145,13 +3223,13 @@ impl App {
                 let cell = (mouse.column, mouse.row);
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        self.scroll = self.scroll.saturating_add(3);
+                        self.scroll_transcript(3);
                         // The content under each cell just moved, so the old
                         // selection no longer maps to it.
                         self.selection = None;
                     }
                     MouseEventKind::ScrollDown => {
-                        self.scroll = self.scroll.saturating_sub(3);
+                        self.scroll_transcript(-3);
                         self.selection = None;
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -3266,6 +3344,13 @@ impl App {
                 }
                 KeyCode::Char('d') => {
                     self.should_quit = true;
+                    return Ok(None);
+                }
+                // Ctrl-End jumps the transcript (or attached pane) to the live
+                // tail and re-enables stick-to-bottom after reading history
+                // during a long stream.
+                KeyCode::End => {
+                    self.scroll_to_bottom();
                     return Ok(None);
                 }
                 KeyCode::Char('u') => {
@@ -3804,8 +3889,8 @@ impl App {
                     // Then the todo sidebar (it auto-opens on the first todo
                     // update, so it needs a way out that isn't `/todos`).
                     self.show_todos = false;
-                } else if self.scroll > 0 {
-                    self.scroll = 0;
+                } else if !self.scroll_follow {
+                    self.scroll_to_bottom();
                 } else {
                     self.clear_input();
                 }
@@ -3813,7 +3898,8 @@ impl App {
             }
             // While the diff sidebar is open it owns paging: read a long diff
             // top-to-bottom (offset from the top). Otherwise PgUp/PgDn scroll
-            // the transcript (offset from the bottom).
+            // the transcript; leaving the bottom freezes the viewport while
+            // output streams, returning to it re-enables stick-to-bottom.
             KeyCode::PageUp if self.show_diff => {
                 self.diff_scroll = self.diff_scroll.saturating_sub(10);
                 None
@@ -3823,11 +3909,11 @@ impl App {
                 None
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll_transcript(10);
                 None
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll_transcript(-10);
                 None
             }
             KeyCode::Up => {
@@ -3982,7 +4068,7 @@ impl App {
         self.push_history(&input);
         self.clear_input();
         self.transcript.push(TranscriptEntry::User(input));
-        self.scroll = 0;
+        self.scroll_to_bottom();
         Some(AppAction::Submit(prepared))
     }
 
@@ -5227,7 +5313,8 @@ keys:\n  \
 Tab / →                     accept command completion\n  \
 Shift+Tab                   toggle plan mode\n  \
 ↑ / ↓                       select suggestion · browse input history\n  \
-PgUp/PgDn · wheel           scroll the transcript\n  \
+PgUp/PgDn · wheel           scroll the transcript (stays put while streaming)\n  \
+Esc · Ctrl-End              jump back to the live tail\n  \
 drag                        select text — copied to the clipboard on release\n  \
 click a tool card           expand / collapse its output\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
@@ -6383,7 +6470,7 @@ impl CommandContext<'_> {
         self.app.transcript.clear();
         self.app.streaming.clear();
         self.app.streaming_thinking.clear();
-        self.app.scroll = 0;
+        self.app.scroll_to_bottom();
         // Mirror the agent's counter reset so the status bar drops the old
         // conversation's totals immediately (not after the next Usage event).
         self.app.status.prompt_tokens = 0;
@@ -6625,7 +6712,7 @@ impl CommandContext<'_> {
                 self.app.transcript.clear();
                 self.app.streaming.clear();
                 self.app.streaming_thinking.clear();
-                self.app.scroll = 0;
+                self.app.scroll_to_bottom();
                 let files = if restored.is_empty() {
                     "no files needed restoring".to_string()
                 } else {
@@ -9956,14 +10043,21 @@ mod tests {
     fn shift_arrows_scroll_the_pane_you_are_reading() {
         let mut app = app_with_panes(3);
         app.attach_pane(1);
+        // Pretend the last frame had room to scroll (renderer fills this).
+        app.panes[1].max_scroll.set(100);
 
         press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
         assert_eq!(app.attached, Some(1), "shift+↑ must not change pane");
-        assert_eq!(app.panes[1].scroll, 2);
+        assert!(!app.panes[1].scroll_follow, "scrolling up leaves the tail");
+        assert_eq!(
+            app.panes[1].scroll, 98,
+            "top-anchored: two lines up from max"
+        );
 
         press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
-        assert_eq!(app.panes[1].scroll, 1);
+        assert_eq!(app.panes[1].scroll, 99);
+        assert!(!app.panes[1].scroll_follow);
     }
 
     #[test]
@@ -9971,23 +10065,86 @@ mod tests {
         let mut app = app_with_panes(1);
         app.history.push("an earlier prompt".to_string());
         app.attach_pane(0);
+        app.panes[0].max_scroll.set(100);
 
         // The bug: ↑/↓ fell through to the composer and walked the main chat's
         // history while the user was plainly looking at a subagent.
         press(&mut app, KeyCode::Up);
         assert!(app.input.is_empty(), "↑ must not recall history in a pane");
-        assert_eq!(app.panes[0].scroll, 1);
+        assert!(!app.panes[0].scroll_follow);
+        assert_eq!(app.panes[0].scroll, 99);
 
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.panes[0].scroll, 2);
+        assert_eq!(app.panes[0].scroll, 98);
         press(&mut app, KeyCode::Down);
-        assert_eq!(app.panes[0].scroll, 1);
+        assert_eq!(app.panes[0].scroll, 99);
         // Pinned at the live tail; it cannot scroll past the bottom.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
+        assert!(app.panes[0].scroll_follow, "reaching the bottom re-follows");
         assert_eq!(app.panes[0].scroll, 0);
         assert!(app.input.is_empty());
         assert_eq!(app.attached, Some(0));
+    }
+
+    #[test]
+    fn transcript_stays_put_while_streaming_after_scroll_up() {
+        let mut app = app();
+        // Viewport is full and we are following the live tail.
+        app.transcript_max_scroll.set(50);
+        assert!(app.scroll_follow);
+
+        // User scrolls up to re-read earlier output.
+        app.scroll_transcript(10);
+        assert!(!app.scroll_follow);
+        assert_eq!(app.scroll, 40);
+
+        // Content grows (renderer would bump max_scroll); the top-anchored
+        // offset must not change — that is the whole stick-to-bottom contract.
+        app.transcript_max_scroll.set(80);
+        assert_eq!(app.scroll, 40, "scroll offset holds while content grows");
+        assert!(!app.scroll_follow);
+
+        // Scrolling down to the (new) bottom re-enables follow.
+        app.scroll_transcript(-100);
+        assert!(app.scroll_follow);
+        assert_eq!(app.scroll, 0);
+
+        // Ctrl-End is the explicit jump-to-tail chord.
+        app.scroll_transcript(5);
+        assert!(!app.scroll_follow);
+        app.scroll_to_bottom();
+        assert!(app.scroll_follow);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn wheel_and_page_keys_drive_stick_to_bottom() {
+        let mut app = app();
+        app.transcript_max_scroll.set(30);
+
+        press(&mut app, KeyCode::PageUp);
+        assert!(!app.scroll_follow);
+        assert_eq!(app.scroll, 20);
+
+        // One PgDn of 10 lands exactly on the bottom and re-enables follow.
+        press(&mut app, KeyCode::PageDown);
+        assert!(
+            app.scroll_follow,
+            "PgDn onto the bottom should re-enable follow"
+        );
+        assert_eq!(app.scroll, 0);
+
+        // Esc while scrolled away jumps to the tail (instead of clearing input).
+        app.scroll_transcript(5);
+        assert!(!app.scroll_follow);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.scroll_follow);
+
+        // Ctrl-End does the same.
+        app.scroll_transcript(5);
+        press_mod(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+        assert!(app.scroll_follow);
     }
 
     #[test]
