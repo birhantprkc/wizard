@@ -32,6 +32,12 @@ pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 /// non-continuous budget).
 const RETRY_ATTEMPTS: u32 = 6;
 
+/// What a subagent reports when its loop ended without any final text — it
+/// only ever called tools, or the model returned nothing. Not an error, but
+/// not an answer either, which is why a caller that *judges* subagent output
+/// ([`crate::agent::ultra`]) has to be able to tell the two apart.
+pub const NO_FINAL_TEXT: &str = "(subagent produced no final text)";
+
 /// Session-unique id for one subagent run. Every `AgentEvent::SubagentRun*`
 /// event carries it, so a surface can demux concurrent runs — including two
 /// runs of the same subagent — into separate panes.
@@ -203,27 +209,78 @@ pub struct SpawnOptions {
 
 /// One model round-trip: stream a completion, skipping reasoning
 /// ("thinking") chunks so they never leak into subagent history or reports.
-async fn stream_step(
-    client: &Arc<dyn LlmProvider>,
-    request: ChatRequest,
-) -> Result<(String, Vec<ToolCall>)> {
+async fn stream_step(client: &Arc<dyn LlmProvider>, request: ChatRequest) -> Result<Step> {
     let mut stream = client.chat_stream(request).await?;
-    let mut content = String::new();
-    let mut tool_calls = Vec::new();
+    let mut step = Step::default();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if let Some(message) = chunk.message {
             if !chunk.thinking {
-                content.push_str(&message.content);
+                step.content.push_str(&message.content);
             }
-            tool_calls.extend(message.tool_calls);
+            step.tool_calls.extend(message.tool_calls);
+        }
+        if chunk.prompt_eval_count.is_some() {
+            step.prompt_tokens = chunk.prompt_eval_count;
+        }
+        if chunk.eval_count.is_some() {
+            step.completion_tokens = chunk.eval_count;
         }
         if chunk.done {
             break;
         }
     }
-    Ok((content, tool_calls))
+    Ok(step)
 }
+
+/// One completed model call inside a subagent's loop: what the model said,
+/// what it asked to run, and what it cost (when the backend reported counts).
+#[derive(Debug, Default)]
+struct Step {
+    content: String,
+    tool_calls: Vec<ToolCall>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+/// Account for one subagent model call, on both of the surfaces that report
+/// spend: the parent's counters (`/cost`, the usage log) through the shared
+/// [`ToolContext::usage`] tracker, and the live status bar through the run's
+/// event channel.
+///
+/// Without this a subagent's tokens are spent and then reported nowhere. That
+/// was survivable while `spawn_subagent` was an occasional tool call; `/ultra`
+/// makes N candidate runs plus a judge the price of *every* turn, so a status
+/// bar that counted the main loop alone would understate an ultra turn several
+/// times over — under a chip that advertises exactly that multiplier.
+///
+/// It is [`crate::usage::UsageTracker::record_delegated`], not `record`: these
+/// tokens belong on the totals but must not become the parent's `last_prompt`,
+/// which is what decides when to compact.
+async fn record_usage(ctx: &ToolContext, progress: Option<&Progress>, step: &Step) {
+    if step.prompt_tokens.is_none() && step.completion_tokens.is_none() {
+        return;
+    }
+    let prompt_tokens = step.prompt_tokens.unwrap_or(0);
+    let completion_tokens = step.completion_tokens.unwrap_or(0);
+    if let Some(usage) = &ctx.usage {
+        usage.record_delegated(prompt_tokens, completion_tokens);
+    }
+    if let Some(events) = progress {
+        super::emit(
+            events,
+            crate::agent::AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            },
+        )
+        .await;
+    }
+}
+
+/// The run's event channel: where a subagent's progress (and its spend) is
+/// streamed for the surface to render as its pane.
+type Progress = tokio::sync::mpsc::Sender<crate::agent::AgentEvent>;
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
 /// scoped registry, own step budget. The parent's lifecycle `hooks` apply to
@@ -319,7 +376,7 @@ pub async fn spawn(
         // (transport drops, 429/5xx) back off and retry instead of killing a
         // deep run; permanent errors (auth, bad request) fail immediately.
         let mut attempt: u32 = 0;
-        let (content, mut tool_calls) = loop {
+        let step_result = loop {
             match stream_step(client, request.clone()).await {
                 Ok(completion) => break completion,
                 Err(err) => {
@@ -352,6 +409,12 @@ pub async fn spawn(
                 }
             }
         };
+        record_usage(&ctx, progress.as_ref(), &step_result).await;
+        let Step {
+            content,
+            mut tool_calls,
+            ..
+        } = step_result;
 
         history.push(ChatMessage {
             role: Role::Assistant,
@@ -474,7 +537,7 @@ pub async fn spawn(
     }
 
     let output = if last_text.trim().is_empty() {
-        "(subagent produced no final text)".to_string()
+        NO_FINAL_TEXT.to_string()
     } else {
         last_text
     };
@@ -776,7 +839,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
-    use crate::llm::{ChatChunk, ChatStream};
+    use crate::llm::{ChatChunk, ChatStream, FunctionCall};
 
     /// Temp project dir removed on drop.
     struct TempDir(PathBuf);
@@ -992,6 +1055,92 @@ mod tests {
         assert_eq!(result.output, "the actual report", "thinking never leaks");
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests[0].model, "parent-active-model");
+    }
+
+    #[tokio::test]
+    async fn a_subagents_tokens_bill_the_parent_and_reach_the_surface() {
+        let tmp = TempDir::new();
+        // Two model calls: one that asks for a tool, then the report. Both
+        // report counts, and both have to be accounted for — an ultra turn is
+        // N of these runs, and the status bar shows one number.
+        let provider = ScriptedProvider::new(vec![
+            vec![ChatChunk {
+                message: Some(ChatMessage {
+                    role: Role::Assistant,
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        function: FunctionCall {
+                            name: "probe".to_string(),
+                            arguments: json!({}),
+                        },
+                    }],
+                    tool_name: None,
+                }),
+                prompt_eval_count: Some(100),
+                eval_count: Some(20),
+                ..chunk("", false, true)
+            }],
+            vec![ChatChunk {
+                prompt_eval_count: Some(300),
+                eval_count: Some(40),
+                ..chunk("the report", false, true)
+            }],
+        ]);
+        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let usage = Arc::new(crate::usage::UsageTracker::new());
+        let (events, mut drain) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0)
+            .with_usage(Arc::clone(&usage))
+            .with_events(events);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "report",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+        assert_eq!(result.output, "the report");
+
+        assert_eq!(
+            usage.session_totals(),
+            (400, 60),
+            "the parent paid for both of the subagent's model calls, so both land on its totals \
+             (and therefore in /cost)"
+        );
+        assert_eq!(
+            usage.last_prompt_tokens(),
+            None,
+            "but never on last_prompt: that is the parent's own prompt size, and it decides when \
+             to compact"
+        );
+
+        let mut reported = Vec::new();
+        while let Ok(event) = drain.try_recv() {
+            if let crate::agent::AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } = event
+            {
+                reported.push((prompt_tokens, completion_tokens));
+            }
+        }
+        assert_eq!(
+            reported,
+            [(100, 20), (300, 40)],
+            "one Usage event per model call, so the status bar counts the fan-out it advertises"
+        );
     }
 
     #[tokio::test]

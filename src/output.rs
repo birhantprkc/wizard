@@ -194,6 +194,14 @@ impl EventSink for TextSink {
                 ));
                 self.spinner.show();
             }
+            // The drafts themselves are the TUI's to render (it can fold them
+            // into a card the reader opens on demand); a stream of plain text
+            // can only bury the answer under them. Say that the phase ran, and
+            // what it cost, because that is the part a headless reader cannot
+            // otherwise see.
+            AgentEvent::UltraGuidance { label, .. } => {
+                self.spinner.println(&format!("~ {label}"));
+            }
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -401,6 +409,9 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                 self.completion_tokens += completion_tokens;
             }
             AgentEvent::Done { .. } => self.turns += 1,
+            // The json summary is the turn's result and what it cost; ultra's
+            // drafts are neither (the tokens they spent arrive as `Usage`).
+            AgentEvent::UltraGuidance { .. } => {}
             AgentEvent::ThinkingDelta(_)
             | AgentEvent::Notice(_)
             | AgentEvent::HookFired { .. }
@@ -624,6 +635,13 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
             }
             AgentEvent::CommandRequested(line) => {
                 self.emit(json!({"type": "command_requested", "command": line}));
+            }
+            AgentEvent::UltraGuidance { label, guidance } => {
+                self.emit(json!({
+                    "type": "ultra_guidance",
+                    "roster": label,
+                    "guidance": guidance,
+                }));
             }
             AgentEvent::Done { reason } => {
                 self.emit(json!({"type": "turn_done", "reason": reason_str(reason)}));

@@ -413,6 +413,60 @@ fn default_fusion_rounds() -> u32 {
     1
 }
 
+/// Mixture-of-agents settings (`[ultra]` in `config.toml`); see `/ultra` and
+/// [`crate::agent::ultra`]. Unlike [`FusionConfig`], nothing here names a
+/// provider: ultra fans its candidates out over whatever model is *already*
+/// active — a provider binds exactly one model, so there is nothing else for
+/// them to be on. A lens is therefore just a subagent definition, and the
+/// number of lenses *is* the candidate count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UltraConfig {
+    /// Candidate lenses, in order — one read-only subagent each. Names resolve
+    /// against [`crate::agent::ultra::lens_catalog`]: ultra's built-in lenses,
+    /// shadowed by anything of the same name in `~/.wizard/subagents/`, so a
+    /// lens can be retuned or replaced with a TOML file and any subagent the
+    /// user already wrote can serve as one. Duplicates are rejected — the same
+    /// prompt twice buys two near-identical drafts and two panes labeled the
+    /// same thing.
+    pub lenses: Vec<String>,
+    /// Judges that compare the drafts head-to-head. `0` skips the compare
+    /// phase and hands the raw drafts to the main agent; one is almost always
+    /// enough, since verdicts do not vote — the main agent decides.
+    pub judges: u8,
+    /// Step budget for one candidate's sub-loop. Ultra owns this: a lens
+    /// contributes a prompt, never its own budget or tool scope.
+    pub candidate_max_steps: u32,
+    /// Step budget for one judge's sub-loop.
+    pub judge_max_steps: u32,
+    /// Wall-clock cap on one candidate or judge. Not optional, and not
+    /// allowed to be zero: without it a throttled provider parks a candidate
+    /// inside [`crate::agent::subagent::spawn`]'s retry ladder (`retry_base`
+    /// doubling to `retry_max`, six attempts — 315s of sleeping at the shipped
+    /// 5s/300s defaults) and the turn hangs for five minutes on a spinner.
+    pub timeout_secs: u64,
+    /// Ceiling on one draft's characters inside the injected guidance, applied
+    /// on top of the context-window budget. The middle of an oversized draft is
+    /// elided.
+    pub max_draft_chars: usize,
+}
+
+impl Default for UltraConfig {
+    fn default() -> Self {
+        Self {
+            lenses: crate::agent::ultra::DEFAULT_LENSES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            judges: 1,
+            candidate_max_steps: 10,
+            judge_max_steps: 6,
+            timeout_secs: 300,
+            max_draft_chars: 6_000,
+        }
+    }
+}
+
 /// A named LLM provider. Cloud keys are never stored here — only the name of
 /// the environment variable holding the key (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,6 +699,11 @@ pub struct Config {
     /// falls back to a default panel derived from `providers` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fusion: Option<FusionConfig>,
+    /// Mixture-of-agents settings (`/ultra`). Absent until configured; the
+    /// toggle falls back to [`UltraConfig::default`], which needs nothing from
+    /// disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultra: Option<UltraConfig>,
 }
 
 /// Default port for the local llama.cpp `llama-server`. Deliberately not 8080:
@@ -685,6 +744,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             sync: SyncConfig::default(),
             fusion: None,
+            ultra: None,
         }
     }
 }
@@ -950,6 +1010,30 @@ impl Config {
             fusion.rounds,
             label,
         )
+    }
+
+    /// The effective ultra config: the explicit `[ultra]` block if set,
+    /// otherwise the defaults. Never `None` — unlike
+    /// [`effective_fusion`](Self::effective_fusion), ultra resolves no provider
+    /// names, it just reuses the active one, so there is nothing to derive and
+    /// nothing to fail on.
+    pub fn effective_ultra(&self) -> UltraConfig {
+        self.ultra.clone().unwrap_or_default()
+    }
+
+    /// Build the `/ultra` engine from the effective config.
+    pub fn build_ultra(&self) -> Result<crate::agent::ultra::UltraEngine> {
+        self.build_ultra_from(&self.effective_ultra())
+    }
+
+    /// Build the engine from a specific config — used by `/ultra config` to
+    /// validate a selection *before* persisting it, and by `restore_ultra` to
+    /// re-arm a rebuilt agent.
+    pub fn build_ultra_from(
+        &self,
+        ultra: &UltraConfig,
+    ) -> Result<crate::agent::ultra::UltraEngine> {
+        crate::agent::ultra::UltraEngine::build(ultra, &Self::subagents_dir()?)
     }
 
     /// Index of the effective active provider in [`providers`](Self::providers),
@@ -1223,6 +1307,14 @@ mod tests {
                 synthesizer: "openai".to_string(),
                 rounds: 2,
             }),
+            ultra: Some(UltraConfig {
+                lenses: vec!["skeptic".to_string(), "minimalist".to_string()],
+                judges: 2,
+                candidate_max_steps: 8,
+                judge_max_steps: 4,
+                timeout_secs: 120,
+                max_draft_chars: 4_000,
+            }),
         };
         let raw = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -1265,6 +1357,26 @@ mod tests {
         assert_eq!(parsed.update, original.update);
         assert_eq!(parsed.sync, original.sync);
         assert_eq!(parsed.fusion, original.fusion);
+        assert_eq!(parsed.ultra, original.ultra);
+    }
+
+    #[test]
+    fn ultra_defaults_when_section_missing() {
+        let config: Config = toml::from_str("model = \"m\"").expect("valid toml");
+        assert!(config.ultra.is_none());
+        assert_eq!(config.effective_ultra(), UltraConfig::default());
+
+        // A partial block fills the rest from the defaults, so adding a knob to
+        // `[ultra]` never invalidates a config that predates it.
+        let config: Config = toml::from_str("[ultra]\njudges = 0").expect("valid toml");
+        let ultra = config.effective_ultra();
+        assert_eq!(ultra.judges, 0);
+        assert_eq!(ultra.lenses, UltraConfig::default().lenses);
+        assert_eq!(
+            ultra.candidate_max_steps,
+            UltraConfig::default().candidate_max_steps
+        );
+        assert_eq!(ultra.timeout_secs, UltraConfig::default().timeout_secs);
     }
 
     #[test]

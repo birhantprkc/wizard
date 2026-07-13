@@ -74,6 +74,13 @@ pub struct ToolContext {
     /// it before execution. `None` outside an agent (direct registry
     /// execution in tests).
     pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
+    /// The agent's token counters, set by the agent at construction. Shared
+    /// (not owned) because the spend a tool delegates to a model is the
+    /// parent's spend: [`crate::agent::subagent::spawn`] records every
+    /// subagent model call here, so `/cost` and the status bar account for a
+    /// fan-out (`spawn_subagent`, every `/ultra` candidate and judge) instead
+    /// of reporting the main loop alone. `None` outside an agent.
+    pub usage: Option<Arc<crate::usage::UsageTracker>>,
     /// True only on the interactive TUI surface, which drains and dispatches
     /// slash commands the agent queues via `run_command`. A live `events`
     /// channel alone does not imply this — headless and gateway runs stream
@@ -93,6 +100,7 @@ impl ToolContext {
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
+            usage: None,
             dispatches_commands: false,
         }
     }
@@ -113,6 +121,13 @@ impl ToolContext {
     /// This context with the checkpoint store attached (agent construction).
     pub fn with_checkpoints(mut self, store: Arc<crate::checkpoint::CheckpointStore>) -> Self {
         self.checkpoints = Some(store);
+        self
+    }
+
+    /// This context with the agent's token counters attached (agent
+    /// construction), so a tool that delegates to a model bills the parent.
+    pub fn with_usage(mut self, usage: Arc<crate::usage::UsageTracker>) -> Self {
+        self.usage = Some(usage);
         self
     }
 

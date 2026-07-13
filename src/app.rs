@@ -18,11 +18,12 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, DoneReason, InterviewQuestion, PlanVerdict, session::Session, subagent,
+    Agent, AgentEvent, CancelHandle, DoneReason, InterviewQuestion, PlanVerdict, session::Session,
+    subagent, ultra,
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
-use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort};
+use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, UltraConfig};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
@@ -89,6 +90,18 @@ const PANE_SPINNER: [&str; 4] = ["●", "◉", "○", "◉"];
 /// see it land, short enough that the rail stays a picture of live work. Its
 /// report stays in the main chat either way.
 const PANE_LINGER: Duration = Duration::from_secs(8);
+
+/// How long Ctrl-C waits for the turn to stop on its own before the task is
+/// aborted instead.
+///
+/// The cooperative stop is worth waiting for: it keeps the agent (an abort
+/// loses it and forces a rebuild off the session), it keeps the partial answer,
+/// and it lets every subagent in flight — every `/ultra` candidate — close its
+/// own pane out instead of being dropped mid-poll. Where the flag *is* checked
+/// (each stream chunk, each tool boundary, each poll of the ultra fan-out) it
+/// lands in milliseconds; this budget only bounds the case where it cannot be
+/// checked, i.e. a tool call already running, which no flag can shorten.
+const INTERRUPT_GRACE: Duration = Duration::from_millis(1_500);
 
 /// One subagent run, surfaced on the rail below the composer and openable as
 /// a full chat view.
@@ -322,6 +335,10 @@ pub enum SlashCommand {
     /// `/fusion [config]` — toggle model fusion (a panel of providers debate
     /// then a synthesizer answers), or open the panel configurator.
     Fusion(FusionAction),
+    /// `/ultra [config]` — toggle mixture of agents (N read-only subagents draft
+    /// the turn on the *active* model, a judge compares the drafts, and the main
+    /// agent executes from the verdict), or open the roster editor.
+    Ultra(UltraAction),
     /// `/provider ...` — add, remove, or switch LLM providers.
     Provider(ProviderAction),
     /// Finalize an interactive provider setup: add the provider (storing the
@@ -358,6 +375,20 @@ pub enum FusionAction {
     Toggle,
     /// `/fusion config` — open the panel/synthesizer configurator.
     Config,
+}
+
+/// What an `/ultra` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UltraAction {
+    /// `/ultra` (no args) — toggle mixture-of-agents mode on/off.
+    Toggle,
+    /// `/ultra config` — open the lens/judge roster editor.
+    Config,
+    /// Save the roster chosen at that editor. Not a typed command: the picker
+    /// emits it on Enter, which is why it carries the whole [`UltraConfig`]
+    /// rather than a name. Every field of it is `Eq`, so `SlashCommand` stays
+    /// `Eq`.
+    Apply(UltraConfig),
 }
 
 /// What a `/provider` subcommand does.
@@ -438,6 +469,12 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
 /// picker. The dispatch also keys off the last index, but matching the value
 /// keeps it robust if the list grows.
 const PROVIDER_ADD_ROW: &str = "＋ Add provider…";
+
+/// Value of the final row in the `/ultra config` picker: the judge, which is
+/// not a lens and must not land in the roster. It is deliberately the same
+/// string as [`crate::agent::ultra::JUDGE_NAME`] — `lens_catalog` excludes that
+/// name from the lens rows, so this row cannot collide with one of them.
+const ULTRA_JUDGE_ROW: &str = ultra::JUDGE_NAME;
 
 /// The level-2 provider-type menu: `(label, detail)` in dispatch order. The
 /// Enter handler in [`App::handle_key`] matches on the row index, so this
@@ -635,6 +672,13 @@ impl SlashCommand {
                     "unknown /fusion subcommand '{other}' — use /fusion or /fusion config"
                 )),
             },
+            "ultra" => match args.first().copied() {
+                None => Ok(Self::Ultra(UltraAction::Toggle)),
+                Some("config") => Ok(Self::Ultra(UltraAction::Config)),
+                Some(other) => Err(format!(
+                    "unknown /ultra subcommand '{other}' — use /ultra or /ultra config"
+                )),
+            },
             "server" => parse_server(&args),
             "login" => match args.first() {
                 Some(provider) => Ok(Self::Login((*provider).to_string())),
@@ -680,7 +724,8 @@ impl SlashCommand {
             | Settings
             | Vim
             | Help
-            | Fusion(FusionAction::Toggle) => Ok(()),
+            | Fusion(FusionAction::Toggle)
+            | Ultra(UltraAction::Toggle) => Ok(()),
 
             // Interactive pickers: there is no human at the keyboard mid-turn,
             // so require the argument that names the choice directly.
@@ -689,6 +734,9 @@ impl SlashCommand {
             Effort(None) => Err("name a level, e.g. `/effort high`".into()),
             Fusion(FusionAction::Config) => {
                 Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
+            }
+            Ultra(UltraAction::Config | UltraAction::Apply(_)) => {
+                Err("`/ultra config` opens an interactive editor; use `/ultra` to toggle".into())
             }
             Agents => Err(
                 "`/agents` opens a picker for the user; spawn subagents with the spawn tool".into(),
@@ -827,6 +875,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "fusion",
         args: "[config]",
         description: "toggle model fusion, or configure the panel",
+        takes_args: false,
+    },
+    CommandSpec {
+        name: "ultra",
+        args: "[config]",
+        description: "toggle mixture of agents, or configure the roster",
         takes_args: false,
     },
     CommandSpec {
@@ -1025,6 +1079,12 @@ pub enum PickerKind {
     /// fusion panel and Enter saves `[fusion]` (the first toggled row becomes
     /// the synthesizer). Reuses [`PickerItem::current`] as the checkbox.
     FusionPanel,
+    /// `/ultra config`: a multi-select over the lens catalog, with a final
+    /// [`ULTRA_JUDGE_ROW`] row for the compare phase. Space toggles, Enter
+    /// saves `[ultra]`. The toggled lens rows *are* the candidate count — one
+    /// lens, one candidate — so this one picker sets both knobs the user cares
+    /// about.
+    UltraLenses,
 }
 
 /// One selectable row in a picker popup.
@@ -1055,7 +1115,9 @@ impl Picker {
     pub fn footer_hint(&self) -> &'static str {
         match self.kind {
             PickerKind::ClaudeImport => " ↑↓ move · space toggles · enter runs · Esc cancel ",
-            PickerKind::FusionPanel => " ↑↓ move · space toggles · enter saves · Esc cancel ",
+            PickerKind::FusionPanel | PickerKind::UltraLenses => {
+                " ↑↓ move · space toggles · enter saves · Esc cancel "
+            }
             _ => " ↑↓ move · Enter select · Esc cancel ",
         }
     }
@@ -1277,6 +1339,16 @@ pub struct App {
     /// (`/fusion` toggled on). Drives the loud status-bar indicator and lets
     /// `/fusion` toggle back to the underlying single provider.
     pub fusion_active: bool,
+    /// The mixture-of-agents roster `/ultra` is running, or `None` when ultra is
+    /// off. Holds the *built* engine, not the [`UltraConfig`] behind it, for two
+    /// reasons: the `ULTRA ×N` badge then counts the lenses the agent will
+    /// actually fan out over rather than a config that may no longer resolve,
+    /// and [`restore_ultra`] can re-arm a rebuilt agent by cloning the handle
+    /// instead of rebuilding a roster that could fail at exactly the moment
+    /// there is no good way to report it. The engine binds no client — the agent
+    /// supplies the live one — so the same instance survives a `/model` switch
+    /// and the candidates follow the new model.
+    pub ultra: Option<Arc<ultra::UltraEngine>>,
     /// Open plan-review modal (the turn is paused inside `exit_plan` until
     /// it resolves), if any.
     pub plan_review: Option<PlanReview>,
@@ -1406,6 +1478,7 @@ impl App {
             plan_mode,
             omakase,
             fusion_active: false,
+            ultra: None,
             plan_review: None,
             interview: None,
             history: Vec::new(),
@@ -1678,6 +1751,42 @@ impl App {
         self.picker = Some(Picker {
             kind: PickerKind::FusionPanel,
             title: " fusion panel · space toggles · enter saves ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Open the `/ultra config` multi-select: one row per lens in the catalog
+    /// (ultra's built-ins plus every subagent in `~/.wizard/subagents/`),
+    /// pre-toggled to the configured roster, and a final [`ULTRA_JUDGE_ROW`] for
+    /// the compare phase. Space toggles; Enter saves `[ultra]`. There is no
+    /// separate "candidate count" row because there is no separate number: one
+    /// toggled lens is one candidate.
+    pub fn open_ultra_picker(&mut self) {
+        let ultra = self.config.effective_ultra();
+        let roster: std::collections::HashSet<&str> =
+            ultra.lenses.iter().map(String::as_str).collect();
+        let catalog = ultra::lens_catalog(&Config::subagents_dir().unwrap_or_default());
+        let mut items: Vec<PickerItem> = catalog
+            .iter()
+            .map(|lens| PickerItem {
+                value: lens.name.clone(),
+                detail: lens.description.clone(),
+                current: roster.contains(lens.name.as_str()),
+            })
+            .collect();
+        items.push(PickerItem {
+            value: ULTRA_JUDGE_ROW.to_string(),
+            detail: match ultra.judges {
+                0 => "off — the drafts go to the agent uncompared".to_string(),
+                1 => "compares the drafts head-to-head before the agent executes".to_string(),
+                n => format!("{n} judges compare the drafts head-to-head"),
+            },
+            current: ultra.judges > 0,
+        });
+        self.picker = Some(Picker {
+            kind: PickerKind::UltraLenses,
+            title: " ultra roster · space toggles · enter saves ".to_string(),
             items,
             selected: 0,
         });
@@ -2177,14 +2286,41 @@ impl App {
         };
     }
 
+    /// Close out every pane still marked running, because the turn that owned
+    /// them was killed outright rather than asked to stop.
+    ///
+    /// A run's pane is closed by the `SubagentRunDone` its own loop emits. Abort
+    /// the turn's task and that loop is dropped mid-poll, so the event never
+    /// comes: the pane keeps `finished: None`, [`App::retire_finished_panes`]
+    /// retains it forever (`None => true`), and the rail grows a permanent
+    /// pulsing row — one per in-flight run, every time a turn is aborted.
+    ///
+    /// The cooperative path ([`CancelHandle`]) does not need this: every loop
+    /// closes its own pane on the way out. This is for the fallback that does
+    /// not give them the chance.
+    pub fn fail_running_panes(&mut self, why: &str) {
+        let now = Instant::now();
+        for pane in &mut self.panes {
+            if pane.status != PaneStatus::Running {
+                continue;
+            }
+            pane.status = PaneStatus::Failed;
+            pane.finished = Some(now);
+            pane.transcript
+                .push(TranscriptEntry::Notice(format!("failed: {why}")));
+        }
+    }
+
     /// Drop finished runs off the rail once they have been resting long enough
     /// to notice, so the rail shows live work instead of accumulating every
     /// subagent the session ever ran.
     ///
     /// Nothing is lost: a foreground run's report is the output of its
-    /// `spawn_subagent` card in the main chat, and a background run's report is
+    /// `spawn_subagent` card in the main chat, a background run's report is
     /// written back into that same card when it lands (see
-    /// [`App::record_subagent_report`]).
+    /// [`App::record_subagent_report`]), and an `/ultra` candidate's draft is in
+    /// the collapsed guidance card that phase pushes
+    /// ([`AgentEvent::UltraGuidance`]).
     ///
     /// The pane you are *inside* never retires under you — its clock starts
     /// when you leave it.
@@ -3372,7 +3508,9 @@ impl App {
                 KeyCode::Char(' ')
                     if matches!(
                         picker.kind,
-                        PickerKind::ClaudeImport | PickerKind::FusionPanel
+                        PickerKind::ClaudeImport
+                            | PickerKind::FusionPanel
+                            | PickerKind::UltraLenses
                     ) =>
                 {
                     if let Some(item) = picker.items.get_mut(picker.selected) {
@@ -3485,6 +3623,41 @@ impl App {
                                 panel.join("+")
                             ));
                             return Ok(None);
+                        }
+                        PickerKind::UltraLenses => {
+                            // The judge row is the tail (open_ultra_picker put it
+                            // there); everything above it is a lens. Saving is
+                            // left to the command handler, which is the only
+                            // place that can both persist [ultra] and re-arm a
+                            // running engine in one step.
+                            let Some((judge, lenses)) = picker.items.split_last() else {
+                                return Ok(None);
+                            };
+                            let lenses: Vec<String> = lenses
+                                .iter()
+                                .filter(|item| item.current)
+                                .map(|item| item.value.clone())
+                                .collect();
+                            if lenses.is_empty() {
+                                self.notice(
+                                    "select at least one lens (Space toggles) — ultra has nothing \
+                                     to fan out over without one",
+                                );
+                                return Ok(None);
+                            }
+                            // A checkbox can only say none-or-one, so a count
+                            // above one (which only `config.toml` can set) is
+                            // preserved when the row stays on, exactly as the
+                            // fusion picker preserves `rounds`.
+                            let base = self.config.effective_ultra();
+                            let judges = if judge.current { base.judges.max(1) } else { 0 };
+                            AppAction::Command(SlashCommand::Ultra(UltraAction::Apply(
+                                UltraConfig {
+                                    lenses,
+                                    judges,
+                                    ..base
+                                },
+                            )))
                         }
                         PickerKind::Provider => {
                             // The final row opens the add-provider type menu;
@@ -4228,6 +4401,23 @@ impl App {
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
             }
+            // The ultra pre-phase's drafts and verdict, as a collapsed card.
+            // This is the *only* durable record of them: the candidates' panes
+            // retire off the rail seconds after they finish, minutes before the
+            // main agent is done working from what they wrote, and the guidance
+            // itself is a system message, which the transcript never renders.
+            AgentEvent::UltraGuidance { label, guidance } => {
+                self.flush_streaming();
+                self.transcript.push(TranscriptEntry::ToolCard {
+                    name: label,
+                    args: Value::Null,
+                    output: Some(guidance),
+                    is_error: false,
+                    // Always folded: it is tens of KB, and the point of the turn
+                    // is the answer below it, not the drafts behind it.
+                    collapsed: true,
+                });
+            }
             // TaskStarted is also mirrored to the gateway's JSON stream (see
             // output.rs); the TUI additionally bumps the live status-bar
             // counter (see draw_status_bar) so a running task stays visible
@@ -4439,8 +4629,8 @@ pub enum AppAction {
     Submit(String),
     /// Execute a parsed slash command.
     Command(SlashCommand),
-    /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
-    /// the agent from the last session.
+    /// Interrupt the running turn (Ctrl-C): ask it to stop cooperatively, and
+    /// abort its task if it does not (see [`INTERRUPT_GRACE`]).
     Interrupt,
     /// Copy the current mouse selection to the clipboard. Handled in the main
     /// loop because it owns the terminal (and thus the rendered cell buffer).
@@ -4797,6 +4987,22 @@ async fn build_agent(
     Ok(agent)
 }
 
+/// Re-arm `/ultra` on a freshly built agent, and a no-op when ultra is off.
+///
+/// [`build_agent`] hands back an agent with ultra unset, so every rebuild — a
+/// `/model` switch, a provider switch, a `/resume` — silently drops the
+/// mixture-of-agents pre-phase while [`App::ultra`] keeps the badge lit and the
+/// user keeps paying attention to a fan-out that is no longer happening. Call
+/// this at every site that installs a rebuilt agent.
+///
+/// The engine holds no client: the agent supplies the live one at run time. So
+/// the same handle re-arms unchanged across a model switch, and the candidates
+/// simply follow whatever model is now active — which is the whole point of
+/// ultra being agent-level rather than model-level.
+fn restore_ultra(app: &App, agent: &mut Agent) {
+    agent.set_ultra(app.ultra.clone());
+}
+
 /// Run `git <args>` in `root` and return stdout.
 async fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     let output = tokio::process::Command::new("git")
@@ -4937,6 +5143,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider                   add or switch LLM providers (interactive picker)\n  \
 /fusion [config]            toggle model fusion (panel debate → synthesis), or configure the panel\n  \
+/ultra [config]             toggle mixture of agents (candidates draft → judge rules → agent acts)\n  \
 /server [status|start|stop] manage the local llama-server\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
@@ -5176,6 +5383,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         agent.set_plan_mode(true);
     }
     let mut agent_task: Option<JoinHandle<Agent>> = None;
+    // The running turn's cooperative cancel handle, cloned off the agent before
+    // it moved into `agent_task` — which is the only moment it can be had, and
+    // the reason it is kept here rather than reached for on Ctrl-C.
+    let mut agent_cancel: Option<CancelHandle> = None;
+    // When the cooperative interrupt gives up and the task is aborted instead.
+    // `Some` only between a Ctrl-C and the turn actually stopping.
+    let mut interrupt_at: Option<Instant> = None;
 
     // Genie-mode max_steps as configured, used when switching back from
     // sovereign in-session.
@@ -5346,6 +5560,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 if app.plan_mode {
                     agent.set_plan_mode(true);
                 }
+                restore_ultra(&app, &mut agent);
                 // A rebuild brings a fresh tool context, so the old registry
                 // handle is dead — re-point the rail at the live one.
                 app.subagents = Some(agent.subagent_registry());
@@ -5464,6 +5679,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             }
                         });
 
+                        // Cloned before the agent moves into the task: Ctrl-C
+                        // stops the turn through this, and only falls back to
+                        // aborting the task (which loses the agent) when the
+                        // turn does not take the hint.
+                        agent_cancel = Some(agent.cancel_handle());
+                        interrupt_at = None;
+
                         agent_task = Some(tokio::spawn(async move {
                             let fallback = agent_tx.clone();
                             if let Err(err) = agent.run_turn(&input, agent_tx).await {
@@ -5499,51 +5721,30 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     .await;
                 }
                 AppAction::Interrupt => {
-                    // Cancel the running turn by aborting its task; the agent
-                    // moved into it is lost, so rebuild from the last session
-                    // (same path as crash recovery).
-                    if let Some(handle) = agent_task.take() {
-                        handle.abort();
-                        app.flush_streaming();
-                        app.status.busy = false;
-                        app.status.step = 0;
-                        app.turn_started = None;
-                        app.notice("interrupted");
-                        app.rebuilding = Some("restarting agent".to_string());
-                        let client = client.clone();
-                        let config = app.config.clone();
-                        let skills = skills.clone();
-                        let project_root = project_root.clone();
-                        let manager = Arc::clone(&manager);
-                        let notify = events.sender();
-                        let session = SessionTarget::Id(app.session_id.clone());
-                        tokio::spawn(async move {
-                            let manager = manager.lock().await;
-                            let rebuild = match build_agent(
-                                &client,
-                                &config,
-                                &skills,
-                                &project_root,
-                                &manager,
-                                session,
-                            )
-                            .await
-                            {
-                                Ok(agent) => AgentRebuild {
-                                    agent: Some(agent),
-                                    model: None,
-                                    notice: "ready".to_string(),
-                                },
-                                Err(err) => AgentRebuild {
-                                    agent: None,
-                                    model: None,
-                                    notice: format!(
-                                        "could not restart the agent: {err:#} — /quit and relaunch"
-                                    ),
-                                },
-                            };
-                            let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-                        });
+                    // Ask the turn to stop before killing it. The agent checks
+                    // the cancel flag between stream chunks and between tool
+                    // calls, and `/ultra`'s pre-phase selects on it — so on the
+                    // cooperative path every subagent closes its own pane out,
+                    // the partial answer stays on screen, and the agent comes
+                    // back through the ordinary Done path with no rebuild at
+                    // all. The flag cannot shorten a tool call that is already
+                    // running, though (a 5-minute `cargo build` is 5 minutes),
+                    // so the abort below takes over after `INTERRUPT_GRACE`.
+                    if agent_task.is_some() {
+                        match (&agent_cancel, interrupt_at) {
+                            // Asked already and it has not stopped: the user is
+                            // pressing again, so stop waiting for it.
+                            (_, Some(_)) => interrupt_at = Some(Instant::now()),
+                            (Some(cancel), None) => {
+                                cancel.cancel();
+                                interrupt_at = Some(Instant::now() + INTERRUPT_GRACE);
+                            }
+                            // A turn with no handle cannot be asked, only
+                            // killed. (It does not happen — the handle is cloned
+                            // wherever the task is spawned — but a Ctrl-C that
+                            // did nothing at all would be the worse failure.)
+                            (None, None) => interrupt_at = Some(Instant::now()),
+                        }
                     }
                 }
                 AppAction::CopySelection => {
@@ -5610,6 +5811,10 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         }
 
         if turn_done && let Some(handle) = agent_task.take() {
+            // Whatever ended it — a finished turn, or a cooperative interrupt
+            // that landed — this turn is no longer interruptible.
+            agent_cancel = None;
+            interrupt_at = None;
             match handle.await {
                 Ok(agent) => {
                     agent_slot = Some(agent);
@@ -5636,9 +5841,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     }
                 }
                 Err(err) => {
-                    // The turn task panicked and took the agent with it.
-                    // Rebuild off the event loop so the TUI stays responsive.
+                    // The turn task panicked and took the agent with it — and,
+                    // with it, every subagent loop that would have closed its
+                    // own pane.
                     app.notice(format!("agent task crashed: {err}"));
+                    app.fail_running_panes("the turn crashed");
+                    // Rebuild off the event loop so the TUI stays responsive.
                     app.rebuilding = Some("restarting agent".to_string());
                     let client = client.clone();
                     let config = app.config.clone();
@@ -5676,6 +5884,61 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     });
                 }
             }
+        }
+
+        // The interrupt the user asked for did not land: the turn is parked
+        // somewhere the cancel flag is not checked (inside a long tool call, in
+        // practice). Kill the task. That costs the agent — it moved into the
+        // task — so rebuild from the session, the same path as crash recovery.
+        //
+        // Checked *after* the join above, so a turn that did stop in time is
+        // already gone from `agent_task` and nothing here fires.
+        if let Some(deadline) = interrupt_at
+            && Instant::now() >= deadline
+            && let Some(handle) = agent_task.take()
+        {
+            interrupt_at = None;
+            agent_cancel = None;
+            handle.abort();
+            app.flush_streaming();
+            // Aborting drops every subagent loop the turn had in flight
+            // mid-poll, so none of them will ever close its own pane. Close
+            // them here, or the rail keeps a pulsing row for each of them for
+            // the rest of the session — N of them per interrupted `/ultra` turn.
+            app.fail_running_panes("interrupted");
+            app.status.busy = false;
+            app.status.step = 0;
+            app.turn_started = None;
+            app.notice("interrupted");
+            app.rebuilding = Some("restarting agent".to_string());
+            let client = client.clone();
+            let config = app.config.clone();
+            let skills = skills.clone();
+            let project_root = project_root.clone();
+            let manager = Arc::clone(&manager);
+            let notify = events.sender();
+            let session = SessionTarget::Id(app.session_id.clone());
+            tokio::spawn(async move {
+                let manager = manager.lock().await;
+                let rebuild =
+                    match build_agent(&client, &config, &skills, &project_root, &manager, session)
+                        .await
+                    {
+                        Ok(agent) => AgentRebuild {
+                            agent: Some(agent),
+                            model: None,
+                            notice: "ready".to_string(),
+                        },
+                        Err(err) => AgentRebuild {
+                            agent: None,
+                            model: None,
+                            notice: format!(
+                                "could not restart the agent: {err:#} — /quit and relaunch"
+                            ),
+                        },
+                    };
+                let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+            });
         }
 
         // Dispatch any slash commands the agent queued via `run_command` during
@@ -5804,6 +6067,9 @@ impl CommandContext<'_> {
             SlashCommand::Publish { branch } => self.publish(branch),
             SlashCommand::Fusion(FusionAction::Toggle) => self.toggle_fusion().await,
             SlashCommand::Fusion(FusionAction::Config) => self.open_fusion_picker(),
+            SlashCommand::Ultra(UltraAction::Toggle) => self.toggle_ultra(),
+            SlashCommand::Ultra(UltraAction::Config) => self.open_ultra_picker(),
+            SlashCommand::Ultra(UltraAction::Apply(ultra)) => self.apply_ultra(ultra),
             SlashCommand::Provider(action) => self.provider(action).await,
             SlashCommand::ProviderSetup {
                 name,
@@ -5993,6 +6259,13 @@ impl CommandContext<'_> {
                 "on"
             } else {
                 "off"
+            }
+        ));
+        text.push_str(&format!(
+            "\nultra: {}",
+            match &self.app.ultra {
+                Some(ultra) => ultra.label(),
+                None => "off".to_string(),
             }
         ));
         self.app.notice(text);
@@ -6387,6 +6660,7 @@ impl CommandContext<'_> {
         if self.app.plan_mode {
             agent.set_plan_mode(true);
         }
+        restore_ultra(self.app, &mut agent);
         // Replay the reopened conversation into the transcript view.
         let messages = agent.session().load_messages().unwrap_or_default();
         let resumed_id = agent.session().id.clone();
@@ -6763,6 +7037,7 @@ impl CommandContext<'_> {
                 if self.app.plan_mode {
                     agent.set_plan_mode(true);
                 }
+                restore_ultra(self.app, &mut agent);
                 *self.agent_slot = Some(agent);
                 self.app.status.model = model_label;
                 self.app.notice(summary);
@@ -6788,6 +7063,17 @@ impl CommandContext<'_> {
             self.app.fusion_active = false;
             self.rebuild_active_provider("fusion off — back to the single model".to_string())
                 .await;
+            return;
+        }
+        // Stacked, the two multiply: every ultra candidate is a full agent run
+        // on the active client, and a fused client turns each of *its* model
+        // calls into a panel debate plus a synthesis. Refuse rather than quietly
+        // bill a turn at candidates × panel × rounds.
+        if self.app.ultra.is_some() {
+            self.app.notice(
+                "fusion cannot run under ultra — each of ultra's candidates would re-run the \
+                 whole panel; /ultra to turn ultra off first",
+            );
             return;
         }
 
@@ -6823,6 +7109,102 @@ impl CommandContext<'_> {
     /// debate panel and which synthesizes.
     fn open_fusion_picker(&mut self) {
         self.app.open_fusion_picker();
+    }
+
+    /// Toggle `/ultra`: mixture of agents. Where `/fusion` swaps the client and
+    /// therefore has to rebuild the agent from scratch, ultra changes nothing
+    /// about *which* model answers — the candidates fan out over the client and
+    /// model that are already active. So this is a plain flag on the live agent:
+    /// no rebuild, no session reset, and the conversation in front of the user
+    /// survives the toggle, which is what makes it usable mid-task ("that answer
+    /// was thin — /ultra, try again").
+    fn toggle_ultra(&mut self) {
+        if self.agent_unavailable("toggle ultra") {
+            return;
+        }
+        if self.app.ultra.is_some() {
+            self.app.ultra = None;
+            if let Some(agent) = self.agent_slot.as_mut() {
+                agent.set_ultra(None);
+            }
+            self.app
+                .notice("ultra off — one agent per turn again, no pre-phase");
+            return;
+        }
+        if self.app.fusion_active {
+            self.app.notice(
+                "ultra cannot run on top of fusion — every candidate would re-run the whole \
+                 panel; /fusion to turn fusion off first",
+            );
+            return;
+        }
+        // `build_ultra` is the sole validation gate for `[ultra]`, so a roster
+        // the user hand-edited into an unusable state surfaces here, at the
+        // toggle, instead of at the top of their next turn.
+        let engine = match self.app.config.build_ultra() {
+            Ok(engine) => Arc::new(engine),
+            Err(err) => {
+                self.app.notice(format!("could not start ultra: {err:#}"));
+                return;
+            }
+        };
+        let label = engine.label();
+        if let Some(agent) = self.agent_slot.as_mut() {
+            agent.set_ultra(Some(engine.clone()));
+        }
+        self.app.ultra = Some(engine);
+        self.app.notice(format!(
+            "{label} — each turn now drafts on the active model, compares, then acts; \
+             /ultra to turn off"
+        ));
+    }
+
+    /// Open the `/ultra config` roster editor: which lenses run as candidates,
+    /// and whether a judge compares their drafts.
+    fn open_ultra_picker(&mut self) {
+        self.app.open_ultra_picker();
+    }
+
+    /// Save the roster chosen at that editor. Building it first is not a
+    /// formality: [`UltraEngine::build`](ultra::UltraEngine::build) is the only
+    /// thing that rejects an unknown lens or an out-of-range count, so a roster
+    /// that would not run is reported and never written. When ultra is already
+    /// on, the live agent moves to the new roster in the same breath as the
+    /// badge — the two must not disagree about how many candidates the next turn
+    /// is about to spend.
+    fn apply_ultra(&mut self, ultra: UltraConfig) {
+        let engine = match self.app.config.build_ultra_from(&ultra) {
+            Ok(engine) => Arc::new(engine),
+            Err(err) => {
+                self.app.notice(format!("ultra roster rejected: {err:#}"));
+                return;
+            }
+        };
+        let label = engine.label();
+        self.app.config.ultra = Some(ultra);
+        if let Err(err) = self.app.config.save() {
+            self.app
+                .notice(format!("could not save ultra config: {err:#}"));
+            return;
+        }
+        if self.app.ultra.is_none() {
+            self.app.notice(format!("{label} — /ultra to turn on"));
+            return;
+        }
+        match self.agent_slot.as_mut() {
+            Some(agent) => {
+                agent.set_ultra(Some(engine.clone()));
+                self.app.ultra = Some(engine);
+                self.app.notice(format!("{label} — applied"));
+            }
+            // Mid-turn the agent is inside the turn and holds the old engine.
+            // Swapping only the badge would misreport a fan-out the user is
+            // watching run, so leave both alone and say which one they have.
+            None => self.app.notice(format!(
+                "{label} — saved; the running turn keeps the old roster, /ultra off then on to \
+                 pick this one up"
+            )),
+        }
     }
 
     /// Handle `/provider` subcommands: list, switch, add, or remove providers.
@@ -7935,6 +8317,93 @@ mod tests {
     }
 
     #[test]
+    fn ultra_parses_toggle_config_and_rejects_unknown() {
+        assert_eq!(
+            SlashCommand::parse("/ultra"),
+            Some(Ok(SlashCommand::Ultra(UltraAction::Toggle)))
+        );
+        assert_eq!(
+            SlashCommand::parse("/ultra config"),
+            Some(Ok(SlashCommand::Ultra(UltraAction::Config)))
+        );
+        assert!(matches!(SlashCommand::parse("/ultra bogus"), Some(Err(_))));
+    }
+
+    /// The `/ultra config` picker offers every lens in the catalog plus a trailing
+    /// judge row, pre-toggled to the configured roster, and Enter turns exactly the
+    /// toggled rows into the roster to save. The lens rows are compared as a set:
+    /// a user `~/.wizard/subagents/` entry that shadows a built-in moves it to the
+    /// end of the catalog, which is a legitimate reordering, not a failure.
+    #[test]
+    fn ultra_picker_saves_the_toggled_lenses_and_the_judge_row() {
+        let mut app = app();
+        app.open_ultra_picker();
+        let picker = app.picker.as_ref().expect("the ultra picker is open");
+        assert_eq!(picker.kind, PickerKind::UltraLenses);
+        let (judge, lenses) = picker.items.split_last().expect("rows");
+        assert_eq!(judge.value, ULTRA_JUDGE_ROW);
+        assert!(judge.current, "the default roster runs one judge");
+        for name in ultra::DEFAULT_LENSES {
+            let row = lenses
+                .iter()
+                .find(|item| item.value == *name)
+                .unwrap_or_else(|| panic!("{name} has a row"));
+            assert!(row.current, "{name} is in the default roster");
+        }
+
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Command(SlashCommand::Ultra(UltraAction::Apply(saved)))) = action
+        else {
+            panic!("Enter saves the roster, got {action:?}");
+        };
+        let mut got = saved.lenses;
+        got.sort();
+        let mut want = UltraConfig::default().lenses;
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(saved.judges, 1, "the judge row was left on");
+        assert!(app.picker.is_none(), "the picker closed");
+    }
+
+    /// Untoggling the judge row is how the compare phase is turned off — it must
+    /// reach `[ultra]` as `judges = 0`, not be silently floored back to one.
+    #[test]
+    fn ultra_picker_untoggling_the_judge_row_drops_the_compare_phase() {
+        let mut app = app();
+        app.open_ultra_picker();
+        let picker = app.picker.as_mut().expect("the ultra picker is open");
+        picker.selected = picker.items.len() - 1;
+        press(&mut app, KeyCode::Char(' '));
+
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Command(SlashCommand::Ultra(UltraAction::Apply(saved)))) = action
+        else {
+            panic!("Enter saves the roster, got {action:?}");
+        };
+        assert_eq!(saved.judges, 0);
+        assert!(!saved.lenses.is_empty(), "the lens roster is untouched");
+    }
+
+    /// An empty roster has nothing to fan out over, so Enter refuses it rather
+    /// than persisting an `[ultra]` that `UltraEngine::build` would then reject
+    /// at the next toggle.
+    #[test]
+    fn ultra_picker_refuses_an_empty_roster() {
+        let mut app = app();
+        app.open_ultra_picker();
+        let picker = app.picker.as_mut().expect("the ultra picker is open");
+        for item in &mut picker.items {
+            item.current = false;
+        }
+
+        assert!(press(&mut app, KeyCode::Enter).is_none(), "nothing to save");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Notice(text)) if text.contains("at least one lens")
+        ));
+    }
+
+    #[test]
     fn rewind_parses_with_and_without_a_turn() {
         assert_eq!(
             SlashCommand::parse("/rewind"),
@@ -8640,6 +9109,7 @@ mod tests {
             "/reload",
             "/settings",
             "/fusion",
+            "/ultra",
         ] {
             assert!(runnable(input).is_ok(), "{input} should be runnable");
         }
@@ -8674,6 +9144,7 @@ mod tests {
             "/publish",
             "/agents",
             "/fusion config",
+            "/ultra config",
         ] {
             assert!(runnable(input).is_err(), "{input} should be refused");
         }
@@ -9419,6 +9890,79 @@ mod tests {
         assert_eq!(app.rail_focus, None);
         press(&mut app, KeyCode::Char('h'));
         assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn an_aborted_turn_closes_out_the_panes_it_left_running() {
+        let mut app = app_with_panes(3);
+        // The first run finished before the interrupt; the other two were still
+        // streaming when the task was killed, so their loops were dropped
+        // mid-poll and no SubagentRunDone is ever coming for them.
+        app.handle_agent_event(AgentEvent::SubagentRunDone {
+            run: 0,
+            completed: true,
+            output: "report".to_string(),
+            steps_used: 1,
+            error: None,
+        });
+
+        app.fail_running_panes("interrupted");
+
+        assert_eq!(
+            app.running_panes(),
+            0,
+            "nothing is left pulsing on the rail"
+        );
+        assert_eq!(
+            app.panes[0].status,
+            PaneStatus::Done,
+            "the finished one is untouched"
+        );
+        for pane in &app.panes[1..] {
+            assert_eq!(pane.status, PaneStatus::Failed);
+            assert!(pane.finished.is_some(), "so its linger clock can start");
+        }
+
+        // And they retire like any other finished run, instead of sitting on the
+        // rail with a live clock for the rest of the session.
+        for pane in &mut app.panes {
+            pane.finished = Some(Instant::now() - PANE_LINGER - Duration::from_secs(1));
+        }
+        app.retire_finished_panes();
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn the_ultra_pre_phase_leaves_its_drafts_in_the_transcript() {
+        let mut app = app();
+        app.handle_agent_event(AgentEvent::UltraGuidance {
+            label: "ultra ×2 · implementer+skeptic · 1 judge".to_string(),
+            guidance: "[Ultra] 2 agent(s)…\n\ndraft from the implementer".to_string(),
+        });
+
+        // The candidates' panes retire seconds after they finish, while the main
+        // agent works on for minutes — so the card is the only place the drafts
+        // the user paid 3× for can still be read.
+        let card = app
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::ToolCard {
+                    name,
+                    output,
+                    collapsed,
+                    ..
+                } => Some((name, output, collapsed)),
+                _ => None,
+            })
+            .expect("the guidance card");
+        assert_eq!(card.0, "ultra ×2 · implementer+skeptic · 1 judge");
+        assert!(
+            card.1
+                .as_deref()
+                .is_some_and(|body| body.contains("draft from the implementer"))
+        );
+        assert!(*card.2, "folded: the answer is the point of the turn");
     }
 
     #[test]

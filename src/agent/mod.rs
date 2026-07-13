@@ -8,6 +8,7 @@ pub mod mission;
 pub mod prompts;
 pub mod session;
 pub mod subagent;
+pub mod ultra;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,10 +154,24 @@ pub enum AgentEvent {
     },
     /// Token usage of one completed model call, when the backend reported
     /// counts. Surfaces accumulate these (status bar, headless summary).
+    /// Emitted for the parent's own calls and for every subagent call made
+    /// under it (`spawn_subagent`, `/ultra`'s candidates and judges), so the
+    /// counter reflects what the turn actually spent.
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// The `/ultra` pre-phase produced its guidance: `label` is the roster that
+    /// ran (`"ultra ×3 · implementer+skeptic+minimalist · 1 judge"`), `guidance`
+    /// the candidate drafts and the judge's verdict exactly as they were
+    /// injected into the turn.
+    ///
+    /// The TUI folds it into a collapsed transcript card, which is the durable
+    /// record of a fan-out the user paid several× a normal turn for: the
+    /// candidates' panes retire off the rail within seconds of finishing, while
+    /// the main agent is still working. Surfaces that only print the turn's
+    /// answer ignore it — the drafts are advice, not the answer.
+    UltraGuidance { label: String, guidance: String },
     /// The todo list was replaced via the `todo` tool. Carries the full new
     /// list; the TUI mirrors it in a side panel, headless prints a one-line
     /// summary, the gateway ignores it.
@@ -504,7 +519,10 @@ pub struct Agent {
     /// system prompt; refreshed on mismatch alongside the plan block.
     omakase_prompt_on: bool,
     /// Token counters fed from `ChatChunk` eval counts during streaming.
-    usage: crate::usage::UsageTracker,
+    /// Shared into the tool context (`ToolContext::usage`) so a subagent's
+    /// model calls — `spawn_subagent`, and every `/ultra` candidate and judge —
+    /// bill this agent instead of vanishing from the totals.
+    usage: Arc<crate::usage::UsageTracker>,
     /// Where per-turn usage records are appended
     /// (`~/.wizard/usage.jsonl`); `None` disables the log.
     usage_log: Option<PathBuf>,
@@ -520,6 +538,15 @@ pub struct Agent {
     /// ([`Agent::bind_subagent_model`]): `/model` switches write through so
     /// subagents run on the parent's active model.
     subagent_model: Option<subagent::SharedActiveModel>,
+    /// The `/ultra` engine while mixture-of-agents mode is on: each turn first
+    /// fans candidate subagents out on *this* client and model, has judges
+    /// compare their drafts, and injects the verdict — then runs normally.
+    /// `None` (the default, and what every non-TUI surface gets) is an ordinary
+    /// turn.
+    ///
+    /// Session state, not config: a rebuilt agent (`/model`, a provider switch,
+    /// `/resume`) starts without it, so every rebuild path must re-arm it.
+    ultra: Option<Arc<ultra::UltraEngine>>,
 }
 
 /// One row of the `/rewind` picker: a turn, the prompt that started it, and
@@ -535,6 +562,14 @@ pub struct RewindCandidate {
 
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
+
+/// Heading of the note [`Agent::compact_now`] leaves in place of the span it
+/// summarized. Public because it is the only handle anything downstream has on
+/// that note: it is a `Role::System` message like any other, and
+/// [`ultra::render_context`] has to be able to tell "everything older than the
+/// tail, summarized" apart from an ordinary injected note when it briefs a
+/// candidate.
+pub const COMPACT_SUMMARY_HEADING: &str = "[Compacted progress summary]";
 
 /// Fraction of the provider's context window the last prompt may fill before
 /// token-aware compaction kicks in.
@@ -652,6 +687,8 @@ impl Agent {
             Arc::clone(&omakase),
         )));
 
+        let usage = Arc::new(crate::usage::UsageTracker::new());
+
         let mut agent = Self {
             client,
             model,
@@ -668,7 +705,8 @@ impl Agent {
             session,
             ctx: ToolContext::new(project_root)
                 .with_web(web)
-                .with_checkpoints(Arc::clone(&checkpoints)),
+                .with_checkpoints(Arc::clone(&checkpoints))
+                .with_usage(Arc::clone(&usage)),
             native_tools,
             skills,
             agents_md,
@@ -679,11 +717,12 @@ impl Agent {
             plan_prompt_on: false,
             omakase,
             omakase_prompt_on: false,
-            usage: crate::usage::UsageTracker::new(),
+            usage,
             usage_log: crate::usage::default_log_path(),
             checkpoints,
             cancel: CancelHandle::default(),
             subagent_model: None,
+            ultra: None,
         };
         agent
             .history
@@ -951,6 +990,19 @@ impl Agent {
         self.sync_plan_prompt();
     }
 
+    /// Turn `/ultra` on with a built engine, or off. Unlike `/fusion` this swaps
+    /// neither the client nor the registry — the candidates run on this agent's
+    /// own client and model — so the toggle is instant and the conversation
+    /// survives it.
+    pub fn set_ultra(&mut self, engine: Option<Arc<ultra::UltraEngine>>) {
+        self.ultra = engine;
+    }
+
+    /// Whether `/ultra` is on for this session.
+    pub fn ultra(&self) -> bool {
+        self.ultra.is_some()
+    }
+
     /// Re-compose the system prompt when the plan-mode or omakase flag changed
     /// since it was last baked in. Either flag can flip mid-turn (exit_plan
     /// approval clears plan mode), so the turn loop calls this before every
@@ -1080,10 +1132,33 @@ impl Agent {
                 Err(err)
             }
         };
+        // However the turn ended, ultra's guidance goes with it.
+        self.drop_ultra_guidance();
         // turn_end hooks: observational, fired however the turn ended.
         self.hooks.turn_end(self.mode, Some(&events)).await;
         self.record_turn_usage();
         result
+    }
+
+    /// Drop the guidance `/ultra` injected for the turn that just ended.
+    ///
+    /// Guidance is turn-scoped by nature: it is N drafts and a verdict about
+    /// *one* request, and that request has now been answered. Left in history it
+    /// would be re-sent on every subsequent turn and accumulate one block per
+    /// ultra turn — tens of KB each — until it filled a large fraction of the
+    /// window with stale advice, and (because a guidance block sits immediately
+    /// after its user message) it would also stall the compactor, whose kept
+    /// tail must start at a `Role::User` message.
+    ///
+    /// It is only ever in `self.history`, never in the session file, so nothing
+    /// has to be un-persisted. Compaction may have folded it into a summary
+    /// mid-turn, in which case there is nothing left to find and this is a
+    /// no-op — as it is on every turn of the ordinary single-agent path, which
+    /// is why this is unconditional rather than gated on the ultra flag: the
+    /// flag can be turned off between turns, and the block it left behind still
+    /// has to go.
+    fn drop_ultra_guidance(&mut self) {
+        self.history.retain(|message| !ultra::is_guidance(message));
     }
 
     /// Append this turn's token usage to the JSONL log (when the backend
@@ -1146,7 +1221,67 @@ impl Agent {
         if let Err(err) = self.session.append_marker(turn, &input) {
             tracing::warn!("could not append turn marker: {err}");
         }
-        self.push(ChatMessage::user(input));
+        self.push(ChatMessage::user(input.clone()));
+
+        // Ultra: the mixture-of-agents pre-phase. Candidates propose and judges
+        // compare *before* the main loop starts, so their conclusions enter the
+        // turn as one system note and the loop below — the only thing in this
+        // session that may write — proceeds unchanged.
+        //
+        // Position is load-bearing. After the user push, so a cancellation here
+        // leaves history exactly as a cancelled model stream does. Before
+        // `compact_if_needed`, so a large guidance block is *accounted for* by
+        // the compactor instead of overflowing the window behind it. `run`
+        // borrows `self` immutably and hands back an owned outcome, so those
+        // borrows are over by the time history needs `&mut self`.
+        if let Some(engine) = self.ultra.clone() {
+            let outcome = ultra::run(
+                &engine,
+                &input,
+                // The history as it stood *before* this request: it is already
+                // pushed, and a candidate must not read its own brief twice.
+                &self.history[..self.history.len() - 1],
+                &self.client,
+                &self.model,
+                self.dispatcher.registry(),
+                &self.hooks,
+                // Bare: `ultra::run` wires this turn's event channel into the
+                // context itself, since that is what its candidates' panes hang
+                // off (see its doc comment).
+                &self.ctx,
+                &self.cancel,
+                events,
+            )
+            .await;
+            match outcome {
+                ultra::UltraOutcome::Guidance(guidance) => {
+                    // The drafts and the verdict, verbatim, for the surface to
+                    // keep: the candidates' panes retire off the rail long
+                    // before this turn ends, and the guidance itself is never
+                    // rendered, so without this the work the user just paid N×
+                    // for would be unreadable everywhere.
+                    let _ = emit(
+                        events,
+                        AgentEvent::UltraGuidance {
+                            label: engine.label(),
+                            guidance: guidance.clone(),
+                        },
+                    )
+                    .await;
+                    // History only, never the session: this is advice about the
+                    // *one* request below it, so it is dropped again at the end
+                    // of the turn (`drop_ultra_guidance`) and must not come back
+                    // on `/resume` either. `push` would persist it as a system
+                    // note, which is exactly what we do not want.
+                    self.history.push(ChatMessage::system(guidance));
+                }
+                ultra::UltraOutcome::Skipped(reason) => {
+                    let _ = emit(events, AgentEvent::Notice(format!("ultra: {reason}"))).await;
+                }
+                ultra::UltraOutcome::Cancelled => return Ok(DoneReason::Stopped),
+            }
+        }
+
         self.compact_if_needed(events).await;
         let max_steps = self.config.max_steps.max(1);
 
@@ -1466,7 +1601,7 @@ impl Agent {
         let outcome = match self.summarize_span(start, end).await {
             Ok(summary) => {
                 let replacement =
-                    ChatMessage::system(format!("[Compacted progress summary]\n{summary}"));
+                    ChatMessage::system(format!("{COMPACT_SUMMARY_HEADING}\n{summary}"));
                 self.history
                     .splice(start..end, std::iter::once(replacement));
                 CompactOutcome::Summarized(count)
@@ -4263,5 +4398,236 @@ mod tests {
 
         // The real sessions dir was touched: clean up the empty file.
         let _ = std::fs::remove_file(new_session_path);
+    }
+
+    /// A one-lens, no-judge ultra engine. One candidate makes the scripted
+    /// provider's queue deterministic: the pre-phase takes exactly one response
+    /// (the draft), the main loop the next.
+    fn ultra_engine() -> Arc<ultra::UltraEngine> {
+        Arc::new(ultra::UltraEngine {
+            lenses: vec![subagent::SubagentConfig {
+                name: "implementer".to_string(),
+                description: "drafts".to_string(),
+                system_prompt: "draft it".to_string(),
+                tool_scope: None,
+                max_steps: 1,
+            }],
+            judge: ultra::builtin_judge(),
+            judges: 0,
+            timeout: Duration::from_secs(30),
+            max_draft_chars: 6_000,
+        })
+    }
+
+    #[tokio::test]
+    async fn ultra_guidance_lives_for_one_turn_and_is_never_persisted() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![final_chunk("draft: rename the flag in cli.rs")], // turn 1 candidate
+            vec![final_chunk("renamed it")],                       // turn 1 main loop
+            vec![final_chunk("draft: and the docs too")],          // turn 2 candidate
+            vec![final_chunk("done")],                             // turn 2 main loop
+        ]);
+        let mut agent = test_agent_with(&tmp, provider.clone(), Vec::new(), ToolRegistry::new());
+        agent.set_ultra(Some(ultra_engine()));
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("rename the flag", tx.clone()).await.unwrap();
+
+        // The drafts reached the model that acts on them...
+        let main_turn = provider.requests.lock().unwrap()[1].clone();
+        let injected: Vec<&ChatMessage> = main_turn
+            .messages
+            .iter()
+            .filter(|message| ultra::is_guidance(message))
+            .collect();
+        assert_eq!(injected.len(), 1, "exactly one guidance block");
+        assert!(injected[0].content.contains("rename the flag in cli.rs"));
+
+        // ...and the surface got them too, or they would be readable nowhere:
+        // the candidate's pane retires within seconds and a system message is
+        // never rendered in the transcript.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::UltraGuidance { guidance, .. }
+                    if guidance.contains("rename the flag in cli.rs")
+            )),
+            "the drafts are surfaced for the user to keep"
+        );
+
+        // The turn is over, so the advice about it is over.
+        assert!(
+            !agent.history.iter().any(ultra::is_guidance),
+            "guidance is turn-scoped: left in, one block per ultra turn accumulates in the window \
+             and every later turn re-sends drafts about requests that were already answered"
+        );
+        assert!(
+            !agent
+                .session()
+                .load_messages()
+                .expect("session loads")
+                .iter()
+                .any(ultra::is_guidance),
+            "and it is not in the session either, so /resume does not bring it back"
+        );
+
+        // A second ultra turn sees its own drafts and none of the last turn's.
+        agent.run_turn("now the docs", tx).await.unwrap();
+        let second_turn = provider.requests.lock().unwrap()[3].clone();
+        let injected: Vec<&ChatMessage> = second_turn
+            .messages
+            .iter()
+            .filter(|message| ultra::is_guidance(message))
+            .collect();
+        assert_eq!(injected.len(), 1, "still exactly one, not two");
+        assert!(injected[0].content.contains("and the docs too"));
+        assert!(
+            !injected[0].content.contains("rename the flag in cli.rs"),
+            "last turn's drafts are gone"
+        );
+    }
+
+    /// Provider that raises the parent's cancel handle as soon as it is asked
+    /// for a completion, and then never answers — the interrupt that arrives
+    /// while the ultra fan-out is mid-stream, which is when a user is most
+    /// likely to press Ctrl-C (nothing streams during the pre-phase).
+    struct CancelOnCallProvider {
+        handle: Arc<Mutex<Option<CancelHandle>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CancelOnCallProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<crate::llm::ChatStream> {
+            self.handle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("handle bound")
+                .cancel();
+            // Never answers: the run can only end by being cancelled.
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            unreachable!("the cancelled run is dropped long before this")
+        }
+
+        async fn context_window(&self, _model: &str) -> Option<u32> {
+            None
+        }
+
+        fn label(&self) -> String {
+            "cancel-on-call".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_turn_stops_the_ultra_fanout_and_closes_its_panes() {
+        let tmp = TempDir::new();
+        let slot = Arc::new(Mutex::new(None));
+        let provider = Arc::new(CancelOnCallProvider {
+            handle: Arc::clone(&slot),
+        });
+        let session = Session::create(&tmp.0).expect("create session");
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            session.id.clone(),
+        ));
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            Config::default(),
+            Vec::new(),
+            tmp.0.clone(),
+            session,
+            true,
+            hooks,
+        )
+        .expect("build agent");
+        agent.set_usage_log(None);
+        agent.set_ultra(Some(ultra_engine()));
+        // Exactly what the TUI does before it hands the agent to the turn task:
+        // it keeps this handle, and Ctrl-C raises it (see `AppAction::Interrupt`).
+        *slot.lock().unwrap() = Some(agent.cancel_handle());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent
+            .run_turn("something slow", tx)
+            .await
+            .expect("no error");
+        assert_eq!(
+            reason,
+            DoneReason::Stopped,
+            "the turn ends, and ends stopped"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let opened: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::SubagentRunStarted { run, .. } => Some(*run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened.len(), 1, "the candidate's pane opened");
+        let closed: Vec<(u64, bool)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::SubagentRunDone { run, completed, .. } => Some((*run, *completed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            [(opened[0], false)],
+            "and it was closed out on the way through: a pane the fan-out leaves at 'running' \
+             never retires off the rail, because retirement keys off `finished`"
+        );
+        assert!(
+            !agent.history.iter().any(ultra::is_guidance),
+            "a cancelled pre-phase injects nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn ultra_candidates_bill_the_parents_usage_log() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![usage_chunk("draft: do it", 500, 80)], // the candidate
+            vec![usage_chunk("did it", 200, 30)],       // the main loop
+        ]);
+        let mut agent = test_agent_with(&tmp, provider, Vec::new(), ToolRegistry::new());
+        agent.set_ultra(Some(ultra_engine()));
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("do it", tx).await.unwrap();
+
+        assert_eq!(
+            agent.usage().turn_totals(),
+            (700, 110),
+            "the candidate's tokens are the turn's tokens — an ultra turn that reported only the \
+             main agent's spend would understate itself several times over, under a chip that \
+             advertises exactly that multiplier"
+        );
+        let log = std::fs::read_to_string(tmp.0.join("usage.jsonl")).expect("usage log written");
+        assert!(log.contains("\"prompt_tokens\":700"), "{log}");
     }
 }

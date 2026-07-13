@@ -50,6 +50,25 @@ impl UsageTracker {
         }
     }
 
+    /// Record the usage of one *delegated* model call — a subagent run the
+    /// parent paid for (`spawn_subagent`, or one of `/ultra`'s candidates and
+    /// judges).
+    ///
+    /// It lands on the session and turn totals, because the tokens are spent
+    /// either way, but deliberately not on `last_prompt`: that one is the
+    /// *parent's* own prompt size and is what decides when to compact, and a
+    /// candidate's prompt — a different history, a different system prompt —
+    /// says nothing about how full the parent's context window is.
+    pub fn record_delegated(&self, prompt_tokens: u64, completion_tokens: u64) {
+        self.session_prompt
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.turn_prompt.fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.session_completion
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+        self.turn_completion
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+    }
+
     /// Reset the per-turn counters (called at the top of every turn).
     pub fn begin_turn(&self) {
         self.turn_prompt.store(0, Ordering::Relaxed);

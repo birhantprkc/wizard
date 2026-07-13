@@ -21,6 +21,7 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 - **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so OpenAI, Groq, vLLM, LM Studio, OpenRouter, Cloudflare Workers AI, Anthropic, xAI, and Ollama all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
 - **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you, including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
 - **Model fusion (`/fusion`).** Run a panel of your providers as a debate and synthesize one tool-capable answer that tends to beat the best single model in the panel. → [Fusion](docs/fusion.md)
+- **Mixture of agents (`/ultra`).** Fan a turn out to N read-only subagents on the model you're already using — each with a different lens, each reading the actual repo — have a judge compare their drafts, then execute from the verdict. → [Ultra](docs/ultra.md)
 - **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload`. Gated by a clean `cargo build` and a smoke test, it can also rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
 - **Runtime MCP.** stdio and HTTP MCP servers merge into the tool registry without a rebuild: the path for computer use, browser control, and databases. → [Self-extension](docs/evolve.md)
 - **Genie / Sovereign modes, plus `--continuous`.** An interactive direct-action TUI, a headless self-directing mode, or a perpetual mission that compacts its own context and self-heals through outages. → [Modes](docs/modes.md)
@@ -49,6 +50,7 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 - [Modes](docs/modes.md): genie, sovereign, and continuous
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
 - [Fusion](docs/fusion.md): the `/fusion` debate panel
+- [Ultra](docs/ultra.md): the `/ultra` mixture of agents
 - [Bench](docs/bench.md): record/replay trajectories to score builds and models
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster

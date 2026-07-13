@@ -380,11 +380,15 @@ fn mode_span(mode: Mode) -> Span<'static> {
     }
 }
 
-/// The status-bar model label. Loud (accent, bold) while `/fusion` is on — it
-/// runs every turn through a panel of models, several× the tokens — so the mode
-/// is never left running unnoticed; dim otherwise.
+/// The status-bar model label. Loud (accent, bold) while `/fusion` or `/ultra`
+/// is on, dim otherwise. Both cost several× the tokens of a plain turn — fusion
+/// runs every turn through a panel of models, ultra fans the active one out over
+/// N drafting candidates — and both are sticky, so neither is left running
+/// unnoticed. Ultra also gets its own `ULTRA ×N` chip in
+/// [`draw_status_bar`](self::draw_status_bar), because unlike fusion it does not
+/// change the model string this label renders.
 fn model_span(app: &App) -> Span<'static> {
-    if app.fusion_active {
+    if app.fusion_active || app.ultra.is_some() {
         Span::styled(app.status.model.clone(), accent().bold())
     } else {
         Span::styled(app.status.model.clone(), Style::default().fg(TEXT_DIM))
@@ -801,6 +805,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.plan_mode {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled("PLAN", accent().bold()));
+    }
+    // Ultra is the one sticky mode that changes neither the model string nor the
+    // mode word, so it needs a chip of its own — and the chip is the candidate
+    // count, because that is the multiplier on what the next turn costs.
+    if let Some(ultra) = &app.ultra {
+        spans.push(Span::styled(" · ", dim()));
+        spans.push(Span::styled(
+            format!("ULTRA \u{00d7}{}", ultra.candidates()),
+            accent().bold(),
+        ));
     }
     spans.push(Span::styled(" · ", dim()));
     spans.push(Span::styled(format_cwd(&app.project_root, 32), dim()));
