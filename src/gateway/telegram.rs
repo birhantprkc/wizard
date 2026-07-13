@@ -219,10 +219,7 @@ impl Telegram {
                 .mime_type
                 .as_deref()
                 .is_some_and(|m| m.starts_with("image/"))
-                || doc
-                    .file_name
-                    .as_deref()
-                    .is_some_and(|n| is_image_filename(n));
+                || doc.file_name.as_deref().is_some_and(is_image_filename);
             if is_image || caption.is_some() {
                 match self.download_file(&doc.file_id).await {
                     Ok(path) => {

@@ -211,7 +211,7 @@ impl ChatMessage {
 /// Rough token estimate from a character count (`~4` chars per token). Used
 /// only when a backend has not reported real usage; never for billing.
 pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
-    ((chars as u64) + 3) / 4
+    (chars as u64).div_ceil(4)
 }
 
 /// Sum of [`ChatMessage::estimated_tokens`] over a history. The status bar
