@@ -7,7 +7,7 @@
 //! is translated to the OpenAI request shape on the way out, and the SSE
 //! response is decoded back into Wizard's [`ChatChunk`] stream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 
 use super::provider::LlmProvider;
 use super::{
-    ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, ProviderError, Role, ToolCall,
+    ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, Image, ProviderError, Role,
+    ToolCall,
 };
 
 /// Supplies the `Authorization: Bearer` token for each request. The plain
@@ -274,8 +275,6 @@ fn rejects_temperature(model: &str) -> bool {
 /// earliest unmatched call of the same name), since Wizard's wire format does
 /// not carry call ids.
 fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    use std::collections::VecDeque;
-
     let mut pending: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
     let mut seq: u64 = 0;
     let mut out = Vec::with_capacity(messages.len());
@@ -283,15 +282,34 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
     for message in messages {
         match message.role {
             Role::System => out.push(json!({ "role": "system", "content": message.content })),
-            Role::User => out.push(json!({ "role": "user", "content": message.content })),
+            Role::User if message.images.is_empty() => {
+                out.push(json!({ "role": "user", "content": message.content }))
+            }
+            // A user message carrying images becomes a multi-part content
+            // array: the text first, then one `image_url` part per image as a
+            // base64 data URI (the OpenAI / xAI vision format).
+            Role::User => {
+                let mut parts = vec![json!({ "type": "text", "text": message.content })];
+                for image in &message.images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": image.data_uri() },
+                    }));
+                }
+                out.push(json!({ "role": "user", "content": parts }));
+            }
             Role::Assistant => {
                 let mut value = json!({ "role": "assistant" });
+                // An assistant turn cannot carry image content on this API, so
+                // images the model generated are named in the text instead of
+                // silently 400-ing the request.
+                let content = super::assistant_content(message);
                 // OpenAI requires `content: null` (not "") when only tool calls
                 // are present.
-                value["content"] = if message.content.is_empty() && !message.tool_calls.is_empty() {
+                value["content"] = if content.is_empty() && !message.tool_calls.is_empty() {
                     Value::Null
                 } else {
-                    json!(message.content)
+                    json!(content)
                 };
                 if !message.tool_calls.is_empty() {
                     let calls: Vec<Value> = message
@@ -479,14 +497,90 @@ struct StreamChoice {
 
 #[derive(Debug, Default, Deserialize)]
 struct Delta {
+    /// Visible text. A plain string on every text model; image-capable
+    /// endpoints send an array of content parts instead (see [`DeltaContent`]).
     #[serde(default)]
-    content: Option<String>,
+    content: Option<DeltaContent>,
     /// Reasoning ("thinking") fragments streamed before the visible text by
     /// reasoning models (xAI grok-4.3, DeepSeek R1, ...).
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
+    /// Generated images streamed beside the text — OpenRouter's shape for
+    /// image-output models, and the one an OpenAI-compatible image endpoint
+    /// most naturally emits.
+    #[serde(default)]
+    images: Vec<ImagePart>,
+}
+
+/// A delta's `content`: text, or an array of content parts (the multi-modal
+/// shape, where an image arrives as an `image_url` part beside the text).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DeltaContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One part of a multi-modal `delta.content` array.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ContentPart {
+    Text {
+        text: String,
+    },
+    /// Anything with an image payload — an `image_url` part, or a raw
+    /// `b64_json` one (see [`ImagePart`]).
+    Image(ImagePart),
+    /// A part shape we do not understand (a future modality). Matches last, so
+    /// an unknown part is ignored rather than failing the parse of the chunk
+    /// the text is riding on.
+    Other(serde::de::IgnoredAny),
+}
+
+/// A generated image on the wire. Both shapes that OpenAI-compatible endpoints
+/// return are accepted: an `image_url` part carrying a `data:` URI, and a raw
+/// `b64_json` payload with the media type stated separately (the Images-API
+/// shape, which gateways inline into the chat delta).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ImagePart {
+    Url {
+        image_url: ImageUrl,
+    },
+    B64 {
+        b64_json: String,
+        /// `image/png` unless the endpoint says otherwise.
+        #[serde(default, alias = "mime_type", alias = "media_type")]
+        mime: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageUrl {
+    url: String,
+}
+
+impl ImagePart {
+    /// Decode the part into an [`Image`]. `None` (with a warning) when the
+    /// payload is not a usable image — a broken or absurdly large image is
+    /// dropped, never allowed to kill the stream it arrived on.
+    fn decode(self) -> Option<Image> {
+        let decoded = match self {
+            ImagePart::Url { image_url } => Image::from_data_uri(&image_url.url),
+            ImagePart::B64 { b64_json, mime } => {
+                Image::from_base64(&b64_json, mime.as_deref().unwrap_or("image/png"))
+            }
+        };
+        match decoded {
+            Ok(image) => Some(image),
+            Err(err) => {
+                tracing::warn!("dropping a streamed image: {err}");
+                None
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,12 +613,35 @@ struct ToolAccum {
     arguments: String,
 }
 
+/// Split a delta's `content` into its text (if any, non-empty) and the images
+/// carried in it as content parts.
+fn split_content(content: Option<DeltaContent>) -> (Option<String>, Vec<Image>) {
+    match content {
+        None => (None, Vec::new()),
+        Some(DeltaContent::Text(text)) => ((!text.is_empty()).then_some(text), Vec::new()),
+        Some(DeltaContent::Parts(parts)) => {
+            let mut text = String::new();
+            let mut images = Vec::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text: fragment } => text.push_str(&fragment),
+                    ContentPart::Image(image) => images.extend(image.decode()),
+                    ContentPart::Other(_) => {}
+                }
+            }
+            ((!text.is_empty()).then_some(text), images)
+        }
+    }
+}
+
 /// Decoder state for [`decode_sse`].
 struct SseState<S> {
     bytes: S,
     buf: Vec<u8>,
-    /// Second chunk queued when one delta carries both reasoning and content.
-    pending: Option<ChatChunk>,
+    /// Chunks queued behind the one being returned, when a single delta
+    /// carries several things at once (reasoning *and* text, text *and* an
+    /// image). Drained before the next line is parsed, so nothing is lost.
+    pending: VecDeque<ChatChunk>,
     tool_calls: BTreeMap<u64, ToolAccum>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
@@ -566,6 +683,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     };
     ChatChunk {
         message,
+        images: Vec::new(),
         thinking: false,
         done: true,
         done_reason: state.done_reason.clone(),
@@ -578,6 +696,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
 fn text_chunk(content: String, thinking: bool) -> ChatChunk {
     ChatChunk {
         message: Some(ChatMessage::assistant(content)),
+        images: Vec::new(),
         thinking,
         done: false,
         done_reason: None,
@@ -586,9 +705,24 @@ fn text_chunk(content: String, thinking: bool) -> ChatChunk {
     }
 }
 
-/// Decode an OpenAI SSE byte stream into a [`ChatStream`]: text and reasoning
-/// deltas are emitted live as `done: false` chunks; tool-call fragments are
-/// accumulated per index and emitted in a single synthesized `done: true`
+/// A live `done: false` chunk carrying generated images. The agent loop
+/// accumulates these onto the assistant message and announces them to the
+/// surfaces; see [`ChatChunk::images`].
+fn image_chunk(images: Vec<Image>) -> ChatChunk {
+    ChatChunk {
+        message: None,
+        images,
+        thinking: false,
+        done: false,
+        done_reason: None,
+        eval_count: None,
+        prompt_eval_count: None,
+    }
+}
+
+/// Decode an OpenAI SSE byte stream into a [`ChatStream`]: text, reasoning and
+/// image deltas are emitted live as `done: false` chunks; tool-call fragments
+/// are accumulated per index and emitted in a single synthesized `done: true`
 /// chunk at the end.
 pub(crate) fn decode_sse<S>(bytes: S) -> ChatStream
 where
@@ -597,7 +731,7 @@ where
     let state = SseState {
         bytes,
         buf: Vec::new(),
-        pending: None,
+        pending: VecDeque::new(),
         tool_calls: BTreeMap::new(),
         prompt_eval_count: None,
         eval_count: None,
@@ -610,7 +744,7 @@ where
             if state.emitted_final {
                 return Ok(None);
             }
-            if let Some(queued) = state.pending.take() {
+            if let Some(queued) = state.pending.pop_front() {
                 return Ok(Some((queued, state)));
             }
             // Drain complete lines, returning the first content delta we find.
@@ -654,19 +788,31 @@ where
                             }
                         }
                     }
+                    // One delta can carry reasoning, text and images at once;
+                    // each becomes its own chunk, queued in that order.
+                    let (content, mut images) = split_content(choice.delta.content);
+                    images.extend(
+                        choice
+                            .delta
+                            .images
+                            .into_iter()
+                            .filter_map(ImagePart::decode),
+                    );
                     let reasoning = choice
                         .delta
                         .reasoning_content
                         .filter(|text| !text.is_empty());
-                    let content = choice.delta.content.filter(|text| !text.is_empty());
                     if let Some(reasoning) = reasoning {
-                        // Both in one delta: queue the content behind the
-                        // reasoning so neither fragment is lost.
-                        state.pending = content.map(|content| text_chunk(content, false));
-                        return Ok(Some((text_chunk(reasoning, true), state)));
+                        state.pending.push_back(text_chunk(reasoning, true));
                     }
                     if let Some(content) = content {
-                        return Ok(Some((text_chunk(content, false), state)));
+                        state.pending.push_back(text_chunk(content, false));
+                    }
+                    if !images.is_empty() {
+                        state.pending.push_back(image_chunk(images));
+                    }
+                    if let Some(first) = state.pending.pop_front() {
+                        return Ok(Some((first, state)));
                     }
                 }
             }
@@ -749,6 +895,56 @@ mod tests {
             Some("sk-test".to_string())
         );
         assert_eq!(StaticToken::new("").bearer().await.expect("ok"), None);
+    }
+
+    #[test]
+    fn user_images_become_image_url_parts() {
+        let messages = vec![ChatMessage::user_with_images(
+            "what is on screen?",
+            vec![
+                Image::new("QUJD", "image/png"),
+                Image::new("REVG", "image/webp"),
+            ],
+        )];
+        let out = build_messages(&messages);
+        let content = &out[0]["content"];
+        assert!(content.is_array(), "image-bearing content is multi-part");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is on screen?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        // The media type rides with the bytes — not hard-coded to PNG.
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "data:image/webp;base64,REVG"
+        );
+    }
+
+    #[test]
+    fn user_without_images_stays_a_plain_string() {
+        let out = build_messages(&[ChatMessage::user("hi")]);
+        assert_eq!(out[0]["content"], "hi");
+    }
+
+    #[test]
+    fn assistant_images_are_named_in_the_text_not_sent_as_blocks() {
+        // No chat API takes image content in an assistant turn; replaying one
+        // must degrade to text rather than 400 the request.
+        let mut assistant = ChatMessage::assistant("here it is");
+        assistant.images.push(Image::new("QUJD", "image/png"));
+        let out = build_messages(&[assistant]);
+        let content = out[0]["content"].as_str().expect("plain text content");
+        assert!(content.starts_with("here it is"));
+        assert!(
+            content.contains("generated 1 image(s) (image/png)"),
+            "{content}"
+        );
+        assert!(
+            !serde_json::to_string(&out[0])
+                .unwrap()
+                .contains("image_url"),
+            "the image itself is dropped from the wire"
+        );
     }
 
     #[test]
@@ -1046,6 +1242,80 @@ mod tests {
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn decodes_generated_images_from_the_delta_images_array() {
+        // OpenRouter's shape for image-output models: `delta.images`, each a
+        // data URI. Text and image arrive in one delta; both must survive.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"here you go\",\"images\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}]},\"finish_reason\":\"stop\"}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let text = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(text.message.expect("message").content, "here you go");
+        assert!(text.images.is_empty());
+
+        let image = chunks.next().await.expect("image").expect("ok");
+        assert!(!image.done, "images stream live, like text");
+        assert_eq!(image.images.len(), 1);
+        assert_eq!(image.images[0].mime, "image/png");
+        assert_eq!(image.images[0].b64, "QUJD");
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn decodes_image_content_parts_and_b64_json_payloads() {
+        // The multi-modal `delta.content` array, with both accepted image
+        // shapes: an `image_url` part and a raw `b64_json` one.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"two:\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,/9j/\"}},{\"b64_json\":\"R0lGODlh\",\"mime_type\":\"image/gif\"}]}}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let text = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(text.message.expect("message").content, "two:");
+
+        let images = chunks.next().await.expect("images").expect("ok");
+        assert_eq!(images.images.len(), 2);
+        assert_eq!(images.images[0].mime, "image/jpeg");
+        assert_eq!(images.images[0].b64, "/9j/");
+        assert_eq!(images.images[1].mime, "image/gif");
+        assert_eq!(images.images[1].b64, "R0lGODlh");
+
+        assert!(chunks.next().await.expect("final").expect("ok").done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_broken_image_payload_is_dropped_not_fatal() {
+        // A malformed image must not kill the stream the text is riding on.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"still here\",\"images\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/cat.png\"}}]}}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let text = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(text.message.expect("message").content, "still here");
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done, "the unusable image is dropped, the stream lives");
         assert!(chunks.next().await.is_none());
     }
 

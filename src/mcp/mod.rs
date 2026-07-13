@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use crate::llm::Image;
 use crate::tools::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 
 /// MCP protocol revision this client speaks.
@@ -311,9 +312,10 @@ impl McpConnection {
         Ok(tools)
     }
 
-    /// `tools/call` — invoke a tool; returns the concatenated text content
-    /// and whether the server flagged the result as an error.
-    pub async fn call_tool(&self, name: &str, args: Value) -> Result<(String, bool)> {
+    /// `tools/call` — invoke a tool; returns the decoded content (text, plus
+    /// any images the server returned) and whether the server flagged the
+    /// result as an error.
+    pub async fn call_tool(&self, name: &str, args: Value) -> Result<(McpContent, bool)> {
         let arguments = match args {
             Value::Null => json!({}),
             Value::Object(map) => Value::Object(map),
@@ -332,7 +334,7 @@ impl McpConnection {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok((flatten_content(&result), is_error))
+        Ok((decode_content(&result), is_error))
     }
 
     /// Shut down the connection (terminate the child process if stdio).
@@ -884,15 +886,31 @@ fn extract_result(mut msg: Value, server: &str) -> Result<Value> {
         .unwrap_or(Value::Null))
 }
 
-/// Flatten a `tools/call` result's content blocks into one text payload for
-/// the model. Non-text blocks become readable placeholders.
-fn flatten_content(result: &Value) -> String {
+/// A `tools/call` result decoded for the model: the content blocks flattened
+/// into one text payload, and the images carried out of it whole.
+#[derive(Debug)]
+pub struct McpContent {
+    /// What the model reads — one block per line, non-text blocks as readable
+    /// placeholders. An image keeps its `[image content: <mime>]` marker here
+    /// even though the image itself now rides along: a text-only model never
+    /// sees the attachment, and must still be told one came back.
+    pub text: String,
+    /// What the model sees. Handed to the agent loop through
+    /// [`ToolOutput::images`], which persists them, announces them to the
+    /// surfaces and feeds them back on a following user message.
+    pub images: Vec<Image>,
+}
+
+/// Decode a `tools/call` result's content blocks: text and placeholders into
+/// [`McpContent::text`], images into [`McpContent::images`].
+fn decode_content(result: &Value) -> McpContent {
     let blocks = result
         .get("content")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let mut parts: Vec<String> = Vec::with_capacity(blocks.len());
+    let mut images: Vec<Image> = Vec::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -904,23 +922,51 @@ fn flatten_content(result: &Value) -> String {
                         .to_string(),
                 );
             }
-            Some("image") | Some("audio") => {
-                let kind = block.get("type").and_then(Value::as_str).unwrap_or("media");
+            Some("image") => match block_image(block.get("data")) {
+                Ok(image) => {
+                    parts.push(format!("[image content: {}]", image.mime));
+                    images.push(image);
+                }
+                Err(err) => {
+                    // The server promised an image and delivered something
+                    // else. Say so plainly rather than claiming an image the
+                    // model is never shown.
+                    warn!("unusable image in MCP tool result: {err:#}");
+                    parts.push(format!("[unusable image content: {err:#}]"));
+                }
+            },
+            Some("audio") => {
                 let mime = block
                     .get("mimeType")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown type");
-                parts.push(format!("[{kind} content: {mime}]"));
+                parts.push(format!("[audio content: {mime}]"));
             }
             Some("resource") => {
                 let resource = block.get("resource");
+                let uri = resource
+                    .and_then(|r| r.get("uri"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
                 if let Some(text) = resource.and_then(|r| r.get("text")).and_then(Value::as_str) {
                     parts.push(text.to_string());
+                } else if resource.is_some_and(claims_image) {
+                    // An embedded binary resource that says it is an image: its
+                    // `blob` is base64 like an `image` block's `data`, so take
+                    // it the same way — the sniff decides whether the claim was
+                    // true. Anything else stays a placeholder: Wizard has no
+                    // path for a binary that is not an image.
+                    match block_image(resource.and_then(|r| r.get("blob"))) {
+                        Ok(image) => {
+                            parts.push(format!("[image content: {}: {uri}]", image.mime));
+                            images.push(image);
+                        }
+                        Err(err) => {
+                            warn!("unusable image resource '{uri}' in MCP tool result: {err:#}");
+                            parts.push(format!("[binary resource: {uri}]"));
+                        }
+                    }
                 } else {
-                    let uri = resource
-                        .and_then(|r| r.get("uri"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
                     parts.push(format!("[binary resource: {uri}]"));
                 }
             }
@@ -938,14 +984,43 @@ fn flatten_content(result: &Value) -> String {
             }
         }
     }
-    let text = parts.join("\n");
+    let mut text = parts.join("\n");
     if text.is_empty() {
         // Some servers return only structured output.
         if let Some(structured) = result.get("structuredContent") {
-            return serde_json::to_string_pretty(structured).unwrap_or_default();
+            text = serde_json::to_string_pretty(structured).unwrap_or_default();
         }
     }
-    text
+    McpContent { text, images }
+}
+
+/// True when an embedded resource declares an image media type. Only a gate on
+/// whether to *try* decoding a `blob` — what the bytes actually are is decided
+/// by [`block_image`], not by this claim.
+fn claims_image(resource: &Value) -> bool {
+    resource
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.starts_with("image/"))
+}
+
+/// Take the image out of a content block's base64 payload (`data` on an
+/// `image` block, `blob` on an embedded resource).
+///
+/// The media type is sniffed from the decoded bytes by [`Image::from_bytes`],
+/// never read from the block's `mimeType`: a server's claim is not evidence,
+/// and a provider handed a mislabelled image rejects the whole request. The
+/// same call applies the size cap, so a server cannot push an absurd payload
+/// into history through this seam.
+fn block_image(data: Option<&Value>) -> Result<Image> {
+    use base64::Engine as _;
+    let data = data
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no base64 payload"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .context("payload is not valid base64")?;
+    Ok(Image::from_bytes(&bytes)?)
 }
 
 /// Cap `s` at `max` characters for error messages and logs.
@@ -1125,8 +1200,13 @@ impl Tool for McpTool {
         }
         let call = self.connection.call_tool(&self.info.name, args);
         match timeout(Duration::from_secs(CALL_TIMEOUT_SECS), call).await {
-            Ok(Ok((content, true))) => Ok(ToolOutput::error(content)),
-            Ok(Ok((content, false))) => Ok(ToolOutput::ok(content)),
+            // Images ride back even on a failed call: a browser tool that
+            // reports a broken page still returns the screenshot of it.
+            Ok(Ok((content, is_error))) => Ok(ToolOutput {
+                content: content.text,
+                is_error,
+                images: content.images,
+            }),
             Ok(Err(err)) => Err(ToolError::Execution {
                 tool: self.registered_name.clone(),
                 source: err,
@@ -1284,43 +1364,188 @@ Authorization = "Bearer abc"
         assert!(message.contains("method not found"), "got: {message}");
     }
 
+    /// Base64 of a real (if tiny) PNG: the magic number is what `sniff_mime`
+    /// reads, and the trailing bytes stand in for pixels.
+    fn png_b64() -> String {
+        b64(&[
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..],
+            b"pixels",
+        ]
+        .concat())
+    }
+
+    /// Base64 of a real (if tiny) GIF, for telling two images apart.
+    fn gif_b64() -> String {
+        b64(b"GIF89a-pixels")
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     #[test]
-    fn flatten_content_handles_mixed_blocks() {
+    fn decode_content_handles_mixed_blocks() {
         let result = json!({
             "content": [
                 {"type": "text", "text": "hello"},
-                {"type": "image", "mimeType": "image/png", "data": "..."},
+                {"type": "image", "mimeType": "image/png", "data": png_b64()},
                 {"type": "resource", "resource": {"uri": "file:///a.txt", "text": "contents"}},
                 {"type": "resource_link", "uri": "file:///b.txt"},
             ],
         });
-        let text = flatten_content(&result);
+        let content = decode_content(&result);
         assert_eq!(
-            text,
-            "hello\n[image content: image/png]\ncontents\n[resource link: file:///b.txt]"
+            content.text,
+            "hello\n[image content: image/png]\ncontents\n[resource link: file:///b.txt]",
+            "the image keeps its marker in the text a text-only model reads"
+        );
+        assert_eq!(content.images.len(), 1);
+        assert_eq!(content.images[0].mime, "image/png");
+        assert_eq!(content.images[0].b64, png_b64(), "the payload rides whole");
+        assert!(
+            content.images[0].path.is_none(),
+            "the agent's image store fills the path in, not us"
         );
     }
 
     #[test]
-    fn flatten_content_falls_back_to_structured_content() {
+    fn decode_content_leaves_text_only_results_alone() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "line one"},
+                {"type": "text", "text": "line two"},
+            ],
+        });
+        let content = decode_content(&result);
+        assert_eq!(content.text, "line one\nline two");
+        assert!(content.images.is_empty());
+    }
+
+    #[test]
+    fn decode_content_takes_every_image_in_order() {
+        let result = json!({
+            "content": [
+                {"type": "image", "mimeType": "image/png", "data": png_b64()},
+                {"type": "text", "text": "and another"},
+                {"type": "image", "mimeType": "image/gif", "data": gif_b64()},
+            ],
+        });
+        let content = decode_content(&result);
+        let mimes: Vec<&str> = content
+            .images
+            .iter()
+            .map(|image| image.mime.as_str())
+            .collect();
+        assert_eq!(mimes, ["image/png", "image/gif"]);
+        assert_eq!(
+            content.text,
+            "[image content: image/png]\nand another\n[image content: image/gif]"
+        );
+    }
+
+    #[test]
+    fn decode_content_sniffs_the_media_type_instead_of_trusting_the_server() {
+        // A PNG mislabelled as text: the bytes decide, so it still reaches the
+        // model as an image — a provider handed `text/plain` would reject it.
+        let result = json!({
+            "content": [{"type": "image", "mimeType": "text/plain", "data": png_b64()}],
+        });
+        let content = decode_content(&result);
+        assert_eq!(content.images.len(), 1);
+        assert_eq!(content.images[0].mime, "image/png");
+        assert_eq!(content.text, "[image content: image/png]");
+
+        // And the other way round: text dressed up as an image is refused, not
+        // handed on as a broken attachment.
+        let result = json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": b64(b"hello")}],
+        });
+        let content = decode_content(&result);
+        assert!(content.images.is_empty());
+        assert!(
+            content
+                .text
+                .starts_with("[unusable image content: unrecognized image data"),
+            "got: {}",
+            content.text
+        );
+    }
+
+    #[test]
+    fn decode_content_degrades_honestly_on_a_broken_image_block() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "mimeType": "image/png", "data": "!!! not base64 !!!"},
+                {"type": "image", "mimeType": "image/png"},
+                {"type": "image", "mimeType": "image/png", "data": 7},
+                {"type": "text", "text": "after"},
+            ],
+        });
+        let content = decode_content(&result);
+        assert!(
+            content.images.is_empty(),
+            "nothing unusable reaches the model"
+        );
+        let lines: Vec<&str> = content.text.lines().collect();
+        assert_eq!(lines.len(), 5, "every block still says something");
+        assert_eq!(lines[0], "before");
+        assert!(lines[1].contains("not valid base64"), "got: {}", lines[1]);
+        assert!(lines[2].contains("no base64 payload"), "got: {}", lines[2]);
+        assert!(lines[3].contains("no base64 payload"), "got: {}", lines[3]);
+        assert_eq!(lines[4], "after", "a bad block never poisons the good ones");
+    }
+
+    #[test]
+    fn decode_content_takes_images_out_of_embedded_resources() {
+        let result = json!({
+            "content": [
+                {"type": "resource", "resource": {
+                    "uri": "file:///shot.png", "mimeType": "image/png", "blob": png_b64(),
+                }},
+                // Claims an image, is not one: back to a plain binary resource.
+                {"type": "resource", "resource": {
+                    "uri": "file:///lies.png", "mimeType": "image/png", "blob": b64(b"hello"),
+                }},
+                // Never claimed to be an image: untouched, as before.
+                {"type": "resource", "resource": {
+                    "uri": "file:///a.bin", "mimeType": "application/octet-stream",
+                    "blob": b64(b"binary"),
+                }},
+            ],
+        });
+        let content = decode_content(&result);
+        assert_eq!(content.images.len(), 1);
+        assert_eq!(content.images[0].mime, "image/png");
+        assert_eq!(
+            content.text,
+            "[image content: image/png: file:///shot.png]\n[binary resource: file:///lies.png]\n\
+             [binary resource: file:///a.bin]"
+        );
+    }
+
+    #[test]
+    fn decode_content_falls_back_to_structured_content() {
         let result = json!({
             "content": [],
             "structuredContent": {"answer": 42},
         });
-        let text = flatten_content(&result);
-        assert!(text.contains("42"), "got: {text}");
+        let content = decode_content(&result);
+        assert!(content.text.contains("42"), "got: {}", content.text);
+        assert!(content.images.is_empty());
     }
 
     /// A fake stdio MCP server implemented as a `sh` line loop: answers
     /// `initialize` (id 1), `tools/list` (id 2, one tool named `tool`), and
-    /// `tools/call` (id 3).
-    fn fake_server_config(name: &str, tool: &str) -> McpServerConfig {
+    /// `tools/call` (id 3) with `content` — a JSON array of content blocks.
+    fn fake_server_returning(name: &str, tool: &str, content: &str) -> McpServerConfig {
         let script = format!(
             r#"while read -r line; do
   case "$line" in
     *'"initialize"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-03-26","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}}' ;;
     *'"tools/list"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"{tool}","description":"a fake tool","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}' ;;
-    *'"tools/call"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"called {tool}"}}],"isError":false}}}}' ;;
+    *'"tools/call"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"content":{content},"isError":false}}}}' ;;
   esac
 done"#
         );
@@ -1333,6 +1558,12 @@ done"#
             env: HashMap::new(),
             headers: HashMap::new(),
         }
+    }
+
+    /// The same fake server, answering `tools/call` with a line of text.
+    fn fake_server_config(name: &str, tool: &str) -> McpServerConfig {
+        let content = format!(r#"[{{"type":"text","text":"called {tool}"}}]"#);
+        fake_server_returning(name, tool, &content)
     }
 
     #[tokio::test]
@@ -1369,6 +1600,35 @@ done"#
             .expect("tools/call should succeed");
         assert!(!output.is_error);
         assert_eq!(output.content, "called weather");
+        assert!(output.images.is_empty(), "a text result carries no images");
+    }
+
+    /// The whole seam, over a real stdio transport: a server returns a
+    /// screenshot, and it lands on `ToolOutput::images` for the agent loop to
+    /// persist and announce.
+    #[tokio::test]
+    async fn a_screenshot_from_a_server_lands_on_tool_output_images() {
+        let content = format!(
+            r#"[{{"type":"text","text":"the page"}},{{"type":"image","mimeType":"image/png","data":"{}"}}]"#,
+            png_b64()
+        );
+        let config = McpConfig {
+            servers: vec![fake_server_returning("browser", "screenshot", &content)],
+        };
+        let manager = McpManager::connect_all(&config)
+            .await
+            .expect("connect_all never hard-fails");
+        let tools = manager.tools().await.expect("tools/list should succeed");
+        let output = tools[0]
+            .execute(json!({}), &ToolContext::new(std::env::temp_dir()))
+            .await
+            .expect("tools/call should succeed");
+
+        assert!(!output.is_error);
+        assert_eq!(output.content, "the page\n[image content: image/png]");
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime, "image/png");
+        assert_eq!(output.images[0].b64, png_b64());
     }
 
     #[tokio::test]

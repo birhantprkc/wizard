@@ -1121,6 +1121,35 @@ button.ghost-chip:hover {
   color: var(--red);
 }
 
+/* The image pane: one image at its own size. Like the diff, it is not prose —
+   folding a 2048px render into a 720px column is the one thing this view exists
+   not to do — so the header runs the full width and the image scrolls, in here,
+   rather than being shrunk to fit. */
+.image-pane .pane-head-row {
+  max-width: none;
+}
+/* The path takes the room; what the file *is* keeps its line. */
+.image-pane .pane-meta {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.image-body {
+  padding: 20px 32px 140px;
+}
+.image-full {
+  display: block;
+  max-width: 100%;
+}
+.image-note {
+  padding: 14px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.image-note.error {
+  color: var(--red);
+}
+
 /* ------------------------------------------------------------------ */
 /* Live streaming: state dots, thinking, tool groups, system rows       */
 /* ------------------------------------------------------------------ */
@@ -1246,6 +1275,68 @@ button.ghost-chip:hover {
 .tool-name.mono-name {
   font-family: var(--font-mono);
   font-size: 12.5px;
+}
+
+/* Images: what the model drew, or what a tool returned. The thumbnails are one
+   row that wraps, each a fixed height — the frame says how many bytes an image
+   is, never how many pixels, so the box has to be decided before the file
+   arrives or the transcript would jump as each one decodes. Width follows the
+   aspect ratio, which is the only thing that may move, and only sideways. */
+.image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 16px 0;
+}
+/* On a tool's card: tucked under its row, aligned with the call list. */
+.image-strip.tool-images {
+  margin: -8px 0 20px 24px;
+}
+.image-thumb {
+  height: 168px;
+  min-width: 96px;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.image-thumb:hover {
+  border-color: #34343a;
+}
+.image-thumb-img {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
+/* A file that is gone: the same box, saying so, naming itself. */
+.image-thumb.broken {
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 14px;
+  max-width: 280px;
+  border-style: dashed;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: default;
+}
+.image-broken-icon {
+  color: var(--text-faint);
+}
+.image-broken-path {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  color: var(--text-faint);
 }
 
 /* System rows: notices, errors, transient retry note */

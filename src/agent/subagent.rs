@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, Mode};
 use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::provider::LlmProvider;
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Role, ToolCall};
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Image, Role, ToolCall};
 use crate::tools::subagent_tasks::SubagentRunResult;
 use crate::tools::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
 
@@ -203,26 +203,31 @@ pub struct SpawnOptions {
 
 /// One model round-trip: stream a completion, skipping reasoning
 /// ("thinking") chunks so they never leak into subagent history or reports.
+/// Any images the model generated come back alongside the text (see
+/// [`ChatChunk::images`](crate::llm::ChatChunk::images)).
 async fn stream_step(
     client: &Arc<dyn LlmProvider>,
     request: ChatRequest,
-) -> Result<(String, Vec<ToolCall>)> {
+) -> Result<(String, Vec<ToolCall>, Vec<Image>)> {
     let mut stream = client.chat_stream(request).await?;
     let mut content = String::new();
     let mut tool_calls = Vec::new();
+    let mut images = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        images.extend(chunk.images);
         if let Some(message) = chunk.message {
             if !chunk.thinking {
                 content.push_str(&message.content);
             }
+            images.extend(message.images);
             tool_calls.extend(message.tool_calls);
         }
         if chunk.done {
             break;
         }
     }
-    Ok((content, tool_calls))
+    Ok((content, tool_calls, images))
 }
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
@@ -319,7 +324,7 @@ pub async fn spawn(
         // (transport drops, 429/5xx) back off and retry instead of killing a
         // deep run; permanent errors (auth, bad request) fail immediately.
         let mut attempt: u32 = 0;
-        let (content, mut tool_calls) = loop {
+        let (content, mut tool_calls, images) = loop {
             match stream_step(client, request.clone()).await {
                 Ok(completion) => break completion,
                 Err(err) => {
@@ -353,11 +358,25 @@ pub async fn spawn(
             }
         };
 
+        // Images the subagent's model generated: persisted to the session's
+        // image store (shared with the parent through the context) and
+        // announced on this run's pane before they land in its history.
+        let images =
+            crate::agent::absorb_images(images, ctx.images.as_ref(), progress.as_ref(), |images| {
+                crate::agent::AgentEvent::SubagentRunImages {
+                    run,
+                    source: crate::agent::ImageSource::Assistant,
+                    images,
+                }
+            })
+            .await;
+
         history.push(ChatMessage {
             role: Role::Assistant,
             content: content.clone(),
             tool_calls: tool_calls.clone(),
             tool_name: None,
+            images,
         });
 
         if !native_tools
@@ -458,10 +477,34 @@ pub async fn spawn(
                 output.content
             };
             history.push(if native_tools {
-                ChatMessage::tool_result(name, body)
+                ChatMessage::tool_result(name.clone(), body)
             } else {
                 ChatMessage::user(format!("Tool result for `{name}`:\n{body}"))
             });
+
+            // Same convention as the parent loop: a tool's images ride back to
+            // the model on a following user message (a `tool` result cannot
+            // carry them on OpenAI), after being persisted and announced.
+            if !output.images.is_empty() {
+                let tool = name.clone();
+                let images = crate::agent::absorb_images(
+                    output.images,
+                    ctx.images.as_ref(),
+                    progress.as_ref(),
+                    |images| crate::agent::AgentEvent::SubagentRunImages {
+                        run,
+                        source: crate::agent::ImageSource::Tool(tool),
+                        images,
+                    },
+                )
+                .await;
+                if !images.is_empty() {
+                    history.push(ChatMessage::user_with_images(
+                        format!("Image(s) returned by `{name}`:"),
+                        images,
+                    ));
+                }
+            }
         }
 
         if let Some(events) = &progress {
@@ -776,7 +819,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
-    use crate::llm::{ChatChunk, ChatStream};
+    use crate::llm::{ChatChunk, ChatStream, FunctionCall};
 
     /// Temp project dir removed on drop.
     struct TempDir(PathBuf);
@@ -860,6 +903,7 @@ mod tests {
     fn chunk(content: &str, thinking: bool, done: bool) -> ChatChunk {
         ChatChunk {
             message: Some(ChatMessage::assistant(content)),
+            images: Vec::new(),
             thinking,
             done,
             done_reason: None,
@@ -992,6 +1036,113 @@ mod tests {
         assert_eq!(result.output, "the actual report", "thinking never leaks");
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests[0].model, "parent-active-model");
+    }
+
+    #[tokio::test]
+    async fn images_inside_a_subagent_run_are_persisted_and_announced_on_the_run() {
+        // A tool inside a run returns an image: it must reach the subagent's
+        // model (following user message), land in the session's image store,
+        // and be announced on the run's own events — not lost between panes.
+        struct ShotTool;
+        #[async_trait]
+        impl Tool for ShotTool {
+            fn name(&self) -> &str {
+                "generate_image"
+            }
+            fn description(&self) -> &str {
+                "Generate an image."
+            }
+            fn parameters(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+            async fn execute(
+                &self,
+                _args: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+                bytes.extend_from_slice(b"pixels");
+                Ok(ToolOutput::ok_with_images(
+                    "rendered",
+                    vec![Image::from_bytes(&bytes).expect("a PNG")],
+                ))
+            }
+        }
+
+        let tmp = TempDir::new();
+        let mut call = ChatMessage::assistant("");
+        call.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: "generate_image".to_string(),
+                arguments: json!({}),
+            },
+        });
+        let provider = ScriptedProvider::new(vec![
+            vec![ChatChunk {
+                message: Some(call),
+                images: Vec::new(),
+                thinking: false,
+                done: true,
+                done_reason: None,
+                eval_count: None,
+                prompt_eval_count: None,
+            }],
+            vec![chunk("done", false, true)],
+        ]);
+        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0)
+            .with_images(Arc::new(crate::images::ImageStore::in_dir(
+                tmp.0.join("images"),
+            )))
+            .with_events(tx);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ShotTool));
+
+        let run = next_run_id();
+        let result = spawn(
+            run,
+            &worker(),
+            "make a picture",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+        assert!(result.completed);
+
+        // The image reached the subagent's model on a following user message.
+        let second = provider.requests.lock().unwrap()[1].messages.clone();
+        let carried = second
+            .iter()
+            .find(|message| !message.images.is_empty())
+            .expect("a message carrying the image");
+        assert_eq!(carried.role, crate::llm::Role::User);
+        assert_eq!(carried.images[0].mime, "image/png");
+
+        // And it was announced on this run, with a path on disk.
+        let mut announced = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::SubagentRunImages {
+                run: id,
+                source,
+                images,
+            } = event
+            {
+                assert_eq!(id, run, "scoped to the run that produced it");
+                announced.push((source, images));
+            }
+        }
+        assert_eq!(announced.len(), 1);
+        assert_eq!(
+            announced[0].0,
+            crate::agent::ImageSource::Tool("generate_image".to_string())
+        );
+        assert!(announced[0].1[0].path.is_file(), "written to disk");
     }
 
     #[tokio::test]

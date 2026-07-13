@@ -35,12 +35,21 @@ Full transcript replay for the center pane, mapped from session JSONL:
     { "kind": "turn_marker", "turn": 2, "prompt": "..." },
     { "kind": "text", "text": "assistant narration" },
     { "kind": "tool", "name": "execute", "args": {}, "output": { "ok": true, "summary": "1 search, 1 file" } },
+    { "kind": "images", "source": "assistant|tool", "tool": "render", "images": [{ "path": "...", "mime": "image/png", "bytes": 51234 }] },
     { "kind": "notice", "text": "..." }
   ] }
 ```
 Tool output in the replay may be summarized (first line / counts); the GUI renders
 single-line tool rows and can expand. There is no `thinking` replay item: thinking is
 not persisted to the session JSONL, so it exists only as live `thinking_delta` frames.
+
+An `images` item is the `images` frame of the same turn, rebuilt from disk: the session
+file records each image's path on the message that carried it, so a reloaded transcript
+shows what the live stream showed, in the same places. The model's own images follow its
+`text`; a tool's follow *that tool's* `tool` item — which is not necessarily the last one,
+since one assistant message can make several calls. The message a tool's images ride back
+to the model on (`role: user`, "Image(s) returned by `x`:") is not a prompt and is not
+replayed as one.
 
 `session_start` hook output is persisted as a system note but is **not** replayed: it is
 context written for the model, not conversation (the TUI drops it the same way when it
@@ -149,6 +158,19 @@ Switch the active provider → the `GET /api/settings` shape.
 Forget the provider and its stored key; removing the active one hands `active` to a
 survivor. → the `GET /api/settings` shape.
 
+### GET /api/image?path=/home/u/.wizard/images/&lt;session&gt;/&lt;hash&gt;.png
+The bytes of one image the agent wrote — what an `images` frame's `path` names. Returns
+the file with the `Content-Type` sniffed from its own magic number (never the extension,
+never anything the client said) and `Cache-Control: public, max-age=31536000, immutable`:
+the file name is the hash of its bytes, so that URL can never come to mean anything else.
+
+`path` is client input and is resolved against `~/.wizard/images/` and nothing else: the
+name must end in `.png`/`.jpg`/`.webp`/`.gif`, and the path must canonicalize — `..`
+segments, symlinks and all — to a regular file really inside that directory. A traversal,
+an absolute path elsewhere on the disk, a symlink in the store pointing out of it, and a
+file that is not an image are all 400. A file that is simply gone is 404, which the GUI
+renders as a broken-image tile naming the path rather than an empty box.
+
 ### GET /api/git?cwd=/abs/path
 ```json
 { "branch": "feat/gui", "dirty": true, "additions": 734, "deletions": 7,
@@ -196,6 +218,7 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 { "type": "thinking_delta", "text": "..." }
 { "type": "tool_started", "call_id": 7, "name": "read_file", "args": { } }
 { "type": "tool_finished", "call_id": 7, "name": "read_file", "ok": true, "summary": "src/app.rs (120 lines)" }
+{ "type": "images", "source": "assistant|tool", "tool": "generate_image", "images": [{ "path": "/home/u/.wizard/images/<session>/c414cd0e204d.png", "mime": "image/png", "bytes": 51234 }] }
 { "type": "todo", "items": [{ "text": "...", "done": true, "active": false }] }
 { "type": "usage", "prompt_tokens": 123, "completion_tokens": 45 }
 { "type": "state", "state": "working|needs_input|idle|failed" }
@@ -207,6 +230,7 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 { "type": "subagent_run_text", "run": 3, "text": "one of its own messages" }
 { "type": "subagent_run_tool_started", "run": 3, "call_id": 12, "name": "read_file", "args": { } }
 { "type": "subagent_run_tool_finished", "run": 3, "call_id": 12, "name": "read_file", "ok": true, "summary": "src/app.rs (120 lines)" }
+{ "type": "subagent_run_images", "run": 3, "source": "tool", "tool": "generate_image", "images": [{ "path": "...", "mime": "image/png", "bytes": 51234 }] }
 { "type": "subagent_run_step", "run": 3, "step": 2 }
 { "type": "subagent_run_done", "run": 3, "completed": true, "output": "its report", "steps_used": 4, "error": null }
 { "type": "notice", "text": "..." }
@@ -219,6 +243,26 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 started/finished frames. `summary` for tool_finished: short human line (file names,
 counts, first output line) — GUI shows it muted next to the tool name; full output
 not shipped in v1.
+
+### Images
+
+An `images` frame says the turn produced one or more images and where the agent wrote them:
+`~/.wizard/images/<session-id>/<content-hash>.<ext>`. `source` is `"assistant"` (the model
+generated them itself) or `"tool"`, in which case `tool` names the tool that returned them
+and the frame follows that tool's `tool_finished`. `subagent_run_images` is the same frame
+scoped to a run, for that run's pane.
+
+The frame carries a *reference*, never the bytes: `path`, `mime`, `bytes`. The base64 stays
+in the model's history, where a vision model needs it; a frame that embedded it would put
+megabytes into the replay buffer of every turn. The client displays the image by fetching
+the file (`GET /api/image?path=…`, which is also what "open full size" opens). The path is
+stable — it is the hash of the image's own bytes — and it is also recorded on the message in
+the session file, so a transcript replayed from disk shows the same images without
+re-deriving anything.
+
+A tool's images carry no `call_id`: they arrive immediately after that tool's
+`tool_finished`, and the client puts them on the card it just drew. Their place in the turn
+is what identifies them, which is why nothing may be emitted between the two.
 
 ### Subagent runs
 

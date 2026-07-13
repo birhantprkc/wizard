@@ -99,6 +99,170 @@ pub enum Role {
     Tool,
 }
 
+/// Largest decoded image Wizard carries. Anything bigger is dropped at the
+/// seam it arrives on ([`Image::from_bytes`], the providers' stream decoders,
+/// and [`crate::agent::absorb_images`] for anything hand-built) rather than
+/// pushed through history, the session file and every surface.
+pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Why an image could not be taken in.
+#[derive(Debug, thiserror::Error)]
+pub enum ImageError {
+    #[error("unrecognized image data (not PNG, JPEG, WebP or GIF)")]
+    UnknownFormat,
+    #[error("image data is not valid base64: {0}")]
+    NotBase64(#[from] base64::DecodeError),
+    #[error("image is {bytes} bytes, over the {MAX_IMAGE_BYTES} byte cap")]
+    TooLarge { bytes: usize },
+}
+
+/// An image travelling through Wizard, in either direction: attached to a
+/// [`ChatMessage`] on the way *to* a vision model, or produced *by* a tool
+/// ([`crate::tools::ToolOutput::images`]) or by the model itself
+/// ([`ChatChunk::images`]).
+///
+/// `b64` is the base64 of the encoded file bytes with **no** `data:` prefix
+/// (providers that want a data URI build one with [`Image::data_uri`]); `mime`
+/// is its media type, e.g. `image/png`.
+///
+/// This diverges from `feat/computer-use`, where images are a bare
+/// `Vec<String>` of base64 PNGs: a *generated* image is not always a PNG, so
+/// the media type has to ride with the bytes. Reconciling the two branches
+/// when that one merges is mechanical — its `Vec<String>` becomes
+/// `Image::new(b64, "image/png")` at each construction site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// Base64 of the encoded image file (no `data:` prefix).
+    pub b64: String,
+    /// Media type of the encoded bytes, e.g. `image/png`.
+    pub mime: String,
+    /// Where the image was written, once the session's image store took it in
+    /// ([`crate::agent::absorb_images`]). `None` before then — a tool that has
+    /// just produced an image does not know, and does not need to.
+    ///
+    /// It is recorded in the session file alongside the base64 purely for
+    /// *replay*: a surface rebuilding a transcript from disk (the GUI's, the
+    /// TUI's on `--resume`) gets the same path the live
+    /// [`AgentEvent::Images`](crate::agent::AgentEvent::Images) carried,
+    /// instead of re-deriving it. No provider ever sees this field — every
+    /// provider translates `images` into its own shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl Image {
+    /// An image whose base64 and media type are already known (a provider
+    /// decoding its own wire format, a tool that knows what it encoded).
+    pub fn new(b64: impl Into<String>, mime: impl Into<String>) -> Self {
+        Self {
+            b64: b64.into(),
+            mime: mime.into(),
+            path: None,
+        }
+    }
+
+    /// This image, tagged with where the image store wrote it.
+    pub fn at_path(mut self, path: std::path::PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    /// Take in raw encoded image bytes: the media type is sniffed from the
+    /// magic number and the bytes are base64-encoded. The natural constructor
+    /// for a tool that has just produced or read an image file.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ImageError> {
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(ImageError::TooLarge { bytes: bytes.len() });
+        }
+        let mime = sniff_mime(bytes).ok_or(ImageError::UnknownFormat)?;
+        use base64::Engine as _;
+        Ok(Self::new(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime,
+        ))
+    }
+
+    /// Take in a `data:` URI (`data:image/png;base64,iVBOR...`), the shape
+    /// OpenAI-compatible endpoints use for image content parts. `None` when
+    /// the string is not a base64 `data:` URI of an image.
+    pub fn from_data_uri(uri: &str) -> Result<Self, ImageError> {
+        let rest = uri.strip_prefix("data:").ok_or(ImageError::UnknownFormat)?;
+        let (mime, payload) = rest.split_once(',').ok_or(ImageError::UnknownFormat)?;
+        let mime = mime
+            .strip_suffix(";base64")
+            .ok_or(ImageError::UnknownFormat)?;
+        if !mime.starts_with("image/") {
+            return Err(ImageError::UnknownFormat);
+        }
+        Self::from_base64(payload, mime)
+    }
+
+    /// Take in base64 that arrived with its media type stated separately
+    /// (`b64_json` payloads). Validates the base64 and the size cap.
+    pub fn from_base64(b64: &str, mime: &str) -> Result<Self, ImageError> {
+        let image = Self::new(b64.trim(), mime);
+        let bytes = image.decoded_len();
+        if bytes > MAX_IMAGE_BYTES {
+            return Err(ImageError::TooLarge { bytes });
+        }
+        // Decode once, up front: a provider must never hand a broken payload
+        // to a surface that will try to write it to disk.
+        image.decode()?;
+        Ok(image)
+    }
+
+    /// The encoded file bytes.
+    pub fn decode(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(self.b64.trim())
+    }
+
+    /// Size of the decoded image, derived from the base64 length — no decode,
+    /// so the size cap can be checked without allocating the payload.
+    pub fn decoded_len(&self) -> usize {
+        let b64 = self.b64.trim();
+        let padding = b64.bytes().rev().take_while(|&byte| byte == b'=').count();
+        b64.len().saturating_sub(padding) * 3 / 4
+    }
+
+    /// `data:<mime>;base64,<b64>` — how OpenAI-compatible endpoints (and the
+    /// GUI's `<img src>`) want an inline image.
+    pub fn data_uri(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.b64)
+    }
+
+    /// File extension for this media type, for naming the image on disk.
+    pub fn extension(&self) -> &'static str {
+        match self.mime.as_str() {
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            // PNG is both the common case and the safe default: an image whose
+            // type we could not name is still written, just conservatively.
+            _ => "png",
+        }
+    }
+}
+
+/// Media type of `bytes` from its magic number. Covers the formats every
+/// vision model and image endpoint in use speaks; `None` for anything else,
+/// which is refused rather than guessed at.
+pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    None
+}
+
 /// A single chat message, serialized exactly as Ollama expects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -110,6 +274,17 @@ pub struct ChatMessage {
     /// Name of the tool that produced this result (`role == Tool`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Images attached to this message. On a user message they are input for a
+    /// vision model (a screenshot, or an image a tool just returned — see
+    /// [`ChatMessage::user_with_images`]); on an assistant message they are
+    /// what the model itself produced. Every provider translates them into its
+    /// own shape in `build_messages` (Ollama's sibling base64 array, OpenAI's
+    /// `image_url` parts, Anthropic's base64 `image` blocks).
+    ///
+    /// Empty is the overwhelming common case and is omitted from the wire, so
+    /// text-only traffic is byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
 }
 
 impl ChatMessage {
@@ -119,6 +294,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
         }
     }
 
@@ -128,6 +304,22 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// User message carrying images alongside its text. This is how a tool's
+    /// images reach the model: a `tool`-role message cannot carry image blocks
+    /// on OpenAI, but a user message can on every provider, so the tool result
+    /// carries the text and the images follow on a user message (see
+    /// `Agent::dispatch_call`). A non-vision model simply ignores them.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<Image>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_name: None,
+            images,
         }
     }
 
@@ -137,6 +329,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
         }
     }
 
@@ -147,7 +340,39 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: Some(tool_name.into()),
+            images: Vec::new(),
         }
+    }
+}
+
+/// The text of an assistant message as it goes back on the wire, with any
+/// images it produced named in it.
+///
+/// No chat API accepts image content *inside* an assistant turn — images are
+/// user-role input everywhere — so a model's own generated images cannot be
+/// replayed as they were produced. They are dropped from the request and named
+/// in the text instead: the model still knows what it made (and the user still
+/// sees the file, which the surfaces render from
+/// [`AgentEvent::Images`](crate::agent::AgentEvent::Images)), and the request
+/// stays valid rather than 400-ing on a block the API will not take.
+pub(crate) fn assistant_content(message: &ChatMessage) -> String {
+    if message.images.is_empty() {
+        return message.content.clone();
+    }
+    let kinds: Vec<&str> = message
+        .images
+        .iter()
+        .map(|image| image.mime.as_str())
+        .collect();
+    let note = format!(
+        "[generated {} image(s) ({}) — delivered to the user]",
+        message.images.len(),
+        kinds.join(", ")
+    );
+    if message.content.is_empty() {
+        note
+    } else {
+        format!("{}\n\n{note}", message.content)
     }
 }
 
@@ -239,6 +464,19 @@ pub struct ChatRequest {
 pub struct ChatChunk {
     #[serde(default)]
     pub message: Option<ChatMessage>,
+    /// Images the model produced in this chunk.
+    ///
+    /// **This is the seam for an image-generating endpoint.** A provider that
+    /// receives image content while streaming (an `image_url` part, a
+    /// `b64_json` payload — see [`openai::decode_sse`] for the working
+    /// example) decodes it into an [`Image`] and emits it here, on the chunk
+    /// it arrived in; the chunk may carry images, text, tool calls, or any
+    /// combination. The agent loop accumulates them onto the assistant
+    /// [`ChatMessage`], writes them to the session's image directory, and
+    /// announces them to the surfaces as [`crate::agent::AgentEvent::Images`].
+    /// Nothing else is required of the provider.
+    #[serde(default)]
+    pub images: Vec<Image>,
     /// True when `message.content` is model reasoning ("thinking") rather
     /// than answer text (Anthropic `thinking_delta`, xAI `reasoning_content`).
     /// The UI renders it dimmed; it is never fed back into history.
@@ -326,6 +564,120 @@ mod tests {
         let value = serde_json::to_value(ChatMessage::assistant("done")).unwrap();
         assert!(value.get("tool_calls").is_none());
         assert!(value.get("tool_name").is_none());
+        assert!(
+            value.get("images").is_none(),
+            "text-only traffic is unchanged on the wire"
+        );
+    }
+
+    /// Smallest possible files of each format we sniff (header bytes are all
+    /// that matters).
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(b"IHDR-and-the-rest");
+        bytes
+    }
+
+    #[test]
+    fn sniffs_the_media_type_from_magic_numbers() {
+        assert_eq!(sniff_mime(&png_bytes()), Some("image/png"));
+        assert_eq!(
+            sniff_mime(&[0xff, 0xd8, 0xff, 0xe0, 0x00]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_mime(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(sniff_mime(b"GIF87a....."), Some("image/gif"));
+        // Not an image, and truncated headers that merely start right.
+        assert_eq!(sniff_mime(b"not an image at all"), None);
+        assert_eq!(sniff_mime(b"RIFF\0\0\0\0AVI "), None, "RIFF but not WebP");
+        assert_eq!(sniff_mime(&[0x89, b'P']), None);
+        assert_eq!(sniff_mime(&[]), None);
+    }
+
+    #[test]
+    fn from_bytes_sniffs_encodes_and_round_trips() {
+        let image = Image::from_bytes(&png_bytes()).expect("a PNG");
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.extension(), "png");
+        assert!(!image.b64.starts_with("data:"), "no data: prefix on b64");
+        assert_eq!(image.decode().expect("decodes"), png_bytes());
+        assert_eq!(image.decoded_len(), png_bytes().len());
+        assert_eq!(
+            image.data_uri(),
+            format!("data:image/png;base64,{}", image.b64)
+        );
+
+        let err = Image::from_bytes(b"nonsense").expect_err("unknown format");
+        assert!(matches!(err, ImageError::UnknownFormat), "{err}");
+    }
+
+    #[test]
+    fn decoded_len_matches_the_real_payload_at_every_padding() {
+        // 0, 1 and 2 padding chars — the three base64 alignments.
+        for raw in [&b"abc"[..], &b"a"[..], &b"ab"[..]] {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            let image = Image::new(b64, "image/png");
+            assert_eq!(
+                image.decoded_len(),
+                raw.len(),
+                "size is derived from the base64 without decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn from_data_uri_accepts_images_and_refuses_anything_else() {
+        let image = Image::from_data_uri("data:image/webp;base64,UklGRg==").expect("a webp");
+        assert_eq!(image.mime, "image/webp");
+        assert_eq!(image.b64, "UklGRg==");
+        assert_eq!(image.extension(), "webp");
+
+        for bad in [
+            "https://example.com/cat.png",
+            "data:text/plain;base64,aGk=",
+            "data:image/png,notbase64encoded",
+            "data:image/png;base64,!!!not base64!!!",
+        ] {
+            assert!(Image::from_data_uri(bad).is_err(), "must refuse {bad}");
+        }
+    }
+
+    #[test]
+    fn oversized_images_are_refused_at_the_seam() {
+        let huge = vec![0u8; MAX_IMAGE_BYTES + 1];
+        let err = Image::from_bytes(&huge).expect_err("over the cap");
+        assert!(
+            matches!(err, ImageError::TooLarge { bytes } if bytes == MAX_IMAGE_BYTES + 1),
+            "{err}"
+        );
+
+        // The base64 path caps too, without decoding the payload.
+        let b64 = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 8);
+        let err = Image::from_base64(&b64, "image/png").expect_err("over the cap");
+        assert!(matches!(err, ImageError::TooLarge { .. }), "{err}");
+    }
+
+    #[test]
+    fn message_images_round_trip_through_the_session_format() {
+        let message =
+            ChatMessage::user_with_images("what is this?", vec![Image::new("QUJD", "image/jpeg")]);
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["images"][0]["b64"], "QUJD");
+        assert_eq!(value["images"][0]["mime"], "image/jpeg");
+
+        let back: ChatMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back.images, message.images);
+    }
+
+    #[test]
+    fn chat_chunk_without_images_deserializes_to_none() {
+        // Every existing provider's chunks have no `images` field.
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"message":{"role":"assistant","content":"hi"},"done":false}"#)
+                .unwrap();
+        assert!(chunk.images.is_empty());
     }
 
     #[test]

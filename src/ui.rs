@@ -35,8 +35,11 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agent::ImageSource;
 use crate::app::{App, InputMode, PaneStatus, Selection, SubagentPane, TranscriptEntry};
 use crate::config::Mode;
+use crate::image_view::{self, ImageBlock, ImageBox, ImageCache};
+use crate::images::ImageRef;
 use crate::session_registry::SessionState;
 use crate::vim::VimMode;
 
@@ -44,6 +47,10 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 
 /// Tallest the multi-line composer grows before it scrolls internally.
 const MAX_INPUT_ROWS: u16 = 10;
+
+/// Column an image block hangs in — the same two-space text column a tool
+/// card's output and a notice use, so a tool's image lines up under its card.
+const IMAGE_INDENT: u16 = 2;
 
 /// The single accent color used for chrome (prompt, gutters, names,
 /// attention borders).
@@ -67,22 +74,7 @@ fn accent() -> Style {
 /// Render one frame. The only entry point the main loop calls; everything
 /// else in this module is a helper.
 pub fn draw(frame: &mut Frame, app: &App) {
-    // The composer grows with its content (hard line breaks plus soft-wrapped
-    // continuations) up to MAX_INPUT_ROWS, then scrolls vertically. +2 for the
-    // rules above/below.
-    let budget = composer_budget(frame.area().width);
-    let input_rows =
-        (wrap_rows(&composer_chars(app), budget).len() as u16).clamp(1, MAX_INPUT_ROWS);
-    // The rail sits between the composer and the status bar: one row per
-    // subagent, so the dots are always in the same place, right under the bar.
-    let rail_rows = rail_height(app);
-    let [main_area, input_area, rail_area, status_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(input_rows + 2),
-        Constraint::Length(rail_rows),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let [main_area, input_area, rail_area, status_area] = regions(app, frame.area());
 
     if let Some(pane) = app.attached_pane() {
         // Inside a subagent: its conversation takes over the main area and
@@ -112,17 +104,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     draw_input(frame, app, input_area);
-    if rail_rows > 0 {
+    if rail_area.height > 0 {
         draw_rail(frame, app, rail_area);
     }
     draw_status_bar(frame, app, status_area);
 
     // Floating layers, back to front.
-    if app.picker.is_none()
-        && app.plan_review.is_none()
-        && app.interview.is_none()
-        && !app.show_dashboard
-    {
+    if !overlay_open(app) {
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -141,11 +129,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // With any overlay floating above the transcript, a click belongs to the
     // overlay — drop the card hit map so it can't toggle a card underneath.
-    if app.picker.is_some()
-        || app.plan_review.is_some()
-        || app.interview.is_some()
-        || app.show_dashboard
-    {
+    if overlay_open(app) {
         app.card_hits.borrow_mut().clear();
     }
 
@@ -162,6 +146,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         }
     }
+}
+
+/// The rows a frame is laid out into, top to bottom: the transcript body, the
+/// composer, the subagent rail, and the status line. One place, so what [`draw`]
+/// paints and what anything else measures cannot drift apart.
+pub fn regions(app: &App, area: Rect) -> [Rect; 4] {
+    // The composer grows with its content (hard line breaks plus soft-wrapped
+    // continuations) up to MAX_INPUT_ROWS, then scrolls vertically. +2 for the
+    // rules above/below.
+    let budget = composer_budget(area.width);
+    let input_rows =
+        (wrap_rows(&composer_chars(app), budget).len() as u16).clamp(1, MAX_INPUT_ROWS);
+    // The rail sits between the composer and the status bar: one row per
+    // subagent, so the dots are always in the same place, right under the bar.
+    let rail_rows = rail_height(app);
+    Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(input_rows + 2),
+        Constraint::Length(rail_rows),
+        Constraint::Length(1),
+    ])
+    .areas(area)
 }
 
 /// Per-row spans `(y, start_x, end_x_exclusive)` a selection covers over a grid
@@ -232,11 +238,7 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
         // A slash-command menu (e.g. `/provider`) or other modal floats over a
         // small centered area; the welcome card would show through around it.
         // Drop the card while any overlay is open so there's no text overlay.
-        let overlay_open = app.picker.is_some()
-            || app.plan_review.is_some()
-            || app.interview.is_some()
-            || app.show_dashboard;
-        if !overlay_open {
+        if !overlay_open(app) {
             draw_welcome(frame, app, area);
         }
         return;
@@ -252,16 +254,9 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let inner_width = inner.width as usize;
     let inner_height = inner.height as usize;
 
-    // Wrap each source line separately, fanning its tag out over the rows it
-    // becomes, so a click on any wrapped row still traces back to its card.
-    let (text, line_tags) = transcript_text(app);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut row_tags: Vec<Option<usize>> = Vec::new();
-    for (line, tag) in text.lines.into_iter().zip(line_tags) {
-        let before = lines.len();
-        lines.append(&mut wrap_lines(Text::from(vec![line]), inner_width));
-        row_tags.extend(std::iter::repeat_n(tag, lines.len() - before));
-    }
+    let mut cache = app.images.borrow_mut();
+    let rendered = transcript_text(app, &mut cache, image_box(inner));
+    let (lines, row_tags) = wrap_tagged(rendered.lines, rendered.tags, inner_width);
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_height);
     let scroll = (app.scroll as usize).min(max_scroll);
@@ -273,13 +268,26 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     {
         let mut hits = app.card_hits.borrow_mut();
         for (offset, tag) in row_tags[start..end].iter().enumerate() {
-            if let Some(index) = tag {
+            if let RowTag::Card(index) = tag {
                 hits.push((inner.y + offset as u16, *index));
             }
         }
     }
 
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+
+    // Then the pixels, into the rows the text left blank for them. Skipped
+    // under an overlay: the modal owns the screen, and an image drawn with a
+    // terminal graphics protocol must not paint through it.
+    if !overlay_open(app) {
+        paint_images(
+            frame,
+            inner,
+            &row_tags[start..end],
+            &rendered.blocks,
+            &mut cache,
+        );
+    }
 
     // Scrolled away from the tail: a quiet hint in the top-right corner.
     if scroll > 0 {
@@ -417,12 +425,92 @@ fn thinking_text(message: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-/// Build the full (unwrapped) transcript text from app state, plus a
-/// parallel per-line tag holding the transcript index of the tool card
-/// whose header the line is — the click-to-toggle targets.
-fn transcript_text(app: &App) -> (Text<'static>, Vec<Option<usize>>) {
-    let (mut lines, mut tags, first) = entries_text(&app.transcript, app.tick);
-    let mut first = first;
+/// What a rendered transcript row belongs to. Rows are wrapped and sliced by
+/// the scroll before anything is painted, so this is how a row on screen is
+/// traced back to what put it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTag {
+    /// Ordinary text.
+    Text,
+    /// The *header* line of the tool card at this transcript index — the
+    /// click-to-toggle target.
+    Card(usize),
+    /// Row `row` of the image block at `slot` in [`Rendered::blocks`]. The row
+    /// is left blank in the text and the pixels are painted into it afterwards
+    /// (see [`paint_images`]), so an image scrolls and clips like any other
+    /// content.
+    Image { slot: usize, row: u16 },
+}
+
+/// A transcript rendered to lines: what each row is, and the image blocks whose
+/// rows are waiting to be painted.
+struct Rendered {
+    lines: Vec<Line<'static>>,
+    tags: Vec<RowTag>,
+    blocks: Vec<ImageBlock>,
+    /// Nothing has been pushed yet, so a caller appending more gets the
+    /// blank-line spacing right.
+    empty: bool,
+}
+
+/// The cells an image may take in a transcript body: the text column it hangs
+/// in, capped so it stays a thumbnail, and never more than half the viewport —
+/// one image cannot push the conversation off the screen.
+fn image_box(inner: Rect) -> ImageBox {
+    ImageBox {
+        cols: inner
+            .width
+            .saturating_sub(IMAGE_INDENT)
+            .min(image_view::MAX_COLS),
+        rows: (inner.height / 2).clamp(1, image_view::MAX_ROWS),
+    }
+}
+
+/// Is a floating layer covering the transcript? Then a click belongs to the
+/// overlay rather than a card underneath, and nothing of the transcript's own —
+/// its images least of all — should paint through.
+fn overlay_open(app: &App) -> bool {
+    app.picker.is_some()
+        || app.plan_review.is_some()
+        || app.interview.is_some()
+        || app.show_dashboard
+}
+
+/// The two lines that always accompany an image, whatever the terminal can
+/// draw: what made it and how big it is, then the file itself. The path gets a
+/// line to itself so it survives a drag-select as one string — it is how the
+/// user opens the real thing.
+fn image_caption(source: &ImageSource, image: &ImageRef) -> Vec<Line<'static>> {
+    let from = match source.tool() {
+        Some(tool) => format!("image from `{tool}`"),
+        None => "image".to_string(),
+    };
+    vec![
+        Line::from(Span::styled(
+            format!(
+                "  {from} · {} · {} KB",
+                image.mime,
+                image.bytes.div_ceil(1024)
+            ),
+            dim().italic(),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", image.path.display()),
+            Style::default().fg(TEXT_DIM),
+        )),
+    ]
+}
+
+/// Build the full (unwrapped) transcript text from app state, plus the per-row
+/// tags and the image blocks the rows were reserved for.
+fn transcript_text(app: &App, cache: &mut ImageCache, budget: ImageBox) -> Rendered {
+    let Rendered {
+        mut lines,
+        mut tags,
+        blocks,
+        empty,
+    } = entries_text(&app.transcript, app.tick, cache, budget);
+    let mut first = empty;
 
     if !app.streaming_thinking.is_empty() {
         if !first {
@@ -461,23 +549,29 @@ fn transcript_text(app: &App) -> (Text<'static>, Vec<Option<usize>>) {
         ]));
     }
 
-    tags.resize(lines.len(), None);
-    (Text::from(lines), tags)
+    tags.resize(lines.len(), RowTag::Text);
+    Rendered {
+        lines,
+        tags,
+        blocks,
+        empty: first,
+    }
 }
 
-/// Render a list of transcript entries to lines, with a per-line tag carrying
-/// the index of the tool card whose *header* that line is (for click-to-toggle;
-/// `None` everywhere else). Returns whether the output is still empty, so a
-/// caller appending more can get the blank-line spacing right.
+/// Render a list of transcript entries to lines, tagging each row with what it
+/// belongs to and reserving the rows an image block will be painted into.
 ///
 /// Shared by the main transcript and by a subagent's pane, which is what makes
-/// an attached pane render identically to the main chat.
+/// an attached pane render identically to the main chat — images included.
 fn entries_text(
     entries: &[TranscriptEntry],
     tick: u64,
-) -> (Vec<Line<'static>>, Vec<Option<usize>>, bool) {
+    cache: &mut ImageCache,
+    budget: ImageBox,
+) -> Rendered {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut tags: Vec<Option<usize>> = Vec::new();
+    let mut tags: Vec<RowTag> = Vec::new();
+    let mut blocks: Vec<ImageBlock> = Vec::new();
     let mut prev_tool = false;
     let mut prev_notice = false;
     let mut first = true;
@@ -485,9 +579,12 @@ fn entries_text(
     for (index, entry) in entries.iter().enumerate() {
         let is_tool = matches!(entry, TranscriptEntry::ToolCard { .. });
         let is_notice = matches!(entry, TranscriptEntry::Notice(_));
+        let is_image = matches!(entry, TranscriptEntry::Image { .. });
         // Comfortable spacing between turns; runs of tool cards or notices
-        // stay tight so they read as one group.
-        let tight = (is_tool && prev_tool) || (is_notice && prev_notice);
+        // stay tight so they read as one group. An image is always tight: it
+        // belongs to whatever produced it, so it hangs directly under that
+        // message or card rather than floating between them.
+        let tight = (is_tool && prev_tool) || (is_notice && prev_notice) || is_image;
         if !first && !tight {
             lines.push(Line::raw(""));
         }
@@ -497,6 +594,8 @@ fn entries_text(
 
         // A tool card's first pushed line is its header (glyph + name).
         let header_at = lines.len();
+        // Where an image block's rows begin, once it is known to have any.
+        let mut image_at = None;
 
         match entry {
             TranscriptEntry::User(message) => {
@@ -544,6 +643,19 @@ fn entries_text(
                     tick,
                 );
             }
+            TranscriptEntry::Image { source, image } => {
+                // Reserve the block's rows as blank lines. They wrap to
+                // themselves, scroll with the text, and are painted last —
+                // which is what keeps the pixels inside their own rows however
+                // the transcript moves. A terminal that can draw nothing
+                // reserves nothing, and the caption below stands alone.
+                if let Some(block) = cache.layout(image, budget) {
+                    image_at = Some((lines.len(), blocks.len(), block.rows));
+                    lines.extend(std::iter::repeat_n(Line::raw(""), block.rows as usize));
+                    blocks.push(block);
+                }
+                lines.extend(image_caption(source, image));
+            }
             TranscriptEntry::Notice(message) => {
                 let style = if message.starts_with("error") {
                     Style::default().fg(Color::White).bold()
@@ -556,15 +668,26 @@ fn entries_text(
             }
         }
 
-        // Keep the tags in lockstep with whatever the entry pushed; only a
-        // tool card's header line is clickable.
-        tags.resize(lines.len(), None);
+        // Keep the tags in lockstep with whatever the entry pushed: a tool
+        // card's header line is clickable, an image block's rows are paintable,
+        // everything else is text.
+        tags.resize(lines.len(), RowTag::Text);
         if is_tool && header_at < lines.len() {
-            tags[header_at] = Some(index);
+            tags[header_at] = RowTag::Card(index);
+        }
+        if let Some((at, slot, rows)) = image_at {
+            for row in 0..rows {
+                tags[at + row as usize] = RowTag::Image { slot, row };
+            }
         }
     }
 
-    (lines, tags, first)
+    Rendered {
+        lines,
+        tags,
+        blocks,
+        empty: first,
+    }
 }
 
 /// Human label + one-line summary for a tool call. `spawn_subagent` reads as
@@ -1643,11 +1766,9 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
     let inner_width = inner.width as usize;
     let inner_height = inner.height as usize;
 
-    let (raw, _, _) = entries_text(&pane.transcript, app.tick);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for line in raw {
-        lines.append(&mut wrap_lines(Text::from(vec![line]), inner_width));
-    }
+    let mut cache = app.images.borrow_mut();
+    let rendered = entries_text(&pane.transcript, app.tick, &mut cache, image_box(inner));
+    let (mut lines, mut row_tags) = wrap_tagged(rendered.lines, rendered.tags, inner_width);
     if lines.is_empty() {
         let spinner = SPINNER[(app.tick as usize) % SPINNER.len()];
         lines.push(Line::from(vec![
@@ -1663,6 +1784,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
             Span::styled("working…", dim().italic()),
         ]));
     }
+    row_tags.resize(lines.len(), RowTag::Text);
 
     // Anchored to the bottom like the main transcript: newest work in view,
     // PageUp scrolls back.
@@ -1675,6 +1797,17 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
         Paragraph::new(Text::from(lines[start..end].to_vec())),
         inner,
     );
+    // A subagent's images belong to its run, so they are drawn here — in its
+    // pane — and nowhere else.
+    if !overlay_open(app) {
+        paint_images(
+            frame,
+            inner,
+            &row_tags[start..end],
+            &rendered.blocks,
+            &mut cache,
+        );
+    }
 }
 
 /// Plan-review modal (plan mode): the plan markdown with a verdict footer.
@@ -1888,6 +2021,71 @@ fn draw_interview(frame: &mut Frame, app: &App) {
         ])),
         input_area,
     );
+}
+
+/// Soft-wrap each source line on its own, fanning its tag out over the rows it
+/// becomes, so a click — or an image block's row — still traces back to what put
+/// it there. An image block's rows are blank, so they never wrap and stay one
+/// row to one row.
+fn wrap_tagged(
+    lines: Vec<Line<'static>>,
+    tags: Vec<RowTag>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<RowTag>) {
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    let mut row_tags: Vec<RowTag> = Vec::with_capacity(tags.len());
+    for (line, tag) in lines.into_iter().zip(tags) {
+        let before = wrapped.len();
+        wrapped.append(&mut wrap_lines(Text::from(vec![line]), width));
+        row_tags.extend(std::iter::repeat_n(tag, wrapped.len() - before));
+    }
+    (wrapped, row_tags)
+}
+
+/// Paint the image blocks whose rows are on screen, into exactly those rows.
+///
+/// `tags` are the rows of `inner` that survived the scroll, in order, so a block
+/// half-way off the top arrives here as the run of rows it has left — and
+/// [`ImageCache::draw`] is told which row of the block that run starts at. Rows
+/// the scroll took are never painted, which is the whole reason an image here
+/// cannot smear across the screen.
+fn paint_images(
+    frame: &mut Frame,
+    inner: Rect,
+    tags: &[RowTag],
+    blocks: &[ImageBlock],
+    cache: &mut ImageCache,
+) {
+    let mut row = 0usize;
+    while row < tags.len() {
+        let RowTag::Image { slot, row: top } = tags[row] else {
+            row += 1;
+            continue;
+        };
+        // The run of this block's rows that made it onto the screen.
+        let mut height = 1u16;
+        loop {
+            match tags.get(row + height as usize) {
+                Some(RowTag::Image {
+                    slot: next,
+                    row: at,
+                }) if *next == slot && *at == top.saturating_add(height) => {
+                    height += 1;
+                }
+                _ => break,
+            }
+        }
+        if let Some(block) = blocks.get(slot) {
+            let at = Rect {
+                x: inner.x + IMAGE_INDENT,
+                y: inner.y + row as u16,
+                width: block.cols.min(inner.width.saturating_sub(IMAGE_INDENT)),
+                height,
+            };
+            cache.draw(frame.buffer_mut(), at, block, top);
+        }
+        row += height as usize;
+    }
 }
 
 /// Wrap styled lines at `width` display columns (wide CJK/emoji glyphs

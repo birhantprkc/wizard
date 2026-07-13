@@ -135,6 +135,20 @@ When the active provider is llama.cpp and nothing answers at its `base_url`, Wiz
 
 Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 
+### Images
+
+Images move through the loop in both directions. A tool returns them on its `ToolOutput`
+(`images: Vec<Image>`); a model generates them, and its provider emits them on the streaming
+`ChatChunk` (`images` — the seam an image endpoint plugs into). Either way the agent takes
+custody in one place, `agent::absorb_images`: it drops anything over the size cap, writes the
+rest to `~/.wizard/images/<session>/<content-hash>.<ext>`, and announces them as
+`AgentEvent::Images` — a path, a media type, a size, never base64.
+
+The base64 stays on the `ChatMessage` in history, where a vision model needs it, and the path
+is recorded next to it so a replayed transcript needs no re-derivation. A tool's images ride
+back to the model on a *following user message*, not on the tool result: OpenAI's tool role
+takes no image blocks, but a user message carries images on every provider.
+
 ### Tools (`tools/`)
 
 | Tool | Description |
@@ -229,6 +243,7 @@ Ratatui + crossterm terminal UI:
 | `~/.wizard/tools/` | Agent-authored scripted tools |
 | `~/.wizard/src/` | Source checkout for deep evolve (created on demand) |
 | `~/.wizard/sessions/*.jsonl` | Chat history |
+| `~/.wizard/images/<session>/` | Images produced in a session (tool output or model-generated), named by content hash |
 | `~/.wizard/evolution.jsonl` | Self-extension log |
 | `~/.wizard/sync/key` | Ed25519 signing-key seed for `wizard sync` (mode 0600; see [sync.md](sync.md)) |
 | `~/.wizard/sync/trusted_keys` | Public keys `wizard sync pull` accepts, one per line, pinned on first use |

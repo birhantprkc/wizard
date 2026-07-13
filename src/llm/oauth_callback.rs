@@ -221,10 +221,25 @@ pub(crate) fn serial_callback_port() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    fn bind_ephemeral() -> (StdTcpListener, u16) {
-        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        (listener, port)
+    /// Bind a port the rest of the suite cannot take from us.
+    ///
+    /// Not `bind(0)`: that draws from the OS ephemeral range, which is exactly
+    /// the range every other test's `bind(0)` draws from. A test that frees its
+    /// port and then rebinds it — which is the whole point of
+    /// `cancelling_frees_the_port_immediately` — can find the kernel handed it
+    /// to a concurrent test in between, and fail on a race that says nothing
+    /// about the code. So we walk a private range below the ephemeral one,
+    /// where no `bind(0)` can land.
+    fn bind_private() -> (StdTcpListener, u16) {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(21_000);
+        for _ in 0..1_000 {
+            let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(port < 30_000, "ran out of private test ports");
+            if let Ok(listener) = StdTcpListener::bind(("127.0.0.1", port)) {
+                return (listener, port);
+            }
+        }
+        panic!("no free port in the private test range");
     }
 
     /// Play the browser: send the redirect and read the page back. Async on
@@ -246,7 +261,7 @@ mod tests {
     /// The redirect: everything before the code arrives is plumbing.
     #[tokio::test]
     async fn the_browsers_redirect_yields_the_code() {
-        let (listener, port) = bind_ephemeral();
+        let (listener, port) = bind_private();
         let served = tokio::spawn(serve_redirect(
             listener,
             Cancel::never(),
@@ -266,7 +281,7 @@ mod tests {
     /// once, rather than sitting on it for the full timeout.
     #[tokio::test]
     async fn cancelling_frees_the_port_immediately() {
-        let (listener, port) = bind_ephemeral();
+        let (listener, port) = bind_private();
         let (canceller, cancel) = cancellation();
         let served = tokio::spawn(serve_redirect(listener, cancel, |_| Callback::Ignored));
         // The listener is live: the port cannot be taken from under it.
@@ -275,15 +290,33 @@ mod tests {
         canceller.cancel();
         let err = served.await.expect("join").expect_err("cancelled");
         assert!(err.to_string().contains("replaced"), "{err}");
-        // And now it can — no five-minute wait for the timeout.
-        StdTcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+
+        // And now the port comes back. The task's future — and the listener it
+        // owns — is dropped before its `JoinHandle` resolves, but the kernel
+        // does not always have the socket torn down by the time the very next
+        // syscall asks for the port back, so the bind is retried briefly rather
+        // than demanded on the first try. The claim under test is unharmed: the
+        // point is that the port returns in milliseconds instead of being held
+        // for CALLBACK_TIMEOUT, and a whole second is still three hundred times
+        // short of that.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match StdTcpListener::bind(("127.0.0.1", port)) {
+                Ok(_) => break,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("the port was never given back: {err}"),
+            }
+        }
     }
 
     /// Dropping the handle is as good as cancelling: a flow nobody holds is a
     /// flow nobody is waiting for.
     #[tokio::test]
     async fn dropping_the_canceller_cancels() {
-        let (listener, _) = bind_ephemeral();
+        let (listener, _) = bind_private();
         let (canceller, cancel) = cancellation();
         let served = tokio::spawn(serve_redirect(listener, cancel, |_| Callback::Ignored));
         drop(canceller);

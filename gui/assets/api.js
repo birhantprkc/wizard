@@ -71,6 +71,24 @@
  */
 
 /**
+ * One image the agent wrote to `~/.wizard/images/<session>/`, as an `images`
+ * frame (or a replayed `images` item) names it: a reference, never the bytes.
+ * The page fetches the file itself from `imageUrl()`.
+ * @typedef {Object} ImageRef
+ * @property {string} path   Absolute path of the file the agent wrote.
+ * @property {string} mime   Media type, e.g. `image/png`.
+ * @property {number} bytes  Size of the file on disk.
+ */
+
+/**
+ * Images one turn produced, and where they came from.
+ * @typedef {Object} ImageBatch
+ * @property {'assistant'|'tool'} source  The model produced them, or a tool returned them.
+ * @property {string|null} tool           The tool that returned them (`source: 'tool'`).
+ * @property {ImageRef[]} images
+ */
+
+/**
  * One subagent run, announced by a `subagent_run_started` frame. Every later
  * `subagent_run_*` frame carries the same `run`, so concurrent runs demux
  * into their own panes.
@@ -97,9 +115,10 @@
  *  - {type:'text',     text}                    agent narration paragraph
  *  - {type:'thinking', text}                    collapsed reasoning block
  *  - {type:'tool',     ...ToolCall}             tool row
+ *  - {type:'images',   ...ImageBatch}           images, inline or on a tool's card
  *  - {type:'notice',   text}                    muted system row
  * @typedef {Object} TranscriptItem
- * @property {'user'|'worked'|'text'|'thinking'|'tool'|'notice'} type
+ * @property {'user'|'worked'|'text'|'thinking'|'tool'|'images'|'notice'} type
  * @property {string} [text]
  * @property {string} [label]
  */
@@ -151,6 +170,7 @@
  * @property {(delta: string) => void} [onThinking]
  * @property {(call: ToolCall) => void} [onToolCall]
  * @property {(result: ToolResult) => void} [onToolResult]
+ * @property {(batch: ImageBatch) => void} [onImages]                          The turn produced images.
  * @property {(status: TaskStatus) => void} [onStatus]
  * @property {(items: Array<{text:string,done:boolean,active:boolean}>) => void} [onTodo]
  * @property {(usage: {promptTokens:number, completionTokens:number}) => void} [onUsage]
@@ -164,6 +184,7 @@
  * @property {(run: number, text: string) => void} [onSubagentText]            One of its messages.
  * @property {(run: number, call: ToolCall) => void} [onSubagentToolCall]
  * @property {(run: number, result: ToolResult) => void} [onSubagentToolResult]
+ * @property {(run: number, batch: ImageBatch) => void} [onSubagentImages]     Images from inside a run.
  * @property {(run: number, step: number) => void} [onSubagentStep]
  * @property {(run: number, result: SubagentResult) => void} [onSubagentDone]
  */
@@ -270,6 +291,34 @@ export function classifyTool(name, args) {
   return call;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Images                                                                    */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Where the page fetches one image's bytes: `GET /api/image`, by the path the
+ * frame carried. The frames deliberately carry no base64 — a turn's replay
+ * buffer would be megabytes — so the file is a fetch, and the server serves it
+ * only if it really is one of the images wizard saved.
+ * @param {ImageRef} image
+ * @returns {string}
+ */
+export function imageUrl(image) {
+  return `/api/image?path=${encodeURIComponent(image.path)}`;
+}
+
+/**
+ * Normalize an `images` / `subagent_run_images` frame (or its replayed item)
+ * into an {@link ImageBatch}, dropping entries with no file to fetch.
+ * @returns {ImageBatch}
+ */
+function imageBatch(frame) {
+  const images = (Array.isArray(frame.images) ? frame.images : [])
+    .filter((image) => image && image.path)
+    .map((image) => ({ path: image.path, mime: image.mime || 'image/png', bytes: image.bytes || 0 }));
+  return { source: frame.source === 'tool' ? 'tool' : 'assistant', tool: frame.tool || null, images };
+}
+
 /** Fold a finished call's server summary into its display shape. */
 export function applyToolSummary(call, summary) {
   const text = String(summary ?? '').trim();
@@ -332,6 +381,13 @@ function dispatchFrame(frame, cb) {
         summary: frame.summary || '',
       });
       break;
+    // A tool's images follow its `tool_finished`, and the model's own follow
+    // its text: the batch lands where the thing that made it already is.
+    case 'images': {
+      const batch = imageBatch(frame);
+      if (batch.images.length) cb.onImages && cb.onImages(batch);
+      break;
+    }
     case 'todo':
       cb.onTodo && cb.onTodo(Array.isArray(frame.items) ? frame.items : []);
       break;
@@ -386,6 +442,11 @@ function dispatchFrame(frame, cb) {
         summary: frame.summary || '',
       });
       break;
+    case 'subagent_run_images': {
+      const batch = imageBatch(frame);
+      if (batch.images.length) cb.onSubagentImages && cb.onSubagentImages(frame.run, batch);
+      break;
+    }
     case 'subagent_run_step':
       cb.onSubagentStep && cb.onSubagentStep(frame.run, frame.step || 0);
       break;
@@ -518,6 +579,17 @@ export class RealApi {
             call.status = 'pending'; // interrupted run: the result never landed
           }
           transcript.push({ type: 'tool', ...call });
+          break;
+        }
+        case 'images': {
+          // The session file records where each image was written, so a
+          // transcript reloaded from disk shows the same images the live
+          // stream did — the item sits next to the tool card, or the text,
+          // it belongs to.
+          const batch = imageBatch(item);
+          if (!batch.images.length) break;
+          ensureWorked();
+          transcript.push({ type: 'images', ...batch });
           break;
         }
         case 'notice':

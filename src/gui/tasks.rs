@@ -26,6 +26,7 @@ use crate::agent::{
 use crate::config::{Config, Mode};
 use crate::gui::settings::ConfigStore;
 use crate::gui::transcript::summarize_tool;
+use crate::images::ImageRef;
 use crate::tools::todo::{TodoItem, TodoStatus};
 
 /// Keep at most this many agents warm; beyond it the least-recently-used
@@ -56,6 +57,25 @@ pub enum Frame {
         name: String,
         ok: bool,
         summary: String,
+    },
+    /// Images the turn produced, already written to disk by the agent
+    /// (`~/.wizard/images/<session>/`). `source` is `"assistant"` (the model
+    /// generated them) or `"tool"`, in which case `tool` names it. Each entry
+    /// carries `path`, `mime` and `bytes` — a reference, never base64, so a
+    /// buffered turn of frames cannot balloon; the client fetches the file
+    /// itself to display it or link to it full size.
+    Images {
+        source: &'static str,
+        tool: Option<String>,
+        images: Vec<ImageRef>,
+    },
+    /// [`Frame::Images`], scoped to a subagent run — the run's pane renders
+    /// them where the parent's chat renders its own.
+    SubagentRunImages {
+        run: u64,
+        source: &'static str,
+        tool: Option<String>,
+        images: Vec<ImageRef>,
     },
     Todo {
         items: Vec<TodoRow>,
@@ -525,6 +545,21 @@ impl TaskShared {
                     },
                 );
             }
+            AgentEvent::Images { source, images } => self.push(Frame::Images {
+                source: source.as_str(),
+                tool: source.tool().map(str::to_string),
+                images,
+            }),
+            AgentEvent::SubagentRunImages {
+                run,
+                source,
+                images,
+            } => self.push(Frame::SubagentRunImages {
+                run,
+                source: source.as_str(),
+                tool: source.tool().map(str::to_string),
+                images,
+            }),
             AgentEvent::TodoUpdated(items) => self.push(Frame::Todo {
                 items: items.iter().map(TodoRow::from_item).collect(),
             }),

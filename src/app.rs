@@ -18,7 +18,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, DoneReason, InterviewQuestion, PlanVerdict, session::Session, subagent,
+    Agent, AgentEvent, DoneReason, ImageSource, InterviewQuestion, PlanVerdict, session::Session,
+    subagent,
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
@@ -26,6 +27,8 @@ use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort}
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
+use crate::image_view::ImageCache;
+use crate::images::ImageRef;
 use crate::import_claude::{self, ImportSelection};
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
@@ -53,6 +56,14 @@ pub enum TranscriptEntry {
         output: Option<String>,
         is_error: bool,
         collapsed: bool,
+    },
+    /// An image the turn produced — by the model, or by a tool
+    /// ([`AgentEvent::Images`]). The file is already on disk; the entry holds
+    /// only the reference to it, and [`crate::ui`] draws it (or, in a terminal
+    /// that can draw nothing, prints where it is).
+    Image {
+        source: ImageSource,
+        image: ImageRef,
     },
     /// System notice (mode switch, reload result, errors).
     Notice(String),
@@ -187,6 +198,34 @@ impl SubagentPane {
 /// giant minified line counts as 1 by `lines()` but fills the screen anyway).
 fn collapse_long(content: &str) -> bool {
     content.lines().count() > 6 || content.chars().count() > 600
+}
+
+/// The images on a replayed message, as the references the live
+/// [`AgentEvent::Images`] carried. An image the store could not write has no file
+/// to draw and no path to print, so it is not replayed.
+fn replayed_refs(images: &[crate::llm::Image]) -> Vec<ImageRef> {
+    images
+        .iter()
+        .filter_map(|image| {
+            Some(ImageRef {
+                path: image.path.clone()?,
+                mime: image.mime.clone(),
+                bytes: image.decoded_len(),
+            })
+        })
+        .collect()
+}
+
+/// The transcript entries an [`AgentEvent::Images`] becomes: one per image, each
+/// carrying where it came from and where it landed.
+fn image_entries(source: &ImageSource, images: Vec<ImageRef>) -> Vec<TranscriptEntry> {
+    images
+        .into_iter()
+        .map(|image| TranscriptEntry::Image {
+            source: source.clone(),
+            image,
+        })
+        .collect()
 }
 
 /// Outcome of a background agent rebuild (model switch, crash recovery),
@@ -1245,6 +1284,13 @@ pub struct App {
     /// [`crate::ui::draw`] every frame (hence the interior mutability: draw
     /// takes `&App`) and emptied while an overlay covers the transcript.
     pub card_hits: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// What this terminal can draw an image with, and every image it has drawn
+    /// recently. Starts at the half-block floor so a frame can be rendered
+    /// before anything has asked the terminal; `run_tui` replaces it with
+    /// [`ImageCache::detect`] before it takes the screen. Interior mutability
+    /// for the same reason as `card_hits` — draw takes `&App`, and decoding a
+    /// PNG once per image is exactly what a cache is for.
+    pub images: std::cell::RefCell<ImageCache>,
     pub should_quit: bool,
     /// Tick counter driving the busy spinner.
     pub tick: u64,
@@ -1395,6 +1441,7 @@ impl App {
             scroll: 0,
             selection: None,
             card_hits: std::cell::RefCell::new(Vec::new()),
+            images: std::cell::RefCell::new(ImageCache::fallback()),
             should_quit: false,
             tick: 0,
             suggestions: Vec::new(),
@@ -1726,19 +1773,39 @@ impl App {
     fn load_transcript(&mut self, messages: Vec<crate::llm::ChatMessage>) {
         use crate::llm::Role;
         self.transcript.clear();
+        // A tool's images ride back to the model on a user message the agent
+        // wrote for it (`Agent::run_tool`), so a user message full of images
+        // right after a tool answered is that tool's images — not something a
+        // person said. Same reading as the GUI's replay
+        // ([`crate::gui::transcript`]), so both surfaces rebuild the same
+        // conversation.
+        let mut just_answered: Option<String> = None;
         for message in messages {
             match message.role {
                 Role::System => {}
                 Role::User => {
+                    if let Some(tool) = just_answered.take()
+                        && !message.images.is_empty()
+                    {
+                        let source = ImageSource::Tool(tool);
+                        self.transcript
+                            .extend(image_entries(&source, replayed_refs(&message.images)));
+                        continue;
+                    }
                     if !message.content.trim().is_empty() {
                         self.transcript.push(TranscriptEntry::User(message.content));
                     }
                 }
                 Role::Assistant => {
+                    just_answered = None;
                     if !message.content.trim().is_empty() {
                         self.transcript
                             .push(TranscriptEntry::Assistant(message.content));
                     }
+                    self.transcript.extend(image_entries(
+                        &ImageSource::Assistant,
+                        replayed_refs(&message.images),
+                    ));
                     for call in message.tool_calls {
                         self.transcript.push(TranscriptEntry::ToolCard {
                             name: call.function.name,
@@ -1751,6 +1818,7 @@ impl App {
                 }
                 Role::Tool => {
                     let name = message.tool_name.unwrap_or_default();
+                    just_answered = Some(name.clone());
                     // Fill the most recent open card for this tool, as a live
                     // ToolFinished would.
                     let card = self
@@ -4155,6 +4223,13 @@ impl App {
                     }
                 }
             }
+            AgentEvent::Images { source, images } => {
+                // The model's own images arrive right after its reply, a tool's
+                // right after that tool's card — so appending puts each one
+                // under the thing that made it.
+                self.flush_streaming();
+                self.transcript.extend(image_entries(&source, images));
+            }
             AgentEvent::StepCompleted { step } => {
                 self.status.step = step;
             }
@@ -4324,6 +4399,15 @@ impl App {
                     *is_error = output.is_error;
                     *collapsed = output.is_error || collapse_long(&output.content);
                     *slot = Some(output.content);
+                }
+            }
+            AgentEvent::SubagentRunImages {
+                run,
+                source,
+                images,
+            } => {
+                for entry in image_entries(&source, images) {
+                    self.push_pane(run, entry);
                 }
             }
             AgentEvent::SubagentRunStep { run, step } => {
@@ -5240,6 +5324,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             app.handle_agent_event(event);
         }
     }
+
+    // Ask the terminal how it can draw an image, while stdio is still the plain
+    // terminal: the query writes escape sequences and reads the reply, which the
+    // alternate screen and our own raw mode would both get in the way of. A
+    // terminal that says nothing gets half-blocks, which every terminal can draw.
+    *app.images.borrow_mut() = ImageCache::detect();
+    tracing::debug!("terminal images: {:?}", app.images.borrow());
 
     let mut events = EventLoop::new(Duration::from_millis(100));
     let mut terminal = setup_terminal()?;
@@ -8482,6 +8573,236 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A real PNG on disk, as the image store would have left it: a solid red
+    /// square, so any cell that drew it is unmistakable.
+    fn red_png(dir: &Path) -> ImageRef {
+        let path = dir.join("red.png");
+        image::RgbaImage::from_pixel(48, 48, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .expect("wrote the png");
+        ImageRef {
+            path,
+            mime: "image/png".to_string(),
+            bytes: std::fs::metadata(dir.join("red.png")).unwrap().len() as usize,
+        }
+    }
+
+    /// Every cell of a drawn frame, row by row: what is on screen.
+    fn screen(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Rows holding image pixels. The UI is deliberately monochrome — white,
+    /// grays, and no hues anywhere (see [`crate::ui`]) — so a cell painted in
+    /// 24-bit colour is an image cell and nothing else. That makes this both the
+    /// "it drew" check and the "it left nothing behind" check.
+    fn pixel_rows(buf: &ratatui::buffer::Buffer) -> Vec<u16> {
+        use ratatui::style::Color;
+        (0..buf.area.height)
+            .filter(|&y| {
+                (0..buf.area.width).any(|x| {
+                    let cell = buf.cell((x, y)).unwrap();
+                    matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))
+                })
+            })
+            .collect()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    #[test]
+    fn an_image_from_the_model_and_one_from_a_tool_both_render_with_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+
+        app.handle_agent_event(AgentEvent::TextDelta("here it is".to_string()));
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Assistant,
+            images: vec![image.clone()],
+        });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "render".to_string(),
+            args: serde_json::json!({}),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "render".to_string(),
+            output: crate::tools::ToolOutput::ok("drawn"),
+        });
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Tool("render".to_string()),
+            images: vec![image.clone()],
+        });
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|entry| matches!(entry, TranscriptEntry::Image { .. }))
+                .count(),
+            2,
+        );
+
+        let buf = screen(&app, 80, 40);
+        let text: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Both images were drawn, in pixels.
+        assert_eq!(
+            pixel_rows(&buf).len(),
+            6,
+            "two three-row image blocks, drawn in pixels:\n{text}"
+        );
+        // Each is named by what made it, and each names its file — untruncated,
+        // on a line of its own, so it can be copied out and opened.
+        assert!(text.contains("image · image/png"), "{text}");
+        assert!(text.contains("image from `render` · image/png"), "{text}");
+        let path = image.path.display().to_string();
+        assert_eq!(
+            (0..buf.area.height)
+                .filter(|&y| row_text(&buf, y).trim() == path)
+                .count(),
+            2,
+            "each image's path stands alone on its own row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_image_is_clipped_to_the_transcript_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Assistant,
+            images: vec![image],
+        });
+        // Enough text after it to push the image off the top of a short screen.
+        for line in 0..12 {
+            app.handle_agent_event(AgentEvent::Notice(format!("line {line}")));
+        }
+
+        // Pinned to the bottom, the image is above the viewport: no pixels.
+        let (width, height) = (60u16, 12u16);
+        let buf = screen(&app, width, height);
+        assert!(pixel_rows(&buf).is_empty(), "the image is scrolled away");
+
+        // Scroll it back into view a row at a time. However the block straddles
+        // the edge of the viewport, its pixels stay inside the transcript body —
+        // never in the composer, the rail or the status bar below it.
+        let body = crate::ui::regions(&app, ratatui::layout::Rect::new(0, 0, width, height))[0];
+        let mut ever_drawn = false;
+        for _ in 0..20 {
+            app.scroll = app.scroll.saturating_add(1);
+            let buf = screen(&app, width, height);
+            let rows = pixel_rows(&buf);
+            ever_drawn |= !rows.is_empty();
+            for row in rows {
+                assert!(
+                    row < body.bottom(),
+                    "row {row} has pixels below the transcript body (which ends at {})",
+                    body.bottom()
+                );
+            }
+        }
+        assert!(
+            ever_drawn,
+            "scrolling back never brought the image into view"
+        );
+
+        // And back at the bottom, the screen is exactly what it was before the
+        // scroll — no pixels left over anywhere.
+        app.scroll = 0;
+        assert!(pixel_rows(&screen(&app, width, height)).is_empty());
+    }
+
+    #[test]
+    fn a_subagents_image_renders_inside_that_runs_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+        app.handle_agent_event(AgentEvent::SubagentRunStarted {
+            run: 1,
+            bg: None,
+            name: "researcher".to_string(),
+            task: "look".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunImages {
+            run: 1,
+            source: ImageSource::Tool("screenshot".to_string()),
+            images: vec![image],
+        });
+
+        // The run's image is its own: the main chat, which the subagent has said
+        // nothing to yet, shows no pixels.
+        assert!(pixel_rows(&screen(&app, 80, 40)).is_empty());
+
+        // Open the pane and it is there, on the tool that took it.
+        app.attached = Some(0);
+        let buf = screen(&app, 80, 40);
+        assert!(!pixel_rows(&buf).is_empty(), "the pane draws the image");
+        let text: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("image from `screenshot`"), "{text}");
+    }
+
+    #[test]
+    fn a_resumed_session_replays_the_images_it_left_on_disk() {
+        use crate::llm::{ChatMessage, Image};
+        let png = Image::new("iVBOR", "image/png").at_path(PathBuf::from("/img/a.png"));
+
+        let mut app = app();
+        let mut assistant = ChatMessage::assistant("done");
+        assistant.images.push(png.clone());
+        app.load_transcript(vec![
+            ChatMessage::user("draw"),
+            assistant,
+            ChatMessage::tool_result("render", "ok"),
+            // The images `render` returned, riding back to the model. Not a
+            // prompt — the agent wrote it, not the user.
+            ChatMessage::user_with_images("Image(s) returned by `render`:", vec![png]),
+        ]);
+
+        let images: Vec<&TranscriptEntry> = app
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Image { .. }))
+            .collect();
+        assert!(
+            matches!(
+                images.as_slice(),
+                [
+                    TranscriptEntry::Image {
+                        source: ImageSource::Assistant,
+                        ..
+                    },
+                    TranscriptEntry::Image {
+                        source: ImageSource::Tool(tool),
+                        image,
+                    },
+                ] if tool == "render" && image.path == Path::new("/img/a.png")
+            ),
+            "both directions came back, attributed: {images:?}"
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::User(text) if text.contains("Image(s) returned"))),
+            "the carrier message is not replayed as something the user said"
+        );
     }
 
     #[test]

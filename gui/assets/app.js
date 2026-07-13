@@ -3,7 +3,7 @@
 // through the Api seam (api.js): RealApi (HTTP + one WebSocket per open
 // task) by default, MockApi with `?mock=1`.
 
-import { NEW_CHAT_TITLE, applyToolSummary, createApi } from './api.js';
+import { NEW_CHAT_TITLE, applyToolSummary, createApi, imageUrl } from './api.js';
 import { icons, fileIconSvg } from './icons.js';
 
 const api = createApi();
@@ -123,6 +123,21 @@ function fmtTokens(n) {
   if (n < 1000) return String(n);
   if (n < 1e6) return `${short(n / 1000)}K`;
   return `${short(n / 1e6)}M`;
+}
+
+/** A path for a box that elides from the front (`direction: rtl`, so the file
+ *  name — the part you are here for — survives). The mark pins the leading "/"
+ *  of an absolute path, which the bidi algorithm otherwise carries to the far
+ *  end of the line and renders as a trailing slash. */
+const elidedPath = (path) => `\u200e${path}`;
+
+/** "512 B", "50 KB", "2.4 MB" — a file size, as a file manager writes it. */
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const kb = n / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
 
 const stateLabel = (s) =>
@@ -245,13 +260,13 @@ const transcriptInner = () => $('transcript').querySelector('.transcript-inner')
 /**
  * One streaming surface: where new content lands, plus the live refs a later
  * frame patches — the paragraph mid-stream, the tool group being aggregated,
- * the rows waiting on their result. The main chat is one flow; an open
- * subagent pane is another, so a subagent's rows never land in — or aggregate
- * with — the parent's.
+ * the rows waiting on their result, the card an `images` frame belongs on. The
+ * main chat is one flow; an open subagent pane is another, so a subagent's rows
+ * never land in — or aggregate with — the parent's.
  * @param {HTMLElement} scroller the element this flow scrolls in
  */
 function newFlow(scroller) {
-  return { scroller, target: null, para: null, think: null, group: null, rows: new Map() };
+  return { scroller, target: null, para: null, think: null, group: null, rows: new Map(), lastTool: null };
 }
 
 /** The main chat's flow: the center transcript. */
@@ -267,6 +282,7 @@ function autoScroll(flow, force = false) {
 function breakFlow(flow) {
   flow.para = null;
   flow.group = null;
+  flow.lastTool = null;
   collapseThinking(flow);
 }
 
@@ -348,8 +364,9 @@ function startExploreGroup(flow) {
     class: 'tool-row tool-row-btn', type: 'button', title: 'Show the individual calls',
     onclick: () => sublist.classList.toggle('hidden'),
   }, icon('magnifier', 'icon tool-icon'), h('span', { class: 'tool-name' }, 'Explored'), detail, status);
-  flow.target.append(h('div', { class: 'tool-group' }, row, sublist));
-  return { kind: 'explore', parent: flow.target, counts, sublist, detail, status };
+  const card = h('div', { class: 'tool-group' }, row, sublist);
+  flow.target.append(card);
+  return { kind: 'explore', parent: flow.target, card, counts, sublist, detail, status };
 }
 
 function addExploreCall(flow, group, call) {
@@ -414,6 +431,7 @@ function addWriteCall(flow, group, call) {
   });
 }
 
+/** One tool row of its own. Returns the row: the card its images land on. */
 function appendStandaloneTool(flow, call) {
   const row = h('div', { class: 'tool-row' + (call.status === 'pending' ? ' pending' : ''), dataset: { callId: call.id || '' } });
   let detailEl = null;
@@ -450,6 +468,7 @@ function appendStandaloneTool(flow, call) {
       if (result.status === 'failed') status.classList.remove('hidden');
     },
   });
+  return row;
 }
 
 /**
@@ -462,26 +481,86 @@ function appendStandaloneTool(flow, call) {
 function appendToolCall(flow, call) {
   collapseThinking(flow);
   flow.para = null;
+  let card;
   if (call.tool === 'explore' && call.noun) {
     if (!(flow.group && flow.group.kind === 'explore' && flow.group.parent === flow.target)) {
       flow.group = startExploreGroup(flow);
     }
     addExploreCall(flow, flow.group, call);
+    card = flow.group.card;
   } else if (call.tool === 'write' && call.name) {
     if (!(flow.group && flow.group.kind === 'write' && flow.group.parent === flow.target)) {
       flow.group = startWriteGroup(flow);
     }
     addWriteCall(flow, flow.group, call);
+    card = flow.group.row;
   } else {
     flow.group = null;
-    appendStandaloneTool(flow, call);
+    card = appendStandaloneTool(flow, call);
   }
+  // Images a tool returns arrive right after its `tool_finished` — the protocol
+  // orders them that way rather than giving them a call id — so the card just
+  // laid down is the one they belong on.
+  flow.lastTool = { name: call.name, card };
   autoScroll(flow);
 }
 
 function onToolResult(flow, result) {
   const row = flow.rows.get(result.callId);
   if (row) row.update(result);
+}
+
+/* --- Images --------------------------------------------------------------- */
+
+/**
+ * One image, as a thumbnail that opens it full size. The box is sized by CSS
+ * before the file arrives — the frame carries no dimensions, only bytes — so a
+ * 2048px render neither blows the column nor shoves the transcript down as it
+ * decodes. A file that is gone says so and names itself, rather than leaving a
+ * blank square behind.
+ * @param {import('./api.js').ImageRef} image
+ */
+function imageTile(image) {
+  const img = h('img', {
+    class: 'image-thumb-img', src: imageUrl(image), alt: '', loading: 'lazy', decoding: 'async',
+  });
+  const tile = h('button', {
+    class: 'image-thumb', type: 'button', title: `${image.path} — open full size`,
+    onclick: () => openImagePane(image),
+  }, img);
+  img.addEventListener('error', () => {
+    tile.classList.add('broken');
+    tile.disabled = true;
+    tile.title = image.path;
+    tile.replaceChildren(
+      icon('image', 'icon image-broken-icon'),
+      h('span', {}, 'Image missing'),
+      h('span', { class: 'image-broken-path mono' }, elidedPath(image.path)));
+  });
+  return tile;
+}
+
+/**
+ * An `images` frame (or its replayed item): the model's own images go inline
+ * where its text is; a tool's go on that tool's card, which the frame's arrival
+ * order identifies. A batch whose tool card is not the last one laid down — a
+ * transcript truncated mid-turn, a tool row the client hides — still shows its
+ * images, in the flow, rather than dropping them.
+ * @param {Object} flow
+ * @param {import('./api.js').ImageBatch} batch
+ */
+function appendImages(flow, batch) {
+  const onCard = batch.source === 'tool' && flow.lastTool && flow.lastTool.name === batch.tool;
+  const strip = h('div', { class: 'image-strip' + (onCard ? ' tool-images' : '') },
+    batch.images.map(imageTile));
+  if (onCard) {
+    flow.lastTool.card.after(strip);
+  } else {
+    flow.para = null;
+    collapseThinking(flow);
+    flow.target.append(strip);
+  }
+  autoScroll(flow);
 }
 
 /* --- Plan review / interview cards ---------------------------------------- */
@@ -626,6 +705,7 @@ function resetChatFlow(inner) {
   chat.para = null;
   chat.think = null;
   chat.group = null;
+  chat.lastTool = null;
   chat.rows = new Map();
   liveTurn = null;
 }
@@ -651,6 +731,8 @@ function renderTranscript() {
       appendThinkingBlock(chat, item.text, true);
     } else if (item.type === 'tool') {
       appendToolCall(chat, item);
+    } else if (item.type === 'images') {
+      appendImages(chat, item);
     } else if (item.type === 'notice') {
       appendSystemRow(chat, item.text);
     }
@@ -1018,10 +1100,11 @@ function syncGitPoll() {
  * One entry of a run's transcript: a message it wrote, a tool card, or a
  * closing notice.
  * @typedef {Object} RunEntry
- * @property {'text'|'tool'|'notice'} type
+ * @property {'text'|'tool'|'images'|'notice'} type
  * @property {string} [text]
  * @property {string} [cls]                          Row modifier for a notice ('error').
  * @property {import('./api.js').ToolCall} [call]
+ * @property {import('./api.js').ImageBatch} [batch]
  */
 
 /**
@@ -1151,10 +1234,11 @@ function onSubagentRun(info) {
 }
 
 /** Render one entry with the components the main chat uses, so a subagent's
- *  messages and tool cards read exactly like the parent's. */
+ *  messages, tool cards and images read exactly like the parent's. */
 function renderRunEntry(flow, entry) {
   if (entry.type === 'text') appendMessage(flow, entry.text);
   else if (entry.type === 'tool') appendToolCall(flow, entry.call);
+  else if (entry.type === 'images') appendImages(flow, entry.batch);
   else appendSystemRow(flow, entry.text, entry.cls || '');
 }
 
@@ -1193,6 +1277,15 @@ function onSubagentToolResult(id, result) {
     applyToolSummary(entry.call, result.summary);
   }
   if (openPane && openPane.run === run) onToolResult(openPane.flow, result);
+  touchRun(run);
+}
+
+/** Images from inside a run: they belong in that run's pane, where its tool
+ *  cards and messages are — not in the parent's chat. */
+function onSubagentImages(id, batch) {
+  const run = findRun(id);
+  if (!run) return;
+  appendToRun(run, { type: 'images', batch });
   touchRun(run);
 }
 
@@ -1316,6 +1409,34 @@ function closePane() {
   $('transcript').classList.remove('hidden');
   if (run) updateSubagentRow(run); // its row is no longer the open one
   autoScroll(chat, true);
+}
+
+/* ------------------------------------------------------------------------ */
+/* The image pane: one image, at full size                                   */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Open an image where the chat is: the file at its own size, what it is, and
+ * how big. The same pane the diff and the subagent runs open in, so it closes
+ * the same way — the back control, or Escape.
+ * @param {import('./api.js').ImageRef} image
+ */
+function openImagePane(image) {
+  const img = h('img', { class: 'image-full', src: imageUrl(image), alt: '', decoding: 'async' });
+  const body = h('div', { class: 'image-body' }, img);
+  const scroll = h('div', { class: 'pane-scroll' }, body);
+  const head = paneHead([
+    icon('image', 'icon pane-icon'),
+    h('span', { class: 'pane-path', title: image.path }, elidedPath(image.path)),
+    h('span', { class: 'pane-spacer' }),
+    h('span', { class: 'pane-meta' }, `${image.mime} · ${fmtBytes(image.bytes)}`),
+  ]);
+  // The thumbnail loaded from the same URL, so this rarely fires — but a
+  // session cleaned up between the two is a blank pane unless it says so.
+  img.addEventListener('error', () => {
+    body.replaceChildren(h('div', { class: 'image-note error' }, `The file is gone: ${image.path}`));
+  });
+  showPane({ kind: 'image', path: image.path }, 'image-pane', head, scroll);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2257,6 +2378,7 @@ function makeCallbacks(id) {
     onThinking: content(onThinking),
     onToolCall: content((call) => appendToolCall(chat, call)),
     onToolResult: content((result) => onToolResult(chat, result)),
+    onImages: content((batch) => appendImages(chat, batch)),
     onStatus: guard(onStatus), // reads + clears replayPending itself
     onTodo: content(onTodo),
     onUsage: content(onUsage),
@@ -2270,6 +2392,7 @@ function makeCallbacks(id) {
     onSubagentText: content(onSubagentText),
     onSubagentToolCall: content(onSubagentToolCall),
     onSubagentToolResult: content(onSubagentToolResult),
+    onSubagentImages: content(onSubagentImages),
     onSubagentStep: content(onSubagentStep),
     onSubagentDone: content(onSubagentDone),
   };

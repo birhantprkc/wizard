@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::llm::ToolSpec;
+use crate::llm::{Image, ToolSpec};
 
 /// Where a tool comes from. Affects display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,12 @@ pub struct ToolContext {
     /// it before execution. `None` outside an agent (direct registry
     /// execution in tests).
     pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
+    /// Where images produced during this session are written, set by the agent
+    /// at construction (`~/.wizard/images/<session>/`). The agent loop and the
+    /// subagent loop persist through it before announcing an image to the
+    /// surfaces. `None` outside an agent (direct registry execution in tests),
+    /// in which case images still reach the model but land nowhere on disk.
+    pub images: Option<Arc<crate::images::ImageStore>>,
     /// True only on the interactive TUI surface, which drains and dispatches
     /// slash commands the agent queues via `run_command`. A live `events`
     /// channel alone does not imply this — headless and gateway runs stream
@@ -93,6 +99,7 @@ impl ToolContext {
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
+            images: None,
             dispatches_commands: false,
         }
     }
@@ -116,6 +123,13 @@ impl ToolContext {
         self
     }
 
+    /// This context with the session's image store attached (agent
+    /// construction).
+    pub fn with_images(mut self, store: Arc<crate::images::ImageStore>) -> Self {
+        self.images = Some(store);
+        self
+    }
+
     /// A copy of this context carrying the turn's event channel.
     pub fn with_events(&self, events: tokio::sync::mpsc::Sender<crate::agent::AgentEvent>) -> Self {
         Self {
@@ -135,6 +149,17 @@ pub struct ToolOutput {
     /// file, ...). Distinct from [`ToolError`], which means the call itself
     /// could not be carried out.
     pub is_error: bool,
+    /// Images the tool produced (a generated image, a screenshot, a rendered
+    /// chart). Build them with [`Image::from_bytes`](crate::llm::Image::from_bytes),
+    /// which sniffs the media type and enforces the size cap.
+    ///
+    /// The agent loop takes them from here: it writes them to the session's
+    /// image directory, announces them to the surfaces
+    /// ([`AgentEvent::Images`](crate::agent::AgentEvent::Images)), and feeds
+    /// them back to the model on a following user message — a `tool`-role
+    /// message cannot carry image blocks on OpenAI, but a user message can
+    /// everywhere (see [`ChatMessage::user_with_images`]).
+    pub images: Vec<Image>,
 }
 
 impl ToolOutput {
@@ -142,6 +167,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
         }
     }
 
@@ -149,6 +175,17 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
+        }
+    }
+
+    /// Successful output carrying one or more images alongside its text. The
+    /// text is what the model reads; the images are what it sees.
+    pub fn ok_with_images(content: impl Into<String>, images: Vec<Image>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images,
         }
     }
 }

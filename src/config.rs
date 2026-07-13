@@ -793,6 +793,12 @@ impl Config {
         Ok(Self::wizard_dir()?.join("sessions"))
     }
 
+    /// `~/.wizard/images/` — images produced during a session, one directory
+    /// per session id (`crate::images::ImageStore`).
+    pub fn images_dir() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("images"))
+    }
+
     /// `~/.wizard/tools/` — agent-authored scripted tools.
     pub fn scripted_tools_dir() -> Result<PathBuf> {
         Ok(Self::wizard_dir()?.join("tools"))

@@ -6,7 +6,8 @@ use serde_json::Value;
 
 use crate::agent::SESSION_START_HOOK_NOTE;
 use crate::agent::session::SessionEntry;
-use crate::llm::Role;
+use crate::images::ImageRef;
+use crate::llm::{Image, Role};
 
 /// Cap on a tool summary line — the GUI renders it muted next to the tool
 /// name, so it must stay short.
@@ -34,6 +35,17 @@ pub enum Item {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<ItemOutput>,
     },
+    /// Images the turn produced, in the shape of the live
+    /// [`Frame::Images`](crate::gui::tasks::Frame::Images) frame: the same
+    /// `source`, the same references. The images are on the messages in the
+    /// session file, each tagged with where the store wrote it, so a reloaded
+    /// transcript shows exactly what the live stream showed — an assistant's
+    /// image after its text, a tool's image on that tool's card.
+    Images {
+        source: &'static str,
+        tool: Option<String>,
+        images: Vec<ImageRef>,
+    },
     Notice {
         text: String,
     },
@@ -55,6 +67,10 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
     // Indices into `items` of tool rows still awaiting their result.
     let mut pending: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    // The tool call whose result was the message just read — its row's index in
+    // `items` and its name — if that was the last thing to happen: what a
+    // following user message full of images belongs to.
+    let mut answered_tool: Option<(usize, String)> = None;
 
     for entry in entries {
         let record = match entry {
@@ -69,7 +85,33 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
             SessionEntry::Message(record) => record,
         };
         let message = &record.message;
+        let just_answered = answered_tool.take();
         match message.role {
+            // Images a tool returned ride back to the model on a user message
+            // (see `Agent::dispatch_call`) — the one message with this role that
+            // is not something a person said. It is that tool call's images, and
+            // it renders on that tool's card, not as a prompt of its own.
+            //
+            // The card is where it was, not at the end: one assistant message
+            // makes several calls, and its rows are all laid down when it is
+            // read, so appending here would put `render`'s image under whatever
+            // ran after it. The pending calls stand too — they are still waiting
+            // for results that come after this message — but their rows have
+            // shifted down by the one just spliced in.
+            Role::User if !message.images.is_empty() && just_answered.is_some() => {
+                let (row, tool) = just_answered.expect("the guard just matched it");
+                items.insert(
+                    row + 1,
+                    Item::Images {
+                        source: "tool",
+                        tool: Some(tool),
+                        images: image_refs(&message.images),
+                    },
+                );
+                for index in pending.iter_mut().filter(|index| **index > row) {
+                    *index += 1;
+                }
+            }
             Role::User => {
                 pending.clear();
                 items.push(Item::User {
@@ -98,6 +140,15 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
                         text: message.content.clone(),
                     });
                 }
+                // Images the model produced itself: with its reply, before the
+                // calls it made — exactly where the live stream put them.
+                if !message.images.is_empty() {
+                    items.push(Item::Images {
+                        source: "assistant",
+                        tool: None,
+                        images: image_refs(&message.images),
+                    });
+                }
                 for call in &message.tool_calls {
                     pending.push_back(items.len());
                     items.push(Item::Tool {
@@ -121,6 +172,7 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
                         } = &mut items[index]
                         {
                             let summary = summarize_tool(name, args, &message.content);
+                            answered_tool = Some((index, name.clone()));
                             *slot = Some(ItemOutput { summary, ..output });
                         }
                     }
@@ -132,6 +184,7 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
                             .clone()
                             .unwrap_or_else(|| "tool".to_string());
                         let summary = summarize_tool(&name, &Value::Null, &message.content);
+                        answered_tool = Some((items.len(), name.clone()));
                         items.push(Item::Tool {
                             name,
                             args: Value::Object(serde_json::Map::new()),
@@ -143,6 +196,25 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
         }
     }
     items
+}
+
+/// A message's images as the references the GUI renders from. The store tagged
+/// each one with where it wrote it ([`ImageStore::save_all`](crate::images::ImageStore::save_all)),
+/// so a transcript replayed from disk names the same files the live `images`
+/// frames did, and the byte count comes from the base64 rather than a stat of
+/// every file. An image that never landed on disk carries no path and nothing
+/// to fetch, so it is not announced.
+fn image_refs(images: &[Image]) -> Vec<ImageRef> {
+    images
+        .iter()
+        .filter_map(|image| {
+            Some(ImageRef {
+                path: image.path.clone()?,
+                mime: image.mime.clone(),
+                bytes: image.decoded_len(),
+            })
+        })
+        .collect()
 }
 
 /// Whether a replayed tool result looks successful. The session file does
@@ -339,6 +411,94 @@ mod tests {
                 assert!(second.is_none(), "dangling call replays without output");
             }
             other => panic!("expected two tool items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_carries_the_images_on_both_kinds_of_message() {
+        let png = Image::new("aGk=", "image/png").at_path("/img/a.png".into());
+        let mut assistant = assistant_with_calls(
+            "here it is",
+            &[
+                ("render", json!({ "shape": "hat" })),
+                ("read_file", json!({ "path": "a.rs" })),
+            ],
+        );
+        assistant.images.push(png.clone());
+        let entries = vec![
+            message_entry(ChatMessage::user("draw me a hat")),
+            message_entry(assistant),
+            message_entry(ChatMessage::tool_result("render", "rendered")),
+            // The images `render` returned, riding back to the model. The
+            // second call's result follows it — the pairing must survive.
+            message_entry(ChatMessage::user_with_images(
+                "Image(s) returned by `render`:",
+                vec![png.clone()],
+            )),
+            message_entry(ChatMessage::tool_result("read_file", "fn main() {}")),
+        ];
+
+        let items = replay(&entries);
+        // [0] user, [1] text, [2] assistant's image, [3] render, [4] its image
+        // (spliced onto its own card, not after the call that came next),
+        // [5] read_file — and no second prompt card.
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert!(matches!(&items[0], Item::User { .. }));
+        match &items[2] {
+            Item::Images {
+                source,
+                tool,
+                images,
+            } => {
+                assert_eq!(*source, "assistant");
+                assert_eq!(*tool, None);
+                assert_eq!(images[0].path, std::path::PathBuf::from("/img/a.png"));
+                assert_eq!(images[0].mime, "image/png");
+                assert_eq!(images[0].bytes, 2);
+            }
+            other => panic!("expected the assistant's image, got {other:?}"),
+        }
+        match &items[4] {
+            Item::Images { source, tool, .. } => {
+                assert_eq!(*source, "tool");
+                assert_eq!(tool.as_deref(), Some("render"));
+            }
+            other => panic!("expected the tool's image, got {other:?}"),
+        }
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Item::User { text } if text.starts_with("Image(s)"))),
+            "the images' carrier message is not a prompt: {items:?}"
+        );
+        match (&items[3], &items[5]) {
+            (Item::Tool { output: first, .. }, Item::Tool { name, output, .. }) => {
+                assert!(first.is_some());
+                assert_eq!(name, "read_file");
+                assert!(
+                    output.is_some(),
+                    "the images between the calls did not break the pairing"
+                );
+            }
+            other => panic!("expected both tool rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_announces_only_the_images_that_landed_on_disk() {
+        let mut assistant = ChatMessage::assistant("two, one of which never landed");
+        assistant.images = vec![
+            Image::new("aGk=", "image/png").at_path("/img/a.png".into()),
+            Image::new("aGk=", "image/png"),
+        ];
+        let items = replay(&[message_entry(assistant)]);
+        match &items[1] {
+            Item::Images { images, .. } => assert_eq!(
+                images.len(),
+                1,
+                "an image with no file has nothing to fetch: {images:?}"
+            ),
+            other => panic!("expected an images item, got {other:?}"),
         }
     }
 

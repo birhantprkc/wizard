@@ -119,6 +119,7 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/providers/{name}/active", post(activate_provider))
         .route("/api/providers/{name}/test", post(test_provider))
         .route("/api/workspaces", get(workspaces))
+        .route("/api/image", get(image))
         .route("/api/git", get(git_status))
         .route("/api/git/diff", get(git_diff))
         .route("/api/git/commit", post(git_commit))
@@ -178,6 +179,7 @@ fn origin_is_local(value: &str) -> bool {
 }
 
 /// A JSON API error: `{ "error": "..." }` with the matching status.
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 impl ApiError {
@@ -767,6 +769,82 @@ fn parse_kind(kind: &str) -> Result<ProviderKind, ApiError> {
         .map_err(|_| ApiError::bad_request(format!("unknown provider kind '{kind}'")))
 }
 
+/* ---------------------------------------------------------------------- */
+/* Images                                                                 */
+/* ---------------------------------------------------------------------- */
+
+/// The extensions [`crate::images::ImageStore`] writes
+/// ([`crate::llm::Image::extension`]) — and so the only ones [`image`] serves.
+const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "webp", "gif"];
+
+/// `GET /api/image?path=...` query.
+#[derive(Debug, Deserialize)]
+struct ImageQuery {
+    path: String,
+}
+
+/// `GET /api/image`: the bytes of one image the agent wrote, named by the path
+/// an `images` frame (or a replayed `images` item) carried.
+///
+/// `path` is client input, so it is resolved against `~/.wizard/images/` and
+/// nothing else ([`resolve_image`]): this route hands out image files, not any
+/// file the page cares to name.
+async fn image(Query(query): Query<ImageQuery>) -> Result<Response, ApiError> {
+    let path = resolve_image(&Config::images_dir()?, &query.path)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|err| ApiError::not_found(format!("{}: {err}", query.path)))?;
+    // The media type comes from the file's own magic number, not from anything
+    // the client said and not from the extension: it is the one answer that
+    // cannot be talked into mislabelling the bytes the browser is about to run
+    // through an image decoder. It doubles as the last content check — a file
+    // in the store that is not an image is not served.
+    let mime = crate::llm::sniff_mime(&bytes)
+        .ok_or_else(|| ApiError::bad_request(format!("{} is not an image", query.path)))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            // The file name is the hash of these exact bytes, so the URL can
+            // never come to mean anything else: cache it for good.
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Resolve a client-supplied image path against the image store, or refuse it.
+///
+/// The rules, in order: the name must end in an image extension; the path must
+/// resolve — `..` segments, symlinks and all, which is what
+/// [`std::fs::canonicalize`] does — to a *regular file* that is really inside
+/// `root`. So `../../../etc/passwd`, an absolute path elsewhere on the disk,
+/// and a symlink in the store pointing out of it all land in the same refusal,
+/// and a file that is simply gone is a 404 the page can render honestly.
+fn resolve_image(root: &FsPath, path: &str) -> Result<PathBuf, ApiError> {
+    let refused = || ApiError::bad_request(format!("'{path}' is not an image wizard saved"));
+    let candidate = FsPath::new(path);
+    let extension = candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if !extension.is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str())) {
+        return Err(refused());
+    }
+    // Both sides are canonicalized before they are compared: a symlinked root
+    // (a home directory that is one, a store under /tmp on macOS) would
+    // otherwise fail to prefix-match its own files.
+    let root = root.canonicalize().map_err(|_| refused())?;
+    let file = candidate
+        .canonicalize()
+        .map_err(|err| ApiError::not_found(format!("{path}: {err}")))?;
+    if !file.starts_with(&root) || !file.is_file() {
+        return Err(refused());
+    }
+    Ok(file)
+}
+
 /// `GET /api/git?cwd=...` query.
 #[derive(Debug, Deserialize)]
 struct GitQuery {
@@ -1003,6 +1081,58 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn images_resolve_only_inside_the_store() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("images").join("2026-07-13T09-00-00");
+        std::fs::create_dir_all(&root).unwrap();
+        let png = root.join("c414cd0e204de974.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        let store = home.path().join("images");
+
+        // The path an `images` frame carried.
+        let resolved = resolve_image(&store, &png.display().to_string()).expect("served");
+        assert_eq!(resolved, png.canonicalize().unwrap());
+
+        // A secret outside the store, reached three ways.
+        let secret = home.path().join("credentials.toml");
+        std::fs::write(&secret, "key = 'sk-1'").unwrap();
+        let traversal = root.join("../../credentials.toml");
+        for path in [
+            secret.display().to_string(),
+            traversal.display().to_string(),
+        ] {
+            let refusal = resolve_image(&store, &path).expect_err("refused");
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{path}");
+        }
+        // Renaming the traversal to look like an image does not make it one:
+        // the extension passes, the resolved path is still outside the store.
+        let disguised = root.join("../../credentials.toml.png");
+        std::fs::write(home.path().join("credentials.toml.png"), "key = 'sk-1'").unwrap();
+        assert!(resolve_image(&store, &disguised.display().to_string()).is_err());
+
+        // A symlink inside the store pointing out of it resolves to its target,
+        // which is outside — the same refusal, not a hole.
+        #[cfg(unix)]
+        {
+            let escape = root.join("escape.png");
+            std::os::unix::fs::symlink(&secret, &escape).unwrap();
+            assert!(resolve_image(&store, &escape.display().to_string()).is_err());
+        }
+
+        // Not an image name at all, and a directory that ends in one.
+        assert!(resolve_image(&store, &root.join("notes.txt").display().to_string()).is_err());
+        let dir = root.join("nested.png");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(resolve_image(&store, &dir.display().to_string()).is_err());
+
+        // A file that is simply gone (the session was cleaned up) is a 404, so
+        // the page can say so rather than sit on a blank box.
+        let missing = resolve_image(&store, &root.join("deadbeef.png").display().to_string())
+            .expect_err("missing");
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
     }
 
     #[test]

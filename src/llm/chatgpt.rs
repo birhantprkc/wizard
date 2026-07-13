@@ -332,17 +332,32 @@ fn build_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                     instructions.push(message.content.clone());
                 }
             }
-            Role::User => input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": message.content }],
-            })),
+            Role::User => {
+                let mut content = vec![json!({ "type": "input_text", "text": message.content })];
+                // Responses takes images as `input_image` parts carrying a data
+                // URI — the same base64 the other providers get, differently
+                // wrapped.
+                for image in &message.images {
+                    content.push(json!({
+                        "type": "input_image",
+                        "image_url": image.data_uri(),
+                    }));
+                }
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }));
+            }
             Role::Assistant => {
-                if !message.content.is_empty() {
+                // An assistant turn carries no image content on this API
+                // either: images the model generated are named in its text.
+                let text = crate::llm::assistant_content(message);
+                if !text.is_empty() {
                     input.push(json!({
                         "type": "message",
                         "role": "assistant",
-                        "content": [{ "type": "output_text", "text": message.content }],
+                        "content": [{ "type": "output_text", "text": text }],
                     }));
                 }
                 for call in &message.tool_calls {
@@ -557,7 +572,9 @@ fn text_chunk(text: String, thinking: bool) -> ChatChunk {
             content: text,
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
         }),
+        images: Vec::new(),
         thinking,
         done: false,
         done_reason: None,
@@ -574,7 +591,9 @@ fn build_final<S>(state: &mut SseState<S>) -> ChatChunk {
             content: String::new(),
             tool_calls,
             tool_name: None,
+            images: Vec::new(),
         }),
+        images: Vec::new(),
         thinking: false,
         done: true,
         done_reason: Some("stop".to_string()),

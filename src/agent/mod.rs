@@ -22,8 +22,9 @@ use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
 use crate::dispatch::Dispatcher;
 use crate::hooks::{HookEngine, PromptSubmit};
+use crate::images::{ImageRef, ImageStore};
 use crate::llm::provider::LlmProvider;
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Image, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
 use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
@@ -85,6 +86,35 @@ pub struct InterviewQuestion {
     pub options: Vec<String>,
 }
 
+/// Where an image came from, on an [`AgentEvent::Images`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// The model produced it inline in its reply
+    /// ([`ChatChunk::images`](crate::llm::ChatChunk::images)).
+    Assistant,
+    /// A tool returned it ([`ToolOutput::images`]); the name of the tool.
+    Tool(String),
+}
+
+impl ImageSource {
+    /// Stable tag for the structured surfaces (`stream-json`, the GUI's
+    /// protocol frames).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageSource::Assistant => "assistant",
+            ImageSource::Tool(_) => "tool",
+        }
+    }
+
+    /// The tool that produced the image, if a tool did.
+    pub fn tool(&self) -> Option<&str> {
+        match self {
+            ImageSource::Assistant => None,
+            ImageSource::Tool(name) => Some(name),
+        }
+    }
+}
+
 /// Events emitted by the agent loop. The TUI renders them; the headless
 /// runner logs them.
 #[derive(Debug)]
@@ -96,8 +126,28 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     /// A tool call is being executed.
     ToolStarted { name: String, args: Value },
-    /// A tool call finished.
+    /// A tool call finished. `output.images` carries any images the tool
+    /// produced, as base64; the [`AgentEvent::Images`] that follows says where
+    /// they landed on disk, which is what a renderer wants.
     ToolFinished { name: String, output: ToolOutput },
+    /// Images produced during this turn — by a tool, or by the model itself —
+    /// and written to the session's image directory
+    /// (`~/.wizard/images/<session>/`).
+    ///
+    /// This is the event the surfaces render off. Each [`ImageRef`] names a
+    /// file on disk plus its media type and size: the TUI prints the path when
+    /// the terminal cannot draw the image, the GUI links to it for "open full
+    /// size". No base64 rides on this event — the payload the model needs stays
+    /// in history, and a transcript frame references the image rather than
+    /// embedding it.
+    ///
+    /// Ordering: for a tool's images this arrives immediately after that tool's
+    /// [`AgentEvent::ToolFinished`]; for the model's own images, immediately
+    /// after the last [`AgentEvent::TextDelta`] of the reply that produced them.
+    Images {
+        source: ImageSource,
+        images: Vec<ImageRef>,
+    },
     /// One agent step (model round-trip) completed. 1-based.
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
@@ -209,6 +259,14 @@ pub enum AgentEvent {
         run: u64,
         name: String,
         output: ToolOutput,
+    },
+    /// [`AgentEvent::Images`], scoped to a subagent run — images produced
+    /// inside a run land in the same session directory and are announced the
+    /// same way, so a run's pane can render them instead of losing them.
+    SubagentRunImages {
+        run: u64,
+        source: ImageSource,
+        images: Vec<ImageRef>,
     },
     /// A subagent completed one step (model round-trip). 1-based, scoped to a
     /// run.
@@ -341,6 +399,50 @@ pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -
     events.send(event).await.is_ok()
 }
 
+/// Take custody of images produced during a turn — the one seam every image
+/// passes through, from either direction: a tool's [`ToolOutput::images`] or
+/// the model's own [`ChatChunk::images`](crate::llm::ChatChunk::images).
+///
+/// Images over [`crate::llm::MAX_IMAGE_BYTES`] are dropped here with a notice:
+/// an absurd image must not reach history, where it would melt the context
+/// window and bloat the session file. The rest are written to the session's
+/// image store and announced to the surfaces as `announce(refs)` — an event
+/// carrying paths, never base64. Persistence is best-effort (see
+/// [`ImageStore::save_all`]); the model's copy is the base64 this returns, for
+/// the caller to attach to the message it is about to push.
+pub(crate) async fn absorb_images(
+    images: Vec<Image>,
+    store: Option<&Arc<ImageStore>>,
+    events: Option<&mpsc::Sender<AgentEvent>>,
+    announce: impl FnOnce(Vec<ImageRef>) -> AgentEvent,
+) -> Vec<Image> {
+    if images.is_empty() {
+        return images;
+    }
+    let (kept, dropped) = crate::images::split_oversized(images);
+    if !dropped.is_empty() {
+        let notice = crate::images::oversized_notice(&dropped);
+        tracing::warn!("{notice}");
+        if let Some(events) = events {
+            emit(events, AgentEvent::Notice(notice)).await;
+        }
+    }
+    let Some(store) = store else {
+        // No store (a registry driven directly, outside an agent): the images
+        // still reach the model, they just land nowhere for the surfaces.
+        return kept;
+    };
+    // Each surviving image comes back tagged with its path, so the session file
+    // records where it went and a replayed transcript needs no re-derivation.
+    let (kept, saved) = store.save_all(kept);
+    if !saved.is_empty()
+        && let Some(events) = events
+    {
+        emit(events, announce(saved)).await;
+    }
+    kept
+}
+
 /// Whether an LLM error is worth retrying after backoff. Typed provider
 /// errors classify themselves; unknown errors (mid-stream drops surface as
 /// plain `anyhow` context chains) stay transient for robustness.
@@ -411,6 +513,8 @@ enum Completion {
     Done {
         content: String,
         tool_calls: Vec<ToolCall>,
+        /// Images the model produced inline in this reply, in arrival order.
+        images: Vec<Image>,
     },
     Cancelled,
 }
@@ -660,6 +764,16 @@ impl Agent {
             Arc::clone(&omakase),
         )));
 
+        // Images produced this session (by a tool or by the model) land under
+        // `~/.wizard/images/<session>/`, so every surface has a real file to
+        // render or link to.
+        let mut ctx = ToolContext::new(project_root)
+            .with_web(web)
+            .with_checkpoints(Arc::clone(&checkpoints));
+        if let Some(images) = open_image_store(&session.id) {
+            ctx = ctx.with_images(images);
+        }
+
         let mut agent = Self {
             client,
             model,
@@ -674,9 +788,7 @@ impl Agent {
             config,
             history: Vec::new(),
             session,
-            ctx: ToolContext::new(project_root)
-                .with_web(web)
-                .with_checkpoints(Arc::clone(&checkpoints)),
+            ctx,
             native_tools,
             skills,
             agents_md,
@@ -821,6 +933,9 @@ impl Agent {
         self.ctx.subagents = Arc::new(crate::tools::subagent_tasks::SubagentTaskRegistry::new());
         self.ctx.todos = Arc::new(std::sync::Mutex::new(Vec::new()));
         self.session = Session::create(&Config::sessions_dir()?)?;
+        // Images follow the session: the fresh conversation writes into its own
+        // directory, and the old one's files stay where its transcript points.
+        self.ctx.images = open_image_store(&self.session.id);
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
@@ -1176,7 +1291,7 @@ impl Agent {
             // system prompt's plan-mode block in step with the flag.
             self.sync_plan_prompt();
 
-            let (mut content, mut tool_calls) =
+            let (mut content, mut tool_calls, mut images) =
                 match self.stream_completion_with_retry(events).await? {
                     // Cancelled mid-stream: the partial completion is discarded
                     // (never entered history), so nothing dangles.
@@ -1184,27 +1299,30 @@ impl Agent {
                     Completion::Done {
                         content,
                         tool_calls,
-                    } => (content, tool_calls),
+                        images,
+                    } => (content, tool_calls, images),
                 };
 
             // Some reasoning models (xAI grok-4.3 after tool results) emit
             // only reasoning and stop, leaving the visible message empty.
             // Nudge once; if it stays empty, surface a notice instead of
-            // ending the turn silently.
-            if completion_is_empty(&content, &tool_calls) {
+            // ending the turn silently. A reply that produced an image but no
+            // text is not empty — it said what it had to say in pixels.
+            if images.is_empty() && completion_is_empty(&content, &tool_calls) {
                 // In-memory only (not `push`): the nudge must not pollute the
                 // persisted session history.
                 self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
                 let retried = self.stream_completion_with_retry(events).await;
                 self.history.pop();
-                let (retry_content, retry_calls) = match retried? {
+                let (retry_content, retry_calls, retry_images) = match retried? {
                     Completion::Cancelled => return Ok(DoneReason::Stopped),
                     Completion::Done {
                         content,
                         tool_calls,
-                    } => (content, tool_calls),
+                        images,
+                    } => (content, tool_calls, images),
                 };
-                if completion_is_empty(&retry_content, &retry_calls) {
+                if retry_images.is_empty() && completion_is_empty(&retry_content, &retry_calls) {
                     let _ = emit(
                         events,
                         AgentEvent::Error("model returned an empty response".to_string()),
@@ -1214,13 +1332,26 @@ impl Agent {
                 }
                 content = retry_content;
                 tool_calls = retry_calls;
+                images = retry_images;
             }
+
+            // Images the model generated: persisted and announced before the
+            // assistant message lands, so what history carries is exactly what
+            // the surfaces were told about.
+            let images = absorb_images(images, self.ctx.images.as_ref(), Some(events), |images| {
+                AgentEvent::Images {
+                    source: ImageSource::Assistant,
+                    images,
+                }
+            })
+            .await;
 
             let assistant = ChatMessage {
                 role: Role::Assistant,
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
                 tool_name: None,
+                images,
             };
             self.push(assistant);
 
@@ -1306,6 +1437,7 @@ impl Agent {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut images = Vec::new();
         let mut prompt_tokens = None;
         let mut completion_tokens = None;
         loop {
@@ -1318,6 +1450,10 @@ impl Agent {
                 },
             };
             let chunk = chunk.context("reading chat stream")?;
+            // Images the model generated (see `ChatChunk::images`). They are
+            // collected here and taken in by `absorb_images` once the reply is
+            // complete, so a cancelled or retried stream leaves nothing behind.
+            images.extend(chunk.images);
             if let Some(message) = chunk.message {
                 if !message.content.is_empty() {
                     if chunk.thinking {
@@ -1329,6 +1465,7 @@ impl Agent {
                         let _ = emit(events, AgentEvent::TextDelta(message.content)).await;
                     }
                 }
+                images.extend(message.images);
                 tool_calls.extend(message.tool_calls);
             }
             if chunk.prompt_eval_count.is_some() {
@@ -1355,6 +1492,7 @@ impl Agent {
         Ok(Completion::Done {
             content,
             tool_calls,
+            images,
         })
     }
 
@@ -1608,16 +1746,45 @@ impl Agent {
         call: &ToolCall,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Option<DoneReason> {
+        let name = call.function.name.clone();
         let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
-        match &outcome.output {
-            Some(output) => self.push(self.tool_feedback(&call.function.name, output)),
+        let images = match &outcome.output {
+            Some(output) => {
+                self.push(self.tool_feedback(&name, output));
+                output.images.clone()
+            }
             // No result (event receiver gone mid-batch): answer the call
             // anyway so the persisted history carries no dangling tool_use.
-            None => self.push(self.tool_feedback(
-                &call.function.name,
-                &ToolOutput::ok("(not executed — turn ended early)"),
-            )),
+            None => {
+                self.push(
+                    self.tool_feedback(&name, &ToolOutput::ok("(not executed — turn ended early)")),
+                );
+                Vec::new()
+            }
+        };
+
+        // Images a tool returned ride back to the model on a follow-up user
+        // message: user messages carry images uniformly across every provider,
+        // whereas a `tool` result cannot on OpenAI. A non-vision model simply
+        // ignores the attachment. They are persisted and announced first, so
+        // the surfaces see them attached to the tool card that produced them.
+        if !images.is_empty() {
+            let tool = name.clone();
+            let images = absorb_images(images, self.ctx.images.as_ref(), Some(events), |images| {
+                AgentEvent::Images {
+                    source: ImageSource::Tool(tool),
+                    images,
+                }
+            })
+            .await;
+            if !images.is_empty() {
+                self.push(ChatMessage::user_with_images(
+                    format!("Image(s) returned by `{name}`:"),
+                    images,
+                ));
+            }
         }
+
         if let Some(nudge) = outcome.nudge {
             self.push(ChatMessage::system(nudge));
         }
@@ -1741,6 +1908,20 @@ impl Drop for Agent {
     /// `kill_on_drop`; this makes the teardown explicit and immediate.
     fn drop(&mut self) {
         self.ctx.tasks.kill_all();
+    }
+}
+
+/// The image store for session `id` (`~/.wizard/images/<id>/`). A store that
+/// cannot be opened (no home directory) costs the surfaces their copy of an
+/// image, never the turn — the model still gets the base64 — so the failure is
+/// logged, not fatal.
+fn open_image_store(id: &str) -> Option<Arc<ImageStore>> {
+    match ImageStore::open(id) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            tracing::warn!("could not open the session image store: {err:#}");
+            None
+        }
     }
 }
 
@@ -2423,12 +2604,252 @@ mod tests {
     fn final_chunk(content: &str) -> ChatChunk {
         ChatChunk {
             message: (!content.is_empty()).then(|| ChatMessage::assistant(content)),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,
             eval_count: None,
             prompt_eval_count: None,
         }
+    }
+
+    /// A tiny PNG (a real magic number and some bytes behind it).
+    fn test_png() -> Image {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(b"a few pixels");
+        Image::from_bytes(&bytes).expect("a PNG")
+    }
+
+    /// A live chunk carrying a generated image — what an image-capable provider
+    /// emits on [`ChatChunk::images`].
+    fn image_chunk(images: Vec<Image>) -> ChatChunk {
+        ChatChunk {
+            message: None,
+            images,
+            thinking: false,
+            done: false,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// Every [`AgentEvent::Images`] a turn emitted, flattened.
+    fn drain_images(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<(ImageSource, ImageRef)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Images { source, images } = event {
+                out.extend(images.into_iter().map(|image| (source.clone(), image)));
+            }
+        }
+        out
+    }
+
+    /// A tool that returns `images` alongside its text.
+    struct ImageTool {
+        images: Vec<Image>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ImageTool {
+        fn name(&self) -> &str {
+            "generate_image"
+        }
+        fn description(&self) -> &str {
+            "Generate an image."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::ok_with_images(
+                "rendered 1 image",
+                self.images.clone(),
+            ))
+        }
+    }
+
+    /// One assistant message whose only tool call is `generate_image`.
+    fn calls_image_tool() -> ChatChunk {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: "generate_image".to_string(),
+                arguments: json!({}),
+            },
+        });
+        ChatChunk {
+            message: Some(assistant),
+            images: Vec::new(),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_generated_images_reach_history_disk_and_the_surfaces() {
+        // A provider that streams text and then an image, exactly as an
+        // image-capable endpoint does through `ChatChunk::images`.
+        let image = test_png();
+        let (mut agent, _provider, _tmp) = test_agent(vec![vec![
+            ChatChunk {
+                message: Some(ChatMessage::assistant("here you go")),
+                ..image_chunk(Vec::new())
+            },
+            image_chunk(vec![image.clone()]),
+            final_chunk(""),
+        ]]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("draw a cat", tx).await.expect("turn ok");
+
+        // In history, on the assistant message, as base64 — a vision model
+        // needs it there on the next turn.
+        let assistant = agent
+            .history()
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .expect("an assistant message");
+        assert_eq!(assistant.content, "here you go");
+        assert_eq!(assistant.images.len(), 1);
+        assert_eq!(assistant.images[0].b64, image.b64);
+        assert_eq!(assistant.images[0].mime, "image/png");
+
+        // Announced to the surfaces as a path, not base64.
+        let announced = drain_images(&mut rx);
+        assert_eq!(announced.len(), 1);
+        let (source, saved) = &announced[0];
+        assert_eq!(*source, ImageSource::Assistant);
+        assert_eq!(saved.mime, "image/png");
+        assert_eq!(
+            assistant.images[0].path.as_ref(),
+            Some(&saved.path),
+            "history records the same path the surfaces were given — a replayed \
+             transcript re-derives nothing"
+        );
+
+        // And on disk, under this session's image directory.
+        assert_eq!(
+            std::fs::read(&saved.path).expect("the image file"),
+            image.decode().unwrap()
+        );
+        assert!(
+            saved
+                .path
+                .starts_with(Config::images_dir().unwrap().join(&agent.session().id)),
+            "images are session-scoped: {}",
+            saved.path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_images_ride_back_on_a_following_user_message() {
+        // The convention every provider tolerates: the tool message carries the
+        // text, the images follow on a user message (a `tool` result cannot
+        // carry image blocks on OpenAI).
+        let image = test_png();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ImageTool {
+            images: vec![image.clone()],
+        }));
+
+        let tmp = TempDir::new();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![vec![calls_image_tool()], vec![final_chunk("done")]],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("make me a picture", tx).await.expect("turn");
+
+        let history = agent.history();
+        let tool_index = history
+            .iter()
+            .position(|message| message.role == Role::Tool)
+            .expect("a tool result");
+        assert_eq!(history[tool_index].content, "rendered 1 image");
+        assert!(
+            history[tool_index].images.is_empty(),
+            "the tool message carries the text only"
+        );
+        let follow_up = &history[tool_index + 1];
+        assert_eq!(follow_up.role, Role::User);
+        assert!(follow_up.content.contains("generate_image"));
+        assert_eq!(follow_up.images.len(), 1, "the model sees it");
+        assert_eq!(follow_up.images[0].b64, image.b64);
+
+        // The surfaces get the tool's images twice over: on ToolFinished (as
+        // base64, for free) and on Images (as a path, which is what they use).
+        let mut finished_images = Vec::new();
+        let mut announced = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolFinished { output, .. } => finished_images.extend(output.images),
+                AgentEvent::Images { source, images } => announced.push((source, images)),
+                _ => {}
+            }
+        }
+        assert_eq!(finished_images.len(), 1);
+        assert_eq!(finished_images[0].b64, image.b64);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].0, ImageSource::Tool("generate_image".into()));
+        let saved = &announced[0].1[0];
+        assert_eq!(
+            std::fs::read(&saved.path).expect("the image file"),
+            image.decode().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_image_is_dropped_with_a_notice_and_never_enters_history() {
+        // A runaway image must not melt the context window or the session file.
+        let huge = Image::new(
+            "A".repeat(crate::llm::MAX_IMAGE_BYTES / 3 * 4 + 8),
+            "image/png",
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ImageTool {
+            images: vec![huge, test_png()],
+        }));
+
+        let tmp = TempDir::new();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![vec![calls_image_tool()], vec![final_chunk("done")]],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("make me a picture", tx).await.expect("turn");
+
+        let follow_up = agent
+            .history()
+            .iter()
+            .find(|message| message.role == Role::User && !message.images.is_empty())
+            .expect("the images user message");
+        assert_eq!(
+            follow_up.images.len(),
+            1,
+            "the oversized image never reaches the model; the sane one does"
+        );
+        assert_eq!(follow_up.images[0].b64, test_png().b64);
+
+        let (_text, _errors, notices) = drain_events(&mut rx);
+        assert!(
+            notices.iter().any(|notice| notice.contains("oversized")),
+            "the drop is surfaced, not silent: {notices:?}"
+        );
     }
 
     /// `done: true` chunk carrying token counts alongside `content`.
@@ -2556,7 +2977,9 @@ mod tests {
                     },
                 }],
                 tool_name: None,
+                images: Vec::new(),
             }),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,
@@ -4111,7 +4534,9 @@ mod tests {
                     })
                     .collect(),
                 tool_name: None,
+                images: Vec::new(),
             }),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,

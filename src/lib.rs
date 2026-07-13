@@ -22,6 +22,8 @@ pub mod gui;
 pub mod hardware;
 pub mod harness;
 pub mod hooks;
+pub mod image_view;
+pub mod images;
 pub mod import_claude;
 pub mod instructions;
 pub mod llm;

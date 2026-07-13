@@ -276,10 +276,11 @@ impl OllamaClient {
         if options.num_ctx.is_none() {
             options.num_ctx = Some(self.derived_num_ctx(&model).await);
         }
+        let body = build_request_body(&request)?;
         let response = self
             .http
             .post(self.url("/api/chat"))
-            .json(&request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| self.transport_error(e))?;
@@ -327,6 +328,45 @@ impl LlmProvider for OllamaClient {
     fn label(&self) -> String {
         self.host().to_string()
     }
+}
+
+/// Translate a native [`ChatRequest`] into Ollama's `/api/chat` body.
+///
+/// Identical to the request's own serde shape but for `images`: Ollama's native
+/// endpoint takes a sibling array of bare base64 strings on the message (it
+/// sniffs the media type itself), whereas Wizard carries typed
+/// [`Image`](crate::llm::Image)s. Images on an *assistant* message — ones the
+/// model generated — are named in its text instead: an assistant turn is not
+/// image input, and a vision model handed its own output back as input would
+/// only be confused by it.
+fn build_request_body(request: &ChatRequest) -> Result<serde_json::Value> {
+    use crate::llm::Role;
+    use serde_json::Value;
+
+    let mut body = serde_json::to_value(request).context("serializing chat request")?;
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(body);
+    };
+    for (wire, message) in messages.iter_mut().zip(&request.messages) {
+        if message.images.is_empty() {
+            continue;
+        }
+        if message.role == Role::Assistant {
+            wire["content"] = Value::String(crate::llm::assistant_content(message));
+            if let Some(object) = wire.as_object_mut() {
+                object.remove("images");
+            }
+            continue;
+        }
+        wire["images"] = Value::Array(
+            message
+                .images
+                .iter()
+                .map(|image| Value::String(image.b64.clone()))
+                .collect(),
+        );
+    }
+    Ok(body)
 }
 
 /// `GET /api/tags` response body (subset we care about).
@@ -454,6 +494,73 @@ mod tests {
         let client = OllamaClient::new("http://127.0.0.1:11434///");
         assert_eq!(client.host(), "http://127.0.0.1:11434");
         assert_eq!(client.url("/api/tags"), "http://127.0.0.1:11434/api/tags");
+    }
+
+    fn request(messages: Vec<crate::llm::ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            model: "qwen3-vl".to_string(),
+            messages,
+            tools: Vec::new(),
+            stream: true,
+            options: None,
+        }
+    }
+
+    #[test]
+    fn user_images_flatten_to_the_native_base64_array() {
+        let body = build_request_body(&request(vec![
+            crate::llm::ChatMessage::user("plain"),
+            crate::llm::ChatMessage::user_with_images(
+                "what is this?",
+                vec![
+                    crate::llm::Image::new("QUJD", "image/png"),
+                    crate::llm::Image::new("REVG", "image/webp"),
+                ],
+            ),
+        ]))
+        .expect("body");
+
+        assert!(
+            body["messages"][0].get("images").is_none(),
+            "text-only messages are untouched"
+        );
+        // Ollama's native shape: bare base64 strings, no media type (it sniffs).
+        assert_eq!(body["messages"][1]["content"], "what is this?");
+        assert_eq!(body["messages"][1]["images"][0], "QUJD");
+        assert_eq!(body["messages"][1]["images"][1], "REVG");
+    }
+
+    #[test]
+    fn the_on_disk_path_never_reaches_the_wire() {
+        // `Image::path` is bookkeeping for replaying a transcript, not content:
+        // no provider sees it, including the one whose body is serde-derived.
+        let image = crate::llm::Image::new("QUJD", "image/png")
+            .at_path(std::path::PathBuf::from("/home/u/.wizard/images/s/abc.png"));
+        let body = build_request_body(&request(vec![crate::llm::ChatMessage::user_with_images(
+            "look",
+            vec![image],
+        )]))
+        .expect("body");
+        assert!(
+            !body.to_string().contains(".wizard/images"),
+            "no local path on the wire: {body}"
+        );
+    }
+
+    #[test]
+    fn assistant_images_are_named_in_the_text_not_sent_back_as_input() {
+        let mut assistant = crate::llm::ChatMessage::assistant("here it is");
+        assistant
+            .images
+            .push(crate::llm::Image::new("QUJD", "image/png"));
+        let body = build_request_body(&request(vec![assistant])).expect("body");
+        let content = body["messages"][0]["content"].as_str().expect("content");
+        assert!(content.contains("here it is"));
+        assert!(
+            content.contains("generated 1 image(s) (image/png)"),
+            "{content}"
+        );
+        assert!(body["messages"][0].get("images").is_none());
     }
 
     #[test]

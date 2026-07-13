@@ -140,14 +140,29 @@ fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                     system_parts.push(message.content.clone());
                 }
             }
-            Role::User => out.push(json!({
-                "role": "user",
-                "content": [{ "type": "text", "text": message.content }],
-            })),
+            Role::User => {
+                let mut content = vec![json!({ "type": "text", "text": message.content })];
+                // Images ride along as base64 `image` blocks after the text
+                // (the Anthropic vision format), each with its own media type.
+                for image in &message.images {
+                    content.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.mime,
+                            "data": image.b64,
+                        },
+                    }));
+                }
+                out.push(json!({ "role": "user", "content": content }));
+            }
             Role::Assistant => {
                 let mut blocks: Vec<Value> = Vec::new();
-                if !message.content.is_empty() {
-                    blocks.push(json!({ "type": "text", "text": message.content }));
+                // An assistant turn takes no image blocks here either: images
+                // the model generated are named in its text instead.
+                let text = super::assistant_content(message);
+                if !text.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": text }));
                 }
                 for call in &message.tool_calls {
                     seq += 1;
@@ -433,6 +448,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
     };
     ChatChunk {
         message,
+        images: Vec::new(),
         thinking: false,
         done: true,
         done_reason: state.done_reason.clone(),
@@ -445,6 +461,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
 fn text_chunk(content: String, thinking: bool) -> ChatChunk {
     ChatChunk {
         message: Some(ChatMessage::assistant(content)),
+        images: Vec::new(),
         thinking,
         done: false,
         done_reason: None,
@@ -565,6 +582,43 @@ mod tests {
 
     fn provider() -> AnthropicProvider {
         AnthropicProvider::new("https://api.anthropic.com/", "claude-fable-5", "key")
+    }
+
+    #[test]
+    fn user_images_become_base64_image_blocks() {
+        let (_system, messages) = build_messages(&[ChatMessage::user_with_images(
+            "what is on screen?",
+            vec![
+                crate::llm::Image::new("QUJD", "image/png"),
+                crate::llm::Image::new("REVG", "image/jpeg"),
+            ],
+        )]);
+        let content = &messages[0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is on screen?");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "QUJD");
+        // The media type comes from the image, not a hard-coded default.
+        assert_eq!(content[2]["source"]["media_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn assistant_images_are_named_in_the_text_not_sent_as_blocks() {
+        // Anthropic takes `image` blocks on user turns only; replaying an
+        // assistant turn that generated one must degrade to text.
+        let mut assistant = ChatMessage::assistant("here it is");
+        assistant
+            .images
+            .push(crate::llm::Image::new("QUJD", "image/png"));
+        let (_system, messages) = build_messages(&[assistant]);
+        let blocks = &messages[0]["content"];
+        assert_eq!(blocks.as_array().expect("blocks").len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        let text = blocks[0]["text"].as_str().expect("text");
+        assert!(text.contains("here it is"));
+        assert!(text.contains("generated 1 image(s) (image/png)"), "{text}");
     }
 
     #[test]
