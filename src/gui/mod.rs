@@ -56,14 +56,18 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
 
     let cwd = std::env::current_dir().context("reading the working directory")?;
     let store = Arc::new(settings::ConfigStore::new(config));
+    // Once for the process, not once per task: an agent build that connects its
+    // own servers would give a GUI with four warm chats four copies of every
+    // configured MCP server. The TUI holds one manager for the same reason.
+    let mcp = Arc::new(crate::agent::connect_mcp().await);
     let state = Arc::new(GuiState {
-        manager: tasks::TaskManager::new(Arc::clone(&store)),
+        manager: tasks::TaskManager::new(Arc::clone(&store), mcp),
         config: store,
         cwd,
         assets_dir: assets,
         sign_in: Arc::new(oauth::SignIn::default()),
     });
-    let router = server::router(state);
+    let router = server::router(Arc::clone(&state));
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -81,6 +85,9 @@ pub async fn run(config: Config, port: u16, no_open: bool, assets: Option<PathBu
         })
         .await
         .context("serving the GUI")?;
+    // The tasks die with the process; their heartbeats would otherwise sit in
+    // the registry claiming to be running until they aged out.
+    state.manager.shutdown();
     println!("\n[gui stopped]");
     Ok(())
 }

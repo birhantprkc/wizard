@@ -12,7 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -27,6 +27,10 @@ use crate::config::{Config, Mode};
 use crate::gui::settings::ConfigStore;
 use crate::gui::transcript::summarize_tool;
 use crate::images::ImageRef;
+use crate::llm::provider::NATIVE_TOOLS_ON_PROBE_FAILURE;
+use crate::mcp::McpManager;
+use crate::session_registry::{self, SessionRecord, SessionState};
+use crate::tools::CommandDispatch;
 use crate::tools::todo::{TodoItem, TodoStatus};
 
 /// Keep at most this many agents warm; beyond it the least-recently-used
@@ -36,6 +40,19 @@ const MAX_WARM_TASKS: usize = 4;
 /// Cap on buffered frames per turn, so a runaway turn with no socket
 /// attached cannot grow without bound (the oldest frames are dropped).
 const MAX_BUFFERED_FRAMES: usize = 10_000;
+
+/// How often every live task's registry heartbeat is refreshed. Must stay well
+/// under [`session_registry::STALE_SECS`], or a task that sits idle between
+/// turns ages out of `/dashboard` while it is still there. The TUI refreshes on
+/// the same cadence, from its draw loop.
+const HEARTBEAT: Duration = Duration::from_secs(3);
+
+/// The slash commands the GUI's own executor runs — the `server` rows of
+/// [`crate::gui::server::COMMANDS`], which a test holds it to. `run_command`
+/// refuses anything outside this set at *call* time, so a command with nowhere
+/// to land in a browser comes back to the model as a tool error rather than a
+/// no-op it never hears about.
+pub(crate) const AGENT_COMMANDS: &[&str] = &["compact", "cost", "model", "mode", "help"];
 
 /// A server→client WebSocket frame (see `docs/gui-protocol.md`).
 #[derive(Debug, Serialize)]
@@ -265,11 +282,35 @@ enum WorkerRequest {
 pub struct TaskShared {
     pub id: String,
     pub cwd: PathBuf,
+    /// When this task went live, for its registry record.
+    started_unix: u64,
+    /// Where this task heartbeats (`~/.wizard/running/`), so `/dashboard` and
+    /// every other Wizard on the machine sees it while it is alive. `None` for a
+    /// task no manager owns — it has no session anyone could attach to, and must
+    /// not advertise one.
+    registry: Option<PathBuf>,
     state: Mutex<SharedState>,
 }
 
 struct SharedState {
     task_state: TaskState,
+    /// Dashboard label: the first line of the task's first message, or the
+    /// workspace name until it has one. The TUI names its session the same way.
+    name: String,
+    /// The first message has landed, so `name` is the task's own and no later
+    /// turn overwrites it.
+    named: bool,
+    /// The posture the agent runs in, mirrored here for the registry record;
+    /// `/mode` moves it.
+    mode: String,
+    /// One-line summary of what the task is doing, for the dashboard row.
+    activity: String,
+    /// Slash commands the agent asked for through `run_command` during the
+    /// current turn. `run_turn` holds `&mut Agent` for its whole duration, so
+    /// nothing can be applied until the borrow ends; the worker drains this the
+    /// moment the turn returns, which is where the TUI applies its own queue and
+    /// for the same reason.
+    pending_commands: Vec<String>,
     /// A turn is queued or running; set by the enqueuer, cleared by the
     /// worker, so "one in-flight turn per task" holds across the gap.
     turn_active: bool,
@@ -351,12 +392,29 @@ impl SharedState {
 }
 
 impl TaskShared {
-    pub(crate) fn new(id: String, cwd: PathBuf, model: String) -> Arc<Self> {
+    pub(crate) fn new(
+        id: String,
+        cwd: PathBuf,
+        model: String,
+        mode: String,
+        registry: Option<PathBuf>,
+    ) -> Arc<Self> {
+        let name = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session".to_string());
         Arc::new(Self {
             id,
             cwd,
+            started_unix: now_unix(),
+            registry,
             state: Mutex::new(SharedState {
                 task_state: TaskState::Idle,
+                name,
+                named: false,
+                mode,
+                activity: "idle".to_string(),
+                pending_commands: Vec::new(),
                 turn_active: false,
                 buffer: VecDeque::new(),
                 subscriber: None,
@@ -394,6 +452,59 @@ impl TaskShared {
 
     fn set_model(&self, model: &str) {
         self.lock().model = model.to_string();
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        self.lock().mode = mode.to_string();
+    }
+
+    /// Name the task after its first message, as the TUI names a session after
+    /// the prompt it launched with. Only the first one: later turns are the
+    /// conversation, not its title.
+    fn name_after_first_message(&self, text: &str) {
+        let Some(line) = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.chars().take(48).collect::<String>())
+        else {
+            return;
+        };
+        let mut state = self.lock();
+        if !state.named {
+            state.named = true;
+            state.name = line;
+        }
+    }
+
+    /// This task's heartbeat record. A GUI chat is a running Wizard session like
+    /// any other: it belongs in `/dashboard` and in every other instance's task
+    /// list, not just in the browser that opened it.
+    fn record(&self) -> SessionRecord {
+        let state = self.lock();
+        SessionRecord {
+            id: self.id.clone(),
+            name: state.name.clone(),
+            cwd: self.cwd.display().to_string(),
+            model: state.model.clone(),
+            mode: state.mode.clone(),
+            state: registry_state(state.task_state),
+            activity: state.activity.clone(),
+            pid: std::process::id(),
+            started_unix: self.started_unix,
+            updated_unix: 0, // stamped by session_registry::write
+        }
+    }
+
+    /// Publish (or refresh) this task's heartbeat.
+    fn publish(&self) {
+        let Some(dir) = &self.registry else { return };
+        session_registry::write_to(dir, &self.record());
+    }
+
+    /// Take the commands the agent queued during the turn that just ended.
+    fn take_pending_commands(&self) -> Vec<String> {
+        std::mem::take(&mut self.lock().pending_commands)
     }
 
     fn set_context_window(&self, window: Option<u32>) {
@@ -454,39 +565,47 @@ impl TaskShared {
     /// working. Subagent state is *not* per-turn: a background run outlives
     /// the turn that spawned it, and keeps streaming into the panel.
     fn begin_turn(&self) {
-        let mut state = self.lock();
-        state.buffer.clear();
-        state.open_calls.clear();
-        state.turn_seq += 1;
-        state.retries = 0;
-        state.turn_error_seen = false;
-        state.turn_cancel_requested = false;
-        state.turn_failed = false;
-        state.task_state = TaskState::Working;
-        let frame = Frame::State {
-            state: state.task_state.as_str(),
-        };
-        push_locked(&mut state, frame);
+        {
+            let mut state = self.lock();
+            state.buffer.clear();
+            state.open_calls.clear();
+            state.turn_seq += 1;
+            state.retries = 0;
+            state.turn_error_seen = false;
+            state.turn_cancel_requested = false;
+            state.turn_failed = false;
+            state.task_state = TaskState::Working;
+            state.activity = "working".to_string();
+            let frame = Frame::State {
+                state: state.task_state.as_str(),
+            };
+            push_locked(&mut state, frame);
+        }
+        self.publish();
     }
 
     /// Turn end: release the turn slot and go idle — or failed, when the
     /// agent could not be built or the turn's `done` reason was `error`.
     fn finish_turn(&self, failed: bool) {
-        let mut state = self.lock();
-        state.turn_active = false;
-        state.task_state = if failed || state.turn_failed {
-            TaskState::Failed
-        } else {
-            TaskState::Idle
-        };
-        // run_turn resolves its own gates before returning; drop any
-        // leftovers defensively so a stale sender can never pin needs_input.
-        state.pending_plan = None;
-        state.pending_interview = None;
-        let frame = Frame::State {
-            state: state.task_state.as_str(),
-        };
-        push_locked(&mut state, frame);
+        {
+            let mut state = self.lock();
+            state.turn_active = false;
+            state.task_state = if failed || state.turn_failed {
+                TaskState::Failed
+            } else {
+                TaskState::Idle
+            };
+            state.activity = "idle".to_string();
+            // run_turn resolves its own gates before returning; drop any
+            // leftovers defensively so a stale sender can never pin needs_input.
+            state.pending_plan = None;
+            state.pending_interview = None;
+            let frame = Frame::State {
+                state: state.task_state.as_str(),
+            };
+            push_locked(&mut state, frame);
+        }
+        self.publish();
     }
 
     /// Attach a socket: replay the current turn's buffered frames (when one
@@ -540,41 +659,56 @@ impl TaskShared {
     /// plan/interview gate resolves the gateway way: approve the plan, skip
     /// the interview — a dropped reviewer must never hang the turn.
     pub fn detach(&self, generation: u64) {
-        let mut state = self.lock();
-        if state.subscriber_gen != generation {
-            return;
-        }
-        state.subscriber = None;
-        if let Some(respond) = state.pending_plan.take() {
-            let _ = respond.send(PlanVerdict::approve());
-            resume_after_gate(&mut state, "plan auto-approved (client disconnected)");
-        }
-        if let Some(respond) = state.pending_interview.take() {
-            let _ = respond.send(None);
-            resume_after_gate(&mut state, "interview skipped (client disconnected)");
+        let resumed = {
+            let mut state = self.lock();
+            if state.subscriber_gen != generation {
+                return;
+            }
+            state.subscriber = None;
+            let mut resumed = false;
+            if let Some(respond) = state.pending_plan.take() {
+                let _ = respond.send(PlanVerdict::approve());
+                resume_after_gate(&mut state, "plan auto-approved (client disconnected)");
+                resumed = true;
+            }
+            if let Some(respond) = state.pending_interview.take() {
+                let _ = respond.send(None);
+                resume_after_gate(&mut state, "interview skipped (client disconnected)");
+                resumed = true;
+            }
+            resumed
+        };
+        if resumed {
+            self.publish();
         }
     }
 
     /// `plan_verdict` client frame. False when no plan is awaiting one.
     pub fn resolve_plan(&self, verdict: PlanVerdict) -> bool {
-        let mut state = self.lock();
-        let Some(respond) = state.pending_plan.take() else {
-            return false;
-        };
-        let _ = respond.send(verdict);
-        resume_after_gate(&mut state, "");
+        {
+            let mut state = self.lock();
+            let Some(respond) = state.pending_plan.take() else {
+                return false;
+            };
+            let _ = respond.send(verdict);
+            resume_after_gate(&mut state, "");
+        }
+        self.publish();
         true
     }
 
     /// `interview_answers` client frame (`None` = declined). False when no
     /// interview is pending.
     pub fn resolve_interview(&self, answers: Option<Vec<String>>) -> bool {
-        let mut state = self.lock();
-        let Some(respond) = state.pending_interview.take() else {
-            return false;
-        };
-        let _ = respond.send(answers);
-        resume_after_gate(&mut state, "");
+        {
+            let mut state = self.lock();
+            let Some(respond) = state.pending_interview.take() else {
+                return false;
+            };
+            let _ = respond.send(answers);
+            resume_after_gate(&mut state, "");
+        }
+        self.publish();
         true
     }
 
@@ -592,6 +726,9 @@ impl TaskShared {
                     .entry(name.clone())
                     .or_default()
                     .push_back((call_id, args.clone()));
+                // The newest in-flight tool call is what the dashboard row shows
+                // while the task works, exactly as in the TUI.
+                state.activity = name.clone();
                 push_locked(
                     &mut state,
                     Frame::ToolStarted {
@@ -666,29 +803,37 @@ impl TaskShared {
             // prompt size went stale.
             AgentEvent::ContextSize { tokens } => self.push_context(tokens),
             AgentEvent::PlanReady { plan, respond } => {
-                let mut state = self.lock();
-                push_locked(&mut state, Frame::PlanReady { plan });
-                state.pending_plan = Some(respond);
-                state.task_state = TaskState::NeedsInput;
-                let frame = Frame::State {
-                    state: state.task_state.as_str(),
-                };
-                push_locked(&mut state, frame);
+                {
+                    let mut state = self.lock();
+                    push_locked(&mut state, Frame::PlanReady { plan });
+                    state.pending_plan = Some(respond);
+                    state.task_state = TaskState::NeedsInput;
+                    state.activity = "waiting for plan approval".to_string();
+                    let frame = Frame::State {
+                        state: state.task_state.as_str(),
+                    };
+                    push_locked(&mut state, frame);
+                }
+                self.publish();
             }
             AgentEvent::Interview { questions, respond } => {
-                let mut state = self.lock();
-                push_locked(
-                    &mut state,
-                    Frame::Interview {
-                        questions: questions.into_iter().map(|q| q.question).collect(),
-                    },
-                );
-                state.pending_interview = Some(respond);
-                state.task_state = TaskState::NeedsInput;
-                let frame = Frame::State {
-                    state: state.task_state.as_str(),
-                };
-                push_locked(&mut state, frame);
+                {
+                    let mut state = self.lock();
+                    push_locked(
+                        &mut state,
+                        Frame::Interview {
+                            questions: questions.into_iter().map(|q| q.question).collect(),
+                        },
+                    );
+                    state.pending_interview = Some(respond);
+                    state.task_state = TaskState::NeedsInput;
+                    state.activity = "waiting for interview answers".to_string();
+                    let frame = Frame::State {
+                        state: state.task_state.as_str(),
+                    };
+                    push_locked(&mut state, frame);
+                }
+                self.publish();
             }
             AgentEvent::OmakaseProceeding { plan } => self.push(Frame::Notice {
                 text: format!("omakase — executing the agent's own plan:\n\n{plan}"),
@@ -825,9 +970,22 @@ impl TaskShared {
             } => self.push(Frame::Notice {
                 text: format!("hook {event}: {outcome} ({command})"),
             }),
-            AgentEvent::CommandRequested(command) => self.push(Frame::Notice {
-                text: format!("agent requested command: {command}"),
-            }),
+            // The agent asked for one of its own slash commands. It cannot run
+            // now — `run_turn` holds `&mut Agent`, and a request already in
+            // flight cannot be reconfigured — so it queues, and the worker
+            // applies it the moment the turn's borrow ends. The tool already
+            // refused anything this surface does not run ([`AGENT_COMMANDS`]),
+            // so what lands here is a command the executor has.
+            AgentEvent::CommandRequested(line) => {
+                let mut state = self.lock();
+                push_locked(
+                    &mut state,
+                    Frame::Notice {
+                        text: format!("agent requested {line} (runs after this turn)"),
+                    },
+                );
+                state.pending_commands.push(line);
+            }
             AgentEvent::Error(message) => {
                 let mut state = self.lock();
                 state.turn_error_seen = true;
@@ -879,10 +1037,33 @@ fn resume_after_gate(state: &mut SharedState, notice: &str) {
         );
     }
     state.task_state = TaskState::Working;
+    state.activity = "working".to_string();
     let frame = Frame::State {
         state: state.task_state.as_str(),
     };
     push_locked(state, frame);
+}
+
+/// The registry state a task state heartbeats as.
+///
+/// A failed turn leaves the task live and waiting for the user, so it publishes
+/// as idle — not as the registry's `Failed`, which marks a *finished* background
+/// run and is retained for a day after its process is gone. Working, needs-input
+/// and idle are the three states the TUI publishes, and a GUI chat is the same
+/// kind of thing.
+fn registry_state(state: TaskState) -> SessionState {
+    match state {
+        TaskState::Working => SessionState::Working,
+        TaskState::NeedsInput => SessionState::NeedsInput,
+        TaskState::Idle | TaskState::Failed => SessionState::Idle,
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The in-process registry of managed tasks, keyed by session id.
@@ -890,6 +1071,15 @@ pub struct TaskManager {
     /// Read at agent-build time rather than cloned at startup, so a provider
     /// added on the Settings page is live for the very next turn.
     config: Arc<ConfigStore>,
+    /// The GUI's MCP servers, connected once by [`crate::gui::run`] and handed
+    /// to every task's agent build. One process-wide manager, as the TUI keeps:
+    /// connecting per build would leave a GUI with four warm tasks running four
+    /// copies of every configured server, each a real OS process.
+    mcp: Arc<McpManager>,
+    /// `~/.wizard/running/`, where every task this manager owns heartbeats.
+    /// `None` only when the wizard directory cannot be resolved at all, in which
+    /// case no session on the machine is registered anyway.
+    registry: Option<PathBuf>,
     tasks: Mutex<HashMap<String, ManagedTask>>,
 }
 
@@ -900,9 +1090,21 @@ struct ManagedTask {
 }
 
 impl TaskManager {
-    pub fn new(config: Arc<ConfigStore>) -> Self {
+    pub fn new(config: Arc<ConfigStore>, mcp: Arc<McpManager>) -> Self {
+        Self::with_registry(config, mcp, session_registry::running_dir())
+    }
+
+    /// [`TaskManager::new`] heartbeating into an explicit directory (tests use a
+    /// temp dir, so a test run never advertises itself as a live session).
+    pub(crate) fn with_registry(
+        config: Arc<ConfigStore>,
+        mcp: Arc<McpManager>,
+        registry: Option<PathBuf>,
+    ) -> Self {
         Self {
             config,
+            mcp,
+            registry,
             tasks: Mutex::new(HashMap::new()),
         }
     }
@@ -1008,17 +1210,40 @@ impl TaskManager {
         self.lock().get(id).map(|task| task.shared.model())
     }
 
+    /// Drop every task's heartbeat, so a stopped server leaves no session behind
+    /// claiming to be running. Called on the server's graceful shutdown; a hard
+    /// kill leaves the records to age out ([`session_registry::STALE_SECS`]).
+    pub fn shutdown(&self) {
+        let Some(dir) = &self.registry else { return };
+        for id in self.lock().keys() {
+            session_registry::remove_from(dir, id);
+        }
+    }
+
     fn spawn(&self, id: String, cwd: PathBuf, session: Session) -> Arc<TaskShared> {
         let mut tasks = self.lock();
         if let Some(existing) = tasks.get(&id) {
             // Raced with another request; keep the first worker.
             return existing.shared.clone();
         }
-        evict_lru(&mut tasks);
-        let shared = TaskShared::new(id.clone(), cwd, self.config.current().active().model);
+        evict_lru(&mut tasks, self.registry.as_deref());
+        let config = self.config.current();
+        let shared = TaskShared::new(
+            id.clone(),
+            cwd,
+            config.active().model,
+            config.mode.to_string(),
+            self.registry.clone(),
+        );
+        // Live from here, not from the first turn: a chat opened and left empty
+        // is a session somebody may come back to, and every other Wizard on the
+        // machine should be able to see it.
+        shared.publish();
+        spawn_heartbeat(&shared);
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_worker(
             Arc::clone(&self.config),
+            Arc::clone(&self.mcp),
             Arc::clone(&shared),
             session,
             turn_rx,
@@ -1035,11 +1260,37 @@ impl TaskManager {
     }
 }
 
+/// Refresh a task's registry heartbeat for as long as it is live.
+///
+/// Its own task, rather than a tick on the worker's loop: the worker sits inside
+/// `run_turn` for however long a turn takes, and a working session that stops
+/// heartbeating is pruned as crashed — precisely when the dashboard most wants
+/// to see it. Holds a `Weak`, so the beat stops when the task is evicted.
+fn spawn_heartbeat(shared: &Arc<TaskShared>) {
+    let shared = Arc::downgrade(shared);
+    tokio::spawn(async move {
+        let mut beat = tokio::time::interval(HEARTBEAT);
+        beat.tick().await; // the first tick is immediate; `spawn` just published
+        loop {
+            beat.tick().await;
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            shared.publish();
+        }
+    });
+}
+
 /// Retire least-recently-used tasks that are safe to drop (no turn queued
 /// or running, no socket attached) until the map is under the keep-warm
 /// cap. Dropping the turn sender ends the worker, which fires the
 /// session-end hooks and releases the agent.
-fn evict_lru(tasks: &mut HashMap<String, ManagedTask>) {
+///
+/// The heartbeat goes here, under the map lock, and not in the worker's exit
+/// path: a task re-spawned for the same session id publishes again immediately,
+/// and the outgoing worker — which is still finishing its session-end hooks —
+/// must not then delete the newcomer's record.
+fn evict_lru(tasks: &mut HashMap<String, ManagedTask>, registry: Option<&Path>) {
     while tasks.len() >= MAX_WARM_TASKS {
         let candidate = tasks
             .iter()
@@ -1053,6 +1304,9 @@ fn evict_lru(tasks: &mut HashMap<String, ManagedTask>) {
         match candidate {
             Some(id) => {
                 tasks.remove(&id);
+                if let Some(dir) = registry {
+                    session_registry::remove_from(dir, &id);
+                }
             }
             // Everything is busy or watched: let the map grow.
             None => break,
@@ -1089,6 +1343,7 @@ fn agent_config(base: &Config, model: Option<&str>) -> Config {
 /// Ends when the manager drops the turn sender (eviction or shutdown).
 async fn run_worker(
     store: Arc<ConfigStore>,
+    mcp: Arc<McpManager>,
     shared: Arc<TaskShared>,
     session: Session,
     mut requests: mpsc::UnboundedReceiver<WorkerRequest>,
@@ -1097,6 +1352,9 @@ async fn run_worker(
     let mut task_config: Option<Config> = None;
 
     while let Some(request) = requests.recv().await {
+        if let WorkerRequest::Turn(turn) = &request {
+            shared.name_after_first_message(&turn.text);
+        }
         shared.begin_turn();
         // Read the config per turn: a build that failed for want of a provider
         // must succeed on the next turn once Settings has configured one.
@@ -1123,7 +1381,13 @@ async fn run_worker(
             }
             None => {
                 let config = agent_config(&base_config, model_override.as_deref());
-                match build_headless_agent_for_session(&config, &shared.cwd, session.clone()).await
+                match build_headless_agent_for_session(
+                    &config,
+                    &shared.cwd,
+                    session.clone(),
+                    Some(mcp.as_ref()),
+                )
+                .await
                 {
                     Ok(mut built) => {
                         if config.plan_first {
@@ -1132,8 +1396,14 @@ async fn run_worker(
                         if config.omakase {
                             built.set_omakase(true);
                         }
+                        // The GUI drains the commands the agent queues — but only
+                        // the ones its executor implements, so `run_command`
+                        // refuses the rest to the model instead of accepting work
+                        // that would never run.
+                        built.set_command_dispatch(CommandDispatch::Only(AGENT_COMMANDS));
                         shared.set_cancel(built.cancel_handle());
                         shared.set_model(&config.active().model);
+                        shared.set_mode(config.mode);
                         read_context_window(&config, &config.active().model, &shared).await;
                         fire_start_hooks(&mut built, &shared).await;
                         task_config = Some(config);
@@ -1154,11 +1424,25 @@ async fn run_worker(
         match request {
             WorkerRequest::Turn(turn) => {
                 run_turn(&mut agent_for_turn, turn, &shared).await;
+                let config = task_config.as_ref().unwrap_or(&base_config);
+                // The turn is over and its borrow of the agent with it, so the
+                // commands it queued can finally be applied — through the one
+                // executor a client-sent `command` frame goes through, emitting
+                // the same frames.
+                for line in shared.take_pending_commands() {
+                    apply_command(
+                        &mut agent_for_turn,
+                        parse_command_line(&line),
+                        config,
+                        &shared,
+                    )
+                    .await;
+                }
                 shared.finish_turn(false);
             }
             WorkerRequest::Command(command) => {
                 let config = task_config.as_ref().unwrap_or(&base_config);
-                run_command(&mut agent_for_turn, command, config, &shared).await;
+                apply_command(&mut agent_for_turn, command, config, &shared).await;
                 shared.finish_turn(false);
             }
         }
@@ -1167,6 +1451,18 @@ async fn run_worker(
 
     if let Some(agent) = &agent {
         agent.fire_session_end(None).await;
+    }
+}
+
+/// Split a slash line the agent queued (`/model claude-sonnet-5`) into the name
+/// and arguments the executor takes. The tool has already validated the line, so
+/// this only has to cut it.
+fn parse_command_line(line: &str) -> CommandRequest {
+    let line = line.trim().trim_start_matches('/');
+    let (name, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    CommandRequest {
+        name: name.to_string(),
+        args: args.trim().to_string(),
     }
 }
 
@@ -1230,7 +1526,10 @@ fn turn_prompt(request: TurnRequest, cwd: &Path) -> crate::commands::Preprocesse
 /// [`crate::gui::server::COMMANDS`]). Everything it has to say comes back as
 /// the frames the protocol already has — `notice`, `context`, `error` — so a
 /// command needs no reply frame of its own.
-async fn run_command(
+///
+/// The one executor: a `command` frame from the client and a `/…` the agent
+/// asked for through `run_command` both land here, and are answered the same.
+async fn apply_command(
     agent: &mut Agent,
     request: CommandRequest,
     config: &Config,
@@ -1287,6 +1586,7 @@ async fn run_command(
 fn set_mode(agent: &mut Agent, mode: Mode, shared: &TaskShared) {
     agent.set_mode(mode);
     agent.set_plan_mode(false);
+    shared.set_mode(mode);
     shared.push(Frame::Notice {
         text: format!("mode: {mode}"),
     });
@@ -1347,16 +1647,13 @@ async fn fire_start_hooks(agent: &mut Agent, shared: &TaskShared) {
 /// preserved.
 async fn switch_model(agent: &mut Agent, config: &Config, model: &str, shared: &TaskShared) {
     let native = match config.active().build() {
-        Ok(client) => match client.supports_native_tools(model).await {
-            Ok(supported) => supported,
-            Err(err) => {
-                tracing::warn!("probing tool support for '{model}': {err:#}; assuming native");
-                true
-            }
-        },
+        Ok(client) => crate::llm::provider::probe_native_tools(client.as_ref(), model).await,
         Err(err) => {
-            tracing::warn!("building a probe client: {err:#}; assuming native tools");
-            true
+            tracing::warn!(
+                "building a probe client: {err:#}; assuming \
+                 native_tools={NATIVE_TOOLS_ON_PROBE_FAILURE}"
+            );
+            NATIVE_TOOLS_ON_PROBE_FAILURE
         }
     };
     agent.set_model(model.to_string(), native);
@@ -1377,11 +1674,15 @@ mod tests {
     use crate::config::StepBudget;
     use crate::tools::ToolOutput;
 
+    /// An unmanaged task: it heartbeats nowhere, so a test run never advertises
+    /// itself in the real registry.
     fn shared() -> Arc<TaskShared> {
         TaskShared::new(
             "2026-07-11T00-00-00".to_string(),
             PathBuf::from("/tmp/project"),
             "test-model".to_string(),
+            "genie".to_string(),
+            None,
         )
     }
 
@@ -2082,7 +2383,7 @@ mod tests {
     }
 
     async fn command(agent: &mut Agent, shared: &TaskShared, name: &str, args: &str) {
-        run_command(
+        apply_command(
             agent,
             CommandRequest {
                 name: name.to_string(),
@@ -2194,5 +2495,208 @@ mod tests {
         command(&mut agent, &shared, "model", "").await;
         let got = frames(&mut rx);
         assert_eq!(got[0]["type"], "error");
+    }
+
+    // --- the agent's own slash commands ---
+
+    /// The set the tool gates on is the set the executor implements. Let them
+    /// drift and the agent is either refused a command the GUI runs, or told
+    /// "queued" for one it will answer with an error after the turn.
+    #[test]
+    fn the_commands_the_agent_may_queue_are_the_ones_the_server_executes() {
+        let mut executed: Vec<&str> = crate::gui::server::COMMANDS
+            .iter()
+            .filter(|(_, _, executed_by, _)| *executed_by == "server")
+            .map(|(name, ..)| *name)
+            .collect();
+        executed.sort_unstable();
+        let mut offered = AGENT_COMMANDS.to_vec();
+        offered.sort_unstable();
+        assert_eq!(offered, executed);
+    }
+
+    #[test]
+    fn a_queued_line_splits_into_the_name_and_arguments_the_executor_takes() {
+        let request = parse_command_line("/model claude-sonnet-5");
+        assert_eq!(request.name, "model");
+        assert_eq!(request.args, "claude-sonnet-5");
+
+        let request = parse_command_line("/compact");
+        assert_eq!(request.name, "compact");
+        assert_eq!(request.args, "");
+    }
+
+    /// The turn holds `&mut Agent`, so a command the agent calls for is queued
+    /// and applied the moment the borrow ends — the TUI's `pending_agent_commands`
+    /// for the same reason. What the model is told is *not* deferred: the tool
+    /// refuses anything this surface cannot run before it ever gets here.
+    #[tokio::test]
+    async fn a_command_the_agent_calls_for_runs_when_the_turn_releases_the_agent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        // Mid-turn: the tool's event lands, and says so — but nothing is applied
+        // while the turn owns the agent.
+        shared.handle_event(AgentEvent::CommandRequested("/mode sovereign".to_string()));
+        shared.handle_event(AgentEvent::Done {
+            reason: DoneReason::Completed,
+        });
+        assert_ne!(agent.mode(), Mode::Sovereign, "not while the turn runs");
+        let queued = frames(&mut rx);
+        assert!(
+            queued.iter().any(|f| f["type"] == "notice"
+                && f["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("/mode sovereign"))),
+            "the request is announced: {queued:?}"
+        );
+
+        // The worker drains the queue the moment the turn returns.
+        for line in shared.take_pending_commands() {
+            apply_command(
+                &mut agent,
+                parse_command_line(&line),
+                &Config::default(),
+                &shared,
+            )
+            .await;
+        }
+        shared.finish_turn(false);
+
+        assert_eq!(agent.mode(), Mode::Sovereign, "it took effect");
+        let applied = frames(&mut rx);
+        assert!(
+            applied
+                .iter()
+                .any(|f| f["type"] == "notice" && f["text"].as_str() == Some("mode: sovereign")),
+            "and its effect is reported, exactly as a client-sent command's is: {applied:?}"
+        );
+        assert!(
+            shared.take_pending_commands().is_empty(),
+            "the queue is drained, not replayed on the next turn"
+        );
+    }
+
+    // --- MCP servers ---
+
+    /// One connected manager for the process, shared by every task. Connecting
+    /// inside each agent build would give a GUI with four warm chats four copies
+    /// of every configured MCP server — four filesystem servers, four browser
+    /// servers, each a real OS process. The workers hold the manager the server
+    /// connected, which is what the strong count says.
+    #[tokio::test]
+    async fn every_task_shares_the_one_connected_mcp_manager() {
+        let cwd = tempfile::tempdir().unwrap();
+        let sessions = cwd.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mcp = Arc::new(McpManager::empty());
+        let tasks = TaskManager::with_registry(
+            Arc::new(ConfigStore::new(Config::default())),
+            Arc::clone(&mcp),
+            None,
+        );
+        assert_eq!(Arc::strong_count(&mcp), 2, "ours and the manager's");
+
+        for _ in 0..2 {
+            let session = Session::create_in(&sessions, cwd.path()).expect("session");
+            tasks.spawn(session.id.clone(), cwd.path().to_path_buf(), session);
+        }
+        assert_eq!(
+            Arc::strong_count(&mcp),
+            4,
+            "each worker holds the manager the server connected, not one it \
+             connected for itself"
+        );
+    }
+
+    // --- the session registry ---
+
+    #[test]
+    fn a_failed_turn_still_heartbeats_as_a_live_idle_session() {
+        // The registry's `Failed` marks a *finished* background run and is kept
+        // for a day; a GUI task whose turn errored is live, and the next message
+        // retries it. The TUI publishes the same three states.
+        assert_eq!(registry_state(TaskState::Working), SessionState::Working);
+        assert_eq!(
+            registry_state(TaskState::NeedsInput),
+            SessionState::NeedsInput
+        );
+        assert_eq!(registry_state(TaskState::Idle), SessionState::Idle);
+        assert_eq!(registry_state(TaskState::Failed), SessionState::Idle);
+    }
+
+    /// A GUI chat is a running Wizard session: `/dashboard` — in any other
+    /// instance on the machine — must see it while it is alive, and must not see
+    /// it once it is gone.
+    #[tokio::test]
+    async fn a_live_gui_task_is_in_the_session_registry_until_it_ends() {
+        let cwd = tempfile::tempdir().unwrap();
+        let sessions = cwd.path().join("sessions");
+        let running = cwd.path().join("running");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let tasks = TaskManager::with_registry(
+            Arc::new(ConfigStore::new(Config::default())),
+            Arc::new(McpManager::empty()),
+            Some(running.clone()),
+        );
+
+        let session = Session::create_in(&sessions, cwd.path()).expect("session");
+        let id = session.id.clone();
+        let shared = tasks.spawn(id.clone(), cwd.path().to_path_buf(), session);
+
+        // Live from the moment the task exists, idle and named for its workspace.
+        let listed = session_registry::list_from(&running);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].state, SessionState::Idle);
+        assert_eq!(listed[0].cwd, cwd.path().display().to_string());
+        assert_eq!(listed[0].pid, std::process::id());
+
+        // The turn's transitions are published as they happen, so a dashboard
+        // does not wait a heartbeat to see the task go to work.
+        shared.name_after_first_message("fix the parser\nand the tests");
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        shared.handle_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            args: json!({ "path": "src/app.rs" }),
+        });
+        shared.publish();
+        let listed = session_registry::list_from(&running);
+        assert_eq!(listed[0].state, SessionState::Working);
+        assert_eq!(listed[0].name, "fix the parser");
+        assert_eq!(listed[0].activity, "read_file");
+
+        // A gate is a session that needs its user — the state `/dashboard` sorts
+        // to the top — and resolving it goes straight back to working.
+        let (respond, _verdict) = oneshot::channel();
+        shared.handle_event(AgentEvent::PlanReady {
+            plan: "1. do it".to_string(),
+            respond,
+        });
+        let listed = session_registry::list_from(&running);
+        assert_eq!(listed[0].state, SessionState::NeedsInput);
+        assert_eq!(listed[0].activity, "waiting for plan approval");
+        assert!(shared.resolve_plan(PlanVerdict::approve()));
+        assert_eq!(
+            session_registry::list_from(&running)[0].state,
+            SessionState::Working
+        );
+
+        shared.finish_turn(false);
+        assert_eq!(
+            session_registry::list_from(&running)[0].state,
+            SessionState::Idle
+        );
+
+        // And it leaves the registry when the server stops, rather than sitting
+        // there claiming to be running until it ages out.
+        tasks.shutdown();
+        assert!(session_registry::list_from(&running).is_empty());
     }
 }

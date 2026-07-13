@@ -169,8 +169,14 @@ mod tests {
             "2026-07-13T00-00-00".to_string(),
             PathBuf::from("/tmp/project"),
             "test-model".to_string(),
+            "genie".to_string(),
+            None,
         );
-        let manager = TaskManager::new(Arc::new(ConfigStore::new(Config::default())));
+        let manager = TaskManager::with_registry(
+            Arc::new(ConfigStore::new(Config::default())),
+            Arc::new(crate::mcp::McpManager::empty()),
+            None,
+        );
         match apply(&shared, &manager, text) {
             Some(Frame::Error { message }) => Some(message),
             _ => None,

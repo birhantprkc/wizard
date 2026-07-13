@@ -28,7 +28,7 @@ use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Image, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
-use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
+use crate::tools::{CommandDispatch, ToolContext, ToolOutput, registry::ToolRegistry};
 
 use session::Session;
 
@@ -842,13 +842,14 @@ impl Agent {
         self.config.reasoning_effort = effort;
     }
 
-    /// Mark this agent as running on a surface that drains slash commands the
-    /// agent queues via `run_command` — the interactive TUI. Only then is the
-    /// `run_command` tool useful; headless and gateway runs leave it off so the
-    /// tool refuses rather than report success for a command nothing applies.
-    /// Preserved across per-turn context clones (`ToolContext::with_events`).
-    pub fn set_command_dispatch(&mut self, on: bool) {
-        self.ctx.dispatches_commands = on;
+    /// Declare which slash commands the surface behind this agent will run when
+    /// the agent queues one via `run_command` (see [`CommandDispatch`]). Only a
+    /// surface that drains the queue makes the tool useful; headless and gateway
+    /// runs leave it at `None` so the tool refuses rather than report success for
+    /// a command nothing applies. Preserved across per-turn context clones
+    /// (`ToolContext::with_events`).
+    pub fn set_command_dispatch(&mut self, dispatch: CommandDispatch) {
+        self.ctx.command_dispatch = dispatch;
     }
 
     /// Conversation history (system prompt included).
@@ -2027,24 +2028,52 @@ fn read_memory_index(project_root: &Path) -> Option<String> {
 /// This is the shared agent-construction path used by both the sovereign
 /// headless runner ([`run_headless`]) and the messaging gateway
 /// ([`crate::gateway`]). `resume` reopens the latest session instead of
-/// starting a new one.
+/// starting a new one. Each builds exactly one agent, so each lets this path
+/// connect the MCP servers for it.
 pub async fn build_headless_agent(
     config: &Config,
     project_root: &Path,
     resume: bool,
 ) -> Result<Agent> {
-    build_headless_agent_inner(config, project_root, resume, None).await
+    build_headless_agent_inner(config, project_root, resume, None, None).await
 }
 
 /// [`build_headless_agent`] with an explicit session instead of the
 /// latest-or-new resolution — the GUI server manages one session per task
 /// (created for a chosen workspace, or reopened by id) and hands it in.
+///
+/// `mcp` is the caller's already-connected manager. A process that builds more
+/// than one agent — the GUI, one per warm task — must connect its servers once
+/// and pass them here: connecting per build would run one copy of every
+/// configured MCP server *per agent*, each a real OS process. `None` connects a
+/// manager for this agent alone.
 pub async fn build_headless_agent_for_session(
     config: &Config,
     project_root: &Path,
     session: Session,
+    mcp: Option<&McpManager>,
 ) -> Result<Agent> {
-    build_headless_agent_inner(config, project_root, false, Some(session)).await
+    build_headless_agent_inner(config, project_root, false, Some(session), mcp).await
+}
+
+/// Connect every server in `~/.wizard/mcp.toml`. Never hard-fails: a missing or
+/// broken config, or a server that will not come up, costs its tools — not the
+/// session.
+pub async fn connect_mcp() -> McpManager {
+    let config = match Config::mcp_config_path().and_then(|path| McpConfig::load(&path)) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!("could not load mcp.toml: {err:#}");
+            return McpManager::empty();
+        }
+    };
+    match McpManager::connect_all(&config).await {
+        Ok(manager) => manager,
+        Err(err) => {
+            tracing::warn!("MCP startup failed: {err:#}");
+            McpManager::empty()
+        }
+    }
 }
 
 async fn build_headless_agent_inner(
@@ -2052,6 +2081,7 @@ async fn build_headless_agent_inner(
     project_root: &Path,
     resume: bool,
     session: Option<Session>,
+    mcp: Option<&McpManager>,
 ) -> Result<Agent> {
     let active = config.active();
     let model = active.model.clone();
@@ -2072,17 +2102,9 @@ async fn build_headless_agent_inner(
         .await
         .with_context(|| format!("LLM health check failed for {}", client.label()))?;
 
-    let native_tools = match client.supports_native_tools(&model).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!(
-                "could not probe tool support for '{model}': {err}; assuming native tools"
-            );
-            true
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     if !native_tools {
-        println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
+        println!("using the JSON tool protocol for '{model}'");
     }
 
     // Session first: the hook engine carries its id in every payload. An
@@ -2120,20 +2142,15 @@ async fn build_headless_agent_inner(
         }
         Err(err) => tracing::warn!("scripted tools dir unavailable: {err}"),
     }
-    let manager = match Config::mcp_config_path().and_then(|path| McpConfig::load(&path)) {
-        Ok(mcp_config) => match McpManager::connect_all(&mcp_config).await {
-            Ok(manager) => manager,
-            Err(err) => {
-                tracing::warn!("MCP startup failed: {err}");
-                McpManager::empty()
-            }
-        },
-        Err(err) => {
-            tracing::warn!("could not load mcp.toml: {err}");
-            McpManager::empty()
+    let connected;
+    let manager = match mcp {
+        Some(manager) => manager,
+        None => {
+            connected = connect_mcp().await;
+            &connected
         }
     };
-    if let Err(err) = base.attach_mcp(&manager).await {
+    if let Err(err) = base.attach_mcp(manager).await {
         tracing::warn!("attaching MCP tools failed: {err}");
     }
     base.apply_harness_overrides();

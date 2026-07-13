@@ -19,7 +19,9 @@ use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Image, Role, ToolCall};
 use crate::tools::subagent_tasks::SubagentRunResult;
-use crate::tools::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, registry::ToolRegistry};
+use crate::tools::{
+    CommandDispatch, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, registry::ToolRegistry,
+};
 
 use super::prompts;
 use super::{error_is_transient, normalize_args, parse_json_tool_call};
@@ -263,13 +265,7 @@ pub async fn spawn(
     if options.read_only {
         scoped = read_only_registry(&scoped);
     }
-    let native_tools = match client.supports_native_tools(&model).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!("tool-support probe failed for '{model}': {err}; assuming native");
-            true
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
 
     let mut system_prompt = config.system_prompt.clone();
     if !native_tools {
@@ -293,7 +289,7 @@ pub async fn spawn(
         events: None,
         // A subagent has no surface to drive; it must never dispatch the
         // parent's slash commands even if the parent's ctx enabled it.
-        dispatches_commands: false,
+        command_dispatch: CommandDispatch::None,
         ..ctx.clone()
     };
 

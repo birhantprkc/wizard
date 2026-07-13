@@ -50,6 +50,51 @@ pub enum ToolAccess {
     Execute,
 }
 
+/// Which of Wizard's own slash commands the attached surface will actually run
+/// when the agent queues one through `run_command`.
+///
+/// A live `events` channel implies none of them: headless and gateway runs have
+/// one too, streaming to a printer that cannot apply a command. The tool gates
+/// on this so it never reports success for work that would never run — and, on a
+/// surface that implements a subset, refuses the rest *in the tool result*,
+/// which is the only place the model reads before the turn ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CommandDispatch {
+    /// Nothing drains the queue: headless, gateway, subagents.
+    #[default]
+    None,
+    /// Every command [`SlashCommand::agent_runnable`](crate::app::SlashCommand)
+    /// allows — the interactive TUI, which has a surface for all of them.
+    All,
+    /// Only these command names, in a surface whose executor implements a subset
+    /// of them (the GUI: `/vim` and the interactive pickers have nowhere to land
+    /// in a browser).
+    Only(&'static [&'static str]),
+}
+
+impl CommandDispatch {
+    /// Whether the attached surface will run the command called `name` (no
+    /// leading slash), or the reason it will not.
+    pub fn accepts(self, name: &str) -> Result<(), String> {
+        match self {
+            CommandDispatch::None => Err(
+                "slash commands are only available in an interactive Wizard session, \
+                 not in this run"
+                    .to_string(),
+            ),
+            CommandDispatch::All => Ok(()),
+            CommandDispatch::Only(names) if names.contains(&name) => Ok(()),
+            CommandDispatch::Only(names) => {
+                let offered: Vec<String> = names.iter().map(|name| format!("/{name}")).collect();
+                Err(format!(
+                    "'/{name}' has nowhere to run on this surface; it runs only {}",
+                    offered.join(", ")
+                ))
+            }
+        }
+    }
+}
+
 /// Per-call execution context.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -81,13 +126,10 @@ pub struct ToolContext {
     /// surfaces. `None` outside an agent (direct registry execution in tests),
     /// in which case images still reach the model but land nowhere on disk.
     pub images: Option<Arc<crate::images::ImageStore>>,
-    /// True only on the interactive TUI surface, which drains and dispatches
-    /// slash commands the agent queues via `run_command`. A live `events`
-    /// channel alone does not imply this — headless and gateway runs stream
-    /// events to a printer that cannot apply a command — so the `run_command`
-    /// tool gates on this flag to avoid reporting success for work that would
-    /// never run. Set by the TUI's agent builder; false everywhere else.
-    pub dispatches_commands: bool,
+    /// The slash commands the surface behind this run will dispatch when the
+    /// agent queues one via `run_command`. Set by the surface's agent builder;
+    /// [`CommandDispatch::None`] everywhere else.
+    pub command_dispatch: CommandDispatch,
 }
 
 impl ToolContext {
@@ -101,14 +143,14 @@ impl ToolContext {
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
             images: None,
-            dispatches_commands: false,
+            command_dispatch: CommandDispatch::None,
         }
     }
 
-    /// Mark this context as belonging to a surface that drains queued slash
-    /// commands (the interactive TUI). Enables the `run_command` tool.
-    pub fn with_command_dispatch(mut self, on: bool) -> Self {
-        self.dispatches_commands = on;
+    /// Declare which queued slash commands the attached surface will run
+    /// (see [`CommandDispatch`]). Anything but `None` enables `run_command`.
+    pub fn with_command_dispatch(mut self, dispatch: CommandDispatch) -> Self {
+        self.command_dispatch = dispatch;
         self
     }
 

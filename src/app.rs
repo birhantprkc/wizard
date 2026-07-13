@@ -36,6 +36,7 @@ use crate::memory::MemoryStore;
 use crate::server;
 use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::skills::Skill;
+use crate::tools::CommandDispatch;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoItem;
 use crate::vim::{self, Pending, VimMode, VimOp, VimState};
@@ -5137,13 +5138,7 @@ async fn build_agent(
     let (mut registry, subagent_model) = build_registry(manager, client, &hooks).await?;
     attach_config_tools(&mut registry, config);
     let model = config.active().model;
-    let native_tools = match client.supports_native_tools(&model).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!("probing tool support for {model}: {err:#}");
-            false
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     let mut agent = Agent::new(
         Arc::clone(client),
         registry,
@@ -5154,9 +5149,10 @@ async fn build_agent(
         native_tools,
         hooks,
     )?;
-    // The TUI is the one surface that drains queued slash commands, so its
-    // agent is the only one where `run_command` does anything.
-    agent.set_command_dispatch(true);
+    // The TUI has a home for every command the agent may queue, so it dispatches
+    // all of them (the GUI runs the subset its executor implements; headless and
+    // gateway runs, none).
+    agent.set_command_dispatch(CommandDispatch::All);
     agent.bind_subagent_model(subagent_model);
     Ok(agent)
 }
@@ -7620,13 +7616,7 @@ async fn switch_model_task(
             };
         }
     }
-    let native_tools = match client.supports_native_tools(&tag).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!("probing tool support for {tag}: {err:#}");
-            false
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &tag).await;
     match agent {
         Some(mut agent) => {
             agent.set_model(tag.clone(), native_tools);
