@@ -9,7 +9,7 @@ Diagnoses the environment and prints one line per check:
 ✓ provider local    llamacpp @ http://127.0.0.1:11435 (qwen3-30b) reachable
 – provider openai   $OPENAI_API_KEY not set
 ✗ mcp playwright    spawn failed: No such file or directory (os error 2)
-✓ native tools      17 tools registered
+✓ native tools      18 tools registered
 – hooks (global)    /home/you/.wizard/hooks.toml absent (no hooks)
 ✓ hooks (project)   2 hook(s) in .wizard/hooks.toml
 ✓ ~/.wizard         /home/you/.wizard writable
@@ -27,6 +27,7 @@ Checks:
 - **hooks**: global and project `hooks.toml` parse
 - **writable**: `~/.wizard`, the project's `.wizard/`, and the sessions dir accept writes
 - **checkpoints**: the snapshot index parses; stale snapshot directories are counted
+- **gateway**: when configured, kind, token presence (never prints the secret), and whether a `wizard --gateway` process appears to be running; also flags a stored telegram token with `kind = "none"`
 
 Every network probe is capped at 5 seconds, so doctor never hangs. Exit code: 0 when no check failed (`–` skips are not failures), 1 otherwise. Use it as a preflight in scripts:
 

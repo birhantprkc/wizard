@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Mode};
+use crate::config::{Config, Mode, StepBudget};
 use crate::hooks::{HookEngine, PreToolUse};
 use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Image, Role, ToolCall};
@@ -60,14 +60,16 @@ pub struct SubagentConfig {
     /// Tool names this subagent may call. `None` = the parent's full set.
     #[serde(default)]
     pub tool_scope: Option<Vec<String>>,
-    /// Step budget for the sub-loop.
+    /// Step budget for the sub-loop. Unlike the parent turn, a subagent runs
+    /// with nobody watching it, so it keeps a finite default; set `0` for a
+    /// subagent that should run to completion however long that takes.
     #[serde(default = "SubagentConfig::default_max_steps")]
-    pub max_steps: u32,
+    pub max_steps: StepBudget,
 }
 
 impl SubagentConfig {
-    fn default_max_steps() -> u32 {
-        15
+    fn default_max_steps() -> StepBudget {
+        StepBudget::new(15)
     }
 }
 
@@ -298,7 +300,7 @@ pub async fn spawn(
     let mut steps_used = 0;
     let mut completed = false;
     let mut last_text = String::new();
-    let max_steps = config.max_steps.max(1);
+    let max_steps = config.max_steps.last_step();
 
     for step in 1..=max_steps {
         steps_used = step;
@@ -576,7 +578,7 @@ impl SpawnSubagentTool {
                     Some(names) => names.join(", "),
                 };
                 format!(
-                    "\n  - `{}` — {} (tools: {}; up to {} steps)",
+                    "\n  - `{}` — {} (tools: {}; {})",
                     c.name, c.description, scope, c.max_steps
                 )
             })

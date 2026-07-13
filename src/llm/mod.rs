@@ -100,9 +100,10 @@ pub enum Role {
 }
 
 /// Largest decoded image Wizard carries. Anything bigger is dropped at the
-/// seam it arrives on ([`Image::from_bytes`], the providers' stream decoders,
-/// and [`crate::agent::absorb_images`] for anything hand-built) rather than
-/// pushed through history, the session file and every surface.
+/// seam it arrives on ([`Image::from_bytes`], [`Image::from_path`], the
+/// providers' stream decoders, and [`crate::agent::absorb_images`] for
+/// anything hand-built) rather than pushed through history, the session file
+/// and every surface.
 pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Why an image could not be taken in.
@@ -114,6 +115,12 @@ pub enum ImageError {
     NotBase64(#[from] base64::DecodeError),
     #[error("image is {bytes} bytes, over the {MAX_IMAGE_BYTES} byte cap")]
     TooLarge { bytes: usize },
+    #[error("cannot read image {path}: {source}")]
+    Unreadable {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// An image travelling through Wizard, in either direction: attached to a
@@ -180,6 +187,36 @@ impl Image {
             base64::engine::general_purpose::STANDARD.encode(bytes),
             mime,
         ))
+    }
+
+    /// Take in an image file from disk: a user attaching a screenshot, a
+    /// pasted file path. The size cap is enforced against the file's metadata
+    /// *before* any bytes are read, so an oversized file is refused without
+    /// being pulled into memory, and the media type is sniffed from the bytes
+    /// rather than guessed from the extension — a `.png` that is really a
+    /// JPEG is tagged as what it is.
+    ///
+    /// The returned image is tagged with the path it came from, so a surface
+    /// replaying the transcript can render the file it already has on disk.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, ImageError> {
+        let unreadable = |source: std::io::Error| ImageError::Unreadable {
+            path: path.display().to_string(),
+            source,
+        };
+        let meta = std::fs::metadata(path).map_err(unreadable)?;
+        if !meta.is_file() {
+            return Err(unreadable(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a file",
+            )));
+        }
+        if meta.len() > MAX_IMAGE_BYTES as u64 {
+            return Err(ImageError::TooLarge {
+                bytes: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+            });
+        }
+        let bytes = std::fs::read(path).map_err(unreadable)?;
+        Ok(Self::from_bytes(&bytes)?.at_path(path.to_path_buf()))
     }
 
     /// Take in a `data:` URI (`data:image/png;base64,iVBOR...`), the shape
@@ -263,7 +300,9 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// A single chat message, serialized exactly as Ollama expects.
+/// A single chat message. Session files and in-memory history use this shape;
+/// provider adapters translate it to each backend's wire format (including
+/// multimodal content blocks when [`ChatMessage::images`] is non-empty).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -288,6 +327,27 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Rough token estimate for this message (`~4` chars per token, plus a
+    /// flat allowance for each attached image). Used for the TUI context
+    /// meter when the backend has not yet reported a real prompt size
+    /// (fresh session, post-`/clear`, post-compaction).
+    pub fn estimated_tokens(&self) -> u64 {
+        let mut chars = self.content.len();
+        if let Some(name) = &self.tool_name {
+            chars = chars.saturating_add(name.len());
+        }
+        for call in &self.tool_calls {
+            chars = chars.saturating_add(call.function.name.len());
+            // `arguments` is already a JSON value; its string form is what
+            // the wire payload roughly costs.
+            chars = chars.saturating_add(call.function.arguments.to_string().len());
+        }
+        // Vision attachments are model-specific; a flat 1k-token allowance
+        // per image is enough for the status-bar meter.
+        let image_tokens = (self.images.len() as u64).saturating_mul(1_000);
+        estimate_tokens_from_chars(chars).saturating_add(image_tokens)
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
@@ -374,6 +434,19 @@ pub(crate) fn assistant_content(message: &ChatMessage) -> String {
     } else {
         format!("{}\n\n{note}", message.content)
     }
+}
+
+/// Rough token estimate from a character count (`~4` chars per token). Used
+/// only when a backend has not reported real usage; never for billing.
+pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+/// Sum of [`ChatMessage::estimated_tokens`] over a history. The status bar
+/// falls back to this after `/clear` or compaction, when the last real
+/// prompt size is stale or unknown.
+pub fn estimate_history_tokens(messages: &[ChatMessage]) -> u64 {
+    messages.iter().map(ChatMessage::estimated_tokens).sum()
 }
 
 /// A tool invocation requested by the model.
@@ -678,6 +751,66 @@ mod tests {
             serde_json::from_str(r#"{"message":{"role":"assistant","content":"hi"},"done":false}"#)
                 .unwrap();
         assert!(chunk.images.is_empty());
+    }
+
+    #[test]
+    fn from_path_sniffs_the_bytes_and_caps_the_file_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // The extension lies (a JPEG named .png): the bytes decide.
+        let jpeg = dir.path().join("shot.png");
+        std::fs::write(&jpeg, [0xff, 0xd8, 0xff, 0xe0, 0x00]).expect("write");
+        let image = Image::from_path(&jpeg).expect("a JPEG");
+        assert_eq!(image.mime, "image/jpeg");
+        assert_eq!(image.path.as_deref(), Some(jpeg.as_path()));
+
+        // Oversized files are refused on their metadata, before being read.
+        let huge = dir.path().join("huge.png");
+        std::fs::write(&huge, vec![0u8; MAX_IMAGE_BYTES + 1]).expect("write");
+        assert!(matches!(
+            Image::from_path(&huge).expect_err("over the cap"),
+            ImageError::TooLarge { .. }
+        ));
+
+        // Not an image, and not a file at all.
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, b"just words").expect("write");
+        assert!(matches!(
+            Image::from_path(&text).expect_err("not an image"),
+            ImageError::UnknownFormat
+        ));
+        assert!(matches!(
+            Image::from_path(dir.path()).expect_err("a directory"),
+            ImageError::Unreadable { .. }
+        ));
+        assert!(matches!(
+            Image::from_path(&dir.path().join("gone.png")).expect_err("missing"),
+            ImageError::Unreadable { .. }
+        ));
+    }
+
+    #[test]
+    fn old_transcripts_without_images_still_load() {
+        let legacy: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(legacy.images.is_empty());
+    }
+
+    #[test]
+    fn estimated_tokens_scales_with_content_and_images() {
+        let short = ChatMessage::user("abcd"); // 4 chars → 1 token
+        assert_eq!(short.estimated_tokens(), 1);
+        let long = ChatMessage::user("a".repeat(400)); // 400 chars → 100 tokens
+        assert_eq!(long.estimated_tokens(), 100);
+        let with_image =
+            ChatMessage::user_with_images("see", vec![Image::new("QUJD", "image/png")]);
+        // 3 chars → 1 token + 1000 image allowance
+        assert_eq!(with_image.estimated_tokens(), 1_001);
+        assert_eq!(
+            estimate_history_tokens(&[short, long]),
+            101,
+            "history sums message estimates"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod command;
 pub mod evolve;
 pub mod file;
 pub mod git;
+pub mod image;
 pub mod interview;
 pub mod memory;
 pub mod plan;

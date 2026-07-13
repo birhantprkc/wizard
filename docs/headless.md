@@ -24,7 +24,7 @@ Silent until the run ends, then exactly one JSON object on stdout:
 }
 ```
 
-`reason` is one of `completed | max_steps | time_limit | stopped | circuit_breaker`.
+`reason` is one of `completed | max_steps | time_limit | stopped | circuit_breaker`. `max_steps` only appears when the config caps the turn with a positive `max_steps`; the default budget (`max_steps = 0`) has no ceiling to hit.
 
 ## `stream-json`
 
@@ -52,7 +52,7 @@ The process exit code encodes why the run ended:
 |------|---------|
 | 0 | completed (or gracefully stopped via `.wizard/loop-control`) |
 | 1 | hard error (config, provider unreachable, ...) |
-| 2 | step budget exhausted (`max_steps`) |
+| 2 | step budget exhausted — only when a positive `max_steps` caps the turn |
 | 3 | circuit breaker (repeated identical failures) |
 | 4 | `--max-hours` time limit |
 

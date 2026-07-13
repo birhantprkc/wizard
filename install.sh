@@ -1166,7 +1166,8 @@ write_config() {
 # Wizard configuration — see https://github.com/${REPO}
 active_provider = "local"
 mode = "genie"
-max_steps = 25
+# 0 = no step limit: a turn runs until the model is done.
+max_steps = 0
 
 [[providers]]
 name = "local"
@@ -1186,7 +1187,8 @@ EOF
 # Wizard configuration — see https://github.com/${REPO}
 active_provider = "local"
 mode = "genie"
-max_steps = 25
+# 0 = no step limit: a turn runs until the model is done.
+max_steps = 0
 
 [[providers]]
 name = "local"

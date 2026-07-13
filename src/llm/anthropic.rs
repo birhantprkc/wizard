@@ -125,6 +125,9 @@ impl AnthropicProvider {
 /// content-block messages. Assistant tool calls become `tool_use` blocks (with
 /// synthetic ids) and `tool`-role results become a user message holding a
 /// `tool_result` block correlated back to the matching `tool_use` id by name.
+///
+/// User messages with [`ChatMessage::images`] include Anthropic `image` source
+/// blocks (base64). Paths that fail to load fall back to a text note.
 fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     use std::collections::VecDeque;
 
@@ -141,7 +144,13 @@ fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                 }
             }
             Role::User => {
-                let mut content = vec![json!({ "type": "text", "text": message.content })];
+                let mut content: Vec<Value> = Vec::new();
+                // The API rejects an empty text block, so an image-only user
+                // message carries no text part at all. A text-only message
+                // still always has one, empty or not.
+                if !message.content.is_empty() || message.images.is_empty() {
+                    content.push(json!({ "type": "text", "text": message.content }));
+                }
                 // Images ride along as base64 `image` blocks after the text
                 // (the Anthropic vision format), each with its own media type.
                 for image in &message.images {

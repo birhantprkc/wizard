@@ -570,6 +570,10 @@ impl TaskShared {
                 prompt_tokens,
                 completion_tokens,
             }),
+            // The TUI's status-bar estimate of what the next turn will cost.
+            // The GUI reports real usage instead (`Frame::Usage`), so there is
+            // nothing on the protocol for this and nothing to say.
+            AgentEvent::ContextSize { .. } => {}
             AgentEvent::PlanReady { plan, respond } => {
                 let mut state = self.lock();
                 push_locked(&mut state, Frame::PlanReady { plan });
@@ -954,7 +958,7 @@ fn evict_lru(tasks: &mut HashMap<String, ManagedTask>) {
 fn agent_config(base: &Config, model: Option<&str>) -> Config {
     let mut config = base.clone();
     config.mode = Mode::Sovereign;
-    config.max_steps = config.gui.max_steps;
+    config.max_steps = config.gui.step_budget();
     if let Some(want) = model {
         if config.providers.iter().any(|p| p.name == want) {
             config.active_provider = Some(want.to_string());
@@ -1100,6 +1104,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::config::StepBudget;
     use crate::tools::ToolOutput;
 
     fn shared() -> Arc<TaskShared> {
@@ -1558,7 +1563,16 @@ mod tests {
         // else, that control would be decoration.
         let mut base = Config::default();
         base.gui.max_steps = 7;
-        base.max_steps = 25; // the TUI's, and none of the GUI's business
-        assert_eq!(agent_config(&base, None).max_steps, 7);
+        // The TUI's budget, and none of the GUI's business — not even the
+        // unlimited default a TUI turn now runs on.
+        base.max_steps = StepBudget::new(25);
+        assert_eq!(agent_config(&base, None).max_steps, StepBudget::new(7));
+
+        base.gui.max_steps = 0;
+        assert_eq!(
+            agent_config(&base, None).max_steps,
+            StepBudget::UNLIMITED,
+            "0 lifts the GUI's ceiling, as it does the TUI's"
+        );
     }
 }

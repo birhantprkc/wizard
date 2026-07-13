@@ -250,6 +250,8 @@ impl EventSink for TextSink {
                 self.prompt_tokens += prompt_tokens;
                 self.completion_tokens += completion_tokens;
             }
+            // Context-meter update (TUI only); headless has no live meter.
+            AgentEvent::ContextSize { .. } => {}
             AgentEvent::TodoUpdated(items) => {
                 self.spinner
                     .println(&crate::tools::todo::summary_line(&items));
@@ -461,6 +463,7 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             | AgentEvent::Notice(_)
             | AgentEvent::HookFired { .. }
             | AgentEvent::OmakaseProceeding { .. }
+            | AgentEvent::ContextSize { .. }
             | AgentEvent::TodoUpdated(_)
             | AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished { .. }
@@ -640,6 +643,8 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "completion_tokens": completion_tokens,
                 }));
             }
+            // Context-meter update (TUI only); stream-json has no live meter.
+            AgentEvent::ContextSize { .. } => {}
             AgentEvent::TodoUpdated(items) => {
                 self.emit(json!({
                     "type": "todo",

@@ -927,11 +927,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(Span::styled(" · ", dim()));
     spans.push(Span::styled(format_cwd(&app.project_root, 32), dim()));
-    let token_total = app.status.prompt_tokens + app.status.completion_tokens;
-    if token_total > 0 {
+    // Context meter: tokens that will load into the next model call — last
+    // reported prompt size, or a post-compact / post-clear estimate. Not the
+    // session-lifetime sum (that double-counts multi-step history and stays
+    // inflated after /clear).
+    if app.status.context_tokens > 0 {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(
-            crate::usage::format_tokens(token_total),
+            crate::usage::format_tokens(app.status.context_tokens),
             dim(),
         ));
     }
@@ -946,13 +949,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(0);
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(format!("{spinner} "), accent()));
-        spans.push(Span::styled(
-            format!(
-                "step {}/{} · {elapsed}s",
-                app.status.step, app.status.max_steps
-            ),
-            dim(),
-        ));
+        // Capped budget shows the denominator; the default unlimited budget has
+        // none to show, so the step is just a count.
+        let step = match app.status.max_steps.cap() {
+            Some(cap) => format!("step {}/{cap}", app.status.step),
+            None => format!("step {}", app.status.step),
+        };
+        spans.push(Span::styled(format!("{step} · {elapsed}s"), dim()));
     }
     // Background tasks (`/bashes`): a persistent marker while any are
     // running, so a detached command doesn't silently vanish from view.
@@ -1737,7 +1740,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
         header.push(Span::styled(" · foreground", dim().italic()));
     }
     let hint = if app.panes.len() > 1 {
-        "esc back to chat · ↑↓ scroll · shift+↑↓ next agent"
+        "esc back to chat · ↑↓ next agent · shift+↑↓ scroll"
     } else {
         "esc back to chat · ↑↓ scroll"
     };

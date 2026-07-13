@@ -110,8 +110,12 @@ renderer — under a header naming the run.
 
 ```text
  ▌ researcher · running · 0:42 · 6 steps
-   find the latest Tokio release notes  esc back · shift+↑↓ next agent
+   find the latest Tokio release notes  esc back · ↑↓ next agent
 ```
+
+↑/↓ keep walking the runs once you are inside one — each takes over the screen
+in turn, wrapping around — so browsing does not end when you open something.
+Esc is only for leaving.
 
 A foreground run is marked `· foreground` there: the parent turn is blocked
 until it reports. The composer stays live while a pane is open, so you can
@@ -123,8 +127,8 @@ keep talking to the main agent while you watch one work.
 | ↑ / ↓ (on the rail) | Move between runs; ↑ off the top row returns focus to the composer |
 | Enter | Open the selected run |
 | Esc (in a pane) | Back to the main chat, focus in the composer |
-| ↑ / ↓ (in a pane) | Scroll the pane |
-| Shift+↑ / Shift+↓ (in a pane) | Flip to the previous / next run without backing out |
+| ↑ / ↓ (in a pane) | Open the previous / next run, wrapping around; with only one run, scroll it |
+| Shift+↑ / Shift+↓ (in a pane) | Scroll the pane |
 | PageUp / PageDown (in a pane) | Scroll the pane by ten lines |
 | Ctrl-X | Kill the selected run (background runs only) |
 | Any other key | Focus returns to the composer and the key is typed there |
@@ -151,8 +155,12 @@ inline as `<name> ▸ <tool>` ([headless.md](headless.md)).
 Wizard accumulates the prompt/completion token counts every provider reports
 on its final stream chunk.
 
-- **TUI**: the status bar shows a compact session total (`12.3k tok`);
-  `/cost` prints the full prompt/completion breakdown.
+- **TUI**: the status bar shows how many tokens the **next** model call will
+  load into context (`12.3k tok`) — the last reported prompt size, falling
+  back to a char/4 estimate of the remaining history after `/clear` or
+  `/compact`. It is *not* a session-lifetime sum (those double-count multi-step
+  history and stay inflated after a clear). `/cost` still prints the full
+  session prompt/completion breakdown.
 - **Headless**: the final summary line includes the run's totals:
   `[run finished: Completed (1234 prompt + 567 completion tokens)]`.
 - **Log**: every turn appends one JSON line to `~/.wizard/usage.jsonl`:

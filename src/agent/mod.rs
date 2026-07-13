@@ -1,5 +1,6 @@
 //! Agent loop: build messages → stream completion → parse tool calls →
-//! execute tools → repeat until done or `max_steps`.
+//! execute tools → repeat until the model is done (or a configured `max_steps`
+//! cap, the time limit, the circuit breaker, or an interrupt ends the turn).
 //!
 //! The loop is UI-agnostic: it emits [`AgentEvent`]s over a channel that the
 //! Ratatui TUI (genie) or the headless runner (sovereign) consumes.
@@ -36,7 +37,8 @@ use session::Session;
 pub enum DoneReason {
     /// Model finished without requesting more tools.
     Completed,
-    /// Step budget exhausted.
+    /// A configured `max_steps` cap was exhausted. Never reached on the default
+    /// unlimited budget.
     MaxSteps,
     /// `--max-hours` elapsed (sovereign).
     TimeLimit,
@@ -202,11 +204,18 @@ pub enum AgentEvent {
         plan: String,
     },
     /// Token usage of one completed model call, when the backend reported
-    /// counts. Surfaces accumulate these (status bar, headless summary).
+    /// counts. Surfaces accumulate these (status bar lifetime totals via
+    /// `/cost`, headless summary). The TUI context meter uses
+    /// `prompt_tokens` as the size of the next call until compaction or
+    /// `/clear` replaces it with an estimate via [`AgentEvent::ContextSize`].
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// Tokens that will load into the next model call after history shrank
+    /// (`/compact`, auto-compaction). Replaces the context meter without
+    /// touching session lifetime totals.
+    ContextSize { tokens: u64 },
     /// The todo list was replaced via the `todo` tool. Carries the full new
     /// list; the TUI mirrors it in a side panel, headless prints a one-line
     /// summary, the gateway ignores it.
@@ -847,6 +856,18 @@ impl Agent {
         &self.history
     }
 
+    /// Tokens that will load into the next model call: the backend's last
+    /// reported prompt size when known, otherwise a char/4 estimate of the
+    /// current history (used right after `/clear` or compaction, when the
+    /// real count is stale). This is the number the TUI status bar shows —
+    /// *not* the session-lifetime sum of every past prompt.
+    pub fn context_tokens(&self) -> u64 {
+        match self.usage.last_prompt_tokens() {
+            Some(n) => n,
+            None => crate::llm::estimate_history_tokens(&self.history),
+        }
+    }
+
     /// Session this agent persists to.
     pub fn session(&self) -> &Session {
         &self.session
@@ -925,7 +946,8 @@ impl Agent {
     /// session file. Background work from the old conversation is killed
     /// and detached (fresh registries; late monitors hold the old ones, so
     /// their notes can never reach the new conversation) and the todo list
-    /// is reset.
+    /// is reset. Session token counters go to zero with the history so the
+    /// TUI context meter and `/cost` do not keep the wiped conversation.
     pub fn clear(&mut self) -> Result<()> {
         self.ctx.tasks.kill_all();
         self.ctx.subagents.kill_all();
@@ -939,6 +961,7 @@ impl Agent {
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
+        self.usage.clear_session();
         Ok(())
     }
 
@@ -1171,12 +1194,24 @@ impl Agent {
 
     /// Run one user turn: append `input`, then loop
     /// (stream completion → emit deltas → execute tool calls → feed results
-    /// back) until the model stops calling tools or `max_steps` is reached.
+    /// back) until the model stops calling tools — or, when `max_steps` is
+    /// capped, until the budget runs out.
     /// Always finishes with [`AgentEvent::Done`]. Each message is appended
     /// to the session file as it lands.
     pub async fn run_turn(
         &mut self,
         input: &str,
+        events: mpsc::Sender<AgentEvent>,
+    ) -> Result<DoneReason> {
+        self.run_turn_with_images(input, Vec::new(), events).await
+    }
+
+    /// Like [`Self::run_turn`], but attach filesystem image paths to the user
+    /// message for vision-capable models.
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: &str,
+        images: Vec<std::path::PathBuf>,
         events: mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
         if let Some(warning) = self.load_warning.take() {
@@ -1186,7 +1221,7 @@ impl Agent {
         // turn must not kill this one.
         self.cancel.clear();
         self.usage.begin_turn();
-        let result = match self.turn_inner(input, &events).await {
+        let result = match self.turn_inner(input, &images, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
                 Ok(reason)
@@ -1237,6 +1272,7 @@ impl Agent {
     async fn turn_inner(
         &mut self,
         input: &str,
+        images: &[std::path::PathBuf],
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
         // user_prompt_submit hooks: may veto the turn before the model sees
@@ -1269,9 +1305,33 @@ impl Agent {
         if let Err(err) = self.session.append_marker(turn, &input) {
             tracing::warn!("could not append turn marker: {err}");
         }
-        self.push(ChatMessage::user(input));
+        // Images the user attached (pasted into the TUI, passed on the command
+        // line). They are read off disk here — size-capped and media-typed from
+        // their bytes — and ride the user message as `Image`s, the same shape a
+        // tool's or the model's own images travel in. One that cannot be read
+        // is reported and skipped: the rest of the turn still runs.
+        let mut attachments: Vec<crate::llm::Image> = Vec::with_capacity(images.len());
+        for path in images {
+            match crate::llm::Image::from_path(path) {
+                Ok(image) => attachments.push(image),
+                Err(err) => {
+                    let notice = format!("could not attach {}: {err}", path.display());
+                    tracing::warn!("{notice}");
+                    emit(events, AgentEvent::Notice(notice)).await;
+                }
+            }
+        }
+        if attachments.is_empty() {
+            self.push(ChatMessage::user(input));
+        } else {
+            self.push(ChatMessage::user_with_images(input, attachments));
+        }
         self.compact_if_needed(events).await;
-        let max_steps = self.config.max_steps.max(1);
+        // Unlimited by default: the turn runs until the model stops calling
+        // tools. An interrupt, the time limit, the circuit breaker and the
+        // sovereign loop-control file all still end it; only a configured
+        // `max_steps` ends it in `DoneReason::MaxSteps`.
+        let max_steps = self.config.max_steps.last_step();
 
         for step in 1..=max_steps {
             // Surface background tasks that finished since the last step.
@@ -1579,9 +1639,23 @@ impl Agent {
             // genuinely failed) is an error.
             outcome @ CompactOutcome::Summarized(_) => {
                 let _ = emit(events, AgentEvent::Notice(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
             }
             outcome @ CompactOutcome::Truncated { .. } => {
                 let _ = emit(events, AgentEvent::Error(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -2173,9 +2247,11 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         ));
     };
     // The same preprocessing the TUI applies on submit: custom `/command`
-    // expansion and `@file` references.
+    // expansion and `@file` references (including image attachments).
     let custom_commands = crate::commands::load(&project_root);
-    let goal = crate::commands::preprocess(&goal, &custom_commands, &project_root);
+    let prepared = crate::commands::preprocess(&goal, &custom_commands, &project_root);
+    let goal = prepared.text;
+    let goal_images = prepared.images;
 
     let active = config.active();
     let model = active.model.clone();
@@ -2349,7 +2425,17 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         // First checkpoint turn of this cycle, for rollback_failed_cycles
         // (run_turn assigns the next id via begin_turn).
         let cycle_first_turn = agent.checkpoints().current_turn() + 1;
-        match agent.run_turn(&input, tx.clone()).await {
+        // Images only ride on the first cycle's initial user prompt; later
+        // continuation prompts are pure text.
+        let turn_images = if iteration == 1 {
+            goal_images.clone()
+        } else {
+            Vec::new()
+        };
+        match agent
+            .run_turn_with_images(&input, turn_images, tx.clone())
+            .await
+        {
             Ok(reason) => {
                 final_reason = reason;
                 // Record the completed turn as a benchmark candidate
@@ -2515,6 +2601,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::config::StepBudget;
     use crate::hooks::{HookDef, HookEvent};
     use crate::llm::{ChatChunk, ChatStream};
 
@@ -3928,6 +4015,13 @@ mod tests {
             None,
             "stale prompt size cleared so compaction does not re-trigger"
         );
+        // With last_prompt cleared, context_tokens falls back to a char/4
+        // estimate of the remaining history (not the pre-compact 850).
+        assert_eq!(
+            agent.context_tokens(),
+            crate::llm::estimate_history_tokens(agent.history()),
+            "post-compact meter uses the remaining-history estimate"
+        );
 
         // The summarization request carried the extended preservation
         // instructions (todo list + plan file).
@@ -4719,8 +4813,57 @@ mod tests {
             agent.drain_finished_notifications().is_empty(),
             "nothing from the old conversation leaks into the new one"
         );
+        assert_eq!(
+            agent.usage().session_totals(),
+            (0, 0),
+            "session token counters zeroed with the wiped conversation"
+        );
+        // context_tokens falls back to an estimate of the remaining system
+        // prompt (history was truncated to 1).
+        assert!(
+            agent.context_tokens() > 0,
+            "post-clear meter reflects the system prompt only"
+        );
 
         // The real sessions dir was touched: clean up the empty file.
         let _ = std::fs::remove_file(new_session_path);
+    }
+
+    #[tokio::test]
+    async fn default_budget_runs_past_the_old_step_ceiling() {
+        // 30 tool-calling steps, then a final answer. The budget used to stop
+        // this turn at 25; unlimited (the default) carries it to the end.
+        let tmp = TempDir::new();
+        let (registry, calls) = recording_registry();
+        let mut responses: Vec<Vec<ChatChunk>> = (0..30)
+            .map(|_| vec![tool_call_chunk("echo", json!({}))])
+            .collect();
+        responses.push(vec![final_chunk("done")]);
+        let (mut agent, _provider) = test_agent_in(&tmp, responses, Vec::new(), registry);
+        assert_eq!(agent.config.max_steps, StepBudget::UNLIMITED);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(calls.lock().unwrap().len(), 30, "every step ran");
+    }
+
+    #[tokio::test]
+    async fn configured_cap_still_ends_the_turn() {
+        let tmp = TempDir::new();
+        let (registry, calls) = recording_registry();
+        // More tool calls than the cap allows: the loop must stop at the cap.
+        let responses: Vec<Vec<ChatChunk>> = (0..3)
+            .map(|_| vec![tool_call_chunk("echo", json!({}))])
+            .collect();
+        let (mut agent, _provider) = test_agent_in(&tmp, responses, Vec::new(), registry);
+        agent.config.max_steps = StepBudget::new(3);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+
+        assert_eq!(reason, DoneReason::MaxSteps);
+        assert_eq!(calls.lock().unwrap().len(), 3, "stopped at the cap");
     }
 }

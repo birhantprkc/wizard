@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use crate::agent::subagent::SubagentConfig;
 use crate::cli::Cli;
-use crate::config::Config;
+use crate::config::{Config, StepBudget};
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest};
 use crate::mcp::{McpConfig, McpServerConfig, McpTransport};
 use crate::tools::scripted::ScriptManifest;
@@ -504,7 +504,7 @@ impl Evolver {
             description: proposal.description,
             system_prompt: proposal.system_prompt,
             tool_scope: proposal.tool_scope,
-            max_steps: proposal.max_steps.unwrap_or(15).max(1),
+            max_steps: StepBudget::new(proposal.max_steps.unwrap_or(15)),
         };
         let dir = Config::wizard_dir()?.join("subagents");
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

@@ -9,7 +9,11 @@
 # CPU-only / undetectable systems).
 
 mode = "genie"
-max_steps = 25
+
+# Steps (model → tool → model round trips) one turn may take. 0 = no limit: the
+# turn runs until the model is done. Interrupt (Esc), the time limit and the
+# circuit breaker still end a turn. Set a positive number to cap it instead.
+max_steps = 0
 
 # Which provider Wizard talks to. Switch live in the TUI with /provider, or
 # point this at one of the [[providers]] blocks below by name.

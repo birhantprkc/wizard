@@ -142,9 +142,37 @@ pub fn expand_custom(input: &str, commands: &[CustomCommand]) -> Option<String> 
 /// Byte cap applied to one `@file` expansion.
 pub const MAX_FILE_REF_BYTES: usize = 50_000;
 
-/// Extensions treated as images. Wizard has no vision path yet, so these
-/// expand to a note instead of file contents.
+/// Extensions treated as images. These expand to a short placeholder in the
+/// prompt text and are collected as attachment paths for vision models.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Result of expanding custom commands and `@file` / image references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preprocessed {
+    /// Expanded prompt text (file contents inlined; images as `[image: name]`).
+    pub text: String,
+    /// Absolute paths of image files referenced via `@path` (and any other
+    /// image attachments the caller may merge in before the agent turn).
+    pub images: Vec<PathBuf>,
+}
+
+impl Preprocessed {
+    /// Text-only result with no attachments.
+    pub fn text_only(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
+/// Whether `path` looks like a supported image file (by extension).
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+}
 
 /// Expand `@path` tokens in `input` to fenced code blocks with the file's
 /// contents (capped at [`MAX_FILE_REF_BYTES`], with a truncation note).
@@ -153,9 +181,11 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 /// rest resolves to an existing file (relative to `project_root`, absolute,
 /// or `~/`-prefixed). Everything else — `@@escaped` tokens, email-like
 /// `user@host`, `@missing-paths` — passes through unchanged. Image files
-/// become a note: there is no vision path to attach them to.
-pub fn expand_file_refs(input: &str, project_root: &Path) -> String {
+/// expand to a short `[image: name]` placeholder and their absolute paths are
+/// collected in [`Preprocessed::images`] for vision-capable providers.
+pub fn expand_file_refs(input: &str, project_root: &Path) -> Preprocessed {
     let mut out = String::with_capacity(input.len());
+    let mut images = Vec::new();
     let mut rest = input;
     while !rest.is_empty() {
         // Copy leading whitespace verbatim, then take one token.
@@ -170,16 +200,26 @@ pub fn expand_file_refs(input: &str, project_root: &Path) -> String {
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let token = &rest[..token_end];
         match expand_token(token, project_root) {
-            Some(expanded) => out.push_str(&expanded),
+            Some(TokenExpansion::Text(expanded)) => out.push_str(&expanded),
+            Some(TokenExpansion::Image { placeholder, path }) => {
+                out.push_str(&placeholder);
+                images.push(path);
+            }
             None => out.push_str(token),
         }
         rest = &rest[token_end..];
     }
-    out
+    Preprocessed { text: out, images }
+}
+
+/// Result of expanding one `@` token.
+enum TokenExpansion {
+    Text(String),
+    Image { placeholder: String, path: PathBuf },
 }
 
 /// Expand one whitespace-delimited token, or `None` to pass it through.
-fn expand_token(token: &str, project_root: &Path) -> Option<String> {
+fn expand_token(token: &str, project_root: &Path) -> Option<TokenExpansion> {
     let path_part = token.strip_prefix('@')?;
     // `@@path` is the escape hatch and a lone `@` is not a reference.
     if path_part.is_empty() || path_part.starts_with('@') {
@@ -189,14 +229,16 @@ fn expand_token(token: &str, project_root: &Path) -> Option<String> {
     if !path.is_file() {
         return None;
     }
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    if extension.is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str())) {
-        return Some(format!(
-            "[image {path_part} could not be attached: this build has no vision support]"
-        ));
+    if is_image_path(&path) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path_part);
+        let absolute = path.canonicalize().unwrap_or_else(|_| path.clone());
+        return Some(TokenExpansion::Image {
+            placeholder: format!("[image: {name}]"),
+            path: absolute,
+        });
     }
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -213,7 +255,7 @@ fn expand_token(token: &str, project_root: &Path) -> Option<String> {
         block.push_str("… [truncated at 50KB]\n");
     }
     block.push_str(&fence);
-    Some(block)
+    Some(TokenExpansion::Text(block))
 }
 
 /// Resolve a `@`-reference against the project root, expanding a leading `~`.
@@ -259,7 +301,7 @@ fn fence_for(content: &str) -> String {
 /// The one shared preprocessing pipeline for user prompts: expand a custom
 /// `/command` invocation (when `input` is one), then `@file` references.
 /// Used by both the TUI submit path and headless `-p` runs.
-pub fn preprocess(input: &str, commands: &[CustomCommand], project_root: &Path) -> String {
+pub fn preprocess(input: &str, commands: &[CustomCommand], project_root: &Path) -> Preprocessed {
     let expanded = expand_custom(input, commands).unwrap_or_else(|| input.to_string());
     expand_file_refs(&expanded, project_root)
 }
@@ -389,14 +431,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.md"), "hello world\n").unwrap();
         let out = expand_file_refs("see @notes.md please", tmp.path());
-        assert_eq!(out, "see ```notes.md\nhello world\n``` please");
+        assert_eq!(out.text, "see ```notes.md\nhello world\n``` please");
+        assert!(out.images.is_empty());
     }
 
     #[test]
     fn missing_file_token_passes_through() {
         let tmp = tempfile::tempdir().unwrap();
         let out = expand_file_refs("see @missing.md please", tmp.path());
-        assert_eq!(out, "see @missing.md please");
+        assert_eq!(out.text, "see @missing.md please");
+        assert!(out.images.is_empty());
     }
 
     #[test]
@@ -404,7 +448,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("real.md"), "x").unwrap();
         let out = expand_file_refs("@@real.md and user@host.com and a lone @", tmp.path());
-        assert_eq!(out, "@@real.md and user@host.com and a lone @");
+        assert_eq!(out.text, "@@real.md and user@host.com and a lone @");
     }
 
     #[test]
@@ -413,8 +457,8 @@ mod tests {
         let big = "x".repeat(MAX_FILE_REF_BYTES + 1000);
         std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
         let out = expand_file_refs("@big.txt", tmp.path());
-        assert!(out.contains("… [truncated at 50KB]"));
-        assert!(out.len() < big.len() + 200);
+        assert!(out.text.contains("… [truncated at 50KB]"));
+        assert!(out.text.len() < big.len() + 200);
     }
 
     #[test]
@@ -427,7 +471,7 @@ mod tests {
         std::fs::write(&path, "tilde ok").unwrap();
         let out = expand_file_refs(&format!("@~/{name}"), Path::new("/nonexistent-root"));
         std::fs::remove_file(&path).unwrap();
-        assert!(out.contains("tilde ok"), "got: {out}");
+        assert!(out.text.contains("tilde ok"), "got: {}", out.text);
     }
 
     #[test]
@@ -437,17 +481,21 @@ mod tests {
         std::fs::write(&file, "absolute").unwrap();
         let input = format!("@{}", file.display());
         let out = expand_file_refs(&input, Path::new("/elsewhere"));
-        assert!(out.contains("absolute"));
+        assert!(out.text.contains("absolute"));
     }
 
     #[test]
-    fn image_extensions_become_a_note() {
+    fn image_extensions_attach_path_and_placeholder() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("shot.png"), [0x89u8, b'P']).unwrap();
+        let shot = tmp.path().join("shot.png");
+        std::fs::write(&shot, [0x89u8, b'P', b'N', b'G']).unwrap();
         let out = expand_file_refs("look at @shot.png", tmp.path());
+        assert_eq!(out.text, "look at [image: shot.png]");
+        assert_eq!(out.images.len(), 1);
         assert_eq!(
-            out,
-            "look at [image shot.png could not be attached: this build has no vision support]"
+            out.images[0],
+            shot.canonicalize().unwrap_or(shot),
+            "image path is absolute"
         );
     }
 
@@ -456,7 +504,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("subdir")).unwrap();
         let out = expand_file_refs("@subdir", tmp.path());
-        assert_eq!(out, "@subdir");
+        assert_eq!(out.text, "@subdir");
+        assert!(out.images.is_empty());
     }
 
     #[test]
@@ -464,8 +513,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("doc.md"), "```rust\ncode\n```\n").unwrap();
         let out = expand_file_refs("@doc.md", tmp.path());
-        assert!(out.starts_with("````doc.md\n"), "got: {out}");
-        assert!(out.ends_with("````"), "got: {out}");
+        assert!(out.text.starts_with("````doc.md\n"), "got: {}", out.text);
+        assert!(out.text.ends_with("````"), "got: {}", out.text);
     }
 
     #[test]
@@ -473,7 +522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "F").unwrap();
         let out = expand_file_refs("line one\n  @f.txt\nline three", tmp.path());
-        assert_eq!(out, "line one\n  ```f.txt\nF\n```\nline three");
+        assert_eq!(out.text, "line one\n  ```f.txt\nF\n```\nline three");
     }
 
     // --- the shared pipeline ---
@@ -489,8 +538,9 @@ mod tests {
             path: PathBuf::new(),
         }];
         let out = preprocess("/with-ctx the task", &commands, tmp.path());
-        assert!(out.contains("context"), "got: {out}");
-        assert!(out.ends_with("for the task"), "got: {out}");
+        assert!(out.text.contains("context"), "got: {}", out.text);
+        assert!(out.text.ends_with("for the task"), "got: {}", out.text);
+        assert!(out.images.is_empty());
     }
 
     #[test]
@@ -498,8 +548,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
             preprocess("just a prompt", &[], tmp.path()),
-            "just a prompt"
+            Preprocessed::text_only("just a prompt")
         );
-        assert_eq!(preprocess("/unknown cmd", &[], tmp.path()), "/unknown cmd");
+        assert_eq!(
+            preprocess("/unknown cmd", &[], tmp.path()),
+            Preprocessed::text_only("/unknown cmd")
+        );
+    }
+
+    #[test]
+    fn preprocess_collects_image_attachments() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"png").unwrap();
+        std::fs::write(tmp.path().join("b.webp"), b"webp").unwrap();
+        let out = preprocess("compare @a.png and @b.webp", &[], tmp.path());
+        assert!(out.text.contains("[image: a.png]"));
+        assert!(out.text.contains("[image: b.webp]"));
+        assert_eq!(out.images.len(), 2);
     }
 }

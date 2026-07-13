@@ -274,6 +274,10 @@ fn rejects_temperature(model: &str) -> bool {
 /// `tool`-role results are correlated back to those ids by tool name (the
 /// earliest unmatched call of the same name), since Wizard's wire format does
 /// not carry call ids.
+///
+/// User messages with [`ChatMessage::images`] become multimodal content arrays
+/// (`text` + `image_url` data-URLs). Paths that fail to load fall back to a
+/// text note so the turn still proceeds.
 fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut pending: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
     let mut seq: u64 = 0;

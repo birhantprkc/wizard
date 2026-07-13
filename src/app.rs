@@ -23,7 +23,7 @@ use crate::agent::{
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
-use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort};
+use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
@@ -1150,13 +1150,20 @@ pub struct StatusLine {
     pub mode: Mode,
     /// Current step within the running turn (0 when idle).
     pub step: u32,
-    pub max_steps: u32,
+    /// The turn's step budget — unlimited unless `max_steps` is configured.
+    pub max_steps: StepBudget,
     /// True while a turn is streaming.
     pub busy: bool,
-    /// Session prompt-token total (from [`AgentEvent::Usage`]).
+    /// Session prompt-token total (from [`AgentEvent::Usage`]). Used by
+    /// `/cost` for lifetime session usage / estimated spend — *not* the
+    /// status-bar context meter.
     pub prompt_tokens: u64,
     /// Session completion-token total.
     pub completion_tokens: u64,
+    /// Tokens that will load into context on the next model call (last
+    /// reported prompt size, or a post-compact / post-clear estimate).
+    /// This is what the status bar displays.
+    pub context_tokens: u64,
     /// Background tasks (`execute` with `run_in_background`) still running.
     pub background_tasks: usize,
     /// Backgrounded subagents (`spawn_subagent` with `background: true`)
@@ -1314,6 +1321,10 @@ pub struct App {
     /// `web_search` backend (the backend name); set from the `/settings` web
     /// search picker, consumed by [`App::submit_web_key`].
     pub web_key_backend: Option<String>,
+    /// Image files staged for the next submit (from paste of image paths or
+    /// `data:image/...;base64,...` blobs). Merged with `@file` image refs on
+    /// submit, then cleared.
+    pub pending_images: Vec<PathBuf>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
@@ -1404,6 +1415,7 @@ impl App {
             busy: false,
             prompt_tokens: 0,
             completion_tokens: 0,
+            context_tokens: 0,
             background_tasks: 0,
             background_subagents: 0,
         };
@@ -1451,6 +1463,7 @@ impl App {
             picker: None,
             prompt: None,
             web_key_backend: None,
+            pending_images: Vec::new(),
             plan_mode,
             omakase,
             fusion_active: false,
@@ -2215,6 +2228,22 @@ impl App {
         pane.scroll = 0;
         self.attached = Some(index);
         self.rail_focus = Some(index);
+    }
+
+    /// Attach the pane `delta` rows away from `index`, wrapping around the
+    /// rail so ↓ always lands on another run and the browse never dead-ends at
+    /// the last one.
+    ///
+    /// With a single run there is nowhere to step, so ↑/↓ fall back to their
+    /// other job and scroll the pane you are reading.
+    fn step_pane(&mut self, index: usize, delta: isize) {
+        let len = self.panes.len();
+        if len < 2 {
+            self.scroll_pane(index, if delta < 0 { 1 } else { -1 });
+            return;
+        }
+        let next = (index as isize + delta).rem_euclid(len as isize) as usize;
+        self.attach_pane(next);
     }
 
     /// Leave the attached pane and go all the way back to the main chat, with
@@ -3160,8 +3189,7 @@ impl App {
                 Ok(None)
             }
             Event::Paste(text) => {
-                self.insert_str(&text);
-                self.sync_input_mode();
+                self.handle_paste(&text);
                 Ok(None)
             }
             Event::Resize(_, _) => Ok(None),
@@ -3330,21 +3358,21 @@ impl App {
                     self.detach_pane();
                     return Ok(None);
                 }
-                // Shift+↑/↓ flips straight to the next subagent without
-                // backing out to the rail first.
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if index > 0 {
-                        self.attach_pane(index - 1);
-                    }
+                // Plain ↑/↓ keep doing what they did on the rail: walk the
+                // subagents. Opening one is not supposed to end the browse —
+                // you keep arrowing and each run takes over the screen in
+                // turn, wrapping around, so there is never a reason to back
+                // out to the rail just to see the next one.
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.step_pane(index, -1);
                     return Ok(None);
                 }
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if index + 1 < self.panes.len() {
-                        self.attach_pane(index + 1);
-                    }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.step_pane(index, 1);
                     return Ok(None);
                 }
-                // Plain ↑/↓ scroll the pane you are reading.
+                // Scrolling the run you are reading moves to Shift+↑/↓ (and
+                // PageUp/PageDown below).
                 KeyCode::Up => {
                     self.scroll_pane(index, 1);
                     return Ok(None);
@@ -3932,7 +3960,7 @@ impl App {
 
     /// Submit `input` as a user prompt: record it verbatim in history and
     /// the transcript, hand the preprocessed form (custom-command and `@file`
-    /// expansion) to the agent.
+    /// expansion, plus any staged image attachments) to the agent.
     fn submit_prompt(&mut self, input: String) -> Option<AppAction> {
         if self.status.busy {
             // Rejected input never ran; do not record it in history.
@@ -3943,13 +3971,77 @@ impl App {
             self.notice("the agent is rebuilding — try again in a moment");
             return None;
         }
-        let expanded =
+        let mut prepared =
             crate::commands::preprocess(&input, &self.custom_commands, &self.project_root);
+        // Merge staged paste attachments; prefer absolute unique paths.
+        for path in self.pending_images.drain(..) {
+            if !prepared.images.iter().any(|p| p == &path) {
+                prepared.images.push(path);
+            }
+        }
         self.push_history(&input);
         self.clear_input();
         self.transcript.push(TranscriptEntry::User(input));
         self.scroll = 0;
-        Some(AppAction::Submit(expanded))
+        Some(AppAction::Submit(prepared))
+    }
+
+    /// Handle a bracketed paste: stage image file paths / data-URL images as
+    /// attachments, otherwise insert the text into the composer.
+    fn handle_paste(&mut self, text: &str) {
+        // data:image/...;base64,... → write under ~/.wizard/attachments and attach.
+        if let Some((mime, b64)) = parse_data_image_url(text.trim()) {
+            match save_pasted_image_bytes(mime, b64) {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image")
+                        .to_string();
+                    self.stage_image(path, &name);
+                }
+                Err(err) => self.notice(format!("could not save pasted image: {err}")),
+            }
+            self.sync_input_mode();
+            return;
+        }
+
+        // One or more existing image paths (whitespace / newline separated).
+        let tokens: Vec<&str> = text.split_whitespace().filter(|t| !t.is_empty()).collect();
+        if !tokens.is_empty() && tokens.iter().all(|t| looks_like_image_path_token(t)) {
+            let mut any = false;
+            for token in tokens {
+                if let Some(path) = resolve_pasted_image_path(token, &self.project_root) {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(token)
+                        .to_string();
+                    self.stage_image(path, &name);
+                    any = true;
+                }
+            }
+            if any {
+                self.sync_input_mode();
+                return;
+            }
+        }
+
+        self.insert_str(text);
+        self.sync_input_mode();
+    }
+
+    /// Stage `path` for the next submit and insert a visible `[image: name]` token.
+    fn stage_image(&mut self, path: PathBuf, name: &str) {
+        if !self.pending_images.iter().any(|p| p == &path) {
+            self.pending_images.push(path);
+        }
+        let token = format!("[image: {name}]");
+        if !self.input.is_empty() && !self.input.chars().last().is_some_and(|c| c.is_whitespace()) {
+            self.insert_char(' ');
+        }
+        self.insert_str(&token);
+        self.notice(format!("attached {name}"));
     }
 
     /// Minimal Tab path-completion for `@path` tokens: complete the token
@@ -4301,8 +4393,21 @@ impl App {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                // Session lifetime totals (for /cost).
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
+                // Context meter: the most recent prompt size *is* what the
+                // next turn will load (history grows by completion tokens
+                // too, but the next call's reported prompt will supersede
+                // this; until then the last prompt is the best known figure).
+                if prompt_tokens > 0 {
+                    self.status.context_tokens = prompt_tokens;
+                }
+            }
+            AgentEvent::ContextSize { tokens } => {
+                // History just shrank (auto-compaction): replace the meter
+                // with the post-compact estimate without touching /cost totals.
+                self.status.context_tokens = tokens;
             }
             // TaskStarted is also mirrored to the gateway's JSON stream (see
             // output.rs); the TUI additionally bumps the live status-bar
@@ -4502,7 +4607,7 @@ impl App {
                 match reason {
                     DoneReason::Completed => {}
                     DoneReason::MaxSteps => self.notice(format!(
-                        "step budget reached ({} steps) — send another message to continue",
+                        "step budget reached ({}) — send another message to continue",
                         self.status.max_steps
                     )),
                     DoneReason::TimeLimit => self.notice("time limit reached"),
@@ -4520,8 +4625,8 @@ impl App {
 /// stays synchronous and side-effect free).
 #[derive(Debug)]
 pub enum AppAction {
-    /// Start an agent turn with this user message.
-    Submit(String),
+    /// Start an agent turn with this user message (text + optional image paths).
+    Submit(crate::commands::Preprocessed),
     /// Execute a parsed slash command.
     Command(SlashCommand),
     /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
@@ -4530,6 +4635,87 @@ pub enum AppAction {
     /// Copy the current mouse selection to the clipboard. Handled in the main
     /// loop because it owns the terminal (and thus the rendered cell buffer).
     CopySelection,
+}
+
+/// Parse a `data:image/<subtype>;base64,<payload>` URL. Returns `(mime, b64)`.
+fn parse_data_image_url(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.contains(";base64") {
+        return None;
+    }
+    let mime = meta.split(';').next()?.trim();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    Some((mime, payload.trim()))
+}
+
+/// Write base64 image bytes under `~/.wizard/attachments/`.
+fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|err| format!("invalid base64: {err}"))?;
+    if bytes.len() > crate::llm::MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image is {} bytes (max {} MB)",
+            bytes.len(),
+            crate::llm::MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    let dir = crate::config::Config::wizard_dir()
+        .map_err(|err| err.to_string())?
+        .join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|err| format!("mkdir {}: {err}", dir.display()))?;
+    let name = format!(
+        "paste-{}-{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        &uuid::Uuid::new_v4().to_string()[..8],
+        ext
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).map_err(|err| format!("write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// Whether a paste token looks like an image path (extension only — existence
+/// is checked separately).
+fn looks_like_image_path_token(token: &str) -> bool {
+    let cleaned = token
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .strip_prefix("file://")
+        .unwrap_or(token.trim().trim_matches(|c| c == '"' || c == '\''));
+    crate::commands::is_image_path(Path::new(cleaned))
+}
+
+/// Resolve a pasted path token to an existing image file.
+fn resolve_pasted_image_path(token: &str, project_root: &Path) -> Option<PathBuf> {
+    let cleaned = token.trim().trim_matches(|c| c == '"' || c == '\'');
+    let cleaned = cleaned.strip_prefix("file://").unwrap_or(cleaned);
+    let expanded = shellexpand::tilde(cleaned);
+    let candidate = Path::new(expanded.as_ref());
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        project_root.join(candidate)
+    };
+    if path.is_file() && crate::commands::is_image_path(&path) {
+        Some(path.canonicalize().unwrap_or(path))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5427,6 +5613,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         if let Event::AgentRebuilt(rebuild) = event {
             let rebuild = *rebuild;
             app.rebuilding = None;
+            let was_compacting = app.compacting;
             app.compacting = false;
             if let Some(model) = rebuild.model {
                 app.config.model = model.clone();
@@ -5441,6 +5628,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 // A rebuild brings a fresh tool context, so the old registry
                 // handle is dead — re-point the rail at the live one.
                 app.subagents = Some(agent.subagent_registry());
+                // After /compact the history shrank: refresh the context
+                // meter to the post-compact estimate (last_prompt was cleared
+                // so context_tokens() falls back to a char/4 estimate of the
+                // remaining history) instead of leaving the pre-compact size.
+                if was_compacting {
+                    app.status.context_tokens = agent.context_tokens();
+                }
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -5536,7 +5730,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         let action = app.handle_event(event)?;
         if let Some(action) = action {
             match action {
-                AppAction::Submit(input) => match agent_slot.take() {
+                AppAction::Submit(prepared) => match agent_slot.take() {
                     Some(mut agent) => {
                         app.status.busy = true;
                         app.status.step = 0;
@@ -5556,9 +5750,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             }
                         });
 
+                        let prompt = prepared.text;
+                        let images = prepared.images;
                         agent_task = Some(tokio::spawn(async move {
                             let fallback = agent_tx.clone();
-                            if let Err(err) = agent.run_turn(&input, agent_tx).await {
+                            if let Err(err) =
+                                agent.run_turn_with_images(&prompt, images, agent_tx).await
+                            {
                                 // run_turn normally ends with Done itself;
                                 // on a hard error make sure the UI unblocks.
                                 let _ = fallback
@@ -5816,7 +6014,7 @@ struct CommandContext<'a> {
     skills: &'a mut Vec<Skill>,
     project_root: &'a Path,
     mcp_path: &'a Path,
-    genie_max_steps: u32,
+    genie_max_steps: StepBudget,
     events: &'a EventLoop,
 }
 
@@ -5835,7 +6033,7 @@ async fn drain_agent_commands(
     skills: &mut Vec<Skill>,
     project_root: &Path,
     mcp_path: &Path,
-    genie_max_steps: u32,
+    genie_max_steps: StepBudget,
     events: &EventLoop,
 ) {
     while agent_slot.is_some() && !app.pending_agent_commands.is_empty() {
@@ -6186,6 +6384,15 @@ impl CommandContext<'_> {
         self.app.streaming.clear();
         self.app.streaming_thinking.clear();
         self.app.scroll = 0;
+        // Mirror the agent's counter reset so the status bar drops the old
+        // conversation's totals immediately (not after the next Usage event).
+        self.app.status.prompt_tokens = 0;
+        self.app.status.completion_tokens = 0;
+        self.app.status.context_tokens = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| agent.context_tokens())
+            .unwrap_or(0);
         self.app.notice("conversation cleared");
     }
 
@@ -6288,10 +6495,7 @@ impl CommandContext<'_> {
                     Some(names) => names.join(", "),
                 };
                 PickerItem {
-                    detail: format!(
-                        "{} · {scope} · {} steps",
-                        config.description, config.max_steps
-                    ),
+                    detail: format!("{} · {scope} · {}", config.description, config.max_steps),
                     value: config.name,
                     current: false,
                 }
@@ -6536,11 +6740,7 @@ impl CommandContext<'_> {
         self.app.status.mode = mode;
         match mode {
             Mode::Sovereign => {
-                self.app.config.max_steps = self
-                    .app
-                    .config
-                    .max_steps
-                    .max(Mode::Sovereign.default_max_steps());
+                self.app.config.max_steps = self.app.config.max_steps.for_mode(Mode::Sovereign);
             }
             Mode::Genie => {
                 self.app.config.max_steps = self.genie_max_steps;
@@ -7733,10 +7933,10 @@ mod tests {
         app.custom_commands = vec![custom("review", "Review $1 with care.", None)];
         type_str(&mut app, "/review src/app.rs");
         let action = press(&mut app, KeyCode::Enter);
-        let Some(AppAction::Submit(prompt)) = action else {
+        let Some(AppAction::Submit(prepared)) = action else {
             panic!("expected a submit, got {action:?}");
         };
-        assert_eq!(prompt, "Review src/app.rs with care.");
+        assert_eq!(prepared.text, "Review src/app.rs with care.");
         // The transcript shows what the user actually typed.
         assert!(matches!(
             app.transcript.last(),
@@ -7751,7 +7951,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Enter);
         assert!(matches!(
             action,
-            Some(AppAction::Submit(prompt)) if prompt == "/frobnicate the build"
+            Some(AppAction::Submit(prepared)) if prepared.text == "/frobnicate the build"
         ));
     }
 
@@ -7775,15 +7975,47 @@ mod tests {
         app.project_root = tmp.path().to_path_buf();
         type_str(&mut app, "use @ctx.txt here");
         let action = press(&mut app, KeyCode::Enter);
-        let Some(AppAction::Submit(prompt)) = action else {
+        let Some(AppAction::Submit(prepared)) = action else {
             panic!("expected a submit, got {action:?}");
         };
-        assert!(prompt.contains("the context"), "got: {prompt}");
+        assert!(
+            prepared.text.contains("the context"),
+            "got: {}",
+            prepared.text
+        );
         // The transcript keeps the compact form.
         assert!(matches!(
             app.transcript.last(),
             Some(TranscriptEntry::User(text)) if text == "use @ctx.txt here"
         ));
+    }
+
+    #[test]
+    fn submit_attaches_image_at_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Minimal 1x1 PNG.
+        let png = [
+            0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(tmp.path().join("shot.png"), png).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+        type_str(&mut app, "look at @shot.png");
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Submit(prepared)) = action else {
+            panic!("expected a submit, got {action:?}");
+        };
+        assert!(
+            prepared.text.contains("[image: shot.png]"),
+            "got: {}",
+            prepared.text
+        );
+        assert_eq!(prepared.images.len(), 1);
+        assert!(prepared.images[0].ends_with("shot.png"));
     }
 
     #[test]
@@ -8368,7 +8600,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_events_accumulate_session_totals_in_the_status_bar() {
+    fn usage_events_drive_session_totals_and_the_context_meter() {
         let mut app = app();
         app.handle_agent_event(AgentEvent::Usage {
             prompt_tokens: 100,
@@ -8378,6 +8610,15 @@ mod tests {
             prompt_tokens: 50,
             completion_tokens: 5,
         });
+        // Session lifetime still accumulates for /cost.
+        assert_eq!(app.status.prompt_tokens, 150);
+        assert_eq!(app.status.completion_tokens, 25);
+        // Context meter tracks the most recent prompt size, not the sum.
+        assert_eq!(app.status.context_tokens, 50);
+
+        // Auto-compaction replaces the meter without touching lifetime totals.
+        app.handle_agent_event(AgentEvent::ContextSize { tokens: 12 });
+        assert_eq!(app.status.context_tokens, 12);
         assert_eq!(app.status.prompt_tokens, 150);
         assert_eq!(app.status.completion_tokens, 25);
     }
@@ -9431,8 +9672,12 @@ mod tests {
         type_str(&mut app, "second");
         let action = press(&mut app, KeyCode::Enter);
         match action {
-            Some(AppAction::Submit(text)) => {
-                assert!(text.contains("first") && text.contains('\n') && text.contains("second"));
+            Some(AppAction::Submit(prepared)) => {
+                assert!(
+                    prepared.text.contains("first")
+                        && prepared.text.contains('\n')
+                        && prepared.text.contains("second")
+                );
             }
             other => panic!("expected a submit action, got {other:?}"),
         }
@@ -9689,20 +9934,36 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrows_flip_between_panes_without_backing_out() {
+    fn arrows_walk_from_one_pane_straight_into_the_next() {
         let mut app = app_with_panes(3);
         app.attach_pane(0);
 
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.attached, Some(1));
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.attached, Some(2));
-        // Clamped at the last pane.
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        // Wraps rather than dead-ending at the last run.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.attached, Some(0));
+
+        press(&mut app, KeyCode::Up);
         assert_eq!(app.attached, Some(2));
+        // Browsing runs never scrolls the one you passed through.
+        assert!(app.panes.iter().all(|pane| pane.scroll == 0));
+    }
+
+    #[test]
+    fn shift_arrows_scroll_the_pane_you_are_reading() {
+        let mut app = app_with_panes(3);
+        app.attach_pane(1);
 
         press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(app.attached, Some(1));
+        press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(1), "shift+↑ must not change pane");
+        assert_eq!(app.panes[1].scroll, 2);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.panes[1].scroll, 1);
     }
 
     #[test]
