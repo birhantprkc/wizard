@@ -402,60 +402,61 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    let (gateway_kind, gateway_token_env, gateway_allowed_chat_ids, gateway_bot_token) =
-        if gateway == 1 {
-            // Paste the bot token itself (stored in credentials.toml, 0600).
-            // Leave empty only if the user prefers an env var (next prompt).
-            let bot_token = match text_input(
+    let (gateway_kind, gateway_token_env, gateway_allowed_chat_ids, gateway_bot_token) = if gateway
+        == 1
+    {
+        // Paste the bot token itself (stored in credentials.toml, 0600).
+        // Leave empty only if the user prefers an env var (next prompt).
+        let bot_token = match text_input(
+            terminal,
+            "Telegram bot token",
+            "Paste the token from @BotFather. Stored in ~/.wizard/credentials.toml (0600). Leave empty to use an env var instead.",
+            "",
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let bot_token = bot_token.trim().to_string();
+        let gateway_bot_token = (!bot_token.is_empty()).then_some(bot_token);
+
+        // Optional env-var fallback name (used when no credential is stored).
+        let token_env = match text_input(
+            terminal,
+            "Telegram bot token env var (optional fallback)",
+            "Used only when no token is stored in credentials.toml.",
+            GatewayConfig::DEFAULT_TOKEN_ENV,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        // Allowed chat IDs: re-prompt on a parse error rather than discarding
+        // the answer.
+        let allowed = loop {
+            let raw = match text_input(
                 terminal,
-                "Telegram bot token",
-                "Paste the token from @BotFather. Stored in ~/.wizard/credentials.toml (0600). Leave empty to use an env var instead.",
+                "Allowed chat IDs (optional)",
+                "Comma-separated numeric chat IDs. Leave empty to allow all.",
                 "",
             )? {
                 Some(value) => value,
                 None => return Ok(None),
             };
-            let bot_token = bot_token.trim().to_string();
-            let gateway_bot_token = (!bot_token.is_empty()).then_some(bot_token);
-
-            // Optional env-var fallback name (used when no credential is stored).
-            let token_env = match text_input(
-                terminal,
-                "Telegram bot token env var (optional fallback)",
-                "Used only when no token is stored in credentials.toml.",
-                GatewayConfig::DEFAULT_TOKEN_ENV,
-            )? {
-                Some(value) => value,
-                None => return Ok(None),
-            };
-            // Allowed chat IDs: re-prompt on a parse error rather than discarding
-            // the answer.
-            let allowed = loop {
-                let raw = match text_input(
-                    terminal,
-                    "Allowed chat IDs (optional)",
-                    "Comma-separated numeric chat IDs. Leave empty to allow all.",
-                    "",
-                )? {
-                    Some(value) => value,
-                    None => return Ok(None),
-                };
-                match parse_chat_ids(&raw) {
-                    Ok(ids) => break ids,
-                    Err(message) => {
-                        notice(terminal, &message)?;
-                    }
+            match parse_chat_ids(&raw) {
+                Ok(ids) => break ids,
+                Err(message) => {
+                    notice(terminal, &message)?;
                 }
-            };
-            (
-                GatewayKind::Telegram,
-                Some(token_env),
-                allowed,
-                gateway_bot_token,
-            )
-        } else {
-            (GatewayKind::None, None, Vec::new(), None)
+            }
         };
+        (
+            GatewayKind::Telegram,
+            Some(token_env),
+            allowed,
+            gateway_bot_token,
+        )
+    } else {
+        (GatewayKind::None, None, Vec::new(), None)
+    };
 
     // Step 4 — mode.
     let mode_options = [
@@ -1297,8 +1298,8 @@ fn print_summary(config: &Config) {
 
     if config.gateway.kind == GatewayKind::Telegram {
         let env = config.gateway.token_env();
-        let token_stored = crate::credentials::get("telegram")
-            .is_some_and(|t| !t.trim().is_empty());
+        let token_stored =
+            crate::credentials::get("telegram").is_some_and(|t| !t.trim().is_empty());
         if token_stored {
             println!("  • Telegram bot token: stored in ~/.wizard/credentials.toml");
         } else {

@@ -16,9 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{
-    Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args, resolve_path,
-};
+use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args, resolve_path};
 use crate::config::{Config, ProviderKind};
 use crate::llm::openai::TokenSource;
 use crate::llm::xai_oauth::{self, XaiTokenSource};
@@ -56,9 +54,10 @@ impl ImageEndpoint {
     async fn bearer(&self) -> anyhow::Result<String> {
         match &self.auth {
             ImageAuth::ApiKey(key) => Ok(key.clone()),
-            ImageAuth::Oauth(source) => source.bearer().await?.ok_or_else(|| {
-                anyhow::anyhow!("no xAI OAuth token available; run `/login xai`")
-            }),
+            ImageAuth::Oauth(source) => source
+                .bearer()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no xAI OAuth token available; run `/login xai`")),
         }
     }
 
@@ -246,7 +245,11 @@ impl Tool for GenerateImageTool {
 
         let response = match post_generations(&client, &url, &endpoint, &body).await {
             Ok(response) => response,
-            Err(err) => return Ok(ToolOutput::error(format!("image generation failed: {err:#}"))),
+            Err(err) => {
+                return Ok(ToolOutput::error(format!(
+                    "image generation failed: {err:#}"
+                )));
+            }
         };
 
         let payload: Value = match response.json().await {
@@ -435,9 +438,7 @@ fn xai_signed_in() -> bool {
 }
 
 fn is_xai_base_url(base_url: &str) -> bool {
-    base_url
-        .to_ascii_lowercase()
-        .contains("api.x.ai")
+    base_url.to_ascii_lowercase().contains("api.x.ai")
 }
 
 fn default_model(is_xai: bool) -> String {
@@ -561,7 +562,8 @@ async fn materialize_image(
 /// Download image bytes from a temporary generation URL. SSRF-safe: https only,
 /// no local/private hosts.
 async fn download_image(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
-    let parsed = reqwest::Url::parse(url).map_err(|err| anyhow::anyhow!("invalid image url: {err}"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|err| anyhow::anyhow!("invalid image url: {err}"))?;
     if parsed.scheme() != "https" {
         anyhow::bail!(
             "refusing to download image over '{}' (only https is allowed)",
@@ -669,14 +671,8 @@ fn output_path_for_index(base: &Path, index: usize, total: usize) -> PathBuf {
     if total <= 1 {
         return base.to_path_buf();
     }
-    let stem = base
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("image");
-    let ext = base
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("png");
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("png");
     let parent = base.parent().unwrap_or_else(|| Path::new(""));
     parent.join(format!("{stem}-{}.{ext}", index + 1))
 }
@@ -795,7 +791,9 @@ mod tests {
         assert!(host_is_blocked("10.0.0.5"));
         assert!(host_is_blocked("192.168.1.1"));
         assert!(!host_is_blocked("cdn.x.ai"));
-        assert!(!host_is_blocked("oaidalleapiprodscus.blob.core.windows.net"));
+        assert!(!host_is_blocked(
+            "oaidalleapiprodscus.blob.core.windows.net"
+        ));
     }
 
     #[test]

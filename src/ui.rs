@@ -804,11 +804,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(Span::styled(" · ", dim()));
     spans.push(Span::styled(format_cwd(&app.project_root, 32), dim()));
-    let token_total = app.status.prompt_tokens + app.status.completion_tokens;
-    if token_total > 0 {
+    // Context meter: tokens that will load into the next model call — last
+    // reported prompt size, or a post-compact / post-clear estimate. Not the
+    // session-lifetime sum (that double-counts multi-step history and stays
+    // inflated after /clear).
+    if app.status.context_tokens > 0 {
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(
-            crate::usage::format_tokens(token_total),
+            crate::usage::format_tokens(app.status.context_tokens),
             dim(),
         ));
     }

@@ -86,6 +86,17 @@ impl UsageTracker {
     pub fn clear_last_prompt(&self) {
         self.last_prompt.store(0, Ordering::Relaxed);
     }
+
+    /// Zero every counter (session, turn, last prompt). Used by `/clear` so
+    /// the TUI context meter and `/cost` do not keep totals from the wiped
+    /// conversation.
+    pub fn clear_session(&self) {
+        self.session_prompt.store(0, Ordering::Relaxed);
+        self.session_completion.store(0, Ordering::Relaxed);
+        self.turn_prompt.store(0, Ordering::Relaxed);
+        self.turn_completion.store(0, Ordering::Relaxed);
+        self.last_prompt.store(0, Ordering::Relaxed);
+    }
 }
 
 /// One line of `~/.wizard/usage.jsonl`: the token usage of one agent turn.
@@ -335,6 +346,12 @@ mod tests {
         assert_eq!(tracker.session_totals(), (250, 50), "None records nothing");
 
         tracker.clear_last_prompt();
+        assert_eq!(tracker.last_prompt_tokens(), None);
+
+        tracker.record(Some(10), Some(5));
+        tracker.clear_session();
+        assert_eq!(tracker.session_totals(), (0, 0));
+        assert_eq!(tracker.turn_totals(), (0, 0));
         assert_eq!(tracker.last_prompt_tokens(), None);
     }
 

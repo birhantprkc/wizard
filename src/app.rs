@@ -1114,10 +1114,16 @@ pub struct StatusLine {
     pub max_steps: StepBudget,
     /// True while a turn is streaming.
     pub busy: bool,
-    /// Session prompt-token total (from [`AgentEvent::Usage`]).
+    /// Session prompt-token total (from [`AgentEvent::Usage`]). Used by
+    /// `/cost` for lifetime session usage / estimated spend — *not* the
+    /// status-bar context meter.
     pub prompt_tokens: u64,
     /// Session completion-token total.
     pub completion_tokens: u64,
+    /// Tokens that will load into context on the next model call (last
+    /// reported prompt size, or a post-compact / post-clear estimate).
+    /// This is what the status bar displays.
+    pub context_tokens: u64,
     /// Background tasks (`execute` with `run_in_background`) still running.
     pub background_tasks: usize,
     /// Backgrounded subagents (`spawn_subagent` with `background: true`)
@@ -1362,6 +1368,7 @@ impl App {
             busy: false,
             prompt_tokens: 0,
             completion_tokens: 0,
+            context_tokens: 0,
             background_tasks: 0,
             background_subagents: 0,
         };
@@ -3915,10 +3922,7 @@ impl App {
         }
 
         // One or more existing image paths (whitespace / newline separated).
-        let tokens: Vec<&str> = text
-            .split_whitespace()
-            .filter(|t| !t.is_empty())
-            .collect();
+        let tokens: Vec<&str> = text.split_whitespace().filter(|t| !t.is_empty()).collect();
         if !tokens.is_empty() && tokens.iter().all(|t| looks_like_image_path_token(t)) {
             let mut any = false;
             for token in tokens {
@@ -3948,13 +3952,7 @@ impl App {
             self.pending_images.push(path);
         }
         let token = format!("[image: {name}]");
-        if !self.input.is_empty()
-            && !self
-                .input
-                .chars()
-                .last()
-                .is_some_and(|c| c.is_whitespace())
-        {
+        if !self.input.is_empty() && !self.input.chars().last().is_some_and(|c| c.is_whitespace()) {
             self.insert_char(' ');
         }
         self.insert_str(&token);
@@ -4303,8 +4301,21 @@ impl App {
                 prompt_tokens,
                 completion_tokens,
             } => {
+                // Session lifetime totals (for /cost).
                 self.status.prompt_tokens += prompt_tokens;
                 self.status.completion_tokens += completion_tokens;
+                // Context meter: the most recent prompt size *is* what the
+                // next turn will load (history grows by completion tokens
+                // too, but the next call's reported prompt will supersede
+                // this; until then the last prompt is the best known figure).
+                if prompt_tokens > 0 {
+                    self.status.context_tokens = prompt_tokens;
+                }
+            }
+            AgentEvent::ContextSize { tokens } => {
+                // History just shrank (auto-compaction): replace the meter
+                // with the post-compact estimate without touching /cost totals.
+                self.status.context_tokens = tokens;
             }
             // TaskStarted is also mirrored to the gateway's JSON stream (see
             // output.rs); the TUI additionally bumps the live status-bar
@@ -4590,9 +4601,7 @@ fn looks_like_image_path_token(token: &str) -> bool {
 
 /// Resolve a pasted path token to an existing image file.
 fn resolve_pasted_image_path(token: &str, project_root: &Path) -> Option<PathBuf> {
-    let cleaned = token
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'');
+    let cleaned = token.trim().trim_matches(|c| c == '"' || c == '\'');
     let cleaned = cleaned.strip_prefix("file://").unwrap_or(cleaned);
     let expanded = shellexpand::tilde(cleaned);
     let candidate = Path::new(expanded.as_ref());
@@ -5496,6 +5505,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         if let Event::AgentRebuilt(rebuild) = event {
             let rebuild = *rebuild;
             app.rebuilding = None;
+            let was_compacting = app.compacting;
             app.compacting = false;
             if let Some(model) = rebuild.model {
                 app.config.model = model.clone();
@@ -5510,6 +5520,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 // A rebuild brings a fresh tool context, so the old registry
                 // handle is dead — re-point the rail at the live one.
                 app.subagents = Some(agent.subagent_registry());
+                // After /compact the history shrank: refresh the context
+                // meter to the post-compact estimate (last_prompt was cleared
+                // so context_tokens() falls back to a char/4 estimate of the
+                // remaining history) instead of leaving the pre-compact size.
+                if was_compacting {
+                    app.status.context_tokens = agent.context_tokens();
+                }
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -5629,9 +5646,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         let images = prepared.images;
                         agent_task = Some(tokio::spawn(async move {
                             let fallback = agent_tx.clone();
-                            if let Err(err) = agent
-                                .run_turn_with_images(&prompt, images, agent_tx)
-                                .await
+                            if let Err(err) =
+                                agent.run_turn_with_images(&prompt, images, agent_tx).await
                             {
                                 // run_turn normally ends with Done itself;
                                 // on a hard error make sure the UI unblocks.
@@ -6260,6 +6276,15 @@ impl CommandContext<'_> {
         self.app.streaming.clear();
         self.app.streaming_thinking.clear();
         self.app.scroll = 0;
+        // Mirror the agent's counter reset so the status bar drops the old
+        // conversation's totals immediately (not after the next Usage event).
+        self.app.status.prompt_tokens = 0;
+        self.app.status.completion_tokens = 0;
+        self.app.status.context_tokens = self
+            .agent_slot
+            .as_ref()
+            .map(|agent| agent.context_tokens())
+            .unwrap_or(0);
         self.app.notice("conversation cleared");
     }
 
@@ -8467,7 +8492,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_events_accumulate_session_totals_in_the_status_bar() {
+    fn usage_events_drive_session_totals_and_the_context_meter() {
         let mut app = app();
         app.handle_agent_event(AgentEvent::Usage {
             prompt_tokens: 100,
@@ -8477,6 +8502,15 @@ mod tests {
             prompt_tokens: 50,
             completion_tokens: 5,
         });
+        // Session lifetime still accumulates for /cost.
+        assert_eq!(app.status.prompt_tokens, 150);
+        assert_eq!(app.status.completion_tokens, 25);
+        // Context meter tracks the most recent prompt size, not the sum.
+        assert_eq!(app.status.context_tokens, 50);
+
+        // Auto-compaction replaces the meter without touching lifetime totals.
+        app.handle_agent_event(AgentEvent::ContextSize { tokens: 12 });
+        assert_eq!(app.status.context_tokens, 12);
         assert_eq!(app.status.prompt_tokens, 150);
         assert_eq!(app.status.completion_tokens, 25);
     }

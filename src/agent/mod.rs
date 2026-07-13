@@ -154,11 +154,18 @@ pub enum AgentEvent {
         plan: String,
     },
     /// Token usage of one completed model call, when the backend reported
-    /// counts. Surfaces accumulate these (status bar, headless summary).
+    /// counts. Surfaces accumulate these (status bar lifetime totals via
+    /// `/cost`, headless summary). The TUI context meter uses
+    /// `prompt_tokens` as the size of the next call until compaction or
+    /// `/clear` replaces it with an estimate via [`AgentEvent::ContextSize`].
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// Tokens that will load into the next model call after history shrank
+    /// (`/compact`, auto-compaction). Replaces the context meter without
+    /// touching session lifetime totals.
+    ContextSize { tokens: u64 },
     /// The todo list was replaced via the `todo` tool. Carries the full new
     /// list; the TUI mirrors it in a side panel, headless prints a one-line
     /// summary, the gateway ignores it.
@@ -729,6 +736,18 @@ impl Agent {
         &self.history
     }
 
+    /// Tokens that will load into the next model call: the backend's last
+    /// reported prompt size when known, otherwise a char/4 estimate of the
+    /// current history (used right after `/clear` or compaction, when the
+    /// real count is stale). This is the number the TUI status bar shows —
+    /// *not* the session-lifetime sum of every past prompt.
+    pub fn context_tokens(&self) -> u64 {
+        match self.usage.last_prompt_tokens() {
+            Some(n) => n,
+            None => crate::llm::estimate_history_tokens(&self.history),
+        }
+    }
+
     /// Session this agent persists to.
     pub fn session(&self) -> &Session {
         &self.session
@@ -807,7 +826,8 @@ impl Agent {
     /// session file. Background work from the old conversation is killed
     /// and detached (fresh registries; late monitors hold the old ones, so
     /// their notes can never reach the new conversation) and the todo list
-    /// is reset.
+    /// is reset. Session token counters go to zero with the history so the
+    /// TUI context meter and `/cost` do not keep the wiped conversation.
     pub fn clear(&mut self) -> Result<()> {
         self.ctx.tasks.kill_all();
         self.ctx.subagents.kill_all();
@@ -818,6 +838,7 @@ impl Agent {
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
+        self.usage.clear_session();
         Ok(())
     }
 
@@ -1461,9 +1482,23 @@ impl Agent {
             // genuinely failed) is an error.
             outcome @ CompactOutcome::Summarized(_) => {
                 let _ = emit(events, AgentEvent::Notice(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
             }
             outcome @ CompactOutcome::Truncated { .. } => {
                 let _ = emit(events, AgentEvent::Error(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -3513,6 +3548,13 @@ mod tests {
             None,
             "stale prompt size cleared so compaction does not re-trigger"
         );
+        // With last_prompt cleared, context_tokens falls back to a char/4
+        // estimate of the remaining history (not the pre-compact 850).
+        assert_eq!(
+            agent.context_tokens(),
+            crate::llm::estimate_history_tokens(agent.history()),
+            "post-compact meter uses the remaining-history estimate"
+        );
 
         // The summarization request carried the extended preservation
         // instructions (todo list + plan file).
@@ -4302,6 +4344,17 @@ mod tests {
         assert!(
             agent.drain_finished_notifications().is_empty(),
             "nothing from the old conversation leaks into the new one"
+        );
+        assert_eq!(
+            agent.usage().session_totals(),
+            (0, 0),
+            "session token counters zeroed with the wiped conversation"
+        );
+        // context_tokens falls back to an estimate of the remaining system
+        // prompt (history was truncated to 1).
+        assert!(
+            agent.context_tokens() > 0,
+            "post-clear meter reflects the system prompt only"
         );
 
         // The real sessions dir was touched: clean up the empty file.

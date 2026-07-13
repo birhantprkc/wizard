@@ -635,7 +635,10 @@ mod tests {
         }"#;
         let body: GetUpdates = serde_json::from_str(raw).expect("valid payload");
         let msg = body.result[0].message.as_ref().expect("message");
-        assert_eq!(msg.document.as_ref().unwrap().mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            msg.document.as_ref().unwrap().mime_type.as_deref(),
+            Some("image/png")
+        );
         let inbound = inbound_from_message_fields(
             msg.chat.id,
             msg.text.clone(),

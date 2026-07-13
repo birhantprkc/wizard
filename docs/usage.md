@@ -151,8 +151,12 @@ inline as `<name> ▸ <tool>` ([headless.md](headless.md)).
 Wizard accumulates the prompt/completion token counts every provider reports
 on its final stream chunk.
 
-- **TUI**: the status bar shows a compact session total (`12.3k tok`);
-  `/cost` prints the full prompt/completion breakdown.
+- **TUI**: the status bar shows how many tokens the **next** model call will
+  load into context (`12.3k tok`) — the last reported prompt size, falling
+  back to a char/4 estimate of the remaining history after `/clear` or
+  `/compact`. It is *not* a session-lifetime sum (those double-count multi-step
+  history and stay inflated after a clear). `/cost` still prints the full
+  session prompt/completion breakdown.
 - **Headless**: the final summary line includes the run's totals:
   `[run finished: Completed (1234 prompt + 567 completion tokens)]`.
 - **Log**: every turn appends one JSON line to `~/.wizard/usage.jsonl`:

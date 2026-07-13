@@ -312,11 +312,7 @@ async fn fire_session_hooks(agent: &mut Agent, start: bool) {
 /// and collect the reply: stream the turn while draining its [`AgentEvent`]
 /// channel, concatenating text deltas and noting tool activity. The reply is
 /// capped at [`MAX_REPLY_CHARS`].
-async fn run_one_turn(
-    agent: &mut Agent,
-    text: &str,
-    images: &[std::path::PathBuf],
-) -> String {
+async fn run_one_turn(agent: &mut Agent, text: &str, images: &[std::path::PathBuf]) -> String {
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
 
     // Drain events concurrently with the turn: the turn borrows the agent
@@ -346,10 +342,8 @@ async fn run_one_turn(
     };
 
     let images = images.to_vec();
-    let (_done, (mut reply, tools, error)) = tokio::join!(
-        agent.run_turn_with_images(text, images, tx),
-        collector
-    );
+    let (_done, (mut reply, tools, error)) =
+        tokio::join!(agent.run_turn_with_images(text, images, tx), collector);
 
     let reply_trimmed = reply.trim();
     if reply_trimmed.is_empty() {

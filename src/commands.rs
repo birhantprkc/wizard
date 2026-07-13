@@ -209,10 +209,7 @@ pub fn expand_file_refs(input: &str, project_root: &Path) -> Preprocessed {
         }
         rest = &rest[token_end..];
     }
-    Preprocessed {
-        text: out,
-        images,
-    }
+    Preprocessed { text: out, images }
 }
 
 /// Result of expanding one `@` token.
@@ -237,9 +234,7 @@ fn expand_token(token: &str, project_root: &Path) -> Option<TokenExpansion> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(path_part);
-        let absolute = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.clone());
+        let absolute = path.canonicalize().unwrap_or_else(|_| path.clone());
         return Some(TokenExpansion::Image {
             placeholder: format!("[image: {name}]"),
             path: absolute,

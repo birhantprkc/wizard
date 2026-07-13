@@ -134,6 +134,27 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Rough token estimate for this message (`~4` chars per token, plus a
+    /// flat allowance for each attached image). Used for the TUI context
+    /// meter when the backend has not yet reported a real prompt size
+    /// (fresh session, post-`/clear`, post-compaction).
+    pub fn estimated_tokens(&self) -> u64 {
+        let mut chars = self.content.len();
+        if let Some(name) = &self.tool_name {
+            chars = chars.saturating_add(name.len());
+        }
+        for call in &self.tool_calls {
+            chars = chars.saturating_add(call.function.name.len());
+            // `arguments` is already a JSON value; its string form is what
+            // the wire payload roughly costs.
+            chars = chars.saturating_add(call.function.arguments.to_string().len());
+        }
+        // Vision attachments are model-specific; a flat 1k-token allowance
+        // per image is enough for the status-bar meter.
+        let image_tokens = (self.images.len() as u64).saturating_mul(1_000);
+        estimate_tokens_from_chars(chars).saturating_add(image_tokens)
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
@@ -155,10 +176,7 @@ impl ChatMessage {
     }
 
     /// User message with image attachments for vision models.
-    pub fn user_with_images(
-        content: impl Into<String>,
-        images: Vec<ImageAttachment>,
-    ) -> Self {
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
         Self {
             role: Role::User,
             content: content.into(),
@@ -188,6 +206,19 @@ impl ChatMessage {
             images: Vec::new(),
         }
     }
+}
+
+/// Rough token estimate from a character count (`~4` chars per token). Used
+/// only when a backend has not reported real usage; never for billing.
+pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    ((chars as u64) + 3) / 4
+}
+
+/// Sum of [`ChatMessage::estimated_tokens`] over a history. The status bar
+/// falls back to this after `/clear` or compaction, when the last real
+/// prompt size is stale or unknown.
+pub fn estimate_history_tokens(messages: &[ChatMessage]) -> u64 {
+    messages.iter().map(ChatMessage::estimated_tokens).sum()
 }
 
 /// Guess an image MIME type from a file path extension.
@@ -445,8 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn estimated_tokens_scales_with_content_and_images() {
+        let short = ChatMessage::user("abcd"); // 4 chars → 1 token
+        assert_eq!(short.estimated_tokens(), 1);
+        let long = ChatMessage::user("a".repeat(400)); // 400 chars → 100 tokens
+        assert_eq!(long.estimated_tokens(), 100);
+        let with_image = ChatMessage::user_with_images(
+            "see",
+            vec![ImageAttachment {
+                path: Some("/tmp/a.png".into()),
+                mime: "image/png".into(),
+            }],
+        );
+        // 3 chars → 1 token + 1000 image allowance
+        assert_eq!(with_image.estimated_tokens(), 1_001);
+        assert_eq!(
+            estimate_history_tokens(&[short, long]),
+            101,
+            "history sums message estimates"
+        );
+    }
+
+    #[test]
     fn mime_from_path_covers_common_image_types() {
-        assert_eq!(mime_from_path(std::path::Path::new("a.PNG")), Some("image/png"));
+        assert_eq!(
+            mime_from_path(std::path::Path::new("a.PNG")),
+            Some("image/png")
+        );
         assert_eq!(
             mime_from_path(std::path::Path::new("/x/y.jpeg")),
             Some("image/jpeg")

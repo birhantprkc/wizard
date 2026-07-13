@@ -264,8 +264,8 @@ pub fn check_native_tools() -> Check {
 pub fn check_gateway(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
     let kind = config.gateway.kind;
-    let token_in_credentials = crate::credentials::get("telegram")
-        .is_some_and(|t| !t.trim().is_empty());
+    let token_in_credentials =
+        crate::credentials::get("telegram").is_some_and(|t| !t.trim().is_empty());
     let env_name = config.gateway.token_env();
     let token_in_env = std::env::var(env_name)
         .ok()
@@ -349,7 +349,10 @@ pub fn check_gateway_process() -> Check {
                  systemd user unit; see docs/gateway.md)",
             )
         }
-        Err(_) => Check::skip(label, "pgrep not available; cannot check for a running gateway"),
+        Err(_) => Check::skip(
+            label,
+            "pgrep not available; cannot check for a running gateway",
+        ),
     }
 }
 
@@ -733,7 +736,9 @@ mod tests {
         };
         let checks = check_gateway(&config);
         assert!(
-            checks.iter().any(|c| c.label == "gateway" && c.status == Status::Pass),
+            checks
+                .iter()
+                .any(|c| c.label == "gateway" && c.status == Status::Pass),
             "{checks:?}"
         );
         // Token check: either pass (if real credentials have a token) or fail.
