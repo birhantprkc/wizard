@@ -125,6 +125,9 @@ impl AnthropicProvider {
 /// content-block messages. Assistant tool calls become `tool_use` blocks (with
 /// synthetic ids) and `tool`-role results become a user message holding a
 /// `tool_result` block correlated back to the matching `tool_use` id by name.
+///
+/// User messages with [`ChatMessage::images`] include Anthropic `image` source
+/// blocks (base64). Paths that fail to load fall back to a text note.
 fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     use std::collections::VecDeque;
 
@@ -140,10 +143,7 @@ fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                     system_parts.push(message.content.clone());
                 }
             }
-            Role::User => out.push(json!({
-                "role": "user",
-                "content": [{ "type": "text", "text": message.content }],
-            })),
+            Role::User => out.push(anthropic_user_message(message)),
             Role::Assistant => {
                 let mut blocks: Vec<Value> = Vec::new();
                 if !message.content.is_empty() {
@@ -190,6 +190,45 @@ fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
         }
     }
     (system_parts.join("\n\n"), out)
+}
+
+/// Anthropic user content blocks: optional text plus base64 image sources.
+fn anthropic_user_message(message: &ChatMessage) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut text = message.content.clone();
+    for image in &message.images {
+        match super::load_image_base64(image) {
+            Ok((mime, data)) => {
+                blocks.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": data,
+                    }
+                }));
+            }
+            Err(err) => {
+                let label = image
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image");
+                let note = format!("[image {label} could not be attached: {err}]");
+                if text.is_empty() {
+                    text = note;
+                } else {
+                    text = format!("{text}\n{note}");
+                }
+            }
+        }
+    }
+    if !text.is_empty() || blocks.is_empty() {
+        // Put text first so mixed text+image prompts read naturally.
+        blocks.insert(0, json!({ "type": "text", "text": text }));
+    }
+    json!({ "role": "user", "content": blocks })
 }
 
 #[async_trait]

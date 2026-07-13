@@ -276,10 +276,14 @@ impl OllamaClient {
         if options.num_ctx.is_none() {
             options.num_ctx = Some(self.derived_num_ctx(&model).await);
         }
+        // Translate path-based image attachments into Ollama's native
+        // `images: ["base64…"]` arrays on each message. Load failures become
+        // text notes so local vision models still get a usable prompt.
+        let body = ollama_request_body(&request);
         let response = self
             .http
             .post(self.url("/api/chat"))
-            .json(&request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| self.transport_error(e))?;
@@ -327,6 +331,69 @@ impl LlmProvider for OllamaClient {
     fn label(&self) -> String {
         self.host().to_string()
     }
+}
+
+/// Build the Ollama `/api/chat` JSON body. Path-based image attachments on
+/// user messages become Ollama's native `images: ["base64…"]` arrays; load
+/// failures append a note to the message text.
+fn ollama_request_body(request: &ChatRequest) -> serde_json::Value {
+    use serde_json::{Value, json};
+
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| {
+            let mut content = message.content.clone();
+            let mut images_b64: Vec<String> = Vec::new();
+            for image in &message.images {
+                match super::load_image_base64(image) {
+                    Ok((_mime, data)) => images_b64.push(data),
+                    Err(err) => {
+                        let label = image
+                            .path
+                            .as_deref()
+                            .and_then(|p| std::path::Path::new(p).file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image");
+                        let note = format!("[image {label} could not be attached: {err}]");
+                        if content.is_empty() {
+                            content = note;
+                        } else {
+                            content = format!("{content}\n{note}");
+                        }
+                    }
+                }
+            }
+            let mut value = json!({
+                "role": message.role,
+                "content": content,
+            });
+            if !message.tool_calls.is_empty() {
+                value["tool_calls"] = serde_json::to_value(&message.tool_calls)
+                    .unwrap_or_else(|_| Value::Array(Vec::new()));
+            }
+            if let Some(name) = &message.tool_name {
+                value["tool_name"] = json!(name);
+            }
+            if !images_b64.is_empty() {
+                value["images"] = json!(images_b64);
+            }
+            value
+        })
+        .collect();
+
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": request.stream,
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = serde_json::to_value(&request.tools).unwrap_or(Value::Array(Vec::new()));
+    }
+    if let Some(options) = &request.options {
+        body["options"] = serde_json::to_value(options).unwrap_or(Value::Null);
+    }
+    body
 }
 
 /// `GET /api/tags` response body (subset we care about).

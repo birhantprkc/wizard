@@ -268,6 +268,10 @@ fn rejects_temperature(model: &str) -> bool {
 /// `tool`-role results are correlated back to those ids by tool name (the
 /// earliest unmatched call of the same name), since Wizard's wire format does
 /// not carry call ids.
+///
+/// User messages with [`ChatMessage::images`] become multimodal content arrays
+/// (`text` + `image_url` data-URLs). Paths that fail to load fall back to a
+/// text note so the turn still proceeds.
 fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
     use std::collections::VecDeque;
 
@@ -278,7 +282,7 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
     for message in messages {
         match message.role {
             Role::System => out.push(json!({ "role": "system", "content": message.content })),
-            Role::User => out.push(json!({ "role": "user", "content": message.content })),
+            Role::User => out.push(openai_user_message(message)),
             Role::Assistant => {
                 let mut value = json!({ "role": "assistant" });
                 // OpenAI requires `content: null` (not "") when only tool calls
@@ -329,6 +333,47 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
         }
     }
     out
+}
+
+/// OpenAI user content: plain string when there are no images, otherwise a
+/// multimodal content array.
+fn openai_user_message(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!({ "role": "user", "content": message.content });
+    }
+    let mut content: Vec<Value> = Vec::new();
+    let mut text = message.content.clone();
+    for image in &message.images {
+        match super::load_image_base64(image) {
+            Ok((mime, data)) => {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{mime};base64,{data}")
+                    }
+                }));
+            }
+            Err(err) => {
+                let label = image
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image");
+                let note = format!("[image {label} could not be attached: {err}]");
+                if text.is_empty() {
+                    text = note;
+                } else {
+                    text = format!("{text}\n{note}");
+                }
+            }
+        }
+    }
+    // Text block first (OpenAI convention); include even if empty when images
+    // loaded so the model still gets an explicit text part.
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    parts.append(&mut content);
+    json!({ "role": "user", "content": parts })
 }
 
 #[async_trait]

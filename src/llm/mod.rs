@@ -96,7 +96,27 @@ pub enum Role {
     Tool,
 }
 
-/// A single chat message, serialized exactly as Ollama expects.
+/// An image attached to a user message for vision-capable models.
+///
+/// Session transcripts store a filesystem path (and MIME type) so history stays
+/// small; providers load and base64-encode the bytes only when building the
+/// outbound request body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// Absolute path on disk (preferred for session replay). Empty/None only
+    /// when the attachment could not be persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// MIME type: `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub mime: String,
+}
+
+/// Hard cap on a single image attachment loaded for a provider request.
+pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// A single chat message. Session files and in-memory history use this shape;
+/// provider adapters translate it to each backend's wire format (including
+/// multimodal content blocks when [`ChatMessage::images`] is non-empty).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -107,6 +127,10 @@ pub struct ChatMessage {
     /// Name of the tool that produced this result (`role == Tool`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Image attachments on user messages (paths + MIME). Omitted when empty so
+    /// older session transcripts keep loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl ChatMessage {
@@ -116,6 +140,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
         }
     }
 
@@ -125,6 +150,21 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// User message with image attachments for vision models.
+    pub fn user_with_images(
+        content: impl Into<String>,
+        images: Vec<ImageAttachment>,
+    ) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_name: None,
+            images,
         }
     }
 
@@ -134,6 +174,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: None,
+            images: Vec::new(),
         }
     }
 
@@ -144,8 +185,63 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_name: Some(tool_name.into()),
+            images: Vec::new(),
         }
     }
+}
+
+/// Guess an image MIME type from a file path extension.
+pub fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Build an [`ImageAttachment`] from a filesystem path (MIME from extension).
+pub fn image_attachment_from_path(path: &std::path::Path) -> ImageAttachment {
+    let mime = mime_from_path(path)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    ImageAttachment {
+        path: Some(path.to_string_lossy().into_owned()),
+        mime,
+    }
+}
+
+/// Load image bytes from an attachment, enforcing [`MAX_IMAGE_BYTES`].
+/// Returns `(mime, base64_payload)` without a `data:` prefix.
+pub fn load_image_base64(image: &ImageAttachment) -> Result<(String, String), String> {
+    use base64::Engine as _;
+
+    let Some(path) = image.path.as_deref().filter(|p| !p.is_empty()) else {
+        return Err("image attachment has no path".into());
+    };
+    let meta = std::fs::metadata(path).map_err(|err| format!("cannot stat {path}: {err}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image {path} is {} bytes (max {} MB)",
+            meta.len(),
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|err| format!("cannot read {path}: {err}"))?;
+    let mime = if image.mime.is_empty() {
+        mime_from_path(std::path::Path::new(path))
+            .unwrap_or("application/octet-stream")
+            .to_string()
+    } else {
+        image.mime.clone()
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok((mime, encoded))
 }
 
 /// A tool invocation requested by the model.
@@ -323,6 +419,39 @@ mod tests {
         let value = serde_json::to_value(ChatMessage::assistant("done")).unwrap();
         assert!(value.get("tool_calls").is_none());
         assert!(value.get("tool_name").is_none());
+        assert!(value.get("images").is_none());
+    }
+
+    #[test]
+    fn user_with_images_round_trips_paths() {
+        let message = ChatMessage::user_with_images(
+            "what is this?",
+            vec![ImageAttachment {
+                path: Some("/tmp/shot.png".into()),
+                mime: "image/png".into(),
+            }],
+        );
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["images"][0]["path"], "/tmp/shot.png");
+        assert_eq!(value["images"][0]["mime"], "image/png");
+        let back: ChatMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back.images.len(), 1);
+        assert_eq!(back.images[0].path.as_deref(), Some("/tmp/shot.png"));
+
+        // Old transcripts without `images` still deserialize.
+        let legacy: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(legacy.images.is_empty());
+    }
+
+    #[test]
+    fn mime_from_path_covers_common_image_types() {
+        assert_eq!(mime_from_path(std::path::Path::new("a.PNG")), Some("image/png"));
+        assert_eq!(
+            mime_from_path(std::path::Path::new("/x/y.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(mime_from_path(std::path::Path::new("z.txt")), None);
     }
 
     #[test]

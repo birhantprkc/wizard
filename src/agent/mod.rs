@@ -1059,6 +1059,17 @@ impl Agent {
         input: &str,
         events: mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
+        self.run_turn_with_images(input, Vec::new(), events).await
+    }
+
+    /// Like [`Self::run_turn`], but attach filesystem image paths to the user
+    /// message for vision-capable models.
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: &str,
+        images: Vec<std::path::PathBuf>,
+        events: mpsc::Sender<AgentEvent>,
+    ) -> Result<DoneReason> {
         if let Some(warning) = self.load_warning.take() {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
@@ -1066,7 +1077,7 @@ impl Agent {
         // turn must not kill this one.
         self.cancel.clear();
         self.usage.begin_turn();
-        let result = match self.turn_inner(input, &events).await {
+        let result = match self.turn_inner(input, &images, &events).await {
             Ok(reason) => {
                 let _ = emit(&events, AgentEvent::Done { reason }).await;
                 Ok(reason)
@@ -1117,6 +1128,7 @@ impl Agent {
     async fn turn_inner(
         &mut self,
         input: &str,
+        images: &[std::path::PathBuf],
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<DoneReason> {
         // user_prompt_submit hooks: may veto the turn before the model sees
@@ -1149,7 +1161,15 @@ impl Agent {
         if let Err(err) = self.session.append_marker(turn, &input) {
             tracing::warn!("could not append turn marker: {err}");
         }
-        self.push(ChatMessage::user(input));
+        let attachments: Vec<crate::llm::ImageAttachment> = images
+            .iter()
+            .map(|path| crate::llm::image_attachment_from_path(path))
+            .collect();
+        if attachments.is_empty() {
+            self.push(ChatMessage::user(input));
+        } else {
+            self.push(ChatMessage::user_with_images(input, attachments));
+        }
         self.compact_if_needed(events).await;
         // Unlimited by default: the turn runs until the model stops calling
         // tools. An interrupt, the time limit, the circuit breaker and the
@@ -1220,6 +1240,7 @@ impl Agent {
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
                 tool_name: None,
+                images: Vec::new(),
             };
             self.push(assistant);
 
@@ -1965,9 +1986,11 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         ));
     };
     // The same preprocessing the TUI applies on submit: custom `/command`
-    // expansion and `@file` references.
+    // expansion and `@file` references (including image attachments).
     let custom_commands = crate::commands::load(&project_root);
-    let goal = crate::commands::preprocess(&goal, &custom_commands, &project_root);
+    let prepared = crate::commands::preprocess(&goal, &custom_commands, &project_root);
+    let goal = prepared.text;
+    let goal_images = prepared.images;
 
     let active = config.active();
     let model = active.model.clone();
@@ -2141,7 +2164,17 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         // First checkpoint turn of this cycle, for rollback_failed_cycles
         // (run_turn assigns the next id via begin_turn).
         let cycle_first_turn = agent.checkpoints().current_turn() + 1;
-        match agent.run_turn(&input, tx.clone()).await {
+        // Images only ride on the first cycle's initial user prompt; later
+        // continuation prompts are pure text.
+        let turn_images = if iteration == 1 {
+            goal_images.clone()
+        } else {
+            Vec::new()
+        };
+        match agent
+            .run_turn_with_images(&input, turn_images, tx.clone())
+            .await
+        {
             Ok(reason) => {
                 final_reason = reason;
                 // Record the completed turn as a benchmark candidate
@@ -2530,6 +2563,7 @@ mod tests {
                     },
                 }],
                 tool_name: None,
+                images: Vec::new(),
             }),
             thinking: false,
             done: true,
@@ -4085,6 +4119,7 @@ mod tests {
                     })
                     .collect(),
                 tool_name: None,
+                images: Vec::new(),
             }),
             thinking: false,
             done: true,

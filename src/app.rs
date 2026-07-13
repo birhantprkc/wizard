@@ -1268,6 +1268,10 @@ pub struct App {
     /// `web_search` backend (the backend name); set from the `/settings` web
     /// search picker, consumed by [`App::submit_web_key`].
     pub web_key_backend: Option<String>,
+    /// Image files staged for the next submit (from paste of image paths or
+    /// `data:image/...;base64,...` blobs). Merged with `@file` image refs on
+    /// submit, then cleared.
+    pub pending_images: Vec<PathBuf>,
     /// Whether plan mode is active (mirrors the agent's flag for the status
     /// bar; toggled by `/plan` and Shift+Tab).
     pub plan_mode: bool,
@@ -1404,6 +1408,7 @@ impl App {
             picker: None,
             prompt: None,
             web_key_backend: None,
+            pending_images: Vec::new(),
             plan_mode,
             omakase,
             fusion_active: false,
@@ -3092,8 +3097,7 @@ impl App {
                 Ok(None)
             }
             Event::Paste(text) => {
-                self.insert_str(&text);
-                self.sync_input_mode();
+                self.handle_paste(&text);
                 Ok(None)
             }
             Event::Resize(_, _) => Ok(None),
@@ -3864,7 +3868,7 @@ impl App {
 
     /// Submit `input` as a user prompt: record it verbatim in history and
     /// the transcript, hand the preprocessed form (custom-command and `@file`
-    /// expansion) to the agent.
+    /// expansion, plus any staged image attachments) to the agent.
     fn submit_prompt(&mut self, input: String) -> Option<AppAction> {
         if self.status.busy {
             // Rejected input never ran; do not record it in history.
@@ -3875,13 +3879,86 @@ impl App {
             self.notice("the agent is rebuilding — try again in a moment");
             return None;
         }
-        let expanded =
+        let mut prepared =
             crate::commands::preprocess(&input, &self.custom_commands, &self.project_root);
+        // Merge staged paste attachments; prefer absolute unique paths.
+        for path in self.pending_images.drain(..) {
+            if !prepared.images.iter().any(|p| p == &path) {
+                prepared.images.push(path);
+            }
+        }
         self.push_history(&input);
         self.clear_input();
         self.transcript.push(TranscriptEntry::User(input));
         self.scroll = 0;
-        Some(AppAction::Submit(expanded))
+        Some(AppAction::Submit(prepared))
+    }
+
+    /// Handle a bracketed paste: stage image file paths / data-URL images as
+    /// attachments, otherwise insert the text into the composer.
+    fn handle_paste(&mut self, text: &str) {
+        // data:image/...;base64,... → write under ~/.wizard/attachments and attach.
+        if let Some((mime, b64)) = parse_data_image_url(text.trim()) {
+            match save_pasted_image_bytes(mime, b64) {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image")
+                        .to_string();
+                    self.stage_image(path, &name);
+                }
+                Err(err) => self.notice(format!("could not save pasted image: {err}")),
+            }
+            self.sync_input_mode();
+            return;
+        }
+
+        // One or more existing image paths (whitespace / newline separated).
+        let tokens: Vec<&str> = text
+            .split_whitespace()
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !tokens.is_empty() && tokens.iter().all(|t| looks_like_image_path_token(t)) {
+            let mut any = false;
+            for token in tokens {
+                if let Some(path) = resolve_pasted_image_path(token, &self.project_root) {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(token)
+                        .to_string();
+                    self.stage_image(path, &name);
+                    any = true;
+                }
+            }
+            if any {
+                self.sync_input_mode();
+                return;
+            }
+        }
+
+        self.insert_str(text);
+        self.sync_input_mode();
+    }
+
+    /// Stage `path` for the next submit and insert a visible `[image: name]` token.
+    fn stage_image(&mut self, path: PathBuf, name: &str) {
+        if !self.pending_images.iter().any(|p| p == &path) {
+            self.pending_images.push(path);
+        }
+        let token = format!("[image: {name}]");
+        if !self.input.is_empty()
+            && !self
+                .input
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_whitespace())
+        {
+            self.insert_char(' ');
+        }
+        self.insert_str(&token);
+        self.notice(format!("attached {name}"));
     }
 
     /// Minimal Tab path-completion for `@path` tokens: complete the token
@@ -4436,8 +4513,8 @@ impl App {
 /// stays synchronous and side-effect free).
 #[derive(Debug)]
 pub enum AppAction {
-    /// Start an agent turn with this user message.
-    Submit(String),
+    /// Start an agent turn with this user message (text + optional image paths).
+    Submit(crate::commands::Preprocessed),
     /// Execute a parsed slash command.
     Command(SlashCommand),
     /// Interrupt the running turn (Ctrl-C): abort the turn task and rebuild
@@ -4446,6 +4523,89 @@ pub enum AppAction {
     /// Copy the current mouse selection to the clipboard. Handled in the main
     /// loop because it owns the terminal (and thus the rendered cell buffer).
     CopySelection,
+}
+
+/// Parse a `data:image/<subtype>;base64,<payload>` URL. Returns `(mime, b64)`.
+fn parse_data_image_url(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.contains(";base64") {
+        return None;
+    }
+    let mime = meta.split(';').next()?.trim();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    Some((mime, payload.trim()))
+}
+
+/// Write base64 image bytes under `~/.wizard/attachments/`.
+fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|err| format!("invalid base64: {err}"))?;
+    if bytes.len() as u64 > crate::llm::MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image is {} bytes (max {} MB)",
+            bytes.len(),
+            crate::llm::MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    let dir = crate::config::Config::wizard_dir()
+        .map_err(|err| err.to_string())?
+        .join("attachments");
+    std::fs::create_dir_all(&dir).map_err(|err| format!("mkdir {}: {err}", dir.display()))?;
+    let name = format!(
+        "paste-{}-{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        &uuid::Uuid::new_v4().to_string()[..8],
+        ext
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).map_err(|err| format!("write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+/// Whether a paste token looks like an image path (extension only — existence
+/// is checked separately).
+fn looks_like_image_path_token(token: &str) -> bool {
+    let cleaned = token
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .strip_prefix("file://")
+        .unwrap_or(token.trim().trim_matches(|c| c == '"' || c == '\''));
+    crate::commands::is_image_path(Path::new(cleaned))
+}
+
+/// Resolve a pasted path token to an existing image file.
+fn resolve_pasted_image_path(token: &str, project_root: &Path) -> Option<PathBuf> {
+    let cleaned = token
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
+    let cleaned = cleaned.strip_prefix("file://").unwrap_or(cleaned);
+    let expanded = shellexpand::tilde(cleaned);
+    let candidate = Path::new(expanded.as_ref());
+    let path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        project_root.join(candidate)
+    };
+    if path.is_file() && crate::commands::is_image_path(&path) {
+        Some(path.canonicalize().unwrap_or(path))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5445,7 +5605,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         let action = app.handle_event(event)?;
         if let Some(action) = action {
             match action {
-                AppAction::Submit(input) => match agent_slot.take() {
+                AppAction::Submit(prepared) => match agent_slot.take() {
                     Some(mut agent) => {
                         app.status.busy = true;
                         app.status.step = 0;
@@ -5465,9 +5625,14 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             }
                         });
 
+                        let prompt = prepared.text;
+                        let images = prepared.images;
                         agent_task = Some(tokio::spawn(async move {
                             let fallback = agent_tx.clone();
-                            if let Err(err) = agent.run_turn(&input, agent_tx).await {
+                            if let Err(err) = agent
+                                .run_turn_with_images(&prompt, images, agent_tx)
+                                .await
+                            {
                                 // run_turn normally ends with Done itself;
                                 // on a hard error make sure the UI unblocks.
                                 let _ = fallback
@@ -7635,10 +7800,10 @@ mod tests {
         app.custom_commands = vec![custom("review", "Review $1 with care.", None)];
         type_str(&mut app, "/review src/app.rs");
         let action = press(&mut app, KeyCode::Enter);
-        let Some(AppAction::Submit(prompt)) = action else {
+        let Some(AppAction::Submit(prepared)) = action else {
             panic!("expected a submit, got {action:?}");
         };
-        assert_eq!(prompt, "Review src/app.rs with care.");
+        assert_eq!(prepared.text, "Review src/app.rs with care.");
         // The transcript shows what the user actually typed.
         assert!(matches!(
             app.transcript.last(),
@@ -7653,7 +7818,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Enter);
         assert!(matches!(
             action,
-            Some(AppAction::Submit(prompt)) if prompt == "/frobnicate the build"
+            Some(AppAction::Submit(prepared)) if prepared.text == "/frobnicate the build"
         ));
     }
 
@@ -7677,15 +7842,47 @@ mod tests {
         app.project_root = tmp.path().to_path_buf();
         type_str(&mut app, "use @ctx.txt here");
         let action = press(&mut app, KeyCode::Enter);
-        let Some(AppAction::Submit(prompt)) = action else {
+        let Some(AppAction::Submit(prepared)) = action else {
             panic!("expected a submit, got {action:?}");
         };
-        assert!(prompt.contains("the context"), "got: {prompt}");
+        assert!(
+            prepared.text.contains("the context"),
+            "got: {}",
+            prepared.text
+        );
         // The transcript keeps the compact form.
         assert!(matches!(
             app.transcript.last(),
             Some(TranscriptEntry::User(text)) if text == "use @ctx.txt here"
         ));
+    }
+
+    #[test]
+    fn submit_attaches_image_at_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Minimal 1x1 PNG.
+        let png = [
+            0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe,
+            0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(tmp.path().join("shot.png"), png).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+        type_str(&mut app, "look at @shot.png");
+        let action = press(&mut app, KeyCode::Enter);
+        let Some(AppAction::Submit(prepared)) = action else {
+            panic!("expected a submit, got {action:?}");
+        };
+        assert!(
+            prepared.text.contains("[image: shot.png]"),
+            "got: {}",
+            prepared.text
+        );
+        assert_eq!(prepared.images.len(), 1);
+        assert!(prepared.images[0].ends_with("shot.png"));
     }
 
     #[test]
@@ -9103,8 +9300,12 @@ mod tests {
         type_str(&mut app, "second");
         let action = press(&mut app, KeyCode::Enter);
         match action {
-            Some(AppAction::Submit(text)) => {
-                assert!(text.contains("first") && text.contains('\n') && text.contains("second"));
+            Some(AppAction::Submit(prepared)) => {
+                assert!(
+                    prepared.text.contains("first")
+                        && prepared.text.contains('\n')
+                        && prepared.text.contains("second")
+                );
             }
             other => panic!("expected a submit action, got {other:?}"),
         }

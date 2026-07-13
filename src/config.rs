@@ -226,14 +226,18 @@ impl fmt::Display for GatewayKind {
 
 /// Configuration for the optional messaging gateway. Bot tokens are never
 /// stored here — only the name of the environment variable that holds the
-/// token (`token_env`).
+/// token (`token_env`). The token itself lives in
+/// `~/.wizard/credentials.toml` under `[keys] telegram` (preferred) or in the
+/// named env var.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Which gateway to run (default [`GatewayKind::None`]).
     #[serde(default)]
     pub kind: GatewayKind,
     /// Name of the env var holding the bot token (default
-    /// `WIZARD_TELEGRAM_TOKEN`); the token itself is never persisted.
+    /// `WIZARD_TELEGRAM_TOKEN`); the token itself is never persisted to
+    /// config. Consulted only when no `telegram` entry exists in
+    /// credentials.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
     /// Allowed inbound chat IDs. Empty means "allow all".

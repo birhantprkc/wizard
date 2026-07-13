@@ -33,15 +33,46 @@ const MAX_REPLY_CHARS: usize = 24_000;
 pub struct Inbound {
     /// Platform chat identifier the message came from (and replies go to).
     pub chat_id: i64,
-    /// The message text.
+    /// The message text (caption when the user sent a photo/document with
+    /// caption; a short placeholder for media-only messages).
     pub text: String,
+    /// Local paths of files downloaded from the platform (photos, image
+    /// documents). Empty for pure text. Absolute paths so the agent can
+    /// `read_file` them, and so a future vision path can pick them up.
+    pub attachments: Vec<std::path::PathBuf>,
+}
+
+impl Inbound {
+    /// Build a text-only inbound (no attachments). Used by transports and tests.
+    pub fn text(chat_id: i64, text: impl Into<String>) -> Self {
+        Self {
+            chat_id,
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Prompt text handed to the agent: original text plus absolute attachment
+    /// paths when any files were downloaded, so a text-only model can still
+    /// open them with tools.
+    pub fn agent_prompt(&self) -> String {
+        if self.attachments.is_empty() {
+            return self.text.clone();
+        }
+        let mut prompt = self.text.clone();
+        prompt.push_str("\n\n");
+        for path in &self.attachments {
+            prompt.push_str(&format!("[attached: {}]\n", path.display()));
+        }
+        prompt
+    }
 }
 
 /// A chat transport: long-poll for inbound messages and send replies. The
 /// agent loop and reply formatting are transport-agnostic and live in
 /// [`serve`].
 #[async_trait]
-pub trait Gateway: Send {
+pub trait Gateway: Send + Sync {
     /// Short human label for status output (e.g. `"telegram"`).
     fn label(&self) -> &str;
 
@@ -53,6 +84,13 @@ pub trait Gateway: Send {
     /// Send `text` to `chat_id`. Callers pre-split long replies via
     /// [`split_message`].
     async fn send(&self, chat_id: i64, text: &str) -> Result<()>;
+
+    /// Optional UX hint that the bot is working on a reply (e.g. Telegram
+    /// `sendChatAction typing`). Default is a no-op so transports that do not
+    /// support it need not implement anything.
+    async fn typing(&self, _chat_id: i64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Whether `chat_id` is allowed: an empty allow-list permits everyone,
@@ -102,8 +140,12 @@ pub fn split_message(text: &str, max: usize) -> Vec<String> {
 /// Entry point for `wizard --gateway`: dispatch on the configured gateway
 /// kind. [`GatewayKind::None`] is an actionable error; otherwise the matching
 /// transport is constructed and driven by [`serve`].
+///
+/// Project root is `$WIZARD_GATEWAY_CWD` when set (useful for systemd units
+/// whose `WorkingDirectory` is `$HOME`), otherwise the process current
+/// directory.
 pub async fn run(config: Config, _cli: Cli) -> Result<()> {
-    let project_root = std::env::current_dir().context("determining project root")?;
+    let project_root = gateway_project_root()?;
     match config.gateway.kind {
         GatewayKind::None => none::NoneGateway.poll().await.map(|_| ()),
         GatewayKind::Telegram => {
@@ -111,6 +153,17 @@ pub async fn run(config: Config, _cli: Cli) -> Result<()> {
             serve(Box::new(gateway), config, &project_root).await
         }
     }
+}
+
+/// Resolve the project root the gateway agent should operate on.
+fn gateway_project_root() -> Result<std::path::PathBuf> {
+    if let Ok(cwd) = std::env::var("WIZARD_GATEWAY_CWD") {
+        let path = std::path::PathBuf::from(cwd.trim());
+        if !path.as_os_str().is_empty() {
+            return Ok(path);
+        }
+    }
+    std::env::current_dir().context("determining project root")
 }
 
 /// Drive a gateway: build one sovereign agent, then loop — poll for inbound
@@ -214,8 +267,12 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
                 continue;
             }
 
-            println!("← [{}] {}", message.chat_id, first_line(&message.text));
-            let reply = run_one_turn(&mut agent, &message.text).await;
+            let prompt = message.agent_prompt();
+            println!("← [{}] {}", message.chat_id, first_line(&prompt));
+            if let Err(err) = gateway.typing(message.chat_id).await {
+                tracing::debug!("typing indicator failed: {err:#}");
+            }
+            let reply = run_one_turn(&mut agent, &prompt, &message.attachments).await;
             for chunk in split_message(&reply, MAX_MESSAGE_CHARS) {
                 if let Err(err) = gateway.send(message.chat_id, &chunk).await {
                     eprintln!("failed to send reply to {}: {err:#}", message.chat_id);
@@ -251,10 +308,15 @@ async fn fire_session_hooks(agent: &mut Agent, start: bool) {
     }
 }
 
-/// Run exactly one agent turn against `text` and collect the reply: stream the
-/// turn while draining its [`AgentEvent`] channel, concatenating text deltas
-/// and noting tool activity. The reply is capped at [`MAX_REPLY_CHARS`].
-async fn run_one_turn(agent: &mut Agent, text: &str) -> String {
+/// Run exactly one agent turn against `text` (with optional image attachments)
+/// and collect the reply: stream the turn while draining its [`AgentEvent`]
+/// channel, concatenating text deltas and noting tool activity. The reply is
+/// capped at [`MAX_REPLY_CHARS`].
+async fn run_one_turn(
+    agent: &mut Agent,
+    text: &str,
+    images: &[std::path::PathBuf],
+) -> String {
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
 
     // Drain events concurrently with the turn: the turn borrows the agent
@@ -283,7 +345,11 @@ async fn run_one_turn(agent: &mut Agent, text: &str) -> String {
         (reply, tools, error)
     };
 
-    let (_done, (mut reply, tools, error)) = tokio::join!(agent.run_turn(text, tx), collector);
+    let images = images.to_vec();
+    let (_done, (mut reply, tools, error)) = tokio::join!(
+        agent.run_turn_with_images(text, images, tx),
+        collector
+    );
 
     let reply_trimmed = reply.trim();
     if reply_trimmed.is_empty() {
@@ -351,5 +417,27 @@ mod tests {
         let chunks = split_message(&line, 10);
         assert_eq!(chunks, vec!["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
         assert_eq!(chunks.concat(), line);
+    }
+
+    #[test]
+    fn agent_prompt_is_text_when_no_attachments() {
+        let inbound = Inbound::text(1, "hello");
+        assert_eq!(inbound.agent_prompt(), "hello");
+    }
+
+    #[test]
+    fn agent_prompt_appends_attachment_paths() {
+        let inbound = Inbound {
+            chat_id: 1,
+            text: "look".to_string(),
+            attachments: vec![
+                std::path::PathBuf::from("/tmp/a.jpg"),
+                std::path::PathBuf::from("/tmp/b.png"),
+            ],
+        };
+        let prompt = inbound.agent_prompt();
+        assert!(prompt.starts_with("look\n\n"), "{prompt}");
+        assert!(prompt.contains("[attached: /tmp/a.jpg]"), "{prompt}");
+        assert!(prompt.contains("[attached: /tmp/b.png]"), "{prompt}");
     }
 }

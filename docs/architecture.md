@@ -152,6 +152,7 @@ Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 | `git_diff` | Staged/unstaged diff |
 | `web_fetch` | Fetch a URL, HTML converted to markdown; SSRF-guarded ([web.md](web.md)) |
 | `web_search` | Web search via DuckDuckGo (default), Brave, Tavily, or xAI Grok ([web.md](web.md)) |
+| `generate_image` | Generate an image via xAI Imagine (or any OpenAI-compatible images endpoint); saves under `generated/` ([image.md](image.md)) |
 | `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
 | `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
 | `run_command` | Run one of Wizard's own slash commands (e.g. `/effort high`, `/model`, `/compact`); dispatched by the TUI after the turn ([usage.md](usage.md#agent-run-slash-commands)) |

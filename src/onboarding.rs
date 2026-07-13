@@ -98,6 +98,10 @@ pub struct Answers {
     /// backend name in `~/.wizard/credentials.toml` by [`run_blocking`] after
     /// the pure config mapping (so [`Answers::into_config`] stays pure).
     pub web_search_api_key: Option<String>,
+    /// Pasted Telegram bot token (Telegram gateway only). Stored under
+    /// `telegram` in `~/.wizard/credentials.toml` by [`run_blocking`] after the
+    /// pure config mapping — same pattern as [`Self::web_search_api_key`].
+    pub gateway_bot_token: Option<String>,
     /// Artifacts to import from an existing Claude Code install, if any. The
     /// actual import (file writes + spinner verbs) runs in [`run_blocking`]
     /// after [`Answers::into_config`], so this is consumed there rather than in
@@ -246,6 +250,7 @@ fn run_blocking() -> Result<Option<Config>> {
     // The pasted web-search key (if any) is stored separately from config.
     let web_search_backend = answers.web_search_backend.clone();
     let web_search_api_key = answers.web_search_api_key.clone();
+    let gateway_bot_token = answers.gateway_bot_token.clone();
     let mut config = answers.into_config();
 
     // Persist a pasted web-search API key under the backend name (0600),
@@ -255,6 +260,16 @@ fn run_blocking() -> Result<Option<Config>> {
         && let Err(err) = crate::credentials::store(&web_search_backend, key.trim())
     {
         eprintln!("warning: could not save the {web_search_backend} API key: {err:#}");
+    }
+
+    // Persist the Telegram bot token under the fixed key "telegram" (0600).
+    // The gateway reads credentials first, then the env var named in
+    // `token_env` — so a token pasted here is enough to start `wizard --gateway`.
+    if let Some(token) = gateway_bot_token
+        && !token.trim().is_empty()
+        && let Err(err) = crate::credentials::store("telegram", token.trim())
+    {
+        eprintln!("warning: could not save the Telegram bot token: {err:#}");
     }
 
     // Perform the Claude Code import (MCP/commands file writes + spinner verbs)
@@ -387,39 +402,60 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    let (gateway_kind, gateway_token_env, gateway_allowed_chat_ids) = if gateway == 1 {
-        let token_env = match text_input(
-            terminal,
-            "Telegram bot token env var",
-            "Create a bot via @BotFather, then export the token in this var.",
-            GatewayConfig::DEFAULT_TOKEN_ENV,
-        )? {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        // Allowed chat IDs: re-prompt on a parse error rather than discarding
-        // the answer.
-        let allowed = loop {
-            let raw = match text_input(
+    let (gateway_kind, gateway_token_env, gateway_allowed_chat_ids, gateway_bot_token) =
+        if gateway == 1 {
+            // Paste the bot token itself (stored in credentials.toml, 0600).
+            // Leave empty only if the user prefers an env var (next prompt).
+            let bot_token = match text_input(
                 terminal,
-                "Allowed chat IDs (optional)",
-                "Comma-separated numeric chat IDs. Leave empty to allow all.",
+                "Telegram bot token",
+                "Paste the token from @BotFather. Stored in ~/.wizard/credentials.toml (0600). Leave empty to use an env var instead.",
                 "",
             )? {
                 Some(value) => value,
                 None => return Ok(None),
             };
-            match parse_chat_ids(&raw) {
-                Ok(ids) => break ids,
-                Err(message) => {
-                    notice(terminal, &message)?;
+            let bot_token = bot_token.trim().to_string();
+            let gateway_bot_token = (!bot_token.is_empty()).then_some(bot_token);
+
+            // Optional env-var fallback name (used when no credential is stored).
+            let token_env = match text_input(
+                terminal,
+                "Telegram bot token env var (optional fallback)",
+                "Used only when no token is stored in credentials.toml.",
+                GatewayConfig::DEFAULT_TOKEN_ENV,
+            )? {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+            // Allowed chat IDs: re-prompt on a parse error rather than discarding
+            // the answer.
+            let allowed = loop {
+                let raw = match text_input(
+                    terminal,
+                    "Allowed chat IDs (optional)",
+                    "Comma-separated numeric chat IDs. Leave empty to allow all.",
+                    "",
+                )? {
+                    Some(value) => value,
+                    None => return Ok(None),
+                };
+                match parse_chat_ids(&raw) {
+                    Ok(ids) => break ids,
+                    Err(message) => {
+                        notice(terminal, &message)?;
+                    }
                 }
-            }
+            };
+            (
+                GatewayKind::Telegram,
+                Some(token_env),
+                allowed,
+                gateway_bot_token,
+            )
+        } else {
+            (GatewayKind::None, None, Vec::new(), None)
         };
-        (GatewayKind::Telegram, Some(token_env), allowed)
-    } else {
-        (GatewayKind::None, None, Vec::new())
-    };
 
     // Step 4 — mode.
     let mode_options = [
@@ -472,6 +508,7 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         mode,
         web_search_backend,
         web_search_api_key,
+        gateway_bot_token,
         claude_import,
     }))
 }
@@ -1260,9 +1297,34 @@ fn print_summary(config: &Config) {
 
     if config.gateway.kind == GatewayKind::Telegram {
         let env = config.gateway.token_env();
-        println!("  • create a bot via @BotFather and export the token:");
-        println!("        export {env}=...");
-        println!("  • run the gateway: wizard --gateway");
+        let token_stored = crate::credentials::get("telegram")
+            .is_some_and(|t| !t.trim().is_empty());
+        if token_stored {
+            println!("  • Telegram bot token: stored in ~/.wizard/credentials.toml");
+        } else {
+            println!("  • store the bot token (credentials preferred over env):");
+            println!("        # ~/.wizard/credentials.toml  (mode 0600)");
+            println!("        [keys]");
+            println!("        telegram = \"<token from @BotFather>\"");
+            println!("    or: export {env}=...");
+        }
+        println!();
+        println!("  ⚠  The gateway is a long-running process — messages get no reply");
+        println!("     until it is running. Start it in the project you want it to");
+        println!("     operate on:");
+        println!();
+        println!("        cd ~/your/project && wizard --gateway");
+        println!();
+        println!("     Keep it running (or install a user service so it survives logout):");
+        println!();
+        println!("        mkdir -p ~/.config/systemd/user");
+        println!("        # copy contrib/wizard-gateway.service, set WorkingDirectory");
+        println!("        # (or set Environment=WIZARD_GATEWAY_CWD=/path/to/project)");
+        println!("        systemctl --user daemon-reload");
+        println!("        systemctl --user enable --now wizard-gateway");
+        println!("        journalctl --user -u wizard-gateway -f");
+        println!();
+        println!("     Full docs: docs/gateway.md");
     }
 
     println!("  • start Wizard:    wizard");
@@ -1672,6 +1734,7 @@ mod tests {
             mode: Mode::Genie,
             web_search_backend: "duckduckgo".to_string(),
             web_search_api_key: None,
+            gateway_bot_token: None,
             claude_import: None,
         }
     }
@@ -1868,12 +1931,21 @@ mod tests {
             gateway_kind: GatewayKind::Telegram,
             gateway_token_env: Some("MY_TOKEN".to_string()),
             gateway_allowed_chat_ids: vec![1, 2, 3],
+            // Token is stored via credentials::store in run_blocking, not in
+            // config — into_config stays pure.
+            gateway_bot_token: Some("123456:ABC-test-token".to_string()),
             ..base_answers()
         };
         let config = answers.into_config();
         assert_eq!(config.gateway.kind, GatewayKind::Telegram);
         assert_eq!(config.gateway.token_env.as_deref(), Some("MY_TOKEN"));
         assert_eq!(config.gateway.allowed_chat_ids, vec![1, 2, 3]);
+        // Bot token must never land in config.toml.
+        let toml = toml::to_string(&config).expect("serialize");
+        assert!(
+            !toml.contains("123456:ABC-test-token"),
+            "token must not appear in config: {toml}"
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ explain @src/main.rs and how it relates to @docs/architecture.md
 
 - Paths resolve relative to the project root; absolute paths and `~/` work too.
 - Contents are capped at 50KB per file, with a truncation note when cut.
-- Image files (`.png .jpg .jpeg .gif .webp`) are replaced by a note: this build has no vision path to attach them to.
+- Image files (`.png .jpg .jpeg .gif .webp`) expand to a short `[image: name]` placeholder and are attached for vision-capable models (xAI Grok, OpenAI, Anthropic, OpenRouter, Ollama vision models). You can also paste an image path or a `data:image/...;base64,...` URL into the composer.
 - A token that does not resolve to a file is left untouched, so email addresses (`user@host`) and decorators pass through. `@@path` escapes a literal `@path`.
 - **TUI:** Tab completes the path under the cursor from its directory listing after you type `@`.
 

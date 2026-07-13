@@ -257,6 +257,102 @@ pub fn check_native_tools() -> Check {
     }
 }
 
+/// Messaging gateway configuration and token presence. Never prints the
+/// secret. Warns when a telegram token is stored but `gateway.kind` is
+/// still `none`, and when kind is telegram but no process appears to be
+/// listening.
+pub fn check_gateway(config: &Config) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let kind = config.gateway.kind;
+    let token_in_credentials = crate::credentials::get("telegram")
+        .is_some_and(|t| !t.trim().is_empty());
+    let env_name = config.gateway.token_env();
+    let token_in_env = std::env::var(env_name)
+        .ok()
+        .is_some_and(|t| !t.trim().is_empty());
+    let token_present = token_in_credentials || token_in_env;
+
+    match kind {
+        crate::config::GatewayKind::None => {
+            if token_in_credentials {
+                checks.push(Check::fail(
+                    "gateway",
+                    "token stored under [keys] telegram but gateway.kind is \"none\" \
+                     — set kind = \"telegram\" in config.toml (or re-run wizard --onboard)",
+                ));
+            } else {
+                checks.push(Check::skip(
+                    "gateway",
+                    "kind = none (terminal only; set kind = \"telegram\" to enable)",
+                ));
+            }
+        }
+        crate::config::GatewayKind::Telegram => {
+            checks.push(Check::pass("gateway", "kind = telegram"));
+            if token_present {
+                let source = if token_in_credentials {
+                    "credentials.toml"
+                } else {
+                    env_name
+                };
+                checks.push(Check::pass(
+                    "gateway token",
+                    format!("present ({source}; secret not shown)"),
+                ));
+            } else {
+                checks.push(Check::fail(
+                    "gateway token",
+                    format!(
+                        "missing — paste during `wizard --onboard`, store under [keys] \
+                         telegram in ~/.wizard/credentials.toml, or export {env_name}"
+                    ),
+                ));
+            }
+            checks.push(check_gateway_process());
+        }
+    }
+    checks
+}
+
+/// Best-effort: is a `wizard --gateway` process running on this machine?
+/// Uses `pgrep -af`; a missing `pgrep` is a skip, not a failure.
+pub fn check_gateway_process() -> Check {
+    let label = "gateway process";
+    let output = std::process::Command::new("pgrep")
+        .args(["-af", "wizard"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let listening = stdout.lines().any(|line| {
+                // Match the gateway flag without matching this doctor process.
+                (line.contains("--gateway") || line.contains(" wizard-gateway"))
+                    && !line.contains("pgrep")
+            });
+            if listening {
+                Check::pass(label, "wizard --gateway appears to be running")
+            } else {
+                Check::fail(
+                    label,
+                    "no wizard --gateway process found — messages will get no reply \
+                     until you run `cd <project> && wizard --gateway` (or enable the \
+                     systemd user unit; see docs/gateway.md)",
+                )
+            }
+        }
+        Ok(_) => {
+            // pgrep exits 1 when nothing matches.
+            Check::fail(
+                label,
+                "no wizard --gateway process found — messages will get no reply \
+                 until you run `cd <project> && wizard --gateway` (or enable the \
+                 systemd user unit; see docs/gateway.md)",
+            )
+        }
+        Err(_) => Check::skip(label, "pgrep not available; cannot check for a running gateway"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // network checks (probe with timeout; never exercised by unit tests)
 // ---------------------------------------------------------------------------
@@ -357,6 +453,7 @@ pub async fn run_checks(project_root: &Path) -> Vec<Check> {
             for provider in &providers {
                 checks.push(check_provider(provider).await);
             }
+            checks.extend(check_gateway(&config));
         }
         Err(err) => checks.push(Check::fail(
             "providers",
@@ -602,5 +699,60 @@ mod tests {
         // Corrupt TOML: fail loudly instead of degrading to "no stored keys".
         std::fs::write(&path, "this is not valid toml = = =").unwrap();
         assert_eq!(check_credentials_file(&path).status, Status::Fail);
+    }
+
+    #[test]
+    fn gateway_check_skips_when_kind_is_none_and_no_token() {
+        let config = Config {
+            gateway: crate::config::GatewayConfig {
+                kind: crate::config::GatewayKind::None,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        // Without a stored telegram token this is a skip. We cannot force
+        // credentials::get to miss if the real home has a token, so only
+        // assert the none/no-token path when get returns None.
+        if crate::credentials::get("telegram").is_none() {
+            let checks = check_gateway(&config);
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].status, Status::Skip, "{}", checks[0].detail);
+            assert!(checks[0].detail.contains("none"), "{}", checks[0].detail);
+        }
+    }
+
+    #[test]
+    fn gateway_check_telegram_reports_token_status_without_leaking_secret() {
+        let config = Config {
+            gateway: crate::config::GatewayConfig {
+                kind: crate::config::GatewayKind::Telegram,
+                token_env: Some("WIZARD_DOCTOR_TEST_TG_TOKEN_NEVER_SET".to_string()),
+                allowed_chat_ids: vec![1],
+            },
+            ..Config::default()
+        };
+        let checks = check_gateway(&config);
+        assert!(
+            checks.iter().any(|c| c.label == "gateway" && c.status == Status::Pass),
+            "{checks:?}"
+        );
+        // Token check: either pass (if real credentials have a token) or fail.
+        let token = checks
+            .iter()
+            .find(|c| c.label == "gateway token")
+            .expect("token check present");
+        assert!(
+            !token.detail.contains(":")
+                || token.detail.contains("credentials.toml")
+                || token.detail.contains("missing")
+                || token.detail.contains("WIZARD_DOCTOR"),
+            "must not leak a raw token: {}",
+            token.detail
+        );
+        // Process check is always present for telegram.
+        assert!(
+            checks.iter().any(|c| c.label == "gateway process"),
+            "{checks:?}"
+        );
     }
 }

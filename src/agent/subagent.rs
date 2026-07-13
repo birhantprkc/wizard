@@ -360,6 +360,7 @@ pub async fn spawn(
             content: content.clone(),
             tool_calls: tool_calls.clone(),
             tool_name: None,
+            images: Vec::new(),
         });
 
         if !native_tools
