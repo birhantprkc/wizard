@@ -9031,7 +9031,7 @@ mod tests {
         let body = crate::ui::regions(&app, ratatui::layout::Rect::new(0, 0, width, height))[0];
         let mut ever_drawn = false;
         for _ in 0..20 {
-            app.scroll = app.scroll.saturating_add(1);
+            app.scroll_transcript(1);
             let buf = screen(&app, width, height);
             let rows = pixel_rows(&buf);
             ever_drawn |= !rows.is_empty();
@@ -9050,7 +9050,7 @@ mod tests {
 
         // And back at the bottom, the screen is exactly what it was before the
         // scroll — no pixels left over anywhere.
-        app.scroll = 0;
+        app.scroll_to_bottom();
         assert!(pixel_rows(&screen(&app, width, height)).is_empty());
     }
 
