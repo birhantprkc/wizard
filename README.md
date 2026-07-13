@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary and a small default loadout (a Playwright browser over MCP and four subagents). The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
+One command installs the `wizard` binary. The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
 
 > **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
 
@@ -51,7 +51,6 @@ One command installs the `wizard` binary and a small default loadout (a Playwrig
 - [Fusion](docs/fusion.md): the `/fusion` debate panel
 - [Bench](docs/bench.md): record/replay trajectories to score builds and models
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
-- [Default loadout](docs/loadout.md): the preconfigured browser MCP and subagent roster
 - [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
 - [Hooks](docs/hooks.md) · [Tasks](docs/tasks.md) · [Web](docs/web.md) · [Headless output](docs/headless.md) · [Checkpoints](docs/checkpoints.md)
 - [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
