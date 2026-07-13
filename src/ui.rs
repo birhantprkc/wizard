@@ -264,8 +264,18 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_height);
-    let scroll = (app.scroll as usize).min(max_scroll);
-    let start = max_scroll - scroll;
+    // Cache for key handlers so they can convert a follow-tail view into a
+    // stable top-anchored offset without re-wrapping the transcript.
+    app.transcript_max_scroll.set(max_scroll as u16);
+    // Stick-to-bottom: when following (or the content still fits), pin to the
+    // live tail. Otherwise hold the absolute top-of-viewport offset so new
+    // streaming lines do not yank the user away from what they were reading.
+    let start = if app.scroll_follow || max_scroll == 0 {
+        max_scroll
+    } else {
+        (app.scroll as usize).min(max_scroll)
+    };
+    let remaining = max_scroll.saturating_sub(start);
     let end = (start + inner_height).min(total);
     let visible: Vec<Line<'static>> = lines[start..end].to_vec();
 
@@ -282,8 +292,8 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(visible)), inner);
 
     // Scrolled away from the tail: a quiet hint in the top-right corner.
-    if scroll > 0 {
-        let label = format!("↓ {scroll} more ");
+    if remaining > 0 {
+        let label = format!("↓ {remaining} more ");
         let width = (label.width() as u16).min(inner.width);
         let hint = Rect {
             x: inner.right().saturating_sub(width),
@@ -1667,12 +1677,17 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
         ]));
     }
 
-    // Anchored to the bottom like the main transcript: newest work in view,
-    // PageUp scrolls back.
+    // Stick-to-bottom like the main transcript: follow the live tail by
+    // default; once the user scrolls up, hold their top-anchored offset so
+    // PageUp/Shift+↑ stay put while the run keeps writing.
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_height);
-    let scroll = (pane.scroll as usize).min(max_scroll);
-    let start = max_scroll - scroll;
+    pane.max_scroll.set(max_scroll as u16);
+    let start = if pane.scroll_follow || max_scroll == 0 {
+        max_scroll
+    } else {
+        (pane.scroll as usize).min(max_scroll)
+    };
     let end = (start + inner_height).min(total);
     frame.render_widget(
         Paragraph::new(Text::from(lines[start..end].to_vec())),
