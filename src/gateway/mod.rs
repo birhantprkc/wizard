@@ -122,9 +122,7 @@ async fn serve(mut gateway: Box<dyn Gateway>, config: Config, project_root: &Pat
     // sovereign posture.
     let mut agent_config = config.clone();
     agent_config.mode = Mode::Sovereign;
-    if agent_config.max_steps < Mode::Sovereign.default_max_steps() {
-        agent_config.max_steps = Mode::Sovereign.default_max_steps();
-    }
+    agent_config.max_steps = agent_config.max_steps.for_mode(Mode::Sovereign);
 
     let mut agent = build_headless_agent(&agent_config, project_root, false)
         .await

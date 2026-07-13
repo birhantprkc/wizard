@@ -22,7 +22,7 @@ use crate::agent::{
 };
 use crate::cli::Cli;
 use crate::commands::CustomCommand;
-use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort};
+use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget};
 use crate::event::{Event, EventLoop};
 use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
@@ -1110,7 +1110,8 @@ pub struct StatusLine {
     pub mode: Mode,
     /// Current step within the running turn (0 when idle).
     pub step: u32,
-    pub max_steps: u32,
+    /// The turn's step budget — unlimited unless `max_steps` is configured.
+    pub max_steps: StepBudget,
     /// True while a turn is streaming.
     pub busy: bool,
     /// Session prompt-token total (from [`AgentEvent::Usage`]).
@@ -4417,7 +4418,7 @@ impl App {
                 match reason {
                     DoneReason::Completed => {}
                     DoneReason::MaxSteps => self.notice(format!(
-                        "step budget reached ({} steps) — send another message to continue",
+                        "step budget reached ({}) — send another message to continue",
                         self.status.max_steps
                     )),
                     DoneReason::TimeLimit => self.notice("time limit reached"),
@@ -5724,7 +5725,7 @@ struct CommandContext<'a> {
     skills: &'a mut Vec<Skill>,
     project_root: &'a Path,
     mcp_path: &'a Path,
-    genie_max_steps: u32,
+    genie_max_steps: StepBudget,
     events: &'a EventLoop,
 }
 
@@ -5743,7 +5744,7 @@ async fn drain_agent_commands(
     skills: &mut Vec<Skill>,
     project_root: &Path,
     mcp_path: &Path,
-    genie_max_steps: u32,
+    genie_max_steps: StepBudget,
     events: &EventLoop,
 ) {
     while agent_slot.is_some() && !app.pending_agent_commands.is_empty() {
@@ -6196,10 +6197,7 @@ impl CommandContext<'_> {
                     Some(names) => names.join(", "),
                 };
                 PickerItem {
-                    detail: format!(
-                        "{} · {scope} · {} steps",
-                        config.description, config.max_steps
-                    ),
+                    detail: format!("{} · {scope} · {}", config.description, config.max_steps),
                     value: config.name,
                     current: false,
                 }
@@ -6444,11 +6442,7 @@ impl CommandContext<'_> {
         self.app.status.mode = mode;
         match mode {
             Mode::Sovereign => {
-                self.app.config.max_steps = self
-                    .app
-                    .config
-                    .max_steps
-                    .max(Mode::Sovereign.default_max_steps());
+                self.app.config.max_steps = self.app.config.max_steps.for_mode(Mode::Sovereign);
             }
             Mode::Genie => {
                 self.app.config.max_steps = self.genie_max_steps;

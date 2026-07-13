@@ -42,12 +42,78 @@ impl Mode {
             Mode::Sovereign => 0.6,
         }
     }
+}
 
-    /// Default agent-loop step budget per turn (genie 25, sovereign 100).
-    pub fn default_max_steps(self) -> u32 {
-        match self {
-            Mode::Genie => 25,
-            Mode::Sovereign => 100,
+/// How many model → tool → model round trips one turn may take.
+///
+/// Zero — the default — means *unlimited*: the turn ends when the model stops
+/// calling tools, or when something else stops it (interrupt, time limit,
+/// circuit breaker, sovereign loop-control file). A positive value re-imposes a
+/// ceiling; the turn then ends in [`DoneReason::MaxSteps`] when it is reached.
+///
+/// [`DoneReason::MaxSteps`]: crate::agent::DoneReason::MaxSteps
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StepBudget(u32);
+
+impl StepBudget {
+    /// No ceiling: the turn runs until the work is done.
+    pub const UNLIMITED: Self = Self(0);
+
+    /// Floor on a *finite* budget in sovereign mode. Nobody is waiting at a
+    /// prompt to say "continue", so a hand-set budget below this is raised to
+    /// it. An unlimited budget is already more permissive and is left alone.
+    const SOVEREIGN_FLOOR: u32 = 100;
+
+    /// A budget of `steps` steps. Zero is [`Self::UNLIMITED`].
+    pub const fn new(steps: u32) -> Self {
+        Self(steps)
+    }
+
+    /// The ceiling, or `None` when unlimited.
+    pub const fn cap(self) -> Option<u32> {
+        if self.0 == 0 { None } else { Some(self.0) }
+    }
+
+    /// The highest step number the loop may run, saturating at [`u32::MAX`] when
+    /// unlimited — four billion round trips is a limit no turn ever reaches, so
+    /// the loop can stay a plain bounded range.
+    pub const fn last_step(self) -> u32 {
+        match self.cap() {
+            Some(cap) => cap,
+            None => u32::MAX,
+        }
+    }
+
+    /// This budget as `mode` needs it: sovereign lifts a finite budget to
+    /// [`Self::SOVEREIGN_FLOOR`]; everything else is returned unchanged.
+    pub fn for_mode(self, mode: Mode) -> Self {
+        match (mode, self.cap()) {
+            (Mode::Sovereign, Some(cap)) if cap < Self::SOVEREIGN_FLOOR => {
+                Self(Self::SOVEREIGN_FLOOR)
+            }
+            _ => self,
+        }
+    }
+}
+
+impl Default for StepBudget {
+    fn default() -> Self {
+        Self::UNLIMITED
+    }
+}
+
+impl From<u32> for StepBudget {
+    fn from(steps: u32) -> Self {
+        Self::new(steps)
+    }
+}
+
+impl fmt::Display for StepBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.cap() {
+            Some(cap) => write!(f, "{cap} steps"),
+            None => write!(f, "no step limit"),
         }
     }
 }
@@ -580,9 +646,10 @@ pub struct Config {
     /// `/effort`. `None` leaves the provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Agent loop limit per turn (genie). Sovereign uses its own default
-    /// unless this is explicitly raised above it.
-    pub max_steps: u32,
+    /// Agent loop limit per turn. `0` (the default) is unlimited: a turn runs
+    /// until the model stops calling tools. A positive value caps the turn;
+    /// sovereign raises a cap below its floor, since no one is at the prompt.
+    pub max_steps: StepBudget,
     /// Perpetual sovereign operation: keep working/self-directing/self-improving
     /// until stopped.
     pub continuous: bool,
@@ -665,7 +732,7 @@ impl Default for Config {
             gguf_path: None,
             mode: Mode::Genie,
             reasoning_effort: None,
-            max_steps: 25,
+            max_steps: StepBudget::UNLIMITED,
             continuous: false,
             plan_first: false,
             omakase: false,
@@ -1047,8 +1114,8 @@ impl Config {
     }
 
     /// Apply CLI flag overrides on top of file/env config for this run.
-    /// CLI mode wins; sovereign mode raises `max_steps` to its default if
-    /// the configured value is lower.
+    /// CLI mode wins; sovereign mode raises a capped `max_steps` to its floor
+    /// (an unlimited budget stays unlimited).
     pub fn apply_cli(&mut self, cli: &Cli) {
         if let Some(mode) = cli.mode {
             self.mode = mode;
@@ -1065,9 +1132,7 @@ impl Config {
             self.omakase = true;
             self.plan_first = true;
         }
-        if self.mode == Mode::Sovereign && self.max_steps < Mode::Sovereign.default_max_steps() {
-            self.max_steps = Mode::Sovereign.default_max_steps();
-        }
+        self.max_steps = self.max_steps.for_mode(self.mode);
     }
 }
 
@@ -1101,7 +1166,7 @@ mod tests {
         assert_eq!(config.llamacpp_host, DEFAULT_LLAMACPP_HOST);
         assert!(config.gguf_path.is_none());
         assert_eq!(config.mode, Mode::Genie);
-        assert_eq!(config.max_steps, 25);
+        assert_eq!(config.max_steps, StepBudget::UNLIMITED);
         assert!(!config.continuous);
         assert!(!config.plan_first);
         assert!(!config.plan_each_cycle);
@@ -1172,8 +1237,6 @@ mod tests {
     fn mode_parameters() {
         assert_eq!(Mode::Genie.temperature(), 0.8);
         assert_eq!(Mode::Sovereign.temperature(), 0.6);
-        assert_eq!(Mode::Genie.default_max_steps(), 25);
-        assert_eq!(Mode::Sovereign.default_max_steps(), 100);
         assert_eq!(Mode::Genie.to_string(), "genie");
         assert_eq!(Mode::Sovereign.to_string(), "sovereign");
     }
@@ -1184,7 +1247,7 @@ mod tests {
         assert_eq!(config.model, "qwen3.5:9b");
         assert_eq!(config.ollama_host, "http://127.0.0.1:11434");
         assert_eq!(config.mode, Mode::Genie);
-        assert_eq!(config.max_steps, 25);
+        assert_eq!(config.max_steps, StepBudget::UNLIMITED);
     }
 
     #[test]
@@ -1196,7 +1259,7 @@ mod tests {
             gguf_path: Some("/models/qwen3-8b-q4_k_m.gguf".to_string()),
             mode: Mode::Sovereign,
             reasoning_effort: Some(ReasoningEffort::High),
-            max_steps: 200,
+            max_steps: StepBudget::new(200),
             continuous: true,
             plan_first: true,
             omakase: true,
@@ -1862,7 +1925,11 @@ usd_per_mtok_out = 15.0
         let mut config = Config::default();
         config.apply_cli(&cli(&["--mode", "sovereign"]));
         assert_eq!(config.mode, Mode::Sovereign);
-        assert_eq!(config.max_steps, 100, "sovereign raises the step budget");
+        assert_eq!(
+            config.max_steps,
+            StepBudget::UNLIMITED,
+            "sovereign does not cap an unlimited budget"
+        );
     }
 
     #[test]
@@ -1889,17 +1956,56 @@ usd_per_mtok_out = 15.0
         config.apply_cli(&cli(&["--continuous"]));
         assert_eq!(config.mode, Mode::Sovereign);
         assert!(config.continuous);
-        assert_eq!(config.max_steps, 100);
+        assert_eq!(config.max_steps, StepBudget::UNLIMITED);
     }
 
     #[test]
     fn sovereign_keeps_explicitly_higher_max_steps() {
         let mut config = Config {
-            max_steps: 250,
+            max_steps: StepBudget::new(250),
             ..Config::default()
         };
         config.apply_cli(&cli(&["--mode", "sovereign"]));
-        assert_eq!(config.max_steps, 250);
+        assert_eq!(config.max_steps, StepBudget::new(250));
+    }
+
+    #[test]
+    fn sovereign_raises_a_capped_budget_to_its_floor() {
+        let mut config = Config {
+            max_steps: StepBudget::new(25),
+            ..Config::default()
+        };
+        config.apply_cli(&cli(&["--mode", "sovereign"]));
+        assert_eq!(config.max_steps, StepBudget::new(100));
+    }
+
+    #[test]
+    fn step_budget_zero_is_unlimited() {
+        let unlimited = StepBudget::new(0);
+        assert_eq!(unlimited, StepBudget::UNLIMITED);
+        assert_eq!(unlimited, StepBudget::default());
+        assert_eq!(unlimited.cap(), None);
+        assert_eq!(unlimited.last_step(), u32::MAX);
+        assert_eq!(unlimited.to_string(), "no step limit");
+        // Unattended posture never shrinks an unlimited budget.
+        assert_eq!(unlimited.for_mode(Mode::Sovereign), StepBudget::UNLIMITED);
+
+        let capped = StepBudget::new(25);
+        assert_eq!(capped.cap(), Some(25));
+        assert_eq!(capped.last_step(), 25);
+        assert_eq!(capped.to_string(), "25 steps");
+        assert_eq!(capped.for_mode(Mode::Genie), capped);
+    }
+
+    #[test]
+    fn step_budget_is_a_bare_integer_in_toml() {
+        let config: Config = toml::from_str("max_steps = 7").expect("valid toml");
+        assert_eq!(config.max_steps, StepBudget::new(7));
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(raw.contains("max_steps = 7"), "{raw}");
+
+        let config: Config = toml::from_str("max_steps = 0").expect("valid toml");
+        assert!(config.max_steps.cap().is_none(), "0 opts out of the limit");
     }
 
     #[test]
@@ -1920,16 +2026,17 @@ usd_per_mtok_out = 15.0
         let mut config = Config::default();
         config.apply_cli(&cli(&[]));
         assert_eq!(config.mode, Mode::Genie);
-        assert_eq!(config.max_steps, 25);
+        assert_eq!(config.max_steps, StepBudget::UNLIMITED);
     }
 
     #[test]
-    fn config_sovereign_mode_raises_max_steps_without_flags() {
+    fn config_sovereign_mode_raises_a_capped_budget_without_flags() {
         let mut config = Config {
             mode: Mode::Sovereign,
+            max_steps: StepBudget::new(10),
             ..Config::default()
         };
         config.apply_cli(&cli(&[]));
-        assert_eq!(config.max_steps, 100);
+        assert_eq!(config.max_steps, StepBudget::new(100));
     }
 }

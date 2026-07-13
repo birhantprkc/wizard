@@ -1,6 +1,6 @@
 # Personality modes
 
-Wizard ships with two personalities that share the same tools and model but differ in autonomy, interaction style, and step budget.
+Wizard ships with two personalities that share the same tools and model but differ in autonomy, interaction style, and sampling temperature.
 
 ## Genie mode (default)
 
@@ -16,7 +16,7 @@ Genie is the interactive, conversational mode. It's eager and creative ("your wi
 - Full Ratatui interface with chat history and tool output panels
 - Executes all tool calls directly; there is no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
-- Default loop limit: 25 agent steps per turn
+- Loop limit: none by default (`max_steps = 0`) — a turn runs until the model stops calling tools; Esc interrupts it
 - Best for: collaboration, exploration, incremental changes
 
 ### Flags
@@ -54,7 +54,7 @@ Sovereign mode is the autonomous, proactive agent. It runs with minimal human in
   shows while the model thinks or a tool runs
 - Auto-approves all tool calls
 - Temperature: 0.6 (tighter tool-call formatting)
-- Default loop limit: 100 steps
+- Loop limit: none by default; a `max_steps` capped below 100 is raised to 100, since nobody is at the prompt to say "continue"
 - Circuit breaker: stops after 3 consecutive identical failures
 - Best for: long-running refactors, test suites, multi-file features
 
@@ -199,7 +199,7 @@ The last presented plan is always available at `<project>/.wizard/plan.md`.
 /genie             # shorthand for /mode genie
 ```
 
-Mode changes affect prompting, step budget, and interaction style for the current session. The choice is not persisted unless you update `~/.wizard/config.toml`.
+Mode changes affect prompting, interaction style, and — if `max_steps` is capped — the step budget. Switching writes the new mode to `~/.wizard/config.toml`, so it survives a restart.
 
 ## System prompts
 

@@ -1,5 +1,6 @@
 //! Agent loop: build messages → stream completion → parse tool calls →
-//! execute tools → repeat until done or `max_steps`.
+//! execute tools → repeat until the model is done (or a configured `max_steps`
+//! cap, the time limit, the circuit breaker, or an interrupt ends the turn).
 //!
 //! The loop is UI-agnostic: it emits [`AgentEvent`]s over a channel that the
 //! Ratatui TUI (genie) or the headless runner (sovereign) consumes.
@@ -35,7 +36,8 @@ use session::Session;
 pub enum DoneReason {
     /// Model finished without requesting more tools.
     Completed,
-    /// Step budget exhausted.
+    /// A configured `max_steps` cap was exhausted. Never reached on the default
+    /// unlimited budget.
     MaxSteps,
     /// `--max-hours` elapsed (sovereign).
     TimeLimit,
@@ -1048,7 +1050,8 @@ impl Agent {
 
     /// Run one user turn: append `input`, then loop
     /// (stream completion → emit deltas → execute tool calls → feed results
-    /// back) until the model stops calling tools or `max_steps` is reached.
+    /// back) until the model stops calling tools — or, when `max_steps` is
+    /// capped, until the budget runs out.
     /// Always finishes with [`AgentEvent::Done`]. Each message is appended
     /// to the session file as it lands.
     pub async fn run_turn(
@@ -1148,7 +1151,11 @@ impl Agent {
         }
         self.push(ChatMessage::user(input));
         self.compact_if_needed(events).await;
-        let max_steps = self.config.max_steps.max(1);
+        // Unlimited by default: the turn runs until the model stops calling
+        // tools. An interrupt, the time limit, the circuit breaker and the
+        // sovereign loop-control file all still end it; only a configured
+        // `max_steps` ends it in `DoneReason::MaxSteps`.
+        let max_steps = self.config.max_steps.last_step();
 
         for step in 1..=max_steps {
             // Surface background tasks that finished since the last step.
@@ -2300,6 +2307,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::config::StepBudget;
     use crate::hooks::{HookDef, HookEvent};
     use crate::llm::{ChatChunk, ChatStream};
 
@@ -4263,5 +4271,43 @@ mod tests {
 
         // The real sessions dir was touched: clean up the empty file.
         let _ = std::fs::remove_file(new_session_path);
+    }
+
+    #[tokio::test]
+    async fn default_budget_runs_past_the_old_step_ceiling() {
+        // 30 tool-calling steps, then a final answer. The budget used to stop
+        // this turn at 25; unlimited (the default) carries it to the end.
+        let tmp = TempDir::new();
+        let (registry, calls) = recording_registry();
+        let mut responses: Vec<Vec<ChatChunk>> = (0..30)
+            .map(|_| vec![tool_call_chunk("echo", json!({}))])
+            .collect();
+        responses.push(vec![final_chunk("done")]);
+        let (mut agent, _provider) = test_agent_in(&tmp, responses, Vec::new(), registry);
+        assert_eq!(agent.config.max_steps, StepBudget::UNLIMITED);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(calls.lock().unwrap().len(), 30, "every step ran");
+    }
+
+    #[tokio::test]
+    async fn configured_cap_still_ends_the_turn() {
+        let tmp = TempDir::new();
+        let (registry, calls) = recording_registry();
+        // More tool calls than the cap allows: the loop must stop at the cap.
+        let responses: Vec<Vec<ChatChunk>> = (0..3)
+            .map(|_| vec![tool_call_chunk("echo", json!({}))])
+            .collect();
+        let (mut agent, _provider) = test_agent_in(&tmp, responses, Vec::new(), registry);
+        agent.config.max_steps = StepBudget::new(3);
+
+        let (tx, _rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+
+        assert_eq!(reason, DoneReason::MaxSteps);
+        assert_eq!(calls.lock().unwrap().len(), 3, "stopped at the cap");
     }
 }

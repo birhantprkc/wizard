@@ -823,13 +823,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(0);
         spans.push(Span::styled(" · ", dim()));
         spans.push(Span::styled(format!("{spinner} "), accent()));
-        spans.push(Span::styled(
-            format!(
-                "step {}/{} · {elapsed}s",
-                app.status.step, app.status.max_steps
-            ),
-            dim(),
-        ));
+        // Capped budget shows the denominator; the default unlimited budget has
+        // none to show, so the step is just a count.
+        let step = match app.status.max_steps.cap() {
+            Some(cap) => format!("step {}/{cap}", app.status.step),
+            None => format!("step {}", app.status.step),
+        };
+        spans.push(Span::styled(format!("{step} · {elapsed}s"), dim()));
     }
     // Background tasks (`/bashes`): a persistent marker while any are
     // running, so a detached command doesn't silently vanish from view.

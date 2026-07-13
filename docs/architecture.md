@@ -92,7 +92,8 @@ Loaded from `~/.wizard/config.toml` with optional env overrides (`WIZARD_MODEL`,
 ```toml
 active_provider = "local"
 mode = "genie"
-max_steps = 25
+# 0 = no step limit: a turn runs until the model stops calling tools.
+max_steps = 0
 
 [[providers]]
 name = "local"
@@ -129,9 +130,11 @@ When the active provider is llama.cpp and nothing answers at its `base_url`, Wiz
 │  2. Stream completion from the provider │
 │  3. Parse tool calls from response      │
 │  4. Execute tools → append results        │
-│  5. Repeat until done or max_steps      │
+│  5. Repeat until the model is done      │
 └─────────────────────────────────────────┘
 ```
+
+A turn runs until the model stops calling tools. `max_steps = 0` (the default) puts no ceiling on that; a positive `max_steps` caps the round trips and ends the turn in `DoneReason::MaxSteps` when the budget is spent. Either way a turn is also bounded by a user interrupt or the sovereign loop-control file (`DoneReason::Stopped`), the `--max-hours` limit (`TimeLimit`), and the circuit breaker after repeated identical failures (`CircuitBreaker`).
 
 Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
 

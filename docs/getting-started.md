@@ -153,7 +153,8 @@ Wizard reads files, applies changes, runs tests, and shows git diffs.
 ```toml
 active_provider = "local"
 mode = "genie"
-max_steps = 25
+# 0 = no step limit: a turn runs until the model stops calling tools.
+max_steps = 0
 
 [[providers]]
 name = "local"
@@ -164,6 +165,8 @@ gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
 `gguf_path` is what lets Wizard start `llama-server` for you; without it (e.g. a server you run yourself, or on another machine) Wizard just connects to `base_url`. `gguf_path` only applies to `kind = "llamacpp"` providers, which never use an API key.
+
+`max_steps` bounds one turn (a step is one model → tool → model round trip). `0`, the default, means no limit: the turn ends when the model stops calling tools. An interrupt (Esc), the `--max-hours` limit, and the circuit breaker still end a turn. Set a positive number to cap it instead; the turn then stops when the budget runs out and Wizard says so.
 
 The installer also lays down `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/` (a four-subagent roster), each file only if absent; see [the default loadout](loadout.md). To move this state (config, skills, commands, subagents, scripted tools) to another machine, see [Sync](sync.md).
 
@@ -176,7 +179,7 @@ While Wizard works, the chat-area spinner shows a wizard-flavored verb ("Conjuri
 spinner_verbs = ["Pondering", "Musing", "Noodling"]
 ```
 
-A non-empty list fully replaces the defaults; omitting the section or setting `spinner_verbs = []` keeps the built-in wizard verbs. The status bar (`step x/y · Ns`) and tool spinners are unaffected.
+A non-empty list fully replaces the defaults; omitting the section or setting `spinner_verbs = []` keeps the built-in wizard verbs. The status bar (`step x · Ns`, or `step x/y` under a capped `max_steps`) and tool spinners are unaffected.
 
 ### Vim mode (`[ui]`)
 
