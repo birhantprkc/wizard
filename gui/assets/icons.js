@@ -15,7 +15,6 @@ export const icons = {
   // Sidebar actions
   plusSquare: s('<rect x="3" y="3" width="18" height="18" rx="4.5"/><path d="M12 8v8"/><path d="M8 12h8"/>'),
   folder: s('<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
-  wand: s('<path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/>'),
 
   // Git
   branch: s('<path d="M6 3v12"/><circle cx="18" cy="6" r="2.7"/><circle cx="6" cy="18" r="2.7"/><path d="M18 9a9 9 0 0 1-9 9"/>'),

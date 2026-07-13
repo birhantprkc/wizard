@@ -114,6 +114,20 @@
  */
 
 /**
+ * One changed file's diff against HEAD — staged and unstaged changes together,
+ * which is what the same file's `additions`/`deletions` in `GitInfo` count.
+ * Already parsed into hunks: the client colors lines, it does not parse diffs.
+ * @typedef {Object} FileDiff
+ * @property {string} path
+ * @property {string} status         `M`, `A`, `D` or `?`, as in `GitInfo.files`.
+ * @property {number} additions
+ * @property {number} deletions
+ * @property {boolean} binary        No line diff exists: an image, an artifact.
+ * @property {boolean} truncated     Too long to ship whole; `hunks` is what fits.
+ * @property {Array<{header: string, lines: Array<{kind: 'add'|'del'|'ctx'|'meta', text: string}>}>} hunks
+ */
+
+/**
  * @typedef {Object} TaskDetail
  * @property {string} id
  * @property {string} title
@@ -611,6 +625,19 @@ export class RealApi {
   /** GET /api/git for the task's workspace. */
   async gitStatus(task) {
     return this._json(`/api/git?cwd=${encodeURIComponent(task.path)}`);
+  }
+
+  /**
+   * GET /api/git/diff: one changed file's diff, hunks already parsed. The
+   * backend takes only paths `gitStatus` itself just reported, so a path it
+   * does not recognize comes back as an error rather than a diff.
+   * @param {{path: string}} task
+   * @param {string} path  workspace-relative, as listed in `GitInfo.files`
+   * @returns {Promise<FileDiff>}
+   */
+  async fileDiff(task, path) {
+    const query = `cwd=${encodeURIComponent(task.path)}&path=${encodeURIComponent(path)}`;
+    return this._json(`/api/git/diff?${query}`);
   }
 
   /** POST /api/git/commit: `git add -A && git commit` in the workspace. */
@@ -1120,6 +1147,37 @@ export class MockApi {
     const detail = this._data.tasks.get(task.id);
     if (!detail) throw new Error(`unknown task: ${task.id}`);
     return detail.git ?? { branch: 'main', additions: 0, deletions: 0, files: [] };
+  }
+
+  /**
+   * A synthetic diff for one of the fixture's changed files: as many `+`/`-`
+   * lines as its counts claim (bounded — the fixtures claim hundreds), so the
+   * diff pane has something to render with no git repo behind it.
+   * @param {{id: string, path: string}} task
+   * @returns {Promise<FileDiff>}
+   */
+  async fileDiff(task, path) {
+    const detail = this._data.tasks.get(task.id);
+    const file = ((detail && detail.git && detail.git.files) || []).find((f) => f.path === path);
+    if (!file) throw new Error(`'${path}' is not a changed file in this workspace`);
+    const shown = (n) => Math.min(n || 0, 12);
+    const deletions = shown(file.deletions);
+    const additions = shown(file.additions);
+    const lines = [
+      { kind: 'ctx', text: ' fn main() {' },
+      ...Array.from({ length: deletions }, (_, i) => ({ kind: 'del', text: `-    let was_${i + 1} = ();` })),
+      ...Array.from({ length: additions }, (_, i) => ({ kind: 'add', text: `+    let now_${i + 1} = ();` })),
+      { kind: 'ctx', text: ' }' },
+    ];
+    return {
+      path,
+      status: file.status || 'M',
+      additions: file.additions || 0,
+      deletions: file.deletions || 0,
+      binary: false,
+      truncated: additions < (file.additions || 0) || deletions < (file.deletions || 0),
+      hunks: [{ header: `@@ -1,${deletions + 2} +1,${additions + 2} @@ fn main()`, lines }],
+    };
   }
 
   /** @param {{id: string, path: string}} task */

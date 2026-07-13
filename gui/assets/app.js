@@ -884,7 +884,10 @@ function updateGitCard() {
   ctx.gitBranch.textContent = g.branch || '—';
   ctx.gitFileList.replaceChildren(
     ...files.map((f) =>
-      h('div', { class: 'git-file', title: f.path },
+      h('button', {
+        class: 'git-file', type: 'button', title: `${f.path}\nShow this file's diff`,
+        onclick: () => openDiffPane(f),
+      },
         h('span', { class: 'git-file-path' }, f.path),
         h('span', { class: 'git-file-stat' },
           h('span', { class: 'add' }, `+${f.additions || 0}`),
@@ -1021,7 +1024,11 @@ function syncGitPoll() {
  * @property {import('./api.js').ToolCall} [call]
  */
 
-/** The run whose pane is open in the main content area: {view, flow, ...refs}. */
+/**
+ * What is open in the main content area in place of the chat, if anything:
+ * `{kind: 'subagent', run, flow, status, meta}` or `{kind: 'diff', path}`. Both
+ * views are built by the same pane plumbing further down.
+ */
 let openPane = null;
 /** Ticks the elapsed clock of the runs still going. */
 let paneClock = null;
@@ -1101,13 +1108,13 @@ function updateSubagentRow(run) {
   row.meta.textContent = runMeta(run);
   row.badge.textContent = String(run.unread);
   row.badge.classList.toggle('hidden', !run.unread);
-  row.row.classList.toggle('open', !!openPane && openPane.view === run);
+  row.row.classList.toggle('open', !!openPane && openPane.run === run);
 }
 
 /** A run changed: patch its row, and its pane's header when it is the open one. */
 function touchRun(run) {
   updateSubagentRow(run);
-  if (openPane && openPane.view === run) updatePaneHead();
+  if (openPane && openPane.run === run) updatePaneHead();
 }
 
 /** Keep the elapsed time honest while a run is going; stop when none is. */
@@ -1155,7 +1162,7 @@ function renderRunEntry(flow, entry) {
  *  and onto its unread badge when the user is looking somewhere else. */
 function appendToRun(run, entry) {
   run.transcript.push(entry);
-  if (openPane && openPane.view === run) {
+  if (openPane && openPane.run === run) {
     renderRunEntry(openPane.flow, entry);
     autoScroll(openPane.flow);
   } else {
@@ -1185,7 +1192,7 @@ function onSubagentToolResult(id, result) {
     entry.call.status = result.status;
     applyToolSummary(entry.call, result.summary);
   }
-  if (openPane && openPane.view === run) onToolResult(openPane.flow, result);
+  if (openPane && openPane.run === run) onToolResult(openPane.flow, result);
   touchRun(run);
 }
 
@@ -1219,13 +1226,11 @@ function onSubagentDone(id, result) {
   syncPaneClock();
 }
 
-/* --- The pane --------------------------------------------------------------- */
+/* --- The subagent pane ------------------------------------------------------ */
 
 /**
  * Open one run's own view in the main content area: its messages and its tool
- * cards, streaming on while it runs. The chat is only hidden, never torn down,
- * so it keeps streaming behind this and is one press away — the back control,
- * or Escape.
+ * cards, streaming on while it runs.
  */
 function openSubagentPane(id) {
   const run = findRun(id);
@@ -1237,25 +1242,15 @@ function openSubagentPane(id) {
 
   const status = h('span', { class: 'pane-status' });
   const meta = h('span', { class: 'pane-meta' });
-  const head = h('header', { class: 'pane-head' },
-    h('div', { class: 'pane-head-row' },
-      h('button', {
-        class: 'btn quiet btn-sm pane-back', type: 'button', title: 'Back to the chat (Esc)',
-        onclick: () => closeSubagentPane(),
-      }, icon('chevronLeft', 'icon pane-back-icon'), 'Chat'),
-      icon('agents', 'icon pane-icon'),
+  const head = paneHead(
+    [icon('agents', 'icon pane-icon'),
       h('span', { class: 'pane-name' }, run.name),
       status,
       h('span', { class: 'pane-spacer' }),
-      meta),
+      meta],
     h('div', { class: 'pane-task' }, run.task));
 
-  const view = $('subagent-view');
-  view.replaceChildren(head, scroll);
-  view.classList.remove('hidden');
-  $('transcript').classList.add('hidden');
-  openPane = { view: run, flow, status, meta };
-
+  showPane({ kind: 'subagent', run, flow, status, meta }, 'subagent-pane', head, scroll);
   for (const entry of run.transcript) renderRunEntry(flow, entry);
   breakFlow(flow);
   run.unread = 0;
@@ -1264,27 +1259,140 @@ function openSubagentPane(id) {
   scroll.scrollTop = scroll.scrollHeight;
 }
 
-/** The pane's header: what the run is, and where it has got to. */
+/** The subagent pane's header: what the run is, and where it has got to. */
 function updatePaneHead() {
   if (!openPane) return;
-  const run = openPane.view;
+  const run = openPane.run;
   openPane.status.className = `pane-status ${run.status}`;
   openPane.status.textContent = RUN_STATUS[run.status];
   openPane.meta.textContent = runMeta(run);
 }
 
+/* ------------------------------------------------------------------------ */
+/* The pane: a second view where the chat is                                 */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * The pane's header: the one-press way back to the chat, then the view's own
+ * title row, and an optional line under it.
+ * @param {Array<Node|false|null>} row  what this view puts beside the back button
+ * @param {Node} [sub]                  a second header line
+ */
+function paneHead(row, sub) {
+  return h('header', { class: 'pane-head' },
+    h('div', { class: 'pane-head-row' },
+      h('button', {
+        class: 'btn quiet btn-sm pane-back', type: 'button', title: 'Back to the chat (Esc)',
+        onclick: () => closePane(),
+      }, icon('chevronLeft', 'icon pane-back-icon'), 'Chat'),
+      row),
+    sub);
+}
+
+/**
+ * Show `nodes` in the main content area, in place of the chat. The chat is only
+ * hidden, never torn down, so it keeps streaming behind the pane and is one
+ * press away — the back control, or Escape.
+ * @param {Object} pane  what is open; `closePane` and the stream handlers read it
+ * @param {string} cls   the view's own class ('subagent-pane', 'diff-pane')
+ */
+function showPane(pane, cls, ...nodes) {
+  const view = $('pane');
+  view.className = `pane ${cls}`;
+  view.replaceChildren(...nodes);
+  $('transcript').classList.add('hidden');
+  openPane = pane;
+}
+
 /** Back to the chat — the pane's DOM goes with it, so no two panes ever share
  *  a row or a tool group. */
-function closeSubagentPane() {
+function closePane() {
   if (!openPane) return;
-  const run = openPane.view;
+  const { run } = openPane;
   openPane = null;
-  const view = $('subagent-view');
+  const view = $('pane');
   view.replaceChildren();
-  view.classList.add('hidden');
+  view.className = 'pane hidden';
   $('transcript').classList.remove('hidden');
-  updateSubagentRow(run);
+  if (run) updateSubagentRow(run); // its row is no longer the open one
   autoScroll(chat, true);
+}
+
+/* ------------------------------------------------------------------------ */
+/* The diff pane: one changed file, against HEAD                             */
+/* ------------------------------------------------------------------------ */
+
+/** Line kind → the class that colors its row. */
+const DIFF_LINE_CLASS = { add: 'diff-add', del: 'diff-del', meta: 'diff-meta' };
+
+/**
+ * Open a changed file's diff where the chat is: every hunk of it against HEAD,
+ * staged and unstaged changes together — the same working-tree state the file's
+ * `+N -M` in the panel counts.
+ *
+ * The diff is a snapshot taken now, and the agent may edit the file a second
+ * later; clicking the row again refetches rather than reopening this one.
+ * @param {{path: string, additions: number, deletions: number}} file
+ */
+async function openDiffPane(file) {
+  const task = state.task;
+  if (!task) return;
+  const body = h('div', { class: 'diff-body' }, h('div', { class: 'diff-note' }, 'Loading…'));
+  const scroll = h('div', { class: 'pane-scroll' }, body);
+  const add = h('span', { class: 'add' }, `+${file.additions || 0}`);
+  const del = h('span', { class: 'del' }, `-${file.deletions || 0}`);
+  const head = paneHead([
+    icon('diff', 'icon pane-icon'),
+    h('span', { class: 'pane-path', title: file.path }, file.path),
+    h('span', { class: 'pane-spacer' }),
+    h('span', { class: 'diff-stat' }, add, del),
+  ]);
+
+  const pane = { kind: 'diff', path: file.path };
+  showPane(pane, 'diff-pane', head, scroll);
+  try {
+    const diff = await api.fileDiff(task, file.path);
+    if (openPane !== pane) return; // closed, or another file opened, while we fetched
+    // The counts the backend just measured, not the ones the row was showing:
+    // the poll behind the panel may be a few seconds old.
+    add.textContent = `+${diff.additions}`;
+    del.textContent = `-${diff.deletions}`;
+    renderDiff(body, diff);
+  } catch (err) {
+    if (openPane !== pane) return;
+    body.replaceChildren(h('div', { class: 'diff-note error' }, String((err && err.message) || err)));
+  }
+}
+
+/**
+ * The hunks, as plain rows: one element per line, no per-character work, so a
+ * 5000-line diff opens as fast as a 5-line one. Every case git can hand back
+ * says something — a binary file, a change with no lines in it (a mode, a
+ * rename), a diff too long to ship whole — rather than sitting on a spinner.
+ */
+function renderDiff(body, diff) {
+  if (diff.binary) {
+    body.replaceChildren(h('div', { class: 'diff-note' }, 'Binary file — no line diff to show.'));
+    return;
+  }
+  if (!diff.hunks.length) {
+    body.replaceChildren(h('div', { class: 'diff-note' },
+      'No line changes — git records this file as changed in its mode or name only.'));
+    return;
+  }
+  const rows = [];
+  let lines = 0;
+  for (const hunk of diff.hunks) {
+    rows.push(h('div', { class: 'diff-hunk' }, hunk.header));
+    for (const line of hunk.lines) {
+      rows.push(h('div', { class: `diff-line ${DIFF_LINE_CLASS[line.kind] || 'diff-ctx'}` }, line.text || ' '));
+      lines += 1;
+    }
+  }
+  if (diff.truncated) {
+    rows.push(h('div', { class: 'diff-note' }, `Truncated after ${lines.toLocaleString()} lines.`));
+  }
+  body.replaceChildren(...rows);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1583,9 +1691,6 @@ function renderComposer() {
   form.replaceChildren(
     input,
     h('div', { class: 'composer-row' },
-      // Wizard has no permission gating: this chip states the agent mode.
-      h('span', { class: 'chip ghost-chip mode-chip', title: 'Agent mode — GUI sessions run autonomously' },
-        icon('wand', 'icon chip-icon'), h('span', { class: 'chip-label' }, 'Sovereign')),
       h('span', { class: 'composer-spacer' }),
       modelAnchor,
       sendBtn,
@@ -2173,7 +2278,7 @@ function makeCallbacks(id) {
 async function selectTask(id, { reload = false } = {}) {
   const seq = ++selectSeq;
   closeStream();
-  closeSubagentPane();
+  closePane();
   if (gitPoll) {
     clearInterval(gitPoll);
     gitPoll = null;
@@ -2271,11 +2376,11 @@ async function init() {
       e.preventDefault();
       newChatHere();
     }
-    // One press back out of a subagent pane — unless an overlay is up, whose
-    // own Escape closes it first.
+    // One press back out of a pane — unless an overlay is up, whose own Escape
+    // closes it first.
     if (e.key === 'Escape' && openPane && !$('overlay-root').firstChild) {
       e.preventDefault();
-      closeSubagentPane();
+      closePane();
     }
   });
 

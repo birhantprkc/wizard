@@ -120,6 +120,7 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/providers/{name}/test", post(test_provider))
         .route("/api/workspaces", get(workspaces))
         .route("/api/git", get(git_status))
+        .route("/api/git/diff", get(git_diff))
         .route("/api/git/commit", post(git_commit))
         .route("/api/git/branches", get(git_branches))
         .route("/api/git/checkout", post(git_checkout))
@@ -784,6 +785,35 @@ async fn git_status(Query(query): Query<GitQuery>) -> Result<axum::Json<git::Git
         .await
         .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     Ok(axum::Json(status))
+}
+
+/// `GET /api/git/diff?cwd=...&path=...` query.
+#[derive(Debug, Deserialize)]
+struct GitDiffQuery {
+    cwd: String,
+    path: String,
+}
+
+/// `GET /api/git/diff`: one changed file's diff against HEAD (staged and
+/// unstaged together, matching the file's `+N -M` in `GET /api/git`).
+///
+/// `path` is client input, and [`git::diff`] takes only paths `GET /api/git`
+/// itself just listed for this workspace — anything else is a 400 rather than
+/// an argument handed to git.
+async fn git_diff(
+    Query(query): Query<GitDiffQuery>,
+) -> Result<axum::Json<git::FileDiff>, ApiError> {
+    let root = PathBuf::from(&query.cwd);
+    if !root.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "cwd '{}' is not a directory",
+            query.cwd
+        )));
+    }
+    let diff = git::diff(&root, &query.path)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    Ok(axum::Json(diff))
 }
 
 /// `POST /api/git/commit` body.

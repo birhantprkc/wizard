@@ -157,6 +157,21 @@ survivor. → the `GET /api/settings` shape.
 From `git status --porcelain=v1 -b` + `git diff --numstat` (+ staged, + untracked counted
 as additions, matching `git_diff_text` semantics; skip `.wizard/` paths).
 
+### GET /api/git/diff?cwd=/abs/path&path=src/gui/mod.rs
+```json
+{ "path": "src/gui/mod.rs", "status": "M", "additions": 10, "deletions": 2,
+  "binary": false, "truncated": false,
+  "hunks": [{ "header": "@@ -1,4 +1,6 @@ fn main()",
+              "lines": [{ "kind": "ctx|add|del|meta", "text": "+    let x = 1;" }] }] }
+```
+One changed file as the working tree stands against HEAD — staged *and* unstaged, so the
+diff matches the `+N -M` `GET /api/git` reports for it. Untracked files diff against
+`/dev/null` (all additions); binary files set `binary` and carry no hunks; a change with no
+lines in it (a mode, a rename) is honestly empty. `text` keeps git's leading marker.
+
+`path` is only ever a path `GET /api/git` itself just listed for this workspace — anything
+else is a 400, so nothing the client sends becomes a git argument.
+
 ### POST /api/git/commit
 `{ "cwd": "...", "message": "..." }` → `{ "ok": true, "sha": "..." }`. Runs `git add -A && git commit`.
 

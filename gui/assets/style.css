@@ -964,8 +964,9 @@ button.ghost-chip:hover {
   font-size: 11.5px;
 }
 
-/* The pane: the run's own transcript, where the chat's would be. */
-.subagent-view {
+/* The pane: a second view where the chat's transcript would be — a subagent
+   run's own transcript, or a changed file's diff. */
+.pane {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -1031,6 +1032,93 @@ button.ghost-chip:hover {
   font-size: 12.5px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+/* The diff pane: one changed file against HEAD. Wider than the chat's column —
+   a diff is code, and folding it into 720px only makes it harder to read. */
+.diff-pane .pane-head-row {
+  max-width: none;
+}
+.pane-path {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /* A long path elides at its front: the file name is the part you are here for. */
+  direction: rtl;
+  text-align: left;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.diff-stat {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.diff-stat .add {
+  color: var(--green);
+}
+.diff-stat .del {
+  color: var(--red);
+}
+
+/* Long lines scroll here, inside the view — the page itself never scrolls
+   sideways. Rows are `max-content` wide so their tint runs the whole line
+   rather than stopping at the fold. */
+.diff-body {
+  overflow-x: auto;
+  padding: 12px 0 140px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 4;
+}
+.diff-hunk,
+.diff-line {
+  width: max-content;
+  min-width: 100%;
+  padding: 0 32px;
+  white-space: pre;
+}
+.diff-hunk {
+  margin-top: 14px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline-soft);
+  color: var(--text-faint);
+}
+.diff-hunk:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+.diff-ctx {
+  color: var(--text-muted);
+}
+.diff-add {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 11%, transparent);
+}
+.diff-del {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 11%, transparent);
+}
+/* Git's own note about the file ("\ No newline at end of file"), not a line of it. */
+.diff-meta {
+  color: var(--text-faint);
+}
+/* Prose, not a diff line: what the file is (binary), what it is not (a line
+   change), or why there is nothing here. */
+.diff-note {
+  padding: 14px 32px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+.diff-note.error {
+  color: var(--red);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1372,12 +1460,8 @@ button.ghost-chip:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Composer: mode chip, model menu, stop button                         */
+/* Composer: model menu, stop button                                    */
 /* ------------------------------------------------------------------ */
-
-span.mode-chip {
-  cursor: default;
-}
 
 .spinner-btn {
   margin: 0 2px;
@@ -1513,17 +1597,26 @@ span.mode-chip {
 }
 
 .git-files {
-  margin: 2px 6px 6px 32px;
+  margin: 2px 6px 6px 26px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
 }
+/* A row you can open: same hover as the panel's other rows, because it does the
+   same kind of thing — it takes you somewhere. */
 .git-file {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
+  width: 100%;
+  padding: 3px 6px;
+  border-radius: var(--r-sm);
   font-size: 12px;
+  text-align: left;
+}
+.git-file:hover {
+  background: #1e1e22;
 }
 .git-file-path {
   font-family: var(--font-mono);

@@ -24,10 +24,10 @@
       <div class="content">
         <main id="conversation" class="conversation">
           <div id="transcript" class="transcript" aria-live="polite"></div>
-          <!-- One subagent run's own transcript, in place of the chat's, while
-               its pane is open. The chat is hidden, not torn down: it keeps
-               streaming behind this. -->
-          <div id="subagent-view" class="subagent-view hidden" aria-live="polite"></div>
+          <!-- A second view in place of the chat's: one subagent run's own
+               transcript, or one changed file's diff. The chat is hidden, not
+               torn down — it keeps streaming behind this. -->
+          <div id="pane" class="pane hidden" aria-live="polite"></div>
           <div class="composer-wrap">
             <form id="composer" class="composer"></form>
           </div>

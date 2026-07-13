@@ -11,6 +11,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+/// How many diff lines one file's [`diff`] hands back before it is cut off. A
+/// regenerated lockfile changes by tens of thousands of lines; past a few
+/// hundred screens nobody is reading it, and shipping all of it only stalls
+/// the tab that has to render it.
+const MAX_DIFF_LINES: usize = 20_000;
+
 /// Response shape of `GET /api/git`.
 #[derive(Debug, Serialize)]
 pub struct GitStatus {
@@ -90,6 +96,153 @@ pub async fn status(root: &Path) -> Result<GitStatus> {
     })
 }
 
+/// Response shape of `GET /api/git/diff`: one changed file, parsed into hunks
+/// so the client colors it without re-parsing a diff of its own.
+#[derive(Debug, Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    /// The same `M|A|D|?` alphabet [`GitFile`] uses.
+    pub status: char,
+    pub additions: u64,
+    pub deletions: u64,
+    /// Git found nothing to diff by lines (an image, a compiled artifact): no
+    /// hunks, and nothing to show but the fact itself.
+    pub binary: bool,
+    /// Cut off at [`MAX_DIFF_LINES`]; the hunks are as much as fits.
+    pub truncated: bool,
+    pub hunks: Vec<Hunk>,
+}
+
+/// One `@@` hunk.
+#[derive(Debug, Serialize)]
+pub struct Hunk {
+    /// Git's own `@@ -1,4 +1,6 @@ fn main()` line, section heading included.
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line of a hunk. `text` keeps git's leading marker (`+`, `-`, or the
+/// context space), so a line copied out of the view is the diff line git wrote.
+#[derive(Debug, Serialize)]
+pub struct DiffLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+
+/// What a hunk line is, tagged for the client rather than left as a character
+/// it would have to sniff.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineKind {
+    Add,
+    Del,
+    Ctx,
+    /// `\ No newline at end of file` — git's note about the file, not a line of it.
+    Meta,
+}
+
+/// The diff of one changed file in `root`: the working tree as it stands
+/// against HEAD, staged and unstaged changes together — which is exactly what
+/// the `+N -M` beside the file in the git panel counts.
+///
+/// `path` arrives from the client, so it never reaches git until [`status`]
+/// vouches for it: only a path git itself just reported as changed in this
+/// workspace can be asked for. That refuses `../`, absolute paths and
+/// `-`-prefixed pseudo-flags without a special case for any of them.
+pub async fn diff(root: &Path, path: &str) -> Result<FileDiff> {
+    let file = status(root)
+        .await?
+        .files
+        .into_iter()
+        .find(|file| file.path == path)
+        .with_context(|| format!("'{path}' is not a changed file in this workspace"))?;
+
+    let text = if file.status == '?' {
+        // An untracked file is in neither HEAD nor the index, so `git diff` has
+        // nothing to say about it — yet a brand new file is where seeing the
+        // diff matters most. Diff it against nothing instead. `--no-index`
+        // implies `--exit-code`, and "the files differ" (1) is the whole point
+        // of asking, so it is not a failure.
+        let args = ["diff", "--no-index", "--", "/dev/null", &file.path];
+        git_output_ok(root, &args, &[0, 1]).await?
+    } else {
+        let base = diff_base(root).await?;
+        git_output(root, &["diff", &base, "--", &file.path]).await?
+    };
+
+    let (hunks, binary, truncated) = parse_diff(&text);
+    Ok(FileDiff {
+        path: file.path,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        binary,
+        truncated,
+        hunks,
+    })
+}
+
+/// What [`diff`] compares the working tree against: `HEAD`, or — in a repo
+/// whose first commit is not written yet — the empty tree. An unborn HEAD is
+/// not a revision, and `git diff HEAD` fails on it rather than diffing, which
+/// would make a staged file in a fresh `git init` unopenable.
+async fn diff_base(root: &Path) -> Result<String> {
+    if git_output(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await
+        .is_ok()
+    {
+        return Ok("HEAD".to_string());
+    }
+    // Asked for rather than hardcoded: the empty tree's id depends on the
+    // repo's hash algorithm (sha1 and sha256 repos disagree about it).
+    let empty = git_output(root, &["hash-object", "-t", "tree", "/dev/null"]).await?;
+    Ok(empty.trim().to_string())
+}
+
+/// Parse a one-file unified diff into hunks.
+///
+/// Everything before the first `@@` is git's preamble — the `diff --git`,
+/// `index`, `---`/`+++` and rename headers — which is not part of any hunk and
+/// which the client does not render. A binary file has no hunks at all: git
+/// says so in the preamble and stops, and that is what `binary` reports.
+fn parse_diff(text: &str) -> (Vec<Hunk>, bool, bool) {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut binary = false;
+    let mut truncated = false;
+    let mut count = 0usize;
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            hunks.push(Hunk {
+                header: line.to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        let Some(hunk) = hunks.last_mut() else {
+            if line.starts_with("Binary files") || line.starts_with("GIT binary patch") {
+                binary = true;
+            }
+            continue;
+        };
+        if count >= MAX_DIFF_LINES {
+            truncated = true;
+            break;
+        }
+        let kind = match line.as_bytes().first() {
+            Some(b'+') => LineKind::Add,
+            Some(b'-') => LineKind::Del,
+            Some(b'\\') => LineKind::Meta,
+            _ => LineKind::Ctx,
+        };
+        hunk.lines.push(DiffLine {
+            kind,
+            text: line.to_string(),
+        });
+        count += 1;
+    }
+    (hunks, binary, truncated)
+}
+
 /// `POST /api/git/commit`: stage everything and commit, returning the new
 /// HEAD sha. Errors surface git's own stderr (nothing to commit, missing
 /// identity, ...).
@@ -160,13 +313,24 @@ pub async fn checkout(root: &Path, branch: &str, create: bool) -> Result<String>
 /// Run `git <args>` in `root` and return stdout; a nonzero exit is an error
 /// carrying git's stderr.
 async fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    git_output_ok(root, args, &[0]).await
+}
+
+/// [`git_output`], but with the exit codes that count as success spelled out:
+/// `git diff --no-index` reports "the files differ" as a 1, which is the
+/// ordinary outcome of diffing a new file rather than a failure.
+async fn git_output_ok(root: &Path, args: &[&str], codes: &[i32]) -> Result<String> {
     let output = tokio::process::Command::new("git")
         .args(args)
         .current_dir(root)
         .output()
         .await
         .context("running git")?;
-    if !output.status.success() {
+    if !output
+        .status
+        .code()
+        .is_some_and(|code| codes.contains(&code))
+    {
         anyhow::bail!(
             "git {} failed: {}",
             args.join(" "),
@@ -351,6 +515,142 @@ mod tests {
 
         assert!(checkout(root, "", false).await.is_err());
         assert!(checkout(root, "--force", false).await.is_err());
+    }
+
+    /// Every line of the diff, hunks flattened, as `(kind, text)`.
+    fn diff_lines(diff: &FileDiff) -> Vec<(LineKind, &str)> {
+        diff.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn diff_shows_staged_and_unstaged_changes_together() {
+        let dir = repo().await;
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        git_output(root, &["add", "a.txt"]).await.unwrap();
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let diff = diff(root, "a.txt").await.unwrap();
+        assert_eq!(diff.status, 'M');
+        assert!(!diff.binary && !diff.truncated);
+        assert!(diff.hunks[0].header.starts_with("@@"), "{:?}", diff.hunks);
+        assert_eq!(
+            diff_lines(&diff),
+            vec![
+                (LineKind::Ctx, " one"),
+                (LineKind::Add, "+two"),
+                (LineKind::Add, "+three"),
+            ],
+            "the staged line and the unstaged one, in one diff"
+        );
+        // The panel's `+N -M` for this file counts both too: the diff the row
+        // opens is the diff the row promised.
+        assert_eq!((diff.additions, diff.deletions), (2, 0));
+    }
+
+    #[tokio::test]
+    async fn diff_shows_an_untracked_file_as_all_additions() {
+        let dir = repo().await;
+        let root = dir.path();
+        std::fs::write(root.join("new.txt"), "alpha\nbeta\n").unwrap();
+
+        let diff = diff(root, "new.txt").await.unwrap();
+        assert_eq!(diff.status, '?');
+        assert_eq!((diff.additions, diff.deletions), (2, 0));
+        assert_eq!(
+            diff_lines(&diff),
+            vec![(LineKind::Add, "+alpha"), (LineKind::Add, "+beta")]
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_shows_a_deleted_file_as_all_deletions() {
+        let dir = repo().await;
+        let root = dir.path();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+
+        let diff = diff(root, "a.txt").await.unwrap();
+        assert_eq!(diff.status, 'D');
+        assert_eq!((diff.additions, diff.deletions), (0, 1));
+        assert_eq!(diff_lines(&diff), vec![(LineKind::Del, "-one")]);
+    }
+
+    #[tokio::test]
+    async fn diff_names_binary_files_instead_of_dumping_them() {
+        let dir = repo().await;
+        let root = dir.path();
+        std::fs::write(root.join("logo.bin"), [0u8, 1, 2, 3]).unwrap();
+        git_output(root, &["add", "-A"]).await.unwrap();
+        git_output(root, &["commit", "-qm", "binary"])
+            .await
+            .unwrap();
+        std::fs::write(root.join("logo.bin"), [0u8, 9, 9, 9, 9]).unwrap();
+        std::fs::write(root.join("new.bin"), [0u8, 7]).unwrap();
+
+        let tracked = diff(root, "logo.bin").await.unwrap();
+        assert!(tracked.binary);
+        assert!(tracked.hunks.is_empty());
+
+        let untracked = diff(root, "new.bin").await.unwrap();
+        assert!(untracked.binary, "a new binary file is binary too");
+        assert!(untracked.hunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_refuses_paths_the_workspace_does_not_report_as_changed() {
+        let dir = repo().await;
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+
+        // Nothing the client sends reaches git unless `status` just named it:
+        // an escape out of the workspace, an absolute path, a flag in path's
+        // clothing, and a file that simply is not changed all stop here.
+        for path in [
+            "../outside.txt",
+            "/etc/passwd",
+            "-p",
+            "--output=/tmp/pwned",
+            "a.txt/../a.txt",
+            "b.txt",
+        ] {
+            let err = diff(root, path).await.unwrap_err().to_string();
+            assert!(err.contains("not a changed file"), "{path}: {err}");
+        }
+        assert!(!diff(root, "a.txt").await.unwrap().hunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_huge_diff_is_truncated_rather_than_shipped_whole() {
+        let dir = repo().await;
+        let root = dir.path();
+        let body: String = (0..MAX_DIFF_LINES + 500)
+            .map(|i| format!("{i}\n"))
+            .collect();
+        std::fs::write(root.join("lock.txt"), body).unwrap();
+
+        let diff = diff(root, "lock.txt").await.unwrap();
+        assert!(diff.truncated);
+        assert_eq!(diff_lines(&diff).len(), MAX_DIFF_LINES);
+    }
+
+    /// A change git records but has no lines for: the file's diff is honestly
+    /// empty rather than an error the client would have to interpret.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_of_a_mode_only_change_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo().await;
+        let root = dir.path();
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(root.join("a.txt"), perms).unwrap();
+
+        let diff = diff(root, "a.txt").await.unwrap();
+        assert_eq!((diff.additions, diff.deletions), (0, 0));
+        assert!(diff.hunks.is_empty() && !diff.binary);
     }
 
     #[test]
