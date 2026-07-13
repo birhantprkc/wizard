@@ -5043,11 +5043,15 @@ fn load_skill_roots() -> Vec<Skill> {
 /// spawner layered on top. The spawn tool captures the base registry
 /// (without itself) so subagents cannot recurse, plus the lifecycle `hooks`
 /// so subagent tool calls fire the same hooks as the parent's.
+/// Returns the registry and the spawn tool's shared model slot, which the
+/// caller must hand to `Agent::bind_subagent_model` — otherwise subagents read
+/// the *configured* model and quietly ignore `/model`. Every registry rebuild
+/// mints a fresh spawn tool, so every rebuild has to rebind.
 async fn build_registry(
     manager: &McpManager,
     client: &Arc<dyn LlmProvider>,
     hooks: &Arc<HookEngine>,
-) -> Result<ToolRegistry> {
+) -> Result<(ToolRegistry, subagent::SharedActiveModel)> {
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
         Ok(dir) => {
@@ -5066,13 +5070,15 @@ async fn build_registry(
     let subagent_configs = subagent::available_configs(&subagents_dir);
     let base = Arc::new(base);
     let mut registry = subagent::scoped_registry(&base, None);
-    registry.register(Arc::new(subagent::SpawnSubagentTool::new(
+    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
         subagent_configs,
         Arc::clone(client),
         Arc::clone(&base),
         Arc::clone(hooks),
-    )));
-    Ok(registry)
+    ));
+    let subagent_model = spawn_tool.model_handle();
+    registry.register(spawn_tool);
+    Ok((registry, subagent_model))
 }
 
 /// Attach the config-dependent tools (evolve, publish) to a registry built
@@ -5128,7 +5134,7 @@ async fn build_agent(
         project_root.to_path_buf(),
         session.id.clone(),
     ));
-    let mut registry = build_registry(manager, client, &hooks).await?;
+    let (mut registry, subagent_model) = build_registry(manager, client, &hooks).await?;
     attach_config_tools(&mut registry, config);
     let model = config.active().model;
     let native_tools = match client.supports_native_tools(&model).await {
@@ -5151,6 +5157,7 @@ async fn build_agent(
     // The TUI is the one surface that drains queued slash commands, so its
     // agent is the only one where `run_command` does anything.
     agent.set_command_dispatch(true);
+    agent.bind_subagent_model(subagent_model);
     Ok(agent)
 }
 
@@ -6930,10 +6937,11 @@ impl CommandContext<'_> {
             return;
         };
         match build_registry(&manager, self.client, &hooks).await {
-            Ok(registry) => {
+            Ok((registry, subagent_model)) => {
                 let tool_count = registry.len();
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
+                    agent.bind_subagent_model(subagent_model);
                     agent.set_skills(self.skills.clone());
                 }
                 self.app.notice(format!(
@@ -6960,13 +6968,14 @@ impl CommandContext<'_> {
         };
         let manager = self.manager.lock().await;
         match build_registry(&manager, self.client, &hooks).await {
-            Ok(registry) => {
+            Ok((registry, subagent_model)) => {
                 // Success is silent: tools simply start working and the
                 // "connecting tools…" indicator disappears. A success notice
                 // here is tool-flex narration and, emitted ~2s in, would float
                 // above the user's first message as if it were a reply to it.
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
+                    agent.bind_subagent_model(subagent_model);
                 }
             }
             Err(err) => self.app.notice(format!(
@@ -7015,10 +7024,12 @@ impl CommandContext<'_> {
             .agent_slot
             .as_ref()
             .map(|agent| Arc::clone(agent.hooks()))
-            && let Ok(registry) = build_registry(&manager, self.client, &hooks).await
+            && let Ok((registry, subagent_model)) =
+                build_registry(&manager, self.client, &hooks).await
             && let Some(agent) = self.agent_slot.as_mut()
         {
             agent.set_registry(registry);
+            agent.bind_subagent_model(subagent_model);
             agent.set_skills(self.skills.clone());
         }
         drop(manager);

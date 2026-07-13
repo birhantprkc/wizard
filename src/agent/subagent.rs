@@ -1006,6 +1006,45 @@ mod tests {
         assert_eq!(configs[0].description, "custom");
     }
 
+    /// The spawn tool reads the parent's live model out of the slot handed to
+    /// `Agent::bind_subagent_model`. A surface that builds the tool and drops
+    /// the handle strands its subagents on the *configured* model, silently
+    /// ignoring `/model` — which is what the TUI did until its registry was
+    /// made to hand the handle back.
+    #[tokio::test]
+    async fn a_bound_model_handle_is_what_subagents_run_on() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![vec![chunk("done", false, true)]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let tool = SpawnSubagentTool::new(
+            vec![worker()],
+            Arc::clone(&client),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(HookEngine::new(Vec::new(), tmp.0.clone(), "test".into())),
+        );
+
+        // Nothing bound: the slot is empty and the sub-loop falls back to the
+        // configured model.
+        assert!(tool.active_model().is_none());
+
+        // Bound, then written through by a `/model` switch.
+        let handle = tool.model_handle();
+        *handle.write().unwrap() = Some("switched-model".to_string());
+
+        tool.execute(
+            serde_json::json!({ "subagent": worker().name, "task": "report" }),
+            &ToolContext::new(&tmp.0),
+        )
+        .await
+        .expect("spawn ok");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].model, "switched-model",
+            "the subagent ran on the parent's switched model, not the configured one"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_skips_thinking_chunks_and_uses_the_model_override() {
         let tmp = TempDir::new();

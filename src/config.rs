@@ -261,41 +261,6 @@ impl GatewayConfig {
     }
 }
 
-/// Browser-GUI settings (`[gui]` in `config.toml`), edited from the GUI's own
-/// Settings page.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuiConfig {
-    /// Tool calls one GUI turn may make, as a plain count the Settings page
-    /// edits (0 is [`StepBudget::UNLIMITED`], like the top-level budget).
-    /// Separate from the top-level `max_steps` (which the TUI uses): a GUI chat
-    /// runs with nobody at a terminal to nudge it along, so it gets a finite
-    /// budget of its own rather than the top-level unlimited default.
-    #[serde(default = "GuiConfig::default_max_steps")]
-    pub max_steps: u32,
-}
-
-impl GuiConfig {
-    /// The autonomous budget: the same floor a sovereign turn is held to.
-    const DEFAULT_MAX_STEPS: u32 = StepBudget::SOVEREIGN_FLOOR;
-
-    fn default_max_steps() -> u32 {
-        Self::DEFAULT_MAX_STEPS
-    }
-
-    /// This budget as the agent takes it.
-    pub fn step_budget(&self) -> StepBudget {
-        StepBudget::new(self.max_steps)
-    }
-}
-
-impl Default for GuiConfig {
-    fn default() -> Self {
-        Self {
-            max_steps: Self::default_max_steps(),
-        }
-    }
-}
-
 /// Cosmetic TUI settings (`[ui]` in `config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -699,9 +664,10 @@ pub struct Config {
     /// `/effort`. `None` leaves the provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Agent loop limit per turn. `0` (the default) is unlimited: a turn runs
-    /// until the model stops calling tools. A positive value caps the turn;
-    /// sovereign raises a cap below its floor, since no one is at the prompt.
+    /// Agent loop limit per turn, on every surface — TUI, headless, gateway,
+    /// GUI. `0` (the default) is unlimited: a turn runs until the model stops
+    /// calling tools. A positive value caps the turn; sovereign raises a cap
+    /// below its floor, since no one is at the prompt.
     pub max_steps: StepBudget,
     /// Perpetual sovereign operation: keep working/self-directing/self-improving
     /// until stopped.
@@ -746,9 +712,6 @@ pub struct Config {
     /// Cosmetic TUI settings (spinner verbs).
     #[serde(default)]
     pub ui: UiConfig,
-    /// Browser-GUI settings (`wizard gui`).
-    #[serde(default)]
-    pub gui: GuiConfig,
     /// Native web tool settings (`web_fetch` / `web_search`).
     #[serde(default)]
     pub web: WebConfig,
@@ -802,7 +765,6 @@ impl Default for Config {
             active_provider: None,
             gateway: GatewayConfig::default(),
             ui: UiConfig::default(),
-            gui: GuiConfig::default(),
             web: WebConfig::default(),
             checkpoints: CheckpointConfig::default(),
             fleet: FleetConfig::default(),
@@ -878,6 +840,14 @@ impl Config {
     /// per session id (`crate::images::ImageStore`).
     pub fn images_dir() -> Result<PathBuf> {
         Ok(Self::wizard_dir()?.join("images"))
+    }
+
+    /// `~/.wizard/attachments/` — non-image files a user attached, one
+    /// directory per session id. Images do not land here: they belong to the
+    /// content-addressed [`images_dir`](Self::images_dir), which is the only
+    /// directory the GUI will serve an image back out of.
+    pub fn attachments_dir() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("attachments"))
     }
 
     /// `~/.wizard/tools/` — agent-authored scripted tools.
@@ -1380,7 +1350,6 @@ mod tests {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
                 vim: true,
             },
-            gui: GuiConfig { max_steps: 250 },
             web: WebConfig {
                 fetch_max_bytes: 250_000,
                 allow_local: true,
@@ -2110,6 +2079,21 @@ usd_per_mtok_out = 15.0
         assert!(
             !raw.contains("auto_approve"),
             "deprecated key is not written back: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_gui_step_budget_still_loads() {
+        // The GUI used to keep a budget of its own (`[gui] max_steps`). It now
+        // runs on the shared one like every other surface, and a config still
+        // carrying the old section must load — not fail — and not gain it back.
+        let config: Config =
+            toml::from_str("max_steps = 12\n[gui]\nmax_steps = 250\n").expect("old section parses");
+        assert_eq!(config.max_steps, StepBudget::new(12));
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("[gui]"),
+            "the section is not written back: {raw}"
         );
     }
 

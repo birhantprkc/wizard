@@ -147,7 +147,9 @@ with dead air beneath it.
 - Composer sends follow-up user messages to the running session; the model picker reloads
   `/api/models` each time it opens (providers change, local backends come up) and offers
   "Manage providers…" when there is nothing to pick.
-- Chats run sovereign (no terminal to prompt at) on `[gui] max_steps`, which Settings edits.
+- Chats run on the user's own config — same mode, same `max_steps` (unlimited by default) as
+  the TUI, which Settings edits. The GUI is that agent on another surface, not a reduced one:
+  plan and interview gates ask over the WebSocket where the TUI asks at the prompt.
 - Git card: live diffstat of the task's workspace, current branch, per-file diffs. Committing
   is the agent's job, not a button's.
 - Goal/Progress: map to wizard's plan/todo state if available (plan.md / todo tool), else hide gracefully.

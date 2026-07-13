@@ -80,9 +80,20 @@ pub enum Frame {
     Todo {
         items: Vec<TodoRow>,
     },
+    /// Session-lifetime token totals, as the backend reported them. Every model
+    /// call adds to these; they are what `/cost` bills on.
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
+    },
+    /// Tokens that will load into the *next* model call, against the active
+    /// model's context window when the provider names one. Not a running total —
+    /// compaction and `/clear` make it fall — so it is a separate frame from
+    /// [`Frame::Usage`] rather than a field on it.
+    Context {
+        tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
     },
     State {
         state: &'static str,
@@ -216,11 +227,36 @@ fn done_reason(reason: DoneReason, error_seen: bool, cancel_requested: bool) -> 
     }
 }
 
-/// One queued turn: the user text plus an optional model override.
-#[derive(Debug)]
+/// One queued turn: the user text, an optional model override, and the
+/// attachments the client uploaded for it. Both path lists have already been
+/// verified to sit inside the stores wizard wrote them to
+/// ([`crate::gui::server::verify_attachments`]) — the worker takes them as
+/// given.
+#[derive(Debug, Default)]
 pub struct TurnRequest {
     pub text: String,
     pub model: Option<String>,
+    /// Images to attach to the user message (the vision path).
+    pub images: Vec<PathBuf>,
+    /// Non-image attachments. Appended to the text as `@/abs/path` tokens, so
+    /// the `@file` expansion every surface shares is what reads them.
+    pub files: Vec<PathBuf>,
+}
+
+/// One queued server-side slash command (`GET /api/commands`, `where: "server"`).
+#[derive(Debug)]
+pub struct CommandRequest {
+    pub name: String,
+    pub args: String,
+}
+
+/// What the worker takes off its queue. Commands and turns share one channel,
+/// and one slot, because both need `&mut Agent`: `/compact` running beside a
+/// turn would be two mutable borrows of the same conversation.
+#[derive(Debug)]
+enum WorkerRequest {
+    Turn(TurnRequest),
+    Command(CommandRequest),
 }
 
 /// State shared between a task's worker, the WebSocket handler, and the
@@ -276,6 +312,16 @@ struct SharedState {
     /// [`TaskShared::finish_turn`] ends it failed rather than idle.
     turn_failed: bool,
     model: String,
+    /// Context window of the active model, when the provider names one. Read
+    /// once per model (the probe can be an HTTP round trip) and carried on
+    /// every [`Frame::Context`]; `None` stays absent from the frame rather
+    /// than becoming a guessed default.
+    context_window: Option<u32>,
+    /// The last context reading this task emitted. Kept so a client attaching
+    /// between turns is told the size of the history it is looking at: the
+    /// reading is otherwise only produced *during* a turn, and the replay
+    /// buffer it lived in is cleared at the start of the next one.
+    context_tokens: Option<u64>,
 }
 
 /// One subagent run that has not reported back yet. A background run outlives
@@ -292,8 +338,20 @@ struct LiveRun {
     frame: String,
 }
 
+impl SharedState {
+    /// Whether the replay this attach is about to send already carries a
+    /// context reading — in which case the snapshot would only duplicate it.
+    fn buffer_carries_context(&self) -> bool {
+        self.turn_active
+            && self
+                .buffer
+                .iter()
+                .any(|frame| frame.starts_with(r#"{"type":"context""#))
+    }
+}
+
 impl TaskShared {
-    fn new(id: String, cwd: PathBuf, model: String) -> Arc<Self> {
+    pub(crate) fn new(id: String, cwd: PathBuf, model: String) -> Arc<Self> {
         Arc::new(Self {
             id,
             cwd,
@@ -316,6 +374,8 @@ impl TaskShared {
                 turn_cancel_requested: false,
                 turn_failed: false,
                 model,
+                context_window: None,
+                context_tokens: None,
             }),
         })
     }
@@ -334,6 +394,18 @@ impl TaskShared {
 
     fn set_model(&self, model: &str) {
         self.lock().model = model.to_string();
+    }
+
+    fn set_context_window(&self, window: Option<u32>) {
+        self.lock().context_window = window;
+    }
+
+    /// Emit a [`Frame::Context`] for `tokens` against the active model's window.
+    fn push_context(&self, tokens: u64) {
+        let mut state = self.lock();
+        let window = state.context_window;
+        state.context_tokens = Some(tokens);
+        push_locked(&mut state, Frame::Context { tokens, window });
     }
 
     fn has_subscriber(&self) -> bool {
@@ -444,6 +516,15 @@ impl TaskShared {
                 state: state.task_state.as_str(),
             });
             let _ = tx.send(current);
+        }
+        // The meter is a property of the conversation, not of the turn that
+        // last moved it, so a client attaching between turns is told the
+        // reading rather than showing nothing until the next one lands.
+        if !state.buffer_carries_context()
+            && let Some(tokens) = state.context_tokens
+        {
+            let window = state.context_window;
+            let _ = tx.send(serialize(&Frame::Context { tokens, window }));
         }
         for live in &state.live_runs {
             if replayed_turn != Some(live.turn) {
@@ -566,14 +647,24 @@ impl TaskShared {
             AgentEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
-            } => self.push(Frame::Usage {
-                prompt_tokens,
-                completion_tokens,
-            }),
-            // The TUI's status-bar estimate of what the next turn will cost.
-            // The GUI reports real usage instead (`Frame::Usage`), so there is
-            // nothing on the protocol for this and nothing to say.
-            AgentEvent::ContextSize { .. } => {}
+            } => {
+                self.push(Frame::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                });
+                // The prompt this call actually ran on *is* the context that
+                // will load into the next one — it is the number
+                // `Agent::context_tokens` reports right after this event, and
+                // the one the TUI's meter shows. A provider that reported only
+                // completion tokens sends 0 here, which is not a context size.
+                if prompt_tokens > 0 {
+                    self.push_context(prompt_tokens);
+                }
+            }
+            // What the next model call will load, re-estimated after the
+            // history shrank (`/clear`, compaction) and the last reported
+            // prompt size went stale.
+            AgentEvent::ContextSize { tokens } => self.push_context(tokens),
             AgentEvent::PlanReady { plan, respond } => {
                 let mut state = self.lock();
                 push_locked(&mut state, Frame::PlanReady { plan });
@@ -804,7 +895,7 @@ pub struct TaskManager {
 
 struct ManagedTask {
     shared: Arc<TaskShared>,
-    turn_tx: mpsc::UnboundedSender<TurnRequest>,
+    turn_tx: mpsc::UnboundedSender<WorkerRequest>,
     last_used: Instant,
 }
 
@@ -835,8 +926,15 @@ impl TaskManager {
         let id = session.id.clone();
         self.spawn(id.clone(), cwd.to_path_buf(), session);
         if let Some(text) = prompt {
-            self.submit_turn(&id, TurnRequest { text, model })
-                .map_err(|message| anyhow::anyhow!(message))?;
+            self.submit_turn(
+                &id,
+                TurnRequest {
+                    text,
+                    model,
+                    ..TurnRequest::default()
+                },
+            )
+            .map_err(|message| anyhow::anyhow!(message))?;
         }
         Ok(id)
     }
@@ -870,6 +968,18 @@ impl TaskManager {
     /// `user_message` while one runs is refused with the protocol's error
     /// text.
     pub fn submit_turn(&self, id: &str, request: TurnRequest) -> Result<(), String> {
+        self.submit(id, WorkerRequest::Turn(request))
+    }
+
+    /// Queue one server-side slash command on task `id`. It takes the same
+    /// slot a turn does — it mutates the same conversation — so a command
+    /// arriving mid-turn is refused rather than queued behind it: the client
+    /// asked for something to happen now, and "in four minutes" is not that.
+    pub fn submit_command(&self, id: &str, request: CommandRequest) -> Result<(), String> {
+        self.submit(id, WorkerRequest::Command(request))
+    }
+
+    fn submit(&self, id: &str, request: WorkerRequest) -> Result<(), String> {
         let mut tasks = self.lock();
         let Some(task) = tasks.get_mut(id) else {
             return Err(format!("task '{id}' is not live"));
@@ -950,15 +1060,13 @@ fn evict_lru(tasks: &mut HashMap<String, ManagedTask>) {
     }
 }
 
-/// Per-task agent config: sovereign posture (there is no terminal behind the
-/// GUI to prompt at) on the GUI's own step budget (`[gui] max_steps`, which
-/// the Settings page edits), plus the optional model override — a configured
+/// Per-task agent config: the user's own config, unchanged — same mode, same
+/// step budget as the TUI, because the GUI is that agent on another surface and
+/// not a reduced one. The only per-task edit is the model override: a configured
 /// provider name switches the active provider, anything else is a model tag on
 /// the active provider.
 fn agent_config(base: &Config, model: Option<&str>) -> Config {
     let mut config = base.clone();
-    config.mode = Mode::Sovereign;
-    config.max_steps = config.gui.step_budget();
     if let Some(want) = model {
         if config.providers.iter().any(|p| p.name == want) {
             config.active_provider = Some(want.to_string());
@@ -977,13 +1085,13 @@ fn agent_config(base: &Config, model: Option<&str>) -> Config {
 
 /// The dedicated worker for one task: owns the agent (built on the first
 /// turn so server startup never needs a reachable provider) and runs queued
-/// turns one at a time, draining each turn's events into `shared`. Ends
-/// when the manager drops the turn sender (eviction or shutdown).
+/// turns and commands one at a time, draining each turn's events into `shared`.
+/// Ends when the manager drops the turn sender (eviction or shutdown).
 async fn run_worker(
     store: Arc<ConfigStore>,
     shared: Arc<TaskShared>,
     session: Session,
-    mut requests: mpsc::UnboundedReceiver<TurnRequest>,
+    mut requests: mpsc::UnboundedReceiver<WorkerRequest>,
 ) {
     let mut agent: Option<Agent> = None;
     let mut task_config: Option<Config> = None;
@@ -993,6 +1101,10 @@ async fn run_worker(
         // Read the config per turn: a build that failed for want of a provider
         // must succeed on the next turn once Settings has configured one.
         let base_config = store.current();
+        let model_override = match &request {
+            WorkerRequest::Turn(turn) => turn.model.clone(),
+            WorkerRequest::Command(_) => None,
+        };
 
         // The agent is taken out for the turn and put back when it ends: an
         // agent that has not been built yet is built here (the session is
@@ -1001,7 +1113,7 @@ async fn run_worker(
         // first turn's override is already baked into its config.
         let mut agent_for_turn = match agent.take() {
             Some(mut live) => {
-                if let Some(model) = request.model.as_deref()
+                if let Some(model) = model_override.as_deref()
                     && model != shared.model()
                 {
                     let config = task_config.as_ref().unwrap_or(&base_config);
@@ -1010,7 +1122,7 @@ async fn run_worker(
                 live
             }
             None => {
-                let config = agent_config(&base_config, request.model.as_deref());
+                let config = agent_config(&base_config, model_override.as_deref());
                 match build_headless_agent_for_session(&config, &shared.cwd, session.clone()).await
                 {
                     Ok(mut built) => {
@@ -1022,6 +1134,7 @@ async fn run_worker(
                         }
                         shared.set_cancel(built.cancel_handle());
                         shared.set_model(&config.active().model);
+                        read_context_window(&config, &config.active().model, &shared).await;
                         fire_start_hooks(&mut built, &shared).await;
                         task_config = Some(config);
                         built
@@ -1038,29 +1151,183 @@ async fn run_worker(
             }
         };
 
-        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
-        // Drain events concurrently with the turn: the turn owns the sender
-        // (dropped on completion, ending the collector), the collector owns
-        // the receiver — disjoint borrows, same pattern as the gateway.
-        let collector = async {
-            while let Some(event) = events_rx.recv().await {
-                shared.handle_event(event);
+        match request {
+            WorkerRequest::Turn(turn) => {
+                run_turn(&mut agent_for_turn, turn, &shared).await;
+                shared.finish_turn(false);
             }
-        };
-        let (result, ()) =
-            tokio::join!(agent_for_turn.run_turn(&request.text, events_tx), collector);
-        if let Err(err) = result {
-            // The turn already emitted `error` + `done` frames; the task
-            // itself stays usable.
-            tracing::warn!("gui task {}: turn failed: {err:#}", shared.id);
+            WorkerRequest::Command(command) => {
+                let config = task_config.as_ref().unwrap_or(&base_config);
+                run_command(&mut agent_for_turn, command, config, &shared).await;
+                shared.finish_turn(false);
+            }
         }
         agent = Some(agent_for_turn);
-        shared.finish_turn(false);
     }
 
     if let Some(agent) = &agent {
         agent.fire_session_end(None).await;
     }
+}
+
+/// Run one user turn on `agent`, streaming its events out as frames.
+///
+/// The text goes through [`crate::commands::preprocess`] first — the one
+/// pipeline every surface shares — so a GUI message gets the same `@file`
+/// references and the same custom `.wizard/commands/*.md` commands a TUI
+/// message does. Non-image attachments join it as `@`-tokens, which is how
+/// their contents reach the model: no second file-reading path.
+async fn run_turn(agent: &mut Agent, request: TurnRequest, shared: &TaskShared) {
+    let prompt = turn_prompt(request, &shared.cwd);
+
+    let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
+    // Drain events concurrently with the turn: the turn owns the sender
+    // (dropped on completion, ending the collector), the collector owns
+    // the receiver — disjoint borrows, same pattern as the gateway.
+    let collector = async {
+        while let Some(event) = events_rx.recv().await {
+            shared.handle_event(event);
+        }
+    };
+    let (result, ()) = tokio::join!(
+        agent.run_turn_with_images(&prompt.text, prompt.images, events_tx),
+        collector
+    );
+    if let Err(err) = result {
+        // The turn already emitted `error` + `done` frames; the task itself
+        // stays usable.
+        tracing::warn!("gui task {}: turn failed: {err:#}", shared.id);
+    }
+    // Not every provider reports token counts, and `Usage` is the only thing
+    // that otherwise moves the meter — so a turn against one that stays quiet
+    // would leave it blank. `context_tokens` falls back to an estimate of the
+    // history, which is what the TUI status bar shows in the same situation.
+    shared.push_context(agent.context_tokens());
+}
+
+/// What the agent is actually asked: the message with its attached files as
+/// `@/abs/path` tokens, run through the shared preprocessing pipeline (custom
+/// `/command` expansion, then `@file` references), and the images to attach.
+///
+/// A path with whitespace in it would not survive `@`-tokenization, which is why
+/// the upload route sanitizes names before writing.
+fn turn_prompt(request: TurnRequest, cwd: &Path) -> crate::commands::Preprocessed {
+    let mut input = request.text;
+    for file in &request.files {
+        input.push_str(&format!(" @{}", file.display()));
+    }
+    let custom = crate::commands::load(cwd);
+    let mut prompt = crate::commands::preprocess(&input, &custom, cwd);
+    // Uploaded images first: they are what the user attached to *this* message,
+    // where an `@`-referenced one is context they pointed at.
+    let mut images = request.images;
+    images.append(&mut prompt.images);
+    prompt.images = images;
+    prompt
+}
+
+/// Apply one server-side slash command to the live agent (see
+/// [`crate::gui::server::COMMANDS`]). Everything it has to say comes back as
+/// the frames the protocol already has — `notice`, `context`, `error` — so a
+/// command needs no reply frame of its own.
+async fn run_command(
+    agent: &mut Agent,
+    request: CommandRequest,
+    config: &Config,
+    shared: &TaskShared,
+) {
+    let args = request.args.trim();
+    match request.name.as_str() {
+        "compact" => {
+            let outcome = agent.compact_now().await;
+            shared.push(Frame::Notice {
+                text: outcome.describe(),
+            });
+            shared.push_context(agent.context_tokens());
+        }
+        "cost" => shared.push(Frame::Notice {
+            text: cost_report(agent, config),
+        }),
+        "model" => {
+            if args.is_empty() {
+                shared.push(Frame::Error {
+                    message: "usage: /model <name>".to_string(),
+                });
+                return;
+            }
+            switch_model(agent, config, args, shared).await;
+        }
+        "mode" => match args {
+            "genie" => set_mode(agent, Mode::Genie, shared),
+            "sovereign" => set_mode(agent, Mode::Sovereign, shared),
+            // Plan is not a mode but a posture on top of one: the agent
+            // investigates read-only and presents a plan through the same
+            // `plan_ready` gate the socket already answers.
+            "plan" => {
+                agent.set_plan_mode(true);
+                shared.push(Frame::Notice {
+                    text: "plan mode on — the next turn plans before it acts".to_string(),
+                });
+            }
+            other => shared.push(Frame::Error {
+                message: format!("unknown mode '{other}' (sovereign|genie|plan)"),
+            }),
+        },
+        "help" => shared.push(Frame::Notice {
+            text: crate::gui::server::help_text(),
+        }),
+        other => shared.push(Frame::Error {
+            message: format!("unknown command '/{other}'"),
+        }),
+    }
+}
+
+/// `/mode <sovereign|genie>`: switch the posture and leave plan mode, which is
+/// a stance the old mode was holding, not a property of the new one.
+fn set_mode(agent: &mut Agent, mode: Mode, shared: &TaskShared) {
+    agent.set_mode(mode);
+    agent.set_plan_mode(false);
+    shared.push(Frame::Notice {
+        text: format!("mode: {mode}"),
+    });
+}
+
+/// `/cost`: session token totals, with an estimate when the active provider
+/// carries rates. The same report the TUI's `/cost` prints.
+fn cost_report(agent: &Agent, config: &Config) -> String {
+    let (prompt, completion) = agent.usage().session_totals();
+    let mut text = format!("session usage: {prompt} prompt + {completion} completion tokens");
+    let provider = config.active();
+    match crate::usage::cost_usd(
+        prompt,
+        completion,
+        provider.usd_per_mtok_in,
+        provider.usd_per_mtok_out,
+    ) {
+        Some(cost) => text.push_str(&format!(" · est. ${cost:.4}")),
+        None => text.push_str(&format!(
+            "\nset usd_per_mtok_in / usd_per_mtok_out on provider '{}' in \
+             ~/.wizard/config.toml for cost estimates",
+            provider.name
+        )),
+    }
+    text
+}
+
+/// Read the active model's context window and hold it for the task's `context`
+/// frames. Once per model, not per event: for a local backend this is an HTTP
+/// round trip (llama.cpp's `/props`), and a provider that cannot say degrades
+/// to `None` — the meter then shows a count without a ceiling rather than a
+/// ceiling somebody invented.
+async fn read_context_window(config: &Config, model: &str, shared: &TaskShared) {
+    let window = match config.active().build() {
+        Ok(client) => client.context_window(model).await,
+        Err(err) => {
+            tracing::warn!("building a client to read the context window: {err:#}");
+            None
+        }
+    };
+    shared.set_context_window(window);
 }
 
 /// Fire the `session_start` hooks once per built agent, surfacing their
@@ -1094,6 +1361,9 @@ async fn switch_model(agent: &mut Agent, config: &Config, model: &str, shared: &
     };
     agent.set_model(model.to_string(), native);
     shared.set_model(model);
+    // The window is a property of the model, so it is re-read here and nowhere
+    // else — a meter still scaled to the old model's window would misreport.
+    read_context_window(config, model, shared).await;
     shared.push(Frame::Notice {
         text: format!("switched to model {model}"),
     });
@@ -1351,6 +1621,50 @@ mod tests {
         assert_eq!(replayed[0]["state"], "idle");
     }
 
+    /// The meter describes the conversation, not the turn that last moved it:
+    /// a page reloaded between turns must not come back with a blank one.
+    #[test]
+    fn attaching_between_turns_is_told_the_context_reading() {
+        let shared = shared();
+        shared.set_context_window(Some(200_000));
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        shared.push_context(1_234);
+        shared.finish_turn(false);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let replayed = frames(&mut rx);
+        let context = replayed
+            .iter()
+            .find(|frame| frame["type"] == "context")
+            .expect("the reading survives the turn that produced it");
+        assert_eq!(context["tokens"], 1_234);
+        assert_eq!(context["window"], 200_000);
+    }
+
+    /// Mid-turn the replay already carries the reading, so the snapshot would
+    /// only say it twice.
+    #[test]
+    fn attaching_mid_turn_is_not_told_the_reading_twice() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        shared.push_context(99);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let replayed = frames(&mut rx);
+        assert_eq!(
+            replayed
+                .iter()
+                .filter(|frame| frame["type"] == "context")
+                .count(),
+            1,
+            "one reading, from the replay: {replayed:?}"
+        );
+    }
+
     #[test]
     fn one_turn_slot_per_task() {
         let shared = shared();
@@ -1542,9 +1856,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Sovereign posture always applies.
+        // No override: the config is the user's own, untouched.
         let config = agent_config(&base, None);
-        assert_eq!(config.mode, Mode::Sovereign);
+        assert_eq!(config.mode, base.mode);
+        assert_eq!(config.active().name, "local");
 
         // A provider name switches the active provider.
         let config = agent_config(&base, Some("claude"));
@@ -1558,21 +1873,326 @@ mod tests {
     }
 
     #[test]
-    fn gui_turns_run_on_the_step_limit_settings_shows() {
-        // The Settings page edits `[gui] max_steps`; if a turn ran on anything
-        // else, that control would be decoration.
-        let mut base = Config::default();
-        base.gui.max_steps = 7;
-        // The TUI's budget, and none of the GUI's business — not even the
-        // unlimited default a TUI turn now runs on.
-        base.max_steps = StepBudget::new(25);
-        assert_eq!(agent_config(&base, None).max_steps, StepBudget::new(7));
+    fn gui_turns_run_on_the_users_own_mode_and_step_budget() {
+        // The GUI is the same agent on another surface: it runs the config the
+        // user configured, not a posture or a budget of its own.
+        let base = Config {
+            mode: Mode::Genie,
+            max_steps: StepBudget::new(25),
+            ..Config::default()
+        };
+        let config = agent_config(&base, None);
+        assert_eq!(config.mode, Mode::Genie);
+        assert_eq!(config.max_steps, StepBudget::new(25));
 
-        base.gui.max_steps = 0;
+        let base = Config {
+            mode: Mode::Sovereign,
+            max_steps: StepBudget::UNLIMITED,
+            ..Config::default()
+        };
+        let config = agent_config(&base, None);
+        assert_eq!(config.mode, Mode::Sovereign);
         assert_eq!(
-            agent_config(&base, None).max_steps,
+            config.max_steps,
             StepBudget::UNLIMITED,
-            "0 lifts the GUI's ceiling, as it does the TUI's"
+            "the v1.2 default — no ceiling — reaches the GUI too"
         );
+    }
+
+    // --- the preprocessing seam ---
+
+    #[test]
+    fn a_gui_message_gets_the_file_refs_and_custom_commands_every_surface_has() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("notes.md"), "the note\n").unwrap();
+        std::fs::create_dir_all(cwd.path().join(".wizard/commands")).unwrap();
+        std::fs::write(
+            cwd.path().join(".wizard/commands/review.md"),
+            "Review $ARGUMENTS against @notes.md",
+        )
+        .unwrap();
+
+        // An `@file` reference is read into the prompt.
+        let prompt = turn_prompt(
+            TurnRequest {
+                text: "explain @notes.md".to_string(),
+                ..TurnRequest::default()
+            },
+            cwd.path(),
+        );
+        assert!(prompt.text.contains("the note"), "got: {}", prompt.text);
+
+        // A project custom command expands to its template — arguments and the
+        // `@file` refs inside it included.
+        let prompt = turn_prompt(
+            TurnRequest {
+                text: "/review src/app.rs".to_string(),
+                ..TurnRequest::default()
+            },
+            cwd.path(),
+        );
+        assert!(
+            prompt.text.starts_with("Review src/app.rs against"),
+            "got: {}",
+            prompt.text
+        );
+        assert!(prompt.text.contains("the note"), "got: {}", prompt.text);
+    }
+
+    #[test]
+    fn attachments_reach_the_turn_as_images_and_file_refs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spec = cwd.path().join("spec.txt");
+        std::fs::write(&spec, "the spec\n").unwrap();
+        let shot = cwd.path().join("shot.png");
+        std::fs::write(&shot, [0x89, b'P', b'N', b'G']).unwrap();
+
+        let prompt = turn_prompt(
+            TurnRequest {
+                text: "what is wrong here?".to_string(),
+                images: vec![shot.clone()],
+                files: vec![spec],
+                ..TurnRequest::default()
+            },
+            cwd.path(),
+        );
+        // The file is pulled in by the `@file` expansion, not by a second
+        // file-reading path.
+        assert!(prompt.text.starts_with("what is wrong here?"));
+        assert!(prompt.text.contains("the spec"), "got: {}", prompt.text);
+        // The image rides along as an attachment for the vision path.
+        assert_eq!(prompt.images, vec![shot]);
+    }
+
+    // --- the context meter ---
+
+    #[test]
+    fn the_context_frame_reports_the_next_turn_not_the_lifetime_total() {
+        let shared = shared();
+        shared.set_context_window(Some(200_000));
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        // Two model calls in one turn. `usage` accumulates in the client's
+        // lifetime total; `context` is what the *next* call will load, so the
+        // second call's prompt replaces the first's rather than adding to it.
+        shared.handle_event(AgentEvent::Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 40,
+        });
+        shared.handle_event(AgentEvent::Usage {
+            prompt_tokens: 1_600,
+            completion_tokens: 30,
+        });
+        let got = frames(&mut rx);
+        let usage: Vec<&Value> = got.iter().filter(|f| f["type"] == "usage").collect();
+        let context: Vec<&Value> = got.iter().filter(|f| f["type"] == "context").collect();
+        assert_eq!(usage.len(), 2, "the lifetime frame is untouched");
+        assert_eq!(usage[1]["prompt_tokens"], 1_600);
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[1]["tokens"], 1_600, "not 2_600");
+        assert_eq!(context[1]["window"], 200_000);
+
+        // Compaction shrinks the history: the meter falls, and says so.
+        shared.handle_event(AgentEvent::ContextSize { tokens: 300 });
+        let got = frames(&mut rx);
+        assert_eq!(got.len(), 1, "no usage frame — nothing was spent: {got:?}");
+        assert_eq!(got[0]["type"], "context");
+        assert_eq!(got[0]["tokens"], 300);
+    }
+
+    #[test]
+    fn a_provider_with_no_known_window_omits_it() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.begin_turn();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        shared.handle_event(AgentEvent::ContextSize { tokens: 512 });
+        // A completion-only usage report is not a context size.
+        shared.handle_event(AgentEvent::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 12,
+        });
+
+        let context: Vec<Value> = frames(&mut rx)
+            .into_iter()
+            .filter(|f| f["type"] == "context")
+            .collect();
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["tokens"], 512);
+        assert_eq!(
+            context[0].get("window"),
+            None,
+            "no window is no field, not a made-up default"
+        );
+    }
+
+    // --- server-side slash commands ---
+
+    /// A provider that answers nothing: the command tests drive the agent's own
+    /// state (history, session, usage), which needs no model call.
+    #[derive(Debug)]
+    struct SilentProvider;
+
+    #[async_trait::async_trait]
+    impl crate::llm::provider::LlmProvider for SilentProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn chat_stream(
+            &self,
+            _request: crate::llm::ChatRequest,
+        ) -> Result<crate::llm::ChatStream> {
+            anyhow::bail!("no model behind this test")
+        }
+        fn label(&self) -> String {
+            "silent".to_string()
+        }
+    }
+
+    fn test_agent(cwd: &Path) -> Agent {
+        let sessions = Config::sessions_dir().expect("sessions dir");
+        let session = Session::create_in(&sessions, cwd).expect("session");
+        let hooks = Arc::new(crate::hooks::HookEngine::new(
+            Vec::new(),
+            cwd.to_path_buf(),
+            session.id.clone(),
+        ));
+        Agent::new(
+            Arc::new(SilentProvider),
+            crate::tools::registry::ToolRegistry::new(),
+            Config::default(),
+            Vec::new(),
+            cwd.to_path_buf(),
+            session,
+            true,
+            hooks,
+        )
+        .expect("agent")
+    }
+
+    async fn command(agent: &mut Agent, shared: &TaskShared, name: &str, args: &str) {
+        run_command(
+            agent,
+            CommandRequest {
+                name: name.to_string(),
+                args: args.to_string(),
+            },
+            &Config::default(),
+            shared,
+        )
+        .await;
+    }
+
+    /// `Agent::clear` rotates the session file, and a GUI task is keyed by its
+    /// session id: a server-side clear would leave `GET /api/tasks/{id}`
+    /// replaying the session the agent had just stopped writing to, so the chat
+    /// would come back from a reload missing every turn taken after the clear.
+    /// The GUI therefore clears by starting a new chat, on the client.
+    #[tokio::test]
+    async fn clear_is_not_a_server_command_because_it_would_strand_the_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let before = agent.session().id.clone();
+
+        command(&mut agent, &shared, "clear", "").await;
+
+        // Refused like any other unknown server command, and the session the
+        // task is keyed by is left alone.
+        assert_eq!(agent.session().id, before);
+        let got = frames(&mut rx);
+        assert!(
+            got.iter().any(|f| f["type"] == "error"),
+            "clear is not dispatched server-side: {got:?}"
+        );
+
+        assert_eq!(
+            crate::gui::server::COMMANDS
+                .iter()
+                .find(|(name, ..)| *name == "clear")
+                .map(|(_, _, executed_by, _)| *executed_by),
+            Some("client"),
+            "and the palette routes it to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_summarizes_and_reports_the_new_context_size() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        // A history with nothing between the system prompt and the recent tail
+        // has nothing to compact — and says so, rather than failing silently.
+        command(&mut agent, &shared, "compact", "").await;
+        let got = frames(&mut rx);
+        let notice = got
+            .iter()
+            .find(|f| f["type"] == "notice")
+            .expect("notice frame");
+        assert!(
+            notice["text"].as_str().unwrap().contains("compact"),
+            "got: {notice}"
+        );
+        assert!(
+            got.iter().any(|f| f["type"] == "context"),
+            "the meter is refreshed either way: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_reports_the_lifetime_totals_and_unknown_commands_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+
+        let _ = frames(&mut rx); // the attach snapshot
+
+        agent.usage().record(Some(1_200), Some(300));
+        command(&mut agent, &shared, "cost", "").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "notice");
+        let text = got[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("1200 prompt + 300 completion"),
+            "the session total, not the last call: {text}"
+        );
+
+        // `/mode` switches the posture the turn runs in.
+        command(&mut agent, &shared, "mode", "sovereign").await;
+        assert_eq!(agent.mode(), Mode::Sovereign);
+        assert_eq!(frames(&mut rx)[0]["type"], "notice");
+
+        command(&mut agent, &shared, "mode", "yolo").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+
+        // A command the server does not have is an error, not a silent no-op.
+        command(&mut agent, &shared, "publish", "").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+        assert!(got[0]["message"].as_str().unwrap().contains("publish"));
+
+        // `/model` without the model it needs.
+        command(&mut agent, &shared, "model", "").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
     }
 }

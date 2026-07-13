@@ -22,8 +22,9 @@ async-trait = "0.1"
 # Ollama HTTP (rustls so the binary has no OpenSSL link dependency)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
-# Browser GUI (`wizard gui`): local HTTP server + WebSocket event stream
-axum = { version = "0.8", features = ["ws"] }
+# Browser GUI (`wizard gui`): local HTTP server + WebSocket event stream +
+# multipart uploads (attachments)
+axum = { version = "0.8", features = ["ws", "multipart"] }
 
 # OAuth sign-in (xAI): PKCE hashing, base64url tokens, randomness
 sha2 = "0.10"

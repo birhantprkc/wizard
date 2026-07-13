@@ -13,12 +13,24 @@ use crate::llm::{Image, Role};
 /// name, so it must stay short.
 const SUMMARY_CHARS: usize = 100;
 
+/// How the agent labels the user-role message it rides a tool's images back to
+/// the model on (`Agent::dispatch_call`). It is the one thing that tells that
+/// message apart from a person attaching an image to a prompt of their own —
+/// which, now that the GUI can upload one, is not a hypothetical collision.
+const TOOL_IMAGE_NOTE: &str = "Image(s) returned by `";
+
 /// One transcript item, in the protocol's shape (`kind`-tagged).
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Item {
     User {
         text: String,
+        /// Images the user attached to the message. Omitted when there were
+        /// none, so a plain prompt is the shape it always was. Non-image
+        /// attachments need no echo of their own: `@file` expansion inlined
+        /// their contents into `text`, which is what was actually sent.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     TurnMarker {
         turn: u64,
@@ -98,7 +110,11 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
             // ran after it. The pending calls stand too — they are still waiting
             // for results that come after this message — but their rows have
             // shifted down by the one just spliced in.
-            Role::User if !message.images.is_empty() && just_answered.is_some() => {
+            Role::User
+                if !message.images.is_empty()
+                    && just_answered.is_some()
+                    && message.content.starts_with(TOOL_IMAGE_NOTE) =>
+            {
                 let (row, tool) = just_answered.expect("the guard just matched it");
                 items.insert(
                     row + 1,
@@ -116,6 +132,9 @@ pub fn replay(entries: &[SessionEntry]) -> Vec<Item> {
                 pending.clear();
                 items.push(Item::User {
                     text: message.content.clone(),
+                    // What the user attached, replayed with the message it was
+                    // attached to — the same references the live turn carried.
+                    images: image_refs(&message.images),
                 });
             }
             Role::System => {
@@ -361,7 +380,9 @@ mod tests {
         let items = replay(&entries);
         assert_eq!(items.len(), 5, "the header maps to no item: {items:?}");
         assert!(matches!(&items[0], Item::TurnMarker { turn: 1, prompt } if prompt == "read main"));
-        assert!(matches!(&items[1], Item::User { text } if text == "read main"));
+        assert!(
+            matches!(&items[1], Item::User { text, images } if text == "read main" && images.is_empty())
+        );
         assert!(matches!(&items[2], Item::Text { text } if text == "I'll read it."));
         match &items[3] {
             Item::Tool { name, args, output } => {
@@ -466,9 +487,9 @@ mod tests {
             other => panic!("expected the tool's image, got {other:?}"),
         }
         assert!(
-            !items
-                .iter()
-                .any(|item| matches!(item, Item::User { text } if text.starts_with("Image(s)"))),
+            !items.iter().any(
+                |item| matches!(item, Item::User { text, .. } if text.starts_with("Image(s)"))
+            ),
             "the images' carrier message is not a prompt: {items:?}"
         );
         match (&items[3], &items[5]) {
@@ -482,6 +503,67 @@ mod tests {
             }
             other => panic!("expected both tool rows, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_shows_the_images_the_user_attached() {
+        let shot = Image::new("aGk=", "image/png").at_path("/img/shot.png".into());
+        let entries = vec![
+            message_entry(ChatMessage::user_with_images(
+                "what is wrong here?",
+                vec![shot],
+            )),
+            message_entry(ChatMessage::assistant("the button is off-centre")),
+        ];
+
+        let items = replay(&entries);
+        // The attachment replays on the message it was attached to — not as a
+        // tool's images, and not dropped.
+        match &items[0] {
+            Item::User { text, images } => {
+                assert_eq!(text, "what is wrong here?");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].path, std::path::PathBuf::from("/img/shot.png"));
+                assert_eq!(images[0].mime, "image/png");
+            }
+            other => panic!("expected the user's prompt, got {other:?}"),
+        }
+        assert!(
+            !items.iter().any(|item| matches!(item, Item::Images { .. })),
+            "the user's image is on their message, not a card of its own: {items:?}"
+        );
+    }
+
+    #[test]
+    fn a_user_image_after_a_tool_result_is_not_that_tool_s_image() {
+        // An interrupted turn can leave a tool result as the last thing that
+        // happened; the next prompt may carry an image of its own. Only the
+        // agent's own carrier message ("Image(s) returned by `x`:") is a tool's
+        // images — a person's attachment is not, whatever preceded it.
+        let shot = Image::new("aGk=", "image/png").at_path("/img/shot.png".into());
+        let entries = vec![
+            message_entry(ChatMessage::user("read it")),
+            message_entry(assistant_with_calls(
+                "reading",
+                &[("read_file", json!({ "path": "a.rs" }))],
+            )),
+            message_entry(ChatMessage::tool_result("read_file", "fn main() {}")),
+            message_entry(ChatMessage::user_with_images("and this?", vec![shot])),
+        ];
+
+        let items = replay(&entries);
+        let last = items.last().expect("the new prompt");
+        match last {
+            Item::User { text, images } => {
+                assert_eq!(text, "and this?");
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("expected the user's prompt, got {other:?}"),
+        }
+        assert!(
+            !items.iter().any(|item| matches!(item, Item::Images { .. })),
+            "it did not land on the tool's card: {items:?}"
+        );
     }
 
     #[test]

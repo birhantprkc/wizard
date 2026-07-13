@@ -486,6 +486,28 @@ button.chip:hover {
   margin-top: -26px;
   border-radius: 16px 5px 5px 16px;
 }
+/* What you attached, on the message it went out with. The thumbnails are
+   smaller than the transcript's: they are part of a message, not the subject
+   of one. */
+.prompt-images,
+.prompt-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.prompt-images + .prompt-files {
+  margin-top: 6px;
+}
+/* An attachment with nothing said about it: no gap above nothing. */
+.prompt-images:first-child,
+.prompt-files:first-child {
+  margin-top: 0;
+}
+.prompt-images .image-thumb {
+  height: 112px;
+  min-width: 60px;
+}
 
 .worked-section {
   margin-bottom: 8px;
@@ -618,6 +640,7 @@ button.chip:hover {
 }
 
 .composer {
+  position: relative; /* the `/` palette hangs off it */
   pointer-events: auto;
   width: 100%;
   max-width: var(--content-max);
@@ -626,6 +649,11 @@ button.chip:hover {
   border-radius: var(--r-md);
   padding: 12px 12px 10px 14px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+/* A file is over the chat: the composer is where it will land. */
+.composer.dropping {
+  border-color: #3c556f;
+  background: #16171a;
 }
 
 .composer-input {
@@ -733,6 +761,136 @@ button.ghost-chip:hover {
 }
 
 /* ------------------------------------------------------------------ */
+/* Composer: staged attachments, and the `/` palette                    */
+/* ------------------------------------------------------------------ */
+
+/* What will go up with the next message: a thumbnail if the file is one you
+   can look at, its type if it is not. */
+.attach-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 230px;
+  padding: 4px 4px 4px 5px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  color: var(--text-soft);
+  font-size: 12.5px;
+}
+.attach-chip.pending {
+  opacity: 0.6;
+}
+.attach-chip.failed {
+  border-color: rgba(229, 72, 77, 0.45);
+  color: #c96a6a;
+}
+.attach-thumb {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  display: block;
+  border-radius: 5px;
+  object-fit: cover;
+}
+.attach-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.attach-icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+.attach-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.attach-size {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.attach-chip.failed .attach-size {
+  color: inherit;
+}
+.attach-remove {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-faint);
+}
+.attach-remove:hover {
+  background: var(--hover-2);
+  color: var(--text);
+}
+.attach-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* The palette: what a leading `/` could become, over the composer it types
+   into — the same surface as the menus, because it is one. */
+.palette {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid #2e2e33;
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 5px;
+  z-index: 30;
+}
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: var(--text-mid);
+  font-size: 13px;
+  text-align: left;
+}
+/* Hover and keyboard selection are the same state: there is one cursor here. */
+.palette-item.active {
+  background: var(--hover-2);
+}
+.palette-name {
+  flex-shrink: 0;
+  color: var(--text);
+}
+.palette-args {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.palette-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+/* ------------------------------------------------------------------ */
 /* Context panel                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -830,6 +988,38 @@ button.ghost-chip:hover {
 }
 .goal-meta {
   margin-top: 7px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+/* The context meter: how full the next model call is. Its own section, with its
+   own words ("next turn"), because the Goal card's token count above it is the
+   session's lifetime spend — a different number that must not read as this one. */
+.meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 3px 6px;
+}
+.meter {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: #232327;
+  overflow: hidden;
+}
+.meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--text-mid);
+  transition: width 0.25s ease;
+}
+/* Nearly full: the next turn is where the history starts getting dropped. */
+.meter-fill.high {
+  background: var(--amber);
+}
+.meter-text {
   color: var(--text-faint);
   font-size: 12.5px;
 }

@@ -3,7 +3,7 @@
 // through the Api seam (api.js): RealApi (HTTP + one WebSocket per open
 // task) by default, MockApi with `?mock=1`.
 
-import { NEW_CHAT_TITLE, applyToolSummary, createApi, imageUrl } from './api.js';
+import { NEW_CHAT_TITLE, applyToolSummary, createApi, imageUrl, rememberImage } from './api.js';
 import { icons, fileIconSvg } from './icons.js';
 
 const api = createApi();
@@ -27,7 +27,20 @@ const state = {
   taskState: 'idle',
   /** @type {Array<{text:string,done:boolean,active?:boolean}>} */
   todos: [],
+  /** `/todos` hid the progress section; it stays hidden until it is toggled back. */
+  todosHidden: false,
+  /** Session lifetime spend (the `usage` frames), which the Goal card reports. */
   usage: { prompt: 0, completion: 0 },
+  /** Latest `context` frame: what the NEXT model call carries. A different
+   *  number from `usage` above, and shown apart from it.
+   *  @type {import('./api.js').ContextSize | null} */
+  context: null,
+  /** The `/` palette's commands, for this chat's workspace.
+   *  @type {import('./api.js').SlashCommand[]} */
+  commands: [],
+  /** Files staged in the composer, to go up with the next message.
+   *  @type {StagedFile[]} */
+  attachments: [],
   /** @type {import('./api.js').GitInfo | null} */
   git: null,
   /** Elapsed label of the last finished turn ("3m 1s"). */
@@ -55,6 +68,10 @@ let selectSeq = 0;
 /** Composer refs. */
 let composerInput = null;
 let modelLabelEl = null;
+let attachTray = null;
+let fileInput = null;
+/** The open `/` palette: `{el, list, matches, index}`, or null. */
+let palette = null;
 /** The one open dropdown (model / directory / branch), if any. */
 let menuEl = null;
 
@@ -291,10 +308,32 @@ function collapseThinking(flow) {
   }
 }
 
-function appendPromptCard(text) {
+/** A non-image attachment: what it is, on the message it went out with. */
+function attachedFileChip(file) {
+  return h('span', { class: 'file-chip', title: `${file.path || file.name} · ${fmtBytes(file.bytes || 0)}` },
+    h('span', { class: 'file-chip-icon', html: fileIconSvg(file.name), 'aria-hidden': 'true' }),
+    h('span', { class: 'file-chip-name' }, file.name));
+}
+
+/**
+ * What you said, and what you sent with it. The images ride on the card rather
+ * than in a strip below it: they were part of the message, not something the
+ * turn produced.
+ * @param {string} text
+ * @param {import('./api.js').Attachment[]} [attachments]
+ */
+function appendPromptCard(text, attachments = []) {
   breakFlow(chat);
   const inner = transcriptInner();
-  inner.append(h('div', { class: 'prompt-card' }, text));
+  const images = attachments.filter((a) => a.kind === 'image' && a.path);
+  const files = attachments.filter((a) => a.kind !== 'image' && a.path);
+  // `h()` drops a null child, but would render a `0` — so these are ternaries,
+  // not `length &&`.
+  const card = h('div', { class: 'prompt-card' },
+    text ? h('div', { class: 'prompt-text' }, text) : null,
+    images.length ? h('div', { class: 'prompt-images' }, images.map(imageTile)) : null,
+    files.length ? h('div', { class: 'prompt-files' }, files.map(attachedFileChip)) : null);
+  inner.append(card);
   chat.target = inner;
 }
 
@@ -717,7 +756,7 @@ function renderTranscript() {
 
   for (const item of state.task.transcript) {
     if (item.type === 'user') {
-      appendPromptCard(item.text);
+      appendPromptCard(item.text, item.attachments);
     } else if (item.type === 'worked') {
       breakFlow(chat);
       appendWorkedSection(item.label || 'Worked');
@@ -833,6 +872,12 @@ function onUsage(usage) {
   updateGoal();
 }
 
+/** The `context` frame: a reading, not a running total — it replaces. */
+function onContext(context) {
+  state.context = context;
+  updateContextMeter();
+}
+
 function onRetrying(attempt) {
   transientNote = h('div', { class: 'system-row retrying' },
     h('span', { class: 'spinner-icon spinning', html: icons.spinner, 'aria-hidden': 'true' }),
@@ -900,6 +945,19 @@ function renderContextPanel() {
       icon('target', 'icon goal-icon'),
       h('div', { class: 'goal-main' }, ctx.goalText, ctx.goalMeta)));
 
+  // --- Context ---
+  // The tokens the NEXT model call will carry, from the `context` frame. The
+  // Goal card's `N tokens` above is the session's lifetime spend, from `usage`,
+  // and the two are deliberately not the same readout: reporting one as the
+  // other is the bug main just fixed in the TUI.
+  ctx.meterPct = h('span', { class: 'ctx-header-right' }, '');
+  ctx.meterFill = h('span', { class: 'meter-fill' });
+  ctx.meterBar = h('span', { class: 'meter' }, ctx.meterFill);
+  ctx.meterText = h('div', { class: 'meter-text' }, '');
+  ctx.contextSection = h('section', { class: 'ctx-section hidden' },
+    h('div', { class: 'ctx-header' }, h('span', {}, 'Context'), ctx.meterPct),
+    h('div', { class: 'meter-row' }, ctx.meterBar, ctx.meterText));
+
   // --- Subagents ---
   ctx.subagentList = h('div', { class: 'subagent-list' });
   ctx.subagentSection = h('section', { class: 'ctx-section hidden' },
@@ -915,11 +973,36 @@ function renderContextPanel() {
     ctx.progressList);
 
   root.append(h('div', { class: 'context-card' },
-    ctx.gitSection, goalSection, ctx.subagentSection, ctx.progressSection));
+    ctx.gitSection, goalSection, ctx.contextSection, ctx.subagentSection, ctx.progressSection));
   updateGitCard();
   updateGoal();
+  updateContextMeter();
   renderSubagentList();
   updateProgress();
+}
+
+/**
+ * The context meter: how full the next model call is. Without a window (the
+ * provider does not report one) there is nothing to fill, so the bar goes and
+ * the count stays — a bar against an invented denominator would be a guess
+ * dressed up as a measurement.
+ */
+function updateContextMeter() {
+  if (!ctx) return;
+  const c = state.context;
+  if (!c || !c.tokens) {
+    ctx.contextSection.classList.add('hidden');
+    return;
+  }
+  ctx.contextSection.classList.remove('hidden');
+  const pct = c.window ? Math.min(100, Math.round((c.tokens / c.window) * 100)) : null;
+  ctx.meterBar.classList.toggle('hidden', pct == null);
+  ctx.meterPct.textContent = pct == null ? '' : `${pct}%`;
+  ctx.meterFill.className = 'meter-fill' + (pct != null && pct >= 85 ? ' high' : '');
+  ctx.meterFill.style.width = `${pct || 0}%`;
+  ctx.meterText.textContent = c.window
+    ? `${fmtTokens(c.tokens)} of ${fmtTokens(c.window)} next turn`
+    : `${fmtTokens(c.tokens)} next turn`;
 }
 
 function updateGitCard() {
@@ -971,7 +1054,8 @@ function updateGoal() {
 function updateProgress() {
   if (!ctx) return;
   const items = state.todos.length ? state.todos : (state.task && state.task.progress) || [];
-  if (!items.length) {
+  // `/todos` hid it: a later todo frame updates it, it does not reopen it.
+  if (!items.length || state.todosHidden) {
     ctx.progressSection.classList.add('hidden');
     return;
   }
@@ -1462,6 +1546,344 @@ function renderDiff(body, diff) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* Attachments: files staged for the next message                            */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * One file staged in the composer. It uploads the moment it is attached, so by
+ * the time the message is sent the server has already written it and said what
+ * it is; `path` is what goes out on the wire.
+ * @typedef {Object} StagedFile
+ * @property {string} key           Identity for the chip, before a path exists.
+ * @property {string} name
+ * @property {number} bytes
+ * @property {string} mime
+ * @property {'image'|'file'} kind  Guessed locally to draw the chip; the SERVER decides it for real.
+ * @property {string|null} preview  Object URL, images only.
+ * @property {string|null} path     Where the server wrote it; null until it has.
+ * @property {string|null} error    Why it did not land.
+ * @property {boolean} pending
+ * @property {Promise<void>} upload
+ */
+
+let attachSeq = 0;
+
+/**
+ * Stage files: the chips appear at once and the uploads run behind them, so a
+ * 4MB screenshot does not freeze the composer while it goes up.
+ * @param {File[]} files
+ */
+function attachFiles(files) {
+  const task = state.task;
+  if (!task || !files.length) return;
+  for (const file of files) {
+    const image = /^image\//.test(file.type || '');
+    /** @type {StagedFile} */
+    const item = {
+      key: `att-${++attachSeq}`,
+      name: file.name || (image ? 'pasted image.png' : 'file'),
+      bytes: file.size || 0,
+      mime: file.type || '',
+      kind: image ? 'image' : 'file',
+      preview: image ? URL.createObjectURL(file) : null,
+      path: null,
+      error: null,
+      pending: true,
+      upload: null,
+    };
+    item.upload = uploadStaged(task.id, file, item);
+    state.attachments.push(item);
+  }
+  renderAttachTray();
+}
+
+/** Put one file where the server can serve it back, and take its word for what
+ *  it is: the server sniffs the bytes, and the file name here is only a label. */
+async function uploadStaged(taskId, file, item) {
+  try {
+    const [saved] = await api.upload(taskId, [file]);
+    if (!saved || !saved.path) throw new Error('the server saved nothing');
+    item.path = saved.path;
+    item.name = saved.name || item.name;
+    item.mime = saved.mime || item.mime;
+    item.bytes = saved.bytes || item.bytes;
+    item.kind = saved.kind === 'image' ? 'image' : 'file';
+    // The bytes are already here; the thumbnail need not fetch them back.
+    if (item.kind === 'image' && item.preview) rememberImage(item.path, item.preview);
+  } catch (err) {
+    item.error = String((err && err.message) || err);
+  } finally {
+    item.pending = false;
+    if (state.attachments.includes(item)) renderAttachTray();
+  }
+}
+
+function removeAttachment(item) {
+  state.attachments = state.attachments.filter((a) => a !== item);
+  renderAttachTray();
+}
+
+/** One staged file: a thumbnail for an image, its type for anything else. */
+function attachChip(item) {
+  const face = item.kind === 'image' && item.preview
+    ? h('img', { class: 'attach-thumb', src: item.preview, alt: '' })
+    : h('span', { class: 'attach-icon', html: fileIconSvg(item.name), 'aria-hidden': 'true' });
+  return h('div', {
+    class: 'attach-chip' + (item.pending ? ' pending' : '') + (item.error ? ' failed' : ''),
+    title: item.error ? `${item.name} — ${item.error}` : `${item.name} · ${fmtBytes(item.bytes)}`,
+  },
+    face,
+    h('span', { class: 'attach-name' }, item.name),
+    h('span', { class: 'attach-size' }, item.error ? 'failed' : fmtBytes(item.bytes)),
+    h('button', {
+      class: 'attach-remove', type: 'button',
+      title: 'Remove', 'aria-label': `Remove ${item.name}`,
+      onclick: () => removeAttachment(item),
+    }, icon('close')));
+}
+
+function renderAttachTray() {
+  if (!attachTray) return;
+  attachTray.classList.toggle('hidden', !state.attachments.length);
+  attachTray.replaceChildren(...state.attachments.map(attachChip));
+}
+
+/**
+ * Files dropped on the chat — the transcript or the composer — attach to the
+ * next message, exactly as the paperclip does. The document-level handlers are
+ * what stop a file dropped anywhere else from navigating the page to it.
+ */
+function initDropTarget() {
+  const zone = $('conversation');
+  const form = $('composer');
+  const hasFiles = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
+  // A drag over a child fires `dragleave` on the parent: count the crossings
+  // rather than trusting one leave to mean the pointer really left.
+  let depth = 0;
+  const leave = () => {
+    depth = 0;
+    form.classList.remove('dropping');
+  };
+  zone.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e)) return;
+    depth += 1;
+    form.classList.add('dropping');
+  });
+  zone.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  zone.addEventListener('dragleave', (e) => {
+    if (!hasFiles(e)) return;
+    depth -= 1;
+    if (depth <= 0) leave();
+  });
+  zone.addEventListener('drop', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    leave();
+    attachFiles(Array.from(e.dataTransfer.files || []));
+  });
+  for (const type of ['dragover', 'drop']) {
+    document.addEventListener(type, (e) => {
+      if (hasFiles(e)) e.preventDefault();
+    });
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Slash commands: the palette, and who runs what                            */
+/* ------------------------------------------------------------------------ */
+
+/** The workspace's commands. Custom ones live in its `.wizard/commands/`, so
+ *  the list is per-chat and is reloaded when one is opened. */
+async function loadCommands(task) {
+  const seq = selectSeq;
+  try {
+    const commands = await api.commands(task.path);
+    if (seq === selectSeq) state.commands = commands;
+  } catch {
+    if (seq === selectSeq) state.commands = []; // no palette, typing still works
+  }
+  // The list arrives after the composer does. Someone who typed `/` while it
+  // was in flight filtered an empty list and got no palette — and, since the
+  // palette only re-syncs on input, no palette until they typed another
+  // character. Re-sync once it lands.
+  if (seq === selectSeq) syncPalette();
+}
+
+/** A leading `/name`, with the rest as its arguments — and only when the name
+ *  is one we were given. A message can legitimately start with a slash: a path
+ *  (`/home/…`) is not a command, and is sent as what it is. */
+function matchCommand(text) {
+  const m = /^\/([A-Za-z0-9_-]+)(?:\s+([\s\S]*))?$/.exec(text);
+  if (!m) return null;
+  const def = state.commands.find((c) => c.name === m[1]);
+  return def ? { def, args: (m[2] || '').trim() } : null;
+}
+
+/**
+ * Run a command that is not a `prompt` one (those are messages, and go out
+ * through `send`). A `server` command becomes a `command` frame and is answered
+ * with the frames the protocol already has; a `client` one is handled here.
+ */
+function runCommand({ def, args }) {
+  const line = args ? `/${def.name} ${args}` : `/${def.name}`;
+  appendSystemRow(chat, line);
+  if (def.where === 'client') {
+    runClientCommand(def, args, line);
+    return;
+  }
+  try {
+    api.sendCommand(state.task.id, def.name, args);
+  } catch (err) {
+    appendSystemRow(chat, String((err && err.message) || err), 'error');
+  }
+}
+
+function runClientCommand(def, args, line) {
+  switch (def.name) {
+    case 'diff': {
+      const files = (state.git && state.git.files) || [];
+      const file = args
+        ? files.find((f) => f.path === args || f.path.endsWith(`/${args}`))
+        : files[0];
+      if (!file) {
+        appendSystemRow(chat, args ? `${args} is not a changed file.` : 'Nothing has changed in the working tree.');
+        return;
+      }
+      openDiffPane(file);
+      return;
+    }
+    case 'todos':
+      state.todosHidden = !state.todosHidden;
+      updateProgress();
+      return;
+    // A chat and its session file are the same object here, and clearing the
+    // history rotates that file — so the honest clear is a new chat, in the
+    // same directory. The old one stays in the sidebar rather than being wiped.
+    case 'clear':
+      newChatHere();
+      return;
+    case 'help':
+      openHelpPalette();
+      return;
+    default:
+      appendSystemRow(chat, `${line} is not implemented in the GUI.`, 'error');
+  }
+}
+
+/** Rebuild the palette from what it is currently offering. */
+function renderPalette() {
+  if (!palette) return;
+  palette.list.replaceChildren(...palette.matches.map((cmd, i) =>
+    h('button', {
+      class: 'palette-item' + (i === palette.index ? ' active' : ''),
+      type: 'button', role: 'option', 'aria-selected': i === palette.index ? 'true' : 'false',
+      // mousedown, not click: the composer must not lose focus before the pick,
+      // or the palette closes on blur and the click lands on nothing.
+      onmousedown: (e) => {
+        e.preventDefault();
+        pickCommand(cmd, true);
+      },
+      onmousemove: () => {
+        if (palette.index === i) return;
+        palette.index = i;
+        renderPalette();
+      },
+    },
+      h('span', { class: 'palette-name mono' }, `/${cmd.name}`),
+      cmd.args ? h('span', { class: 'palette-args mono' }, cmd.args) : null,
+      h('span', { class: 'palette-detail' }, cmd.detail),
+      // Custom commands come from the workspace, not from wizard: worth saying.
+      cmd.where === 'prompt' && h('span', { class: 'tag' }, 'custom'))));
+  const active = palette.list.children[palette.index];
+  if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+function openPalette(matches, index = 0) {
+  if (!palette) {
+    const list = h('div', { class: 'palette-list' });
+    palette = { el: h('div', { class: 'palette', role: 'listbox', 'aria-label': 'Commands' }, list), list, matches: [], index: 0 };
+    $('composer').append(palette.el);
+  }
+  palette.matches = matches;
+  palette.index = Math.min(Math.max(index, 0), matches.length - 1);
+  renderPalette();
+}
+
+function closePalette() {
+  if (!palette) return;
+  palette.el.remove();
+  palette = null;
+}
+
+/** `/help`: the whole list, in the palette that is already the place to read it. */
+function openHelpPalette() {
+  if (!state.commands.length || !composerInput) return;
+  composerInput.value = '/';
+  composerInput.focus();
+  openPalette(state.commands);
+}
+
+/**
+ * Follow the composer: a `/` in the first column offers what it could become.
+ * Once a space is typed the user is on to arguments, and the palette is done.
+ */
+function syncPalette() {
+  const m = composerInput && /^\/(\S*)$/.exec(composerInput.value);
+  if (!m) {
+    closePalette();
+    return;
+  }
+  const query = m[1].toLowerCase();
+  const matches = state.commands.filter((c) => c.name.toLowerCase().startsWith(query));
+  if (!matches.length) {
+    closePalette(); // a path, or a typo: neither is a menu worth holding open
+    return;
+  }
+  openPalette(matches);
+}
+
+/**
+ * Complete the composer to the picked command. Enter runs it right there —
+ * unless it takes arguments, which are typed, not guessed.
+ */
+function pickCommand(cmd, run) {
+  if (!cmd || !composerInput) return;
+  const takesArgs = !!cmd.args;
+  composerInput.value = `/${cmd.name}${takesArgs ? ' ' : ''}`;
+  closePalette();
+  composerInput.focus();
+  if (run && !takesArgs) $('composer').requestSubmit();
+}
+
+/** The palette's own keys, while it is open. Returns true when it took the key. */
+function paletteKeydown(e) {
+  if (!palette) return false;
+  const n = palette.matches.length;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    palette.index = (palette.index + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+    renderPalette();
+    return true;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation(); // Escape closes the palette, not the pane behind it
+    closePalette();
+    return true;
+  }
+  if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault();
+    pickCommand(palette.matches[palette.index], e.key === 'Enter');
+    return true;
+  }
+  return false;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Composer                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -1727,19 +2149,40 @@ function renderComposer() {
   const form = $('composer');
   const input = h('textarea', {
     class: 'composer-input', rows: '1',
-    placeholder: 'Ask wizard to change something', 'aria-label': 'Message wizard',
+    placeholder: 'Ask wizard to change something, or / for a command', 'aria-label': 'Message wizard',
   });
   composerInput = input;
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+    syncPalette();
   });
+  input.addEventListener('blur', () => closePalette());
   input.addEventListener('keydown', (e) => {
+    if (paletteKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       form.requestSubmit();
     }
   });
+  // A screenshot on the clipboard is bytes, not a path: it is attached, and
+  // uploaded, like any other file. A text paste falls through untouched.
+  input.addEventListener('paste', (e) => {
+    const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+    if (!files.length) return;
+    e.preventDefault();
+    attachFiles(files);
+  });
+
+  attachTray = h('div', { class: 'attach-tray hidden' });
+  fileInput = h('input', {
+    class: 'hidden', type: 'file', multiple: true, 'aria-hidden': 'true', tabindex: '-1',
+  });
+  fileInput.addEventListener('change', () => {
+    attachFiles(Array.from(fileInput.files || []));
+    fileInput.value = ''; // the same file, picked twice in a row, still fires
+  });
+  const attachBtn = iconBtn('paperclip', 'Attach files', () => fileInput.click());
 
   modelLabelEl = h('span', { class: 'chip-label' }, defaultModelLabel());
   const modelAnchor = h('span', { class: 'menu-anchor' },
@@ -1756,22 +2199,43 @@ function renderComposer() {
 
   form.replaceChildren(
     input,
+    attachTray,
+    fileInput,
     h('div', { class: 'composer-row' },
+      attachBtn,
       h('span', { class: 'composer-spacer' }),
       modelAnchor,
       sendBtn,
     ),
   );
   updateSendButton();
+  renderAttachTray();
 
   form.onsubmit = (e) => {
     e.preventDefault();
+    closePalette();
     const text = input.value.trim();
-    // One turn at a time: the backend refuses a second, so do not pretend.
-    if (!text || !state.task || state.taskState === 'working') return;
+    if (!state.task) return;
+    if (!text && !state.attachments.length) return;
+
+    // A `prompt` command is a message — the server expands it, through the same
+    // preprocess that resolves @file refs — so it goes down the send path. The
+    // other two kinds are not messages at all, and take no attachments with them.
+    const command = matchCommand(text);
+    // A `client` command touches nothing but this page, so a turn in flight is
+    // no reason to refuse it. Everything that reaches the agent is: one turn at
+    // a time, and the backend refuses a second — so do not pretend otherwise.
+    if (state.taskState === 'working' && !(command && command.def.where === 'client')) return;
     input.value = '';
     input.style.height = 'auto';
-    send(text);
+    if (command && command.def.where !== 'prompt') {
+      runCommand(command);
+      return;
+    }
+    const staged = state.attachments;
+    state.attachments = [];
+    renderAttachTray();
+    send(text, staged);
   };
 }
 
@@ -1781,20 +2245,43 @@ function titleFrom(text) {
   return line.length > 90 ? `${line.slice(0, 89)}…` : line;
 }
 
-async function send(text) {
-  appendPromptCard(text);
+/**
+ * @param {string} text
+ * @param {StagedFile[]} [staged]  what was in the composer's tray
+ */
+async function send(text, staged = []) {
+  const task = state.task;
+  // A file still going up is part of this message: wait for it, rather than
+  // sending the prompt without the thing the prompt is about. The uploads
+  // started when the file was attached, so this is all but always already done.
+  await Promise.all(staged.map((a) => a.upload).filter(Boolean));
+  // The chat was switched while a file uploaded; its socket went with it.
+  if (!state.task || state.task.id !== task.id) return;
+
+  const sent = staged.filter((a) => a.path);
+  const images = sent.filter((a) => a.kind === 'image');
+  const files = sent.filter((a) => a.kind !== 'image');
+
+  appendPromptCard(text, sent);
+  for (const bad of staged.filter((a) => !a.path)) {
+    appendSystemRow(chat, `${bad.name} was not attached: ${bad.error || 'the upload failed'}`, 'error');
+  }
   pendingTurnStart = Date.now();
   autoScroll(chat, true);
   // The first message in an empty chat names it, everywhere it is shown.
-  if (state.task && state.task.title === NEW_CHAT_TITLE) {
-    state.task.title = titleFrom(text);
-    if (draft && draft.id === state.task.id) draft.title = state.task.title;
-    updateTaskSummary(state.task.id, { title: state.task.title });
+  if (task.title === NEW_CHAT_TITLE) {
+    task.title = titleFrom(text) || (sent[0] && sent[0].name) || NEW_CHAT_TITLE;
+    if (draft && draft.id === task.id) draft.title = task.title;
+    updateTaskSummary(task.id, { title: task.title });
     renderTopbar();
     updateGoal();
   }
   try {
-    await api.sendMessage(state.task.id, text, { model: state.modelId || undefined });
+    await api.sendMessage(task.id, text, {
+      model: state.modelId || undefined,
+      images: images.map((a) => a.path),
+      files: files.map((a) => a.path),
+    });
   } catch (err) {
     appendSystemRow(chat, String((err && err.message) || err), 'error');
   }
@@ -2161,18 +2648,24 @@ function renderSettings(body, foot) {
   // Persists when the field is left, or on Enter. A number with a Save button
   // beside it is one control more than the job needs.
   const steps = h('input', {
-    class: 'input num', type: 'number', min: '1', max: '1000', value: String(s.max_steps),
+    class: 'input num', type: 'number', min: '0', max: '1000', value: String(s.max_steps),
   });
   const agentNote = h('span', { class: 'note inline hidden' });
   steps.addEventListener('keydown', (e) => { if (e.key === 'Enter') steps.blur(); });
   steps.addEventListener('change', async () => {
-    const value = Number(steps.value);
-    if (!value || value === s.max_steps) return;
+    const raw = steps.value.trim();
+    const value = Number(raw);
+    // 0 is a value — it is how the limit is turned off — but an empty box is
+    // not: clearing the field must not be read as a request for no limit.
+    if (!raw || !Number.isInteger(value) || value < 0 || value === s.max_steps) {
+      steps.value = String(s.max_steps);
+      return;
+    }
     try {
       state.settings = await api.saveSettings({ max_steps: value });
       s.max_steps = state.settings.max_steps;
       agentNote.className = 'note inline';
-      agentNote.textContent = 'Saved';
+      agentNote.textContent = s.max_steps === 0 ? 'Saved — no limit' : 'Saved';
     } catch (err) {
       steps.value = String(s.max_steps);
       agentNote.className = 'note inline error';
@@ -2192,7 +2685,7 @@ function renderSettings(body, foot) {
       h('div', { class: 'setting' },
         h('div', { class: 'setting-main' },
           h('div', { class: 'setting-name' }, 'Step limit'),
-          h('div', { class: 'setting-help' }, 'Tool calls one chat may make per turn.')),
+          h('div', { class: 'setting-help' }, 'Tool calls one chat may make per turn. 0 is no limit.')),
         h('div', { class: 'setting-control' }, agentNote, steps))),
   );
   foot.textContent = s.config_path;
@@ -2327,6 +2820,7 @@ function makeCallbacks(id) {
     onStatus: guard(onStatus), // reads + clears replayPending itself
     onTodo: content(onTodo),
     onUsage: content(onUsage),
+    onContext: content(onContext),
     onPlan: content(onPlan),
     onInterview: content(onInterview),
     onNotice: content((text) => appendSystemRow(chat, text)),
@@ -2355,10 +2849,13 @@ async function selectTask(id, { reload = false } = {}) {
     clearInterval(paneClock);
     paneClock = null;
   }
+  closePalette();
   const sameTask = reload && state.task && state.task.id === id;
   state.selectedTaskId = id;
   state.todos = [];
+  state.todosHidden = false;
   state.usage = { prompt: 0, completion: 0 };
+  state.context = null;
   state.git = null;
   state.lastWorked = null;
   state.subagents = [];
@@ -2366,6 +2863,11 @@ async function selectTask(id, { reload = false } = {}) {
   if (!sameTask) {
     state.modelId = null;
     state.modelLabel = null;
+    // Files staged for a message that was never sent belong to the chat they
+    // were staged in, not to the one being opened.
+    state.attachments = [];
+    state.commands = [];
+    renderAttachTray();
   }
   renderSidebar();
 
@@ -2396,6 +2898,7 @@ async function selectTask(id, { reload = false } = {}) {
   renderContextPanel();
   updateModelChip();
   refreshGit();
+  loadCommands(task);
   replayPending = true;
   streamHandle = api.streamTask(id, makeCallbacks(id));
 }
@@ -2414,6 +2917,7 @@ async function bootChat() {
 
 async function init() {
   renderComposer();
+  initDropTarget();
   renderSidebar();
   renderTopbar();
   try {

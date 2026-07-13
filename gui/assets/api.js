@@ -89,6 +89,43 @@
  */
 
 /**
+ * One file the user attached, as `POST /api/tasks/{id}/upload` saved it. The
+ * server decides `kind` by sniffing the bytes — never the client, and never the
+ * file name — because that is what decides where the file was written, and only
+ * `~/.wizard/images/` is servable back to the page.
+ * @typedef {Object} Attachment
+ * @property {string} path   Absolute path the server wrote it to.
+ * @property {string} name   Original file name.
+ * @property {string} mime   Sniffed media type.
+ * @property {number} bytes
+ * @property {'image'|'file'} kind
+ */
+
+/**
+ * One entry of `GET /api/commands`. `where` says who runs it:
+ *  - `server` — a `command` frame; the Agent acts on it.
+ *  - `client` — app.js handles it (a pane, a panel toggle).
+ *  - `prompt` — a custom command from `.wizard/commands/*.md`. It goes out as an
+ *    ordinary `user_message`: the SERVER expands it, through the same
+ *    `commands::preprocess` that gives the composer its `@file` refs. The client
+ *    never expands one, so a custom command means the same thing in both UIs.
+ * @typedef {Object} SlashCommand
+ * @property {string} name
+ * @property {string} detail          One line, for the palette.
+ * @property {'server'|'client'|'prompt'} where
+ * @property {string} [args]          Argument hint ("<name>"), when it takes any.
+ */
+
+/**
+ * The `context` frame: what the NEXT model call will carry. Distinct from
+ * `usage`, which is the session's lifetime spend — conflating the two is what
+ * the TUI got wrong before main's 0ed201b, so the two readouts stay apart here.
+ * @typedef {Object} ContextSize
+ * @property {number} tokens
+ * @property {number|null} window  The model's context window; null when unknown.
+ */
+
+/**
  * One subagent run, announced by a `subagent_run_started` frame. Every later
  * `subagent_run_*` frame carries the same `run`, so concurrent runs demux
  * into their own panes.
@@ -110,7 +147,7 @@
 
 /**
  * One item of a task transcript, discriminated by `type`:
- *  - {type:'user',     text}                    user prompt quote card
+ *  - {type:'user',     text, attachments}       user prompt quote card
  *  - {type:'worked',   label}                   collapsible "Worked ..." divider
  *  - {type:'text',     text}                    agent narration paragraph
  *  - {type:'thinking', text}                    collapsed reasoning block
@@ -174,6 +211,7 @@
  * @property {(status: TaskStatus) => void} [onStatus]
  * @property {(items: Array<{text:string,done:boolean,active:boolean}>) => void} [onTodo]
  * @property {(usage: {promptTokens:number, completionTokens:number}) => void} [onUsage]
+ * @property {(context: ContextSize) => void} [onContext]                       Next turn's context size.
  * @property {(plan: string) => void} [onPlan]
  * @property {(questions: string[]) => void} [onInterview]
  * @property {(text: string) => void} [onNotice]
@@ -296,15 +334,30 @@ export function classifyTool(name, args) {
 /* ------------------------------------------------------------------------ */
 
 /**
+ * Images the browser already holds the bytes of — the file the user just
+ * attached — keyed by the path the upload came back with. Nothing here is ever
+ * revoked: the same blob backs the composer's chip, then the thumbnail on the
+ * prompt card the message became, for as long as the page lives.
+ * @type {Map<string, string>}
+ */
+const localImages = new Map();
+
+/** Serve `path` from these bytes rather than fetching it back from the server. */
+export function rememberImage(path, objectUrl) {
+  if (path && objectUrl) localImages.set(path, objectUrl);
+}
+
+/**
  * Where the page fetches one image's bytes: `GET /api/image`, by the path the
  * frame carried. The frames deliberately carry no base64 — a turn's replay
  * buffer would be megabytes — so the file is a fetch, and the server serves it
- * only if it really is one of the images wizard saved.
+ * only if it really is one of the images wizard saved. An image this page
+ * uploaded itself skips the round trip entirely.
  * @param {ImageRef} image
  * @returns {string}
  */
 export function imageUrl(image) {
-  return `/api/image?path=${encodeURIComponent(image.path)}`;
+  return localImages.get(image.path) || `/api/image?path=${encodeURIComponent(image.path)}`;
 }
 
 /**
@@ -317,6 +370,36 @@ function imageBatch(frame) {
     .filter((image) => image && image.path)
     .map((image) => ({ path: image.path, mime: image.mime || 'image/png', bytes: image.bytes || 0 }));
   return { source: frame.source === 'tool' ? 'tool' : 'assistant', tool: frame.tool || null, images };
+}
+
+/**
+ * The attachment refs a recorded user message carries, so a replayed session
+ * shows what was sent up with the prompt rather than only the prose. Accepts
+ * either the upload response's own shape (an `attachments` list, each entry
+ * carrying the server's `kind`) or separate `images` / `files` lists, and a
+ * bare path string in place of an object.
+ * @returns {Attachment[]}
+ */
+function userAttachments(item) {
+  /** @type {Attachment[]} */
+  const out = [];
+  const add = (raw, kind) => {
+    const ref = typeof raw === 'string' ? { path: raw } : raw;
+    if (!ref || !ref.path) return;
+    out.push({
+      path: ref.path,
+      name: ref.name || pathBasename(ref.path),
+      mime: ref.mime || (kind === 'image' ? 'image/png' : ''),
+      bytes: ref.bytes || 0,
+      kind,
+    });
+  };
+  for (const raw of Array.isArray(item.attachments) ? item.attachments : []) {
+    add(raw, raw && raw.kind === 'image' ? 'image' : 'file');
+  }
+  for (const raw of Array.isArray(item.images) ? item.images : []) add(raw, 'image');
+  for (const raw of Array.isArray(item.files) ? item.files : []) add(raw, 'file');
+  return out;
 }
 
 /** Fold a finished call's server summary into its display shape. */
@@ -357,6 +440,25 @@ function mapTaskState(state) {
   }
 }
 
+const WHERE = new Set(['server', 'client', 'prompt']);
+
+/**
+ * The command list, with every entry pinned to a `where` the client knows how
+ * to act on. An unrecognized one falls back to `server`: the list came from the
+ * server, so the server is the half that knows what to do with it.
+ * @returns {SlashCommand[]}
+ */
+function normalizeCommands(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => row && row.name)
+    .map((row) => ({
+      name: String(row.name),
+      detail: row.detail || '',
+      where: WHERE.has(row.where) ? row.where : 'server',
+      args: row.args || '',
+    }));
+}
+
 /** Dispatch one parsed server frame onto the callback surface. */
 function dispatchFrame(frame, cb) {
   switch (frame.type) {
@@ -395,6 +497,14 @@ function dispatchFrame(frame, cb) {
       cb.onUsage && cb.onUsage({
         promptTokens: frame.prompt_tokens || 0,
         completionTokens: frame.completion_tokens || 0,
+      });
+      break;
+    // What the next model call will carry — not the session's lifetime spend,
+    // which is `usage` above and which the Goal card already reports.
+    case 'context':
+      cb.onContext && cb.onContext({
+        tokens: frame.tokens || 0,
+        window: typeof frame.window === 'number' && frame.window > 0 ? frame.window : null,
       });
       break;
     case 'state':
@@ -552,7 +662,7 @@ export class RealApi {
     for (const item of raw.items || []) {
       switch (item.kind) {
         case 'user':
-          transcript.push({ type: 'user', text: item.text || '' });
+          transcript.push({ type: 'user', text: item.text || '', attachments: userAttachments(item) });
           sawUser = true;
           inWorked = false;
           if (!title) title = firstLine(item.text) || String(item.text || '').trim();
@@ -669,12 +779,54 @@ export class RealApi {
     ws.send(JSON.stringify(frame));
   }
 
-  /** `user_message` over the task's socket; the reply streams back. */
+  /**
+   * `user_message` over the task's socket; the reply streams back. Attachment
+   * paths go up as the paths the server itself handed back from `upload` — it
+   * re-verifies each one against the directory it wrote them to, so a path this
+   * client invented would be refused rather than read.
+   * @param {{model?: string, images?: string[], files?: string[]}} [opts]
+   */
   async sendMessage(id, text, opts = {}) {
     const frame = { type: 'user_message', text };
     if (opts.model) frame.model = opts.model;
+    if (opts.images && opts.images.length) frame.images = opts.images;
+    if (opts.files && opts.files.length) frame.files = opts.files;
     this._send(id, frame);
     return { ok: true };
+  }
+
+  /**
+   * POST /api/tasks/{id}/upload: the files, as multipart. One request per file,
+   * so a chip in the composer maps to exactly one result — the endpoint takes
+   * several parts, but nothing here needs to guess which came back as which.
+   * The content-type is left to the browser: it owns the multipart boundary.
+   * @param {string} id
+   * @param {File[]} files
+   * @returns {Promise<Attachment[]>}
+   */
+  async upload(id, files) {
+    const body = new FormData();
+    for (const file of files) body.append('file', file, file.name);
+    const out = await this._json(`/api/tasks/${encodeURIComponent(id)}/upload`, { method: 'POST', body });
+    return (out && out.attachments) || [];
+  }
+
+  /**
+   * GET /api/commands: what `/` offers in this workspace — the built-ins plus
+   * the custom commands of `.wizard/commands/`, which is why it is scoped to a
+   * directory rather than global.
+   * @param {string} cwd
+   * @returns {Promise<SlashCommand[]>}
+   */
+  async commands(cwd) {
+    const out = await this._json(`/api/commands?cwd=${encodeURIComponent(cwd || '')}`);
+    return normalizeCommands(out && out.commands);
+  }
+
+  /** `command`: a server-side slash command. It answers with the frame kinds it
+   *  already has — `notice`, `state`, `context`, or `error`. */
+  sendCommand(id, name, args) {
+    this._send(id, { type: 'command', name, args: args || '' });
   }
 
   /** `plan_verdict`: approve or reject (with optional feedback) a held plan. */
@@ -918,6 +1070,17 @@ function buildMockData() {
           'Build a static three-pane GUI shell for wizard: dark sidebar with the task list, ' +
           'streaming conversation in the center, and a git/plan context panel on the right. ' +
           'No frameworks — plain HTML, CSS, and ES modules the Rust binary can embed and serve.',
+        // A replayed message shows what went up with it. (A fixture image would
+        // have no bytes behind it; a real one is attached in the composer.)
+        attachments: [
+          {
+            path: '/home/you/.wizard/attachments/wiz-gui-shell/gui-design-spec.md',
+            name: 'gui-design-spec.md',
+            mime: 'text/markdown',
+            bytes: 8100,
+            kind: 'file',
+          },
+        ],
       },
       { type: 'worked', label: 'Worked for 3m 1s' },
       {
@@ -1087,6 +1250,19 @@ function textEvents(text) {
 let idCounter = 0;
 const nextId = (prefix) => `${prefix}-${Date.now().toString(36)}-${++idCounter}`;
 
+/** The mock's `/` palette: one of each `where`, so all three paths are drivable. */
+const MOCK_COMMANDS = [
+  { name: 'clear', detail: 'Drop the conversation history', where: 'server' },
+  { name: 'compact', detail: 'Summarize history to free context', where: 'server' },
+  { name: 'cost', detail: 'Session token spend', where: 'server' },
+  { name: 'model', detail: 'Switch model', where: 'server', args: '<name>' },
+  { name: 'mode', detail: 'sovereign | genie | plan', where: 'server', args: '<mode>' },
+  { name: 'diff', detail: 'Show working-tree changes', where: 'client' },
+  { name: 'todos', detail: 'Toggle the progress panel', where: 'client' },
+  { name: 'help', detail: 'List the commands', where: 'client' },
+  { name: 'review', detail: '(custom, .wizard/commands/review.md)', where: 'prompt' },
+];
+
 /** The presets the mock's Settings page offers (a subset of the real ones). */
 const MOCK_PRESETS = [
   { name: 'anthropic', label: 'Anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-fable-5', needs_key: true, needs_base_url: false, hint: 'Claude models, straight from Anthropic.' },
@@ -1105,6 +1281,11 @@ export class MockApi {
       { name: 'zai', kind: 'openai', base_url: 'https://api.z.ai/v1', model: 'GLM-5.2', key: 'stored' },
       { name: 'anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-5', key: 'env' },
     ];
+    /** What the next turn would carry; grows with the conversation, and drops
+     *  when /clear or /compact takes a scythe to it. @type {ContextSize} */
+    this._context = { tokens: 24310, window: 200000 };
+    /** The GUI's step budget. 0 = no limit, as v1.2's default now is. */
+    this._maxSteps = 0;
   }
 
   /** @returns {Promise<Workspace[]>} */
@@ -1140,13 +1321,15 @@ export class MockApi {
       this._streams.set(id, set);
     }
     set.add(callbacks);
-    if (callbacks.onOpen) {
-      const t = setTimeout(() => {
-        this._timers.delete(t);
-        if (set.has(callbacks)) callbacks.onOpen();
-      }, 0);
-      this._timers.add(t);
-    }
+    const t = setTimeout(() => {
+      this._timers.delete(t);
+      if (!set.has(callbacks)) return;
+      if (callbacks.onOpen) callbacks.onOpen();
+      // The meter has a reading as soon as a chat is open, not only once the
+      // first turn of it has run.
+      if (callbacks.onContext) callbacks.onContext(this._context);
+    }, 0);
+    this._timers.add(t);
 
     const task = this._data.tasks.get(id);
     if (task && task.tailEvents && task.tailEvents.length) {
@@ -1176,15 +1359,26 @@ export class MockApi {
   /**
    * @param {string} id
    * @param {string} text
-   * @param {{model?: string}} [opts]
+   * @param {{model?: string, images?: string[], files?: string[]}} [opts]
    */
   async sendMessage(id, text, opts = {}) {
     const subscribers = () => Array.from(this._streams.get(id) ?? []);
     const callId = nextId('call');
+    const attached = [
+      (opts.images || []).length && `${opts.images.length} image(s)`,
+      (opts.files || []).length && `${opts.files.length} file(s)`,
+    ].filter(Boolean).join(' and ');
+    // The prompt grew by what was said and what came with it; the reply grows it
+    // again. The meter reads this, the Goal card's lifetime total reads `usage`.
+    const promptTokens = 1200 + Math.round(text.length / 4);
+    this._context = { tokens: this._context.tokens + promptTokens + 480, window: 200000 };
     const events = [
       { type: 'status', status: { state: 'working' } },
+      { type: 'context', context: this._context },
       ...textEvents(
-        'Taking another pass at that now. I’m rechecking the affected files and rerunning the quick checks before reporting back. '
+        attached
+          ? `Looking at the ${attached} you attached, and at the files they point to. `
+          : 'Taking another pass at that now. I’m rechecking the affected files and rerunning the quick checks before reporting back. '
       ),
       {
         type: 'tool_call',
@@ -1195,9 +1389,65 @@ export class MockApi {
         'Done — the follow-up change is in place. The shell still renders cleanly and the mock stream replays as expected' +
           (opts.model ? ` (model: ${opts.model}).` : '.')
       ),
+      { type: 'usage', usage: { promptTokens, completionTokens: 480 } },
     ];
     this._play(subscribers, events, { state: 'complete' }, 'completed');
     return { ok: true };
+  }
+
+  /**
+   * The server half of a `/command`, answered with the frame kinds the protocol
+   * already has: a notice, and — where the command moved the context — a new
+   * reading for the meter.
+   */
+  sendCommand(id, name, args) {
+    const subscribers = () => Array.from(this._streams.get(id) ?? []);
+    const said = {
+      clear: 'History cleared.',
+      compact: 'History compacted into a summary.',
+      cost: 'Session spend: 24,310 prompt · 3,120 completion tokens.',
+      model: `Model set to ${args || '(no model given)'}.`,
+      mode: `Mode set to ${args || '(no mode given)'}.`,
+    }[name];
+    if (!said) {
+      this._play(subscribers, [{ type: 'error', message: `unknown command: /${name}` }], { state: 'idle' });
+      return;
+    }
+    const events = [{ type: 'notice', text: said }];
+    if (name === 'clear' || name === 'compact') {
+      this._context = { tokens: name === 'clear' ? 0 : 4200, window: 200000 };
+      events.push({ type: 'context', context: this._context });
+    }
+    this._play(subscribers, events, { state: 'idle' });
+  }
+
+  /** @returns {Promise<SlashCommand[]>} */
+  async commands() {
+    return normalizeCommands(MOCK_COMMANDS);
+  }
+
+  /**
+   * An upload with no disk behind it: the paths are the ones the real server
+   * would have written to (an image under `~/.wizard/images/`, anything else
+   * under `~/.wizard/attachments/`), and `kind` is decided here from the bytes'
+   * media type — the one thing the client is never allowed to decide for real.
+   * @param {string} id
+   * @param {File[]} files
+   * @returns {Promise<Attachment[]>}
+   */
+  async upload(id, files) {
+    await new Promise((r) => setTimeout(r, 140)); // the round trip the real one has
+    return Array.from(files).map((file) => {
+      const image = /^image\//.test(file.type || '');
+      const name = file.name || (image ? 'pasted.png' : 'file');
+      return {
+        path: `/home/you/.wizard/${image ? 'images' : 'attachments'}/${id}/${nextId('up')}-${name}`,
+        name,
+        mime: file.type || 'application/octet-stream',
+        bytes: file.size || 0,
+        kind: image ? 'image' : 'file',
+      };
+    });
   }
 
   planVerdict() {}
@@ -1286,13 +1536,17 @@ export class MockApi {
       config_path: '/home/you/.wizard/config.toml',
       credentials_path: '/home/you/.wizard/credentials.toml',
       active: this._mockProviders[0] ? this._mockProviders[0].name : null,
-      max_steps: 100,
+      max_steps: this._maxSteps,
       providers: this._mockProviders.map((p, i) => ({ ...p, active: i === 0 })),
       presets: MOCK_PRESETS,
     };
   }
 
-  async saveSettings() {
+  async saveSettings(patch) {
+    // 0 is a value, not an absence: it is how the step limit is turned off.
+    if (patch && Number.isInteger(patch.max_steps) && patch.max_steps >= 0) {
+      this._maxSteps = patch.max_steps;
+    }
     return this.settings();
   }
 
@@ -1365,6 +1619,10 @@ export class MockApi {
         else if (ev.type === 'tool_call' && cb.onToolCall) cb.onToolCall(ev.call);
         else if (ev.type === 'tool_result' && cb.onToolResult) cb.onToolResult(ev.result);
         else if (ev.type === 'status' && cb.onStatus) cb.onStatus(ev.status);
+        else if (ev.type === 'context' && cb.onContext) cb.onContext(ev.context);
+        else if (ev.type === 'usage' && cb.onUsage) cb.onUsage(ev.usage);
+        else if (ev.type === 'notice' && cb.onNotice) cb.onNotice(ev.text);
+        else if (ev.type === 'error' && cb.onError) cb.onError(ev.message);
       }
       timer = setTimeout(tick, ev.type === 'text' ? 26 : 220);
       this._timers.add(timer);

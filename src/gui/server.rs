@@ -109,6 +109,8 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/{id}", get(get_task))
         .route("/api/tasks/{id}/ws", get(task_ws))
+        .route("/api/tasks/{id}/upload", post(upload))
+        .route("/api/commands", get(commands))
         .route("/api/workspace", get(workspace))
         .route("/api/models", get(models))
         .route("/api/settings", get(get_settings).patch(patch_settings))
@@ -518,9 +520,9 @@ struct SettingsResponse {
     config_path: String,
     credentials_path: Option<String>,
     active: Option<String>,
-    /// Tool calls one GUI chat may make per turn (`[gui] max_steps`). The
-    /// top-level `max_steps` belongs to the TUI and is left alone: a control
-    /// here that silently governed a different surface would be a lie.
+    /// Model → tool → model round trips one turn may take (`max_steps`), on
+    /// every surface: the GUI is the same agent as the TUI, so it edits the same
+    /// field. `0` is the default and means no limit.
     max_steps: u32,
     providers: Vec<SettingsProvider>,
     presets: &'static [settings::Preset],
@@ -543,7 +545,7 @@ fn settings_response(config: &Config) -> SettingsResponse {
         config_path: settings::config_path(),
         credentials_path: settings::credentials_path().map(|p| p.display().to_string()),
         active: config.active_provider.clone(),
-        max_steps: config.gui.max_steps,
+        max_steps: config.max_steps.cap().unwrap_or(0),
         providers: config
             .providers
             .iter()
@@ -564,7 +566,7 @@ async fn get_settings(State(state): State<Arc<GuiState>>) -> axum::Json<Settings
     axum::Json(settings_response(&state.config.current()))
 }
 
-/// `PATCH /api/settings`: the GUI's own step budget.
+/// `PATCH /api/settings`: the step budget every surface runs on.
 #[derive(Debug, Deserialize)]
 struct PatchSettings {
     #[serde(default)]
@@ -575,16 +577,18 @@ async fn patch_settings(
     State(state): State<Arc<GuiState>>,
     axum::Json(body): axum::Json<PatchSettings>,
 ) -> Result<axum::Json<SettingsResponse>, ApiError> {
+    // 0 is the default and means unlimited; the ceiling is a sanity bound on a
+    // number typed into a box, not a policy.
     if let Some(steps) = body.max_steps
-        && !(1..=1000).contains(&steps)
+        && steps > 1000
     {
         return Err(ApiError::bad_request(
-            "the step limit must be between 1 and 1000",
+            "the step limit must be 0 (no limit) or at most 1000",
         ));
     }
     let config = state.config.update(|config| {
         if let Some(steps) = body.max_steps {
-            config.gui.max_steps = steps;
+            config.max_steps = crate::config::StepBudget::new(steps);
         }
         Ok(())
     })?;
@@ -769,6 +773,255 @@ fn parse_kind(kind: &str) -> Result<ProviderKind, ApiError> {
 }
 
 /* ---------------------------------------------------------------------- */
+/* Slash commands                                                         */
+/* ---------------------------------------------------------------------- */
+
+/// One row of `GET /api/commands`.
+///
+/// `where` says who executes it: `server` is sent back as a `command` frame and
+/// applied to the Agent ([`crate::gui::tasks::run_command`]); `client` is the
+/// page's own (a panel toggle — nothing to ask the server for); `prompt` is a
+/// custom `.wizard/commands/*.md` command, which the client sends as an
+/// ordinary `user_message` and the *server* expands through
+/// [`crate::commands::preprocess`], exactly as the TUI does.
+#[derive(Debug, Serialize)]
+struct CommandRow {
+    name: String,
+    detail: String,
+    #[serde(rename = "where")]
+    executed_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<&'static str>,
+}
+
+/// The built-in commands the GUI offers. Deliberately a subset of the TUI's
+/// (`app.rs` `COMMANDS`): a command with nowhere to land in this UI — `/vim`,
+/// `/quit`, the interactive pickers — would be a menu entry that does nothing.
+///
+/// `clear` is a *client* command here, unlike in the TUI. `Agent::clear`
+/// rotates the session file, and a GUI task is keyed by its session id — so a
+/// server-side clear would leave the page replaying the session the agent had
+/// just stopped writing to. A new chat is what clearing means when the
+/// conversation and the file are the same object.
+pub(crate) const COMMANDS: [(&str, &str, &str, Option<&str>); 8] = [
+    (
+        "clear",
+        "start a new chat in this directory",
+        "client",
+        None,
+    ),
+    (
+        "compact",
+        "summarize the history to free context",
+        "server",
+        None,
+    ),
+    ("cost", "session token usage and cost", "server", None),
+    ("model", "switch model", "server", Some("<name>")),
+    ("mode", "sovereign | genie | plan", "server", Some("<mode>")),
+    ("help", "list the commands", "server", None),
+    ("diff", "toggle the working-tree diff", "client", None),
+    ("todos", "toggle the progress panel", "client", None),
+];
+
+/// `/help`, as the `notice` frame that answers it.
+pub(crate) fn help_text() -> String {
+    let mut text = String::from("commands:");
+    for (name, detail, _, args) in COMMANDS {
+        match args {
+            Some(args) => text.push_str(&format!("\n  /{name} {args} — {detail}")),
+            None => text.push_str(&format!("\n  /{name} — {detail}")),
+        }
+    }
+    text.push_str("\n\nplus any custom command in .wizard/commands/*.md, and @path to");
+    text.push_str(" reference a file.");
+    text
+}
+
+/// `GET /api/commands?cwd=/abs/path`: the built-ins plus the custom commands
+/// loaded for that workspace, so the composer's menu is the one the *server*
+/// will actually honor.
+async fn commands(Query(query): Query<GitQuery>) -> Result<axum::Json<Value>, ApiError> {
+    let root = PathBuf::from(&query.cwd);
+    if !root.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "cwd '{}' is not a directory",
+            query.cwd
+        )));
+    }
+    let mut rows: Vec<CommandRow> = COMMANDS
+        .iter()
+        .map(|(name, detail, executed_by, args)| CommandRow {
+            name: (*name).to_string(),
+            detail: (*detail).to_string(),
+            executed_by,
+            args: *args,
+        })
+        .collect();
+    for command in crate::commands::load(&root) {
+        let args = command.expects_args().then_some("<args>");
+        let detail = command.description.unwrap_or_else(|| {
+            format!(
+                "custom command ({})",
+                command
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+        });
+        rows.push(CommandRow {
+            name: command.name,
+            detail,
+            executed_by: "prompt",
+            args,
+        });
+    }
+    Ok(axum::Json(json!({ "commands": rows })))
+}
+
+/* ---------------------------------------------------------------------- */
+/* Attachments                                                            */
+/* ---------------------------------------------------------------------- */
+
+/// One file `POST /api/tasks/{id}/upload` took in.
+#[derive(Debug, Serialize)]
+struct Attachment {
+    path: String,
+    name: String,
+    mime: String,
+    bytes: usize,
+    /// `image` or `file` — decided from the *bytes*, never from what the client
+    /// called it.
+    kind: &'static str,
+}
+
+/// `POST /api/tasks/{id}/upload`: take in one or more `file` parts of a
+/// `multipart/form-data` body and hand back the paths a `user_message` may
+/// attach.
+///
+/// Task-scoped because both stores are session-scoped: an image has to land in
+/// *this* session's image directory, since [`resolve_image`] serves nothing
+/// from anywhere else.
+///
+/// The media type is sniffed from the bytes ([`crate::llm::sniff_mime`]). An
+/// image goes through [`crate::llm::Image::from_bytes`] — which enforces the
+/// size cap — into the content-addressed [`crate::images::ImageStore`]; anything
+/// else is written to `~/.wizard/attachments/<session>/` under a sanitized name.
+/// A client that labels a PDF `image/png`, or names it `x.png`, changes nothing:
+/// neither the label nor the extension is read.
+async fn upload(
+    Path(id): Path<String>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<axum::Json<Value>, ApiError> {
+    let session = session_id(&id)?;
+    let mut attachments = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("reading the upload: {err}")))?
+    {
+        let name = field.file_name().unwrap_or_default().to_string();
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|err| ApiError::bad_request(format!("reading the upload: {err}")))?;
+        attachments.push(store_attachment(session, &name, &bytes)?);
+    }
+    if attachments.is_empty() {
+        return Err(ApiError::bad_request("the upload carried no files"));
+    }
+    Ok(axum::Json(json!({ "attachments": attachments })))
+}
+
+/// Write one uploaded file to the store its own bytes put it in.
+fn store_attachment(session: &str, name: &str, bytes: &[u8]) -> Result<Attachment, ApiError> {
+    let name = sanitize_name(name);
+    if let Some(mime) = crate::llm::sniff_mime(bytes) {
+        // The cap lives in `Image::from_bytes`; the store then names the file
+        // after the hash of these exact bytes, which is what makes the path it
+        // returns safe to hand back and cache forever.
+        let image = crate::llm::Image::from_bytes(bytes)
+            .map_err(|err| ApiError::bad_request(format!("{name}: {err}")))?;
+        let saved = crate::images::ImageStore::open(session)
+            .and_then(|store| store.save(&image))
+            .map_err(|err| ApiError::from(err.context(format!("saving {name}"))))?;
+        return Ok(Attachment {
+            path: saved.path.display().to_string(),
+            name,
+            mime: mime.to_string(),
+            bytes: saved.bytes,
+            kind: "image",
+        });
+    }
+    if bytes.len() > crate::llm::MAX_IMAGE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "{name} is {} bytes, over the {} byte cap",
+            bytes.len(),
+            crate::llm::MAX_IMAGE_BYTES
+        )));
+    }
+    let dir = Config::attachments_dir()?.join(session);
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}")))?;
+    let path = dir.join(&name);
+    std::fs::write(&path, bytes)
+        .map_err(|err| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}")))?;
+    Ok(Attachment {
+        path: path.display().to_string(),
+        name,
+        // Cosmetic only — a label for the chip in the composer. Nothing is
+        // decided by it: `kind` above came from the bytes, and the turn reads
+        // the file through the same `@file` expansion the TUI uses.
+        mime: "application/octet-stream".to_string(),
+        bytes: bytes.len(),
+        kind: "file",
+    })
+}
+
+/// A session id fit to name a directory: the store paths are built from it, so
+/// a `..` or a `/` in it would be a write outside the store. Session ids are
+/// timestamps (`2026-07-11T09-12-33`); anything with other characters in it is
+/// not one.
+fn session_id(id: &str) -> Result<&str, ApiError> {
+    let ok = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !ok {
+        return Err(ApiError::bad_request(format!("'{id}' is not a task id")));
+    }
+    Ok(id)
+}
+
+/// An uploaded file's name, reduced to something safe to join onto a directory:
+/// the basename only, with anything that is not a plain name character folded to
+/// `_`. Whitespace included — an attachment is referenced as an `@/abs/path`
+/// token in the prompt, and a space in the path would split the token in half.
+fn sanitize_name(name: &str) -> String {
+    let base = FsPath::new(name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // `..`, `.`, and the empty name are all directory traversal or nonsense.
+    let cleaned = cleaned.trim_start_matches('.').to_string();
+    if cleaned.is_empty() {
+        return "attachment".to_string();
+    }
+    cleaned
+}
+
+/* ---------------------------------------------------------------------- */
 /* Images                                                                 */
 /* ---------------------------------------------------------------------- */
 
@@ -816,32 +1069,80 @@ async fn image(Query(query): Query<ImageQuery>) -> Result<Response, ApiError> {
 /// Resolve a client-supplied image path against the image store, or refuse it.
 ///
 /// The rules, in order: the name must end in an image extension; the path must
-/// resolve — `..` segments, symlinks and all, which is what
-/// [`std::fs::canonicalize`] does — to a *regular file* that is really inside
-/// `root`. So `../../../etc/passwd`, an absolute path elsewhere on the disk,
-/// and a symlink in the store pointing out of it all land in the same refusal,
-/// and a file that is simply gone is a 404 the page can render honestly.
+/// resolve — `..` segments, symlinks and all — to a *regular file* really
+/// inside `root` ([`resolve_in_store`]). So `../../../etc/passwd`, an absolute
+/// path elsewhere on the disk, and a symlink in the store pointing out of it
+/// all land in the same refusal.
 fn resolve_image(root: &FsPath, path: &str) -> Result<PathBuf, ApiError> {
     let refused = || ApiError::bad_request(format!("'{path}' is not an image wizard saved"));
-    let candidate = FsPath::new(path);
-    let extension = candidate
+    let extension = FsPath::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
     if !extension.is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str())) {
         return Err(refused());
     }
+    resolve_in_store(root, path, refused)
+}
+
+/// Resolve a client-supplied attachment path against the attachment store, or
+/// refuse it — [`resolve_image`] without the image-extension rule, since an
+/// attachment is any file the user uploaded.
+fn resolve_attachment(root: &FsPath, path: &str) -> Result<PathBuf, ApiError> {
+    resolve_in_store(root, path, || {
+        ApiError::bad_request(format!("'{path}' is not a file wizard saved"))
+    })
+}
+
+/// The containment check both stores share: the path must canonicalize — `..`
+/// segments, symlinks and all, which is what [`std::fs::canonicalize`] does —
+/// to a regular file inside `root`. A file that is simply gone is a 404 the
+/// page can render honestly; anything else is `refused`.
+///
+/// This is the *only* place a client-supplied absolute path is admitted. Every
+/// route that takes one goes through it: a second implementation is a second
+/// chance to get it wrong.
+fn resolve_in_store(
+    root: &FsPath,
+    path: &str,
+    refused: impl Fn() -> ApiError,
+) -> Result<PathBuf, ApiError> {
     // Both sides are canonicalized before they are compared: a symlinked root
     // (a home directory that is one, a store under /tmp on macOS) would
     // otherwise fail to prefix-match its own files.
     let root = root.canonicalize().map_err(|_| refused())?;
-    let file = candidate
+    let file = FsPath::new(path)
         .canonicalize()
         .map_err(|err| ApiError::not_found(format!("{path}: {err}")))?;
     if !file.starts_with(&root) || !file.is_file() {
         return Err(refused());
     }
     Ok(file)
+}
+
+/// Verify the attachment paths on a `user_message` frame: images must sit in
+/// `~/.wizard/images/`, files in `~/.wizard/attachments/`. Nothing else is a
+/// path this server put in the client's hands.
+///
+/// Called on every message, not just the ones the upload route answered: a
+/// socket can send whatever it likes, and the turn is about to read these files
+/// into the model's context.
+pub(crate) fn verify_attachments(
+    images: &[String],
+    files: &[String],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let message = |err: ApiError| err.1;
+    let images_root = Config::images_dir().map_err(|err| format!("{err:#}"))?;
+    let files_root = Config::attachments_dir().map_err(|err| format!("{err:#}"))?;
+    let images = images
+        .iter()
+        .map(|path| resolve_image(&images_root, path).map_err(message))
+        .collect::<Result<Vec<_>, _>>()?;
+    let files = files
+        .iter()
+        .map(|path| resolve_attachment(&files_root, path).map_err(message))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((images, files))
 }
 
 /// `GET /api/git?cwd=...` query.
@@ -1106,6 +1407,101 @@ mod tests {
         let missing = resolve_image(&store, &root.join("deadbeef.png").display().to_string())
             .expect_err("missing");
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn attachments_resolve_only_inside_their_own_store() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("attachments");
+        let root = store.join("2026-07-13T09-00-00");
+        std::fs::create_dir_all(&root).unwrap();
+        let spec = root.join("spec.pdf");
+        std::fs::write(&spec, b"%PDF-1.7").unwrap();
+
+        let resolved = resolve_attachment(&store, &spec.display().to_string()).expect("served");
+        assert_eq!(resolved, spec.canonicalize().unwrap());
+
+        // The same refusals `resolve_image` gives — this is that guard, reused.
+        let secret = home.path().join("credentials.toml");
+        std::fs::write(&secret, "key = 'sk-1'").unwrap();
+        let traversal = root.join("../../credentials.toml");
+        for path in [
+            secret.display().to_string(),
+            traversal.display().to_string(),
+        ] {
+            let refusal = resolve_attachment(&store, &path).expect_err("refused");
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{path}");
+        }
+        #[cfg(unix)]
+        {
+            let escape = root.join("escape.pdf");
+            std::os::unix::fs::symlink(&secret, &escape).unwrap();
+            assert!(resolve_attachment(&store, &escape.display().to_string()).is_err());
+        }
+        // An image path is not an attachment path: each store answers for its
+        // own, so an uploaded image cannot be laundered into a file ref.
+        let images = home.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let png = images.join("ab12.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        assert!(resolve_attachment(&store, &png.display().to_string()).is_err());
+        assert!(resolve_image(&images, &spec.display().to_string()).is_err());
+    }
+
+    #[test]
+    fn an_upload_is_classified_by_its_bytes_not_by_what_the_client_called_it() {
+        let session = "2026-07-13T10-00-00";
+        // A PNG the client swore was a PDF, and a PDF it swore was a PNG. The
+        // filename and the content-type are both ignored; only the magic number
+        // decides where the file lands.
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let image = store_attachment(session, "not-an-image.pdf", &png).expect("stored");
+        assert_eq!(image.kind, "image");
+        assert_eq!(image.mime, "image/png");
+        // In the image store, under a name that is the hash of its bytes — the
+        // only place `GET /api/image` will serve it back from.
+        let images_root = Config::images_dir().unwrap();
+        assert!(
+            FsPath::new(&image.path).starts_with(&images_root),
+            "{}",
+            image.path
+        );
+        assert!(image.path.ends_with(".png"), "{}", image.path);
+        assert!(resolve_image(&images_root, &image.path).is_ok());
+
+        let file =
+            store_attachment(session, "screenshot.png", b"%PDF-1.7\nnot a png").expect("stored");
+        assert_eq!(file.kind, "file", "the bytes are not an image");
+        let attachments_root = Config::attachments_dir().unwrap();
+        assert!(
+            FsPath::new(&file.path).starts_with(&attachments_root),
+            "a non-image never enters the image store: {}",
+            file.path
+        );
+        assert_eq!(file.name, "screenshot.png");
+        // And it is not servable as an image, whatever it is called.
+        assert!(resolve_image(&Config::images_dir().unwrap(), &file.path).is_err());
+    }
+
+    #[test]
+    fn uploaded_names_cannot_escape_the_session_directory() {
+        // A name is a name, not a path: traversal, separators, and the
+        // whitespace that would split the `@/abs/path` token in the prompt are
+        // all folded away.
+        assert_eq!(sanitize_name("../../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_name("/etc/shadow"), "shadow");
+        assert_eq!(sanitize_name("my notes.txt"), "my_notes.txt");
+        assert_eq!(sanitize_name(".."), "attachment");
+        assert_eq!(sanitize_name(""), "attachment");
+        assert_eq!(sanitize_name(".ssh"), "ssh");
+        assert_eq!(sanitize_name("report-v2.final.pdf"), "report-v2.final.pdf");
+
+        // The session id names a directory, so it is checked the same way.
+        assert!(session_id("2026-07-13T09-00-00").is_ok());
+        assert!(session_id("../../etc").is_err());
+        assert!(session_id("a/b").is_err());
+        assert!(session_id(".").is_err());
+        assert!(session_id("").is_err());
     }
 
     #[test]

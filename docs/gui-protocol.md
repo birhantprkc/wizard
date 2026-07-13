@@ -31,7 +31,7 @@ Full transcript replay for the center pane, mapped from session JSONL:
 ```json
 { "id": "...", "cwd": "...", "workspace": "...", "model": "...",
   "items": [
-    { "kind": "user", "text": "..." },
+    { "kind": "user", "text": "...", "images": [{ "path": "...", "mime": "image/png", "bytes": 51234 }] },
     { "kind": "turn_marker", "turn": 2, "prompt": "..." },
     { "kind": "text", "text": "assistant narration" },
     { "kind": "tool", "name": "execute", "args": {}, "output": { "ok": true, "summary": "1 search, 1 file" } },
@@ -49,7 +49,13 @@ shows what the live stream showed, in the same places. The model's own images fo
 `text`; a tool's follow *that tool's* `tool` item — which is not necessarily the last one,
 since one assistant message can make several calls. The message a tool's images ride back
 to the model on (`role: user`, "Image(s) returned by `x`:") is not a prompt and is not
-replayed as one.
+replayed as one — that label is what tells it apart from a person attaching an image to a
+prompt of their own, which can land in exactly the same place after an interrupted turn.
+
+A `user` item's `images` are what the *user* attached (uploaded, or `@shot.png`), echoed on
+the message they were attached to; the field is omitted when there were none. Non-image
+attachments get no echo of their own: `@file` expansion inlined their contents into `text`,
+which is what was actually sent to the model.
 
 `session_start` hook output is persisted as a system note but is **not** replayed: it is
 context written for the model, not conversation (the TUI drops it the same way when it
@@ -83,6 +89,63 @@ own — for the topbar's folder chip. Directories that no longer exist are omitt
 then shows just the configured model). Read per request, not cached: a provider added
 in Settings shows up without a restart.
 
+### POST /api/tasks/{id}/upload
+`multipart/form-data` with one or more `file` parts → the paths a `user_message` may
+then attach:
+```json
+{ "attachments": [
+  { "path": "/home/u/.wizard/images/<session>/ab12cd34.png",
+    "name": "screenshot.png", "mime": "image/png", "bytes": 51234, "kind": "image" },
+  { "path": "/home/u/.wizard/attachments/<session>/spec.pdf",
+    "name": "spec.pdf", "mime": "application/octet-stream", "bytes": 8100, "kind": "file" }
+] }
+```
+Task-scoped, not a bare `/api/upload`, because both stores are session-scoped: an image
+has to land in *this* session's image directory, since `GET /api/image` serves nothing
+from anywhere else.
+
+`kind` is decided by the server from the file's **bytes** (`llm::sniff_mime`) — never
+from the client's content-type and never from the extension. An image (png/jpeg/gif/webp)
+goes through `Image::from_bytes` (which enforces the 10 MB cap) into the
+content-addressed image store; anything else is written to
+`~/.wizard/attachments/<session>/` under a sanitized basename (traversal, separators and
+whitespace folded to `_` — a space would split the `@/abs/path` token the turn references
+it by). A PDF named `x.png` and labelled `image/png` still lands in attachments as
+`kind: "file"`. `mime` on a non-image is a cosmetic label for the composer chip; nothing
+is decided by it.
+
+### GET /api/commands?cwd=/abs/path
+The composer's slash menu — the commands the *server* will honor for that workspace:
+```json
+{ "commands": [
+  { "name": "clear",   "detail": "start a new chat in this directory", "where": "client" },
+  { "name": "compact", "detail": "summarize the history to free context", "where": "server" },
+  { "name": "cost",    "detail": "session token usage and cost", "where": "server" },
+  { "name": "model",   "detail": "switch model", "where": "server", "args": "<name>" },
+  { "name": "mode",    "detail": "sovereign | genie | plan", "where": "server", "args": "<mode>" },
+  { "name": "help",    "detail": "list the commands", "where": "server" },
+  { "name": "diff",    "detail": "toggle the working-tree diff", "where": "client" },
+  { "name": "todos",   "detail": "toggle the progress panel", "where": "client" },
+  { "name": "review",  "detail": "review the diff", "where": "prompt", "args": "<args>" }
+] }
+```
+`where` says who executes it:
+- `server` → send it as a `command` frame; the server applies it to the Agent.
+- `client` → the page's own (a panel toggle); nothing to ask the server for.
+- `prompt` → a custom command from `.wizard/commands/*.md`. It expands to prompt text, so
+  the client sends it as an ordinary `user_message` and the **server** expands it through
+  `commands::preprocess`. The client never expands one — that is the same pipeline the TUI
+  runs, and having two would mean two behaviors.
+
+The built-ins are deliberately a subset of the TUI's: a command with nowhere to land in
+this UI (`/vim`, `/quit`, the interactive pickers) would be a menu entry that does nothing.
+
+`clear` is a client command here, though the TUI runs it against the agent. `Agent::clear`
+rotates the session file, and a GUI task is *keyed by* its session id — so clearing
+server-side would leave `GET /api/tasks/{id}` replaying the session the agent had just
+stopped writing to, and a reload would lose every turn taken after the clear. Where the
+conversation and the file are the same object, clearing one means starting the other.
+
 ## Settings
 
 Every write re-reads `~/.wizard/config.toml` first and mutates *that* — the TUI and other
@@ -99,10 +162,16 @@ copy must never be what lands on disk.
                 "model": "…", "needs_key": true, "needs_base_url": false, "hint": "…" }] }
 ```
 `first_run` = no provider configured: the GUI onboards instead of opening a chat.
-`max_steps` is `[gui] max_steps` — the GUI's own step budget, not the TUI's top-level one.
+
+`max_steps` is the top-level `max_steps` — the one budget every surface runs on. `0` is
+the default and means **no limit**: the turn ends when the model stops calling tools. The
+GUI used to keep a `[gui] max_steps` of its own; it does not, because it is the same agent
+as the TUI and not a reduced one. A config still carrying the old `[gui]` section loads
+fine (the section is ignored, and not written back).
 
 ### PATCH /api/settings
-`{ "max_steps": 100 }` → the same shape as `GET`.
+`{ "max_steps": 0 }` → the same shape as `GET`. `0` (no limit) or 1–1000; anything higher
+is a 400.
 
 ## Subscription sign-in (OAuth)
 
@@ -218,6 +287,7 @@ One socket per open task. Server→client frames mirror `AgentEvent`:
 { "type": "images", "source": "assistant|tool", "tool": "generate_image", "images": [{ "path": "/home/u/.wizard/images/<session>/c414cd0e204d.png", "mime": "image/png", "bytes": 51234 }] }
 { "type": "todo", "items": [{ "text": "...", "done": true, "active": false }] }
 { "type": "usage", "prompt_tokens": 123, "completion_tokens": 45 }
+{ "type": "context", "tokens": 24310, "window": 200000 }
 { "type": "state", "state": "working|needs_input|idle|failed" }
 { "type": "plan_ready", "plan": "markdown" }
 { "type": "interview", "questions": ["..."] }
@@ -261,6 +331,24 @@ A tool's images carry no `call_id`: they arrive immediately after that tool's
 `tool_finished`, and the client puts them on the card it just drew. Their place in the turn
 is what identifies them, which is why nothing may be emitted between the two.
 
+### Usage vs context
+
+Two numbers, two frames, and they are not the same number.
+
+`usage` is **session-lifetime**: every model call adds to it, and it only ever grows. It is
+what `/cost` bills on.
+
+`context` is what will load into the **next** model call — the number the TUI's status bar
+shows. It is emitted on every `Usage` event (carrying that call's `prompt_tokens`, which is
+exactly the context the next call inherits) and on `ContextSize`, which fires after the
+history *shrank*: compaction, `/clear`. So `context` falls; `usage` cannot.
+
+Conflating the two — showing a lifetime total on a context meter — is the bug the TUI fixed
+in 0ed201b. `window` is the active provider's context window for the active model, and it is
+**omitted** when the provider does not know one (a local llama.cpp that will not say): a
+meter with no ceiling is honest, an invented ceiling is not. It is re-read when `/model`
+switches the model.
+
 ### Subagent runs
 
 `subagent` is the one-liner a background delegation shows in the chat. The `subagent_run_*`
@@ -290,11 +378,48 @@ reports `error` instead, and the closing `state` frame is `failed` rather than `
 
 Client→server frames:
 ```json
-{ "type": "user_message", "text": "...", "model": "optional override" }
+{ "type": "user_message", "text": "...", "model": "optional override",
+  "images": ["/home/u/.wizard/images/<session>/ab12cd34.png"],
+  "files":  ["/home/u/.wizard/attachments/<session>/spec.pdf"] }
 { "type": "cancel" }
 { "type": "plan_verdict", "approve": true, "feedback": "optional" }
 { "type": "interview_answers", "answers": ["..."] }   // or null to skip: { "answers": null }
+{ "type": "command", "name": "compact", "args": "" }
 ```
+
+### user_message
+
+Every `user_message` runs through `commands::preprocess(text, custom, cwd)` server-side —
+the one pipeline the TUI and headless runs use. That is what gives the GUI `@file`
+references and custom `.wizard/commands/*.md` commands, identically and for free. The
+client sends what the user typed; it expands nothing.
+
+`images` (from the upload route) are attached to the user message for the vision path.
+`files` are appended to the text as `@/abs/path` tokens, so the `@file` expansion reads
+them — there is no second file-reading path in the GUI.
+
+Both lists are **re-verified** server-side against the same canonicalize-and-contain check
+`GET /api/image` uses: an image path must resolve inside `~/.wizard/images/`, a file path
+inside `~/.wizard/attachments/`. A path the client sends is client input no matter which
+route first produced it; taken on trust it is an arbitrary-file read, and — once
+`@`-expanded into the prompt — a way to exfiltrate whatever it named. A path outside the
+stores is an `error` frame and no turn runs.
+
+### command
+
+A `where: "server"` command from `GET /api/commands`, applied to the live Agent. It takes
+the same slot a turn does (both need `&mut Agent`), so one sent mid-turn comes back as
+`error` "turn in progress" rather than queuing behind it.
+
+The server answers with the frames the protocol already has — there is no command-reply
+frame:
+- `compact` → `notice` (what the pass did), `context` (the history is smaller now).
+- `cost` → `notice` with the session totals and, when the provider carries rates, an estimate.
+- `model <name>` → `notice`; the context window is re-read for the new model.
+- `mode sovereign|genie|plan` → `notice`. `plan` is a posture on top of a mode: the next turn
+  investigates read-only and presents a plan through the `plan_ready` gate.
+- `help` → `notice`.
+- Anything unknown or unavailable → `error`.
 
 Rules:
 - One in-flight turn per task; `user_message` during a turn → `error` frame "turn in progress".
@@ -313,7 +438,12 @@ Rules:
 api.js `RealApi` implements the seam in `gui-design-spec.md` against this protocol:
 - listTasks → GET /api/tasks; getTask → GET /api/tasks/{id}; streamTask → the WS;
   sendMessage → WS user_message; gitStatus → GET /api/git; listModels → GET /api/models;
-  newTask → POST /api/tasks.
+  newTask → POST /api/tasks; upload → POST /api/tasks/{id}/upload;
+  listCommands → GET /api/commands; runCommand → WS command.
 - Right-panel Progress card ← `todo` frames; Goal card ← task title + done/total of todos +
   usage tokens; Git card ← /api/git polled after each `tool_finished` that mutates files
   (or simple 3s poll while a turn is live).
+- The context meter ← `context` frames, and *not* the Goal card's lifetime token count.
+  They are different numbers (see "Usage vs context").
+- `MockApi` (`?mock=1`) must cover every one of these: it is the only headless way to drive
+  the GUI, so a feature it cannot exercise is a feature nobody can check in a browser.

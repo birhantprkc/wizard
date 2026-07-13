@@ -10,7 +10,8 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::agent::PlanVerdict;
-use crate::gui::tasks::{Frame, TaskManager, TaskShared, TurnRequest};
+use crate::gui::server::verify_attachments;
+use crate::gui::tasks::{CommandRequest, Frame, TaskManager, TaskShared, TurnRequest};
 
 /// A client→server frame (see `docs/gui-protocol.md`).
 #[derive(Debug, Deserialize)]
@@ -20,6 +21,14 @@ enum ClientFrame {
         text: String,
         #[serde(default)]
         model: Option<String>,
+        /// Paths `POST /api/tasks/{id}/upload` returned for images, i.e. files
+        /// inside `~/.wizard/images/`. Verified again here: a path the client
+        /// sends is client input whatever route first produced it.
+        #[serde(default)]
+        images: Vec<String>,
+        /// The same for non-image attachments, inside `~/.wizard/attachments/`.
+        #[serde(default)]
+        files: Vec<String>,
     },
     Cancel,
     PlanVerdict {
@@ -29,6 +38,12 @@ enum ClientFrame {
     },
     InterviewAnswers {
         answers: Option<Vec<String>>,
+    },
+    /// A server-side slash command (`GET /api/commands`, `where: "server"`).
+    Command {
+        name: String,
+        #[serde(default)]
+        args: String,
     },
 }
 
@@ -86,8 +101,34 @@ fn apply(shared: &TaskShared, manager: &TaskManager, text: &str) -> Option<Frame
         }
     };
     match frame {
-        ClientFrame::UserMessage { text, model } => manager
-            .submit_turn(&shared.id, TurnRequest { text, model })
+        ClientFrame::UserMessage {
+            text,
+            model,
+            images,
+            files,
+        } => {
+            // An attachment path is a path the *client* chose. Taken on trust
+            // it is an arbitrary-file read — and, once `@`-expanded into the
+            // prompt, a way to exfiltrate whatever it named.
+            let (images, files) = match verify_attachments(&images, &files) {
+                Ok(paths) => paths,
+                Err(message) => return Some(Frame::Error { message }),
+            };
+            manager
+                .submit_turn(
+                    &shared.id,
+                    TurnRequest {
+                        text,
+                        model,
+                        images,
+                        files,
+                    },
+                )
+                .err()
+                .map(|message| Frame::Error { message })
+        }
+        ClientFrame::Command { name, args } => manager
+            .submit_command(&shared.id, CommandRequest { name, args })
             .err()
             .map(|message| Frame::Error { message }),
         ClientFrame::Cancel => {
@@ -114,19 +155,113 @@ fn apply(shared: &TaskShared, manager: &TaskManager, text: &str) -> Option<Frame
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::config::Config;
+    use crate::gui::settings::ConfigStore;
+
+    /// The error message an inbound frame came back with, or `None` when it was
+    /// accepted.
+    fn refusal(text: &str) -> Option<String> {
+        let shared = TaskShared::new(
+            "2026-07-13T00-00-00".to_string(),
+            PathBuf::from("/tmp/project"),
+            "test-model".to_string(),
+        );
+        let manager = TaskManager::new(Arc::new(ConfigStore::new(Config::default())));
+        match apply(&shared, &manager, text) {
+            Some(Frame::Error { message }) => Some(message),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn attachment_paths_outside_the_stores_are_refused_before_the_turn() {
+        let images = Config::images_dir().unwrap().join("2026-07-13T00-00-00");
+        std::fs::create_dir_all(&images).unwrap();
+        let png = images.join("a1b2c3d4.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+
+        let secret = Config::wizard_dir().unwrap().join("credentials.toml");
+        std::fs::write(&secret, "key = 'sk-1'").unwrap();
+
+        // A path inside the store passes the guard. (The task is not live in
+        // this bare manager, so the turn is refused *after* the check — which is
+        // the point: the check happened first, and it did not fire.)
+        let message = refusal(&format!(
+            r#"{{ "type": "user_message", "text": "hi", "images": ["{}"] }}"#,
+            png.display()
+        ))
+        .expect("no live task to run the turn");
+        assert!(message.contains("not live"), "got: {message}");
+
+        // An absolute path outside the store, a traversal out of it, and a
+        // symlink pointing out of it: all refused, and none of them reaches the
+        // turn.
+        let traversal = images.join("../../credentials.toml");
+        let symlink = images.join("escape.png");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, &symlink).ok();
+        for path in [&secret, &traversal, &symlink] {
+            let message = refusal(&format!(
+                r#"{{ "type": "user_message", "text": "read this", "images": ["{}"] }}"#,
+                path.display()
+            ))
+            .expect("refused");
+            assert!(
+                !message.contains("not live"),
+                "the path was taken on trust: {message}"
+            );
+        }
+
+        // The same for a file attachment: the attachment store is not the image
+        // store, and neither is anywhere else on the disk.
+        let message = refusal(&format!(
+            r#"{{ "type": "user_message", "text": "read this", "files": ["{}"] }}"#,
+            secret.display()
+        ))
+        .expect("refused");
+        assert!(!message.contains("not live"), "got: {message}");
+    }
 
     #[test]
     fn client_frames_parse_the_protocol_shapes() {
         let m: ClientFrame =
             serde_json::from_str(r#"{ "type": "user_message", "text": "hi" }"#).unwrap();
-        assert!(matches!(m, ClientFrame::UserMessage { text, model: None } if text == "hi"));
+        assert!(
+            matches!(m, ClientFrame::UserMessage { text, model: None, images, files }
+                if text == "hi" && images.is_empty() && files.is_empty())
+        );
 
         let m: ClientFrame =
             serde_json::from_str(r#"{ "type": "user_message", "text": "hi", "model": "claude" }"#)
                 .unwrap();
         assert!(
             matches!(m, ClientFrame::UserMessage { model: Some(model), .. } if model == "claude")
+        );
+
+        let m: ClientFrame = serde_json::from_str(
+            r#"{ "type": "user_message", "text": "look", "images": ["/i/a.png"],
+                 "files": ["/f/spec.pdf"] }"#,
+        )
+        .unwrap();
+        assert!(matches!(m, ClientFrame::UserMessage { images, files, .. }
+            if images == ["/i/a.png"] && files == ["/f/spec.pdf"]));
+
+        // `args` is optional: an argument-less command carries none.
+        let m: ClientFrame =
+            serde_json::from_str(r#"{ "type": "command", "name": "compact" }"#).unwrap();
+        assert!(
+            matches!(m, ClientFrame::Command { name, args } if name == "compact" && args.is_empty())
+        );
+
+        let m: ClientFrame =
+            serde_json::from_str(r#"{ "type": "command", "name": "model", "args": "claude" }"#)
+                .unwrap();
+        assert!(
+            matches!(m, ClientFrame::Command { name, args } if name == "model" && args == "claude")
         );
 
         let m: ClientFrame = serde_json::from_str(r#"{ "type": "cancel" }"#).unwrap();
