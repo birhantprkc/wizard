@@ -2161,6 +2161,22 @@ impl App {
         self.rail_focus = Some(index);
     }
 
+    /// Attach the pane `delta` rows away from `index`, wrapping around the
+    /// rail so ↓ always lands on another run and the browse never dead-ends at
+    /// the last one.
+    ///
+    /// With a single run there is nowhere to step, so ↑/↓ fall back to their
+    /// other job and scroll the pane you are reading.
+    fn step_pane(&mut self, index: usize, delta: isize) {
+        let len = self.panes.len();
+        if len < 2 {
+            self.scroll_pane(index, if delta < 0 { 1 } else { -1 });
+            return;
+        }
+        let next = (index as isize + delta).rem_euclid(len as isize) as usize;
+        self.attach_pane(next);
+    }
+
     /// Leave the attached pane and go all the way back to the main chat, with
     /// focus in the composer — one Esc, and you are typing again. (Leaving
     /// focus parked on the rail meant a second Esc to actually get out, which
@@ -3273,21 +3289,21 @@ impl App {
                     self.detach_pane();
                     return Ok(None);
                 }
-                // Shift+↑/↓ flips straight to the next subagent without
-                // backing out to the rail first.
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if index > 0 {
-                        self.attach_pane(index - 1);
-                    }
+                // Plain ↑/↓ keep doing what they did on the rail: walk the
+                // subagents. Opening one is not supposed to end the browse —
+                // you keep arrowing and each run takes over the screen in
+                // turn, wrapping around, so there is never a reason to back
+                // out to the rail just to see the next one.
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.step_pane(index, -1);
                     return Ok(None);
                 }
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if index + 1 < self.panes.len() {
-                        self.attach_pane(index + 1);
-                    }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.step_pane(index, 1);
                     return Ok(None);
                 }
-                // Plain ↑/↓ scroll the pane you are reading.
+                // Scrolling the run you are reading moves to Shift+↑/↓ (and
+                // PageUp/PageDown below).
                 KeyCode::Up => {
                     self.scroll_pane(index, 1);
                     return Ok(None);
@@ -9596,20 +9612,36 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrows_flip_between_panes_without_backing_out() {
+    fn arrows_walk_from_one_pane_straight_into_the_next() {
         let mut app = app_with_panes(3);
         app.attach_pane(0);
 
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.attached, Some(1));
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Down);
         assert_eq!(app.attached, Some(2));
-        // Clamped at the last pane.
-        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        // Wraps rather than dead-ending at the last run.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.attached, Some(0));
+
+        press(&mut app, KeyCode::Up);
         assert_eq!(app.attached, Some(2));
+        // Browsing runs never scrolls the one you passed through.
+        assert!(app.panes.iter().all(|pane| pane.scroll == 0));
+    }
+
+    #[test]
+    fn shift_arrows_scroll_the_pane_you_are_reading() {
+        let mut app = app_with_panes(3);
+        app.attach_pane(1);
 
         press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-        assert_eq!(app.attached, Some(1));
+        press_mod(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(app.attached, Some(1), "shift+↑ must not change pane");
+        assert_eq!(app.panes[1].scroll, 2);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.panes[1].scroll, 1);
     }
 
     #[test]

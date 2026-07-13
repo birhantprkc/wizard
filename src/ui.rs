@@ -1617,7 +1617,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
         header.push(Span::styled(" · foreground", dim().italic()));
     }
     let hint = if app.panes.len() > 1 {
-        "esc back to chat · ↑↓ scroll · shift+↑↓ next agent"
+        "esc back to chat · ↑↓ next agent · shift+↑↓ scroll"
     } else {
         "esc back to chat · ↑↓ scroll"
     };
