@@ -128,7 +128,6 @@ with dead air beneath it.
    - label `GIT TOOLS`
    - row: `⊞ Changes` … right-aligned `+734` (green) `-7` (red)
    - row: `⎇ feat/gomoku-ai` (current branch, static)
-   - row: `-o- Commit ⌄` — expands the commit-message editor
 2. **Goal** group:
    - label `GOAL` … right-aligned status `Complete` (muted)
    - `◎` target icon + goal text ("Gomoku vs. AI — implement computer moves with a heuristic algorithm")
@@ -149,5 +148,6 @@ with dead air beneath it.
   `/api/models` each time it opens (providers change, local backends come up) and offers
   "Manage providers…" when there is nothing to pick.
 - Chats run sovereign (no terminal to prompt at) on `[gui] max_steps`, which Settings edits.
-- Git card: live diffstat of the task's workspace, current branch, commit action.
+- Git card: live diffstat of the task's workspace, current branch, per-file diffs. Committing
+  is the agent's job, not a button's.
 - Goal/Progress: map to wizard's plan/todo state if available (plan.md / todo tool), else hide gracefully.

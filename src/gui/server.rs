@@ -122,7 +122,6 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/image", get(image))
         .route("/api/git", get(git_status))
         .route("/api/git/diff", get(git_diff))
-        .route("/api/git/commit", post(git_commit))
         .route("/api/git/branches", get(git_branches))
         .route("/api/git/checkout", post(git_checkout))
         .layer(middleware::from_fn(local_guard))
@@ -892,32 +891,6 @@ async fn git_diff(
         .await
         .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     Ok(axum::Json(diff))
-}
-
-/// `POST /api/git/commit` body.
-#[derive(Debug, Deserialize)]
-struct CommitBody {
-    cwd: String,
-    message: String,
-}
-
-async fn git_commit(
-    axum::Json(body): axum::Json<CommitBody>,
-) -> Result<axum::Json<Value>, ApiError> {
-    let root = PathBuf::from(&body.cwd);
-    if !root.is_dir() {
-        return Err(ApiError::bad_request(format!(
-            "cwd '{}' is not a directory",
-            body.cwd
-        )));
-    }
-    if body.message.trim().is_empty() {
-        return Err(ApiError::bad_request("commit message must not be empty"));
-    }
-    let sha = git::commit(&root, &body.message)
-        .await
-        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
-    Ok(axum::Json(json!({ "ok": true, "sha": sha })))
 }
 
 /// `GET /api/git/branches?cwd=...`: local branches of the workspace.

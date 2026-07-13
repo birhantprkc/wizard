@@ -862,8 +862,9 @@ function clearTransient() {
 /* Context panel                                                             */
 /* ------------------------------------------------------------------------ */
 
-/** Live refs into the context panel so streams update without re-rendering
- *  (a full re-render would eat the commit editor mid-keystroke). */
+/** Live refs into the context panel so streams patch it in place instead of
+ *  re-rendering (a rebuild would collapse the expanded changed-file list and
+ *  throw away the panel's scroll position mid-turn). */
 let ctx = null;
 
 function renderContextPanel() {
@@ -880,22 +881,6 @@ function renderContextPanel() {
   ctx.gitCount = h('span', { class: 'ctx-sub' }, '');
   ctx.gitBranch = h('span', { class: 'ctx-label' }, '—');
   ctx.gitFileList = h('div', { class: 'git-files hidden' });
-  ctx.commitInput = h('input', {
-    class: 'input commit-input', type: 'text', placeholder: 'Commit message',
-    onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); doCommit(); } },
-  });
-  ctx.commitGo = h('button', { class: 'btn primary btn-sm', type: 'button', onclick: () => doCommit() }, 'Commit');
-  ctx.commitErr = h('div', { class: 'note error hidden' });
-  ctx.commitBox = h('div', { class: 'commit-editor hidden' },
-    ctx.commitInput,
-    h('div', { class: 'card-actions' },
-      ctx.commitGo,
-      h('button', {
-        class: 'btn ghost btn-sm', type: 'button',
-        onclick: () => { ctx.commitBox.classList.add('hidden'); ctx.commitErr.classList.add('hidden'); },
-      }, 'Cancel')),
-    ctx.commitErr);
-  ctx.commitNote = h('div', { class: 'note hidden' });
   ctx.gitSection = h('section', { class: 'ctx-section hidden' },
     h('div', { class: 'ctx-header' }, h('span', {}, 'Git tools')),
     h('button', {
@@ -905,19 +890,7 @@ function renderContextPanel() {
       icon('diff', 'icon ctx-icon'), h('span', { class: 'ctx-label' }, 'Changes'), ctx.gitCount,
       h('span', { class: 'ctx-right' }, ctx.gitAdd, ctx.gitDel)),
     ctx.gitFileList,
-    h('div', { class: 'ctx-row static' }, icon('branch', 'icon ctx-icon'), ctx.gitBranch),
-    h('button', {
-      class: 'ctx-row', type: 'button', title: 'Commit all changes',
-      onclick: () => {
-        ctx.commitBox.classList.toggle('hidden');
-        ctx.commitNote.classList.add('hidden');
-        if (!ctx.commitBox.classList.contains('hidden')) ctx.commitInput.focus();
-      },
-    },
-      icon('commitNode', 'icon ctx-icon'), h('span', { class: 'ctx-label' }, 'Commit'),
-      icon('chevronDown', 'icon ctx-caret')),
-    ctx.commitBox,
-    ctx.commitNote);
+    h('div', { class: 'ctx-row static' }, icon('branch', 'icon ctx-icon'), ctx.gitBranch));
 
   // --- Goal ---
   ctx.goalStatus = h('span', { class: 'ctx-header-right' }, '');
@@ -1011,32 +984,6 @@ function updateProgress() {
         'icon check-icon' + (p.done ? ' done' : p.active ? ' active' : '')),
       h('span', { class: 'progress-text' + (p.done ? ' done' : '') }, p.text))),
   );
-}
-
-async function doCommit() {
-  if (!ctx || !state.task) return;
-  const message = ctx.commitInput.value.trim();
-  if (!message) {
-    ctx.commitInput.focus();
-    return;
-  }
-  ctx.commitGo.setAttribute('disabled', '');
-  ctx.commitGo.textContent = 'Committing…';
-  ctx.commitErr.classList.add('hidden');
-  try {
-    const out = await api.commit(state.task, message);
-    ctx.commitInput.value = '';
-    ctx.commitBox.classList.add('hidden');
-    ctx.commitNote.textContent = `Committed ${String(out.sha || '').slice(0, 7)}`;
-    ctx.commitNote.classList.remove('hidden');
-    refreshGit();
-  } catch (err) {
-    ctx.commitErr.textContent = String((err && err.message) || err);
-    ctx.commitErr.classList.remove('hidden');
-  } finally {
-    ctx.commitGo.removeAttribute('disabled');
-    ctx.commitGo.textContent = 'Commit';
-  }
 }
 
 /* --- Git polling ------------------------------------------------------------ */

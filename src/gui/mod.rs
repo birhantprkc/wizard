@@ -3,7 +3,7 @@
 //!
 //! An axum HTTP server on `127.0.0.1:<port>` serves the embedded static
 //! assets from `gui/assets/` plus a JSON API (see `docs/gui-protocol.md`):
-//! task listing/creation, transcript replay, git status/commit, and a
+//! task listing/creation, transcript replay, git status/diffs, and a
 //! WebSocket per task that streams [`AgentEvent`](crate::agent::AgentEvent)s
 //! as JSON frames. Agents are built lazily — one per task, on its first
 //! turn — via [`crate::agent::build_headless_agent_for_session`], so the

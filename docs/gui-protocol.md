@@ -194,9 +194,6 @@ lines in it (a mode, a rename) is honestly empty. `text` keeps git's leading mar
 `path` is only ever a path `GET /api/git` itself just listed for this workspace — anything
 else is a 400, so nothing the client sends becomes a git argument.
 
-### POST /api/git/commit
-`{ "cwd": "...", "message": "..." }` → `{ "ok": true, "sha": "..." }`. Runs `git add -A && git commit`.
-
 ### GET /api/git/branches?cwd=/abs/path
 `{ "current": "feat/gui", "branches": ["feat/gui", "main", "..."] }` — local branches, most
 recently committed first. `current` is null on a detached HEAD.

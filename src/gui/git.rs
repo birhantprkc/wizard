@@ -1,4 +1,4 @@
-//! Git status/diffstat/commit for the GUI's git panel.
+//! Git status, diffs and branches for the GUI's git panel.
 //!
 //! Shells out to `git` in the task's workspace (`tokio::process`, never the
 //! server's own cwd). Semantics match the TUI's `/diff` sidebar: unstaged +
@@ -241,16 +241,6 @@ fn parse_diff(text: &str) -> (Vec<Hunk>, bool, bool) {
         count += 1;
     }
     (hunks, binary, truncated)
-}
-
-/// `POST /api/git/commit`: stage everything and commit, returning the new
-/// HEAD sha. Errors surface git's own stderr (nothing to commit, missing
-/// identity, ...).
-pub async fn commit(root: &Path, message: &str) -> Result<String> {
-    git_output(root, &["add", "-A"]).await?;
-    git_output(root, &["commit", "-m", message]).await?;
-    let sha = git_output(root, &["rev-parse", "HEAD"]).await?;
-    Ok(sha.trim().to_string())
 }
 
 /// Response shape of `GET /api/git/branches`.

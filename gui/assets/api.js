@@ -712,11 +712,6 @@ export class RealApi {
     return this._json(`/api/git/diff?${query}`);
   }
 
-  /** POST /api/git/commit: `git add -A && git commit` in the workspace. */
-  async commit(task, message) {
-    return this._post('/api/git/commit', { cwd: task.path, message });
-  }
-
   /**
    * GET /api/models flattened for the picker. The active provider lists its
    * configured model (the no-override default) plus its listed models; every
@@ -1250,13 +1245,6 @@ export class MockApi {
       truncated: additions < (file.additions || 0) || deletions < (file.deletions || 0),
       hunks: [{ header: `@@ -1,${deletions + 2} +1,${additions + 2} @@ fn main()`, lines }],
     };
-  }
-
-  /** @param {{id: string, path: string}} task */
-  async commit(task, message) {
-    void task;
-    void message;
-    return { ok: true, sha: 'mock0000' };
   }
 
   /** @returns {Promise<WorkspaceRef[]>} */

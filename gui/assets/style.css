@@ -811,13 +811,6 @@ button.ghost-chip:hover {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.ctx-caret {
-  color: var(--text-faint);
-}
-.ctx-caret svg {
-  width: 13px;
-  height: 13px;
-}
 .ctx-right {
   margin-left: auto;
   display: inline-flex;
@@ -1668,7 +1661,7 @@ button.ghost-chip:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Context panel: git file list, commit editor, progress states         */
+/* Context panel: git file list, branch row, progress states            */
 /* ------------------------------------------------------------------ */
 
 .ctx-sub {
@@ -1729,22 +1722,6 @@ button.ghost-chip:hover {
 }
 .git-file-stat .del {
   color: var(--red);
-}
-
-.commit-editor {
-  margin: 4px 6px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-.commit-editor .card-actions {
-  margin-top: 8px;
-}
-.commit-input {
-  font-size: 13px;
-}
-.context-card .note {
-  margin: 0 6px 8px;
 }
 
 .check-icon.active {
@@ -1992,8 +1969,7 @@ button.ghost-chip:hover {
   font-size: 12.5px;
   line-height: 1.5;
 }
-.gate-card .note,
-.commit-editor .note {
+.gate-card .note {
   margin-top: 10px;
 }
 .note.error {
