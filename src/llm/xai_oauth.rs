@@ -14,10 +14,10 @@
 //! Tokens never go into `config.toml`; keys live in env vars or dedicated
 //! files only.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use super::oauth_callback::{self, Callback, Cancel};
 use super::openai::TokenSource;
 use crate::config::Config;
 
@@ -36,12 +37,12 @@ const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration"
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 /// Scopes: identity, refresh tokens, and API access.
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
-/// Preferred localhost callback port; an ephemeral port is used when taken.
+/// The loopback callback registered for [`CLIENT_ID`]. Fixed, not preferred:
+/// xAI only redirects the browser to the address it has on file, so this is the
+/// single port the flow can work on.
 const CALLBACK_PORT: u16 = 56121;
 /// Refresh the access token when it expires within this many seconds.
 const EXPIRY_LEEWAY_SECS: i64 = 120;
-/// How long the localhost listener waits for the browser callback.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default Chat Completions base URL for both xAI provider kinds.
 pub const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
@@ -268,18 +269,15 @@ struct TokenResponse {
     token_type: Option<String>,
 }
 
-/// A sign-in in flight: everything the caller must hold between sending the
-/// user to `authorize_url` and receiving the redirect back.
-///
-/// The GUI owns its own HTTP server, so it drives the two halves itself
-/// ([`begin_login`] / [`complete_login`]); the terminal flows have no server
-/// and let [`login`] bind a listener for them. Both end at the same exchange.
+/// The OAuth half of a sign-in in flight: everything needed to turn the
+/// callback's `code` into tokens. Paired with the listener that receives that
+/// callback by [`PendingBrowserLogin`].
 #[derive(Debug)]
-pub struct PendingLogin {
+struct PendingLogin {
     /// Send the user here.
-    pub authorize_url: String,
+    authorize_url: String,
     /// Compare against the `state` on the callback: a mismatch is a forgery.
-    pub state: String,
+    state: String,
     /// Must be byte-identical at authorize and at exchange, so it is kept here
     /// rather than rebuilt.
     redirect_uri: String,
@@ -289,7 +287,7 @@ pub struct PendingLogin {
 
 /// Discover the endpoints, mint PKCE + state, and build the authorize URL for a
 /// `redirect_uri` the **caller** serves.
-pub async fn begin_login(redirect_uri: &str) -> Result<PendingLogin> {
+async fn begin_login(redirect_uri: &str) -> Result<PendingLogin> {
     let http = reqwest::Client::new();
     let discovery = discover(&http).await?;
 
@@ -324,11 +322,7 @@ pub async fn begin_login(redirect_uri: &str) -> Result<PendingLogin> {
 
 /// Exchange the callback's `code` for tokens and persist them. The `state` from
 /// the callback must match the one minted by [`begin_login`].
-pub async fn complete_login(
-    pending: PendingLogin,
-    code: &str,
-    state: &str,
-) -> Result<StoredTokens> {
+async fn complete_login(pending: PendingLogin, code: &str, state: &str) -> Result<StoredTokens> {
     anyhow::ensure!(
         state == pending.state,
         "the sign-in state did not match — start again"
@@ -368,36 +362,76 @@ pub fn provider_config() -> crate::config::ProviderConfig {
     }
 }
 
-/// Run the full browser login for a caller with no server of its own: bind a
-/// localhost listener, send the user to the authorize URL, wait for the
-/// redirect, exchange. `report` receives human-readable progress lines (stdout
-/// for the CLI flag, transcript notices for the slash command).
-pub async fn login<F>(report: F) -> Result<()>
-where
-    F: Fn(&str) + Send + Sync,
-{
+/// A browser sign-in in flight, holding the listener the redirect will land on.
+///
+/// xAI sends the browser to the one loopback address registered for
+/// [`CLIENT_ID`] and nowhere else, so *every* caller — the terminal flows and
+/// the GUI alike — must own that listener rather than serve the redirect on an
+/// origin of its own. [`wait_and_complete`] consumes this.
+pub struct PendingBrowserLogin {
+    /// Send the user here.
+    pub authorize_url: String,
+    listener: TcpListener,
+    pending: PendingLogin,
+}
+
+/// Bind the registered callback port, discover the endpoints, and build the
+/// authorize URL. The caller sends the user to `authorize_url`, then hands this
+/// back to [`wait_and_complete`].
+pub async fn begin_browser_login() -> Result<PendingBrowserLogin> {
     let listener = bind_callback_listener()?;
     let port = listener
         .local_addr()
         .context("reading listener port")?
         .port();
+    // Derived from the port actually bound, so authorize and token-exchange
+    // agree byte-for-byte on the redirect_uri.
     let pending = begin_login(&format!("http://127.0.0.1:{port}/callback")).await?;
+    Ok(PendingBrowserLogin {
+        authorize_url: pending.authorize_url.clone(),
+        listener,
+        pending,
+    })
+}
 
+/// Wait for the browser to hit the callback, exchange the code, and persist the
+/// tokens. Consumes the pending login (and its listener).
+///
+/// `cancel` abandons the wait and gives the port back at once — the GUI fires
+/// it when a second sign-in replaces this one. A caller with no competition for
+/// the port passes [`Cancel::never`].
+pub async fn wait_and_complete(
+    pending: PendingBrowserLogin,
+    cancel: Cancel,
+) -> Result<StoredTokens> {
+    let PendingBrowserLogin {
+        listener, pending, ..
+    } = pending;
+    let expected_state = pending.state.clone();
+    let code = oauth_callback::serve_redirect(listener, cancel, |target| {
+        parse_callback(target, &expected_state)
+    })
+    .await?;
+    let state = pending.state.clone();
+    complete_login(pending, &code, &state).await
+}
+
+/// The self-contained terminal flow (`wizard --login xai`, `/login xai`): open
+/// the browser, wait, exchange. `report` receives human-readable progress lines
+/// (stdout for the CLI flag, transcript notices for the slash command).
+pub async fn login<F>(report: F) -> Result<()>
+where
+    F: Fn(&str) + Send + Sync,
+{
+    let pending = begin_browser_login().await?;
     report(&format!(
         "open this URL to sign in with your xAI account:\n{}",
         pending.authorize_url
     ));
     open_browser(&pending.authorize_url);
     report("waiting for the browser callback (5 minute timeout)...");
-
-    let expected_state = pending.state.clone();
-    let code = tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected_state))
-        .await
-        .context("callback listener task panicked")??;
-
-    report("exchanging the authorization code for tokens...");
-    let state = pending.state.clone();
-    complete_login(pending, &code, &state).await?;
+    // Nothing else in a terminal run competes for the callback port.
+    wait_and_complete(pending, Cancel::never()).await?;
     report(&format!(
         "signed in to xAI; tokens saved to {}",
         token_path()?.display()
@@ -405,15 +439,18 @@ where
     Ok(())
 }
 
-/// Bind the preferred callback port, falling back to an ephemeral one. The
-/// redirect_uri is derived from whatever was actually bound, so authorize and
-/// token-exchange always agree byte-for-byte.
+/// Bind [`CALLBACK_PORT`], or fail. There is nothing to fall back to: an
+/// ephemeral port yields a redirect_uri xAI has never heard of, so it would
+/// authorize against an address the browser is never sent to — a sign-in that
+/// can only hang. Better to name the conflict.
 fn bind_callback_listener() -> Result<TcpListener> {
-    match TcpListener::bind(("127.0.0.1", CALLBACK_PORT)) {
-        Ok(listener) => Ok(listener),
-        Err(_) => TcpListener::bind(("127.0.0.1", 0))
-            .context("binding a localhost port for the OAuth callback"),
-    }
+    TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).with_context(|| {
+        format!(
+            "could not bind 127.0.0.1:{CALLBACK_PORT} for the xAI sign-in callback; \
+             it is the only redirect xAI accepts for this client, so the sign-in cannot \
+             run elsewhere — close whatever is using it (another wizard sign-in?) and retry"
+        )
+    })
 }
 
 /// Best-effort browser launch; the URL is always printed as a fallback.
@@ -429,17 +466,6 @@ fn open_browser(url: &str) {
             return;
         }
     }
-}
-
-/// What one callback HTTP request amounted to.
-#[derive(Debug, PartialEq, Eq)]
-enum Callback {
-    /// `/callback` with a code and matching state.
-    Code(String),
-    /// `/callback` carried an OAuth error or a state mismatch.
-    Failed(String),
-    /// Some other path (favicon and friends): respond 404 and keep waiting.
-    Ignored,
 }
 
 /// Classify a request line's target (e.g. `/callback?code=...&state=...`).
@@ -472,96 +498,6 @@ fn parse_callback(target: &str, expected_state: &str) -> Callback {
         Some(code) => Callback::Code(code),
         None => Callback::Failed("the OAuth callback carried no code".to_string()),
     }
-}
-
-/// Accept connections until `/callback` arrives (or the timeout passes),
-/// validating `state` and answering each request with a tiny HTML page.
-fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
-    listener
-        .set_nonblocking(true)
-        .context("configuring the callback listener")?;
-    let deadline = Instant::now() + CALLBACK_TIMEOUT;
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Some(outcome) = handle_callback_connection(stream, expected_state) {
-                    return outcome;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    bail!("timed out waiting for the browser sign-in (5 minutes)");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(err) => return Err(err).context("accepting the OAuth callback connection"),
-        }
-    }
-}
-
-/// Serve one connection. `Some(result)` ends the wait; `None` keeps waiting.
-fn handle_callback_connection(
-    mut stream: TcpStream,
-    expected_state: &str,
-) -> Option<Result<String>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    // The request line fits well inside 8 KiB; we only need the GET target.
-    let mut buf = [0u8; 8192];
-    let mut len = 0;
-    while len < buf.len() {
-        match stream.read(&mut buf[len..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                len += n;
-                if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let request = String::from_utf8_lossy(&buf[..len]);
-    let target = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("");
-
-    match parse_callback(target, expected_state) {
-        Callback::Ignored => {
-            respond(&mut stream, "404 Not Found", "Not found.");
-            None
-        }
-        Callback::Failed(message) => {
-            respond(
-                &mut stream,
-                "200 OK",
-                "Sign-in failed. Return to the terminal for details.",
-            );
-            Some(Err(anyhow!(message)))
-        }
-        Callback::Code(code) => {
-            respond(
-                &mut stream,
-                "200 OK",
-                "Signed in to Wizard. You can close this tab.",
-            );
-            Some(Ok(code))
-        }
-    }
-}
-
-/// Minimal HTTP response with a one-line HTML body.
-fn respond(stream: &mut TcpStream, status: &str, message: &str) {
-    let body = format!(
-        "<!doctype html><html><head><title>Wizard</title></head><body style=\"font-family: sans-serif; margin: 4em\"><p>{message}</p></body></html>"
-    );
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
 }
 
 /// Exchange the authorization code for tokens. xAI quirk: the token POST must
@@ -871,6 +807,20 @@ mod tests {
             Callback::Failed(_)
         ));
         assert_eq!(parse_callback("/favicon.ico", "s1"), Callback::Ignored);
+    }
+
+    #[test]
+    fn an_occupied_callback_port_fails_instead_of_falling_back() {
+        // xAI redirects only to CALLBACK_PORT, so an ephemeral fallback could
+        // never receive the browser — it would hang until the timeout. The bind
+        // must fail loudly, naming the port that is in the way.
+        let _serial = oauth_callback::serial_callback_port();
+        let _held = TcpListener::bind(("127.0.0.1", CALLBACK_PORT));
+        let err = bind_callback_listener().expect_err("the port is taken");
+        assert!(
+            format!("{err:#}").contains(&CALLBACK_PORT.to_string()),
+            "the error should name the port: {err:#}"
+        );
     }
 
     #[tokio::test]

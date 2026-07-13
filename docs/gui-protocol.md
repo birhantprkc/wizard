@@ -105,27 +105,30 @@ the first rather than racing it.
 `provider` is `xai` or `chatgpt`. → `{ "authorize_url": "…" }` — start the flow. The browser
 opens that URL (from a window opened *synchronously* on the click, or browsers block it).
 
-Two redirect shapes, because the providers register different ones:
-- **xai** redirects to `http://127.0.0.1:<gui port>/callback` — the GUI serves its own redirect
-  (`GET /callback`) and finishes the exchange there. xAI's client allows a floating loopback port.
-- **chatgpt** redirects to the fixed `http://localhost:1455/auth/callback` (fallback 1457) that
-  OpenAI's Codex client is registered with — so the flow binds *that* listener itself, in a
-  spawned task, and writes the provider when it completes. The GUI only watches `GET /api/login`.
+The redirect never comes back to this server. A provider only sends the browser to the
+loopback address registered with its client id — `http://localhost:1455/auth/callback`
+(fallback 1457) for OpenAI's Codex client, `http://127.0.0.1:56121/callback` for xAI's — and
+ignores any other `redirect_uri`. So each flow binds *its own* listener, waits for the
+browser on it in a spawned task, and writes the provider (active) when the exchange lands.
+The GUI only watches `GET /api/login`. A `state` that does not match the one minted at the
+start is refused before any exchange, and `?error=access_denied` (the user said no) is
+reported, not swallowed.
 
-The terminal flows (`wizard --login xai|chatgpt`) bind their own listener the same way.
+Those ports are the only addresses the providers will redirect to, so a sign-in cannot be
+moved elsewhere and an occupied one fails the `POST` rather than hanging. Which makes the
+port scarce: a second `POST` **replaces** the sign-in in flight — cancelling it, waiting for
+its listener to close, and rebinding — so closing the provider's tab and clicking sign in
+again works immediately, rather than colliding with the abandoned flow for five minutes. The
+replaced flow is silent; only the sign-in in flight writes `done`/`failed`.
 
-### GET /callback?code=…&state=…
-Where the *provider* sends the browser back. Not an API call — a page a human is looking at,
-so it answers in HTML. It never renders the code or the tokens, only whether it worked, and
-it closes its own tab. A `state` that does not match the one minted at the start is refused
-before any exchange. `?error=access_denied` (the user said no) is reported, not swallowed.
-On success the provider is written to config and made active — a sign-in that leaves you
-without a usable provider was pointless.
+The terminal flows (`wizard --login xai|chatgpt`) bind the same listeners the same way.
 
 ### GET /api/login
 `{ "state": "idle|pending|done|failed", "provider": "xai", "error": "…" }` — what the
-sign-in in flight is doing. The tab the user *started* from polls this, because the tab that
-finishes the flow is the provider's redirect, which closes itself.
+sign-in in flight is doing. The tab the user *started* from polls this, because the tab they
+*finish* in is the provider's, which lands on the flow's private callback listener. Every
+failure — a denied consent, a timeout, a token exchange that 400s — ends in `failed`, so the
+polling tab never waits forever.
 
 ### POST /api/providers
 `{ "name": "…", "kind": "openai|anthropic|xai|xaioauth|chatgptoauth|openrouter|cloudflare|ollama|llamacpp",

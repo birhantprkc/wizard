@@ -1444,8 +1444,10 @@ const SIGN_INS = [
 ];
 
 /**
- * Sign in to a subscription: the browser goes to the provider, the provider
- * redirects back to a route this server owns, and we watch for the outcome.
+ * Sign in to a subscription: the browser goes to the provider, which redirects
+ * back to the loopback listener that flow bound for itself (never a route this
+ * server serves — a provider only redirects to the address registered with its
+ * client id), and we poll /api/login for the outcome.
  *
  * The popup is opened synchronously from the click — a browser blocks a window
  * opened after an await — and pointed at the authorize URL once we have it.
@@ -1482,7 +1484,7 @@ async function waitForSignIn({ timeoutMs = 5 * 60 * 1000 } = {}) {
     const status = await api.signInStatus();
     if (status.state === 'done') return status;
     if (status.state === 'failed') throw new Error(status.error || 'sign-in failed');
-    // `idle` means the flow was dropped (server restarted, or it expired).
+    // `idle` means the flow was dropped — the server restarted under us.
     if (status.state === 'idle') throw new Error('the sign-in was not completed');
     if (Date.now() > deadline) throw new Error('the sign-in timed out');
   }

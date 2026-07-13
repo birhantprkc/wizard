@@ -36,9 +36,11 @@ pub struct Preset {
     pub needs_base_url: bool,
 }
 
-/// The providers the GUI can set up. `xaioauth` is deliberately absent: it
-/// needs a browser sign-in flow the GUI does not implement yet — `wizard
-/// login xai` in a terminal does it, and the provider then shows up here.
+/// The providers the GUI can set up by pasting a key. `xaioauth` and
+/// `chatgptoauth` are deliberately absent: a subscription is not a string you
+/// can paste, so they are earned through the sign-in rows
+/// (`POST /api/login/{provider}`, see [`crate::gui::oauth`]) and then show up
+/// here like any other provider.
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "anthropic",

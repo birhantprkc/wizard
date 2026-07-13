@@ -8,6 +8,7 @@ pub mod chatgpt_oauth;
 pub mod cloudflare;
 pub mod fusion;
 pub mod llamacpp;
+pub mod oauth_callback;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;

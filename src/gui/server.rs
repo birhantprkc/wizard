@@ -112,9 +112,6 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/api/workspace", get(workspace))
         .route("/api/models", get(models))
         .route("/api/settings", get(get_settings).patch(patch_settings))
-        // The provider redirects the *browser* here after the user authorizes,
-        // so the path is short and stable — it is registered with the provider.
-        .route("/callback", get(oauth_callback))
         .route("/api/login/{provider}", post(begin_sign_in))
         .route("/api/login", get(sign_in_status))
         .route("/api/providers", post(save_provider))
@@ -472,19 +469,18 @@ async fn list_provider_models(provider: &ProviderConfig) -> ProviderRow {
 /* ---------------------------------------------------------------------- */
 
 /// `POST /api/login/{provider}`: start a sign-in and hand back the URL to send
-/// the user to. The browser opens it; the provider redirects back to
-/// [`oauth_callback`].
+/// the user to.
+///
+/// Neither redirect comes back here. A provider only redirects to the loopback
+/// address registered with its client id, so each flow binds that listener
+/// itself and finishes in a task of its own; this server just watches
+/// [`sign_in_status`].
 async fn begin_sign_in(
     Path(provider): Path<String>,
     State(state): State<Arc<GuiState>>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    // The redirect must be an address the provider will actually send a browser
-    // to, and one we serve: our own origin.
     let url = match provider.as_str() {
-        "xai" => {
-            let redirect_uri = format!("http://127.0.0.1:{}/callback", state.port);
-            state.sign_in.begin_xai(&redirect_uri).await?
-        }
+        "xai" => state.sign_in.begin_xai(Arc::clone(&state.config)).await?,
         "chatgpt" => {
             state
                 .sign_in
@@ -501,88 +497,11 @@ async fn begin_sign_in(
 }
 
 /// `GET /api/login`: what the sign-in that is in flight is doing. The tab the
-/// user started from polls this, because the tab that *finishes* the sign-in is
-/// the provider's redirect — a different page, which then closes itself.
+/// user started from polls this, because the tab they *finish* in is the
+/// provider's own — which lands on the flow's private callback listener, not
+/// here.
 async fn sign_in_status(State(state): State<Arc<GuiState>>) -> axum::Json<oauth::Status> {
     axum::Json(state.sign_in.status())
-}
-
-/// `GET /callback?code=…&state=…`: where the provider sends the browser back.
-///
-/// This is a page a human is looking at, not an API call, so it answers in HTML
-/// either way — and it never shows the code or the tokens, only whether it
-/// worked.
-#[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    /// The provider sends `error=access_denied` when the user says no.
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
-async fn oauth_callback(
-    Query(query): Query<CallbackQuery>,
-    State(state): State<Arc<GuiState>>,
-) -> Response {
-    if let Some(error) = query.error {
-        let detail = query.error_description.unwrap_or_else(|| error.clone());
-        state.sign_in.deny(detail.clone());
-        return callback_page("Sign-in cancelled", &detail);
-    }
-    let (Some(code), Some(returned)) = (query.code, query.state) else {
-        let message = "the provider redirected here without an authorization code";
-        state.sign_in.deny(message.to_string());
-        return callback_page("Sign-in failed", message);
-    };
-
-    match state.sign_in.complete(&code, &returned).await {
-        Ok(provider) => {
-            let name = provider.name.clone();
-            // A sign-in that does not leave you with a usable provider was
-            // pointless, so the provider is written and made active here.
-            if let Err(err) = state.config.update(move |config| {
-                settings::upsert_provider(config, provider, true);
-                Ok(())
-            }) {
-                return callback_page("Signed in, but not saved", &format!("{err:#}"));
-            }
-            callback_page("Signed in", &format!("'{name}' is configured and active."))
-        }
-        Err(err) => callback_page("Sign-in failed", &format!("{err:#}")),
-    }
-}
-
-/// The page the user lands on after authorizing. It closes itself when the
-/// browser allows it (it will, for a tab that a script opened), and says what
-/// happened when it cannot.
-fn callback_page(title: &str, detail: &str) -> Response {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>{title}</title>\
-         <style>body{{background:#0c0c0e;color:#ececee;font:14px/1.6 system-ui,sans-serif;\
-         display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}\
-         div{{text-align:center;max-width:32rem;padding:0 1.5rem}}\
-         h1{{font-size:15px;font-weight:600;margin:0 0 .4rem}}\
-         p{{color:#86868e;margin:0}}</style>\
-         <div><h1>{title}</h1><p>{detail}</p><p>You can close this tab.</p></div>\
-         <script>setTimeout(() => window.close(), 1200)</script>",
-        title = html_escape(title),
-        detail = html_escape(detail),
-    );
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
-}
-
-/// Escape text for the callback page: provider error strings are attacker-
-/// adjacent input, and they are rendered into HTML.
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1034,24 +953,6 @@ mod tests {
         assert_eq!(basename("/home/user/projects/wizard"), "wizard");
         assert_eq!(basename("/"), "/");
         assert_eq!(basename(""), "");
-    }
-
-    #[test]
-    fn callback_page_escapes_provider_supplied_text() {
-        // The provider's `error_description` is rendered into HTML; a script
-        // tag in it must not survive as markup.
-        let page = callback_page("Sign-in failed", "<script>alert(1)</script>");
-        let body = format!("{page:?}");
-        assert!(!format!("{:?}", "<script>").is_empty());
-        assert!(html_escape("<script>alert(1)</script>").contains("&lt;script&gt;"));
-        // The page renders (a 200 with a body); the escape is asserted above.
-        let _ = body;
-    }
-
-    #[test]
-    fn html_escape_covers_the_markup_metacharacters() {
-        assert_eq!(html_escape("a<b>&\"c"), "a&lt;b&gt;&amp;&quot;c");
-        assert_eq!(html_escape("plain text"), "plain text");
     }
 
     #[test]

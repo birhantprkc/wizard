@@ -13,15 +13,15 @@
 //! `config.toml`. The account id needed on every API call is a claim inside the
 //! `id_token` and is stored alongside the tokens.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::oauth_callback::{self, Callback, Cancel};
 use super::xai_oauth::{generate_pkce, jwt_exp};
 use crate::config::Config;
 
@@ -44,8 +44,6 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const ORIGINATOR: &str = "codex_cli_rs";
 /// Refresh the access token when its JWT `exp` is within this many seconds.
 const EXPIRY_LEEWAY_SECS: i64 = 300;
-/// How long the localhost listener waits for the browser to come back.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The subscription API base (Responses API lives under it).
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -208,7 +206,11 @@ pub fn begin_login() -> Result<PendingLogin> {
 
 /// Wait for the browser to hit the callback, exchange the code, and persist the
 /// tokens. Consumes the pending login (and its listener).
-pub async fn wait_and_complete(pending: PendingLogin) -> Result<StoredTokens> {
+///
+/// `cancel` abandons the wait and gives the port back at once — the GUI fires
+/// it when a second sign-in replaces this one. A caller with no competition for
+/// the port passes [`Cancel::never`].
+pub async fn wait_and_complete(pending: PendingLogin, cancel: Cancel) -> Result<StoredTokens> {
     let PendingLogin {
         state,
         redirect_uri,
@@ -217,9 +219,10 @@ pub async fn wait_and_complete(pending: PendingLogin) -> Result<StoredTokens> {
         ..
     } = pending;
     let expected = state.clone();
-    let code = tokio::task::spawn_blocking(move || wait_for_callback(listener, &expected))
-        .await
-        .context("callback listener task panicked")??;
+    let code = oauth_callback::serve_redirect(listener, cancel, |target| {
+        parse_callback(target, &expected)
+    })
+    .await?;
 
     let token = exchange_code(&code, &redirect_uri, &verifier).await?;
     let account_id = token.id_token.as_deref().and_then(account_id_from_id_token);
@@ -260,7 +263,8 @@ where
     ));
     open_browser(&pending.authorize_url);
     report("waiting for the browser callback (5 minute timeout)...");
-    wait_and_complete(pending).await?;
+    // Nothing else in a terminal run competes for the callback port.
+    wait_and_complete(pending, Cancel::never()).await?;
     report(&format!(
         "signed in to ChatGPT; tokens saved to {}",
         token_path()?.display()
@@ -383,12 +387,6 @@ fn open_browser(url: &str) {
     }
 }
 
-enum Callback {
-    Code(String),
-    Failed(String),
-    Ignored,
-}
-
 /// Classify a request target (`/auth/callback?code=…&state=…`).
 fn parse_callback(target: &str, expected_state: &str) -> Callback {
     let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
@@ -424,67 +422,6 @@ fn parse_callback(target: &str, expected_state: &str) -> Callback {
         Some(code) => Callback::Code(code),
         None => Callback::Failed("the callback carried no authorization code".to_string()),
     }
-}
-
-fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
-    listener
-        .set_nonblocking(true)
-        .context("configuring the callback listener")?;
-    let deadline = Instant::now() + CALLBACK_TIMEOUT;
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Some(outcome) = handle_connection(stream, expected_state) {
-                    return outcome;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    bail!("timed out waiting for the browser sign-in (5 minutes)");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(err) => return Err(err).context("accepting the callback connection"),
-        }
-    }
-}
-
-/// Serve one connection: `Some(result)` ends the wait, `None` keeps waiting.
-fn handle_connection(mut stream: TcpStream, expected_state: &str) -> Option<Result<String>> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).ok()?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let target = request.split_whitespace().nth(1).unwrap_or("/");
-    match parse_callback(target, expected_state) {
-        Callback::Code(code) => {
-            respond(&mut stream, "Signed in to Wizard. You can close this tab.");
-            Some(Ok(code))
-        }
-        Callback::Failed(message) => {
-            respond(&mut stream, &format!("Sign-in failed: {message}"));
-            Some(Err(anyhow::anyhow!(message)))
-        }
-        Callback::Ignored => {
-            respond(&mut stream, "Waiting for the sign-in…");
-            None
-        }
-    }
-}
-
-fn respond(stream: &mut TcpStream, message: &str) {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>Wizard</title>\
-         <body style=\"background:#0c0c0e;color:#ececee;font:14px system-ui;\
-         display:flex;align-items:center;justify-content:center;height:100vh;margin:0\">\
-         <p>{message}</p>"
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
 }
 
 #[cfg(test)]
