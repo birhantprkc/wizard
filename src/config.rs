@@ -690,10 +690,27 @@ impl Default for Config {
 }
 
 impl Config {
-    /// `~/.wizard` — root of all Wizard state on disk.
+    /// `~/.wizard` — root of all Wizard state on disk. `WIZARD_HOME` relocates
+    /// it wholesale (sandboxes, CI, a second install).
     pub fn wizard_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("could not determine home directory")?;
-        Ok(home.join(".wizard"))
+        if let Some(dir) = std::env::var_os("WIZARD_HOME") {
+            return Ok(PathBuf::from(dir));
+        }
+        Ok(Self::home_dir()?.join(".wizard"))
+    }
+
+    /// Home directory behind [`Self::wizard_dir`].
+    #[cfg(not(test))]
+    fn home_dir() -> Result<PathBuf> {
+        dirs::home_dir().context("could not determine home directory")
+    }
+
+    /// Unit tests get a scratch home. Several exercise code paths that persist
+    /// the config (`/mode`, `/vim`, onboarding) or write a session, and a test
+    /// run must never overwrite the developer's own `~/.wizard`.
+    #[cfg(test)]
+    fn home_dir() -> Result<PathBuf> {
+        Ok(std::env::temp_dir().join("wizard-unit-test-home"))
     }
 
     /// `~/.wizard/config.toml`
@@ -1063,6 +1080,17 @@ mod tests {
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("wizard").chain(args.iter().copied()))
             .expect("valid args")
+    }
+
+    #[test]
+    fn a_test_run_never_resolves_the_real_wizard_dir() {
+        // Regression guard: tests that persist the config (`/mode`, `/vim`,
+        // onboarding) used to write the developer's own ~/.wizard/config.toml.
+        if std::env::var_os("WIZARD_HOME").is_some() {
+            return;
+        }
+        let real = dirs::home_dir().expect("home dir").join(".wizard");
+        assert_ne!(Config::wizard_dir().expect("wizard dir"), real);
     }
 
     #[test]
