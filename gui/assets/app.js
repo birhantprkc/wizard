@@ -640,6 +640,10 @@ const HR_RE = /^ {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$/;
 const QUOTE_RE = /^ {0,3}> ?(.*)$/;
 /** A bullet (`-`, `*`, `+`) or a number (`1.`, `1)`), and what follows it. */
 const ITEM_RE = /^([ \t]*)(?:([-*+])|(\d{1,9})[.)])(?:[ \t]+(.*))?$/;
+/** Underlined heading: `===` (h1) or `---` (h2) under the paragraph it titles. */
+const SETEXT_RE = /^ {0,3}(=+|-{3,})[ \t]*$/;
+/** `- [ ]` / `- [x]`: a checklist item, which a model writes constantly. */
+const TASK_RE = /^\[([ xX])\][ \t]+/;
 
 /** Leading whitespace in columns, a tab being four of them. */
 function indentOf(line) {
@@ -665,17 +669,54 @@ function dedent(line, cols) {
   return line.slice(i);
 }
 
-/** A table row's cells: split on unescaped pipes, minus the optional fencing
- *  pipes at either end, which delimit rather than open a cell. */
+/** Which characters of a row sit inside an inline code span. A pipe in there is
+ *  content — `` `a | b` `` is one cell, not two — and a backtick run that never
+ *  closes on the line opens nothing, so a stray backtick cannot eat the row. */
+function codeMask(s) {
+  const mask = new Array(s.length).fill(false);
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] !== '`') {
+      i += 1;
+      continue;
+    }
+    let open = 1;
+    while (s[i + open] === '`') open += 1;
+    // The span closes on the next run of backticks of exactly the same length.
+    let j = i + open;
+    while (j < s.length) {
+      if (s[j] !== '`') {
+        j += 1;
+        continue;
+      }
+      let run = 1;
+      while (s[j + run] === '`') run += 1;
+      if (run === open) break;
+      j += run;
+    }
+    if (j >= s.length) {
+      i += open; // never closed: those backticks are literal text
+      continue;
+    }
+    for (let k = i; k < j + open; k += 1) mask[k] = true;
+    i = j + open;
+  }
+  return mask;
+}
+
+/** A table row's cells: split on unescaped pipes outside code spans, minus the
+ *  optional fencing pipes at either end, which delimit rather than open a cell. */
 function splitRow(line) {
   const s = line.trim();
+  const code = codeMask(s);
   const cells = [];
   let cur = '';
   for (let i = 0; i < s.length; i += 1) {
     if (s[i] === '\\' && s[i + 1] === '|') {
+      // GFM: in a table an escaped pipe is a pipe, even inside a code span.
       cur += '|';
       i += 1;
-    } else if (s[i] === '|') {
+    } else if (s[i] === '|' && !code[i]) {
       cells.push(cur);
       cur = '';
     } else {
@@ -705,13 +746,25 @@ function cellAlign(spec) {
   return '';
 }
 
+/** A pipe table opens on a header row followed by an alignment row with the same
+ *  number of cells — GFM's own rule, and the one that keeps a sentence which
+ *  happens to hold a `|` above a `---` from turning into a one-column table.
+ *  @returns {?{head: string[], align: string[]}} */
+function tableAt(lines, i) {
+  if (!lines[i].includes('|') || i + 1 >= lines.length || !isAlignRow(lines[i + 1])) return null;
+  const head = splitRow(lines[i]);
+  const align = splitRow(lines[i + 1]);
+  if (head.length !== align.length) return null;
+  return { head, align: align.map(cellAlign) };
+}
+
 /** True if a line would open some block other than a paragraph — i.e. it ends
  *  the paragraph above it even without a blank line between them. */
 function startsBlock(lines, i) {
   const line = lines[i];
   if (FENCE_RE.test(line) || HEADING_RE.test(line) || HR_RE.test(line)) return true;
   if (QUOTE_RE.test(line) || ITEM_RE.test(line)) return true;
-  return line.includes('|') && i + 1 < lines.length && isAlignRow(lines[i + 1]);
+  return tableAt(lines, i) !== null;
 }
 
 /**
@@ -730,6 +783,21 @@ function parseBlocks(md) {
     if (!lines[i].trim()) { i += 1; continue; } // blank lines only separate blocks
     const start = i;
     const line = lines[i];
+
+    // Four columns in, at the top of a block, is a code block that was written
+    // without a fence. The blank lines inside one belong to it; the ones after
+    // it do not, so the run is cut back to the last line that held code.
+    if (indentOf(line) >= 4) {
+      let end = i;
+      while (i < lines.length && (!lines[i].trim() || indentOf(lines[i]) >= 4)) {
+        if (lines[i].trim()) end = i;
+        i += 1;
+      }
+      i = end + 1;
+      const code = lines.slice(start, i).map((l) => dedent(l, 4)).join('\n');
+      blocks.push({ kind: 'code', lang: '', code, src: since(start) });
+      continue;
+    }
 
     const fence = FENCE_RE.exec(line);
     if (fence) {
@@ -758,9 +826,14 @@ function parseBlocks(md) {
 
     if (QUOTE_RE.test(line)) {
       const inner = [];
-      while (i < lines.length && lines[i].trim() && !HR_RE.test(lines[i])) {
+      while (i < lines.length && lines[i].trim()) {
         const m = QUOTE_RE.exec(lines[i]);
-        inner.push(m ? m[1] : lines[i]); // a lazy continuation still belongs to the quote
+        // An unmarked line under a quoted paragraph is a lazy continuation and
+        // still belongs to the quote — but a line that opens a block of its own
+        // (a heading, a fence, a list, a rule) ends the quote instead of being
+        // swallowed by it.
+        if (!m && startsBlock(lines, i)) break;
+        inner.push(m ? m[1] : lines[i]);
         i += 1;
       }
       // The quote's content is markdown in its own right.
@@ -768,16 +841,15 @@ function parseBlocks(md) {
       continue;
     }
 
-    if (line.includes('|') && i + 1 < lines.length && isAlignRow(lines[i + 1])) {
-      const head = splitRow(line);
-      const align = splitRow(lines[i + 1]).map(cellAlign);
+    const table = tableAt(lines, i);
+    if (table) {
       const rows = [];
       i += 2;
       while (i < lines.length && lines[i].trim() && lines[i].includes('|') && !isAlignRow(lines[i])) {
         rows.push(splitRow(lines[i]));
         i += 1;
       }
-      blocks.push({ kind: 'table', head, align, rows, src: since(start) });
+      blocks.push({ kind: 'table', ...table, rows, src: since(start) });
       continue;
     }
 
@@ -811,10 +883,26 @@ function parseBlocks(md) {
     }
 
     const para = [];
+    let setext = null;
     while (i < lines.length && lines[i].trim()) {
-      if (para.length && startsBlock(lines, i)) break;
+      if (para.length) {
+        // An underline turns the lines above it into a heading. It is checked
+        // before the block starters because `---` is also a rule: under a
+        // paragraph it underlines it, and only on its own is it a rule.
+        setext = SETEXT_RE.exec(lines[i]);
+        if (setext) {
+          i += 1;
+          break;
+        }
+        if (startsBlock(lines, i)) break;
+      }
       para.push(lines[i]);
       i += 1;
+    }
+    if (setext) {
+      const level = setext[1][0] === '=' ? 1 : 2;
+      blocks.push({ kind: 'heading', level, text: para.join('\n'), src: since(start) });
+      continue;
     }
     blocks.push({ kind: 'para', text: para.join('\n'), src: since(start) });
   }
@@ -852,16 +940,24 @@ function parseList(lines) {
 
 const ESCAPABLE = /[\\`*_{}[\]()#+\-.!|~<>]/;
 const CODE_SPAN = /^(`+)([\s\S]*?)\1(?!`)/;
+const STRONG_EM_STAR = /^\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/;
+const STRONG_EM_UNDER = /^___(?=\S)([\s\S]*?\S)___(?!\w)/;
 const STRONG_STAR = /^\*\*(?=\S)([\s\S]*?\S)\*\*/;
-const STRONG_UNDER = /^__(?=\S)([\s\S]*?\S)__/;
+/** An underscore only closes emphasis where a word does not carry on through it:
+ *  `__init__` is bold, but `_private_var` is a name and stays one. The content of
+ *  an underscore span stops at the next run of the same delimiter, so an opener
+ *  that never closes cannot reach across the rest of the line to find one. */
+const STRONG_UNDER = /^__(?=\S)((?:[^_]|_(?!_))*?\S)__(?!\w)/;
 const EM_STAR = /^\*(?=\S)([\s\S]*?\S)\*(?!\*)/;
-const EM_UNDER = /^_(?=\S)([\s\S]*?\S)_(?!_)/;
+const EM_UNDER = /^_(?=\S)([^_]*?\S)_(?!\w)/;
 const STRIKE = /^~~(?=\S)([\s\S]*?\S)~~/;
 /** `[text](url)`, or `![alt](url)`. The URL may carry balanced parens. */
 const LINK = /^(!?)\[((?:\\.|[^\][\\])*)\]\([ \t]*((?:[^\s()\\]|\\.|\([^\s()]*\))*)(?:[ \t]+"([^"]*)")?[ \t]*\)/;
 /** A bare URL in prose. It stops before trailing punctuation, which is a
  *  sentence's, not the URL's. */
 const AUTOLINK = /^https?:\/\/[^\s<>[\]()"'`]+[^\s<>[\]()"'`.,;:!?]/;
+/** `<https://…>`: a URL the model bracketed rather than left bare. */
+const ANGLE_LINK = /^<([a-z][a-z\d+.-]*:[^\s<>]+)>/i;
 
 /** The schemes we will hand a browser. Anything else — `javascript:`, `data:`,
  *  `vbscript:` — is not a link, and its source text is shown instead. */
@@ -911,6 +1007,7 @@ function inlineNodes(text, inLink = false) {
     // space, but a model that writes lines means lines — collapsing them into
     // one run-on paragraph is the bug this renderer exists to kill.
     if (c === '\n') {
+      buf = buf.replace(/[ \t]+$/, ''); // the spaces that ended the line are not content
       flush();
       out.push(h('br'));
       i += 1;
@@ -950,6 +1047,19 @@ function inlineNodes(text, inLink = false) {
       }
     }
 
+    if (!inLink && c === '<') {
+      const m = ANGLE_LINK.exec(rest);
+      const href = m && safeHref(m[1]);
+      if (href) {
+        flush();
+        out.push(h('a', { class: 'md-link', href, target: '_blank', rel: 'noopener noreferrer' }, m[1]));
+        i += m[0].length;
+        continue;
+      }
+      // Anything else in angle brackets — `<div>`, `<script>`, a scheme we will
+      // not follow — is text, and falls through to the buffer as it stands.
+    }
+
     if (!inLink && c === 'h' && AUTOLINK.test(rest)) {
       const url = AUTOLINK.exec(rest)[0];
       flush();
@@ -972,6 +1082,13 @@ function inlineNodes(text, inLink = false) {
       // `snake_case` is a word, not emphasis: an underscore mid-word is a character.
       const intraword = c === '_' && /\w/.test(src[i - 1] || '');
       if (!intraword) {
+        const both = (c === '*' ? STRONG_EM_STAR : STRONG_EM_UNDER).exec(rest);
+        if (both) {
+          flush();
+          out.push(h('strong', {}, h('em', {}, ...inlineNodes(both[1], inLink))));
+          i += both[0].length;
+          continue;
+        }
         const strong = (c === '*' ? STRONG_STAR : STRONG_UNDER).exec(rest);
         if (strong) {
           flush();
@@ -1023,12 +1140,24 @@ function renderTable(block) {
 
 /** One list item. Its body is markdown, so it can hold a nested list or a code
  *  block; a plain one is put straight into the `<li>` rather than wrapped in a
- *  `<p>` that would space the whole list out. */
+ *  `<p>` that would space the whole list out. An item the model wrote as a
+ *  checklist gets a checkbox rather than the `[ ]` it typed — read-only, because
+ *  it is a transcript of what the model said, not a form. */
 function renderListItem(src) {
   const li = h('li');
   const blocks = parseBlocks(src);
   if (blocks.length && blocks[0].kind === 'para') {
-    li.append(...inlineNodes(blocks.shift().text));
+    let text = blocks.shift().text;
+    const task = TASK_RE.exec(text);
+    if (task) {
+      li.className = 'md-task';
+      li.append(h('input', {
+        class: 'md-check', type: 'checkbox', disabled: true,
+        checked: task[1] !== ' ', 'aria-hidden': 'true',
+      }));
+      text = text.slice(task[0].length);
+    }
+    li.append(...inlineNodes(text));
   }
   for (const block of blocks) li.append(renderBlock(block));
   return li;
@@ -1098,10 +1227,45 @@ function pushMarkdown(view, delta, after) {
   });
 }
 
+/** A table row that is not part of a table yet: it opens or closes with a pipe,
+ *  the way a row does and a sentence does not. */
+const PIPE_ROW = /^ {0,3}\||\|[ \t]*$/;
+
+/**
+ * The source to draw while the rest of it is still coming. A table arrives header
+ * first, and until its alignment row lands there is nothing to say it is a table —
+ * so drawing it as it stands means a paragraph of pipes that a token later is
+ * thrown away and replaced by the table. Hold those trailing rows back instead:
+ * they land on the next sync, as the table they became or as the prose they turned
+ * out to be, and the last sync of all (`endMarkdown`) holds nothing. Rows inside a
+ * table or a code fence are not a trailing paragraph, and are never held.
+ * @param {string} src
+ * @param {Array<Object>} blocks `src` already parsed
+ * @returns {?string} the source minus the held rows, or null if there are none
+ */
+function withoutNascentTable(src, blocks) {
+  const last = blocks[blocks.length - 1];
+  if (!last || last.kind !== 'para') return null;
+  const at = src.lastIndexOf(last.src);
+  // Anything after the paragraph but the cursor — a blank line — means no
+  // alignment row is coming, and the pipes are prose after all.
+  const tail = src.slice(at + last.src.length);
+  if (tail !== '' && tail !== '\n') return null;
+  const lines = last.src.split('\n');
+  let cut = lines.length;
+  while (cut > 0 && PIPE_ROW.test(lines[cut - 1])) cut -= 1;
+  if (cut === lines.length) return null;
+  return src.slice(0, at) + lines.slice(0, cut).join('\n');
+}
+
 /** Reconcile the DOM with the source: keep the leading blocks whose source has
  *  not changed, redraw from the first that has. */
-function syncMarkdown(view) {
-  const next = parseBlocks(view.src);
+function syncMarkdown(view, final = false) {
+  let next = parseBlocks(view.src);
+  if (!final) {
+    const held = withoutNascentTable(view.src, next);
+    if (held !== null) next = parseBlocks(held);
+  }
   const prev = view.blocks;
   let keep = 0;
   while (keep < next.length && keep < prev.length && next[keep].src === prev[keep].src) {
@@ -1116,11 +1280,11 @@ function syncMarkdown(view) {
   view.blocks = next;
 }
 
-/** The message is complete: land the last delta and stop. */
+/** The message is complete: land the last delta — every line of it — and stop. */
 function endMarkdown(view) {
   if (view.frame) cancelAnimationFrame(view.frame);
   view.frame = 0;
-  syncMarkdown(view);
+  syncMarkdown(view, true);
   view.root.classList.remove('streaming');
 }
 

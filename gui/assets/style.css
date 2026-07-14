@@ -1648,6 +1648,18 @@ button.ghost-chip:hover {
 }
 .md li {
   margin: 0.25em 0;
+  /* As on a paragraph: a path or a URL in a bullet must not widen the column. */
+  overflow-wrap: anywhere;
+}
+/* A checklist item: the box replaces the bullet the item would have had. */
+.md li.md-task {
+  list-style: none;
+  margin-left: -1.25em;
+}
+.md-check {
+  margin: 0 0.5em 0 0;
+  accent-color: var(--text-faint);
+  vertical-align: middle;
 }
 /* A nested list is part of the item above it, not a new stanza. */
 .md li > ul,
