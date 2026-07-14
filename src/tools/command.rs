@@ -2,9 +2,9 @@
 //!
 //! The agent calls this with a command line exactly as a user would type it
 //! (`/effort high`, `/model claude-sonnet-5`, `/status`, …). The tool parses
-//! and validates it against [`SlashCommand`](crate::app::SlashCommand) — the
+//! and validates it against [`SlashCommand`](crate::commands::SlashCommand) — the
 //! same parser the prompt uses — and checks
-//! [`SlashCommand::agent_runnable`](crate::app::SlashCommand::agent_runnable),
+//! [`SlashCommand::agent_runnable`](crate::commands::SlashCommand::agent_runnable),
 //! which gates out interactive-only, session-ending, and external-setup
 //! commands. A valid, allowed command is handed to the interactive surface via
 //! [`AgentEvent::CommandRequested`]; the surface dispatches it once the turn
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::AgentEvent;
-use crate::app::SlashCommand;
+use crate::commands::SlashCommand;
 
 use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args};
 

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Wizard's mark: the four-point sparkle from the GUI favicon
+       (gui/assets/index.html, src/gui/server.rs FAVICON_SVG), on the app
+       canvas colour. Monochrome by design — the GUI has no brand hue. -->
+  <rect width="512" height="512" rx="114" fill="#0c0c0e"/>
+  <rect x="0.5" y="0.5" width="511" height="511" rx="113.5" fill="none" stroke="#26262a"/>
+  <path transform="translate(112 112) scale(18)" fill="#ececee"
+        d="M8 0C8.6 4.2 11.8 7.4 16 8C11.8 8.6 8.6 11.8 8 16C7.4 11.8 4.2 8.6 0 8C4.2 7.4 7.4 4.2 8 0Z"/>
+</svg>

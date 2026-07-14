@@ -115,6 +115,22 @@ fn asset_candidates_for(os: &str, arch: &str, nixos: bool) -> Vec<String> {
     }
 }
 
+/// Rewrite the plain-build candidates into desktop-build ones: a binary with
+/// the `desktop` feature must not silently update itself into a binary without
+/// it — the launcher entry pointing at it would stop opening a window.
+///
+/// Only `-gnu` and `-darwin` survive: there is no musl desktop asset (a static
+/// binary cannot dlopen a system webview), so on a machine where the gnu build
+/// will not run there is nothing to fall back to, and failing loudly beats
+/// quietly removing the app.
+fn desktop_assets(candidates: Vec<String>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|asset| asset.contains("-gnu") || asset.contains("-darwin"))
+        .map(|asset| asset.replacen("wizard-", "wizard-desktop-", 1))
+        .collect()
+}
+
 /// The release-asset candidates for this machine, or an error on an
 /// architecture we ship no binary for.
 fn asset_candidates() -> Result<Vec<String>> {
@@ -124,7 +140,11 @@ fn asset_candidates() -> Result<Vec<String>> {
             std::env::consts::ARCH
         )
     })?;
-    Ok(asset_candidates_for(std::env::consts::OS, arch, is_nixos()))
+    let candidates = asset_candidates_for(std::env::consts::OS, arch, is_nixos());
+    if cfg!(feature = "desktop") {
+        return Ok(desktop_assets(candidates));
+    }
+    Ok(candidates)
 }
 
 /// Extract the expected sha256 hex for `asset` from a `checksums.txt` body
@@ -764,6 +784,26 @@ mod tests {
                 "wizard-aarch64-unknown-linux-gnu.tar.gz".to_string(),
                 "wizard-aarch64-unknown-linux-musl.tar.gz".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn desktop_assets_keep_the_desktop_build_a_desktop_build() {
+        // A `--features desktop` binary updates to a desktop asset, never to
+        // the plain one: it is what the launcher entry points at.
+        assert_eq!(
+            desktop_assets(asset_candidates_for("linux", "x86_64", false)),
+            vec!["wizard-desktop-x86_64-unknown-linux-gnu.tar.gz".to_string()]
+        );
+        assert_eq!(
+            desktop_assets(asset_candidates_for("macos", "aarch64", false)),
+            vec!["wizard-desktop-aarch64-apple-darwin.tar.gz".to_string()]
+        );
+        // musl is dropped rather than rewritten — we publish no static desktop
+        // build, so on NixOS this leaves the gnu one and nothing else.
+        assert_eq!(
+            desktop_assets(asset_candidates_for("linux", "x86_64", true)),
+            vec!["wizard-desktop-x86_64-unknown-linux-gnu.tar.gz".to_string()]
         );
     }
 

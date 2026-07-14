@@ -222,9 +222,53 @@ impl SignIn {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn store() -> Arc<ConfigStore> {
         Arc::new(ConfigStore::new(Config::default()))
+    }
+
+    /// xAI's OpenID discovery document, served on loopback.
+    ///
+    /// [`SignIn::begin_xai`] discovers the endpoints before it binds anything,
+    /// and a test that reached `auth.x.ai` for them would be a test of the
+    /// network. Pointing discovery here is what lets the regression below run
+    /// offline and identically every time, rather than skipping itself whenever
+    /// xAI is out of reach — which is precisely when a regression test is worth
+    /// nothing.
+    ///
+    /// The endpoints in the document are the real ones (they are pinned to x.ai,
+    /// so they have to be), but nothing dials them: the flows are cancelled long
+    /// before any token exchange. Returns the stub's URL and its task, which the
+    /// caller aborts.
+    async fn serve_discovery() -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind the discovery stub");
+        let url = format!(
+            "http://{}/.well-known/openid-configuration",
+            listener.local_addr().expect("stub address")
+        );
+        let task = tokio::spawn(async move {
+            const BODY: &str = r#"{"authorization_endpoint":"https://auth.x.ai/oauth/auth",
+                                   "token_endpoint":"https://auth.x.ai/oauth/token"}"#;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // The stub answers one document, so the request is read only to
+                // let the client finish writing it.
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                    BODY.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, task)
     }
 
     #[test]
@@ -283,7 +327,12 @@ mod tests {
     /// second takes it back, so without the cancel-and-wait the second
     /// `begin_xai` cannot bind and the retry is dead until the timeout.
     ///
-    /// Not a `#[tokio::test]`: it holds the real callback port across the whole
+    /// Hermetic: discovery is the loopback stub, and under `cfg(test)` the flow
+    /// binds a private port rather than xAI's registered one. So the test never
+    /// touches the network, never competes with a sign-in the user has in
+    /// flight, and — the point of it — never has an excuse not to run.
+    ///
+    /// Not a `#[tokio::test]`: it holds one fixed callback port across the whole
     /// run, and the guard for that is a plain lock.
     #[test]
     fn a_second_sign_in_replaces_the_first_and_rebinds_the_port() {
@@ -294,13 +343,14 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
+            let (discovery, stub) = serve_discovery().await;
+            xai_oauth::use_test_discovery_url(&discovery);
+
             let sign_in = Arc::new(SignIn::default());
-            let Ok(first) = sign_in.begin_xai(store()).await else {
-                // Beginning a flow discovers xAI's endpoints over the network.
-                // Offline, no port is ever held and there is nothing to regress.
-                eprintln!("skipped: xAI OpenID discovery is unreachable");
-                return;
-            };
+            let first = sign_in
+                .begin_xai(store())
+                .await
+                .expect("the first sign-in binds the callback port");
             assert!(matches!(sign_in.status(), Status::Pending { .. }));
 
             let second = sign_in
@@ -312,6 +362,7 @@ mod tests {
 
             // Leave no listener behind on the shared port.
             sign_in.release_in_flight().await;
+            stub.abort();
         });
     }
 }

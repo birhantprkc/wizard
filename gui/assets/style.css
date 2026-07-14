@@ -890,6 +890,17 @@ button.ghost-chip:hover {
   font-size: 12.5px;
 }
 
+/* Terminal-only (/vim, /quit, /exit): listed so the menu can say what it is and
+   why it is not here, dimmed so it does not read as something to pick. */
+.palette-item.unavailable .palette-name,
+.palette-item.unavailable .palette-args,
+.palette-item.unavailable .palette-detail {
+  color: var(--text-faint);
+}
+.palette-item.unavailable.active {
+  background: var(--hover);
+}
+
 /* ------------------------------------------------------------------ */
 /* Context panel                                                        */
 /* ------------------------------------------------------------------ */
@@ -911,6 +922,24 @@ button.ghost-chip:hover {
 
 .ctx-section {
   padding: 0;
+}
+
+/* The section a slash command just pointed at (`/subagents`). It was already on
+   screen, so all that is left to add is where to look — and an outline, not a
+   background, because nothing in the panel may shift to say it. */
+@keyframes ctx-flash {
+  from {
+    outline-color: var(--text-faint);
+  }
+  to {
+    outline-color: transparent;
+  }
+}
+.ctx-section.flash {
+  outline: 1px solid transparent;
+  outline-offset: 6px;
+  border-radius: var(--r-sm);
+  animation: ctx-flash 1.4s ease-out;
 }
 
 .ctx-header {
@@ -1561,48 +1590,193 @@ button.ghost-chip:hover {
   font-size: 13.5px;
   line-height: 1.6;
 }
-.plan-body p {
-  margin: 8px 0;
+
+/* Rendered markdown (app.js) — assistant messages, subagent messages, plan
+   cards. Everything is scoped to `.md`, so the tags the renderer emits are
+   styled in the shell's vocabulary rather than the browser's defaults. The
+   surrounding block (.msg-text, .plan-body) still owns colour and type size;
+   these rules only own the rhythm and the furniture. */
+.md > :first-child {
+  margin-top: 0;
 }
-.md-h {
-  font-weight: 600;
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 1em;
+  /* A URL or a path with no spaces in it must not widen the column. */
+  overflow-wrap: anywhere;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
   color: var(--text);
-  margin: 12px 0 4px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 1.6em 0 0.6em;
 }
-.md-h1 {
-  font-size: 14.5px;
+.md h1 {
+  font-size: 1.28em;
 }
-.md-h2 {
-  font-size: 14px;
+.md h2 {
+  font-size: 1.16em;
 }
-.md-h3,
-.md-h4 {
-  font-size: 13.5px;
+.md h3 {
+  font-size: 1.05em;
 }
-.md-list {
-  margin: 6px 0 6px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1em;
+}
+.md ul,
+.md ol {
+  margin: 0 0 1em;
+  padding-left: 1.6em;
+}
+.md ul {
+  list-style: disc;
+}
+.md ul ul {
+  list-style: circle;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.25em 0;
+}
+/* A nested list is part of the item above it, not a new stanza. */
+.md li > ul,
+.md li > ol {
+  margin: 0.25em 0 0;
+}
+.md li::marker {
+  color: var(--text-faint);
+}
+.md strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.md em {
+  font-style: italic;
+}
+.md del {
+  color: var(--text-muted);
+}
+.md blockquote {
+  margin: 0 0 1em;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 2px solid var(--hairline);
+  color: var(--text-muted);
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  margin: 1.6em 0;
+}
+.md-link {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--text-faint);
+  text-underline-offset: 2px;
+}
+.md-link:hover {
+  text-decoration-color: var(--text);
 }
 .md-code {
   font-family: var(--font-mono);
-  font-size: 12px;
-  background: #232327;
+  font-size: 0.86em;
+  background: var(--hover-2);
   border-radius: 4px;
   padding: 1px 5px;
 }
 .md-pre {
   font-family: var(--font-mono);
   font-size: 12px;
+  line-height: 1.6;
   background: #101012;
-  border: 1px solid #232327;
+  border: 1px solid var(--hairline);
   border-radius: 8px;
   padding: 10px 12px;
-  margin: 8px 0;
+  margin: 0 0 1em;
   overflow-x: auto;
   white-space: pre;
   color: var(--text-mid);
+}
+.md-pre code {
+  font: inherit;
+  background: none;
+  padding: 0;
+}
+/* A fenced block that named its language says so, above the code. */
+.md-code-block {
+  margin: 0 0 1em;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #101012;
+}
+.md-code-lang {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--panel-2);
+  color: var(--text-muted);
+}
+.md-code-block .md-pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+
+/* A wide table scrolls inside its own box. The transcript column never does. */
+.md-table-wrap {
+  margin: 0 0 1em;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+.md-table {
+  border-collapse: collapse;
+  /* Sized by its content, but never narrower than the column it sits in — so a
+     wide table overflows into the scroll box above, and a narrow one fills. */
+  width: max-content;
+  min-width: 100%;
+  font-size: 0.93em;
+}
+.md-table th,
+.md-table td {
+  padding: 7px 12px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+.md-table th {
+  color: var(--text);
+  font-weight: 600;
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.md-table td {
+  color: var(--text-soft);
+}
+.md-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+/* The alignment row is a promise about the column; keep it. */
+.md-table .md-al-left {
+  text-align: left;
+}
+.md-table .md-al-center {
+  text-align: center;
+}
+.md-table .md-al-right {
+  text-align: right;
 }
 
 .iv-q {

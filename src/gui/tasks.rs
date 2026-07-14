@@ -17,17 +17,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::agent::session::Session;
 use crate::agent::{
     Agent, AgentEvent, CancelHandle, DoneReason, PlanVerdict, build_headless_agent_for_session,
 };
-use crate::config::{Config, Mode};
+use crate::commands::{Execution, FusionAction, ServerAction, SlashCommand};
+use crate::config::{Config, Mode, ProviderKind};
 use crate::gui::settings::ConfigStore;
 use crate::gui::transcript::summarize_tool;
 use crate::images::ImageRef;
-use crate::llm::provider::NATIVE_TOOLS_ON_PROBE_FAILURE;
+use crate::llm::provider::{LlmProvider, NATIVE_TOOLS_ON_PROBE_FAILURE};
 use crate::mcp::McpManager;
 use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::tools::CommandDispatch;
@@ -47,12 +48,15 @@ const MAX_BUFFERED_FRAMES: usize = 10_000;
 /// the same cadence, from its draw loop.
 const HEARTBEAT: Duration = Duration::from_secs(3);
 
-/// The slash commands the GUI's own executor runs — the `server` rows of
-/// [`crate::gui::server::COMMANDS`], which a test holds it to. `run_command`
-/// refuses anything outside this set at *call* time, so a command with nowhere
-/// to land in a browser comes back to the model as a tool error rather than a
-/// no-op it never hears about.
-pub(crate) const AGENT_COMMANDS: &[&str] = &["compact", "cost", "model", "mode", "help"];
+/// The slash commands the agent may queue here: the ones this surface runs
+/// against the Agent ([`Execution::Server`]) that [`SlashCommand::agent_runnable`]
+/// also allows it. Derived from the one command table, never listed again —
+/// `run_command` refuses everything else at *call* time, so a command with
+/// nowhere to land in a browser comes back to the model as a tool error rather
+/// than a no-op it never hears about.
+fn agent_commands() -> &'static [&'static str] {
+    crate::commands::agent_commands()
+}
 
 /// A server→client WebSocket frame (see `docs/gui-protocol.md`).
 #[derive(Debug, Serialize)]
@@ -180,6 +184,14 @@ pub enum Frame {
     },
     Error {
         message: String,
+    },
+    /// `/rewind` truncated the conversation: every turn from `turn` on is gone
+    /// from the session file. The transcript the page has rendered is now a
+    /// record of turns that no longer exist, so it must discard it and re-fetch
+    /// `GET /api/tasks/{id}` — the session file is the only copy of the history,
+    /// and this is the frame that says it changed under the client's feet.
+    TranscriptReset {
+        turn: u64,
     },
     Retrying {
         attempt: u32,
@@ -1075,7 +1087,7 @@ pub struct TaskManager {
     /// to every task's agent build. One process-wide manager, as the TUI keeps:
     /// connecting per build would leave a GUI with four warm tasks running four
     /// copies of every configured server, each a real OS process.
-    mcp: Arc<McpManager>,
+    mcp: Arc<RwLock<McpManager>>,
     /// `~/.wizard/running/`, where every task this manager owns heartbeats.
     /// `None` only when the wizard directory cannot be resolved at all, in which
     /// case no session on the machine is registered anyway.
@@ -1090,7 +1102,7 @@ struct ManagedTask {
 }
 
 impl TaskManager {
-    pub fn new(config: Arc<ConfigStore>, mcp: Arc<McpManager>) -> Self {
+    pub fn new(config: Arc<ConfigStore>, mcp: Arc<RwLock<McpManager>>) -> Self {
         Self::with_registry(config, mcp, session_registry::running_dir())
     }
 
@@ -1098,7 +1110,7 @@ impl TaskManager {
     /// temp dir, so a test run never advertises itself as a live session).
     pub(crate) fn with_registry(
         config: Arc<ConfigStore>,
-        mcp: Arc<McpManager>,
+        mcp: Arc<RwLock<McpManager>>,
         registry: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -1343,13 +1355,16 @@ fn agent_config(base: &Config, model: Option<&str>) -> Config {
 /// Ends when the manager drops the turn sender (eviction or shutdown).
 async fn run_worker(
     store: Arc<ConfigStore>,
-    mcp: Arc<McpManager>,
+    mcp: Arc<RwLock<McpManager>>,
     shared: Arc<TaskShared>,
     session: Session,
     mut requests: mpsc::UnboundedReceiver<WorkerRequest>,
 ) {
     let mut agent: Option<Agent> = None;
     let mut task_config: Option<Config> = None;
+    // Warm-agent state, like the mode and the plan flag: a task rebuilt after
+    // eviction comes back on its configured provider.
+    let mut fusion = false;
 
     while let Some(request) = requests.recv().await {
         if let WorkerRequest::Turn(turn) = &request {
@@ -1381,14 +1396,17 @@ async fn run_worker(
             }
             None => {
                 let config = agent_config(&base_config, model_override.as_deref());
-                match build_headless_agent_for_session(
-                    &config,
-                    &shared.cwd,
-                    session.clone(),
-                    Some(mcp.as_ref()),
-                )
-                .await
-                {
+                let built = {
+                    let manager = mcp.read().await;
+                    build_headless_agent_for_session(
+                        &config,
+                        &shared.cwd,
+                        session.clone(),
+                        Some(&manager),
+                    )
+                    .await
+                };
+                match built {
                     Ok(mut built) => {
                         if config.plan_first {
                             built.set_plan_mode(true);
@@ -1400,7 +1418,7 @@ async fn run_worker(
                         // the ones its executor implements, so `run_command`
                         // refuses the rest to the model instead of accepting work
                         // that would never run.
-                        built.set_command_dispatch(CommandDispatch::Only(AGENT_COMMANDS));
+                        built.set_command_dispatch(CommandDispatch::Only(agent_commands()));
                         shared.set_cancel(built.cancel_handle());
                         shared.set_model(&config.active().model);
                         shared.set_mode(config.mode);
@@ -1421,28 +1439,27 @@ async fn run_worker(
             }
         };
 
+        let config = task_config.clone().unwrap_or_else(|| base_config.clone());
+        let mut ctx = CommandCtx {
+            config: &config,
+            shared: &shared,
+            mcp: &mcp,
+            fusion: &mut fusion,
+        };
         match request {
             WorkerRequest::Turn(turn) => {
                 run_turn(&mut agent_for_turn, turn, &shared).await;
-                let config = task_config.as_ref().unwrap_or(&base_config);
                 // The turn is over and its borrow of the agent with it, so the
                 // commands it queued can finally be applied — through the one
                 // executor a client-sent `command` frame goes through, emitting
                 // the same frames.
                 for line in shared.take_pending_commands() {
-                    apply_command(
-                        &mut agent_for_turn,
-                        parse_command_line(&line),
-                        config,
-                        &shared,
-                    )
-                    .await;
+                    apply_command(&mut agent_for_turn, parse_command_line(&line), &mut ctx).await;
                 }
                 shared.finish_turn(false);
             }
             WorkerRequest::Command(command) => {
-                let config = task_config.as_ref().unwrap_or(&base_config);
-                apply_command(&mut agent_for_turn, command, config, &shared).await;
+                apply_command(&mut agent_for_turn, command, &mut ctx).await;
                 shared.finish_turn(false);
             }
         }
@@ -1522,74 +1539,692 @@ fn turn_prompt(request: TurnRequest, cwd: &Path) -> crate::commands::Preprocesse
     prompt
 }
 
-/// Apply one server-side slash command to the live agent (see
-/// [`crate::gui::server::COMMANDS`]). Everything it has to say comes back as
-/// the frames the protocol already has — `notice`, `context`, `error` — so a
-/// command needs no reply frame of its own.
+/// What the command executor may reach besides the agent itself.
+pub(crate) struct CommandCtx<'a> {
+    /// The task's config, as its agent was built from.
+    pub config: &'a Config,
+    pub shared: &'a Arc<TaskShared>,
+    /// The process-wide MCP manager. `/reload` re-registers against *this* one:
+    /// connecting a second set would leave the GUI running two copies of every
+    /// configured server, each a real OS process.
+    pub mcp: &'a Arc<RwLock<McpManager>>,
+    /// Whether this task's turns currently run through the fusion panel
+    /// (`/fusion`), so the toggle knows which way it is toggling. Warm-agent
+    /// state, like the mode and the plan flag: an evicted task rebuilds on the
+    /// configured provider.
+    pub fusion: &'a mut bool,
+}
+
+/// Apply one slash command to the live agent. Everything it has to say comes
+/// back as the frames the protocol already has — `notice`, `context`,
+/// `transcript_reset`, `error` — so a command needs no reply frame of its own.
 ///
 /// The one executor: a `command` frame from the client and a `/…` the agent
 /// asked for through `run_command` both land here, and are answered the same.
-async fn apply_command(
-    agent: &mut Agent,
-    request: CommandRequest,
-    config: &Config,
-    shared: &TaskShared,
-) {
-    let args = request.args.trim();
-    match request.name.as_str() {
-        "compact" => {
+/// What it runs is what [`crate::commands::COMMANDS`] says this surface runs —
+/// the table the TUI completes from and `GET /api/commands` is derived from, so
+/// the menu cannot offer a command that lands here as "unknown".
+async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut CommandCtx<'_>) {
+    let shared = ctx.shared;
+    let line = match request.args.trim() {
+        "" => format!("/{}", request.name),
+        args => format!("/{} {args}", request.name),
+    };
+
+    // The one parser, so an argument means here exactly what it means at the
+    // TUI's prompt — including the errors it rejects a bad one with.
+    let command = match SlashCommand::parse(&line) {
+        Some(Ok(command)) => command,
+        Some(Err(message)) => return error(shared, message),
+        None => return error(shared, format!("'{line}' is not a slash command")),
+    };
+
+    // The table decides what this surface runs. An alias with no row of its own
+    // (`/q`) has no `gui` to read and falls through to the match, which answers
+    // it by what it parsed to.
+    match crate::commands::spec(&request.name).map(|spec| spec.gui) {
+        Some(Execution::Client) => return error(shared, elsewhere(&request.name)),
+        Some(Execution::Terminal) => return error(shared, terminal_only(&request.name)),
+        Some(Execution::Server) | None => {}
+    }
+
+    match command {
+        SlashCommand::Compact => {
             let outcome = agent.compact_now().await;
-            shared.push(Frame::Notice {
-                text: outcome.describe(),
-            });
+            notice(shared, outcome.describe());
             shared.push_context(agent.context_tokens());
         }
-        "cost" => shared.push(Frame::Notice {
-            text: cost_report(agent, config),
-        }),
-        "model" => {
-            if args.is_empty() {
-                shared.push(Frame::Error {
-                    message: "usage: /model <name>".to_string(),
-                });
-                return;
+        SlashCommand::Cost => notice(shared, cost_report(agent, ctx.config)),
+        SlashCommand::Model(Some(tag)) => switch_model(agent, ctx.config, &tag, shared).await,
+        SlashCommand::Model(None) => error(
+            shared,
+            "usage: /model <tag> — or pick one from the model menu",
+        ),
+        SlashCommand::Mode(Some(mode)) => set_mode(agent, mode, shared),
+        SlashCommand::Mode(None) => error(shared, "usage: /mode <genie|sovereign>"),
+        SlashCommand::Effort(Some(effort)) => {
+            agent.set_reasoning_effort(effort);
+            match effort {
+                Some(effort) => notice(shared, format!("reasoning effort: {effort}")),
+                None => notice(shared, "reasoning effort: provider default"),
             }
-            switch_model(agent, config, args, shared).await;
         }
-        "mode" => match args {
-            "genie" => set_mode(agent, Mode::Genie, shared),
-            "sovereign" => set_mode(agent, Mode::Sovereign, shared),
-            // Plan is not a mode but a posture on top of one: the agent
-            // investigates read-only and presents a plan through the same
-            // `plan_ready` gate the socket already answers.
-            "plan" => {
-                agent.set_plan_mode(true);
-                shared.push(Frame::Notice {
-                    text: "plan mode on — the next turn plans before it acts".to_string(),
-                });
-            }
-            other => shared.push(Frame::Error {
-                message: format!("unknown mode '{other}' (sovereign|genie|plan)"),
-            }),
+        SlashCommand::Effort(None) => error(shared, "usage: /effort <low|medium|high|default>"),
+        SlashCommand::Plan => toggle_plan(agent, shared),
+        SlashCommand::Omakase => toggle_omakase(agent, shared),
+        SlashCommand::Goal(None) => notice(shared, goal_report(&shared.cwd)),
+        SlashCommand::Goal(Some(text)) => match set_goal(&shared.cwd, &text) {
+            Ok(message) => notice(shared, message),
+            Err(message) => error(shared, message),
         },
-        "help" => shared.push(Frame::Notice {
-            text: crate::gui::server::help_text(),
-        }),
-        other => shared.push(Frame::Error {
-            message: format!("unknown command '/{other}'"),
-        }),
+        SlashCommand::Status => notice(shared, status_report(agent, ctx.config, shared)),
+        SlashCommand::Memory => notice(shared, memory_report(&shared.cwd)),
+        SlashCommand::Doctor => {
+            let checks = crate::doctor::run_checks(&shared.cwd).await;
+            notice(
+                shared,
+                format!("doctor:\n{}", crate::doctor::render(&checks)),
+            );
+        }
+        SlashCommand::Bashes => notice(shared, bashes_report(agent)),
+        SlashCommand::Agents => notice(shared, agents_report()),
+        SlashCommand::Reload => reload(agent, ctx).await,
+        SlashCommand::Rewind(None) => notice(shared, rewind_candidates(agent)),
+        SlashCommand::Rewind(Some(turn)) => rewind(agent, turn, shared),
+        SlashCommand::Fusion(FusionAction::Toggle) => toggle_fusion(agent, ctx).await,
+        SlashCommand::Fusion(FusionAction::Config) => error(
+            shared,
+            "`/fusion config` is a TUI picker; set the panel under [fusion] in \
+             ~/.wizard/config.toml, then /fusion to turn it on",
+        ),
+        SlashCommand::Server(action) => server_command(action, ctx.config, shared).await,
+        SlashCommand::Evolve { deep, description } => {
+            evolve(deep, description, ctx.config, shared).await
+        }
+        SlashCommand::Publish { branch } => publish(branch, ctx.config, shared).await,
+        SlashCommand::Help => notice(shared, crate::gui::server::help_text()),
+
+        // The table gated these above; a `command` frame for one is a client
+        // bug, and the honest answer to it is the same one the table gives.
+        SlashCommand::Clear
+        | SlashCommand::Diff
+        | SlashCommand::Todos
+        | SlashCommand::Subagents
+        | SlashCommand::Dashboard
+        | SlashCommand::Resume(_)
+        | SlashCommand::Settings
+        | SlashCommand::Provider(_)
+        | SlashCommand::ProviderSetup { .. }
+        | SlashCommand::Login(_)
+        | SlashCommand::ImportClaude(_) => error(shared, elsewhere(&request.name)),
+        SlashCommand::Vim | SlashCommand::Quit => error(shared, terminal_only(&request.name)),
     }
 }
 
-/// `/mode <sovereign|genie>`: switch the posture and leave plan mode, which is
-/// a stance the old mode was holding, not a property of the new one.
+fn notice(shared: &TaskShared, text: impl Into<String>) {
+    shared.push(Frame::Notice { text: text.into() });
+}
+
+fn error(shared: &TaskShared, message: impl Into<String>) {
+    shared.push(Frame::Error {
+        message: message.into(),
+    });
+}
+
+/// The answer to a command the *page* owns, arriving as a `command` frame: the
+/// server has no hand on a panel, an overlay, or the task list.
+fn elsewhere(name: &str) -> String {
+    format!("'/{name}' is part of the page, not the agent — the browser runs it, not the server")
+}
+
+/// The answer to a command with genuinely nowhere to land here. It says what it
+/// is rather than pretending to have done something.
+fn terminal_only(name: &str) -> String {
+    match name {
+        "vim" => "'/vim' toggles modal editing of the terminal composer; this one is a \
+                  browser textarea, and your editor's keys are its own"
+            .to_string(),
+        "quit" | "exit" | "q" => "'/quit' exits the terminal app. This chat is a page: close \
+                                  the tab, or stop the server it is talking to"
+            .to_string(),
+        other => format!("'/{other}' runs only in the terminal"),
+    }
+}
+
+/// `/mode <sovereign|genie>`: switch the posture subsequent turns run in. Plan
+/// mode is a stance on top of a mode, not a property of one, so it survives the
+/// switch — as it does in the TUI.
 fn set_mode(agent: &mut Agent, mode: Mode, shared: &TaskShared) {
     agent.set_mode(mode);
-    agent.set_plan_mode(false);
     shared.set_mode(mode);
-    shared.push(Frame::Notice {
-        text: format!("mode: {mode}"),
-    });
+    notice(shared, format!("mode: {mode}"));
+}
+
+/// `/plan`: toggle read-only investigation until a plan is approved. Leaving
+/// plan mode leaves omakase with it — omakase is a flavor of plan mode, and the
+/// agent mirrors that.
+fn toggle_plan(agent: &mut Agent, shared: &TaskShared) {
+    let on = !agent.plan_mode();
+    agent.set_plan_mode(on);
+    notice(
+        shared,
+        if on {
+            "plan mode on — the agent investigates read-only and presents a plan for approval \
+             (/plan to leave)"
+        } else {
+            "plan mode off"
+        },
+    );
+}
+
+/// `/omakase`: chef's-choice plan mode — the agent decides the approach itself
+/// and executes its own plan. Implies plan mode (the read-only exploration).
+fn toggle_omakase(agent: &mut Agent, shared: &TaskShared) {
+    let on = !agent.omakase();
+    agent.set_omakase(on);
+    notice(
+        shared,
+        if on {
+            "omakase on — chef's choice: the agent explores read-only, decides the approach \
+             itself, and executes its own plan (/omakase to leave)"
+        } else {
+            "omakase off — back to plan mode (you review the plan)"
+        },
+    );
+}
+
+/// `/goal`: the standing mission for this workspace
+/// (`<cwd>/.wizard/mission.toml`), which drives sovereign runs.
+fn goal_report(cwd: &Path) -> String {
+    match crate::agent::mission::Mission::load(cwd) {
+        Err(err) => format!("could not read mission: {err:#}"),
+        Ok(None) => "no standing goal set — use `/goal <text>` to set one \
+                     (drives sovereign/continuous mode)"
+            .to_string(),
+        Ok(Some(mission)) => {
+            let mut text = format!(
+                "goal: {}\ncycles: {}  ·  updated {}",
+                mission.goal,
+                mission.cycles,
+                mission.updated.format("%Y-%m-%d %H:%M UTC"),
+            );
+            if !mission.notes.is_empty() {
+                text.push_str("\nrecent:");
+                let skip = mission.notes.len().saturating_sub(5);
+                for note in &mission.notes[skip..] {
+                    text.push_str(&format!("\n  - {note}"));
+                }
+            }
+            text
+        }
+    }
+}
+
+/// `/goal <text>`: set the standing mission, noting the change on an existing
+/// one rather than dropping its history.
+fn set_goal(cwd: &Path, text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("usage: /goal <text>".to_string());
+    }
+    let mission = match crate::agent::mission::Mission::load(cwd) {
+        Err(err) => return Err(format!("could not read mission: {err:#}")),
+        Ok(Some(mut mission)) => {
+            mission.goal = text.to_string();
+            mission.note(format!("goal changed to: {text}"));
+            mission
+        }
+        Ok(None) => crate::agent::mission::Mission::new(text),
+    };
+    mission
+        .save(cwd)
+        .map_err(|err| format!("could not save mission: {err:#}"))?;
+    Ok(format!("standing goal set:\n{text}"))
+}
+
+/// `/status`: what this session is, in one notice.
+fn status_report(agent: &Agent, config: &Config, shared: &TaskShared) -> String {
+    let provider = config.active();
+    let effort = config
+        .reasoning_effort
+        .map(|effort| effort.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let (prompt, completion) = agent.usage().session_totals();
+    let mut text = format!(
+        "model: {}\nprovider: {} ({:?} @ {})\nmode: {}\neffort: {effort}\nsteps: {}\n\
+         session: {}\nusage: {prompt} prompt + {completion} completion tokens\ncontext: {} tokens\n\
+         background tasks: {} running",
+        shared.model(),
+        provider.name,
+        provider.kind,
+        provider.base_url,
+        agent.mode(),
+        config.max_steps,
+        agent.session().id,
+        agent.context_tokens(),
+        agent.running_tasks(),
+    );
+    let todos = agent.todos();
+    let (done, total) = crate::tools::todo::progress(&todos);
+    match total {
+        0 => text.push_str("\ntodos: none"),
+        _ => text.push_str(&format!("\ntodos: {done}/{total} done")),
+    }
+    text.push_str(&format!(
+        "\nplan mode: {}",
+        match (agent.plan_mode(), agent.omakase()) {
+            (_, true) => "on (omakase — chef's choice)",
+            (true, false) => "on",
+            (false, false) => "off",
+        }
+    ));
+    text
+}
+
+/// `/memory`: the project memories saved under `.wizard/memory/`.
+fn memory_report(cwd: &Path) -> String {
+    let store = match crate::memory::MemoryStore::open(cwd) {
+        Ok(store) => store,
+        Err(err) => return format!("could not open memory store: {err:#}"),
+    };
+    match store.list() {
+        Err(err) => format!("could not list memories: {err:#}"),
+        Ok(entries) if entries.is_empty() => {
+            format!("no memories saved yet ({})", store.dir().display())
+        }
+        Ok(entries) => {
+            let mut text = format!("saved memories ({}):\n", store.dir().display());
+            for entry in &entries {
+                text.push_str(&format!("  {} — {}\n", entry.name, entry.description));
+            }
+            text.trim_end().to_string()
+        }
+    }
+}
+
+/// `/bashes`: the background `execute` tasks this session has spawned.
+fn bashes_report(agent: &Agent) -> String {
+    let tasks = agent.tasks();
+    if tasks.is_empty() {
+        return "background tasks: none".to_string();
+    }
+    let mut text = String::from("background tasks:\n");
+    for task in &tasks {
+        text.push_str(&format!(
+            "  #{} [{}] {}\n",
+            task.id,
+            task.status.describe(),
+            task.command
+        ));
+    }
+    text.trim_end().to_string()
+}
+
+/// `/agents`: the subagent roster. The TUI opens a picker that pre-fills a
+/// delegation; a page has no picker to open, so the roster comes back as what
+/// it is — the list, and how to use it.
+fn agents_report() -> String {
+    let dir = match Config::subagents_dir() {
+        Ok(dir) => dir,
+        Err(err) => return format!("could not resolve the subagents directory: {err:#}"),
+    };
+    let configs = crate::agent::subagent::available_configs(&dir);
+    if configs.is_empty() {
+        return format!("no subagents available ({})", dir.display());
+    }
+    let mut text = String::from("subagents:\n");
+    for config in &configs {
+        let scope = match &config.tool_scope {
+            None => "all tools".to_string(),
+            Some(names) => names.join(", "),
+        };
+        text.push_str(&format!(
+            "  {} — {} · {scope} · {} steps\n",
+            config.name, config.description, config.max_steps
+        ));
+    }
+    text.push_str("\nask for one by name to delegate to it.");
+    text
+}
+
+/// `/reload`: pick up skills, scripted tools, and MCP servers edited since the
+/// session started, without a restart.
+///
+/// The MCP config reloads into the *shared* manager — the one every task's agent
+/// was built against — so a reload re-registers the servers this process already
+/// runs instead of starting a second set beside them.
+async fn reload(agent: &mut Agent, ctx: &mut CommandCtx<'_>) {
+    let shared = ctx.shared;
+    let mut manager = ctx.mcp.write().await;
+    match Config::mcp_config_path().and_then(|path| crate::mcp::McpConfig::load(&path)) {
+        Ok(config) => {
+            if let Err(err) = manager.reload(&config).await {
+                notice(shared, format!("MCP reload warning: {err:#}"));
+            }
+        }
+        Err(err) => notice(shared, format!("could not reload MCP config: {err:#}")),
+    }
+    let hooks = Arc::clone(agent.hooks());
+    let client = Arc::clone(agent.client());
+    match crate::agent::build_tool_registry(ctx.config, &client, &hooks, &manager).await {
+        Ok((registry, subagent_model)) => {
+            let tools = registry.len();
+            let skills = crate::agent::load_skills();
+            let count = skills.len();
+            agent.set_registry(registry);
+            agent.bind_subagent_model(subagent_model);
+            agent.set_skills(skills);
+            notice(shared, format!("reloaded: {tools} tools, {count} skills"));
+        }
+        Err(err) => error(shared, format!("reload failed: {err:#}")),
+    }
+}
+
+/// Bare `/rewind`: the turns there is something to go back to, newest first.
+/// The TUI opens a picker over exactly this list; here it is the list.
+fn rewind_candidates(agent: &Agent) -> String {
+    let candidates = agent.rewind_candidates(20);
+    if candidates.is_empty() {
+        return "nothing to rewind yet".to_string();
+    }
+    let mut text = String::from("rewind to before turn:\n");
+    for candidate in &candidates {
+        let files = candidate
+            .files
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = match (candidate.prompt.is_empty(), files.is_empty()) {
+            (false, false) => format!("{} · {files}", candidate.prompt),
+            (false, true) => candidate.prompt.clone(),
+            (true, false) => files,
+            (true, true) => String::new(),
+        };
+        text.push_str(&format!("  {} — {detail}\n", candidate.turn));
+    }
+    text.push_str("\n/rewind <turn> restores the files and truncates the conversation.");
+    text
+}
+
+/// `/rewind <turn>`: restore every file snapshot from `turn` onward and drop the
+/// rewound turns from the conversation.
+///
+/// The turns are gone from the session file, so the rendered transcript the page
+/// holds is now a lie: [`Frame::TranscriptReset`] tells it to throw that away and
+/// re-fetch `GET /api/tasks/{id}`, which reads the truncated session back.
+fn rewind(agent: &mut Agent, turn: u64, shared: &TaskShared) {
+    match agent.rewind_to(turn) {
+        Ok(restored) => {
+            shared.push(Frame::TranscriptReset { turn });
+            let files = match restored.is_empty() {
+                true => "no files needed restoring".to_string(),
+                false => format!(
+                    "restored {}",
+                    restored
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            notice(
+                shared,
+                format!("rewound to before turn {turn} — {files}; conversation truncated"),
+            );
+            shared.push_context(agent.context_tokens());
+        }
+        Err(err) => error(shared, format!("rewind failed: {err:#}")),
+    }
+}
+
+/// `/fusion`: every turn runs through the panel — several providers answer, a
+/// synthesizer fuses them — or back to the single configured model.
+///
+/// The client is swapped in place and the registry rebuilt against it, rather
+/// than the agent being rebuilt onto a fresh session as the TUI does: a GUI task
+/// *is* its session file, and rotating that would strand the page on a session
+/// nothing writes to any more (the same reason `/clear` is the client's).
+async fn toggle_fusion(agent: &mut Agent, ctx: &mut CommandCtx<'_>) {
+    let shared = ctx.shared;
+    let config = ctx.config;
+    let (client, label) = match *ctx.fusion {
+        true => match config.active().build() {
+            Ok(client) => {
+                let name = config.active().model;
+                (client, format!("fusion off — back to {name}"))
+            }
+            Err(err) => {
+                return error(shared, format!("could not rebuild the provider: {err:#}"));
+            }
+        },
+        false => {
+            let Some(fusion) = config.effective_fusion() else {
+                return error(
+                    shared,
+                    "fusion needs at least one configured provider — add one on the Settings \
+                     page, then set [fusion] in ~/.wizard/config.toml",
+                );
+            };
+            match config.build_fusion_from(&fusion) {
+                Ok(provider) => {
+                    let label = provider.label();
+                    (
+                        Arc::new(provider) as Arc<dyn LlmProvider>,
+                        format!("{label} — every turn now fuses the panel; /fusion to turn off"),
+                    )
+                }
+                Err(err) => return error(shared, format!("could not start fusion: {err:#}")),
+            }
+        }
+    };
+
+    let model = shared.model();
+    let native = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
+    agent.set_client(Arc::clone(&client), native);
+    // The spawn tool captured the old client: without this, subagents would keep
+    // answering from the model the panel just replaced.
+    let hooks = Arc::clone(agent.hooks());
+    let manager = ctx.mcp.read().await;
+    match crate::agent::build_tool_registry(config, &client, &hooks, &manager).await {
+        Ok((registry, subagent_model)) => {
+            agent.set_registry(registry);
+            agent.bind_subagent_model(subagent_model);
+        }
+        Err(err) => tracing::warn!("rebuilding the registry for /fusion: {err:#}"),
+    }
+    *ctx.fusion = !*ctx.fusion;
+    notice(shared, label);
+}
+
+/// `/server [status|start|stop]`: the local llama-server's lifecycle. It is a
+/// process on this machine, and the GUI runs on that machine — the same command,
+/// answering into the chat instead of onto a status line.
+async fn server_command(action: ServerAction, config: &Config, shared: &Arc<TaskShared>) {
+    let provider = config.active();
+    if provider.kind != ProviderKind::LlamaCpp {
+        return error(
+            shared,
+            format!(
+                "'/server' manages the local llama-server; the active provider '{}' is {:?}",
+                provider.name, provider.kind
+            ),
+        );
+    }
+    match action {
+        ServerAction::Status => {
+            let spawned = crate::server::spawned_pid()
+                .map(|pid| format!(" (PID {pid}, started by wizard)"))
+                .unwrap_or_default();
+            let text = match crate::server::probe(&provider.base_url).await {
+                crate::server::Health::Ready => {
+                    format!("llama-server at {}: ready{spawned}", provider.base_url)
+                }
+                crate::server::Health::Loading => format!(
+                    "llama-server at {}: loading its model{spawned}",
+                    provider.base_url
+                ),
+                crate::server::Health::Down => format!(
+                    "llama-server at {}: not running — start it with /server start",
+                    provider.base_url
+                ),
+            };
+            notice(shared, text);
+        }
+        ServerAction::Start => {
+            if crate::server::probe(&provider.base_url).await == crate::server::Health::Ready {
+                return notice(
+                    shared,
+                    format!("llama-server at {} is already running", provider.base_url),
+                );
+            }
+            notice(
+                shared,
+                format!("starting llama-server at {}…", provider.base_url),
+            );
+            let progress = FrameProgress {
+                shared: Arc::clone(shared),
+            };
+            match crate::server::ensure_running(&provider, &progress).await {
+                Ok(()) => notice(
+                    shared,
+                    format!("llama-server at {} is ready", provider.base_url),
+                ),
+                Err(err) => error(shared, format!("could not start llama-server: {err:#}")),
+            }
+        }
+        ServerAction::Stop => {
+            let text = match crate::server::stop() {
+                Ok(crate::server::StopOutcome::Stopped(pid)) => {
+                    format!("stopped llama-server (PID {pid})")
+                }
+                Ok(crate::server::StopOutcome::NotRecorded) => {
+                    "wizard has not started a llama-server — nothing to stop".to_string()
+                }
+                Ok(crate::server::StopOutcome::NotRunning(pid)) => {
+                    format!("llama-server (PID {pid}) already exited")
+                }
+                Ok(crate::server::StopOutcome::NotOurs { pid, name }) => {
+                    format!("refusing to stop PID {pid}: it is '{name}', not llama-server")
+                }
+                Err(err) => format!("could not stop llama-server: {err:#}"),
+            };
+            notice(shared, text);
+        }
+    }
+}
+
+/// [`crate::server::Progress`] adapter for the GUI's `/server start`: the
+/// server's status lines and download milestones arrive in the chat as notices.
+/// The byte guard outlives the borrow that opened it (`Box<dyn ByteProgress>` is
+/// `'static`), which is why this holds the task by handle rather than by
+/// reference.
+struct FrameProgress {
+    shared: Arc<TaskShared>,
+}
+
+impl crate::server::Progress for FrameProgress {
+    fn status(&self, line: &str) {
+        notice(&self.shared, line.to_string());
+    }
+
+    fn bytes(&self, label: &str, total: Option<u64>) -> Box<dyn crate::server::ByteProgress> {
+        Box::new(FrameBytes {
+            shared: Arc::clone(&self.shared),
+            label: label.to_string(),
+            total: total.filter(|total| *total > 0),
+            written: std::sync::atomic::AtomicU64::new(0),
+            last_percent: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+/// Byte-progress guard for [`FrameProgress`]. Throttled to whole-percent steps,
+/// as the TUI's is: a multi-GB model pull would otherwise flood the chat with a
+/// notice per chunk.
+struct FrameBytes {
+    shared: Arc<TaskShared>,
+    label: String,
+    total: Option<u64>,
+    written: std::sync::atomic::AtomicU64,
+    last_percent: std::sync::atomic::AtomicU64,
+}
+
+impl crate::server::ByteProgress for FrameBytes {
+    fn inc(&self, n: u64) {
+        use std::sync::atomic::Ordering;
+        let written = self.written.fetch_add(n, Ordering::Relaxed) + n;
+        let Some(total) = self.total else { return };
+        let percent = written * 100 / total;
+        if percent > self.last_percent.swap(percent, Ordering::Relaxed) {
+            notice(
+                &self.shared,
+                format!(
+                    "{} — {percent}% of {:.1} GB",
+                    self.label,
+                    total as f64 / 1e9
+                ),
+            );
+        }
+    }
+
+    fn finish(self: Box<Self>, msg: &str) {
+        if !msg.is_empty() {
+            notice(&self.shared, msg.to_string());
+        }
+    }
+}
+
+/// `/evolve <what to add>`: Wizard extends itself — a skill, a scripted tool, an
+/// MCP server. The TUI detaches it and notices when it lands; here it runs in the
+/// command's own slot, so the page shows the task working until it is done.
+async fn evolve(deep: bool, description: String, config: &Config, shared: &TaskShared) {
+    notice(
+        shared,
+        format!(
+            "evolving ({}): {description}",
+            if deep { "deep" } else { "runtime" }
+        ),
+    );
+    let tier = match deep {
+        true => crate::evolve::EvolveTier::Deep,
+        false => crate::evolve::EvolveTier::Runtime,
+    };
+    let request = crate::evolve::EvolveRequest { description, tier };
+    let mut evolver = crate::evolve::Evolver::new(config.clone());
+    match evolver.run(request).await {
+        Ok(outcome) => notice(shared, crate::evolve::describe_outcome(&outcome)),
+        Err(err) => error(shared, format!("evolve failed: {err:#}")),
+    }
+}
+
+/// `/publish [branch]`: fork Wizard and hand back a one-line installer.
+async fn publish(branch: Option<String>, config: &Config, shared: &TaskShared) {
+    notice(
+        shared,
+        format!(
+            "publishing Wizard{}…",
+            branch
+                .as_deref()
+                .map(|branch| format!(" (branch: {branch})"))
+                .unwrap_or_default()
+        ),
+    );
+    let request = crate::evolve::PublishRequest { branch };
+    match crate::evolve::publish(config, request, false).await {
+        Ok(outcome) => notice(
+            shared,
+            format!(
+                "publish: forked to {}  (branch: {})\n\nInstall one-liner:\n{}",
+                outcome.fork_url, outcome.branch, outcome.install_one_liner
+            ),
+        ),
+        Err(err) => error(shared, format!("publish failed: {err:#}")),
+    }
 }
 
 /// `/cost`: session token totals, with an estimate when the active provider
@@ -1680,6 +2315,18 @@ mod tests {
         TaskShared::new(
             "2026-07-11T00-00-00".to_string(),
             PathBuf::from("/tmp/project"),
+            "test-model".to_string(),
+            "genie".to_string(),
+            None,
+        )
+    }
+
+    /// A task whose workspace is a real directory: `/goal`, `/memory` and
+    /// `/doctor` all read and write one.
+    fn shared_in(cwd: &Path) -> Arc<TaskShared> {
+        TaskShared::new(
+            "2026-07-11T00-00-00".to_string(),
+            cwd.to_path_buf(),
             "test-model".to_string(),
             "genie".to_string(),
             None,
@@ -2382,17 +3029,58 @@ mod tests {
         .expect("agent")
     }
 
-    async fn command(agent: &mut Agent, shared: &TaskShared, name: &str, args: &str) {
+    /// Run one command against `agent`, as either a client `command` frame or a
+    /// line the agent queued: the executor is the same for both.
+    async fn command(agent: &mut Agent, shared: &Arc<TaskShared>, name: &str, args: &str) {
+        command_in(agent, shared, &Config::default(), name, args).await;
+    }
+
+    async fn command_in(
+        agent: &mut Agent,
+        shared: &Arc<TaskShared>,
+        config: &Config,
+        name: &str,
+        args: &str,
+    ) {
+        let request = CommandRequest {
+            name: name.to_string(),
+            args: args.to_string(),
+        };
+        apply(agent, shared, config, request).await;
+    }
+
+    async fn apply(
+        agent: &mut Agent,
+        shared: &Arc<TaskShared>,
+        config: &Config,
+        request: CommandRequest,
+    ) {
+        let mcp = Arc::new(RwLock::new(McpManager::empty()));
+        let mut fusion = false;
         apply_command(
             agent,
-            CommandRequest {
-                name: name.to_string(),
-                args: args.to_string(),
+            request,
+            &mut CommandCtx {
+                config,
+                shared,
+                mcp: &mcp,
+                fusion: &mut fusion,
             },
-            &Config::default(),
-            shared,
         )
         .await;
+    }
+
+    /// The `notice` text of the last command, or a panic naming what came out
+    /// instead — a command that errors where a notice was expected is a failure
+    /// worth reading.
+    fn notice_text(frames: &[Value]) -> String {
+        frames
+            .iter()
+            .find(|frame| frame["type"] == "notice")
+            .unwrap_or_else(|| panic!("expected a notice, got: {frames:?}"))["text"]
+            .as_str()
+            .expect("notice text")
+            .to_string()
     }
 
     /// `Agent::clear` rotates the session file, and a GUI task is keyed by its
@@ -2421,11 +3109,8 @@ mod tests {
         );
 
         assert_eq!(
-            crate::gui::server::COMMANDS
-                .iter()
-                .find(|(name, ..)| *name == "clear")
-                .map(|(_, _, executed_by, _)| *executed_by),
-            Some("client"),
+            crate::commands::spec("clear").map(|spec| spec.gui),
+            Some(Execution::Client),
             "and the palette routes it to the client"
         );
     }
@@ -2481,38 +3166,429 @@ mod tests {
         assert_eq!(agent.mode(), Mode::Sovereign);
         assert_eq!(frames(&mut rx)[0]["type"], "notice");
 
+        // The one parser: a bad argument is rejected here exactly as at the
+        // TUI's prompt, in the same words.
         command(&mut agent, &shared, "mode", "yolo").await;
         let got = frames(&mut rx);
         assert_eq!(got[0]["type"], "error");
-
-        // A command the server does not have is an error, not a silent no-op.
-        command(&mut agent, &shared, "publish", "").await;
-        let got = frames(&mut rx);
-        assert_eq!(got[0]["type"], "error");
-        assert!(got[0]["message"].as_str().unwrap().contains("publish"));
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown mode 'yolo'"),
+            "got: {got:?}"
+        );
 
         // `/model` without the model it needs.
         command(&mut agent, &shared, "model", "").await;
         let got = frames(&mut rx);
         assert_eq!(got[0]["type"], "error");
+
+        // A word that is no command at all.
+        command(&mut agent, &shared, "frobnicate", "").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+        assert!(got[0]["message"].as_str().unwrap().contains("frobnicate"));
+    }
+
+    /// `/mode` moves the posture; plan mode is a stance held *on top* of a mode,
+    /// so it survives the switch. The TUI does the same, and a plan the user set
+    /// up should not evaporate because they moved to sovereign.
+    #[tokio::test]
+    async fn switching_mode_keeps_the_plan_stance() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+
+        command(&mut agent, &shared, "plan", "").await;
+        assert!(agent.plan_mode());
+        command(&mut agent, &shared, "mode", "sovereign").await;
+        assert_eq!(agent.mode(), Mode::Sovereign);
+        assert!(agent.plan_mode(), "the stance is not the mode's to drop");
+    }
+
+    // --- the commands the GUI grew ---
+
+    /// The one the user noticed was missing. `/goal` is the standing mission in
+    /// `<cwd>/.wizard/mission.toml` — the same file the TUI writes, so a goal set
+    /// in the browser drives a sovereign run started from the terminal.
+    #[tokio::test]
+    async fn goal_reports_the_mission_sets_it_and_notes_the_change() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared_in(cwd.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "goal", "").await;
+        assert!(
+            notice_text(&frames(&mut rx)).contains("no standing goal set"),
+            "an unset goal says so"
+        );
+
+        command(&mut agent, &shared, "goal", "ship the release").await;
+        assert!(notice_text(&frames(&mut rx)).contains("ship the release"));
+        let mission = crate::agent::mission::Mission::load(cwd.path())
+            .expect("load")
+            .expect("a mission on disk");
+        assert_eq!(mission.goal, "ship the release");
+
+        // Setting it again keeps the mission's history rather than replacing it.
+        command(&mut agent, &shared, "goal", "cut a patch release").await;
+        let _ = frames(&mut rx);
+        let text = {
+            command(&mut agent, &shared, "goal", "").await;
+            notice_text(&frames(&mut rx))
+        };
+        assert!(text.contains("goal: cut a patch release"), "got: {text}");
+        assert!(
+            text.contains("goal changed to: cut a patch release"),
+            "the change is noted, not silently overwritten: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_plan_and_omakase_toggle_the_agent_they_name() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "effort", "high").await;
+        assert!(notice_text(&frames(&mut rx)).contains("high"));
+        command(&mut agent, &shared, "effort", "turbo").await;
+        assert_eq!(frames(&mut rx)[0]["type"], "error");
+
+        command(&mut agent, &shared, "plan", "").await;
+        assert!(agent.plan_mode());
+        assert!(notice_text(&frames(&mut rx)).contains("plan mode on"));
+        command(&mut agent, &shared, "plan", "").await;
+        assert!(!agent.plan_mode());
+        let _ = frames(&mut rx);
+
+        // Omakase implies plan mode: it is the flavor of it where the agent
+        // approves its own plan.
+        command(&mut agent, &shared, "omakase", "").await;
+        assert!(agent.omakase());
+        assert!(agent.plan_mode(), "omakase is plan mode, chef's choice");
+        assert!(notice_text(&frames(&mut rx)).contains("omakase on"));
+    }
+
+    /// `/genie` and `/sovereign` are the `/mode` aliases, and reach the same
+    /// executor through the same parser.
+    #[tokio::test]
+    async fn the_mode_aliases_switch_the_mode() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+
+        command(&mut agent, &shared, "sovereign", "").await;
+        assert_eq!(agent.mode(), Mode::Sovereign);
+        command(&mut agent, &shared, "genie", "").await;
+        assert_eq!(agent.mode(), Mode::Genie);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_session_and_bashes_and_agents_report_theirs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        agent.usage().record(Some(10), Some(4));
+        command(&mut agent, &shared, "status", "").await;
+        let text = notice_text(&frames(&mut rx));
+        for expected in [
+            "model: test-model",
+            "mode: genie",
+            "effort: default",
+            "10 prompt + 4 completion",
+            "plan mode: off",
+            "todos: none",
+        ] {
+            assert!(
+                text.contains(expected),
+                "status is missing {expected}: {text}"
+            );
+        }
+        assert!(
+            text.contains(&agent.session().id),
+            "and names the session it is talking about: {text}"
+        );
+
+        // No background `execute` has run, and the report says that rather than
+        // printing an empty list.
+        command(&mut agent, &shared, "bashes", "").await;
+        assert_eq!(notice_text(&frames(&mut rx)), "background tasks: none");
+
+        // The roster is whatever is installed; it must at least come back as a
+        // notice rather than an error.
+        command(&mut agent, &shared, "agents", "").await;
+        assert_eq!(frames(&mut rx)[0]["type"], "notice");
+    }
+
+    #[tokio::test]
+    async fn memory_and_doctor_answer_with_a_notice() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared_in(cwd.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "memory", "").await;
+        assert!(
+            notice_text(&frames(&mut rx)).contains("no memories saved yet"),
+            "an empty store says so, with the directory it looked in"
+        );
+
+        command(&mut agent, &shared, "doctor", "").await;
+        assert!(notice_text(&frames(&mut rx)).starts_with("doctor:"));
+    }
+
+    /// `/reload` recomposes the tool set against the *shared* MCP manager. It
+    /// must come back with a live registry — a reload that dropped the agent's
+    /// tools would be worse than no reload at all.
+    #[tokio::test]
+    async fn reload_recomposes_the_tools_and_skills() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "reload", "").await;
+        let text = notice_text(&frames(&mut rx));
+        assert!(text.starts_with("reloaded: "), "got: {text}");
+        assert!(
+            !text.contains("reloaded: 0 tools"),
+            "the reloaded agent has its tools: {text}"
+        );
+    }
+
+    /// Bare `/rewind` lists what there is to go back to; `/rewind <turn>`
+    /// restores the files and truncates the conversation, and tells the page the
+    /// transcript it has rendered is no longer the one on disk.
+    #[tokio::test]
+    async fn rewind_lists_candidates_then_restores_and_resets_the_transcript() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "rewind", "").await;
+        assert_eq!(
+            notice_text(&frames(&mut rx)),
+            "nothing to rewind yet",
+            "a session with no turns has nothing to offer"
+        );
+
+        // A turn to go back to, and a file the turn changed.
+        let file = cwd.path().join("edited.txt");
+        std::fs::write(&file, "before").unwrap();
+        let turn = agent.checkpoints().begin_turn();
+        agent
+            .checkpoints()
+            .snapshot(turn, "write_file", &file)
+            .unwrap();
+        std::fs::write(&file, "after").unwrap();
+
+        command(&mut agent, &shared, "rewind", "").await;
+        let text = notice_text(&frames(&mut rx));
+        assert!(text.contains("edited.txt"), "the turn is listed: {text}");
+
+        command(&mut agent, &shared, "rewind", &turn.to_string()).await;
+        let got = frames(&mut rx);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "before",
+            "the file is restored"
+        );
+        let reset = got
+            .iter()
+            .find(|frame| frame["type"] == "transcript_reset")
+            .expect("the client is told to re-fetch the transcript");
+        assert_eq!(reset["turn"], turn);
+        assert!(notice_text(&got).contains(&format!("rewound to before turn {turn}")));
+    }
+
+    /// `/fusion` with nothing to fuse refuses and says what is missing, rather
+    /// than reporting a panel that is not there.
+    #[tokio::test]
+    async fn fusion_without_providers_refuses_honestly() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        command(&mut agent, &shared, "fusion", "").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+        assert!(got[0]["message"].as_str().unwrap().contains("fusion needs"));
+
+        // The panel *editor* is a TUI picker; the refusal points at the file the
+        // browser can change instead of pretending to open one.
+        command(&mut agent, &shared, "fusion", "config").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+        assert!(got[0]["message"].as_str().unwrap().contains("config.toml"));
+    }
+
+    /// `/server` manages the local llama-server. On a provider that is not
+    /// llama.cpp there is no server to manage, and it says so instead of probing
+    /// a URL that answers for something else.
+    #[tokio::test]
+    async fn server_refuses_when_the_provider_is_not_llamacpp() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        let mut config = Config::default();
+        config.providers.push(crate::config::ProviderConfig {
+            name: "openai".to_string(),
+            kind: ProviderKind::Openai,
+            base_url: "https://example.test/v1".to_string(),
+            model: "m".to_string(),
+            api_key_env: None,
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+        });
+
+        command_in(&mut agent, &shared, &config, "server", "status").await;
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "error");
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("local llama-server"),
+            "got: {got:?}"
+        );
+    }
+
+    /// A command the *page* owns, arriving as a `command` frame, is answered —
+    /// not swallowed. Same for one that only ever runs in a terminal: the
+    /// refusal says what the command is, rather than "unknown command".
+    #[tokio::test]
+    async fn client_and_terminal_commands_are_refused_by_name() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(cwd.path());
+        let shared = shared();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        shared.attach(tx);
+        let _ = frames(&mut rx);
+
+        for name in [
+            "diff",
+            "todos",
+            "subagents",
+            "settings",
+            "dashboard",
+            "resume",
+        ] {
+            command(&mut agent, &shared, name, "").await;
+            let got = frames(&mut rx);
+            assert_eq!(got[0]["type"], "error", "/{name}");
+            assert!(
+                got[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("part of the page"),
+                "/{name} is the page's own: {got:?}"
+            );
+        }
+
+        command(&mut agent, &shared, "vim", "").await;
+        let got = frames(&mut rx);
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("modal editing"),
+            "the refusal says what /vim is: {got:?}"
+        );
+
+        command(&mut agent, &shared, "quit", "").await;
+        let got = frames(&mut rx);
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("close the tab"),
+            "and what /quit would have meant: {got:?}"
+        );
     }
 
     // --- the agent's own slash commands ---
 
-    /// The set the tool gates on is the set the executor implements. Let them
-    /// drift and the agent is either refused a command the GUI runs, or told
-    /// "queued" for one it will answer with an error after the turn.
+    /// The set the tool gates on is the set the executor implements, filtered by
+    /// the gate the TUI applies to the same request. Let them drift and the agent
+    /// is either refused a command the GUI runs, or told "queued" for one it will
+    /// answer with an error after the turn.
     #[test]
     fn the_commands_the_agent_may_queue_are_the_ones_the_server_executes() {
-        let mut executed: Vec<&str> = crate::gui::server::COMMANDS
-            .iter()
-            .filter(|(_, _, executed_by, _)| *executed_by == "server")
-            .map(|(name, ..)| *name)
-            .collect();
-        executed.sort_unstable();
-        let mut offered = AGENT_COMMANDS.to_vec();
-        offered.sort_unstable();
-        assert_eq!(offered, executed);
+        for name in agent_commands() {
+            let spec = crate::commands::spec(name).expect("a table entry");
+            assert_eq!(
+                spec.gui,
+                Execution::Server,
+                "/{name} is offered to the agent, so this surface must execute it"
+            );
+            let line = format!("/{} {}", spec.name, spec.agent_arg);
+            let command = SlashCommand::parse(&line)
+                .unwrap_or_else(|| panic!("/{name} parses"))
+                .unwrap_or_else(|err| panic!("/{name} parses: {err}"));
+            assert!(
+                command.agent_runnable().is_ok(),
+                "/{name} is offered to the agent, but the gate refuses it"
+            );
+        }
+
+        // And nothing the executor runs is withheld from the agent unless the
+        // gate is what withholds it.
+        for spec in crate::commands::commands_where(Execution::Server) {
+            if agent_commands().contains(&spec.name) {
+                continue;
+            }
+            let line = format!("/{} {}", spec.name, spec.agent_arg);
+            let refused = match SlashCommand::parse(&line) {
+                Some(Ok(command)) => command.agent_runnable().is_err(),
+                _ => true,
+            };
+            assert!(
+                refused,
+                "/{} runs on this surface and the gate allows it — so the agent should have it",
+                spec.name
+            );
+        }
+    }
+
+    /// The user's `/rewind` restores checkpoints; the agent's does not. It is the
+    /// sharpest case of a command this surface runs that the model still may not.
+    #[test]
+    fn the_agent_may_not_rewind_a_session_the_gui_can() {
+        assert_eq!(
+            crate::commands::spec("rewind").map(|spec| spec.gui),
+            Some(Execution::Server)
+        );
+        assert!(
+            !agent_commands().contains(&"rewind"),
+            "the executor runs it for the user, never for the model"
+        );
     }
 
     #[test]
@@ -2558,11 +3634,11 @@ mod tests {
 
         // The worker drains the queue the moment the turn returns.
         for line in shared.take_pending_commands() {
-            apply_command(
+            apply(
                 &mut agent,
-                parse_command_line(&line),
-                &Config::default(),
                 &shared,
+                &Config::default(),
+                parse_command_line(&line),
             )
             .await;
         }
@@ -2594,7 +3670,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let sessions = cwd.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        let mcp = Arc::new(McpManager::empty());
+        let mcp = Arc::new(RwLock::new(McpManager::empty()));
         let tasks = TaskManager::with_registry(
             Arc::new(ConfigStore::new(Config::default())),
             Arc::clone(&mcp),
@@ -2641,7 +3717,7 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let tasks = TaskManager::with_registry(
             Arc::new(ConfigStore::new(Config::default())),
-            Arc::new(McpManager::empty()),
+            Arc::new(RwLock::new(McpManager::empty())),
             Some(running.clone()),
         );
 

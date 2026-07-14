@@ -238,6 +238,26 @@ pub enum Command {
         assets: Option<PathBuf>,
     },
 
+    /// Open the GUI as a native desktop app: the same local server as
+    /// `wizard gui`, on an OS-chosen loopback port, in a window driven by the
+    /// system webview (WebKitGTK / WKWebView — no bundled browser). Needs a
+    /// build with `--features desktop`; the plain binary says so and points at
+    /// `wizard gui`. See docs/desktop.md.
+    App {
+        /// Open the webview inspector alongside the window.
+        #[arg(long)]
+        devtools: bool,
+
+        /// Add Wizard to the launcher (Linux: ~/.local/share/applications;
+        /// macOS: ~/Applications/Wizard.app) and exit. Idempotent.
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+
+        /// Remove the launcher entry written by --install and exit.
+        #[arg(long)]
+        uninstall: bool,
+    },
+
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
     /// project and per provider. Self-contained; never loads config.
     Usage {

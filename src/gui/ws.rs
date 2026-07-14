@@ -174,7 +174,7 @@ mod tests {
         );
         let manager = TaskManager::with_registry(
             Arc::new(ConfigStore::new(Config::default())),
-            Arc::new(crate::mcp::McpManager::empty()),
+            Arc::new(tokio::sync::RwLock::new(crate::mcp::McpManager::empty())),
             None,
         );
         match apply(&shared, &manager, text) {

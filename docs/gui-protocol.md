@@ -115,36 +115,50 @@ it by). A PDF named `x.png` and labelled `image/png` still lands in attachments 
 is decided by it.
 
 ### GET /api/commands?cwd=/abs/path
-The composer's slash menu — the commands the *server* will honor for that workspace:
+The composer's slash menu. **Derived from `commands::COMMANDS`** — the one table the TUI
+completes and dispatches from — plus the custom commands loaded for that workspace. There is
+no second list: a built-in the GUI advertises is one the GUI runs, and a built-in the TUI has
+is one this menu shows.
+
 ```json
 { "commands": [
-  { "name": "clear",   "detail": "start a new chat in this directory", "where": "client" },
-  { "name": "compact", "detail": "summarize the history to free context", "where": "server" },
-  { "name": "cost",    "detail": "session token usage and cost", "where": "server" },
-  { "name": "model",   "detail": "switch model", "where": "server", "args": "<name>" },
-  { "name": "mode",    "detail": "sovereign | genie | plan", "where": "server", "args": "<mode>" },
-  { "name": "help",    "detail": "list the commands", "where": "server" },
-  { "name": "diff",    "detail": "toggle the working-tree diff", "where": "client" },
-  { "name": "todos",   "detail": "toggle the progress panel", "where": "client" },
-  { "name": "review",  "detail": "review the diff", "where": "prompt", "args": "<args>" }
+  { "name": "model",  "detail": "pick or switch the model", "where": "server", "args": "[tag]" },
+  { "name": "goal",   "detail": "show or set the standing mission goal", "where": "server", "args": "[text]" },
+  { "name": "diff",   "detail": "toggle the git diff sidebar", "where": "client" },
+  { "name": "vim",    "detail": "toggle vim-style modal editing of the input line", "where": "unavailable" },
+  { "name": "review", "detail": "review the diff", "where": "prompt", "args": "<args>" }
 ] }
 ```
+(An excerpt — every built-in appears, in the TUI's display order.)
+
 `where` says who executes it:
-- `server` → send it as a `command` frame; the server applies it to the Agent.
-- `client` → the page's own (a panel toggle); nothing to ask the server for.
+- `server` → send it as a `command` frame; the server applies it to the Agent and answers
+  with `notice` / `context` / `transcript_reset` / `error` frames.
+- `client` → the page's own: a panel, an overlay, a list. Nothing to ask the server for, and
+  a `command` frame for one comes back as an `error` saying so.
+- `unavailable` → terminal-only (`/vim`, `/quit`, `/exit`). Listed so the menu can say what
+  it is and why it is not here, rather than pretend it never existed. Render it disabled with
+  `detail` as the reason; sending it anyway is answered with an honest `error`.
 - `prompt` → a custom command from `.wizard/commands/*.md`. It expands to prompt text, so
   the client sends it as an ordinary `user_message` and the **server** expands it through
   `commands::preprocess`. The client never expands one — that is the same pipeline the TUI
   runs, and having two would mean two behaviors.
 
-The built-ins are deliberately a subset of the TUI's: a command with nowhere to land in
-this UI (`/vim`, `/quit`, the interactive pickers) would be a menu entry that does nothing.
+Two commands are `client` here though the TUI runs them against the agent, and for the same
+reason in both cases — **a GUI task is keyed by its session id**:
 
-`clear` is a client command here, though the TUI runs it against the agent. `Agent::clear`
-rotates the session file, and a GUI task is *keyed by* its session id — so clearing
-server-side would leave `GET /api/tasks/{id}` replaying the session the agent had just
-stopped writing to, and a reload would lose every turn taken after the clear. Where the
-conversation and the file are the same object, clearing one means starting the other.
+- `clear` — `Agent::clear` rotates the session file, so clearing server-side would leave
+  `GET /api/tasks/{id}` replaying the session the agent had just stopped writing to, and a
+  reload would lose every turn taken after the clear. Where the conversation and the file are
+  the same object, clearing one means starting the other.
+- `resume` — the task list *is* the session picker.
+
+The rest of the `client` set (`diff`, `todos`, `subagents`, `dashboard`, `settings`,
+`provider`, `login`) are windows the page owns; the server has no hand on them.
+
+`/mode` no longer takes `plan`. It never did in the TUI — plan is a posture on top of a mode,
+not a mode — and `/plan` and `/omakase` now toggle it here as they do there. A client that
+hardcoded `/mode plan` must send `/plan`.
 
 ## Settings
 
@@ -411,15 +425,48 @@ A `where: "server"` command from `GET /api/commands`, applied to the live Agent.
 the same slot a turn does (both need `&mut Agent`), so one sent mid-turn comes back as
 `error` "turn in progress" rather than queuing behind it.
 
-The server answers with the frames the protocol already has — there is no command-reply
-frame:
-- `compact` → `notice` (what the pass did), `context` (the history is smaller now).
-- `cost` → `notice` with the session totals and, when the provider carries rates, an estimate.
-- `model <name>` → `notice`; the context window is re-read for the new model.
-- `mode sovereign|genie|plan` → `notice`. `plan` is a posture on top of a mode: the next turn
-  investigates read-only and presents a plan through the `plan_ready` gate.
-- `help` → `notice`.
-- Anything unknown or unavailable → `error`.
+The arguments are parsed by `SlashCommand::parse` — the parser the TUI's prompt uses — so an
+argument means here exactly what it means there, and a bad one is rejected in the same words.
+
+The server answers with the frames the protocol already has; there is no command-reply frame:
+
+| command | answers with |
+|---|---|
+| `compact` | `notice` (what the pass did), `context` (the history is smaller now) |
+| `cost` | `notice`: session totals, plus an estimate when the provider carries rates |
+| `model <tag>` | `notice`; the context window is re-read for the new model |
+| `mode <genie\|sovereign>` | `notice`. Plan mode survives the switch — it is a stance on top of a mode, not one of them |
+| `genie`, `sovereign` | `notice` (the `/mode` aliases) |
+| `effort <low\|medium\|high\|default>` | `notice` |
+| `plan`, `omakase` | `notice`; the next turn investigates read-only and presents a plan through the `plan_ready` gate |
+| `goal [text]` | `notice`: the standing mission (`<cwd>/.wizard/mission.toml`), or the one just set |
+| `status` | `notice`: model, provider, mode, effort, step budget, session, usage, context, tasks, todos, plan |
+| `memory`, `doctor`, `bashes`, `agents` | `notice` |
+| `reload` | `notice`: skills, scripted tools, and MCP servers, re-registered against the one shared manager |
+| `rewind` | `notice` listing the turns there is something to go back to |
+| `rewind <turn>` | **`transcript_reset`** (see below), then `notice` (what was restored) and `context` |
+| `fusion` | `notice`; every turn now runs through the panel. `fusion config` is refused: the panel editor is a TUI picker |
+| `server [status\|start\|stop]` | `notice`; download and load progress arrive as further notices |
+| `evolve [--deep] <desc>`, `publish [branch]` | `notice` at the start and at the end. Both run in the command's own slot, so the task reads `working` until they land |
+| `help` | `notice`, derived from the same table this menu is |
+| a `client` command | `error`: the page runs it, not the server |
+| `vim`, `quit`, `exit` | `error`: what the command is, and why a browser is not where it runs |
+| anything unknown | `error` |
+
+### transcript_reset
+
+```json
+{ "type": "transcript_reset", "turn": 7 }
+```
+
+`/rewind <turn>` truncated the conversation: every turn from `turn` on is gone from the
+session file, and the transcript the page has rendered is now a record of turns that no
+longer exist. The client must **discard its rendered transcript and re-fetch
+`GET /api/tasks/{id}`**, which reads the truncated session back. The session file is the only
+copy of the history — this is the frame that says it changed under the client's feet.
+
+It arrives before the `notice` describing what was restored, so a client that re-fetches on
+sight of it and then appends the notice ends up with both.
 
 Rules:
 - One in-flight turn per task; `user_message` during a turn → `error` frame "turn in progress".

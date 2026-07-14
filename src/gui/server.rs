@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::agent::session::{self, Session};
+use crate::commands::{CommandSpec, Execution};
 use crate::config::{Config, ProviderConfig, ProviderKind};
 use crate::gui::tasks::TaskState;
 use crate::gui::{GuiState, git, oauth, settings, transcript, ws};
@@ -778,12 +779,21 @@ fn parse_kind(kind: &str) -> Result<ProviderKind, ApiError> {
 
 /// One row of `GET /api/commands`.
 ///
-/// `where` says who executes it: `server` is sent back as a `command` frame and
-/// applied to the Agent ([`crate::gui::tasks::run_command`]); `client` is the
-/// page's own (a panel toggle — nothing to ask the server for); `prompt` is a
-/// custom `.wizard/commands/*.md` command, which the client sends as an
-/// ordinary `user_message` and the *server* expands through
-/// [`crate::commands::preprocess`], exactly as the TUI does.
+/// `where` says who executes it:
+/// - `server` — sent back as a `command` frame and applied to the Agent
+///   ([`crate::gui::tasks::apply_command`]).
+/// - `client` — the page's own (a panel, an overlay, a list): nothing to ask the
+///   server for.
+/// - `unavailable` — terminal-only ([`Execution::Terminal`]). Offered so the menu
+///   can say what it is and why it is not here, rather than pretend it never
+///   existed; invoking it anyway is answered with an honest `error` frame.
+/// - `prompt` — a custom `.wizard/commands/*.md` command, which the client sends
+///   as an ordinary `user_message` and the *server* expands through
+///   [`crate::commands::preprocess`], exactly as the TUI does.
+///
+/// The built-ins are derived from [`crate::commands::COMMANDS`] — the one table
+/// the TUI completes from — so the two surfaces cannot drift into offering
+/// different commands.
 #[derive(Debug, Serialize)]
 struct CommandRow {
     name: String,
@@ -794,44 +804,38 @@ struct CommandRow {
     args: Option<&'static str>,
 }
 
-/// The built-in commands the GUI offers. Deliberately a subset of the TUI's
-/// (`app.rs` `COMMANDS`): a command with nowhere to land in this UI — `/vim`,
-/// `/quit`, the interactive pickers — would be a menu entry that does nothing.
-///
-/// `clear` is a *client* command here, unlike in the TUI. `Agent::clear`
-/// rotates the session file, and a GUI task is keyed by its session id — so a
-/// server-side clear would leave the page replaying the session the agent had
-/// just stopped writing to. A new chat is what clearing means when the
-/// conversation and the file are the same object.
-pub(crate) const COMMANDS: [(&str, &str, &str, Option<&str>); 8] = [
-    (
-        "clear",
-        "start a new chat in this directory",
-        "client",
-        None,
-    ),
-    (
-        "compact",
-        "summarize the history to free context",
-        "server",
-        None,
-    ),
-    ("cost", "session token usage and cost", "server", None),
-    ("model", "switch model", "server", Some("<name>")),
-    ("mode", "sovereign | genie | plan", "server", Some("<mode>")),
-    ("help", "list the commands", "server", None),
-    ("diff", "toggle the working-tree diff", "client", None),
-    ("todos", "toggle the progress panel", "client", None),
-];
+impl From<&'static CommandSpec> for CommandRow {
+    fn from(spec: &'static CommandSpec) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            detail: spec.description.to_string(),
+            executed_by: spec.gui.wire(),
+            args: (!spec.args.is_empty()).then_some(spec.args),
+        }
+    }
+}
 
-/// `/help`, as the `notice` frame that answers it.
+/// `/help`, as the `notice` frame that answers it: everything this surface runs,
+/// straight off the shared table, plus an honest line about what it does not.
 pub(crate) fn help_text() -> String {
     let mut text = String::from("commands:");
-    for (name, detail, _, args) in COMMANDS {
-        match args {
-            Some(args) => text.push_str(&format!("\n  /{name} {args} — {detail}")),
-            None => text.push_str(&format!("\n  /{name} — {detail}")),
+    for spec in crate::commands::COMMANDS
+        .iter()
+        .filter(|spec| spec.gui != Execution::Terminal)
+    {
+        match spec.args.is_empty() {
+            true => text.push_str(&format!("\n  /{} — {}", spec.name, spec.description)),
+            false => text.push_str(&format!(
+                "\n  /{} {} — {}",
+                spec.name, spec.args, spec.description
+            )),
         }
+    }
+    let terminal: Vec<String> = crate::commands::commands_where(Execution::Terminal)
+        .map(|spec| format!("/{}", spec.name))
+        .collect();
+    if !terminal.is_empty() {
+        text.push_str(&format!("\n\nterminal only: {}", terminal.join(", ")));
     }
     text.push_str("\n\nplus any custom command in .wizard/commands/*.md, and @path to");
     text.push_str(" reference a file.");
@@ -849,14 +853,9 @@ async fn commands(Query(query): Query<GitQuery>) -> Result<axum::Json<Value>, Ap
             query.cwd
         )));
     }
-    let mut rows: Vec<CommandRow> = COMMANDS
+    let mut rows: Vec<CommandRow> = crate::commands::COMMANDS
         .iter()
-        .map(|(name, detail, executed_by, args)| CommandRow {
-            name: (*name).to_string(),
-            detail: (*detail).to_string(),
-            executed_by,
-            args: *args,
-        })
+        .map(CommandRow::from)
         .collect();
     for command in crate::commands::load(&root) {
         let args = command.expects_args().then_some("<args>");
@@ -1329,6 +1328,59 @@ fn mtime_unix(path: &FsPath) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The menu the page shows is the table the TUI completes from. Two lists
+    /// would be two behaviors: a command the GUI advertises and cannot run, or
+    /// one it runs and never offers — which is how `/goal` came to be missing
+    /// from a GUI whose agent could already set the mission.
+    #[test]
+    fn the_commands_the_gui_offers_are_the_ones_the_table_defines() {
+        let rows: Vec<CommandRow> = crate::commands::COMMANDS
+            .iter()
+            .map(CommandRow::from)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            crate::commands::COMMANDS.len(),
+            "every built-in has a row — including the ones this surface refuses, \
+             which say so rather than vanishing"
+        );
+
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("/{name} is offered"))
+        };
+        assert_eq!(row("goal").executed_by, "server");
+        assert_eq!(row("goal").args, Some("[text]"));
+        assert_eq!(row("diff").executed_by, "client");
+        assert_eq!(row("vim").executed_by, "unavailable");
+
+        // The detail text is the table's own: one description per command, for
+        // every surface that names it.
+        assert_eq!(
+            row("goal").detail,
+            crate::commands::spec("goal").unwrap().description
+        );
+    }
+
+    /// `/help` answers with what this surface actually runs, and is honest about
+    /// what it does not.
+    #[test]
+    fn help_lists_the_runnable_commands_and_names_the_terminal_only_ones() {
+        let text = help_text();
+        assert!(text.contains("/goal [text] — show or set the standing mission goal"));
+        assert!(text.contains("/diff"));
+        assert!(
+            !text.contains("\n  /vim"),
+            "not offered as a command: {text}"
+        );
+        assert!(
+            text.contains("terminal only: /vim, /quit, /exit"),
+            "but named, not silently absent: {text}"
+        );
+        assert!(text.contains(".wizard/commands/*.md"));
+    }
 
     #[test]
     fn basenames_fall_back_to_the_path_itself() {

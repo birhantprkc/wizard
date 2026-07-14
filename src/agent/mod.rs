@@ -1047,6 +1047,38 @@ impl Agent {
         self.ctx.tasks.list()
     }
 
+    /// The agent's working todo list, for `/status` on a surface that does not
+    /// mirror the `TodoUpdated` events itself.
+    pub fn todos(&self) -> Vec<crate::tools::todo::TodoItem> {
+        self.ctx
+            .todos
+            .lock()
+            .map(|list| list.clone())
+            .unwrap_or_default()
+    }
+
+    /// The model client this agent talks to. A surface rebuilding the tool
+    /// registry (`/reload`) has to hand the subagent spawner the same client
+    /// the parent runs on, or its subagents answer from a different model than
+    /// the one `/model` and `/fusion` last set.
+    pub fn client(&self) -> &Arc<dyn LlmProvider> {
+        &self.client
+    }
+
+    /// Swap the model client mid-session (`/fusion`: the panel answers every
+    /// turn; toggling back restores the configured provider). The conversation
+    /// and the session file are untouched — on a surface whose chat *is* its
+    /// session file (the GUI), rotating either to change what answers would
+    /// strand the page on a session nothing writes to any more.
+    ///
+    /// The caller must also rebuild the tool registry against the new client
+    /// ([`build_tool_registry`]), or subagents keep spawning on the old one.
+    pub fn set_client(&mut self, client: Arc<dyn LlmProvider>, native_tools: bool) {
+        self.client = client;
+        self.native_tools = native_tools;
+        self.refresh_system_prompt();
+    }
+
     /// Shared handle on the background-subagent registry, so a surface can
     /// kill a detached run. Cloned out rather than borrowed through the agent
     /// because the TUI parks the whole `Agent` elsewhere while a turn is in
@@ -2056,6 +2088,68 @@ pub async fn build_headless_agent_for_session(
     build_headless_agent_inner(config, project_root, false, Some(session), mcp).await
 }
 
+/// The agent's whole tool set, freshly composed: native tools, scripted tools
+/// (`~/.wizard/tools`), the MCP tools `manager` is connected to, the subagent
+/// spawner, and the config-dependent `evolve` / `publish` tools.
+///
+/// Returns the registry and the spawn tool's shared model slot, which the caller
+/// must hand to [`Agent::bind_subagent_model`] — a fresh spawn tool reads the
+/// *configured* model until it is bound, and would quietly ignore `/model`.
+///
+/// This is what a build composes and what `/reload` recomposes, so a reloaded
+/// session has exactly the tools a fresh one does — no more (a second copy of
+/// every MCP server) and no fewer (`evolve` and `publish` silently dropped).
+pub async fn build_tool_registry(
+    config: &Config,
+    client: &Arc<dyn LlmProvider>,
+    hooks: &Arc<HookEngine>,
+    manager: &McpManager,
+) -> Result<(ToolRegistry, subagent::SharedActiveModel)> {
+    let mut base = ToolRegistry::with_native_tools();
+    match Config::scripted_tools_dir() {
+        Ok(dir) => {
+            if let Err(err) = base.load_scripted(&dir) {
+                tracing::warn!("loading scripted tools failed: {err}");
+            }
+        }
+        Err(err) => tracing::warn!("scripted tools dir unavailable: {err}"),
+    }
+    if let Err(err) = base.attach_mcp(manager).await {
+        tracing::warn!("attaching MCP tools failed: {err}");
+    }
+    base.apply_harness_overrides();
+
+    let subagents_dir = Config::subagents_dir()?;
+    let subagent_configs = subagent::available_configs(&subagents_dir);
+    let base = Arc::new(base);
+    let mut registry = subagent::scoped_registry(&base, None);
+    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
+        subagent_configs,
+        Arc::clone(client),
+        Arc::clone(&base),
+        Arc::clone(hooks),
+    ));
+    let subagent_model = spawn_tool.model_handle();
+    registry.register(spawn_tool);
+    registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
+        config.clone(),
+    )));
+    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
+        config.clone(),
+    )));
+    Ok((registry, subagent_model))
+}
+
+/// Skills from the repo/bundled roots plus `~/.wizard/skills` (user shadowing).
+/// A skill tree that will not load costs its skills, never the session.
+pub fn load_skills() -> Vec<Skill> {
+    let roots = crate::skills::default_roots();
+    crate::skills::load_skills(&roots).unwrap_or_else(|err| {
+        tracing::warn!("loading skills failed: {err}");
+        Vec::new()
+    })
+}
+
 /// Connect every server in `~/.wizard/mcp.toml`. Never hard-fails: a missing or
 /// broken config, or a server that will not come up, costs its tools — not the
 /// session.
@@ -2133,15 +2227,6 @@ async fn build_headless_agent_inner(
     ));
 
     // Tools: natives + scripted + MCP, then the subagent spawner on top.
-    let mut base = ToolRegistry::with_native_tools();
-    match Config::scripted_tools_dir() {
-        Ok(dir) => {
-            if let Err(err) = base.load_scripted(&dir) {
-                tracing::warn!("loading scripted tools failed: {err}");
-            }
-        }
-        Err(err) => tracing::warn!("scripted tools dir unavailable: {err}"),
-    }
     let connected;
     let manager = match mcp {
         Some(manager) => manager,
@@ -2150,37 +2235,9 @@ async fn build_headless_agent_inner(
             &connected
         }
     };
-    if let Err(err) = base.attach_mcp(manager).await {
-        tracing::warn!("attaching MCP tools failed: {err}");
-    }
-    base.apply_harness_overrides();
+    let (registry, subagent_model) = build_tool_registry(config, &client, &hooks, manager).await?;
 
-    let subagents_dir = Config::subagents_dir()?;
-    let subagent_configs = subagent::available_configs(&subagents_dir);
-    let base = Arc::new(base);
-    let mut registry = subagent::scoped_registry(&base, None);
-    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
-        subagent_configs,
-        Arc::clone(&client),
-        Arc::clone(&base),
-        Arc::clone(&hooks),
-    ));
-    // Bound to the agent below so subagents follow `/model` switches.
-    let subagent_model = spawn_tool.model_handle();
-    registry.register(spawn_tool);
-    registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
-        config.clone(),
-    )));
-    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
-        config.clone(),
-    )));
-
-    // Skills: repo/bundled roots + user (~/.wizard/skills), user shadowing.
-    let skill_roots = crate::skills::default_roots();
-    let skills = crate::skills::load_skills(&skill_roots).unwrap_or_else(|err| {
-        tracing::warn!("loading skills failed: {err}");
-        Vec::new()
-    });
+    let skills = load_skills();
 
     let mut agent = Agent::new(
         client,

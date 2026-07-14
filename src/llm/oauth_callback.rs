@@ -208,13 +208,40 @@ fn html_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A provider's registered callback port is a single machine-wide resource, and
-/// unit tests run in parallel threads of one process. Tests that bind a real one
-/// take this first, so they queue rather than fight over it.
+/// A fixed callback port is a single machine-wide resource, and unit tests run
+/// in parallel threads of one process. Tests that bind one take this first, so
+/// they queue rather than fight over it.
 #[cfg(test)]
 pub(crate) fn serial_callback_port() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// A free port no other test can take from us. The sign-in flows bind one of
+/// these under `cfg(test)` in place of their registered port, and the callback
+/// tests bind them directly.
+///
+/// Not `bind(0)`: that draws from the OS ephemeral range (32768–60999 here),
+/// which is exactly the range every other test's `bind(0)` draws from. A test
+/// that frees its port and then rebinds it — which is the whole point of
+/// `cancelling_frees_the_port_immediately`, and of the GUI's replace-a-sign-in
+/// regression — can find the kernel handed it to a concurrent test in between,
+/// and fail on a race that says nothing about the code. So we walk a private
+/// range below the ephemeral one, where no `bind(0)` can land, and hand each
+/// port out once: a successful bind proves it is free, and dropping the
+/// listener (nothing was ever accepted on it) gives it straight back to the
+/// caller.
+#[cfg(test)]
+pub(crate) fn private_test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(21_000);
+    for _ in 0..1_000 {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(port < 30_000, "ran out of private test ports");
+        if StdTcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in the private test range");
 }
 
 #[cfg(test)]
@@ -222,24 +249,10 @@ mod tests {
     use super::*;
 
     /// Bind a port the rest of the suite cannot take from us.
-    ///
-    /// Not `bind(0)`: that draws from the OS ephemeral range, which is exactly
-    /// the range every other test's `bind(0)` draws from. A test that frees its
-    /// port and then rebinds it — which is the whole point of
-    /// `cancelling_frees_the_port_immediately` — can find the kernel handed it
-    /// to a concurrent test in between, and fail on a race that says nothing
-    /// about the code. So we walk a private range below the ephemeral one,
-    /// where no `bind(0)` can land.
     fn bind_private() -> (StdTcpListener, u16) {
-        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(21_000);
-        for _ in 0..1_000 {
-            let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert!(port < 30_000, "ran out of private test ports");
-            if let Ok(listener) = StdTcpListener::bind(("127.0.0.1", port)) {
-                return (listener, port);
-            }
-        }
-        panic!("no free port in the private test range");
+        let port = private_test_port();
+        let listener = StdTcpListener::bind(("127.0.0.1", port)).expect("the private port is ours");
+        (listener, port)
     }
 
     /// Play the browser: send the redirect and read the page back. Async on

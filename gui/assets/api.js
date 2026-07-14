@@ -102,17 +102,22 @@
  */
 
 /**
- * One entry of `GET /api/commands`. `where` says who runs it:
+ * One entry of `GET /api/commands`, derived from the one table the TUI runs on
+ * (`commands::COMMANDS`). `where` says who runs it:
  *  - `server` — a `command` frame; the Agent acts on it.
- *  - `client` — app.js handles it (a pane, a panel toggle).
+ *  - `client` — app.js handles it (a pane, a panel, an overlay, the chat list).
  *  - `prompt` — a custom command from `.wizard/commands/*.md`. It goes out as an
  *    ordinary `user_message`: the SERVER expands it, through the same
  *    `commands::preprocess` that gives the composer its `@file` refs. The client
  *    never expands one, so a custom command means the same thing in both UIs.
+ *  - `unavailable` — terminal-only (`/vim`, `/quit`, `/exit`): a browser has no
+ *    modal editor to toggle and no process to exit. Listed, not hidden — someone
+ *    who knows it from the TUI should read why it is not here rather than wonder
+ *    whether they mistyped it — and never sent, in either direction.
  * @typedef {Object} SlashCommand
  * @property {string} name
  * @property {string} detail          One line, for the palette.
- * @property {'server'|'client'|'prompt'} where
+ * @property {'server'|'client'|'prompt'|'unavailable'} where
  * @property {string} [args]          Argument hint ("<name>"), when it takes any.
  */
 
@@ -215,6 +220,7 @@
  * @property {(plan: string) => void} [onPlan]
  * @property {(questions: string[]) => void} [onInterview]
  * @property {(text: string) => void} [onNotice]
+ * @property {(turn: number|null) => void} [onTranscriptReset]                 `/rewind` truncated the session on disk.
  * @property {(message: string) => void} [onError]
  * @property {(attempt: number) => void} [onRetrying]
  * @property {(reason: string) => void} [onDone]
@@ -440,7 +446,7 @@ function mapTaskState(state) {
   }
 }
 
-const WHERE = new Set(['server', 'client', 'prompt']);
+const WHERE = new Set(['server', 'client', 'prompt', 'unavailable']);
 
 /**
  * The command list, with every entry pinned to a `where` the client knows how
@@ -570,6 +576,12 @@ function dispatchFrame(frame, cb) {
       break;
     case 'notice':
       cb.onNotice && cb.onNotice(frame.text || '');
+      break;
+    // `/rewind` truncated the session file: the transcript on screen is a record
+    // of turns that no longer exist. The client re-reads the session rather than
+    // editing what it drew — the file is the history, and this says it changed.
+    case 'transcript_reset':
+      cb.onTranscriptReset && cb.onTranscriptReset(typeof frame.turn === 'number' ? frame.turn : null);
       break;
     case 'error':
       cb.onError && cb.onError(frame.message || 'unknown error');
@@ -1250,18 +1262,76 @@ function textEvents(text) {
 let idCounter = 0;
 const nextId = (prefix) => `${prefix}-${Date.now().toString(36)}-${++idCounter}`;
 
-/** The mock's `/` palette: one of each `where`, so all three paths are drivable. */
+/**
+ * The mock's `/` palette. The real menu is derived from `commands::COMMANDS`, so
+ * this mirrors that table — every built-in, in its display order, with the
+ * `where` the backend assigns it — plus one custom `prompt` command, the kind a
+ * workspace's `.wizard/commands/*.md` adds. All four `where` kinds appear, which
+ * is what makes each path drivable headlessly.
+ */
 const MOCK_COMMANDS = [
-  { name: 'clear', detail: 'Drop the conversation history', where: 'server' },
-  { name: 'compact', detail: 'Summarize history to free context', where: 'server' },
-  { name: 'cost', detail: 'Session token spend', where: 'server' },
-  { name: 'model', detail: 'Switch model', where: 'server', args: '<name>' },
-  { name: 'mode', detail: 'sovereign | genie | plan', where: 'server', args: '<mode>' },
-  { name: 'diff', detail: 'Show working-tree changes', where: 'client' },
-  { name: 'todos', detail: 'Toggle the progress panel', where: 'client' },
-  { name: 'help', detail: 'List the commands', where: 'client' },
-  { name: 'review', detail: '(custom, .wizard/commands/review.md)', where: 'prompt' },
+  { name: 'model', args: '[tag]', detail: 'pick or switch the model', where: 'server' },
+  { name: 'mode', args: '[genie|sovereign]', detail: 'pick or switch personality mode', where: 'server' },
+  { name: 'genie', detail: 'switch to genie mode', where: 'server' },
+  { name: 'sovereign', detail: 'switch to sovereign mode', where: 'server' },
+  { name: 'effort', args: '[low|medium|high|default]', detail: 'set reasoning effort (Grok 4.x, OpenAI o-series / gpt-5)', where: 'server' },
+  { name: 'plan', detail: 'toggle plan mode: read-only until a plan is approved', where: 'server' },
+  { name: 'omakase', detail: "toggle omakase: chef's-choice plan mode, the agent decides", where: 'server' },
+  { name: 'rewind', args: '[turn]', detail: 'rewind files and conversation to before a turn', where: 'server' },
+  { name: 'resume', detail: 'reopen and continue a past session', where: 'client' },
+  { name: 'compact', detail: 'summarize older history into a progress note now', where: 'server' },
+  { name: 'agents', detail: 'browse subagents and delegate to one', where: 'server' },
+  { name: 'subagents', detail: 'monitor the subagents running in this session', where: 'client' },
+  { name: 'evolve', args: '[--deep] <desc>', detail: 'self-extend: add a skill, tool, or MCP server', where: 'server' },
+  { name: 'publish', args: '[branch]', detail: 'fork & publish your Wizard, get a one-line installer', where: 'server' },
+  { name: 'provider', detail: 'add or switch LLM providers (interactive)', where: 'client' },
+  { name: 'fusion', args: '[config]', detail: 'toggle model fusion, or configure the panel', where: 'server' },
+  { name: 'server', args: '[status|start|stop]', detail: 'manage the local llama-server', where: 'server' },
+  { name: 'login', args: '<xai>', detail: 'sign in to a provider account (xAI OAuth)', where: 'client' },
+  { name: 'diff', detail: 'toggle the git diff sidebar', where: 'client' },
+  { name: 'todos', detail: 'toggle the todo side panel', where: 'client' },
+  { name: 'dashboard', detail: 'session manager: all live wizard sessions on this machine', where: 'client' },
+  { name: 'cost', detail: 'show session token usage and cost', where: 'server' },
+  { name: 'memory', detail: 'show saved project memories', where: 'server' },
+  { name: 'status', detail: 'show session status: model, usage, todos, tasks', where: 'server' },
+  { name: 'bashes', detail: 'list background tasks: id, status, command', where: 'server' },
+  { name: 'goal', args: '[text]', detail: 'show or set the standing mission goal', where: 'server' },
+  { name: 'settings', detail: 'open the settings menu (change config anytime)', where: 'client' },
+  { name: 'vim', detail: 'toggle vim-style modal editing of the input line', where: 'unavailable' },
+  { name: 'doctor', detail: 'diagnose config, providers, MCP, hooks, state dirs', where: 'server' },
+  { name: 'reload', detail: 'reload skills, scripted tools, and MCP servers', where: 'server' },
+  { name: 'clear', detail: 'clear the conversation', where: 'client' },
+  { name: 'help', detail: 'show available commands and keys', where: 'server' },
+  { name: 'quit', detail: 'exit wizard', where: 'unavailable' },
+  { name: 'exit', detail: 'exit wizard', where: 'unavailable' },
+  { name: 'review', detail: 'review the diff (.wizard/commands/review.md)', where: 'prompt', args: '<args>' },
 ];
+
+/** What the mock's `server` commands answer with — a notice, as the real ones do.
+ *  `/rewind` is not here: it truncates, and answers with `transcript_reset`. */
+const MOCK_NOTICES = {
+  model: (a) => `Model set to ${a || '(no model given)'}.`,
+  mode: (a) => `Mode set to ${a || '(no mode given)'}.`,
+  genie: () => 'Mode set to genie.',
+  sovereign: () => 'Mode set to sovereign.',
+  effort: (a) => `Reasoning effort set to ${a || 'default'}.`,
+  plan: () => 'Plan mode on: the next turn investigates read-only and presents a plan.',
+  omakase: () => 'Omakase on: the agent decides when the plan is ready.',
+  compact: () => 'History compacted into a progress note.',
+  agents: () => 'Subagents: researcher, reviewer, tester.',
+  evolve: (a) => `Evolve: ${a || '(nothing to build)'} — skill written and registered.`,
+  publish: (a) => `Published to ${a || 'main'}.`,
+  fusion: () => 'Fusion on: every turn now runs through the panel.',
+  server: (a) => `Local llama-server: ${a === 'stop' ? 'stopped' : a === 'start' ? 'running on :8080' : 'not running'}.`,
+  cost: () => 'Session spend: 24,310 prompt · 3,120 completion tokens.',
+  memory: () => 'Project memories: 3 notes in .wizard/memory.md.',
+  status: () => 'glm-5.2 · zai · sovereign · effort default · no step limit · 24,310 tokens next turn.',
+  bashes: () => 'No background tasks.',
+  goal: (a) => (a ? `Goal set: ${a}` : 'No standing goal in this workspace.'),
+  doctor: () => 'Config, providers, MCP, hooks and state dirs all check out.',
+  reload: () => 'Reloaded: 2 skills, 1 scripted tool, 0 MCP servers.',
+  help: () => `Commands: ${MOCK_COMMANDS.map((c) => `/${c.name}`).join(' ')}`,
+};
 
 /** The presets the mock's Settings page offers (a subset of the real ones). */
 const MOCK_PRESETS = [
@@ -1282,10 +1352,14 @@ export class MockApi {
       { name: 'anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-5', key: 'env' },
     ];
     /** What the next turn would carry; grows with the conversation, and drops
-     *  when /clear or /compact takes a scythe to it. @type {ContextSize} */
+     *  when /compact or /rewind takes a scythe to it. @type {ContextSize} */
     this._context = { tokens: 24310, window: 200000 };
     /** The GUI's step budget. 0 = no limit, as v1.2's default now is. */
     this._maxSteps = 0;
+    /** Session-unique subagent run ids, as the server's are. */
+    this._runs = 0;
+    /** The sign-in in flight, for `/login` and the Settings sign-in rows. */
+    this._signIn = null;
   }
 
   /** @returns {Promise<Workspace[]>} */
@@ -1364,31 +1438,68 @@ export class MockApi {
   async sendMessage(id, text, opts = {}) {
     const subscribers = () => Array.from(this._streams.get(id) ?? []);
     const callId = nextId('call');
+    const subCallId = nextId('call');
+    const run = ++this._runs;
     const attached = [
       (opts.images || []).length && `${opts.images.length} image(s)`,
       (opts.files || []).length && `${opts.files.length} file(s)`,
     ].filter(Boolean).join(' and ');
+    const opening = attached
+      ? `Looking at the ${attached} you attached, and at the files they point to. `
+      : 'Taking another pass at that now. I’m rechecking the affected files and rerunning the quick checks before reporting back. ';
+    const closing =
+      'Done — the follow-up change is in place. The shell still renders cleanly and the mock stream replays as expected' +
+      (opts.model ? ` (model: ${opts.model}).` : '.');
     // The prompt grew by what was said and what came with it; the reply grows it
     // again. The meter reads this, the Goal card's lifetime total reads `usage`.
     const promptTokens = 1200 + Math.round(text.length / 4);
     this._context = { tokens: this._context.tokens + promptTokens + 480, window: 200000 };
+
+    // The mock's session file: what `getTask` reads back, and therefore what the
+    // refetch a `transcript_reset` forces will show. A turn that streamed but was
+    // never recorded would silently vanish at the next `/rewind`, which is the
+    // one thing a rewind has to get right.
+    const task = this._data.tasks.get(id);
+    if (task) {
+      task.transcript.push({ type: 'user', text });
+      task.transcript.push({ type: 'worked', label: 'Worked for 21s' });
+      task.transcript.push({ type: 'text', text: opening + closing });
+    }
+
+    const todo = (n) => [
+      { text: 'Re-read the files the change touched', done: n > 0, active: n === 0 },
+      { text: 'Rerun the quick checks', done: n > 1, active: n === 1 },
+      { text: 'Report back', done: n > 2, active: n === 2 },
+    ];
     const events = [
       { type: 'status', status: { state: 'working' } },
       { type: 'context', context: this._context },
-      ...textEvents(
-        attached
-          ? `Looking at the ${attached} you attached, and at the files they point to. `
-          : 'Taking another pass at that now. I’m rechecking the affected files and rerunning the quick checks before reporting back. '
-      ),
+      { type: 'todo', items: todo(0) },
+      ...textEvents(opening),
       {
         type: 'tool_call',
         call: { id: callId, name: 'execute', tool: 'run', title: 'Ran', command: 'node --check gui/assets/app.js', status: 'pending' },
       },
       { type: 'tool_result', result: { callId, status: 'ok' } },
-      ...textEvents(
-        'Done — the follow-up change is in place. The shell still renders cleanly and the mock stream replays as expected' +
-          (opts.model ? ` (model: ${opts.model}).` : '.')
-      ),
+      { type: 'todo', items: todo(1) },
+      // One delegation, streamed as its own run: the panel's Subagents section —
+      // what `/subagents` reveals — is empty until something has run in the chat.
+      { type: 'subagent_run', info: { run, bg: null, name: 'reviewer', task: 'Check the diff for regressions' } },
+      { type: 'subagent_text', run, text: 'Reading the changed files against HEAD.' },
+      {
+        type: 'subagent_tool_call',
+        run,
+        call: { id: subCallId, name: 'read_file', tool: 'explore', title: 'Explored', detail: 'gui/assets/app.js', status: 'pending' },
+      },
+      { type: 'subagent_tool_result', run, result: { callId: subCallId, status: 'ok', summary: 'gui/assets/app.js (2,900 lines)' } },
+      { type: 'subagent_step', run, step: 2 },
+      {
+        type: 'subagent_done',
+        run,
+        result: { completed: true, output: 'No regressions in the diff.', stepsUsed: 2, error: null },
+      },
+      ...textEvents(closing),
+      { type: 'todo', items: todo(3) },
       { type: 'usage', usage: { promptTokens, completionTokens: 480 } },
     ];
     this._play(subscribers, events, { state: 'complete' }, 'completed');
@@ -1397,28 +1508,66 @@ export class MockApi {
 
   /**
    * The server half of a `/command`, answered with the frame kinds the protocol
-   * already has: a notice, and — where the command moved the context — a new
-   * reading for the meter.
+   * already has: a notice, a fresh reading for the meter where the command moved
+   * the context, and — for `/rewind <turn>` — the `transcript_reset` that says
+   * the session file itself was truncated.
+   *
+   * The refusals are here too. A `client` or `unavailable` command should never
+   * reach this method; if a page bug sends one, it is answered exactly as the
+   * server answers it, so the bug is visible under `?mock=1` and not only
+   * against a live backend.
    */
   sendCommand(id, name, args) {
     const subscribers = () => Array.from(this._streams.get(id) ?? []);
-    const said = {
-      clear: 'History cleared.',
-      compact: 'History compacted into a summary.',
-      cost: 'Session spend: 24,310 prompt · 3,120 completion tokens.',
-      model: `Model set to ${args || '(no model given)'}.`,
-      mode: `Mode set to ${args || '(no mode given)'}.`,
-    }[name];
-    if (!said) {
-      this._play(subscribers, [{ type: 'error', message: `unknown command: /${name}` }], { state: 'idle' });
-      return;
-    }
-    const events = [{ type: 'notice', text: said }];
-    if (name === 'clear' || name === 'compact') {
-      this._context = { tokens: name === 'clear' ? 0 : 4200, window: 200000 };
+    const refuse = (message) => this._play(subscribers, [{ type: 'error', message }], { state: 'idle' });
+    const spec = MOCK_COMMANDS.find((c) => c.name === name);
+    if (!spec) return refuse(`unknown command: /${name}`);
+    if (spec.where === 'client') return refuse(`/${name} is run by the page, not the server`);
+    if (spec.where === 'unavailable') return refuse(`/${name} runs in the terminal; a browser has nowhere to put it`);
+    if (spec.where === 'prompt') return refuse(`/${name} is a prompt: send it as a message`);
+    if (name === 'rewind') return this._play(subscribers, this._rewind(id, args), { state: 'idle' });
+
+    const say = MOCK_NOTICES[name];
+    if (!say) return refuse(`/${name} is not implemented in the mock`);
+    const events = [{ type: 'notice', text: say(args) }];
+    if (name === 'compact') {
+      this._context = { tokens: 4200, window: 200000 };
       events.push({ type: 'context', context: this._context });
     }
     this._play(subscribers, events, { state: 'idle' });
+  }
+
+  /**
+   * `/rewind`: bare, it lists the turns there is something to go back to; with a
+   * turn, it truncates the session before it and says so with a `transcript_reset`
+   * — which the client answers by re-reading the session, since the file is the
+   * only copy of the history. The reset comes first and the notice after, the
+   * order the live server sends them in.
+   */
+  _rewind(id, args) {
+    const task = this._data.tasks.get(id);
+    if (!task) return [{ type: 'error', message: `unknown task: ${id}` }];
+    const items = task.transcript;
+    const starts = items.reduce((acc, item, i) => (item.type === 'user' ? [...acc, i] : acc), []);
+    if (!args) {
+      return [{
+        type: 'notice',
+        text: starts.length
+          ? `Turns you can go back to: ${starts.map((_, i) => i + 1).join(', ')}.`
+          : 'Nothing to rewind: this chat has taken no turns.',
+      }];
+    }
+    const turn = Number(args);
+    if (!Number.isInteger(turn) || turn < 1 || turn > starts.length) {
+      return [{ type: 'error', message: `no turn ${args} to rewind to` }];
+    }
+    task.transcript = items.slice(0, starts[turn - 1]);
+    this._context = { tokens: 1200 * (turn - 1), window: 200000 };
+    return [
+      { type: 'transcript_reset', turn },
+      { type: 'notice', text: `Rewound to before turn ${turn}. Files and conversation restored.` },
+      { type: 'context', context: this._context },
+    ];
   }
 
   /** @returns {Promise<SlashCommand[]>} */
@@ -1573,6 +1722,32 @@ export class MockApi {
   }
 
   /**
+   * A sign-in with no provider behind it. The URL goes nowhere on purpose — a
+   * mock must not send a browser to a real consent screen — and the flow lands
+   * as an OAuth provider on the second poll, which is enough to drive `/login`
+   * and the Settings sign-in rows headlessly.
+   */
+  async beginSignIn(provider) {
+    this._signIn = { state: 'pending', provider, polls: 0 };
+    return `about:blank#mock-sign-in-${encodeURIComponent(provider)}`;
+  }
+
+  async signInStatus() {
+    const flow = this._signIn;
+    if (!flow) return { state: 'idle' };
+    if (flow.polls++ < 1) return { state: 'pending', provider: flow.provider };
+    if (flow.state === 'pending') {
+      flow.state = 'done';
+      const oauth = flow.provider === 'xai'
+        ? { kind: 'xaioauth', base_url: 'https://api.x.ai/v1', model: 'grok-4' }
+        : { kind: 'chatgptoauth', base_url: 'https://chatgpt.com/backend-api', model: 'gpt-5.2' };
+      this._mockProviders = this._mockProviders.filter((p) => p.name !== flow.provider);
+      this._mockProviders.unshift({ name: flow.provider, ...oauth, key: 'oauth' });
+    }
+    return { state: 'done', provider: flow.provider };
+  }
+
+  /**
    * An empty chat in the mock's own workspace, mirroring `RealApi.newChat`.
    * @returns {Promise<{id: string, cwd: string, workspace: string}>}
    */
@@ -1621,8 +1796,16 @@ export class MockApi {
         else if (ev.type === 'status' && cb.onStatus) cb.onStatus(ev.status);
         else if (ev.type === 'context' && cb.onContext) cb.onContext(ev.context);
         else if (ev.type === 'usage' && cb.onUsage) cb.onUsage(ev.usage);
+        else if (ev.type === 'todo' && cb.onTodo) cb.onTodo(ev.items);
         else if (ev.type === 'notice' && cb.onNotice) cb.onNotice(ev.text);
+        else if (ev.type === 'transcript_reset' && cb.onTranscriptReset) cb.onTranscriptReset(ev.turn);
         else if (ev.type === 'error' && cb.onError) cb.onError(ev.message);
+        else if (ev.type === 'subagent_run' && cb.onSubagentRun) cb.onSubagentRun(ev.info);
+        else if (ev.type === 'subagent_text' && cb.onSubagentText) cb.onSubagentText(ev.run, ev.text);
+        else if (ev.type === 'subagent_tool_call' && cb.onSubagentToolCall) cb.onSubagentToolCall(ev.run, ev.call);
+        else if (ev.type === 'subagent_tool_result' && cb.onSubagentToolResult) cb.onSubagentToolResult(ev.run, ev.result);
+        else if (ev.type === 'subagent_step' && cb.onSubagentStep) cb.onSubagentStep(ev.run, ev.step);
+        else if (ev.type === 'subagent_done' && cb.onSubagentDone) cb.onSubagentDone(ev.run, ev.result);
       }
       timer = setTimeout(tick, ev.type === 'text' ? 26 : 220);
       this._timers.add(timer);

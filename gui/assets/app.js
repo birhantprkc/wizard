@@ -65,6 +65,11 @@ let transientNote = null;
 let gitPoll = null;
 let gitSeq = 0;
 let selectSeq = 0;
+/** The post-rewind refetch in flight; a later one wins. */
+let resetSeq = 0;
+/** System rows that arrive during that refetch, held for the transcript it is
+ *  rebuilding. Null when no refetch is in flight. @type {Array<{text:string,cls:string|undefined}>|null} */
+let resetRows = null;
 /** Composer refs. */
 let composerInput = null;
 let modelLabelEl = null;
@@ -274,14 +279,14 @@ const transcriptInner = () => $('transcript').querySelector('.transcript-inner')
 
 /**
  * One streaming surface: where new content lands, plus the live refs a later
- * frame patches — the paragraph mid-stream, the tool group being aggregated,
+ * frame patches — the message mid-stream, the tool group being aggregated,
  * the rows waiting on their result, the card an `images` frame belongs on. The
  * main chat is one flow; an open subagent pane is another, so a subagent's rows
  * never land in — or aggregate with — the parent's.
  * @param {HTMLElement} scroller the element this flow scrolls in
  */
 function newFlow(scroller) {
-  return { scroller, target: null, para: null, think: null, group: null, rows: new Map(), lastTool: null };
+  return { scroller, target: null, md: null, think: null, group: null, rows: new Map(), lastTool: null };
 }
 
 /** The main chat's flow: the center transcript. */
@@ -295,10 +300,18 @@ function autoScroll(flow, force = false) {
 
 /** Break the streaming text/thinking/tool-group flow (before a new block). */
 function breakFlow(flow) {
-  flow.para = null;
+  endStream(flow);
   flow.group = null;
   flow.lastTool = null;
   collapseThinking(flow);
+}
+
+/** Close the assistant message being streamed, if there is one: the last delta
+ *  is landed now rather than on a frame that may never come. */
+function endStream(flow) {
+  if (!flow.md) return;
+  endMarkdown(flow.md);
+  flow.md = null;
 }
 
 function collapseThinking(flow) {
@@ -354,10 +367,12 @@ function appendWorkedSection(label, live = false) {
 }
 
 /** One whole assistant message: a replayed one, or a subagent's — which
- *  arrive per step rather than as deltas. */
+ *  arrive per step rather than as deltas. Same markdown as the live stream. */
 function appendMessage(flow, text) {
   breakFlow(flow);
-  flow.target.append(h('p', { class: 'msg-text' }, text));
+  const root = h('div', { class: 'msg-text md' });
+  renderMarkdownInto(root, text);
+  flow.target.append(root);
 }
 
 function appendThinkingBlock(flow, text, collapsed) {
@@ -373,7 +388,7 @@ function appendThinkingBlock(flow, text, collapsed) {
 }
 
 function appendSystemRow(flow, text, cls = '') {
-  flow.para = null;
+  endStream(flow);
   flow.group = null;
   collapseThinking(flow);
   const row = h('div', { class: `system-row ${cls}`.trim() }, text);
@@ -517,7 +532,7 @@ function appendStandaloneTool(flow, call) {
  */
 function appendToolCall(flow, call) {
   collapseThinking(flow);
-  flow.para = null;
+  endStream(flow);
   let card;
   if (call.tool === 'explore' && call.noun) {
     if (!(flow.group && flow.group.kind === 'explore' && flow.group.parent === flow.target)) {
@@ -593,71 +608,528 @@ function appendImages(flow, batch) {
   if (onCard) {
     flow.lastTool.card.after(strip);
   } else {
-    flow.para = null;
+    endStream(flow);
     collapseThinking(flow);
     flow.target.append(strip);
   }
   autoScroll(flow);
 }
 
-/* --- Plan review / interview cards ---------------------------------------- */
+/* ------------------------------------------------------------------------ */
+/* Markdown                                                                  */
+/* ------------------------------------------------------------------------ */
 
-/** Minimal, injection-safe markdown-ish renderer for plan cards. */
-function renderMarkdownInto(root, md) {
-  const inline = (text) => {
-    const out = [];
-    const re = /(`[^`]+`|\*\*[^*]+\*\*)/g;
-    let last = 0;
-    let m;
-    while ((m = re.exec(text))) {
-      if (m.index > last) out.push(text.slice(last, m.index));
-      const tok = m[0];
-      if (tok.startsWith('`')) out.push(h('code', { class: 'md-code' }, tok.slice(1, -1)));
-      else out.push(h('strong', {}, tok.slice(2, -2)));
-      last = m.index + tok.length;
-    }
-    if (last < text.length) out.push(text.slice(last));
-    return out;
-  };
-  let list = null;
-  let para = [];
-  let pre = null;
-  const flushPara = () => {
-    if (para.length) {
-      root.append(h('p', {}, ...inline(para.join(' '))));
-      para = [];
-    }
-  };
-  for (const line of String(md).split('\n')) {
-    if (pre) {
-      if (/^```/.test(line)) { root.append(pre); pre = null; } else pre.textContent += `${line}\n`;
-      continue;
-    }
-    if (/^```/.test(line)) { flushPara(); list = null; pre = h('pre', { class: 'md-pre' }); continue; }
-    const heading = /^(#{1,4})\s+(.*)/.exec(line);
-    if (heading) {
-      flushPara(); list = null;
-      root.append(h('div', { class: `md-h md-h${heading[1].length}` }, ...inline(heading[2])));
-      continue;
-    }
-    const li = /^\s*(?:[-*]|\d+[.)])\s+(.*)/.exec(line);
-    if (li) {
-      flushPara();
-      if (!list) { list = h('ul', { class: 'md-list' }); root.append(list); }
-      list.append(h('li', {}, ...inline(li[1])));
-      continue;
-    }
-    if (!line.trim()) { flushPara(); list = null; continue; }
-    para.push(line.trim());
+/* The one markdown renderer: assistant messages, subagent messages, plan and
+   interview cards all come through here.
+
+   Injection-safe by construction. Every element is built with `h()` and every
+   scrap of model text lands in a text node — `innerHTML` is never handed model
+   output — so a reply containing `<script>alert(1)</script>` renders as those
+   characters. Link targets are model output too, and are checked against a
+   scheme allowlist before they are ever put in an `href`.
+
+   The parse is block-first, and every block keeps the exact source lines it came
+   from (`.src`). That is what makes the streaming path cheap: a delta re-parses
+   the message, but only the blocks whose source actually changed get redrawn.
+   See `syncMarkdown`. */
+
+/** ``` or ~~~, up to three spaces in, with an optional info string (the language). */
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*(\S*)/;
+const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+const HR_RE = /^ {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$/;
+const QUOTE_RE = /^ {0,3}> ?(.*)$/;
+/** A bullet (`-`, `*`, `+`) or a number (`1.`, `1)`), and what follows it. */
+const ITEM_RE = /^([ \t]*)(?:([-*+])|(\d{1,9})[.)])(?:[ \t]+(.*))?$/;
+
+/** Leading whitespace in columns, a tab being four of them. */
+function indentOf(line) {
+  let cols = 0;
+  for (const ch of line) {
+    if (ch === ' ') cols += 1;
+    else if (ch === '\t') cols += 4;
+    else break;
   }
-  flushPara();
-  if (pre) root.append(pre);
+  return cols;
 }
+
+/** Drop up to `cols` columns of leading whitespace. */
+function dedent(line, cols) {
+  let i = 0;
+  let col = 0;
+  while (i < line.length && col < cols) {
+    if (line[i] === ' ') col += 1;
+    else if (line[i] === '\t') col += 4;
+    else break;
+    i += 1;
+  }
+  return line.slice(i);
+}
+
+/** A table row's cells: split on unescaped pipes, minus the optional fencing
+ *  pipes at either end, which delimit rather than open a cell. */
+function splitRow(line) {
+  const s = line.trim();
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i += 1) {
+    if (s[i] === '\\' && s[i + 1] === '|') {
+      cur += '|';
+      i += 1;
+    } else if (s[i] === '|') {
+      cells.push(cur);
+      cur = '';
+    } else {
+      cur += s[i];
+    }
+  }
+  cells.push(cur);
+  if (cells.length > 1 && s.startsWith('|') && !cells[0].trim()) cells.shift();
+  if (cells.length > 1 && s.endsWith('|') && !cells[cells.length - 1].trim()) cells.pop();
+  return cells.map((c) => c.trim());
+}
+
+/** The row of dashes under a header is what makes a pipe table a table. */
+function isAlignRow(line) {
+  if (!line.includes('-') || !/^[\s|:-]+$/.test(line)) return false;
+  const cells = splitRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+/** `:--` left, `--:` right, `:-:` center, `---` unset. */
+function cellAlign(spec) {
+  const left = spec.startsWith(':');
+  const right = spec.endsWith(':');
+  if (left && right) return 'center';
+  if (right) return 'right';
+  if (left) return 'left';
+  return '';
+}
+
+/** True if a line would open some block other than a paragraph — i.e. it ends
+ *  the paragraph above it even without a blank line between them. */
+function startsBlock(lines, i) {
+  const line = lines[i];
+  if (FENCE_RE.test(line) || HEADING_RE.test(line) || HR_RE.test(line)) return true;
+  if (QUOTE_RE.test(line) || ITEM_RE.test(line)) return true;
+  return line.includes('|') && i + 1 < lines.length && isAlignRow(lines[i + 1]);
+}
+
+/**
+ * Markdown source → blocks. Each block carries the exact source it was parsed
+ * from, so two parses can be diffed against each other cheaply.
+ * @param {string} md
+ * @returns {Array<Object>}
+ */
+function parseBlocks(md) {
+  const lines = String(md).replace(/\r\n?/g, '\n').split('\n');
+  const blocks = [];
+  let i = 0;
+  const since = (from) => lines.slice(from, i).join('\n');
+
+  while (i < lines.length) {
+    if (!lines[i].trim()) { i += 1; continue; } // blank lines only separate blocks
+    const start = i;
+    const line = lines[i];
+
+    const fence = FENCE_RE.exec(line);
+    if (fence) {
+      // Closed by a fence of the same character, at least as long as the opener.
+      const close = new RegExp(`^ {0,3}${fence[1][0] === '`' ? '`' : '~'}{${fence[1].length},}[ \t]*$`);
+      const body = [];
+      i += 1;
+      while (i < lines.length && !close.test(lines[i])) body.push(lines[i++]);
+      if (i < lines.length) i += 1; // the closing fence — absent mid-stream
+      blocks.push({ kind: 'code', lang: fence[2], code: body.join('\n'), src: since(start) });
+      continue;
+    }
+
+    const heading = HEADING_RE.exec(line);
+    if (heading) {
+      i += 1;
+      blocks.push({ kind: 'heading', level: heading[1].length, text: heading[2], src: since(start) });
+      continue;
+    }
+
+    if (HR_RE.test(line)) {
+      i += 1;
+      blocks.push({ kind: 'hr', src: since(start) });
+      continue;
+    }
+
+    if (QUOTE_RE.test(line)) {
+      const inner = [];
+      while (i < lines.length && lines[i].trim() && !HR_RE.test(lines[i])) {
+        const m = QUOTE_RE.exec(lines[i]);
+        inner.push(m ? m[1] : lines[i]); // a lazy continuation still belongs to the quote
+        i += 1;
+      }
+      // The quote's content is markdown in its own right.
+      blocks.push({ kind: 'quote', inner: inner.join('\n'), src: since(start) });
+      continue;
+    }
+
+    if (line.includes('|') && i + 1 < lines.length && isAlignRow(lines[i + 1])) {
+      const head = splitRow(line);
+      const align = splitRow(lines[i + 1]).map(cellAlign);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes('|') && !isAlignRow(lines[i])) {
+        rows.push(splitRow(lines[i]));
+        i += 1;
+      }
+      blocks.push({ kind: 'table', head, align, rows, src: since(start) });
+      continue;
+    }
+
+    if (ITEM_RE.test(line)) {
+      const base = indentOf(line);
+      const numbered = !ITEM_RE.exec(line)[2];
+      // Switching marker — a `-` list under a `1.` list — starts a new list, not
+      // another item of this one.
+      const switched = (l) => {
+        const m = ITEM_RE.exec(l);
+        return m && indentOf(l) <= base && !m[2] !== numbered;
+      };
+      while (i < lines.length) {
+        const l = lines[i];
+        if (!l.trim()) {
+          // A blank line ends the list unless the list carries on beneath it.
+          const next = lines[i + 1];
+          if (!next || !next.trim()) break;
+          if (!ITEM_RE.test(next) && indentOf(next) <= base) break;
+          if (switched(next)) break;
+          i += 1;
+          continue;
+        }
+        if (switched(l)) break;
+        const item = ITEM_RE.exec(l);
+        if (item ? indentOf(l) < base : indentOf(l) <= base) break;
+        i += 1;
+      }
+      blocks.push({ kind: 'list', ...parseList(lines.slice(start, i)), src: since(start) });
+      continue;
+    }
+
+    const para = [];
+    while (i < lines.length && lines[i].trim()) {
+      if (para.length && startsBlock(lines, i)) break;
+      para.push(lines[i]);
+      i += 1;
+    }
+    blocks.push({ kind: 'para', text: para.join('\n'), src: since(start) });
+  }
+  return blocks;
+}
+
+/**
+ * A list block's items. An item's body is everything under its marker —
+ * continuation lines and nested lists alike — dedented to the marker's content
+ * column, which makes it a little markdown document of its own. Rendering
+ * recurses into it, and that is how nesting (and a code block inside a bullet)
+ * comes out right.
+ */
+function parseList(lines) {
+  const first = ITEM_RE.exec(lines[0]);
+  const ordered = !first[2];
+  const base = indentOf(lines[0]);
+  const items = [];
+  let cur = null;
+  let content = 0;
+  for (const line of lines) {
+    const m = ITEM_RE.exec(line);
+    if (m && indentOf(line) <= base) {
+      cur = [m[4] || ''];
+      items.push(cur);
+      content = indentOf(line) + (m[2] ? m[2].length : m[3].length + 1) + 1;
+      continue;
+    }
+    if (cur) cur.push(dedent(line, content));
+  }
+  return { ordered, start: ordered ? Number(first[3]) : 1, items: items.map((l) => l.join('\n')) };
+}
+
+/* --- Inline --------------------------------------------------------------- */
+
+const ESCAPABLE = /[\\`*_{}[\]()#+\-.!|~<>]/;
+const CODE_SPAN = /^(`+)([\s\S]*?)\1(?!`)/;
+const STRONG_STAR = /^\*\*(?=\S)([\s\S]*?\S)\*\*/;
+const STRONG_UNDER = /^__(?=\S)([\s\S]*?\S)__/;
+const EM_STAR = /^\*(?=\S)([\s\S]*?\S)\*(?!\*)/;
+const EM_UNDER = /^_(?=\S)([\s\S]*?\S)_(?!_)/;
+const STRIKE = /^~~(?=\S)([\s\S]*?\S)~~/;
+/** `[text](url)`, or `![alt](url)`. The URL may carry balanced parens. */
+const LINK = /^(!?)\[((?:\\.|[^\][\\])*)\]\([ \t]*((?:[^\s()\\]|\\.|\([^\s()]*\))*)(?:[ \t]+"([^"]*)")?[ \t]*\)/;
+/** A bare URL in prose. It stops before trailing punctuation, which is a
+ *  sentence's, not the URL's. */
+const AUTOLINK = /^https?:\/\/[^\s<>[\]()"'`]+[^\s<>[\]()"'`.,;:!?]/;
+
+/** The schemes we will hand a browser. Anything else — `javascript:`, `data:`,
+ *  `vbscript:` — is not a link, and its source text is shown instead. */
+const SAFE_SCHEME = /^(?:https?:\/\/|mailto:|tel:)/i;
+
+/**
+ * A link target out of a model, or null if it is not one we will follow.
+ * @param {string} raw
+ * @returns {string|null}
+ */
+function safeHref(raw) {
+  const url = raw.trim().replace(/^<([\s\S]*)>$/, '$1');
+  // `java&#9;script:` and friends: a browser strips control characters before
+  // resolving the scheme, so the check has to look at what it will actually see.
+  const probe = url.replace(/[\u0000-\u0020\u00a0]/g, '');
+  return SAFE_SCHEME.test(probe) ? url : null;
+}
+
+/**
+ * Inline markdown, in one left-to-right pass. Code spans win over everything
+ * (their content is literal), then links, then emphasis.
+ * @param {string} text
+ * @param {boolean} [inLink] inside an `<a>` already: no nested links
+ * @returns {Array<Node|string>} children for the enclosing block
+ */
+function inlineNodes(text, inLink = false) {
+  const src = String(text);
+  const out = [];
+  let buf = '';
+  const flush = () => {
+    if (buf) out.push(buf);
+    buf = '';
+  };
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const rest = src.slice(i);
+
+    // A backslash escape is the author saying "this one is a literal".
+    if (c === '\\' && ESCAPABLE.test(src[i + 1] || '')) {
+      buf += src[i + 1];
+      i += 2;
+      continue;
+    }
+
+    // A newline inside a paragraph is a line break. CommonMark would make it a
+    // space, but a model that writes lines means lines — collapsing them into
+    // one run-on paragraph is the bug this renderer exists to kill.
+    if (c === '\n') {
+      flush();
+      out.push(h('br'));
+      i += 1;
+      continue;
+    }
+
+    if (c === '`') {
+      const m = CODE_SPAN.exec(rest);
+      if (m && m[2]) {
+        flush();
+        // One padding space either side is a fence for backticks, not content.
+        const body = /^ .* $/.test(m[2]) ? m[2].slice(1, -1) : m[2];
+        out.push(h('code', { class: 'md-code' }, body));
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    if (!inLink && (c === '[' || (c === '!' && src[i + 1] === '['))) {
+      const m = LINK.exec(rest);
+      if (m) {
+        flush();
+        const href = safeHref(m[3]);
+        if (href) {
+          // Model output: it opens in its own tab and cannot reach back into ours.
+          // An image (`![alt](…)`) links rather than loads — a transcript does not
+          // fetch from wherever a model points it.
+          out.push(h('a', {
+            class: 'md-link', href, target: '_blank', rel: 'noopener noreferrer',
+            title: m[4] || null,
+          }, ...inlineNodes(m[2], true)));
+        } else {
+          out.push(m[0]); // not a scheme we will follow: it says what it says
+        }
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    if (!inLink && c === 'h' && AUTOLINK.test(rest)) {
+      const url = AUTOLINK.exec(rest)[0];
+      flush();
+      out.push(h('a', { class: 'md-link', href: url, target: '_blank', rel: 'noopener noreferrer' }, url));
+      i += url.length;
+      continue;
+    }
+
+    if (c === '~') {
+      const m = STRIKE.exec(rest);
+      if (m) {
+        flush();
+        out.push(h('del', {}, ...inlineNodes(m[1], inLink)));
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    if (c === '*' || c === '_') {
+      // `snake_case` is a word, not emphasis: an underscore mid-word is a character.
+      const intraword = c === '_' && /\w/.test(src[i - 1] || '');
+      if (!intraword) {
+        const strong = (c === '*' ? STRONG_STAR : STRONG_UNDER).exec(rest);
+        if (strong) {
+          flush();
+          out.push(h('strong', {}, ...inlineNodes(strong[1], inLink)));
+          i += strong[0].length;
+          continue;
+        }
+        const em = (c === '*' ? EM_STAR : EM_UNDER).exec(rest);
+        if (em) {
+          flush();
+          out.push(h('em', {}, ...inlineNodes(em[1], inLink)));
+          i += em[0].length;
+          continue;
+        }
+      }
+    }
+
+    buf += c;
+    i += 1;
+  }
+  flush();
+  return out;
+}
+
+/* --- Blocks → DOM --------------------------------------------------------- */
+
+/** A fenced block. The info string is labelled rather than dropped: it is the
+ *  one part of a code block that says what you are looking at. */
+function renderCode(block) {
+  const pre = h('pre', { class: 'md-pre' }, h('code', {}, block.code));
+  if (!block.lang) return pre;
+  return h('div', { class: 'md-code-block' },
+    h('div', { class: 'md-code-lang mono' }, block.lang),
+    pre);
+}
+
+/** A GFM pipe table. It scrolls inside its own box — a wide table must not push
+ *  the transcript column sideways. Cells past the header's width are dropped and
+ *  missing ones filled, which is what the alignment row promised. */
+function renderTable(block) {
+  const cell = (tag, text, i) =>
+    h(tag, { class: block.align[i] ? `md-al-${block.align[i]}` : null }, ...inlineNodes(text || ''));
+  return h('div', { class: 'md-table-wrap' },
+    h('table', { class: 'md-table' },
+      h('thead', {}, h('tr', {}, ...block.head.map((c, i) => cell('th', c, i)))),
+      h('tbody', {}, ...block.rows.map((row) =>
+        h('tr', {}, ...block.head.map((_, i) => cell('td', row[i], i)))))));
+}
+
+/** One list item. Its body is markdown, so it can hold a nested list or a code
+ *  block; a plain one is put straight into the `<li>` rather than wrapped in a
+ *  `<p>` that would space the whole list out. */
+function renderListItem(src) {
+  const li = h('li');
+  const blocks = parseBlocks(src);
+  if (blocks.length && blocks[0].kind === 'para') {
+    li.append(...inlineNodes(blocks.shift().text));
+  }
+  for (const block of blocks) li.append(renderBlock(block));
+  return li;
+}
+
+function renderBlock(block) {
+  switch (block.kind) {
+    case 'heading':
+      return h(`h${block.level}`, {}, ...inlineNodes(block.text));
+    case 'hr':
+      return h('hr');
+    case 'code':
+      return renderCode(block);
+    case 'table':
+      return renderTable(block);
+    case 'quote': {
+      const quote = h('blockquote');
+      for (const inner of parseBlocks(block.inner)) quote.append(renderBlock(inner));
+      return quote;
+    }
+    case 'list': {
+      const list = h(block.ordered ? 'ol' : 'ul', { start: block.start !== 1 ? String(block.start) : null });
+      for (const item of block.items) list.append(renderListItem(item));
+      return list;
+    }
+    default:
+      return h('p', {}, ...inlineNodes(block.text));
+  }
+}
+
+/**
+ * Render markdown into `root`, replacing whatever was there. `root` must carry
+ * the `md` class for the stylesheet to reach it.
+ * @param {HTMLElement} root
+ * @param {string} md
+ */
+function renderMarkdownInto(root, md) {
+  root.replaceChildren(...parseBlocks(md).map(renderBlock));
+}
+
+/* --- Streaming ------------------------------------------------------------ */
+
+/**
+ * A message still being written: the markdown source received so far, and the
+ * blocks currently on screen. A delta re-renders only the blocks whose source
+ * changed — in a stream that is the last one — so finished paragraphs, tables
+ * and code blocks keep the very same DOM nodes, and a selection inside them
+ * survives the next token.
+ * @param {HTMLElement} target where the message goes
+ * @param {string} cls the root's classes
+ */
+function newMarkdownView(target, cls) {
+  const view = { root: h('div', { class: cls }), src: '', blocks: [], frame: 0, after: null };
+  target.append(view.root);
+  return view;
+}
+
+/** Take a delta. The repaint is one per animation frame, not one per token. */
+function pushMarkdown(view, delta, after) {
+  view.src += delta;
+  view.after = after;
+  if (view.frame) return;
+  view.frame = requestAnimationFrame(() => {
+    view.frame = 0;
+    syncMarkdown(view);
+    if (view.after) view.after();
+  });
+}
+
+/** Reconcile the DOM with the source: keep the leading blocks whose source has
+ *  not changed, redraw from the first that has. */
+function syncMarkdown(view) {
+  const next = parseBlocks(view.src);
+  const prev = view.blocks;
+  let keep = 0;
+  while (keep < next.length && keep < prev.length && next[keep].src === prev[keep].src) {
+    next[keep].node = prev[keep].node; // untouched: its DOM node, and any selection in it, stands
+    keep += 1;
+  }
+  for (let i = keep; i < prev.length; i += 1) prev[i].node.remove();
+  for (let i = keep; i < next.length; i += 1) {
+    next[i].node = renderBlock(next[i]);
+    view.root.append(next[i].node);
+  }
+  view.blocks = next;
+}
+
+/** The message is complete: land the last delta and stop. */
+function endMarkdown(view) {
+  if (view.frame) cancelAnimationFrame(view.frame);
+  view.frame = 0;
+  syncMarkdown(view);
+  view.root.classList.remove('streaming');
+}
+
+/* --- Plan review / interview cards ---------------------------------------- */
 
 function onPlan(plan) {
   breakFlow(chat);
   const id = state.selectedTaskId;
-  const body = h('div', { class: 'plan-body' });
+  const body = h('div', { class: 'plan-body md' });
   renderMarkdownInto(body, plan);
   const note = h('div', { class: 'note hidden' });
   const feedback = h('textarea', {
@@ -738,8 +1210,11 @@ function onInterview(questions) {
 
 /** Reset the chat flow onto a fresh transcript body. */
 function resetChatFlow(inner) {
+  // Anything mid-stream belongs to the transcript being replaced: cancel its
+  // pending frame rather than paint it into a tree nobody will see again.
+  if (chat.md && chat.md.frame) cancelAnimationFrame(chat.md.frame);
   chat.target = inner;
-  chat.para = null;
+  chat.md = null;
   chat.think = null;
   chat.group = null;
   chat.lastTool = null;
@@ -763,7 +1238,7 @@ function renderTranscript() {
     } else if (item.type === 'text') {
       appendMessage(chat, item.text);
     } else if (item.type === 'thinking') {
-      chat.para = null;
+      endStream(chat);
       chat.group = null;
       appendThinkingBlock(chat, item.text, true);
     } else if (item.type === 'tool') {
@@ -819,16 +1294,16 @@ function finalizeLiveTurn(reason) {
 function onText(delta) {
   collapseThinking(chat);
   chat.group = null;
-  if (!chat.para || !chat.para.isConnected) {
-    chat.para = h('p', { class: 'msg-text streaming' });
-    chat.target.append(chat.para);
+  if (!chat.md || !chat.md.root.isConnected) {
+    chat.md = newMarkdownView(chat.target, 'msg-text md streaming');
   }
-  chat.para.textContent += delta;
-  autoScroll(chat);
+  // The repaint lands on the next frame, and touches only the block the delta
+  // changed — so a selection in the paragraphs above it survives the stream.
+  pushMarkdown(chat.md, delta, () => autoScroll(chat));
 }
 
 function onThinking(delta) {
-  chat.para = null;
+  endStream(chat);
   chat.group = null;
   if (!chat.think || !chat.think.body.isConnected) {
     chat.think = appendThinkingBlock(chat, '', false);
@@ -878,6 +1353,49 @@ function onContext(context) {
   updateContextMeter();
 }
 
+/**
+ * `/rewind <turn>` truncated the session on disk: every turn from `turn` on is
+ * gone, and what is on screen is a record of turns that no longer exist. The
+ * session file is the only copy of the history, so the only correct redraw is to
+ * read it back — not to pick DOM nodes off the end and hope the count matches.
+ */
+async function onTranscriptReset(turn) {
+  const id = state.selectedTaskId;
+  const seq = ++resetSeq;
+  // The notice describing the rewind arrives while this refetch is in flight, and
+  // belongs to the transcript being rebuilt — not to the one being thrown away.
+  resetRows = [];
+  const flush = () => {
+    const rows = resetRows || [];
+    resetRows = null;
+    for (const row of rows) appendSystemRow(chat, row.text, row.cls);
+  };
+
+  let task;
+  try {
+    task = await api.getTask(id);
+  } catch (err) {
+    if (seq !== resetSeq || state.selectedTaskId !== id) return;
+    appendSystemRow(chat, `Rewound${turn == null ? '' : ` to turn ${turn}`}, but the transcript could not be re-read: ${String((err && err.message) || err)}`, 'error');
+    flush();
+    return;
+  }
+  if (seq !== resetSeq || state.selectedTaskId !== id) return; // a later reset, or another chat, owns the screen now
+
+  state.task = task;
+  renderTranscript();
+  updateGoal(); // the title is the first prompt, which a rewind to turn 1 removes
+  flush();
+  refreshGit(); // a rewind restores the files too: the diff on screen is a turn old
+}
+
+/** A system row, held back while a post-rewind refetch is in flight: appending it
+ *  now would put it in the transcript that refetch is about to replace. */
+function systemRow(text, cls) {
+  if (resetRows) resetRows.push({ text, cls });
+  else appendSystemRow(chat, text, cls);
+}
+
 function onRetrying(attempt) {
   transientNote = h('div', { class: 'system-row retrying' },
     h('span', { class: 'spinner-icon spinning', html: icons.spinner, 'aria-hidden': 'true' }),
@@ -887,6 +1405,9 @@ function onRetrying(attempt) {
 }
 
 function onDone(reason) {
+  // The turn is over: land the message's last delta now, rather than leaving it
+  // to whatever frame or flow break happens to come next.
+  endStream(chat);
   finalizeLiveTurn(reason);
   updateSendButton();
   updateTaskSummary(state.selectedTaskId, { bump: true });
@@ -1726,11 +2247,17 @@ function matchCommand(text) {
 /**
  * Run a command that is not a `prompt` one (those are messages, and go out
  * through `send`). A `server` command becomes a `command` frame and is answered
- * with the frames the protocol already has; a `client` one is handled here.
+ * with the frames the protocol already has; a `client` one is handled here; an
+ * `unavailable` one is answered here and never sent, because the only thing the
+ * server would send back is the same refusal.
  */
 function runCommand({ def, args }) {
   const line = args ? `/${def.name} ${args}` : `/${def.name}`;
   appendSystemRow(chat, line);
+  if (def.where === 'unavailable') {
+    explainUnavailable(def);
+    return;
+  }
   if (def.where === 'client') {
     runClientCommand(def, args, line);
     return;
@@ -1742,6 +2269,18 @@ function runCommand({ def, args }) {
   }
 }
 
+/** A terminal-only command: say what it is and why it is not here. Nothing is
+ *  sent — there is no browser surface for it to land on, at either end. */
+function explainUnavailable(def) {
+  closePalette();
+  appendSystemRow(chat, `/${def.name} runs in the terminal, not here — ${def.detail}.`);
+}
+
+/**
+ * The commands the page owns. Each is a window this UI already has: there is no
+ * second panel, list or overlay built for a slash command, because a command
+ * that opened one of its own would be a different feature wearing its name.
+ */
 function runClientCommand(def, args, line) {
   switch (def.name) {
     case 'diff': {
@@ -1766,21 +2305,97 @@ function runClientCommand(def, args, line) {
     case 'clear':
       newChatHere();
       return;
-    case 'help':
-      openHelpPalette();
+    case 'subagents':
+      revealSubagents();
+      return;
+    case 'dashboard':
+      showRunningChats();
+      return;
+    case 'resume':
+      focusChatList();
+      return;
+    case 'settings':
+      openSettings();
+      return;
+    case 'provider':
+      openSettings({ focus: 'providers' });
+      return;
+    case 'login':
+      openSettings({ focus: 'signin', signIn: SIGN_INS.some((s) => s.id === args) ? args : null });
       return;
     default:
       appendSystemRow(chat, `${line} is not implemented in the GUI.`, 'error');
   }
 }
 
+/** Draw the eye to a part of the context panel that is already on screen: a
+ *  command that reveals a panel still has to say which part of it. */
+function flashSection(section) {
+  if (!section) return;
+  section.scrollIntoView({ block: 'nearest' });
+  section.classList.remove('flash');
+  void section.offsetWidth; // restart the animation when the same section is flashed twice
+  section.classList.add('flash');
+}
+
+/** `/subagents`: the panel's Subagents section is where a run is watched from —
+ *  each row opens that run's own pane. */
+function revealSubagents() {
+  $('app').classList.remove('panel-collapsed');
+  if (!state.subagents.length) {
+    appendSystemRow(chat, 'No subagent has run in this chat.');
+    return;
+  }
+  flashSection(ctx && ctx.subagentSection);
+}
+
+/**
+ * `/dashboard`: what is running. The sidebar's chat list is that list — its
+ * state dots are `/api/tasks`, which merges the same running registry the TUI's
+ * session manager reads — so it is re-read and revealed rather than duplicated
+ * into a second view that could disagree with it.
+ */
+async function showRunningChats() {
+  $('app').classList.remove('sidebar-collapsed');
+  await refreshTaskList();
+  const tasks = state.workspaces.flatMap((ws) => ws.tasks);
+  const counts = [
+    ['working', tasks.filter((t) => t.status === 'working').length],
+    ['waiting for input', tasks.filter((t) => t.status === 'needs_input').length],
+    ['failed', tasks.filter((t) => t.status === 'failed').length],
+  ].filter(([, n]) => n).map(([label, n]) => `${n} ${label}`);
+  appendSystemRow(chat, counts.length
+    ? `${counts.join(', ')} — in the chat list.`
+    : `Nothing running. ${tasks.length} ${tasks.length === 1 ? 'chat' : 'chats'} in the list.`);
+}
+
+/** `/resume`: the chat list is the session picker. There is no second one to
+ *  open, so this re-reads it and puts the keyboard in it. */
+async function focusChatList() {
+  $('app').classList.remove('sidebar-collapsed');
+  await refreshTaskList();
+  const tree = $('task-tree');
+  const row = tree.querySelector('.task-row.selected') || tree.querySelector('.task-row');
+  if (!row) {
+    appendSystemRow(chat, 'No other chat to resume.');
+    return;
+  }
+  row.scrollIntoView({ block: 'nearest' });
+  row.focus();
+}
+
 /** Rebuild the palette from what it is currently offering. */
 function renderPalette() {
   if (!palette) return;
-  palette.list.replaceChildren(...palette.matches.map((cmd, i) =>
-    h('button', {
-      class: 'palette-item' + (i === palette.index ? ' active' : ''),
-      type: 'button', role: 'option', 'aria-selected': i === palette.index ? 'true' : 'false',
+  palette.list.replaceChildren(...palette.matches.map((cmd, i) => {
+    // A terminal-only command is listed, dimmed, with what it is: someone who
+    // knows it from the TUI should read why it is not here rather than wonder
+    // whether they mistyped it. It cannot be picked, so it is not `aria-selected`.
+    const dead = cmd.where === 'unavailable';
+    return h('button', {
+      class: 'palette-item' + (i === palette.index ? ' active' : '') + (dead ? ' unavailable' : ''),
+      type: 'button', role: 'option', 'aria-selected': !dead && i === palette.index ? 'true' : 'false',
+      'aria-disabled': dead ? 'true' : null,
       // mousedown, not click: the composer must not lose focus before the pick,
       // or the palette closes on blur and the click lands on nothing.
       onmousedown: (e) => {
@@ -1796,8 +2411,11 @@ function renderPalette() {
       h('span', { class: 'palette-name mono' }, `/${cmd.name}`),
       cmd.args ? h('span', { class: 'palette-args mono' }, cmd.args) : null,
       h('span', { class: 'palette-detail' }, cmd.detail),
-      // Custom commands come from the workspace, not from wizard: worth saying.
-      cmd.where === 'prompt' && h('span', { class: 'tag' }, 'custom'))));
+      // Where a command comes from, when it is not simply wizard's own: a custom
+      // one is the workspace's, a terminal-only one is not this UI's to run.
+      cmd.where === 'prompt' && h('span', { class: 'tag' }, 'custom'),
+      dead && h('span', { class: 'tag' }, 'terminal only'));
+  }));
   const active = palette.list.children[palette.index];
   if (active) active.scrollIntoView({ block: 'nearest' });
 }
@@ -1817,14 +2435,6 @@ function closePalette() {
   if (!palette) return;
   palette.el.remove();
   palette = null;
-}
-
-/** `/help`: the whole list, in the palette that is already the place to read it. */
-function openHelpPalette() {
-  if (!state.commands.length || !composerInput) return;
-  composerInput.value = '/';
-  composerInput.focus();
-  openPalette(state.commands);
 }
 
 /**
@@ -1852,6 +2462,12 @@ function syncPalette() {
  */
 function pickCommand(cmd, run) {
   if (!cmd || !composerInput) return;
+  // There is nothing to complete to: it does not run here. Say so on the pick
+  // rather than completing the composer to a command that goes nowhere.
+  if (cmd.where === 'unavailable') {
+    if (run) explainUnavailable(cmd);
+    return;
+  }
   const takesArgs = !!cmd.args;
   composerInput.value = `/${cmd.name}${takesArgs ? ' ' : ''}`;
   closePalette();
@@ -2222,10 +2838,12 @@ function renderComposer() {
     // preprocess that resolves @file refs — so it goes down the send path. The
     // other two kinds are not messages at all, and take no attachments with them.
     const command = matchCommand(text);
-    // A `client` command touches nothing but this page, so a turn in flight is
-    // no reason to refuse it. Everything that reaches the agent is: one turn at
+    // A `client` command touches nothing but this page, and an `unavailable` one
+    // is answered with an explanation and nothing else, so a turn in flight is no
+    // reason to refuse either. Everything that reaches the agent is: one turn at
     // a time, and the backend refuses a second — so do not pretend otherwise.
-    if (state.taskState === 'working' && !(command && command.def.where === 'client')) return;
+    const local = command && (command.def.where === 'client' || command.def.where === 'unavailable');
+    if (state.taskState === 'working' && !local) return;
     input.value = '';
     input.style.height = 'auto';
     if (command && command.def.where !== 'prompt') {
@@ -2436,6 +3054,7 @@ function signInRow(id, label, plan, { onDone, onStatus }) {
   const say = onStatus || (() => {});
   return h('button', {
     class: 'row row-pick row-signin', type: 'button',
+    dataset: { provider: id }, // `/login <plan>` focuses the row it names
     onclick: async () => {
       const tab = window.open('', '_blank');
       try {
@@ -2537,7 +3156,16 @@ function openOnboarding(settings) {
 
 /* --- Settings ------------------------------------------------------------- */
 
-async function openSettings() {
+/**
+ * Settings. `focus` is what `/provider` and `/login` come in on: this is the one
+ * sheet either of them names, so they open it on the part they mean rather than
+ * on a page of their own.
+ * @param {{focus?: 'providers'|'signin'|null, signIn?: string|null}} [opts]
+ *   `signIn` names the plan `/login <xai>` asked for, whose row is focused —
+ *   focused, not clicked: the consent window has to open on the user's own press
+ *   or the browser blocks it.
+ */
+async function openSettings({ focus = null, signIn = null } = {}) {
   const body = h('div', { class: 'sheet-body' });
   const foot = h('div', { class: 'sheet-foot mono' });
   const sheet = h('div', { class: 'sheet settings', role: 'dialog', 'aria-label': 'Settings' },
@@ -2553,10 +3181,10 @@ async function openSettings() {
     body.replaceChildren(h('div', { class: 'note error' }, String((err && err.message) || err)));
     return;
   }
-  renderSettings(body, foot);
+  renderSettings(body, foot, { focus, signIn });
 }
 
-function renderSettings(body, foot) {
+function renderSettings(body, foot, { focus = null, signIn = null } = {}) {
   const s = state.settings;
   const rerender = () => renderSettings(body, foot);
 
@@ -2689,6 +3317,22 @@ function renderSettings(body, foot) {
         h('div', { class: 'setting-control' }, agentNote, steps))),
   );
   foot.textContent = s.config_path;
+
+  // `/provider` and `/login` open this sheet on the part of it they name: the
+  // same picker the "Add provider" row opens, since a command that opened one of
+  // its own would be a second way to do this that could drift from the first.
+  if (focus) {
+    showChoices();
+    if (focus !== 'signin') {
+      add.scrollIntoView({ block: 'nearest' });
+    } else {
+      const row = add.querySelector(signIn ? `.row-signin[data-provider="${signIn}"]` : '.row-signin');
+      if (row) {
+        row.scrollIntoView({ block: 'nearest' });
+        row.focus(); // the press that opens the consent window has to be the user's own
+      }
+    }
+  }
 
   // The composer's model chip reflects whatever the active provider is now.
   api.listModels().then((models) => {
@@ -2823,8 +3467,9 @@ function makeCallbacks(id) {
     onContext: content(onContext),
     onPlan: content(onPlan),
     onInterview: content(onInterview),
-    onNotice: content((text) => appendSystemRow(chat, text)),
-    onError: content((message) => appendSystemRow(chat, message, 'error')),
+    onNotice: content((text) => systemRow(text)),
+    onError: content((message) => systemRow(message, 'error')),
+    onTranscriptReset: content(onTranscriptReset),
     onRetrying: content(onRetrying),
     onDone: content(onDone),
     onSubagentRun: content(onSubagentRun),
@@ -2850,6 +3495,10 @@ async function selectTask(id, { reload = false } = {}) {
     paneClock = null;
   }
   closePalette();
+  // A rewind's refetch belongs to the chat it was issued in: strand it, and drop
+  // the rows it was holding, rather than let them land in the one being opened.
+  resetSeq += 1;
+  resetRows = null;
   const sameTask = reload && state.task && state.task.id === id;
   state.selectedTaskId = id;
   state.todos = [];

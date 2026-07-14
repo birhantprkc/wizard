@@ -358,17 +358,53 @@ fn random_state() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The ports the callback listener may bind, in order of preference: the two
+/// OpenAI has on file, always. Neither is a preference of ours, so there is
+/// nothing to configure and nothing to get wrong.
+#[cfg(not(test))]
+fn callback_ports() -> [u16; 2] {
+    [CALLBACK_PORT, FALLBACK_PORT]
+}
+
+/// Under test, two private ports stand in for the registered ones — chosen once,
+/// so they behave exactly like the fixed pair they replace (tests that bind them
+/// still queue on [`oauth_callback::serial_callback_port`]).
+///
+/// The registered ports are machine-wide, and a sign-in the user actually has in
+/// flight owns them for real; the suite must neither take them from it nor fail
+/// because it has them. Production is untouched: OpenAI still redirects only to
+/// the registered pair, and the release build has no override to set.
+#[cfg(test)]
+fn callback_ports() -> [u16; 2] {
+    static PORTS: std::sync::OnceLock<[u16; 2]> = std::sync::OnceLock::new();
+    *PORTS.get_or_init(|| {
+        let ports = [
+            oauth_callback::private_test_port(),
+            oauth_callback::private_test_port(),
+        ];
+        for registered in [CALLBACK_PORT, FALLBACK_PORT] {
+            assert!(
+                !ports.contains(&registered),
+                "the suite must never bind a registered callback port"
+            );
+        }
+        ports
+    })
+}
+
 /// Bind the preferred registered port, then the registered fallback. Both are
 /// addresses OpenAI has on file for this client, so either produces a
 /// redirect_uri the authorize endpoint will accept.
 fn bind_callback_listener() -> Result<(TcpListener, u16)> {
-    for port in [CALLBACK_PORT, FALLBACK_PORT] {
+    let ports = callback_ports();
+    for port in ports {
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
             return Ok((listener, port));
         }
     }
+    let [preferred, fallback] = ports;
     bail!(
-        "could not bind the sign-in callback port ({CALLBACK_PORT} or {FALLBACK_PORT}); \
+        "could not bind the sign-in callback port ({preferred} or {fallback}); \
          is another Codex/wizard sign-in already running?"
     )
 }
@@ -487,5 +523,28 @@ mod tests {
             parse_callback("/auth/callback?error=x&error_description=missing_codex_entitlement", "s"),
             Callback::Failed(m) if m.contains("Codex")
         ));
+    }
+
+    /// A second sign-in on the same machine takes the registered fallback, and a
+    /// third has nowhere left to go: both ports are registered addresses, so
+    /// there is no third one to drift onto, and the failure must name the pair
+    /// rather than hang on a port OpenAI never redirects to.
+    #[test]
+    fn the_callback_falls_back_once_and_then_names_both_ports() {
+        let _serial = oauth_callback::serial_callback_port();
+        let [preferred, fallback] = callback_ports();
+
+        let (first, port) = bind_callback_listener().expect("the preferred port is free");
+        assert_eq!(port, preferred);
+        let (second, port) = bind_callback_listener().expect("the fallback port is free");
+        assert_eq!(port, fallback);
+
+        let err = bind_callback_listener().expect_err("both ports are taken");
+        let message = format!("{err:#}");
+        assert!(message.contains(&preferred.to_string()), "{message}");
+        assert!(message.contains(&fallback.to_string()), "{message}");
+
+        // Leave the shared ports as we found them.
+        drop((first, second));
     }
 }

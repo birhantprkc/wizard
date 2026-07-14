@@ -17,7 +17,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -149,16 +149,52 @@ struct Discovery {
     token_endpoint: String,
 }
 
+/// Where the OpenID configuration is fetched from: [`DISCOVERY_URL`], always.
+#[cfg(not(test))]
+fn discovery_url() -> String {
+    DISCOVERY_URL.to_string()
+}
+
+/// Under test, a caller may point discovery at a loopback stub instead — see
+/// [`use_test_discovery_url`]. The endpoints the stub names are still pinned to
+/// x.ai by [`validate_xai_https`], so the seam cannot smuggle a token endpoint
+/// past the check.
+#[cfg(test)]
+fn discovery_url() -> String {
+    TEST_DISCOVERY_URL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+        .unwrap_or_else(|| DISCOVERY_URL.to_string())
+}
+
+#[cfg(test)]
+static TEST_DISCOVERY_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Serve xAI's OpenID discovery from `url` for the rest of the process, so a
+/// test can exercise the sign-in flow offline rather than reaching `auth.x.ai`.
+///
+/// Process-wide, like the flows it stands in for: a test that sets it takes
+/// [`oauth_callback::serial_callback_port`] first, which is the same lock the
+/// one fixed callback port already forces it to hold.
+#[cfg(test)]
+pub(crate) fn use_test_discovery_url(url: &str) {
+    *TEST_DISCOVERY_URL
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(url.to_string());
+}
+
 /// Fetch and validate the OpenID configuration.
 async fn discover(http: &reqwest::Client) -> Result<Discovery> {
+    let url = discovery_url();
     let response = http
-        .get(DISCOVERY_URL)
+        .get(&url)
         .send()
         .await
-        .with_context(|| format!("fetching {DISCOVERY_URL}"))?;
+        .with_context(|| format!("fetching {url}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        bail!("xAI OpenID discovery failed: {DISCOVERY_URL} returned HTTP {status}");
+        bail!("xAI OpenID discovery failed: {url} returned HTTP {status}");
     }
     let discovery: Discovery = response
         .json()
@@ -379,7 +415,7 @@ pub struct PendingBrowserLogin {
 /// authorize URL. The caller sends the user to `authorize_url`, then hands this
 /// back to [`wait_and_complete`].
 pub async fn begin_browser_login() -> Result<PendingBrowserLogin> {
-    let listener = bind_callback_listener()?;
+    let listener = bind_callback_listener().await?;
     let port = listener
         .local_addr()
         .context("reading listener port")?
@@ -439,18 +475,80 @@ where
     Ok(())
 }
 
-/// Bind [`CALLBACK_PORT`], or fail. There is nothing to fall back to: an
+/// The port the callback listener binds: [`CALLBACK_PORT`], always. It is not a
+/// preference, so there is nothing to configure and nothing to get wrong.
+#[cfg(not(test))]
+fn callback_port() -> u16 {
+    CALLBACK_PORT
+}
+
+/// Under test, a private port stands in for the registered one — chosen once,
+/// so it behaves exactly like the fixed port it replaces (tests that bind it
+/// still queue on [`oauth_callback::serial_callback_port`]).
+///
+/// [`CALLBACK_PORT`] is machine-wide, and a sign-in the user actually has in
+/// flight — a `wizard gui` holding it for its five-minute callback window — owns
+/// it for real. The suite must neither take it from them nor fail because they
+/// have it, and it has no business binding a port a browser might be redirected
+/// to. Nothing here changes production: xAI still redirects only to
+/// `CALLBACK_PORT`, and the release build has no override to set.
+#[cfg(test)]
+fn callback_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let port = oauth_callback::private_test_port();
+        assert_ne!(
+            port, CALLBACK_PORT,
+            "the suite must never bind the registered callback port"
+        );
+        port
+    })
+}
+
+/// How long a bind waits out the kernel's teardown of a listener that has just
+/// been dropped.
+///
+/// Closing a listening socket does not hand its port back synchronously: the
+/// socket stays in the kernel's bind table until it is destroyed, which under
+/// load takes a couple of hundred microseconds. So the flow that *replaces* a
+/// cancelled one — the GUI's retry, which cancels, waits for the old flow's task
+/// to finish, and then binds the port it just released — can still find that
+/// port occupied, by nothing but a socket on its way out. Every syscall in that
+/// window is the same `EADDRINUSE` a genuine conflict raises, which is why
+/// waiting for the task is necessary but not sufficient.
+///
+/// Waiting it out is not the same as tolerating a conflict: a port somebody else
+/// owns is still owned when the grace runs out, and still an error.
+const REBIND_GRACE: Duration = Duration::from_millis(250);
+
+/// Bind [`callback_port`], or fail. There is nothing to fall back to: an
 /// ephemeral port yields a redirect_uri xAI has never heard of, so it would
 /// authorize against an address the browser is never sent to — a sign-in that
-/// can only hang. Better to name the conflict.
-fn bind_callback_listener() -> Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).with_context(|| {
-        format!(
-            "could not bind 127.0.0.1:{CALLBACK_PORT} for the xAI sign-in callback; \
-             it is the only redirect xAI accepts for this client, so the sign-in cannot \
-             run elsewhere — close whatever is using it (another wizard sign-in?) and retry"
-        )
-    })
+/// can only hang. Better to name the conflict — after [`REBIND_GRACE`] has ruled
+/// out the one conflict that is not one.
+async fn bind_callback_listener() -> Result<TcpListener> {
+    let port = callback_port();
+    let deadline = Instant::now() + REBIND_GRACE;
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok(listener),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "could not bind 127.0.0.1:{port} for the xAI sign-in callback; \
+                         it is the only redirect xAI accepts for this client, so the sign-in \
+                         cannot run elsewhere — close whatever is using it (another wizard \
+                         sign-in?) and retry"
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// Best-effort browser launch; the URL is always printed as a fallback.
@@ -809,18 +907,49 @@ mod tests {
         assert_eq!(parse_callback("/favicon.ico", "s1"), Callback::Ignored);
     }
 
+    /// A runtime for a test that holds the one callback port. Not
+    /// `#[tokio::test]`: the guard for that port is a plain lock, and it has to
+    /// be held across the very binds it is there to serialize.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A port somebody else owns is still owned when [`REBIND_GRACE`] runs out.
     #[test]
     fn an_occupied_callback_port_fails_instead_of_falling_back() {
-        // xAI redirects only to CALLBACK_PORT, so an ephemeral fallback could
-        // never receive the browser — it would hang until the timeout. The bind
-        // must fail loudly, naming the port that is in the way.
+        // xAI redirects only to the callback port, so an ephemeral fallback
+        // could never receive the browser — it would hang until the timeout.
+        // The bind must fail loudly, naming the port that is in the way.
         let _serial = oauth_callback::serial_callback_port();
-        let _held = TcpListener::bind(("127.0.0.1", CALLBACK_PORT));
-        let err = bind_callback_listener().expect_err("the port is taken");
+        let port = callback_port();
+        let _held = TcpListener::bind(("127.0.0.1", port)).expect("the test port is free");
+        let err = runtime()
+            .block_on(bind_callback_listener())
+            .expect_err("the port is taken");
         assert!(
-            format!("{err:#}").contains(&CALLBACK_PORT.to_string()),
+            format!("{err:#}").contains(&port.to_string()),
             "the error should name the port: {err:#}"
         );
+    }
+
+    /// The grace exists for one thing: the port this process has just given
+    /// back. Dropping a listener does not free its port synchronously, so the
+    /// bind that follows a cancelled sign-in must be able to wait out the
+    /// kernel's teardown rather than report a conflict that is already over.
+    #[test]
+    fn a_port_released_a_moment_ago_is_bound_not_reported_as_a_conflict() {
+        let _serial = oauth_callback::serial_callback_port();
+        let held =
+            TcpListener::bind(("127.0.0.1", callback_port())).expect("the test port is free");
+        // Released from another thread, so the bind races the close exactly as
+        // the GUI's retry races the flow it has just cancelled.
+        std::thread::spawn(move || drop(held));
+        runtime()
+            .block_on(bind_callback_listener())
+            .expect("the port comes back well inside the grace");
     }
 
     #[tokio::test]

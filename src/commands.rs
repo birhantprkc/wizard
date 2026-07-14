@@ -1,4 +1,12 @@
-//! Custom slash commands and `@file` references.
+//! Slash commands: the one built-in table every surface reads, plus custom
+//! commands and `@file` references.
+//!
+//! [`COMMANDS`] is the single source of truth for what a built-in command is
+//! called, what it does, and — through [`CommandSpec::gui`] — how each surface
+//! executes it. The TUI completes and dispatches from it, the GUI derives
+//! `GET /api/commands` from it, and the agent's `run_command` allowlist
+//! ([`agent_commands`]) is filtered out of it. A second hand-kept list on any
+//! surface is how the surfaces drift, so there is only this one.
 //!
 //! Custom commands are markdown files in `~/.wizard/commands/` and
 //! `<project>/.wizard/commands/` (project files shadow global ones on a name
@@ -16,7 +24,768 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{Config, Mode, ProviderKind, ReasoningEffort};
+use crate::import_claude::ImportSelection;
+
+/* ---------------------------------------------------------------------- */
+/* Built-in slash commands                                                */
+/* ---------------------------------------------------------------------- */
+
+/// Parsed `/slash` command (see the README table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Clear,
+    /// `/model [tag]` — show current model, or switch to `tag`.
+    Model(Option<String>),
+    /// `/mode [genie|sovereign]` — show or switch mode.
+    Mode(Option<Mode>),
+    /// `/effort [low|medium|high|default]` — set the reasoning effort sent to
+    /// models that support it. `None` opens the picker; `Some(None)` clears
+    /// back to the provider default; `Some(Some(e))` sets the level.
+    Effort(Option<Option<ReasoningEffort>>),
+    /// `/evolve [--deep] <description>`.
+    Evolve {
+        deep: bool,
+        description: String,
+    },
+    /// Reload skills, scripted tools, and MCP servers without restart.
+    Reload,
+    /// Toggle plan mode (also Shift+Tab): read-only investigation until a
+    /// plan is approved via `exit_plan`.
+    Plan,
+    /// Toggle omakase (chef's-choice) mode: plan mode where the agent decides
+    /// the approach itself and auto-approves its own plan — no interview, no
+    /// review gate.
+    Omakase,
+    /// `/rewind [turn]` — restore file checkpoints and truncate history.
+    /// `None` opens the turn picker; `Some` rewinds to before that turn.
+    Rewind(Option<u64>),
+    /// `/resume [id]` — reopen a past session and continue it. `None` opens
+    /// the session picker; `Some` resumes that session id directly.
+    Resume(Option<String>),
+    /// `/compact` — summarize older history into a progress note now, instead
+    /// of waiting for the automatic threshold.
+    Compact,
+    /// `/agents` — open the subagent roster picker (browse the available
+    /// subagents and what each does; Enter pre-fills a delegation request).
+    Agents,
+    /// `/subagents` — toggle the in-session subagent monitor: the subagents
+    /// that have run (or are running) this session, with live status.
+    Subagents,
+    /// Toggle the git diff sidebar.
+    Diff,
+    /// Toggle the todo side panel.
+    Todos,
+    /// Toggle the machine-wide session manager: every live Wizard session on
+    /// the machine, grouped by state.
+    Dashboard,
+    /// Show session token usage (and cost when rates are configured).
+    Cost,
+    /// Show the saved project memories.
+    Memory,
+    /// Run the environment diagnostics (same checks as `wizard doctor`).
+    Doctor,
+    /// Show the session status: model, provider, mode, session id, usage,
+    /// todo progress, background tasks, plan mode.
+    Status,
+    /// `/bashes` — list background tasks (`execute` with
+    /// `run_in_background`), running and finished, with id/status/command.
+    Bashes,
+    /// `/goal [text]` — show the standing mission goal, or set it. `None`
+    /// shows the current goal; `Some` sets it (drives sovereign/continuous
+    /// mode), persisting to `<project_root>/.wizard/mission.toml`.
+    Goal(Option<String>),
+    /// `/publish [branch]` — fork Wizard and get a one-line installer.
+    Publish {
+        branch: Option<String>,
+    },
+    /// `/fusion [config]` — toggle model fusion (a panel of providers debate
+    /// then a synthesizer answers), or open the panel configurator.
+    Fusion(FusionAction),
+    /// `/provider ...` — add, remove, or switch LLM providers.
+    Provider(ProviderAction),
+    /// Finalize an interactive provider setup: add the provider (storing the
+    /// API key in `~/.wizard/credentials.toml` when present) and switch to it.
+    /// Emitted internally by the inline prompt flow, never parsed from text —
+    /// hence the primitive fields (so `SlashCommand` can stay `Eq`).
+    ProviderSetup {
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    },
+    /// `/server ...` — status / start / stop the local llama-server.
+    Server(ServerAction),
+    /// `/login <provider>`: OAuth sign-in for providers that support it
+    /// (currently `xai`).
+    Login(String),
+    /// `/settings` — open the in-app settings menu (a reusable picker).
+    Settings,
+    /// `/vim` — toggle modal (vim-style) editing of the input composer.
+    Vim,
+    /// Import the selected artifacts from Claude Code (`~/.claude/`). Not a
+    /// typed command; dispatched from the `/settings` import picker, which is
+    /// why it carries the [`ImportSelection`].
+    ImportClaude(ImportSelection),
+    Quit,
+}
+
+/// What a `/fusion` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FusionAction {
+    /// `/fusion` (no args) — toggle fusion mode on/off.
+    Toggle,
+    /// `/fusion config` — open the panel/synthesizer configurator.
+    Config,
+}
+
+/// What a `/provider` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAction {
+    /// `/provider` (no args) — open the interactive two-level picker (switch
+    /// providers, or add a new one).
+    Menu,
+    /// `/provider list` — show configured providers.
+    List,
+    /// `/provider use <name>` — switch the active provider.
+    Use(String),
+    /// `/provider add <name> <kind> <base_url> <model> [API_KEY_ENV]`.
+    Add {
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key_env: Option<String>,
+    },
+    /// `/provider remove <name>`.
+    Remove(String),
+}
+
+/// Parse the arguments to `/provider` (everything after the command word).
+fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
+    let action = match args.first().copied() {
+        None => ProviderAction::Menu,
+        Some("list") => ProviderAction::List,
+        Some("use") => match args.get(1) {
+            Some(name) => ProviderAction::Use((*name).to_string()),
+            None => return Err("usage: /provider use <name>".to_string()),
+        },
+        Some("add") => {
+            if args.len() < 5 {
+                return Err(
+                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare> <base_url> <model> [API_KEY_ENV]"
+                        .to_string(),
+                );
+            }
+            let kind = match args[2] {
+                "llamacpp" => ProviderKind::LlamaCpp,
+                "ollama" => ProviderKind::Ollama,
+                "openai" => ProviderKind::Openai,
+                "anthropic" => ProviderKind::Anthropic,
+                "openrouter" => ProviderKind::OpenRouter,
+                "xai" => ProviderKind::Xai,
+                "xaioauth" => ProviderKind::XaiOauth,
+                "cloudflare" => ProviderKind::Cloudflare,
+                other => {
+                    return Err(format!(
+                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare)"
+                    ));
+                }
+            };
+            ProviderAction::Add {
+                name: args[1].to_string(),
+                kind,
+                base_url: args[3].to_string(),
+                model: args[4].to_string(),
+                api_key_env: args.get(5).map(|s| s.to_string()),
+            }
+        }
+        Some("remove") => match args.get(1) {
+            Some(name) => ProviderAction::Remove((*name).to_string()),
+            None => return Err("usage: /provider remove <name>".to_string()),
+        },
+        Some(other) => {
+            return Err(format!(
+                "unknown /provider subcommand '{other}' (list|use|add|remove)"
+            ));
+        }
+    };
+    Ok(SlashCommand::Provider(action))
+}
+
+/// What a `/server` subcommand does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAction {
+    /// `/server` / `/server status` — health of the local llama-server.
+    Status,
+    /// `/server start` — start llama-server for the active provider.
+    Start,
+    /// `/server stop` — stop the llama-server Wizard started.
+    Stop,
+}
+
+/// Parse the arguments to `/server` (everything after the command word).
+fn parse_server(args: &[&str]) -> Result<SlashCommand, String> {
+    let action = match args.first().copied() {
+        None | Some("status") => ServerAction::Status,
+        Some("start") => ServerAction::Start,
+        Some("stop") => ServerAction::Stop,
+        Some(other) => {
+            return Err(format!(
+                "unknown /server subcommand '{other}' (status|start|stop)"
+            ));
+        }
+    };
+    Ok(SlashCommand::Server(action))
+}
+
+impl SlashCommand {
+    /// Parse a `/...` input line. `None` when `input` is not a slash
+    /// command; `Some(Err(msg))` for an unknown command or bad arguments.
+    pub fn parse(input: &str) -> Option<Result<Self, String>> {
+        let input = input.trim();
+        let rest = input.strip_prefix('/')?;
+        let mut parts = rest.split_whitespace();
+        let command = parts.next().unwrap_or("");
+        let args: Vec<&str> = parts.collect();
+
+        let parsed = match command {
+            "help" => Ok(Self::Help),
+            "clear" => Ok(Self::Clear),
+            "model" => Ok(Self::Model(args.first().map(|s| s.to_string()))),
+            "mode" => match args.first() {
+                None => Ok(Self::Mode(None)),
+                Some(&"genie") => Ok(Self::Mode(Some(Mode::Genie))),
+                Some(&"sovereign") => Ok(Self::Mode(Some(Mode::Sovereign))),
+                Some(other) => Err(format!("unknown mode '{other}' (genie|sovereign)")),
+            },
+            "genie" => Ok(Self::Mode(Some(Mode::Genie))),
+            "sovereign" => Ok(Self::Mode(Some(Mode::Sovereign))),
+            "effort" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                None => Ok(Self::Effort(None)),
+                Some("low") => Ok(Self::Effort(Some(Some(ReasoningEffort::Low)))),
+                Some("medium") | Some("med") => {
+                    Ok(Self::Effort(Some(Some(ReasoningEffort::Medium))))
+                }
+                Some("high") => Ok(Self::Effort(Some(Some(ReasoningEffort::High)))),
+                Some("default") | Some("off") | Some("none") => Ok(Self::Effort(Some(None))),
+                Some(other) => Err(format!(
+                    "unknown effort '{other}' (low|medium|high|default)"
+                )),
+            },
+            "evolve" => {
+                let deep = args.first() == Some(&"--deep");
+                let description = if deep { &args[1..] } else { &args[..] }.join(" ");
+                if description.is_empty() {
+                    Err("usage: /evolve [--deep] <what to add>".to_string())
+                } else {
+                    Ok(Self::Evolve { deep, description })
+                }
+            }
+            "reload" => Ok(Self::Reload),
+            "plan" => Ok(Self::Plan),
+            "omakase" => Ok(Self::Omakase),
+            "rewind" => match args.first() {
+                None => Ok(Self::Rewind(None)),
+                Some(arg) => arg
+                    .parse::<u64>()
+                    .map(|turn| Self::Rewind(Some(turn)))
+                    .map_err(|_| "usage: /rewind [turn]".to_string()),
+            },
+            "resume" => Ok(Self::Resume(args.first().map(|s| s.to_string()))),
+            "compact" => Ok(Self::Compact),
+            "agents" => Ok(Self::Agents),
+            "subagents" => Ok(Self::Subagents),
+            "diff" => Ok(Self::Diff),
+            "todos" => Ok(Self::Todos),
+            "dashboard" => Ok(Self::Dashboard),
+            "cost" => Ok(Self::Cost),
+            "memory" => Ok(Self::Memory),
+            "doctor" => Ok(Self::Doctor),
+            "status" => Ok(Self::Status),
+            "bashes" => Ok(Self::Bashes),
+            "goal" => {
+                let text = args.join(" ");
+                if text.is_empty() {
+                    Ok(Self::Goal(None))
+                } else {
+                    Ok(Self::Goal(Some(text)))
+                }
+            }
+            "publish" => Ok(Self::Publish {
+                branch: args.first().map(|s| s.to_string()),
+            }),
+            "provider" => parse_provider(&args),
+            "fusion" => match args.first().copied() {
+                None => Ok(Self::Fusion(FusionAction::Toggle)),
+                Some("config") => Ok(Self::Fusion(FusionAction::Config)),
+                Some(other) => Err(format!(
+                    "unknown /fusion subcommand '{other}' — use /fusion or /fusion config"
+                )),
+            },
+            "server" => parse_server(&args),
+            "login" => match args.first() {
+                Some(provider) => Ok(Self::Login((*provider).to_string())),
+                None => Err("usage: /login xai".to_string()),
+            },
+            "settings" => Ok(Self::Settings),
+            "vim" => Ok(Self::Vim),
+            "quit" | "q" | "exit" => Ok(Self::Quit),
+            other => Err(format!("unknown command '/{other}' — try /help")),
+        };
+        Some(parsed)
+    }
+
+    /// Whether the agent may invoke this command itself (via the `run_command`
+    /// tool), and if not, the reason to report back to the model.
+    ///
+    /// Allowed: read-only status/info commands and state changes the agent can
+    /// sensibly apply to its own session (effort, model, mode, goal, planning
+    /// modes, reload, compact, and the UI toggles). Refused: commands that need
+    /// a human at an interactive picker (the no-argument forms), that end or
+    /// rewind the session, or that reach outside it to set up providers.
+    pub fn agent_runnable(&self) -> Result<(), String> {
+        use SlashCommand::*;
+        match self {
+            // State the agent can set on itself, plus read-only info toggles.
+            Model(Some(_))
+            | Mode(Some(_))
+            | Effort(Some(_))
+            | Goal(_)
+            | Diff
+            | Todos
+            | Subagents
+            | Dashboard
+            | Cost
+            | Memory
+            | Doctor
+            | Status
+            | Bashes
+            | Compact
+            | Reload
+            | Plan
+            | Omakase
+            | Settings
+            | Vim
+            | Help
+            | Fusion(FusionAction::Toggle) => Ok(()),
+
+            // Interactive pickers: there is no human at the keyboard mid-turn,
+            // so require the argument that names the choice directly.
+            Model(None) => Err("name a model, e.g. `/model claude-sonnet-5`".into()),
+            Mode(None) => Err("name a mode, e.g. `/mode sovereign`".into()),
+            Effort(None) => Err("name a level, e.g. `/effort high`".into()),
+            Fusion(FusionAction::Config) => {
+                Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
+            }
+            Agents => Err(
+                "`/agents` opens a picker for the user; spawn subagents with the spawn tool".into(),
+            ),
+
+            // Session-ending, destructive, or external-setup commands are off
+            // limits to the agent.
+            Quit => Err("refusing to quit the session on the user's behalf".into()),
+            Clear => Err("refusing to clear the conversation on the user's behalf".into()),
+            Rewind(_) => Err("`/rewind` restores checkpoints and is the user's call".into()),
+            Resume(_) => Err("`/resume` switches sessions and is the user's call".into()),
+            Evolve { .. } => {
+                Err("`/evolve` is a heavyweight self-edit; leave it to the user".into())
+            }
+            Publish { .. } => Err("`/publish` forks the tool; leave it to the user".into()),
+            Provider(_) | ProviderSetup { .. } => {
+                Err("provider setup is the user's call; use `/model` to switch models".into())
+            }
+            Server(_) => {
+                Err("`/server` manages the local model server; leave it to the user".into())
+            }
+            Login(_) => Err("`/login` is an interactive sign-in; leave it to the user".into()),
+            ImportClaude(_) => {
+                Err("`/settings` import is driven from a picker; leave it to the user".into())
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* The built-in command table                                             */
+/* ---------------------------------------------------------------------- */
+
+/// How a surface other than the TUI runs a built-in command. The TUI runs all
+/// of them — it is the surface every command was written against — so this
+/// describes the *browser GUI*, the one place a command can genuinely have
+/// nowhere to land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Execution {
+    /// Applied to the live [`Agent`](crate::agent::Agent): the page sends a
+    /// `command` frame and the server answers with the frames the protocol
+    /// already has (`notice`, `context`, `error`, …).
+    Server,
+    /// The page's own — a panel, an overlay, a list. There is nothing to ask
+    /// the server for, and asking would only be a round trip to a no-op.
+    Client,
+    /// Terminal-only: a browser has no modal editor to toggle and no process
+    /// to exit. Offered nowhere and refused honestly when invoked anyway.
+    Terminal,
+}
+
+impl Execution {
+    /// The `where` value on the wire (`GET /api/commands`).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Execution::Server => "server",
+            Execution::Client => "client",
+            Execution::Terminal => "unavailable",
+        }
+    }
+}
+
+/// One built-in slash command. Drives the TUI's suggestion popup and ghost-text
+/// prediction, the GUI's command menu, and the allowlist the agent's
+/// `run_command` tool dispatches through — one table, so no two surfaces can
+/// drift into offering different commands.
+#[derive(Debug)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    /// Argument hint shown after the name (e.g. `[tag]`).
+    pub args: &'static str,
+    pub description: &'static str,
+    /// Completion appends a trailing space and waits for arguments instead
+    /// of submitting immediately.
+    pub takes_args: bool,
+    /// How the browser GUI runs it.
+    pub gui: Execution,
+    /// A valid argument for the commands whose bare form opens an interactive
+    /// picker (`/model`, `/mode`, `/effort`), which [`SlashCommand::agent_runnable`]
+    /// refuses for want of the choice a human would have made. [`agent_commands`]
+    /// parses `/name` plus this before asking the gate, so a picker command is
+    /// not mistaken for one the agent may never run. Empty when the bare form
+    /// already parses into what the agent would ask for.
+    pub agent_arg: &'static str,
+}
+
+/// All slash commands, in display order.
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "model",
+        args: "[tag]",
+        description: "pick or switch the model",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "gpt-5",
+    },
+    CommandSpec {
+        name: "mode",
+        args: "[genie|sovereign]",
+        description: "pick or switch personality mode",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "sovereign",
+    },
+    CommandSpec {
+        name: "genie",
+        args: "",
+        description: "switch to genie mode",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "sovereign",
+        args: "",
+        description: "switch to sovereign mode",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "effort",
+        args: "[low|medium|high|default]",
+        description: "set reasoning effort (Grok 4.x, OpenAI o-series / gpt-5)",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "high",
+    },
+    CommandSpec {
+        name: "plan",
+        args: "",
+        description: "toggle plan mode: read-only until a plan is approved",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "omakase",
+        args: "",
+        description: "toggle omakase: chef's-choice plan mode, the agent decides",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "rewind",
+        args: "[turn]",
+        description: "rewind files and conversation to before a turn",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "resume",
+        args: "",
+        description: "reopen and continue a past session",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "compact",
+        args: "",
+        description: "summarize older history into a progress note now",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "agents",
+        args: "",
+        description: "browse subagents and delegate to one",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "subagents",
+        args: "",
+        description: "monitor the subagents running in this session",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "evolve",
+        args: "[--deep] <desc>",
+        description: "self-extend: add a skill, tool, or MCP server",
+        takes_args: true,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "publish",
+        args: "[branch]",
+        description: "fork & publish your Wizard, get a one-line installer",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "provider",
+        args: "",
+        description: "add or switch LLM providers (interactive)",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "fusion",
+        args: "[config]",
+        description: "toggle model fusion, or configure the panel",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "server",
+        args: "[status|start|stop]",
+        description: "manage the local llama-server",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "login",
+        args: "<xai>",
+        description: "sign in to a provider account (xAI OAuth)",
+        takes_args: true,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "diff",
+        args: "",
+        description: "toggle the git diff sidebar",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "todos",
+        args: "",
+        description: "toggle the todo side panel",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "dashboard",
+        args: "",
+        description: "session manager: all live wizard sessions on this machine",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "cost",
+        args: "",
+        description: "show session token usage and cost",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "memory",
+        args: "",
+        description: "show saved project memories",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "status",
+        args: "",
+        description: "show session status: model, usage, todos, tasks",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "bashes",
+        args: "",
+        description: "list background tasks: id, status, command",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "goal",
+        args: "[text]",
+        description: "show or set the standing mission goal",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "settings",
+        args: "",
+        description: "open the settings menu (change config anytime)",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "vim",
+        args: "",
+        description: "toggle vim-style modal editing of the input line",
+        takes_args: false,
+        gui: Execution::Terminal,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "doctor",
+        args: "",
+        description: "diagnose config, providers, MCP, hooks, state dirs",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "reload",
+        args: "",
+        description: "reload skills, scripted tools, and MCP servers",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "clear",
+        args: "",
+        description: "clear the conversation",
+        takes_args: false,
+        gui: Execution::Client,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "help",
+        args: "",
+        description: "show available commands and keys",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "quit",
+        args: "",
+        description: "exit wizard",
+        takes_args: false,
+        gui: Execution::Terminal,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "exit",
+        args: "",
+        description: "exit wizard",
+        takes_args: false,
+        gui: Execution::Terminal,
+        agent_arg: "",
+    },
+];
+
+/// The [`CommandSpec`] for a built-in command word, if there is one.
+pub fn spec(name: &str) -> Option<&'static CommandSpec> {
+    COMMANDS.iter().find(|spec| spec.name == name)
+}
+
+/// The built-in commands a surface with the given [`Execution`] runs.
+pub fn commands_where(gui: Execution) -> impl Iterator<Item = &'static CommandSpec> {
+    COMMANDS.iter().filter(move |spec| spec.gui == gui)
+}
+
+/// The commands the agent may queue through `run_command` on a surface that
+/// executes [`Execution::Server`] commands against the Agent (the GUI): the
+/// table's server-executed entries, minus the ones
+/// [`SlashCommand::agent_runnable`] refuses whatever their arguments.
+///
+/// Derived from the one table and the one gate — never a second list — so the
+/// tool cannot promise the model a command the executor does not run, nor
+/// refuse one it does.
+pub fn agent_commands() -> &'static [&'static str] {
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        commands_where(Execution::Server)
+            .filter(|spec| spec.agent_runnable())
+            .map(|spec| spec.name)
+            .collect()
+    })
+}
+
+impl CommandSpec {
+    /// Whether the agent may queue this command at all — whether *some*
+    /// invocation of it passes [`SlashCommand::agent_runnable`]. Argument-level
+    /// gating stays in that gate; this is its by-name half, which is all a
+    /// dispatch allowlist can express.
+    fn agent_runnable(&self) -> bool {
+        let line = format!("/{} {}", self.name, self.agent_arg);
+        matches!(
+            SlashCommand::parse(&line),
+            Some(Ok(command)) if command.agent_runnable().is_ok()
+        )
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Custom commands and @file references                                   */
+/* ---------------------------------------------------------------------- */
 
 /// One loaded custom command.
 #[derive(Debug, Clone)]
@@ -313,6 +1082,107 @@ mod tests {
     fn write(dir: &Path, name: &str, content: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    // --- the built-in table ---
+
+    /// Every row is a word the parser knows. A row the parser answers "unknown
+    /// command" to is a menu entry that cannot be typed; a command with no row
+    /// is one only whoever already knew about it can find.
+    #[test]
+    fn every_row_is_a_command_the_parser_knows() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in COMMANDS {
+            assert!(
+                seen.insert(spec.name),
+                "/{} is in the table twice",
+                spec.name
+            );
+            let line = format!("/{} {}", spec.name, spec.agent_arg);
+            match SlashCommand::parse(&line) {
+                // `/evolve` and friends parse only with the argument they exist
+                // to carry; what matters here is that the word is known.
+                Some(Err(message)) => assert!(
+                    !message.contains("unknown command"),
+                    "/{} is offered but the parser does not know it",
+                    spec.name
+                ),
+                Some(Ok(_)) => {}
+                None => panic!("/{} is not a slash command", spec.name),
+            }
+        }
+    }
+
+    /// The agent's allowlist is the intersection of what a surface runs against
+    /// the Agent and what the gate lets the model ask for — derived, so it cannot
+    /// drift from either.
+    #[test]
+    fn the_agent_allowlist_is_the_server_table_minus_what_the_gate_refuses() {
+        let allowed = agent_commands();
+        assert!(allowed.contains(&"goal"), "the agent may set the mission");
+        assert!(allowed.contains(&"model"), "and switch its own model");
+        assert!(allowed.contains(&"effort"));
+        assert!(allowed.contains(&"status"));
+
+        // Runs here, but is the user's call: restoring checkpoints, forking the
+        // tool, rebuilding the binary, or taking the local model server down.
+        for refused in ["rewind", "publish", "evolve", "server", "agents"] {
+            assert_eq!(
+                spec(refused).map(|spec| spec.gui),
+                Some(Execution::Server),
+                "/{refused} is executed by the server"
+            );
+            assert!(
+                !allowed.contains(&refused),
+                "/{refused} is the user's call, not the agent's"
+            );
+        }
+
+        // Nothing the page owns, or the terminal owns, is offered to the agent
+        // here — it would be queued and then answered with an error it never
+        // reads.
+        for spec in COMMANDS {
+            if spec.gui != Execution::Server {
+                assert!(
+                    !allowed.contains(&spec.name),
+                    "/{} does not run against the Agent",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    /// A picker command's bare form is refused for want of the choice a human
+    /// would have made at the picker — which is a *usage* refusal, not a policy
+    /// one. The allowlist has to tell them apart, or `/model` looks like `/quit`.
+    #[test]
+    fn a_picker_command_is_not_mistaken_for_one_the_agent_may_never_run() {
+        assert!(
+            SlashCommand::parse("/model")
+                .unwrap()
+                .unwrap()
+                .agent_runnable()
+                .is_err()
+        );
+        assert!(
+            SlashCommand::parse("/model gpt-5")
+                .unwrap()
+                .unwrap()
+                .agent_runnable()
+                .is_ok()
+        );
+        assert!(agent_commands().contains(&"model"));
+    }
+
+    #[test]
+    fn the_wire_value_says_who_executes_a_command() {
+        assert_eq!(Execution::Server.wire(), "server");
+        assert_eq!(Execution::Client.wire(), "client");
+        assert_eq!(Execution::Terminal.wire(), "unavailable");
+        assert_eq!(spec("goal").map(|spec| spec.gui), Some(Execution::Server));
+        assert_eq!(spec("diff").map(|spec| spec.gui), Some(Execution::Client));
+        assert_eq!(spec("vim").map(|spec| spec.gui), Some(Execution::Terminal));
+        assert!(spec("frobnicate").is_none());
     }
 
     // --- loading ---

@@ -12,6 +12,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod credentials;
+pub mod desktop;
 pub mod dispatch;
 pub mod doctor;
 pub mod event;
@@ -117,6 +118,27 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return gui::run(config, *port, *no_open, assets.clone())
             .await
             .map(|()| 0);
+    }
+
+    // The desktop shell is the same GUI server in a webview window, so it
+    // dispatches the same way. `--install` / `--uninstall` only write launcher
+    // files, and a build without the `desktop` feature only prints how to get
+    // one — neither needs a config, so the load happens inside.
+    if let Some(cli::Command::App {
+        devtools,
+        install,
+        uninstall,
+    }) = &cli.command
+    {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return desktop::run(desktop::AppArgs {
+            devtools: *devtools,
+            install: *install,
+            uninstall: *uninstall,
+        })
+        .await;
     }
 
     // Evolution history: reads ~/.wizard/evolution.jsonl and touches the

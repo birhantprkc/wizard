@@ -18,6 +18,15 @@ fn main() {
         unsafe { std::env::set_var("WIZARD_HARNESS_DIR", dir) };
     }
 
+    // `wizard app` picks its display backend before GTK can initialize — and,
+    // like the above, before any thread exists to race the environment. See
+    // `desktop::select_display_backend` for why it does not simply take
+    // Wayland when Wayland is there.
+    // SAFETY: no other threads have been spawned yet.
+    if matches!(cli.command, Some(wizard::cli::Command::App { .. })) {
+        unsafe { wizard::desktop::select_display_backend() };
+    }
+
     // If the TUI is up when something panics, raw mode and the alternate
     // screen must be torn down before the panic message prints, or the
     // terminal is left unusable.

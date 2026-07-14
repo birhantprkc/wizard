@@ -63,7 +63,7 @@ pub enum CommandDispatch {
     /// Nothing drains the queue: headless, gateway, subagents.
     #[default]
     None,
-    /// Every command [`SlashCommand::agent_runnable`](crate::app::SlashCommand)
+    /// Every command [`SlashCommand::agent_runnable`](crate::commands::SlashCommand)
     /// allows — the interactive TUI, which has a surface for all of them.
     All,
     /// Only these command names, in a surface whose executor implements a subset
@@ -84,13 +84,26 @@ impl CommandDispatch {
             ),
             CommandDispatch::All => Ok(()),
             CommandDispatch::Only(names) if names.contains(&name) => Ok(()),
-            CommandDispatch::Only(names) => {
-                let offered: Vec<String> = names.iter().map(|name| format!("/{name}")).collect();
-                Err(format!(
-                    "'/{name}' has nowhere to run on this surface; it runs only {}",
-                    offered.join(", ")
-                ))
-            }
+            // Say *why*, from the one table, when the table knows: "nowhere to
+            // run" is false of a command the user can run right there in the
+            // page, and the model deserves the real reason rather than a shrug
+            // it will read as a bug and retry around.
+            CommandDispatch::Only(names) => Err(match crate::commands::spec(name).map(|s| s.gui) {
+                Some(crate::commands::Execution::Client) => format!(
+                    "'/{name}' belongs to the user's window, not the agent — they open it, you cannot"
+                ),
+                Some(crate::commands::Execution::Terminal) => {
+                    format!("'/{name}' runs only in a terminal session, and this one is not")
+                }
+                _ => {
+                    let offered: Vec<String> =
+                        names.iter().map(|name| format!("/{name}")).collect();
+                    format!(
+                        "'/{name}' has nowhere to run on this surface; it runs only {}",
+                        offered.join(", ")
+                    )
+                }
+            }),
         }
     }
 }
