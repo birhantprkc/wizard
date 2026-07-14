@@ -82,8 +82,9 @@ pub enum SlashCommand {
     Dashboard,
     /// Show session token usage (and cost when rates are configured).
     Cost,
-    /// Show the saved project memories.
-    Memory,
+    /// `/memory [read|forget <name>]` — inspect and manage the saved project
+    /// memories the agent writes with the `memory` tool.
+    Memory(MemoryAction),
     /// Run the environment diagnostics (same checks as `wizard doctor`).
     Doctor,
     /// Show the session status: model, provider, mode, session id, usage,
@@ -215,6 +216,38 @@ fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
     Ok(SlashCommand::Provider(action))
 }
 
+/// What a `/memory` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryAction {
+    /// `/memory` (no args) — list the saved memories: name, type, description.
+    List,
+    /// `/memory read <name>` — show one memory's content.
+    Read(String),
+    /// `/memory forget <name>` — delete one memory.
+    Forget(String),
+}
+
+/// Parse the arguments to `/memory` (everything after the command word).
+fn parse_memory(args: &[&str]) -> Result<SlashCommand, String> {
+    let action = match args.first().copied() {
+        None => MemoryAction::List,
+        Some("read") => match args.get(1) {
+            Some(name) => MemoryAction::Read((*name).to_string()),
+            None => return Err("usage: /memory read <name>".to_string()),
+        },
+        Some("forget") => match args.get(1) {
+            Some(name) => MemoryAction::Forget((*name).to_string()),
+            None => return Err("usage: /memory forget <name>".to_string()),
+        },
+        Some(other) => {
+            return Err(format!(
+                "unknown /memory subcommand '{other}' — use /memory, /memory read <name>, or /memory forget <name>"
+            ));
+        }
+    };
+    Ok(SlashCommand::Memory(action))
+}
+
 /// What a `/server` subcommand does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerAction {
@@ -302,7 +335,7 @@ impl SlashCommand {
             "todos" => Ok(Self::Todos),
             "dashboard" => Ok(Self::Dashboard),
             "cost" => Ok(Self::Cost),
-            "memory" => Ok(Self::Memory),
+            "memory" => parse_memory(&args),
             "doctor" => Ok(Self::Doctor),
             "status" => Ok(Self::Status),
             "bashes" => Ok(Self::Bashes),
@@ -359,7 +392,9 @@ impl SlashCommand {
             | Subagents
             | Dashboard
             | Cost
-            | Memory
+            // Every `/memory` action — list, read, forget — is one the `memory`
+            // tool already grants the agent, so a gate here would be theater.
+            | Memory(_)
             | Doctor
             | Status
             | Bashes
@@ -645,8 +680,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "memory",
-        args: "",
-        description: "show saved project memories",
+        args: "[read|forget <name>]",
+        description: "list, show, or forget saved project memories",
         takes_args: false,
         gui: Execution::Server,
         agent_arg: "",
@@ -1172,6 +1207,41 @@ mod tests {
                 .is_ok()
         );
         assert!(agent_commands().contains(&"model"));
+    }
+
+    /// `/memory` lists, `/memory read <name>` shows one, `/memory forget
+    /// <name>` deletes one. A subcommand without the name it needs is a usage
+    /// error, not a memory named nothing.
+    #[test]
+    fn memory_parses_its_three_forms() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(
+            parse("/memory"),
+            Ok(SlashCommand::Memory(MemoryAction::List))
+        );
+        assert_eq!(
+            parse("/memory read subagent-panes"),
+            Ok(SlashCommand::Memory(MemoryAction::Read(
+                "subagent-panes".to_string()
+            )))
+        );
+        assert_eq!(
+            parse("/memory forget subagent-panes"),
+            Ok(SlashCommand::Memory(MemoryAction::Forget(
+                "subagent-panes".to_string()
+            )))
+        );
+        assert_eq!(
+            parse("/memory read"),
+            Err("usage: /memory read <name>".to_string())
+        );
+        assert_eq!(
+            parse("/memory forget"),
+            Err("usage: /memory forget <name>".to_string())
+        );
+        assert!(
+            matches!(parse("/memory purge"), Err(message) if message.contains("unknown /memory subcommand"))
+        );
     }
 
     #[test]

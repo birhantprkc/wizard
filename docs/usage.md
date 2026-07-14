@@ -32,7 +32,7 @@ inline hints.
 | `/diff` | Toggle the git diff sidebar |
 | `/todos` | Toggle the todo side panel |
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
-| `/memory` | Show the saved project memories |
+| `/memory [read\|forget <name>]` | List the saved project memories, show one, or forget one ([memory.md](memory.md)) |
 | `/status` | Session status: model, provider, mode, session id, usage, todo progress, background tasks |
 | `/doctor` | Environment diagnostics, same checks as `wizard doctor` ([doctor.md](doctor.md)) |
 | `/provider …` | Add, remove, or switch LLM providers; no arguments opens the interactive menu |

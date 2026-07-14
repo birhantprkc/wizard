@@ -28,7 +28,7 @@ use crate::cli::Cli;
 // the tree has always found it.
 use crate::commands::CustomCommand;
 pub use crate::commands::{
-    COMMANDS, CommandSpec, FusionAction, ProviderAction, ServerAction, SlashCommand,
+    COMMANDS, CommandSpec, FusionAction, MemoryAction, ProviderAction, ServerAction, SlashCommand,
 };
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget};
 use crate::event::{Event, EventLoop};
@@ -39,7 +39,6 @@ use crate::images::ImageRef;
 use crate::import_claude::{self, ImportSelection};
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
-use crate::memory::MemoryStore;
 use crate::server;
 use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::skills::Skill;
@@ -4677,7 +4676,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /todos                      toggle the todo side panel\n  \
 /dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
-/memory                     show saved project memories\n  \
+/memory [read|forget <name>] list, show, or forget saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
 /bashes                     list background tasks (id, status, command)\n  \
 /goal [text]                show or set the standing mission goal\n  \
@@ -5531,7 +5530,7 @@ impl CommandContext<'_> {
             SlashCommand::Dashboard => self.toggle_dashboard(),
             SlashCommand::Subagents => self.toggle_subagents(),
             SlashCommand::Cost => self.cost(),
-            SlashCommand::Memory => self.memory(),
+            SlashCommand::Memory(action) => self.memory(action),
             SlashCommand::Doctor => self.doctor().await,
             SlashCommand::Status => self.status(),
             SlashCommand::Bashes => self.bashes(),
@@ -5660,29 +5659,12 @@ impl CommandContext<'_> {
         self.app.notice(text);
     }
 
-    /// `/memory`: list the saved project memories (name — description).
-    fn memory(&mut self) {
-        let store = match MemoryStore::open(self.project_root) {
-            Ok(store) => store,
-            Err(err) => {
-                self.app
-                    .notice(format!("could not open memory store: {err:#}"));
-                return;
-            }
-        };
-        match store.list() {
-            Ok(entries) if entries.is_empty() => self
-                .app
-                .notice(format!("no memories saved yet ({})", store.dir().display())),
-            Ok(entries) => {
-                let mut text = format!("saved memories ({}):\n", store.dir().display());
-                for entry in &entries {
-                    text.push_str(&format!("  {} — {}\n", entry.name, entry.description));
-                }
-                self.app.notice(text.trim_end().to_string());
-            }
-            Err(err) => self.app.notice(format!("could not list memories: {err:#}")),
-        }
+    /// `/memory`: the user's window onto the memories the agent writes with
+    /// the `memory` tool — list them, read one, or forget one. Rendered by
+    /// [`crate::memory::report`], the same renderer the GUI answers with.
+    fn memory(&mut self, action: MemoryAction) {
+        self.app
+            .notice(crate::memory::report(self.project_root, &action));
     }
 
     /// `/doctor`: the same diagnostics as `wizard doctor`, in the

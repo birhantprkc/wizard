@@ -1618,7 +1618,7 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
             Err(message) => error(shared, message),
         },
         SlashCommand::Status => notice(shared, status_report(agent, ctx.config, shared)),
-        SlashCommand::Memory => notice(shared, memory_report(&shared.cwd)),
+        SlashCommand::Memory(action) => notice(shared, crate::memory::report(&shared.cwd, &action)),
         SlashCommand::Doctor => {
             let checks = crate::doctor::run_checks(&shared.cwd).await;
             notice(
@@ -1819,27 +1819,6 @@ fn status_report(agent: &Agent, config: &Config, shared: &TaskShared) -> String 
         }
     ));
     text
-}
-
-/// `/memory`: the project memories saved under `.wizard/memory/`.
-fn memory_report(cwd: &Path) -> String {
-    let store = match crate::memory::MemoryStore::open(cwd) {
-        Ok(store) => store,
-        Err(err) => return format!("could not open memory store: {err:#}"),
-    };
-    match store.list() {
-        Err(err) => format!("could not list memories: {err:#}"),
-        Ok(entries) if entries.is_empty() => {
-            format!("no memories saved yet ({})", store.dir().display())
-        }
-        Ok(entries) => {
-            let mut text = format!("saved memories ({}):\n", store.dir().display());
-            for entry in &entries {
-                text.push_str(&format!("  {} — {}\n", entry.name, entry.description));
-            }
-            text.trim_end().to_string()
-        }
-    }
 }
 
 /// `/bashes`: the background `execute` tasks this session has spawned.

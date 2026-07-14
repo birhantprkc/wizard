@@ -54,6 +54,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - [Bench](docs/bench.md): record/replay trajectories to score builds and models
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
+- [Memory](docs/memory.md): what Wizard remembers between sessions, and `/memory`
 - [Hooks](docs/hooks.md) · [Tasks](docs/tasks.md) · [Web](docs/web.md) · [Headless output](docs/headless.md) · [Checkpoints](docs/checkpoints.md)
 - [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
 - [Scheduler](docs/scheduler.md): cron-scheduled headless runs
