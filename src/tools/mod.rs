@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::llm::ToolSpec;
+use crate::llm::{Image, ToolSpec};
 
 /// Where a tool comes from. Affects display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,64 @@ pub enum ToolAccess {
     Edit,
     /// Runs commands or has other side effects.
     Execute,
+}
+
+/// Which of Wizard's own slash commands the attached surface will actually run
+/// when the agent queues one through `run_command`.
+///
+/// A live `events` channel implies none of them: headless and gateway runs have
+/// one too, streaming to a printer that cannot apply a command. The tool gates
+/// on this so it never reports success for work that would never run — and, on a
+/// surface that implements a subset, refuses the rest *in the tool result*,
+/// which is the only place the model reads before the turn ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CommandDispatch {
+    /// Nothing drains the queue: headless, gateway, subagents.
+    #[default]
+    None,
+    /// Every command [`SlashCommand::agent_runnable`](crate::commands::SlashCommand)
+    /// allows — the interactive TUI, which has a surface for all of them.
+    All,
+    /// Only these command names, in a surface whose executor implements a subset
+    /// of them (the GUI: `/vim` and the interactive pickers have nowhere to land
+    /// in a browser).
+    Only(&'static [&'static str]),
+}
+
+impl CommandDispatch {
+    /// Whether the attached surface will run the command called `name` (no
+    /// leading slash), or the reason it will not.
+    pub fn accepts(self, name: &str) -> Result<(), String> {
+        match self {
+            CommandDispatch::None => Err(
+                "slash commands are only available in an interactive Wizard session, \
+                 not in this run"
+                    .to_string(),
+            ),
+            CommandDispatch::All => Ok(()),
+            CommandDispatch::Only(names) if names.contains(&name) => Ok(()),
+            // Say *why*, from the one table, when the table knows: "nowhere to
+            // run" is false of a command the user can run right there in the
+            // page, and the model deserves the real reason rather than a shrug
+            // it will read as a bug and retry around.
+            CommandDispatch::Only(names) => Err(match crate::commands::spec(name).map(|s| s.gui) {
+                Some(crate::commands::Execution::Client) => format!(
+                    "'/{name}' belongs to the user's window, not the agent — they open it, you cannot"
+                ),
+                Some(crate::commands::Execution::Terminal) => {
+                    format!("'/{name}' runs only in a terminal session, and this one is not")
+                }
+                _ => {
+                    let offered: Vec<String> =
+                        names.iter().map(|name| format!("/{name}")).collect();
+                    format!(
+                        "'/{name}' has nowhere to run on this surface; it runs only {}",
+                        offered.join(", ")
+                    )
+                }
+            }),
+        }
+    }
 }
 
 /// Per-call execution context.
@@ -75,13 +133,16 @@ pub struct ToolContext {
     /// it before execution. `None` outside an agent (direct registry
     /// execution in tests).
     pub checkpoints: Option<Arc<crate::checkpoint::CheckpointStore>>,
-    /// True only on the interactive TUI surface, which drains and dispatches
-    /// slash commands the agent queues via `run_command`. A live `events`
-    /// channel alone does not imply this — headless and gateway runs stream
-    /// events to a printer that cannot apply a command — so the `run_command`
-    /// tool gates on this flag to avoid reporting success for work that would
-    /// never run. Set by the TUI's agent builder; false everywhere else.
-    pub dispatches_commands: bool,
+    /// Where images produced during this session are written, set by the agent
+    /// at construction (`~/.wizard/images/<session>/`). The agent loop and the
+    /// subagent loop persist through it before announcing an image to the
+    /// surfaces. `None` outside an agent (direct registry execution in tests),
+    /// in which case images still reach the model but land nowhere on disk.
+    pub images: Option<Arc<crate::images::ImageStore>>,
+    /// The slash commands the surface behind this run will dispatch when the
+    /// agent queues one via `run_command`. Set by the surface's agent builder;
+    /// [`CommandDispatch::None`] everywhere else.
+    pub command_dispatch: CommandDispatch,
 }
 
 impl ToolContext {
@@ -94,14 +155,15 @@ impl ToolContext {
             events: None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
-            dispatches_commands: false,
+            images: None,
+            command_dispatch: CommandDispatch::None,
         }
     }
 
-    /// Mark this context as belonging to a surface that drains queued slash
-    /// commands (the interactive TUI). Enables the `run_command` tool.
-    pub fn with_command_dispatch(mut self, on: bool) -> Self {
-        self.dispatches_commands = on;
+    /// Declare which queued slash commands the attached surface will run
+    /// (see [`CommandDispatch`]). Anything but `None` enables `run_command`.
+    pub fn with_command_dispatch(mut self, dispatch: CommandDispatch) -> Self {
+        self.command_dispatch = dispatch;
         self
     }
 
@@ -114,6 +176,13 @@ impl ToolContext {
     /// This context with the checkpoint store attached (agent construction).
     pub fn with_checkpoints(mut self, store: Arc<crate::checkpoint::CheckpointStore>) -> Self {
         self.checkpoints = Some(store);
+        self
+    }
+
+    /// This context with the session's image store attached (agent
+    /// construction).
+    pub fn with_images(mut self, store: Arc<crate::images::ImageStore>) -> Self {
+        self.images = Some(store);
         self
     }
 
@@ -136,6 +205,17 @@ pub struct ToolOutput {
     /// file, ...). Distinct from [`ToolError`], which means the call itself
     /// could not be carried out.
     pub is_error: bool,
+    /// Images the tool produced (a generated image, a screenshot, a rendered
+    /// chart). Build them with [`Image::from_bytes`](crate::llm::Image::from_bytes),
+    /// which sniffs the media type and enforces the size cap.
+    ///
+    /// The agent loop takes them from here: it writes them to the session's
+    /// image directory, announces them to the surfaces
+    /// ([`AgentEvent::Images`](crate::agent::AgentEvent::Images)), and feeds
+    /// them back to the model on a following user message — a `tool`-role
+    /// message cannot carry image blocks on OpenAI, but a user message can
+    /// everywhere (see [`ChatMessage::user_with_images`]).
+    pub images: Vec<Image>,
 }
 
 impl ToolOutput {
@@ -143,6 +223,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
         }
     }
 
@@ -150,6 +231,17 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
+        }
+    }
+
+    /// Successful output carrying one or more images alongside its text. The
+    /// text is what the model reads; the images are what it sees.
+    pub fn ok_with_images(content: impl Into<String>, images: Vec<Image>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images,
         }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,10 @@ pub enum ProviderKind {
     /// xAI via account sign-in: OAuth tokens from `wizard --login xai`
     /// (stored in `~/.wizard/xai_oauth.json`), no API key needed.
     XaiOauth,
+    /// ChatGPT subscription via account sign-in: OAuth tokens from
+    /// `wizard --login chatgpt` (stored in `~/.wizard/chatgpt_oauth.json`),
+    /// calling the Responses API at `chatgpt.com/backend-api/codex`.
+    ChatgptOauth,
     /// Cloudflare Workers AI: serverless open models (GLM, Llama, Qwen, ...)
     /// behind an account-scoped OpenAI-compatible endpoint
     /// (`https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1`) with a
@@ -198,6 +202,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::OpenRouter => write!(f, "openrouter"),
             ProviderKind::Xai => write!(f, "xai"),
             ProviderKind::XaiOauth => write!(f, "xaioauth"),
+            ProviderKind::ChatgptOauth => write!(f, "chatgptoauth"),
             ProviderKind::Cloudflare => write!(f, "cloudflare"),
         }
     }
@@ -602,6 +607,15 @@ impl ProviderConfig {
                     "xai",
                 )))
             }
+            // A ChatGPT subscription is not the Chat Completions API — it is the
+            // Responses API behind account tokens, so it has its own client.
+            ProviderKind::ChatgptOauth => Ok(Arc::new(
+                crate::llm::chatgpt::ChatgptProvider::new(
+                    self.base_url.clone(),
+                    self.model.clone(),
+                )
+                .context("setting up ChatGPT OAuth token storage")?,
+            )),
             // Cloudflare Workers AI speaks the OpenAI-compatible Chat
             // Completions API, but has no `/v1/models`, so it needs its own
             // client for health/model-listing (see `CloudflareProvider`).
@@ -650,9 +664,10 @@ pub struct Config {
     /// `/effort`. `None` leaves the provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Agent loop limit per turn. `0` (the default) is unlimited: a turn runs
-    /// until the model stops calling tools. A positive value caps the turn;
-    /// sovereign raises a cap below its floor, since no one is at the prompt.
+    /// Agent loop limit per turn, on every surface — TUI, headless, gateway,
+    /// GUI. `0` (the default) is unlimited: a turn runs until the model stops
+    /// calling tools. A positive value caps the turn; sovereign raises a cap
+    /// below its floor, since no one is at the prompt.
     pub max_steps: StepBudget,
     /// Perpetual sovereign operation: keep working/self-directing/self-improving
     /// until stopped.
@@ -760,28 +775,50 @@ impl Default for Config {
     }
 }
 
+/// Relocates `~/.wizard` for this process: set from `WIZARD_HOME`, or by
+/// [`use_wizard_dir`] — which the test suite calls, so that a test exercising
+/// something that persists config (the TUI's `/vim` toggle, say) writes to a
+/// temp directory instead of the developer's real config file.
+static WIZARD_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point this process at `dir` instead of `~/.wizard`. First call wins, so
+/// parallel tests all land in the same temp dir.
+pub fn use_wizard_dir(dir: PathBuf) {
+    let _ = WIZARD_DIR.set(dir);
+}
+
+/// Send this test binary's `~/.wizard` to a temp directory of its own.
+#[cfg(test)]
+fn use_temp_wizard_dir() {
+    if WIZARD_DIR.get().is_some() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("wizard-test-home-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    use_wizard_dir(dir);
+}
+
 impl Config {
-    /// `~/.wizard` — root of all Wizard state on disk. `WIZARD_HOME` relocates
-    /// it wholesale (sandboxes, CI, a second install).
+    /// `~/.wizard` — root of all Wizard state on disk. `WIZARD_HOME` (or a
+    /// [`use_wizard_dir`] override) relocates it wholesale (sandboxes, CI, a
+    /// second install).
     pub fn wizard_dir() -> Result<PathBuf> {
-        if let Some(dir) = std::env::var_os("WIZARD_HOME") {
+        // Every path into `~/.wizard` — config, credentials, sessions — comes
+        // through here, so redirecting it under `cfg(test)` is what keeps the
+        // suite off the developer's real state. It is not hypothetical: the
+        // TUI's `/vim` toggle persists config, and the vim tests exercise it,
+        // which used to overwrite the real config.toml with a default one —
+        // silently deleting the developer's providers on every `cargo test`.
+        #[cfg(test)]
+        use_temp_wizard_dir();
+        if let Some(dir) = WIZARD_DIR.get() {
+            return Ok(dir.clone());
+        }
+        if let Some(dir) = std::env::var_os("WIZARD_HOME").filter(|dir| !dir.is_empty()) {
             return Ok(PathBuf::from(dir));
         }
-        Ok(Self::home_dir()?.join(".wizard"))
-    }
-
-    /// Home directory behind [`Self::wizard_dir`].
-    #[cfg(not(test))]
-    fn home_dir() -> Result<PathBuf> {
-        dirs::home_dir().context("could not determine home directory")
-    }
-
-    /// Unit tests get a scratch home. Several exercise code paths that persist
-    /// the config (`/mode`, `/vim`, onboarding) or write a session, and a test
-    /// run must never overwrite the developer's own `~/.wizard`.
-    #[cfg(test)]
-    fn home_dir() -> Result<PathBuf> {
-        Ok(std::env::temp_dir().join("wizard-unit-test-home"))
+        let home = dirs::home_dir().context("could not determine home directory")?;
+        Ok(home.join(".wizard"))
     }
 
     /// `~/.wizard/config.toml`
@@ -797,6 +834,20 @@ impl Config {
     /// `~/.wizard/sessions/` — JSONL chat history.
     pub fn sessions_dir() -> Result<PathBuf> {
         Ok(Self::wizard_dir()?.join("sessions"))
+    }
+
+    /// `~/.wizard/images/` — images produced during a session, one directory
+    /// per session id (`crate::images::ImageStore`).
+    pub fn images_dir() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("images"))
+    }
+
+    /// `~/.wizard/attachments/` — non-image files a user attached, one
+    /// directory per session id. Images do not land here: they belong to the
+    /// content-addressed [`images_dir`](Self::images_dir), which is the only
+    /// directory the GUI will serve an image back out of.
+    pub fn attachments_dir() -> Result<PathBuf> {
+        Ok(Self::wizard_dir()?.join("attachments"))
     }
 
     /// `~/.wizard/tools/` — agent-authored scripted tools.
@@ -1152,14 +1203,20 @@ mod tests {
     }
 
     #[test]
-    fn a_test_run_never_resolves_the_real_wizard_dir() {
-        // Regression guard: tests that persist the config (`/mode`, `/vim`,
-        // onboarding) used to write the developer's own ~/.wizard/config.toml.
-        if std::env::var_os("WIZARD_HOME").is_some() {
-            return;
-        }
-        let real = dirs::home_dir().expect("home dir").join(".wizard");
-        assert_ne!(Config::wizard_dir().expect("wizard dir"), real);
+    fn tests_never_write_to_the_real_wizard_dir() {
+        // Regression guard, and not a hypothetical one: the suite exercises
+        // code that persists config (the TUI's `/vim` toggle, `/mode`,
+        // provider setup, onboarding). When this pointed at $HOME, running
+        // `cargo test` silently overwrote the developer's own config.toml —
+        // providers and all. It did, once.
+        let dir = Config::wizard_dir().expect("a wizard dir");
+        let home = dirs::home_dir().expect("a home dir");
+        assert_ne!(dir, home.join(".wizard"));
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "tests must use a temp wizard dir, got {}",
+            dir.display()
+        );
     }
 
     #[test]
@@ -2022,6 +2079,21 @@ usd_per_mtok_out = 15.0
         assert!(
             !raw.contains("auto_approve"),
             "deprecated key is not written back: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_gui_step_budget_still_loads() {
+        // The GUI used to keep a budget of its own (`[gui] max_steps`). It now
+        // runs on the shared one like every other surface, and a config still
+        // carrying the old section must load — not fail — and not gain it back.
+        let config: Config =
+            toml::from_str("max_steps = 12\n[gui]\nmax_steps = 250\n").expect("old section parses");
+        assert_eq!(config.max_steps, StepBudget::new(12));
+        let raw = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !raw.contains("[gui]"),
+            "the section is not written back: {raw}"
         );
     }
 

@@ -61,6 +61,16 @@ enum SessionLine {
     Message(SessionRecord),
 }
 
+/// One parsed session line, publicly enumerable in file order — the GUI's
+/// transcript replay needs messages *and* turn markers interleaved, which
+/// [`Session::load_messages`] discards. See [`Session::entries`].
+#[derive(Debug, Clone)]
+pub enum SessionEntry {
+    Header(SessionHeader),
+    Marker(TurnMarker),
+    Message(SessionRecord),
+}
+
 /// Cap on the prompt snippet stored in a [`TurnMarker`].
 const MARKER_PROMPT_CHARS: usize = 120;
 
@@ -166,7 +176,13 @@ pub fn summaries(dir: &Path) -> Vec<SessionSummary> {
             }
             match serde_json::from_str::<SessionLine>(&line) {
                 Ok(SessionLine::Message(record)) => {
-                    messages += 1;
+                    // System notes (hook context, background-task notes) are
+                    // not conversation: a session holding nothing else has had
+                    // nothing said in it, and listing it as "(no prompt)" is
+                    // noise in both the /resume picker and the GUI sidebar.
+                    if record.message.role != Role::System {
+                        messages += 1;
+                    }
                     if first_user.is_none() && record.message.role == Role::User {
                         first_user = record.message.content.lines().next().map(str::to_string);
                     }
@@ -219,11 +235,22 @@ impl Session {
     /// of truncating the earlier file. The current working directory is
     /// recorded in a header line so resume can filter by project.
     pub fn create(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
         let cwd = std::env::current_dir()
             .ok()
             .map(|path| path.display().to_string());
+        Self::create_with_cwd(dir, cwd)
+    }
+
+    /// [`Session::create`] with an explicit working directory recorded in
+    /// the header instead of the process cwd — the GUI server runs tasks in
+    /// workspaces other than its own.
+    pub fn create_in(dir: &Path, cwd: &Path) -> Result<Self> {
+        Self::create_with_cwd(dir, Some(cwd.display().to_string()))
+    }
+
+    fn create_with_cwd(dir: &Path, cwd: Option<String>) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
         for attempt in 0u32..1000 {
             let id = if attempt == 0 {
                 stamp.clone()
@@ -374,6 +401,29 @@ impl Session {
         let line = serde_json::to_string(&marker).context("serializing turn marker")?;
         writeln!(file, "{line}").with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
+    }
+
+    /// Every line of this session in file order — header, turn markers, and
+    /// message records interleaved as written. Corrupt lines are skipped.
+    /// Powers the GUI's transcript replay, which renders turn boundaries
+    /// between messages.
+    pub fn entries(&self) -> Result<Vec<SessionEntry>> {
+        let file = std::fs::File::open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut entries = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionLine>(&line) {
+                Ok(SessionLine::Header(header)) => entries.push(SessionEntry::Header(header)),
+                Ok(SessionLine::Marker(marker)) => entries.push(SessionEntry::Marker(marker)),
+                Ok(SessionLine::Message(record)) => entries.push(SessionEntry::Message(record)),
+                Err(err) => tracing::warn!("skipping corrupt session line: {err}"),
+            }
+        }
+        Ok(entries)
     }
 
     /// Load all messages back (for `--resume`). Turn markers, the header,

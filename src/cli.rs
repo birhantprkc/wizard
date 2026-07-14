@@ -91,8 +91,9 @@ pub struct Cli {
     #[arg(long)]
     pub gateway: bool,
 
-    /// Sign in to a provider account instead of starting the TUI. Currently
-    /// `xai`: OAuth in the browser, tokens stored in ~/.wizard/xai_oauth.json.
+    /// Sign in to a provider account instead of starting the TUI: `xai`
+    /// (SuperGrok) or `chatgpt` (Plus/Pro/Team). OAuth in the browser; tokens
+    /// are stored under ~/.wizard/.
     #[arg(long, value_name = "PROVIDER")]
     pub login: Option<String>,
 
@@ -216,6 +217,45 @@ pub enum Command {
     Harness {
         #[command(subcommand)]
         cmd: HarnessCmd,
+    },
+
+    /// Serve the browser GUI: a local web app (task sidebar, streaming
+    /// conversation, git panel) over the same agent core as the TUI. Binds
+    /// 127.0.0.1 only; agents are built lazily per task, so the server
+    /// starts fine without a reachable provider.
+    Gui {
+        /// Port to bind on 127.0.0.1. Fails when the port is taken.
+        #[arg(long, default_value_t = 4680)]
+        port: u16,
+
+        /// Do not open the browser after binding.
+        #[arg(long)]
+        no_open: bool,
+
+        /// Serve GUI assets from this directory instead of the embedded
+        /// copies (dev mode: edit gui/assets/ and reload).
+        #[arg(long, value_name = "DIR")]
+        assets: Option<PathBuf>,
+    },
+
+    /// Open the GUI as a native desktop app: the same local server as
+    /// `wizard gui`, on an OS-chosen loopback port, in a window driven by the
+    /// system webview (WebKitGTK / WKWebView — no bundled browser). Needs a
+    /// build with `--features desktop`; the plain binary says so and points at
+    /// `wizard gui`. See docs/desktop.md.
+    App {
+        /// Open the webview inspector alongside the window.
+        #[arg(long)]
+        devtools: bool,
+
+        /// Add Wizard to the launcher (Linux: ~/.local/share/applications;
+        /// macOS: ~/Applications/Wizard.app) and exit. Idempotent.
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+
+        /// Remove the launcher entry written by --install and exit.
+        #[arg(long)]
+        uninstall: bool,
     },
 
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per

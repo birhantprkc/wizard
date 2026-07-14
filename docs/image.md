@@ -2,6 +2,8 @@
 
 The native `generate_image` tool creates images from a text prompt via an OpenAI-compatible `POST {base}/images/generations` endpoint. On xAI that is the Imagine API (`https://api.x.ai/v1/images/generations`). The result is always written to a local file so the agent (and you) can open it.
 
+It also comes back *inline*: the image rides on the tool result, so it is rendered in the TUI and the GUI, kept in the session's image store, and handed back to the model — which can then see what it made. See [architecture.md](architecture.md#images).
+
 ## generate_image
 
 - **Arguments**

@@ -1,10 +1,21 @@
 [package]
 name = "wizard"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 license = "MIT"
 description = "One line. Your sovereign agent. Self-extending. Bring any model."
 repository = "https://github.com/teddytennant/wizard"
+
+[features]
+default = []
+
+# Native desktop shell (`wizard app`): a tao window with a wry webview over the
+# in-process GUI server. OFF by default and it must stay that way — wry links
+# the system webview (WebKitGTK on Linux), so a default-featured build would
+# gain a hard runtime dependency on libwebkit2gtk that every TUI and CLI user
+# would have to satisfy just to start the binary, and it could no longer be
+# linked statically against musl.
+desktop = ["dep:tao", "dep:wry"]
 
 [dependencies]
 # FUSION debate engine (provider-agnostic core; drives /fusion mode)
@@ -21,6 +32,10 @@ async-trait = "0.1"
 
 # Ollama HTTP (rustls so the binary has no OpenSSL link dependency)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Browser GUI (`wizard gui`): local HTTP server + WebSocket event stream +
+# multipart uploads (attachments)
+axum = { version = "0.8", features = ["ws", "multipart"] }
 
 # OAuth sign-in (xAI): PKCE hashing, base64url tokens, randomness
 sha2 = "0.10"
@@ -45,6 +60,17 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
+
+# Images in the TUI transcript (`src/image_view.rs`): terminal capability
+# detection plus the kitty / sixel / iTerm2 encoders, with unicode half-blocks
+# as the universal floor. Held on the 9.x line deliberately — 10+ moves to
+# ratatui 0.30, which would link a *second* copy of ratatui into the binary and
+# make its widgets untypeable against our 0.29 `Frame`. Default features are off
+# because they pull `chafa` in over pkg-config (a C library we will not require
+# to build wizard) and the whole of `image`'s codec set; we take exactly the
+# four formats `llm::Image` can carry.
+ratatui-image = { version = "9", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 # Plain-terminal progress (bench runs, headless turns, llama-server waits).
 # Defaults are minimal (just unicode-width, which the braille frames need).
@@ -78,6 +104,23 @@ semver = "1"
 # Config/skills sync (`wizard sync`): ed25519 signatures over the bundle
 # manifest. Keys are seeded from getrandom — no rand/rand_core dependency.
 ed25519-dalek = "2"
+
+# Desktop shell (`--features desktop` only): window + system webview, the two
+# libraries Tauri itself is built on. No Electron, no bundled Chromium — wry
+# drives WebKitGTK on Linux and WKWebView on macOS. Optional, so a default
+# build links neither.
+# `default-features = false` drops tao's `dbus` feature, which exists for the
+# tray and global shortcuts this shell does not use. Keeping it would make
+# libdbus-1-dev a build dependency of every Linux desktop build for nothing.
+# `x11` and `rwh_06` are the rest of tao's default set and are load-bearing.
+tao = { version = "0.35", optional = true, default-features = false, features = [
+  "x11",
+  "rwh_06",
+] }
+# `devtools`: wry compiles the inspector out of release builds unless it is
+# asked for (it is `cfg(any(debug_assertions, feature = "devtools"))`), and
+# `wizard app --devtools` has to work in the binary people actually install.
+wry = { version = "0.55", optional = true, features = ["devtools"] }
 
 # Process-group kill for background tasks (`task_kill`, timeouts)
 [target.'cfg(unix)'.dependencies]

@@ -24,6 +24,8 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload`. Gated by a clean `cargo build` and a smoke test, it can also rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
 - **Runtime MCP.** stdio and HTTP MCP servers merge into the tool registry without a rebuild: the path for computer use, browser control, and databases. → [Self-extension](docs/evolve.md)
 - **Genie / Sovereign modes, plus `--continuous`.** An interactive direct-action TUI, a headless self-directing mode, or a perpetual mission that compacts its own context and self-heals through outages. → [Modes](docs/modes.md)
+- **Browser GUI and a desktop app** *(preview)*. `wizard gui` serves the same agent core as the TUI on 127.0.0.1: the transcript, a subagent rail you can open a running agent from, and a git panel whose changed files open their diff. `wizard app` puts that in a native window through the system webview — no bundled Chromium, ~10MB rather than ~200MB — and `wizard app --install` adds Wizard to your launcher. New in 1.3 and still settling; the TUI remains the surface everything ships to first. → [Desktop app](docs/desktop.md)
+- **Persistent memory.** The agent keeps what it learns as plain markdown under `~/.wizard/memory/<project>/` — typed (`user` / `feedback` / `project` / `reference`), linked with `[[name]]`, indexed into the system prompt each session. `/memory` reads it back; it is your file, not a black box. → [Memory](docs/memory.md)
 - **`wizard bench`.** Records your real tasks as trajectories and replays them in isolated git worktrees to score builds and models against each other. "The new model is better" becomes a number. → [Bench](docs/bench.md)
 - **Messaging gateway.** Run headless as a bot you talk to from your phone (Telegram), each inbound message a sovereign agent turn in your project. → [Gateway](docs/gateway.md)
 - **Make it your own.** After a deep evolve modifies its source, `/publish` forks upstream to your GitHub and hands out a one-line installer for your variant. → [Fork and distribute](docs/market.md)
@@ -45,6 +47,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 
 - [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS), tiers, providers, first run, in-place updates (`wizard update`), troubleshooting
 - [Usage](docs/usage.md): slash commands, `wizard agents`, the subagent rail, token usage and cost, todos, project instructions
+- [Desktop app](docs/desktop.md): `wizard app` — the GUI in a native window, and the launcher entry (`WIZARD_APP=1` to install)
 - [Gateway](docs/gateway.md): run Wizard as a Telegram bot
 - [Modes](docs/modes.md): genie, sovereign, and continuous
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
@@ -52,6 +55,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - [Bench](docs/bench.md): record/replay trajectories to score builds and models
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
+- [Memory](docs/memory.md): what Wizard remembers between sessions, and `/memory`
 - [Hooks](docs/hooks.md) · [Tasks](docs/tasks.md) · [Web](docs/web.md) · [Headless output](docs/headless.md) · [Checkpoints](docs/checkpoints.md)
 - [Doctor & status](docs/doctor.md): `wizard doctor` diagnostics, `/status`
 - [Scheduler](docs/scheduler.md): cron-scheduled headless runs

@@ -1,0 +1,2388 @@
+/* Wizard GUI — dark three-pane shell.
+   Palette, type and radii follow docs/gui-design-spec.md. Dark theme only. */
+
+/* Bundled with the binary (gui/assets/fonts/, OFL) rather than hoped for: the
+   system fallback on a plain Linux box is DejaVu Sans, and it shows. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("./fonts/inter.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("./fonts/jetbrains-mono.woff2") format("woff2");
+}
+
+:root {
+  --canvas: #0c0c0e;
+  --panel: #141416;
+  --panel-2: #191a1d;
+  --raised: #202024;
+  --hover: #1a1a1d;
+  --hover-2: #232327;
+  --hairline: #26262a;
+  --hairline-soft: #1f1f23;
+  --text: #ececee;
+  --text-soft: #d2d2d7;
+  --text-mid: #b6b6bd;
+  --text-muted: #86868e;
+  --text-faint: #5c5c64;
+  /* No brand hue. Emphasis is brightness: the "accent" is simply light on
+     dark, and the one filled button per view inverts to it. Colour is reserved
+     for meaning — additions, deletions, errors, a state needing attention. */
+  --accent: #ececee;
+  --accent-hover: #ffffff;
+  --on-accent: #0c0c0e;
+  --green: #3fb96a;
+  --red: #e5484d;
+  --amber: #d8a13a;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --sidebar-w: 240px;
+  --context-w: 300px;
+  --content-max: 720px;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* Anything the user could paste into a terminal — paths, model tags, kinds,
+   URLs, branches — is set in mono. It is a literal, not prose. */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  /* Inter's contextual alternates and disambiguated glyphs; tabular figures so
+     ages, token counts and diffstats do not shift width as they tick. */
+  font-feature-settings: "cv05" 1, "cv08" 1, "ss03" 1;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+::selection {
+  background: rgba(236, 236, 238, 0.18);
+}
+
+:focus-visible {
+  outline: 1px solid rgba(236, 236, 238, 0.45);
+  outline-offset: 1px;
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2e2e33 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2e2e33;
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Icons */
+.icon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+/* ------------------------------------------------------------------ */
+/* App frame                                                            */
+/* ------------------------------------------------------------------ */
+
+.app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Collapse-ready hooks (no JS required to exist) */
+.app.sidebar-collapsed .sidebar {
+  display: none;
+}
+.app.panel-collapsed .context-panel {
+  display: none;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--hairline);
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sidebar                                                              */
+/* ------------------------------------------------------------------ */
+
+.sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 10px;
+}
+
+/* Aligns with the topbar; names the directory a new chat opens in. */
+.sidebar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 52px;
+  padding: 0 4px 0 8px;
+  flex-shrink: 0;
+}
+.brand {
+  min-width: 0;
+  padding-left: 4px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+.icon-btn:hover {
+  background: var(--hover-2);
+  color: var(--text-soft);
+}
+
+.sidebar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 6px;
+  flex-shrink: 0;
+}
+
+.side-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
+  color: var(--text-soft);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-align: left;
+}
+.side-row:hover {
+  background: var(--hover);
+}
+.side-row-icon {
+  color: #b4b4ba;
+}
+.side-row-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.side-row-hint {
+  color: var(--text-faint);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.tasks-header {
+  display: flex;
+  align-items: center;
+  padding: 20px 10px 4px;
+  flex-shrink: 0;
+}
+.tasks-title {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.task-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+.ws-group {
+  margin-top: 6px;
+}
+.ws-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px 5px;
+  color: #b9b9bf;
+  font-size: 13px;
+}
+.ws-icon {
+  color: var(--text-muted);
+}
+.ws-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.ws-name {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ws-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 6px;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 6px 8px 6px 6px;
+  border-radius: var(--r-sm);
+  color: var(--text-mid);
+  font-size: 13px;
+  text-align: left;
+}
+.task-row:hover:not(.selected) {
+  background: #19191d;
+}
+.task-row.selected {
+  background: var(--hover-2);
+  color: var(--text);
+}
+
+.task-gutter {
+  width: 12px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.task-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.task-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.task-age {
+  color: var(--text-faint);
+  font-size: 12px;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Top bar                                                              */
+/* ------------------------------------------------------------------ */
+
+.topbar {
+  height: 52px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 14px 0 18px;
+  border-bottom: 1px solid #212125;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.topbar-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex-shrink: 1;
+  max-width: 46ch;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #1e1e22;
+  border-radius: var(--r-sm);
+  padding: 5px 10px;
+  color: var(--text-mid);
+  font-size: 12.5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+button.chip:hover {
+  background: var(--hover-2);
+  color: var(--text-soft);
+}
+.chip .icon svg {
+  width: 14px;
+  height: 14px;
+}
+.chip-icon {
+  color: var(--text-muted);
+}
+.chip-caret {
+  color: var(--text-faint);
+}
+.chip-branch .chip-label,
+.chip-repo .chip-label,
+.model-select .chip-label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.ctx-row.static .ctx-label,
+.git-file-path {
+  font-family: var(--font-mono);
+}
+.chip-caret svg {
+  width: 12px;
+  height: 12px;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Conversation                                                         */
+/* ------------------------------------------------------------------ */
+
+.conversation {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.transcript-inner {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: 24px 32px 190px;
+}
+
+/* What you said: a bubble, hugging its own text, on your side of the column.
+   What the agent said stays plain prose — it is long-form, and it is interleaved
+   with tool rows that a bubble would fight with. */
+.prompt-card {
+  width: fit-content;
+  max-width: 78%;
+  margin: 10px 0 36px auto;
+  padding: 10px 15px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 16px 16px 5px 16px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.prompt-card + .prompt-card {
+  margin-top: -26px;
+  border-radius: 16px 5px 5px 16px;
+}
+/* What you attached, on the message it went out with. The thumbnails are
+   smaller than the transcript's: they are part of a message, not the subject
+   of one. */
+.prompt-images,
+.prompt-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.prompt-images + .prompt-files {
+  margin-top: 6px;
+}
+/* An attachment with nothing said about it: no gap above nothing. */
+.prompt-images:first-child,
+.prompt-files:first-child {
+  margin-top: 0;
+}
+.prompt-images .image-thumb {
+  height: 112px;
+  min-width: 60px;
+}
+
+.worked-section {
+  margin-bottom: 8px;
+}
+.worked-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 2px 0;
+  border-radius: 6px;
+}
+.worked-head:hover {
+  color: #b6b6bc;
+}
+.worked-caret {
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+.worked-caret svg {
+  width: 13px;
+  height: 13px;
+}
+.worked-rule {
+  height: 1px;
+  background: #232327;
+  margin: 12px 0 22px;
+}
+.worked-section.collapsed .worked-body {
+  display: none;
+}
+.worked-section.collapsed .worked-caret {
+  transform: rotate(-90deg);
+}
+.worked-section.collapsed .worked-rule {
+  margin-bottom: 8px;
+}
+
+.msg-text {
+  color: var(--text-soft);
+  font-size: 14px;
+  line-height: 1.72;
+  letter-spacing: -0.003em;
+  margin: 16px 0;
+}
+
+/* Tool rows */
+.tool-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 20px 0;
+  font-size: 13.5px;
+}
+.tool-icon {
+  color: var(--text-muted);
+}
+.tool-name {
+  color: var(--text-mid);
+  font-weight: 500;
+}
+.tool-args {
+  color: var(--text-muted);
+}
+.tool-cmd {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+.tool-status {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  text-decoration-color: #4a4a50;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #1e1e22;
+  border-radius: 7px;
+  padding: 3px 9px 3px 5px;
+  color: var(--text-soft);
+  font-size: 12.5px;
+}
+.file-chip:hover {
+  background: var(--hover-2);
+}
+.file-chip-icon {
+  display: inline-flex;
+}
+.file-chip-icon svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.diffstat-add {
+  color: var(--green);
+  font-weight: 500;
+  font-size: 12.5px;
+}
+.diffstat-del {
+  color: var(--red);
+  font-weight: 500;
+  font-size: 12.5px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer                                                             */
+/* ------------------------------------------------------------------ */
+
+.composer-wrap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  justify-content: center;
+  padding: 44px 32px 22px;
+  background: linear-gradient(
+    to top,
+    rgba(13, 13, 15, 0.97) 55%,
+    rgba(13, 13, 15, 0)
+  );
+  pointer-events: none;
+}
+
+.composer {
+  position: relative; /* the `/` palette hangs off it */
+  pointer-events: auto;
+  width: 100%;
+  max-width: var(--content-max);
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  padding: 12px 12px 10px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+/* A file is over the chat: the composer is where it will land. */
+.composer.dropping {
+  border-color: #3c556f;
+  background: #16171a;
+}
+
+.composer-input {
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 24px;
+  max-height: 160px;
+  margin-bottom: 10px;
+}
+.composer-input::placeholder {
+  color: #6b6b72;
+}
+
+.composer-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ghost-chip {
+  background: transparent;
+  color: var(--text-muted);
+  padding: 5px 8px;
+}
+button.ghost-chip:hover {
+  background: var(--hover-2);
+  color: var(--text-mid);
+}
+
+.composer-spacer {
+  flex: 1;
+}
+
+.spinner-icon {
+  display: inline-flex;
+  color: var(--text-faint);
+  margin: 0 6px;
+}
+.spinner-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.spinner-icon.spinning {
+  color: var(--text-muted);
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.send-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+.send-btn:hover {
+  background: var(--accent-hover);
+}
+.send-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* Working: the same button stops the agent. A ring turns around it so the
+   button also reports that something is running — no second control needed. */
+.send-btn.working {
+  position: relative;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+}
+.send-btn.working:hover {
+  background: var(--hover-2);
+  color: var(--text);
+}
+.send-btn.working::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  border-top-color: var(--text-muted);
+  border-right-color: var(--text-faint);
+  animation: spin 0.9s linear infinite;
+}
+.send-btn.working svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer: staged attachments, and the `/` palette                    */
+/* ------------------------------------------------------------------ */
+
+/* What will go up with the next message: a thumbnail if the file is one you
+   can look at, its type if it is not. */
+.attach-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 230px;
+  padding: 4px 4px 4px 5px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  color: var(--text-soft);
+  font-size: 12.5px;
+}
+.attach-chip.pending {
+  opacity: 0.6;
+}
+.attach-chip.failed {
+  border-color: rgba(229, 72, 77, 0.45);
+  color: #c96a6a;
+}
+.attach-thumb {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  display: block;
+  border-radius: 5px;
+  object-fit: cover;
+}
+.attach-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.attach-icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+.attach-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.attach-size {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.attach-chip.failed .attach-size {
+  color: inherit;
+}
+.attach-remove {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-faint);
+}
+.attach-remove:hover {
+  background: var(--hover-2);
+  color: var(--text);
+}
+.attach-remove svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* The palette: what a leading `/` could become, over the composer it types
+   into — the same surface as the menus, because it is one. */
+.palette {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid #2e2e33;
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 5px;
+  z-index: 30;
+}
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: var(--text-mid);
+  font-size: 13px;
+  text-align: left;
+}
+/* Hover and keyboard selection are the same state: there is one cursor here. */
+.palette-item.active {
+  background: var(--hover-2);
+}
+.palette-name {
+  flex-shrink: 0;
+  color: var(--text);
+}
+.palette-args {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+.palette-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+/* Terminal-only (/vim, /quit, /exit): listed so the menu can say what it is and
+   why it is not here, dimmed so it does not read as something to pick. */
+.palette-item.unavailable .palette-name,
+.palette-item.unavailable .palette-args,
+.palette-item.unavailable .palette-detail {
+  color: var(--text-faint);
+}
+.palette-item.unavailable.active {
+  background: var(--hover);
+}
+
+/* ------------------------------------------------------------------ */
+/* Context panel                                                        */
+/* ------------------------------------------------------------------ */
+
+/* A rail, not a floating card: it belongs to the window edge. */
+.context-panel {
+  width: var(--context-w);
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 14px 14px 16px;
+  border-left: 1px solid var(--hairline-soft);
+}
+
+.context-card {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.ctx-section {
+  padding: 0;
+}
+
+/* The section a slash command just pointed at (`/subagents`). It was already on
+   screen, so all that is left to add is where to look — and an outline, not a
+   background, because nothing in the panel may shift to say it. */
+@keyframes ctx-flash {
+  from {
+    outline-color: var(--text-faint);
+  }
+  to {
+    outline-color: transparent;
+  }
+}
+.ctx-section.flash {
+  outline: 1px solid transparent;
+  outline-offset: 6px;
+  border-radius: var(--r-sm);
+  animation: ctx-flash 1.4s ease-out;
+}
+
+.ctx-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 8px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.ctx-header-right {
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ctx-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 6px;
+  border-radius: var(--r-sm);
+  color: var(--text-soft);
+  font-size: 13.5px;
+  text-align: left;
+}
+.ctx-row:hover {
+  background: #1e1e22;
+}
+.ctx-icon {
+  color: var(--text-muted);
+}
+.ctx-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctx-right {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.ctx-right .add {
+  color: var(--green);
+}
+.ctx-right .del {
+  color: var(--red);
+}
+
+.goal-row {
+  display: flex;
+  gap: 10px;
+  padding: 2px 6px;
+}
+.goal-icon {
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.goal-main {
+  min-width: 0;
+}
+.goal-text {
+  color: var(--text-soft);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.goal-meta {
+  margin-top: 7px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+/* The context meter: how full the next model call is. Its own section, with its
+   own words ("next turn"), because the Goal card's token count above it is the
+   session's lifetime spend — a different number that must not read as this one. */
+.meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 3px 6px;
+}
+.meter {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: #232327;
+  overflow: hidden;
+}
+.meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--text-mid);
+  transition: width 0.25s ease;
+}
+/* Nearly full: the next turn is where the history starts getting dropped. */
+.meter-fill.high {
+  background: var(--amber);
+}
+.meter-text {
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+.progress-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 5px 6px;
+}
+.check-icon {
+  color: var(--text-faint);
+  margin-top: 1px;
+}
+.check-icon.done {
+  color: var(--green);
+}
+.check-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.progress-text {
+  color: var(--text-mid);
+  font-size: 13px;
+  line-height: 1.5;
+  min-width: 0;
+}
+.progress-text.done {
+  color: #6b6b72;
+  text-decoration: line-through;
+  text-decoration-color: #4f4f56;
+}
+
+/* ------------------------------------------------------------------ */
+/* Subagents: a row per run in the panel, and the run's own pane        */
+/* ------------------------------------------------------------------ */
+
+/* Three lines to a row — name, what it is doing, how far it has got — so the
+   row must hang from its top, not center on it. */
+.subagent-row {
+  align-items: flex-start;
+  gap: 9px;
+}
+.subagent-row.open {
+  background: #1e1e22;
+}
+
+/* The status dot. Running pulses, exactly as the TUI's rail dot does; the
+   resting colors are the ones the rest of the GUI already uses for a good
+   outcome, a bad one, and one that needs a second look. */
+.sub-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+.sub-dot.running {
+  background: var(--text);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.sub-dot.done {
+  background: var(--green);
+}
+.sub-dot.failed {
+  background: var(--red);
+}
+.sub-dot.budget {
+  background: var(--amber);
+}
+
+.sub-main {
+  min-width: 0;
+  flex: 1;
+}
+.sub-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sub-name {
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.sub-badge {
+  margin-left: auto;
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--text-mid);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 15px;
+  text-align: center;
+}
+.sub-activity,
+.sub-meta {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sub-activity {
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+.sub-meta {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+/* The pane: a second view where the chat's transcript would be — a subagent
+   run's own transcript, or a changed file's diff. */
+.pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pane-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.pane-head {
+  flex-shrink: 0;
+  padding: 12px 32px 12px;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+.pane-head-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+.pane-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-right: 4px;
+}
+.pane-back-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.pane-icon {
+  color: var(--text-muted);
+}
+.pane-name {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.pane-status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.pane-status.failed {
+  color: var(--red);
+}
+.pane-status.budget {
+  color: var(--amber);
+}
+.pane-spacer {
+  flex: 1;
+}
+.pane-meta {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.pane-task {
+  max-width: var(--content-max);
+  margin: 5px auto 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* The diff pane: one changed file against HEAD. Wider than the chat's column —
+   a diff is code, and folding it into 720px only makes it harder to read. */
+.diff-pane .pane-head-row {
+  max-width: none;
+}
+.pane-path {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /* A long path elides at its front: the file name is the part you are here for. */
+  direction: rtl;
+  text-align: left;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.diff-stat {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.diff-stat .add {
+  color: var(--green);
+}
+.diff-stat .del {
+  color: var(--red);
+}
+
+/* Long lines scroll here, inside the view — the page itself never scrolls
+   sideways. Rows are `max-content` wide so their tint runs the whole line
+   rather than stopping at the fold. */
+.diff-body {
+  overflow-x: auto;
+  padding: 12px 0 140px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 4;
+}
+.diff-hunk,
+.diff-line {
+  width: max-content;
+  min-width: 100%;
+  padding: 0 32px;
+  white-space: pre;
+}
+.diff-hunk {
+  margin-top: 14px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hairline-soft);
+  color: var(--text-faint);
+}
+.diff-hunk:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+.diff-ctx {
+  color: var(--text-muted);
+}
+.diff-add {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 11%, transparent);
+}
+.diff-del {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 11%, transparent);
+}
+/* Git's own note about the file ("\ No newline at end of file"), not a line of it. */
+.diff-meta {
+  color: var(--text-faint);
+}
+/* Prose, not a diff line: what the file is (binary), what it is not (a line
+   change), or why there is nothing here. */
+.diff-note {
+  padding: 14px 32px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+.diff-note.error {
+  color: var(--red);
+}
+
+/* The image pane: one image at its own size. Like the diff, it is not prose —
+   folding a 2048px render into a 720px column is the one thing this view exists
+   not to do — so the header runs the full width and the image scrolls, in here,
+   rather than being shrunk to fit. */
+.image-pane .pane-head-row {
+  max-width: none;
+}
+/* The path takes the room; what the file *is* keeps its line. */
+.image-pane .pane-meta {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.image-body {
+  padding: 20px 32px 140px;
+}
+.image-full {
+  display: block;
+  max-width: 100%;
+}
+.image-note {
+  padding: 14px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.image-note.error {
+  color: var(--red);
+}
+
+/* ------------------------------------------------------------------ */
+/* Live streaming: state dots, thinking, tool groups, system rows       */
+/* ------------------------------------------------------------------ */
+
+.hidden {
+  display: none !important;
+}
+
+.task-dot.working {
+  background: var(--text);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.task-dot.attn {
+  background: #f59e0b;
+}
+.task-dot.failed {
+  background: var(--red);
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.worked-section.live .worked-head {
+  color: #b6b6bc;
+}
+
+/* Thinking: dimmed collapsible reasoning block */
+.thinking-block {
+  margin: 14px 0;
+  border-left: 2px solid #26262b;
+  padding-left: 12px;
+}
+.thinking-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 2px 0;
+}
+.thinking-head:hover {
+  color: var(--text-muted);
+}
+.thinking-caret {
+  transition: transform 0.12s ease;
+}
+.thinking-caret svg {
+  width: 12px;
+  height: 12px;
+}
+.thinking-body {
+  color: #74747b;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  margin-top: 6px;
+}
+.thinking-block.collapsed .thinking-body {
+  display: none;
+}
+.thinking-block.collapsed .thinking-caret {
+  transform: rotate(-90deg);
+}
+
+/* Tool groups: aggregated Explored rows with an expandable call list */
+.tool-group {
+  margin: 20px 0;
+}
+.tool-group .tool-row {
+  margin: 0;
+}
+.tool-row-btn {
+  text-align: left;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.tool-row-btn:hover .tool-name {
+  color: var(--text-soft);
+}
+.tool-sublist {
+  margin: 6px 0 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tool-subline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.tool-subline .subline-noun {
+  color: var(--text-faint);
+  flex-shrink: 0;
+  min-width: 58px;
+}
+.tool-subline .subline-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-subline.failed .subline-text {
+  color: #b06060;
+}
+.tool-row.pending .tool-name,
+.tool-subline.pending {
+  opacity: 0.65;
+}
+.tool-row.pending .tool-name::after,
+.tool-subline.pending .subline-text::after {
+  content: '…';
+}
+.file-chip.pending {
+  opacity: 0.65;
+}
+.file-chip.failed {
+  border: 1px solid rgba(239, 68, 68, 0.45);
+}
+.tool-name.mono-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* Images: what the model drew, or what a tool returned. The thumbnails are one
+   row that wraps, each a fixed height — the frame says how many bytes an image
+   is, never how many pixels, so the box has to be decided before the file
+   arrives or the transcript would jump as each one decodes. Width follows the
+   aspect ratio, which is the only thing that may move, and only sideways. */
+.image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 16px 0;
+}
+/* On a tool's card: tucked under its row, aligned with the call list. */
+.image-strip.tool-images {
+  margin: -8px 0 20px 24px;
+}
+.image-thumb {
+  height: 168px;
+  min-width: 96px;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.image-thumb:hover {
+  border-color: #34343a;
+}
+.image-thumb-img {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
+/* A file that is gone: the same box, saying so, naming itself. */
+.image-thumb.broken {
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 14px;
+  max-width: 280px;
+  border-style: dashed;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: default;
+}
+.image-broken-icon {
+  color: var(--text-faint);
+}
+.image-broken-path {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  color: var(--text-faint);
+}
+
+/* System rows: notices, errors, transient retry note */
+.system-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 14px 0;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.system-row.error {
+  color: #c96a6a;
+}
+.system-row.retrying {
+  color: var(--text-muted);
+}
+.system-row .spinner-icon {
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Gate cards: plan review + interview                                  */
+/* ------------------------------------------------------------------ */
+
+.gate-card {
+  background: var(--panel);
+  border: 1px solid #2c2c31;
+  border-radius: var(--r-md);
+  padding: 14px 16px;
+  margin: 18px 0;
+}
+.gate-card.resolved {
+  opacity: 0.75;
+}
+.gate-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-mid);
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.gate-icon {
+  color: var(--text-muted);
+}
+
+.plan-body {
+  color: var(--text-soft);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+/* Rendered markdown (app.js) — assistant messages, subagent messages, plan
+   cards. Everything is scoped to `.md`, so the tags the renderer emits are
+   styled in the shell's vocabulary rather than the browser's defaults. The
+   surrounding block (.msg-text, .plan-body) still owns colour and type size;
+   these rules only own the rhythm and the furniture. */
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 1em;
+  /* A URL or a path with no spaces in it must not widen the column. */
+  overflow-wrap: anywhere;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 1.6em 0 0.6em;
+}
+.md h1 {
+  font-size: 1.28em;
+}
+.md h2 {
+  font-size: 1.16em;
+}
+.md h3 {
+  font-size: 1.05em;
+}
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1em;
+}
+.md ul,
+.md ol {
+  margin: 0 0 1em;
+  padding-left: 1.6em;
+}
+.md ul {
+  list-style: disc;
+}
+.md ul ul {
+  list-style: circle;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.25em 0;
+  /* As on a paragraph: a path or a URL in a bullet must not widen the column. */
+  overflow-wrap: anywhere;
+}
+/* A checklist item: the box replaces the bullet the item would have had. */
+.md li.md-task {
+  list-style: none;
+  margin-left: -1.25em;
+}
+.md-check {
+  margin: 0 0.5em 0 0;
+  accent-color: var(--text-faint);
+  vertical-align: middle;
+}
+/* A nested list is part of the item above it, not a new stanza. */
+.md li > ul,
+.md li > ol {
+  margin: 0.25em 0 0;
+}
+.md li::marker {
+  color: var(--text-faint);
+}
+.md strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.md em {
+  font-style: italic;
+}
+.md del {
+  color: var(--text-muted);
+}
+.md blockquote {
+  margin: 0 0 1em;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 2px solid var(--hairline);
+  color: var(--text-muted);
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  margin: 1.6em 0;
+}
+.md-link {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--text-faint);
+  text-underline-offset: 2px;
+}
+.md-link:hover {
+  text-decoration-color: var(--text);
+}
+.md-code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--hover-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.md-pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  background: #101012;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 1em;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text-mid);
+}
+.md-pre code {
+  font: inherit;
+  background: none;
+  padding: 0;
+}
+/* A fenced block that named its language says so, above the code. */
+.md-code-block {
+  margin: 0 0 1em;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #101012;
+}
+.md-code-lang {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--panel-2);
+  color: var(--text-muted);
+}
+.md-code-block .md-pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+
+/* A wide table scrolls inside its own box. The transcript column never does. */
+.md-table-wrap {
+  margin: 0 0 1em;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+.md-table {
+  border-collapse: collapse;
+  /* Sized by its content, but never narrower than the column it sits in — so a
+     wide table overflows into the scroll box above, and a narrow one fills. */
+  width: max-content;
+  min-width: 100%;
+  font-size: 0.93em;
+}
+.md-table th,
+.md-table td {
+  padding: 7px 12px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+.md-table th {
+  color: var(--text);
+  font-weight: 600;
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.md-table td {
+  color: var(--text-soft);
+}
+.md-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+/* The alignment row is a promise about the column; keep it. */
+.md-table .md-al-left {
+  text-align: left;
+}
+.md-table .md-al-center {
+  text-align: center;
+}
+.md-table .md-al-right {
+  text-align: right;
+}
+
+.iv-q {
+  margin: 10px 0;
+}
+.iv-question {
+  color: var(--text-soft);
+  font-size: 13.5px;
+  margin-bottom: 6px;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+/* Buttons: one filled accent per view, everything else a quiet outline or a
+   plain text action. */
+.btn {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-mid);
+  background: var(--panel-2);
+}
+.btn:hover {
+  border-color: #34343a;
+  color: var(--text);
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.btn.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn.quiet,
+.btn.ghost {
+  background: none;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+.btn.quiet:hover,
+.btn.ghost:hover {
+  color: var(--text);
+  background: var(--hover-2);
+}
+.btn-sm {
+  padding: 4px 10px;
+}
+
+/* A text action inside a row: no chrome until you reach for it. */
+.link {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 3px 5px;
+  border-radius: 5px;
+}
+.link:hover {
+  color: var(--text);
+  background: var(--hover-2);
+}
+.link.danger:hover {
+  color: var(--red);
+}
+
+.input {
+  width: 100%;
+  background: #0e0e10;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 7px 9px;
+  outline: none;
+  resize: vertical;
+}
+.input.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.input:focus {
+  border-color: #3c556f;
+  background: #101114;
+}
+.input::placeholder {
+  color: #55555c;
+}
+.input.num {
+  width: 84px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.input[readonly] {
+  color: var(--text-muted);
+}
+.plan-feedback {
+  margin-top: 10px;
+}
+.iv-answer {
+  min-height: 32px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer: model menu, stop button                                    */
+/* ------------------------------------------------------------------ */
+
+.spinner-btn {
+  margin: 0 2px;
+}
+.spinner-btn:not(.active) {
+  cursor: default;
+  background: none;
+}
+.spinner-btn.active:hover {
+  background: var(--hover-2);
+}
+.spinner-btn .spinner-icon {
+  margin: 0;
+}
+
+.menu-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  min-width: 220px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid #2e2e33;
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 5px;
+  z-index: 30;
+}
+.menu-head {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 7px 9px 3px;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: var(--text-mid);
+  font-size: 13px;
+}
+.menu-item:hover {
+  background: var(--hover-2);
+  color: var(--text-soft);
+}
+.menu-item.selected {
+  color: var(--text);
+}
+.menu-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-item-hint {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+.menu-check {
+  display: inline-flex;
+  color: var(--text-mid);
+}
+.menu-check svg {
+  width: 13px;
+  height: 13px;
+}
+/* Composer menus open upward (see .menu); the topbar's open downward. */
+.topbar .menu {
+  top: calc(100% + 8px);
+  bottom: auto;
+  left: 0;
+  right: auto;
+}
+
+.menu-note {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 8px 9px;
+  line-height: 1.45;
+}
+.menu-note.error {
+  color: var(--red);
+}
+.menu-foot {
+  border-top: 1px solid var(--hairline);
+  margin-top: 4px;
+  padding: 6px 4px 2px;
+}
+.menu-input {
+  font-size: 12.5px;
+  padding: 5px 8px;
+}
+.menu-item .menu-item-label {
+  font-family: inherit;
+}
+.menu-manage {
+  border-top: 1px solid var(--hairline);
+  margin-top: 4px;
+  padding-top: 8px;
+  border-radius: 0 0 7px 7px;
+  color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ */
+/* Context panel: git file list, branch row, progress states            */
+/* ------------------------------------------------------------------ */
+
+.ctx-sub {
+  color: var(--text-faint);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.ctx-row.static {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 6px;
+  border-radius: var(--r-sm);
+  color: var(--text-soft);
+  font-size: 13.5px;
+}
+
+.git-files {
+  margin: 2px 6px 6px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+/* A row you can open: same hover as the panel's other rows, because it does the
+   same kind of thing — it takes you somewhere. */
+.git-file {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 3px 6px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  text-align: left;
+}
+.git-file:hover {
+  background: #1e1e22;
+}
+.git-file-path {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.git-file-stat {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.git-file-stat .add {
+  color: var(--green);
+}
+.git-file-stat .del {
+  color: var(--red);
+}
+
+.check-icon.active {
+  color: var(--text-soft);
+}
+.progress-list {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------------------------------------------------------------------ */
+/* Overlays: Settings, onboarding                                       */
+/* ------------------------------------------------------------------ */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 6, 8, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 50;
+}
+
+/* One surface, no cards inside it: sections are separated by hairlines. */
+.sheet {
+  width: min(520px, 100%);
+  max-height: min(78vh, 760px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+}
+.sheet-head {
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--hairline-soft);
+  flex-shrink: 0;
+}
+.sheet-head.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sheet-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--text);
+}
+.sheet-sub {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.sheet-body {
+  padding: 4px 20px 16px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.sheet-foot {
+  padding: 10px 20px;
+  border-top: 1px solid var(--hairline-soft);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.block {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--hairline-soft);
+}
+.block:last-child {
+  border-bottom: none;
+  padding-bottom: 4px;
+}
+.block-title {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+/* Rows: the one list shape used for providers and for the provider picker. */
+.rows {
+  display: flex;
+  flex-direction: column;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: var(--r-sm);
+  text-align: left;
+}
+.row + .row {
+  border-top: 1px solid var(--hairline-soft);
+  border-radius: 0;
+}
+.row-pick:hover {
+  background: var(--hover);
+}
+.row-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.row-meta {
+  color: var(--text-faint);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-pick .row-meta {
+  margin-left: auto;
+}
+/* The picker/form that opens under the provider list. */
+.add-provider {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline-soft);
+}
+.row-add {
+  color: var(--text-muted);
+}
+/* A sign-in is a different kind of act from picking an endpoint: it goes out to
+   the provider and comes back with an account. It reads a little louder. */
+.row-signin .row-name {
+  font-weight: 600;
+}
+.row-signin .row-meta {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+.block-title.with-rule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 10px;
+}
+.block-title.with-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hairline-soft);
+}
+.row-add .row-name {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.row-add:hover {
+  background: var(--hover);
+}
+.row-add:hover .row-name {
+  color: var(--text);
+}
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+.row-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.row-provider .row-meta {
+  margin-top: 3px;
+}
+.row-provider.is-active {
+  box-shadow: inset 2px 0 0 var(--text-mid);
+}
+.row-status {
+  margin-top: 5px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.row-status.error {
+  color: var(--red);
+}
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+.row-provider:hover .row-actions {
+  opacity: 1;
+}
+
+.tag {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.warn {
+  color: var(--amber);
+}
+
+/* Forms */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.field-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.field-hint {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.form-actions.end {
+  justify-content: flex-end;
+}
+
+.note {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.gate-card .note {
+  margin-top: 10px;
+}
+.note.error {
+  color: var(--red);
+}
+.note.inline {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* One settings control: name + help on the left, the control on the right. */
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.setting-name {
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.setting-help {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.onboard {
+  width: min(460px, 100%);
+}
+
+/* ------------------------------------------------------------------ */
+/* Narrow fallback (below the 1280 design floor)                        */
+/* ------------------------------------------------------------------ */
+
+@media (max-width: 1100px) {
+  .context-panel {
+    display: none;
+  }
+}
+@media (max-width: 860px) {
+  .sidebar {
+    display: none;
+  }
+  .main {
+    border-left: none;
+  }
+}

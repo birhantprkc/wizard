@@ -214,18 +214,28 @@ impl FusionProvider {
 
 /// Render the conversation into a single query string for the panel members
 /// (who do not see the structured message history or tools).
+///
+/// The panel debates in text: the fusion engine's messages carry no images, so
+/// an image in the history is named here rather than dropped in silence. The
+/// synthesizer — the model that actually answers, and the only one that runs
+/// tools — receives the real [`ChatRequest`] with its images intact.
 fn render_query(messages: &[ChatMessage]) -> String {
     let mut parts = Vec::new();
     for m in messages {
+        let images = if m.images.is_empty() {
+            String::new()
+        } else {
+            format!(" [{} image(s) not shown to the panel]", m.images.len())
+        };
         match m.role {
             Role::System => {}
-            Role::User => parts.push(format!("User: {}", m.content)),
-            Role::Assistant if !m.content.is_empty() => {
-                parts.push(format!("Assistant: {}", m.content))
+            Role::User => parts.push(format!("User: {}{images}", m.content)),
+            Role::Assistant if !m.content.is_empty() || !m.images.is_empty() => {
+                parts.push(format!("Assistant: {}{images}", m.content))
             }
             Role::Assistant => {}
             Role::Tool => parts.push(format!(
-                "[tool {} result] {}",
+                "[tool {} result] {}{images}",
                 m.tool_name.as_deref().unwrap_or(""),
                 m.content
             )),
@@ -334,6 +344,7 @@ mod tests {
             self.seen.lock().unwrap().push(req.clone());
             let chunk = ChatChunk {
                 message: Some(ChatMessage::assistant(format!("answer from {}", self.tag))),
+                images: Vec::new(),
                 thinking: false,
                 done: true,
                 done_reason: Some("stop".to_string()),

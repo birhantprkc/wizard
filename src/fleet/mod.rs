@@ -1884,6 +1884,7 @@ mod tests {
     fn reply(content: &str) -> Vec<ChatChunk> {
         vec![ChatChunk {
             message: Some(ChatMessage::assistant(content)),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,

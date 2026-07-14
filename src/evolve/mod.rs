@@ -1702,6 +1702,45 @@ fn swap_in(built: &Path, exe: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
+/// What an [`EvolveOutcome`] means, in the one line every surface reports it
+/// with. Runtime-tier changes land on disk but are not live until the tools
+/// are reloaded, so each says so.
+pub fn describe_outcome(outcome: &EvolveOutcome) -> String {
+    match outcome {
+        EvolveOutcome::SkillAdded { name, path } => {
+            format!(
+                "evolve: added skill '{name}' at {} — run /reload to activate",
+                path.display()
+            )
+        }
+        EvolveOutcome::McpServerRegistered { name } => {
+            format!("evolve: registered MCP server '{name}' — run /reload to activate")
+        }
+        EvolveOutcome::ScriptedToolAdded { name, path } => {
+            format!(
+                "evolve: added scripted tool '{name}' at {} — run /reload to activate",
+                path.display()
+            )
+        }
+        EvolveOutcome::SubagentAdded { name } => {
+            format!("evolve: added subagent '{name}' — run /reload to activate")
+        }
+        EvolveOutcome::DeepRebuilt { binary } => {
+            format!(
+                "evolve: deep rebuild succeeded ({}) — restart wizard to run the new binary",
+                binary.display()
+            )
+        }
+        EvolveOutcome::FellBackToRuntime { reason, outcome } => {
+            format!(
+                "evolve: fell back to runtime tier ({reason}); {}",
+                describe_outcome(outcome)
+            )
+        }
+        EvolveOutcome::Denied => "evolve: change denied".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

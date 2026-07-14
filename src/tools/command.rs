@@ -2,28 +2,29 @@
 //!
 //! The agent calls this with a command line exactly as a user would type it
 //! (`/effort high`, `/model claude-sonnet-5`, `/status`, …). The tool parses
-//! and validates it against [`SlashCommand`](crate::app::SlashCommand) — the
+//! and validates it against [`SlashCommand`](crate::commands::SlashCommand) — the
 //! same parser the prompt uses — and checks
-//! [`SlashCommand::agent_runnable`](crate::app::SlashCommand::agent_runnable),
+//! [`SlashCommand::agent_runnable`](crate::commands::SlashCommand::agent_runnable),
 //! which gates out interactive-only, session-ending, and external-setup
 //! commands. A valid, allowed command is handed to the interactive surface via
 //! [`AgentEvent::CommandRequested`]; the surface dispatches it once the turn
 //! finishes and the agent is back in its slot (a turn already in flight cannot
 //! be reconfigured), so effort/model/mode changes take effect on the next turn.
 //!
-//! Only the interactive TUI drains that queue, so the tool gates on
-//! [`ToolContext::dispatches_commands`](crate::tools::ToolContext) — set only
-//! on the TUI surface. Headless and gateway runs have a live event channel too
-//! (it streams to a printer), so a presence check on `ctx.events` alone would
-//! wrongly report "queued"; the capability flag refuses honestly there, as it
-//! does for subagents and direct registry execution.
+//! Only a surface with somewhere to put a command drains that queue, so the tool
+//! gates on [`ToolContext::command_dispatch`](crate::tools::CommandDispatch) —
+//! every command on the TUI, the subset its executor implements on the GUI, none
+//! at all headless. Headless and gateway runs have a live event channel too (it
+//! streams to a printer), so a presence check on `ctx.events` alone would wrongly
+//! report "queued"; the capability refuses honestly there, as it does for
+//! subagents and direct registry execution.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::AgentEvent;
-use crate::app::SlashCommand;
+use crate::commands::SlashCommand;
 
 use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args};
 
@@ -103,16 +104,16 @@ impl Tool for RunCommandTool {
             return Ok(ToolOutput::error(reason));
         }
 
-        // Only the interactive TUI drains and applies queued commands. A live
-        // `events` channel alone isn't enough — headless and gateway runs also
-        // have one, but stream to a printer that can't apply a command — so
-        // gate on the surface capability and refuse honestly elsewhere rather
-        // than report success for work that would never run.
-        if !ctx.dispatches_commands {
-            return Ok(ToolOutput::error(
-                "slash commands are only available in the interactive Wizard session, \
-                 not in this run",
-            ));
+        // Only a surface that drains and applies queued commands may accept one.
+        // A live `events` channel alone isn't enough — headless and gateway runs
+        // also have one, but stream to a printer that can't apply a command —
+        // and a surface that implements only some of them must refuse the rest
+        // here, in the result the model reads, rather than swallow them after
+        // the turn.
+        let name = line.trim_start_matches('/');
+        let name = name.split_whitespace().next().unwrap_or(name);
+        if let Err(reason) = ctx.command_dispatch.accepts(name) {
+            return Ok(ToolOutput::error(reason));
         }
         let Some(events) = ctx.events.clone() else {
             return Ok(ToolOutput::error(
@@ -138,13 +139,14 @@ impl Tool for RunCommandTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::CommandDispatch;
     use tokio::sync::mpsc;
 
-    /// A TUI-like context: a live event channel and command dispatch enabled.
+    /// A TUI-like context: a live event channel and every command dispatchable.
     fn ctx_with_events() -> (ToolContext, mpsc::Receiver<AgentEvent>) {
         let (tx, rx) = mpsc::channel(8);
         let ctx = ToolContext::new(std::env::temp_dir())
-            .with_command_dispatch(true)
+            .with_command_dispatch(CommandDispatch::All)
             .with_events(tx);
         (ctx, rx)
     }
@@ -222,6 +224,38 @@ mod tests {
             .expect("executes");
         assert!(out.is_error);
         assert!(out.content.contains("interactive"), "{}", out.content);
+    }
+
+    /// A surface whose executor implements a subset (the GUI) queues what it can
+    /// run and refuses the rest *here* — the tool result is the last thing the
+    /// model reads about the command, so a silent drop after the turn would leave
+    /// it believing `/effort high` took.
+    #[tokio::test]
+    async fn a_subset_surface_queues_what_it_runs_and_refuses_the_rest() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = ToolContext::new(std::env::temp_dir())
+            .with_command_dispatch(CommandDispatch::Only(&["compact", "model"]))
+            .with_events(tx);
+
+        let out = RunCommandTool
+            .execute(json!({ "command": "/compact" }), &ctx)
+            .await
+            .expect("executes");
+        assert!(!out.is_error, "{}", out.content);
+        match rx.recv().await {
+            Some(AgentEvent::CommandRequested(line)) => assert_eq!(line, "/compact"),
+            other => panic!("expected CommandRequested, got {other:?}"),
+        }
+
+        // `/effort high` is agent-runnable, but this surface has nowhere to put
+        // it: refused, and nothing is queued.
+        let out = RunCommandTool
+            .execute(json!({ "command": "/effort high" }), &ctx)
+            .await
+            .expect("executes");
+        assert!(out.is_error);
+        assert!(out.content.contains("/compact, /model"), "{}", out.content);
+        assert!(rx.try_recv().is_err(), "nothing was queued");
     }
 
     #[tokio::test]

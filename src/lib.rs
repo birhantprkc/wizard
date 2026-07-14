@@ -12,15 +12,19 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod credentials;
+pub mod desktop;
 pub mod dispatch;
 pub mod doctor;
 pub mod event;
 pub mod evolve;
 pub mod fleet;
 pub mod gateway;
+pub mod gui;
 pub mod hardware;
 pub mod harness;
 pub mod hooks;
+pub mod image_view;
+pub mod images;
 pub mod import_claude;
 pub mod instructions;
 pub mod llm;
@@ -96,6 +100,45 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
     // Usage rollup: reads ~/.wizard/usage.jsonl only.
     if let Some(cli::Command::Usage { since }) = &cli.command {
         return usage::run_cli(since.as_deref());
+    }
+
+    // The browser GUI serves existing sessions and builds agents lazily per
+    // task, so it loads config directly (defaults on a fresh install) and
+    // never onboards — startup must not depend on a reachable provider.
+    if let Some(cli::Command::Gui {
+        port,
+        no_open,
+        assets,
+    }) = &cli.command
+    {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        let config = config::Config::load()?;
+        return gui::run(config, *port, *no_open, assets.clone())
+            .await
+            .map(|()| 0);
+    }
+
+    // The desktop shell is the same GUI server in a webview window, so it
+    // dispatches the same way. `--install` / `--uninstall` only write launcher
+    // files, and a build without the `desktop` feature only prints how to get
+    // one — neither needs a config, so the load happens inside.
+    if let Some(cli::Command::App {
+        devtools,
+        install,
+        uninstall,
+    }) = &cli.command
+    {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return desktop::run(desktop::AppArgs {
+            devtools: *devtools,
+            install: *install,
+            uninstall: *uninstall,
+        })
+        .await;
     }
 
     // Evolution history: reads ~/.wizard/evolution.jsonl and touches the
@@ -176,7 +219,12 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"))
                 .await
                 .map(|()| 0),
-            other => anyhow::bail!("unknown login provider '{other}' (supported: xai)"),
+            "chatgpt" => llm::chatgpt_oauth::login(|line: &str| println!("{line}"))
+                .await
+                .map(|()| 0),
+            other => {
+                anyhow::bail!("unknown login provider '{other}' (supported: xai, chatgpt)")
+            }
         };
     }
 

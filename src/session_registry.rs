@@ -107,8 +107,9 @@ pub fn write(record: &SessionRecord) {
     write_to(&dir, record);
 }
 
-/// [`write`] into an explicit directory (tests use a temp dir).
-fn write_to(dir: &Path, record: &SessionRecord) {
+/// [`write`] into an explicit directory (the GUI's task manager holds its own
+/// handle to it; tests use a temp dir).
+pub(crate) fn write_to(dir: &Path, record: &SessionRecord) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
@@ -133,8 +134,13 @@ fn write_to(dir: &Path, record: &SessionRecord) {
 /// Remove a session's heartbeat (called on clean exit).
 pub fn remove(id: &str) {
     if let Some(dir) = running_dir() {
-        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        remove_from(&dir, id);
     }
+}
+
+/// [`remove`] from an explicit directory.
+pub(crate) fn remove_from(dir: &Path, id: &str) {
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
 }
 
 /// Every live session on the machine, sorted by state (needs-input first) then
@@ -147,7 +153,7 @@ pub fn list() -> Vec<SessionRecord> {
 }
 
 /// [`list`] from an explicit directory (tests use a temp dir).
-fn list_from(dir: &Path) -> Vec<SessionRecord> {
+pub(crate) fn list_from(dir: &Path) -> Vec<SessionRecord> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };

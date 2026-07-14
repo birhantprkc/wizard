@@ -100,6 +100,18 @@
             pkgs.nodejs
             pkgs.llama-cpp
           ];
+
+          # The desktop shell (`cargo build --features desktop`, `wizard app`)
+          # links the system webview through wry. The default package below does
+          # not — the feature is off by default precisely so the plain binary
+          # keeps its two-library dependency set — so WebKitGTK is a dev-shell
+          # input only, and this is where a NixOS user gets it from.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [
+            pkgs.webkitgtk_4_1
+            pkgs.gtk3
+          ];
+
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       }

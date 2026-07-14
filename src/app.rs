@@ -18,21 +18,31 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{
-    Agent, AgentEvent, DoneReason, InterviewQuestion, PlanVerdict, session::Session, subagent,
+    Agent, AgentEvent, DoneReason, ImageSource, InterviewQuestion, PlanVerdict, session::Session,
+    subagent,
 };
 use crate::cli::Cli;
+// The built-in command table and its parser live in [`crate::commands`], the
+// one module every surface reads them from. Re-exported here because `/…` is
+// still the TUI's own language: `crate::app::SlashCommand` is where the rest of
+// the tree has always found it.
 use crate::commands::CustomCommand;
+pub use crate::commands::{
+    COMMANDS, CommandSpec, FusionAction, MemoryAction, ProviderAction, ServerAction, SlashCommand,
+};
 use crate::config::{Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget};
 use crate::event::{Event, EventLoop};
-use crate::evolve::{EvolveOutcome, EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
+use crate::evolve::{EvolveRequest, EvolveTier, Evolver, PublishRequest, publish};
 use crate::hooks::HookEngine;
+use crate::image_view::ImageCache;
+use crate::images::ImageRef;
 use crate::import_claude::{self, ImportSelection};
 use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
-use crate::memory::MemoryStore;
 use crate::server;
 use crate::session_registry::{self, SessionRecord, SessionState};
 use crate::skills::Skill;
+use crate::tools::CommandDispatch;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoItem;
 use crate::vim::{self, Pending, VimMode, VimOp, VimState};
@@ -53,6 +63,14 @@ pub enum TranscriptEntry {
         output: Option<String>,
         is_error: bool,
         collapsed: bool,
+    },
+    /// An image the turn produced — by the model, or by a tool
+    /// ([`AgentEvent::Images`]). The file is already on disk; the entry holds
+    /// only the reference to it, and [`crate::ui`] draws it (or, in a terminal
+    /// that can draw nothing, prints where it is).
+    Image {
+        source: ImageSource,
+        image: ImageRef,
     },
     /// System notice (mode switch, reload result, errors).
     Notice(String),
@@ -200,6 +218,34 @@ fn collapse_long(content: &str) -> bool {
     content.lines().count() > 6 || content.chars().count() > 600
 }
 
+/// The images on a replayed message, as the references the live
+/// [`AgentEvent::Images`] carried. An image the store could not write has no file
+/// to draw and no path to print, so it is not replayed.
+fn replayed_refs(images: &[crate::llm::Image]) -> Vec<ImageRef> {
+    images
+        .iter()
+        .filter_map(|image| {
+            Some(ImageRef {
+                path: image.path.clone()?,
+                mime: image.mime.clone(),
+                bytes: image.decoded_len(),
+            })
+        })
+        .collect()
+}
+
+/// The transcript entries an [`AgentEvent::Images`] becomes: one per image, each
+/// carrying where it came from and where it landed.
+fn image_entries(source: &ImageSource, images: Vec<ImageRef>) -> Vec<TranscriptEntry> {
+    images
+        .into_iter()
+        .map(|image| TranscriptEntry::Image {
+            source: source.clone(),
+            image,
+        })
+        .collect()
+}
+
 /// Outcome of a background agent rebuild (model switch, crash recovery),
 /// delivered to the main loop via [`Event::AgentRebuilt`].
 pub struct AgentRebuild {
@@ -259,190 +305,6 @@ pub struct ProviderPrompt {
     api_key: Option<String>,
     /// Remaining fields to ask, in order.
     queue: std::collections::VecDeque<PromptField>,
-}
-
-/// Parsed `/slash` command (see the README table).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlashCommand {
-    Help,
-    Clear,
-    /// `/model [tag]` — show current model, or switch to `tag`.
-    Model(Option<String>),
-    /// `/mode [genie|sovereign]` — show or switch mode.
-    Mode(Option<Mode>),
-    /// `/effort [low|medium|high|default]` — set the reasoning effort sent to
-    /// models that support it. `None` opens the picker; `Some(None)` clears
-    /// back to the provider default; `Some(Some(e))` sets the level.
-    Effort(Option<Option<ReasoningEffort>>),
-    /// `/evolve [--deep] <description>`.
-    Evolve {
-        deep: bool,
-        description: String,
-    },
-    /// Reload skills, scripted tools, and MCP servers without restart.
-    Reload,
-    /// Toggle plan mode (also Shift+Tab): read-only investigation until a
-    /// plan is approved via `exit_plan`.
-    Plan,
-    /// Toggle omakase (chef's-choice) mode: plan mode where the agent decides
-    /// the approach itself and auto-approves its own plan — no interview, no
-    /// review gate.
-    Omakase,
-    /// `/rewind [turn]` — restore file checkpoints and truncate history.
-    /// `None` opens the turn picker; `Some` rewinds to before that turn.
-    Rewind(Option<u64>),
-    /// `/resume [id]` — reopen a past session and continue it. `None` opens
-    /// the session picker; `Some` resumes that session id directly.
-    Resume(Option<String>),
-    /// `/compact` — summarize older history into a progress note now, instead
-    /// of waiting for the automatic threshold.
-    Compact,
-    /// `/agents` — open the subagent roster picker (browse the available
-    /// subagents and what each does; Enter pre-fills a delegation request).
-    Agents,
-    /// `/subagents` — toggle the in-session subagent monitor: the subagents
-    /// that have run (or are running) this session, with live status.
-    Subagents,
-    /// Toggle the git diff sidebar.
-    Diff,
-    /// Toggle the todo side panel.
-    Todos,
-    /// Toggle the machine-wide session manager: every live Wizard session on
-    /// the machine, grouped by state.
-    Dashboard,
-    /// Show session token usage (and cost when rates are configured).
-    Cost,
-    /// Show the saved project memories.
-    Memory,
-    /// Run the environment diagnostics (same checks as `wizard doctor`).
-    Doctor,
-    /// Show the session status: model, provider, mode, session id, usage,
-    /// todo progress, background tasks, plan mode.
-    Status,
-    /// `/bashes` — list background tasks (`execute` with
-    /// `run_in_background`), running and finished, with id/status/command.
-    Bashes,
-    /// `/goal [text]` — show the standing mission goal, or set it. `None`
-    /// shows the current goal; `Some` sets it (drives sovereign/continuous
-    /// mode), persisting to `<project_root>/.wizard/mission.toml`.
-    Goal(Option<String>),
-    /// `/publish [branch]` — fork Wizard and get a one-line installer.
-    Publish {
-        branch: Option<String>,
-    },
-    /// `/fusion [config]` — toggle model fusion (a panel of providers debate
-    /// then a synthesizer answers), or open the panel configurator.
-    Fusion(FusionAction),
-    /// `/provider ...` — add, remove, or switch LLM providers.
-    Provider(ProviderAction),
-    /// Finalize an interactive provider setup: add the provider (storing the
-    /// API key in `~/.wizard/credentials.toml` when present) and switch to it.
-    /// Emitted internally by the inline prompt flow, never parsed from text —
-    /// hence the primitive fields (so `SlashCommand` can stay `Eq`).
-    ProviderSetup {
-        name: String,
-        kind: ProviderKind,
-        base_url: String,
-        model: String,
-        api_key: Option<String>,
-    },
-    /// `/server ...` — status / start / stop the local llama-server.
-    Server(ServerAction),
-    /// `/login <provider>`: OAuth sign-in for providers that support it
-    /// (currently `xai`).
-    Login(String),
-    /// `/settings` — open the in-app settings menu (a reusable picker).
-    Settings,
-    /// `/vim` — toggle modal (vim-style) editing of the input composer.
-    Vim,
-    /// Import the selected artifacts from Claude Code (`~/.claude/`). Not a
-    /// typed command; dispatched from the `/settings` import picker, which is
-    /// why it carries the [`ImportSelection`].
-    ImportClaude(ImportSelection),
-    Quit,
-}
-
-/// What a `/fusion` subcommand does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FusionAction {
-    /// `/fusion` (no args) — toggle fusion mode on/off.
-    Toggle,
-    /// `/fusion config` — open the panel/synthesizer configurator.
-    Config,
-}
-
-/// What a `/provider` subcommand does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderAction {
-    /// `/provider` (no args) — open the interactive two-level picker (switch
-    /// providers, or add a new one).
-    Menu,
-    /// `/provider list` — show configured providers.
-    List,
-    /// `/provider use <name>` — switch the active provider.
-    Use(String),
-    /// `/provider add <name> <kind> <base_url> <model> [API_KEY_ENV]`.
-    Add {
-        name: String,
-        kind: ProviderKind,
-        base_url: String,
-        model: String,
-        api_key_env: Option<String>,
-    },
-    /// `/provider remove <name>`.
-    Remove(String),
-}
-
-/// Parse the arguments to `/provider` (everything after the command word).
-fn parse_provider(args: &[&str]) -> Result<SlashCommand, String> {
-    let action = match args.first().copied() {
-        None => ProviderAction::Menu,
-        Some("list") => ProviderAction::List,
-        Some("use") => match args.get(1) {
-            Some(name) => ProviderAction::Use((*name).to_string()),
-            None => return Err("usage: /provider use <name>".to_string()),
-        },
-        Some("add") => {
-            if args.len() < 5 {
-                return Err(
-                    "usage: /provider add <name> <llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare> <base_url> <model> [API_KEY_ENV]"
-                        .to_string(),
-                );
-            }
-            let kind = match args[2] {
-                "llamacpp" => ProviderKind::LlamaCpp,
-                "ollama" => ProviderKind::Ollama,
-                "openai" => ProviderKind::Openai,
-                "anthropic" => ProviderKind::Anthropic,
-                "openrouter" => ProviderKind::OpenRouter,
-                "xai" => ProviderKind::Xai,
-                "xaioauth" => ProviderKind::XaiOauth,
-                "cloudflare" => ProviderKind::Cloudflare,
-                other => {
-                    return Err(format!(
-                        "unknown provider kind '{other}' (llamacpp|ollama|openai|anthropic|openrouter|xai|xaioauth|cloudflare)"
-                    ));
-                }
-            };
-            ProviderAction::Add {
-                name: args[1].to_string(),
-                kind,
-                base_url: args[3].to_string(),
-                model: args[4].to_string(),
-                api_key_env: args.get(5).map(|s| s.to_string()),
-            }
-        }
-        Some("remove") => match args.get(1) {
-            Some(name) => ProviderAction::Remove((*name).to_string()),
-            None => return Err("usage: /provider remove <name>".to_string()),
-        },
-        Some(other) => {
-            return Err(format!(
-                "unknown /provider subcommand '{other}' (list|use|add|remove)"
-            ));
-        }
-    };
-    Ok(SlashCommand::Provider(action))
 }
 
 /// Sentinel value of the final "add provider" row in the level-1 provider
@@ -511,6 +373,7 @@ fn xai_oauth_session_present() -> bool {
 fn provider_display(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Xai | ProviderKind::XaiOauth => "xAI",
+        ProviderKind::ChatgptOauth => "ChatGPT",
         ProviderKind::OpenRouter => "OpenRouter",
         ProviderKind::Openai => "OpenAI-compatible",
         ProviderKind::Anthropic => "Anthropic",
@@ -535,420 +398,6 @@ fn prompt_question(field: PromptField, prompt: &ProviderPrompt) -> String {
         ),
     }
 }
-
-/// What a `/server` subcommand does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServerAction {
-    /// `/server` / `/server status` — health of the local llama-server.
-    Status,
-    /// `/server start` — start llama-server for the active provider.
-    Start,
-    /// `/server stop` — stop the llama-server Wizard started.
-    Stop,
-}
-
-/// Parse the arguments to `/server` (everything after the command word).
-fn parse_server(args: &[&str]) -> Result<SlashCommand, String> {
-    let action = match args.first().copied() {
-        None | Some("status") => ServerAction::Status,
-        Some("start") => ServerAction::Start,
-        Some("stop") => ServerAction::Stop,
-        Some(other) => {
-            return Err(format!(
-                "unknown /server subcommand '{other}' (status|start|stop)"
-            ));
-        }
-    };
-    Ok(SlashCommand::Server(action))
-}
-
-impl SlashCommand {
-    /// Parse a `/...` input line. `None` when `input` is not a slash
-    /// command; `Some(Err(msg))` for an unknown command or bad arguments.
-    pub fn parse(input: &str) -> Option<Result<Self, String>> {
-        let input = input.trim();
-        let rest = input.strip_prefix('/')?;
-        let mut parts = rest.split_whitespace();
-        let command = parts.next().unwrap_or("");
-        let args: Vec<&str> = parts.collect();
-
-        let parsed = match command {
-            "help" => Ok(Self::Help),
-            "clear" => Ok(Self::Clear),
-            "model" => Ok(Self::Model(args.first().map(|s| s.to_string()))),
-            "mode" => match args.first() {
-                None => Ok(Self::Mode(None)),
-                Some(&"genie") => Ok(Self::Mode(Some(Mode::Genie))),
-                Some(&"sovereign") => Ok(Self::Mode(Some(Mode::Sovereign))),
-                Some(other) => Err(format!("unknown mode '{other}' (genie|sovereign)")),
-            },
-            "genie" => Ok(Self::Mode(Some(Mode::Genie))),
-            "sovereign" => Ok(Self::Mode(Some(Mode::Sovereign))),
-            "effort" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-                None => Ok(Self::Effort(None)),
-                Some("low") => Ok(Self::Effort(Some(Some(ReasoningEffort::Low)))),
-                Some("medium") | Some("med") => {
-                    Ok(Self::Effort(Some(Some(ReasoningEffort::Medium))))
-                }
-                Some("high") => Ok(Self::Effort(Some(Some(ReasoningEffort::High)))),
-                Some("default") | Some("off") | Some("none") => Ok(Self::Effort(Some(None))),
-                Some(other) => Err(format!(
-                    "unknown effort '{other}' (low|medium|high|default)"
-                )),
-            },
-            "evolve" => {
-                let deep = args.first() == Some(&"--deep");
-                let description = if deep { &args[1..] } else { &args[..] }.join(" ");
-                if description.is_empty() {
-                    Err("usage: /evolve [--deep] <what to add>".to_string())
-                } else {
-                    Ok(Self::Evolve { deep, description })
-                }
-            }
-            "reload" => Ok(Self::Reload),
-            "plan" => Ok(Self::Plan),
-            "omakase" => Ok(Self::Omakase),
-            "rewind" => match args.first() {
-                None => Ok(Self::Rewind(None)),
-                Some(arg) => arg
-                    .parse::<u64>()
-                    .map(|turn| Self::Rewind(Some(turn)))
-                    .map_err(|_| "usage: /rewind [turn]".to_string()),
-            },
-            "resume" => Ok(Self::Resume(args.first().map(|s| s.to_string()))),
-            "compact" => Ok(Self::Compact),
-            "agents" => Ok(Self::Agents),
-            "subagents" => Ok(Self::Subagents),
-            "diff" => Ok(Self::Diff),
-            "todos" => Ok(Self::Todos),
-            "dashboard" => Ok(Self::Dashboard),
-            "cost" => Ok(Self::Cost),
-            "memory" => Ok(Self::Memory),
-            "doctor" => Ok(Self::Doctor),
-            "status" => Ok(Self::Status),
-            "bashes" => Ok(Self::Bashes),
-            "goal" => {
-                let text = args.join(" ");
-                if text.is_empty() {
-                    Ok(Self::Goal(None))
-                } else {
-                    Ok(Self::Goal(Some(text)))
-                }
-            }
-            "publish" => Ok(Self::Publish {
-                branch: args.first().map(|s| s.to_string()),
-            }),
-            "provider" => parse_provider(&args),
-            "fusion" => match args.first().copied() {
-                None => Ok(Self::Fusion(FusionAction::Toggle)),
-                Some("config") => Ok(Self::Fusion(FusionAction::Config)),
-                Some(other) => Err(format!(
-                    "unknown /fusion subcommand '{other}' — use /fusion or /fusion config"
-                )),
-            },
-            "server" => parse_server(&args),
-            "login" => match args.first() {
-                Some(provider) => Ok(Self::Login((*provider).to_string())),
-                None => Err("usage: /login xai".to_string()),
-            },
-            "settings" => Ok(Self::Settings),
-            "vim" => Ok(Self::Vim),
-            "quit" | "q" | "exit" => Ok(Self::Quit),
-            other => Err(format!("unknown command '/{other}' — try /help")),
-        };
-        Some(parsed)
-    }
-
-    /// Whether the agent may invoke this command itself (via the `run_command`
-    /// tool), and if not, the reason to report back to the model.
-    ///
-    /// Allowed: read-only status/info commands and state changes the agent can
-    /// sensibly apply to its own session (effort, model, mode, goal, planning
-    /// modes, reload, compact, and the UI toggles). Refused: commands that need
-    /// a human at an interactive picker (the no-argument forms), that end or
-    /// rewind the session, or that reach outside it to set up providers.
-    pub fn agent_runnable(&self) -> Result<(), String> {
-        use SlashCommand::*;
-        match self {
-            // State the agent can set on itself, plus read-only info toggles.
-            Model(Some(_))
-            | Mode(Some(_))
-            | Effort(Some(_))
-            | Goal(_)
-            | Diff
-            | Todos
-            | Subagents
-            | Dashboard
-            | Cost
-            | Memory
-            | Doctor
-            | Status
-            | Bashes
-            | Compact
-            | Reload
-            | Plan
-            | Omakase
-            | Settings
-            | Vim
-            | Help
-            | Fusion(FusionAction::Toggle) => Ok(()),
-
-            // Interactive pickers: there is no human at the keyboard mid-turn,
-            // so require the argument that names the choice directly.
-            Model(None) => Err("name a model, e.g. `/model claude-sonnet-5`".into()),
-            Mode(None) => Err("name a mode, e.g. `/mode sovereign`".into()),
-            Effort(None) => Err("name a level, e.g. `/effort high`".into()),
-            Fusion(FusionAction::Config) => {
-                Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
-            }
-            Agents => Err(
-                "`/agents` opens a picker for the user; spawn subagents with the spawn tool".into(),
-            ),
-
-            // Session-ending, destructive, or external-setup commands are off
-            // limits to the agent.
-            Quit => Err("refusing to quit the session on the user's behalf".into()),
-            Clear => Err("refusing to clear the conversation on the user's behalf".into()),
-            Rewind(_) => Err("`/rewind` restores checkpoints and is the user's call".into()),
-            Resume(_) => Err("`/resume` switches sessions and is the user's call".into()),
-            Evolve { .. } => {
-                Err("`/evolve` is a heavyweight self-edit; leave it to the user".into())
-            }
-            Publish { .. } => Err("`/publish` forks the tool; leave it to the user".into()),
-            Provider(_) | ProviderSetup { .. } => {
-                Err("provider setup is the user's call; use `/model` to switch models".into())
-            }
-            Server(_) => {
-                Err("`/server` manages the local model server; leave it to the user".into())
-            }
-            Login(_) => Err("`/login` is an interactive sign-in; leave it to the user".into()),
-            ImportClaude(_) => {
-                Err("`/settings` import is driven from a picker; leave it to the user".into())
-            }
-        }
-    }
-}
-
-/// One entry in the slash-command completion table. Drives the suggestion
-/// popup and the inline ghost-text prediction.
-#[derive(Debug)]
-pub struct CommandSpec {
-    pub name: &'static str,
-    /// Argument hint shown after the name (e.g. `[tag]`).
-    pub args: &'static str,
-    pub description: &'static str,
-    /// Completion appends a trailing space and waits for arguments instead
-    /// of submitting immediately.
-    pub takes_args: bool,
-}
-
-/// All slash commands, in display order.
-pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "model",
-        args: "[tag]",
-        description: "pick or switch the model",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "mode",
-        args: "[genie|sovereign]",
-        description: "pick or switch personality mode",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "genie",
-        args: "",
-        description: "switch to genie mode",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "sovereign",
-        args: "",
-        description: "switch to sovereign mode",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "effort",
-        args: "[low|medium|high|default]",
-        description: "set reasoning effort (Grok 4.x, OpenAI o-series / gpt-5)",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "plan",
-        args: "",
-        description: "toggle plan mode: read-only until a plan is approved",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "omakase",
-        args: "",
-        description: "toggle omakase: chef's-choice plan mode, the agent decides",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "rewind",
-        args: "[turn]",
-        description: "rewind files and conversation to before a turn",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "resume",
-        args: "",
-        description: "reopen and continue a past session",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "compact",
-        args: "",
-        description: "summarize older history into a progress note now",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "agents",
-        args: "",
-        description: "browse subagents and delegate to one",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "subagents",
-        args: "",
-        description: "monitor the subagents running in this session",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "evolve",
-        args: "[--deep] <desc>",
-        description: "self-extend: add a skill, tool, or MCP server",
-        takes_args: true,
-    },
-    CommandSpec {
-        name: "publish",
-        args: "[branch]",
-        description: "fork & publish your Wizard, get a one-line installer",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "provider",
-        args: "",
-        description: "add or switch LLM providers (interactive)",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "fusion",
-        args: "[config]",
-        description: "toggle model fusion, or configure the panel",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "server",
-        args: "[status|start|stop]",
-        description: "manage the local llama-server",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "login",
-        args: "<xai>",
-        description: "sign in to a provider account (xAI OAuth)",
-        takes_args: true,
-    },
-    CommandSpec {
-        name: "diff",
-        args: "",
-        description: "toggle the git diff sidebar",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "todos",
-        args: "",
-        description: "toggle the todo side panel",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "dashboard",
-        args: "",
-        description: "session manager: all live wizard sessions on this machine",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "cost",
-        args: "",
-        description: "show session token usage and cost",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "memory",
-        args: "",
-        description: "show saved project memories",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "status",
-        args: "",
-        description: "show session status: model, usage, todos, tasks",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "bashes",
-        args: "",
-        description: "list background tasks: id, status, command",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "goal",
-        args: "[text]",
-        description: "show or set the standing mission goal",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "settings",
-        args: "",
-        description: "open the settings menu (change config anytime)",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "vim",
-        args: "",
-        description: "toggle vim-style modal editing of the input line",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "doctor",
-        args: "",
-        description: "diagnose config, providers, MCP, hooks, state dirs",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "reload",
-        args: "",
-        description: "reload skills, scripted tools, and MCP servers",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "clear",
-        args: "",
-        description: "clear the conversation",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "help",
-        args: "",
-        description: "show available commands and keys",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "quit",
-        args: "",
-        description: "exit wizard",
-        takes_args: false,
-    },
-    CommandSpec {
-        name: "exit",
-        args: "",
-        description: "exit wizard",
-        takes_args: false,
-    },
-];
 
 /// One row in the suggestion popup: a builtin [`CommandSpec`] or a custom
 /// command loaded from `~/.wizard/commands/` / `<project>/.wizard/commands/`.
@@ -1272,6 +721,13 @@ pub struct App {
     /// [`crate::ui::draw`] every frame (hence the interior mutability: draw
     /// takes `&App`) and emptied while an overlay covers the transcript.
     pub card_hits: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// What this terminal can draw an image with, and every image it has drawn
+    /// recently. Starts at the half-block floor so a frame can be rendered
+    /// before anything has asked the terminal; `run_tui` replaces it with
+    /// [`ImageCache::detect`] before it takes the screen. Interior mutability
+    /// for the same reason as `card_hits` — draw takes `&App`, and decoding a
+    /// PNG once per image is exactly what a cache is for.
+    pub images: std::cell::RefCell<ImageCache>,
     pub should_quit: bool,
     /// Tick counter driving the busy spinner.
     pub tick: u64,
@@ -1429,6 +885,7 @@ impl App {
             transcript_max_scroll: std::cell::Cell::new(0),
             selection: None,
             card_hits: std::cell::RefCell::new(Vec::new()),
+            images: std::cell::RefCell::new(ImageCache::fallback()),
             should_quit: false,
             tick: 0,
             suggestions: Vec::new(),
@@ -1761,19 +1218,39 @@ impl App {
     fn load_transcript(&mut self, messages: Vec<crate::llm::ChatMessage>) {
         use crate::llm::Role;
         self.transcript.clear();
+        // A tool's images ride back to the model on a user message the agent
+        // wrote for it (`Agent::run_tool`), so a user message full of images
+        // right after a tool answered is that tool's images — not something a
+        // person said. Same reading as the GUI's replay
+        // ([`crate::gui::transcript`]), so both surfaces rebuild the same
+        // conversation.
+        let mut just_answered: Option<String> = None;
         for message in messages {
             match message.role {
                 Role::System => {}
                 Role::User => {
+                    if let Some(tool) = just_answered.take()
+                        && !message.images.is_empty()
+                    {
+                        let source = ImageSource::Tool(tool);
+                        self.transcript
+                            .extend(image_entries(&source, replayed_refs(&message.images)));
+                        continue;
+                    }
                     if !message.content.trim().is_empty() {
                         self.transcript.push(TranscriptEntry::User(message.content));
                     }
                 }
                 Role::Assistant => {
+                    just_answered = None;
                     if !message.content.trim().is_empty() {
                         self.transcript
                             .push(TranscriptEntry::Assistant(message.content));
                     }
+                    self.transcript.extend(image_entries(
+                        &ImageSource::Assistant,
+                        replayed_refs(&message.images),
+                    ));
                     for call in message.tool_calls {
                         self.transcript.push(TranscriptEntry::ToolCard {
                             name: call.function.name,
@@ -1786,6 +1263,7 @@ impl App {
                 }
                 Role::Tool => {
                     let name = message.tool_name.unwrap_or_default();
+                    just_answered = Some(name.clone());
                     // Fill the most recent open card for this tool, as a live
                     // ToolFinished would.
                     let card = self
@@ -4332,6 +3810,13 @@ impl App {
                     }
                 }
             }
+            AgentEvent::Images { source, images } => {
+                // The model's own images arrive right after its reply, a tool's
+                // right after that tool's card — so appending puts each one
+                // under the thing that made it.
+                self.flush_streaming();
+                self.transcript.extend(image_entries(&source, images));
+            }
             AgentEvent::StepCompleted { step } => {
                 self.status.step = step;
             }
@@ -4516,6 +4001,15 @@ impl App {
                     *slot = Some(output.content);
                 }
             }
+            AgentEvent::SubagentRunImages {
+                run,
+                source,
+                images,
+            } => {
+                for entry in image_entries(&source, images) {
+                    self.push_pane(run, entry);
+                }
+            }
             AgentEvent::SubagentRunStep { run, step } => {
                 if let Some(index) = self.pane_index(run) {
                     self.panes[index].steps = step;
@@ -4658,7 +4152,7 @@ fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|err| format!("invalid base64: {err}"))?;
-    if bytes.len() as u64 > crate::llm::MAX_IMAGE_BYTES {
+    if bytes.len() > crate::llm::MAX_IMAGE_BYTES {
         return Err(format!(
             "image is {} bytes (max {} MB)",
             bytes.len(),
@@ -4958,11 +4452,15 @@ fn load_skill_roots() -> Vec<Skill> {
 /// spawner layered on top. The spawn tool captures the base registry
 /// (without itself) so subagents cannot recurse, plus the lifecycle `hooks`
 /// so subagent tool calls fire the same hooks as the parent's.
+/// Returns the registry and the spawn tool's shared model slot, which the
+/// caller must hand to `Agent::bind_subagent_model` — otherwise subagents read
+/// the *configured* model and quietly ignore `/model`. Every registry rebuild
+/// mints a fresh spawn tool, so every rebuild has to rebind.
 async fn build_registry(
     manager: &McpManager,
     client: &Arc<dyn LlmProvider>,
     hooks: &Arc<HookEngine>,
-) -> Result<ToolRegistry> {
+) -> Result<(ToolRegistry, subagent::SharedActiveModel)> {
     let mut base = ToolRegistry::with_native_tools();
     match Config::scripted_tools_dir() {
         Ok(dir) => {
@@ -4981,13 +4479,15 @@ async fn build_registry(
     let subagent_configs = subagent::available_configs(&subagents_dir);
     let base = Arc::new(base);
     let mut registry = subagent::scoped_registry(&base, None);
-    registry.register(Arc::new(subagent::SpawnSubagentTool::new(
+    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
         subagent_configs,
         Arc::clone(client),
         Arc::clone(&base),
         Arc::clone(hooks),
-    )));
-    Ok(registry)
+    ));
+    let subagent_model = spawn_tool.model_handle();
+    registry.register(spawn_tool);
+    Ok((registry, subagent_model))
 }
 
 /// Attach the config-dependent tools (evolve, publish) to a registry built
@@ -5043,16 +4543,10 @@ async fn build_agent(
         project_root.to_path_buf(),
         session.id.clone(),
     ));
-    let mut registry = build_registry(manager, client, &hooks).await?;
+    let (mut registry, subagent_model) = build_registry(manager, client, &hooks).await?;
     attach_config_tools(&mut registry, config);
     let model = config.active().model;
-    let native_tools = match client.supports_native_tools(&model).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!("probing tool support for {model}: {err:#}");
-            false
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     let mut agent = Agent::new(
         Arc::clone(client),
         registry,
@@ -5063,9 +4557,11 @@ async fn build_agent(
         native_tools,
         hooks,
     )?;
-    // The TUI is the one surface that drains queued slash commands, so its
-    // agent is the only one where `run_command` does anything.
-    agent.set_command_dispatch(true);
+    // The TUI has a home for every command the agent may queue, so it dispatches
+    // all of them (the GUI runs the subset its executor implements; headless and
+    // gateway runs, none).
+    agent.set_command_dispatch(CommandDispatch::All);
+    agent.bind_subagent_model(subagent_model);
     Ok(agent)
 }
 
@@ -5155,42 +4651,6 @@ async fn git_diff_untracked(root: &Path, file: &str) -> String {
     }
 }
 
-fn describe_evolve_outcome(outcome: &EvolveOutcome) -> String {
-    match outcome {
-        EvolveOutcome::SkillAdded { name, path } => {
-            format!(
-                "evolve: added skill '{name}' at {} — run /reload to activate",
-                path.display()
-            )
-        }
-        EvolveOutcome::McpServerRegistered { name } => {
-            format!("evolve: registered MCP server '{name}' — run /reload to activate")
-        }
-        EvolveOutcome::ScriptedToolAdded { name, path } => {
-            format!(
-                "evolve: added scripted tool '{name}' at {} — run /reload to activate",
-                path.display()
-            )
-        }
-        EvolveOutcome::SubagentAdded { name } => {
-            format!("evolve: added subagent '{name}' — run /reload to activate")
-        }
-        EvolveOutcome::DeepRebuilt { binary } => {
-            format!(
-                "evolve: deep rebuild succeeded ({}) — restart wizard to run the new binary",
-                binary.display()
-            )
-        }
-        EvolveOutcome::FellBackToRuntime { reason, outcome } => {
-            format!(
-                "evolve: fell back to runtime tier ({reason}); {}",
-                describe_evolve_outcome(outcome)
-            )
-        }
-        EvolveOutcome::Denied => "evolve: change denied".to_string(),
-    }
-}
-
 const HELP_TEXT: &str = "available commands:\n  \
 /help                       show this help\n  \
 /clear                      clear the conversation\n  \
@@ -5216,7 +4676,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /todos                      toggle the todo side panel\n  \
 /dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
-/memory                     show saved project memories\n  \
+/memory [read|forget <name>] list, show, or forget saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
 /bashes                     list background tasks (id, status, command)\n  \
 /goal [text]                show or set the standing mission goal\n  \
@@ -5512,6 +4972,13 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             app.handle_agent_event(event);
         }
     }
+
+    // Ask the terminal how it can draw an image, while stdio is still the plain
+    // terminal: the query writes escape sequences and reads the reply, which the
+    // alternate screen and our own raw mode would both get in the way of. A
+    // terminal that says nothing gets half-blocks, which every terminal can draw.
+    *app.images.borrow_mut() = ImageCache::detect();
+    tracing::debug!("terminal images: {:?}", app.images.borrow());
 
     let mut events = EventLoop::new(Duration::from_millis(100));
     let mut terminal = setup_terminal()?;
@@ -6063,7 +5530,7 @@ impl CommandContext<'_> {
             SlashCommand::Dashboard => self.toggle_dashboard(),
             SlashCommand::Subagents => self.toggle_subagents(),
             SlashCommand::Cost => self.cost(),
-            SlashCommand::Memory => self.memory(),
+            SlashCommand::Memory(action) => self.memory(action),
             SlashCommand::Doctor => self.doctor().await,
             SlashCommand::Status => self.status(),
             SlashCommand::Bashes => self.bashes(),
@@ -6192,29 +5659,12 @@ impl CommandContext<'_> {
         self.app.notice(text);
     }
 
-    /// `/memory`: list the saved project memories (name — description).
-    fn memory(&mut self) {
-        let store = match MemoryStore::open(self.project_root) {
-            Ok(store) => store,
-            Err(err) => {
-                self.app
-                    .notice(format!("could not open memory store: {err:#}"));
-                return;
-            }
-        };
-        match store.list() {
-            Ok(entries) if entries.is_empty() => self
-                .app
-                .notice(format!("no memories saved yet ({})", store.dir().display())),
-            Ok(entries) => {
-                let mut text = format!("saved memories ({}):\n", store.dir().display());
-                for entry in &entries {
-                    text.push_str(&format!("  {} — {}\n", entry.name, entry.description));
-                }
-                self.app.notice(text.trim_end().to_string());
-            }
-            Err(err) => self.app.notice(format!("could not list memories: {err:#}")),
-        }
+    /// `/memory`: the user's window onto the memories the agent writes with
+    /// the `memory` tool — list them, read one, or forget one. Rendered by
+    /// [`crate::memory::report`], the same renderer the GUI answers with.
+    fn memory(&mut self, action: MemoryAction) {
+        self.app
+            .notice(crate::memory::report(self.project_root, &action));
     }
 
     /// `/doctor`: the same diagnostics as `wizard doctor`, in the
@@ -6838,10 +6288,11 @@ impl CommandContext<'_> {
             return;
         };
         match build_registry(&manager, self.client, &hooks).await {
-            Ok(registry) => {
+            Ok((registry, subagent_model)) => {
                 let tool_count = registry.len();
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
+                    agent.bind_subagent_model(subagent_model);
                     agent.set_skills(self.skills.clone());
                 }
                 self.app.notice(format!(
@@ -6868,13 +6319,14 @@ impl CommandContext<'_> {
         };
         let manager = self.manager.lock().await;
         match build_registry(&manager, self.client, &hooks).await {
-            Ok(registry) => {
+            Ok((registry, subagent_model)) => {
                 // Success is silent: tools simply start working and the
                 // "connecting tools…" indicator disappears. A success notice
                 // here is tool-flex narration and, emitted ~2s in, would float
                 // above the user's first message as if it were a reply to it.
                 if let Some(agent) = self.agent_slot.as_mut() {
                     agent.set_registry(registry);
+                    agent.bind_subagent_model(subagent_model);
                 }
             }
             Err(err) => self.app.notice(format!(
@@ -6923,10 +6375,12 @@ impl CommandContext<'_> {
             .agent_slot
             .as_ref()
             .map(|agent| Arc::clone(agent.hooks()))
-            && let Ok(registry) = build_registry(&manager, self.client, &hooks).await
+            && let Ok((registry, subagent_model)) =
+                build_registry(&manager, self.client, &hooks).await
             && let Some(agent) = self.agent_slot.as_mut()
         {
             agent.set_registry(registry);
+            agent.bind_subagent_model(subagent_model);
             agent.set_skills(self.skills.clone());
         }
         drop(manager);
@@ -6956,7 +6410,7 @@ impl CommandContext<'_> {
         let notify = self.events.sender();
         tokio::spawn(async move {
             let message = match evolver.run(request).await {
-                Ok(outcome) => describe_evolve_outcome(&outcome),
+                Ok(outcome) => crate::evolve::describe_outcome(&outcome),
                 Err(err) => format!("evolve failed: {err:#}"),
             };
             let _ = notify.send(Event::Notice(message)).await;
@@ -7517,13 +6971,7 @@ async fn switch_model_task(
             };
         }
     }
-    let native_tools = match client.supports_native_tools(&tag).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!("probing tool support for {tag}: {err:#}");
-            false
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &tag).await;
     match agent {
         Some(mut agent) => {
             agent.set_model(tag.clone(), native_tools);
@@ -8809,6 +8257,236 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A real PNG on disk, as the image store would have left it: a solid red
+    /// square, so any cell that drew it is unmistakable.
+    fn red_png(dir: &Path) -> ImageRef {
+        let path = dir.join("red.png");
+        image::RgbaImage::from_pixel(48, 48, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .expect("wrote the png");
+        ImageRef {
+            path,
+            mime: "image/png".to_string(),
+            bytes: std::fs::metadata(dir.join("red.png")).unwrap().len() as usize,
+        }
+    }
+
+    /// Every cell of a drawn frame, row by row: what is on screen.
+    fn screen(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Rows holding image pixels. The UI is deliberately monochrome — white,
+    /// grays, and no hues anywhere (see [`crate::ui`]) — so a cell painted in
+    /// 24-bit colour is an image cell and nothing else. That makes this both the
+    /// "it drew" check and the "it left nothing behind" check.
+    fn pixel_rows(buf: &ratatui::buffer::Buffer) -> Vec<u16> {
+        use ratatui::style::Color;
+        (0..buf.area.height)
+            .filter(|&y| {
+                (0..buf.area.width).any(|x| {
+                    let cell = buf.cell((x, y)).unwrap();
+                    matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))
+                })
+            })
+            .collect()
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    #[test]
+    fn an_image_from_the_model_and_one_from_a_tool_both_render_with_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+
+        app.handle_agent_event(AgentEvent::TextDelta("here it is".to_string()));
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Assistant,
+            images: vec![image.clone()],
+        });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "render".to_string(),
+            args: serde_json::json!({}),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "render".to_string(),
+            output: crate::tools::ToolOutput::ok("drawn"),
+        });
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Tool("render".to_string()),
+            images: vec![image.clone()],
+        });
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|entry| matches!(entry, TranscriptEntry::Image { .. }))
+                .count(),
+            2,
+        );
+
+        let buf = screen(&app, 80, 40);
+        let text: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Both images were drawn, in pixels.
+        assert_eq!(
+            pixel_rows(&buf).len(),
+            6,
+            "two three-row image blocks, drawn in pixels:\n{text}"
+        );
+        // Each is named by what made it, and each names its file — untruncated,
+        // on a line of its own, so it can be copied out and opened.
+        assert!(text.contains("image · image/png"), "{text}");
+        assert!(text.contains("image from `render` · image/png"), "{text}");
+        let path = image.path.display().to_string();
+        assert_eq!(
+            (0..buf.area.height)
+                .filter(|&y| row_text(&buf, y).trim() == path)
+                .count(),
+            2,
+            "each image's path stands alone on its own row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_image_is_clipped_to_the_transcript_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+        app.handle_agent_event(AgentEvent::Images {
+            source: ImageSource::Assistant,
+            images: vec![image],
+        });
+        // Enough text after it to push the image off the top of a short screen.
+        for line in 0..12 {
+            app.handle_agent_event(AgentEvent::Notice(format!("line {line}")));
+        }
+
+        // Pinned to the bottom, the image is above the viewport: no pixels.
+        let (width, height) = (60u16, 12u16);
+        let buf = screen(&app, width, height);
+        assert!(pixel_rows(&buf).is_empty(), "the image is scrolled away");
+
+        // Scroll it back into view a row at a time. However the block straddles
+        // the edge of the viewport, its pixels stay inside the transcript body —
+        // never in the composer, the rail or the status bar below it.
+        let body = crate::ui::regions(&app, ratatui::layout::Rect::new(0, 0, width, height))[0];
+        let mut ever_drawn = false;
+        for _ in 0..20 {
+            app.scroll_transcript(1);
+            let buf = screen(&app, width, height);
+            let rows = pixel_rows(&buf);
+            ever_drawn |= !rows.is_empty();
+            for row in rows {
+                assert!(
+                    row < body.bottom(),
+                    "row {row} has pixels below the transcript body (which ends at {})",
+                    body.bottom()
+                );
+            }
+        }
+        assert!(
+            ever_drawn,
+            "scrolling back never brought the image into view"
+        );
+
+        // And back at the bottom, the screen is exactly what it was before the
+        // scroll — no pixels left over anywhere.
+        app.scroll_to_bottom();
+        assert!(pixel_rows(&screen(&app, width, height)).is_empty());
+    }
+
+    #[test]
+    fn a_subagents_image_renders_inside_that_runs_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = red_png(dir.path());
+        let mut app = app();
+        app.welcome_dismissed = true;
+        app.handle_agent_event(AgentEvent::SubagentRunStarted {
+            run: 1,
+            bg: None,
+            name: "researcher".to_string(),
+            task: "look".to_string(),
+        });
+        app.handle_agent_event(AgentEvent::SubagentRunImages {
+            run: 1,
+            source: ImageSource::Tool("screenshot".to_string()),
+            images: vec![image],
+        });
+
+        // The run's image is its own: the main chat, which the subagent has said
+        // nothing to yet, shows no pixels.
+        assert!(pixel_rows(&screen(&app, 80, 40)).is_empty());
+
+        // Open the pane and it is there, on the tool that took it.
+        app.attached = Some(0);
+        let buf = screen(&app, 80, 40);
+        assert!(!pixel_rows(&buf).is_empty(), "the pane draws the image");
+        let text: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("image from `screenshot`"), "{text}");
+    }
+
+    #[test]
+    fn a_resumed_session_replays_the_images_it_left_on_disk() {
+        use crate::llm::{ChatMessage, Image};
+        let png = Image::new("iVBOR", "image/png").at_path(PathBuf::from("/img/a.png"));
+
+        let mut app = app();
+        let mut assistant = ChatMessage::assistant("done");
+        assistant.images.push(png.clone());
+        app.load_transcript(vec![
+            ChatMessage::user("draw"),
+            assistant,
+            ChatMessage::tool_result("render", "ok"),
+            // The images `render` returned, riding back to the model. Not a
+            // prompt — the agent wrote it, not the user.
+            ChatMessage::user_with_images("Image(s) returned by `render`:", vec![png]),
+        ]);
+
+        let images: Vec<&TranscriptEntry> = app
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Image { .. }))
+            .collect();
+        assert!(
+            matches!(
+                images.as_slice(),
+                [
+                    TranscriptEntry::Image {
+                        source: ImageSource::Assistant,
+                        ..
+                    },
+                    TranscriptEntry::Image {
+                        source: ImageSource::Tool(tool),
+                        image,
+                    },
+                ] if tool == "render" && image.path == Path::new("/img/a.png")
+            ),
+            "both directions came back, attributed: {images:?}"
+        );
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::User(text) if text.contains("Image(s) returned"))),
+            "the carrier message is not replayed as something the user said"
+        );
     }
 
     #[test]

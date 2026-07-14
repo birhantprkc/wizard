@@ -282,6 +282,7 @@ impl Tool for GenerateImageTool {
         };
 
         let mut lines = Vec::new();
+        let mut generated: Vec<crate::llm::Image> = Vec::new();
         for (index, image) in images.iter().enumerate() {
             let path = output_path_for_index(&base_path, index, images.len());
             let (bytes, source_url) = match materialize_image(&client, image).await {
@@ -303,14 +304,26 @@ impl Tool for GenerateImageTool {
             if let Some(url) = source_url {
                 line.push_str(&format!("\n  (url: {url})"));
             }
+            // The image travels with the result, not just its path: the agent
+            // loop writes it to the session's image store, shows it inline in
+            // the GUI and TUI, and hands it back to the model, which can then
+            // see what it asked for. A payload the carry cap refuses (or a
+            // format we cannot name) is still on disk and still named here —
+            // it just does not ride along.
+            match crate::llm::Image::from_bytes(&bytes) {
+                Ok(image) => generated.push(image),
+                Err(err) => {
+                    tracing::warn!("{} is not carried inline: {err}", path.display());
+                    line.push_str(&format!("\n  (not shown inline: {err})"));
+                }
+            }
             lines.push(line);
         }
 
-        Ok(ToolOutput::ok(format!(
-            "generated {} image(s):\n{}",
-            lines.len(),
-            lines.join("\n")
-        )))
+        Ok(ToolOutput::ok_with_images(
+            format!("generated {} image(s):\n{}", lines.len(), lines.join("\n")),
+            generated,
+        ))
     }
 }
 

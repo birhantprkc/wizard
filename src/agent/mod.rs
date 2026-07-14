@@ -23,11 +23,12 @@ use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
 use crate::dispatch::Dispatcher;
 use crate::hooks::{HookEngine, PromptSubmit};
+use crate::images::{ImageRef, ImageStore};
 use crate::llm::provider::LlmProvider;
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Role, ToolCall};
+use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Image, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
-use crate::tools::{ToolContext, ToolOutput, registry::ToolRegistry};
+use crate::tools::{CommandDispatch, ToolContext, ToolOutput, registry::ToolRegistry};
 
 use session::Session;
 
@@ -87,6 +88,35 @@ pub struct InterviewQuestion {
     pub options: Vec<String>,
 }
 
+/// Where an image came from, on an [`AgentEvent::Images`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// The model produced it inline in its reply
+    /// ([`ChatChunk::images`](crate::llm::ChatChunk::images)).
+    Assistant,
+    /// A tool returned it ([`ToolOutput::images`]); the name of the tool.
+    Tool(String),
+}
+
+impl ImageSource {
+    /// Stable tag for the structured surfaces (`stream-json`, the GUI's
+    /// protocol frames).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageSource::Assistant => "assistant",
+            ImageSource::Tool(_) => "tool",
+        }
+    }
+
+    /// The tool that produced the image, if a tool did.
+    pub fn tool(&self) -> Option<&str> {
+        match self {
+            ImageSource::Assistant => None,
+            ImageSource::Tool(name) => Some(name),
+        }
+    }
+}
+
 /// Events emitted by the agent loop. The TUI renders them; the headless
 /// runner logs them.
 #[derive(Debug)]
@@ -98,8 +128,28 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     /// A tool call is being executed.
     ToolStarted { name: String, args: Value },
-    /// A tool call finished.
+    /// A tool call finished. `output.images` carries any images the tool
+    /// produced, as base64; the [`AgentEvent::Images`] that follows says where
+    /// they landed on disk, which is what a renderer wants.
     ToolFinished { name: String, output: ToolOutput },
+    /// Images produced during this turn — by a tool, or by the model itself —
+    /// and written to the session's image directory
+    /// (`~/.wizard/images/<session>/`).
+    ///
+    /// This is the event the surfaces render off. Each [`ImageRef`] names a
+    /// file on disk plus its media type and size: the TUI prints the path when
+    /// the terminal cannot draw the image, the GUI links to it for "open full
+    /// size". No base64 rides on this event — the payload the model needs stays
+    /// in history, and a transcript frame references the image rather than
+    /// embedding it.
+    ///
+    /// Ordering: for a tool's images this arrives immediately after that tool's
+    /// [`AgentEvent::ToolFinished`]; for the model's own images, immediately
+    /// after the last [`AgentEvent::TextDelta`] of the reply that produced them.
+    Images {
+        source: ImageSource,
+        images: Vec<ImageRef>,
+    },
     /// One agent step (model round-trip) completed. 1-based.
     StepCompleted { step: u32 },
     /// Non-fatal error surfaced to the user; the loop may continue.
@@ -218,6 +268,14 @@ pub enum AgentEvent {
         run: u64,
         name: String,
         output: ToolOutput,
+    },
+    /// [`AgentEvent::Images`], scoped to a subagent run — images produced
+    /// inside a run land in the same session directory and are announced the
+    /// same way, so a run's pane can render them instead of losing them.
+    SubagentRunImages {
+        run: u64,
+        source: ImageSource,
+        images: Vec<ImageRef>,
     },
     /// A subagent completed one step (model round-trip). 1-based, scoped to a
     /// run.
@@ -350,6 +408,50 @@ pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -
     events.send(event).await.is_ok()
 }
 
+/// Take custody of images produced during a turn — the one seam every image
+/// passes through, from either direction: a tool's [`ToolOutput::images`] or
+/// the model's own [`ChatChunk::images`](crate::llm::ChatChunk::images).
+///
+/// Images over [`crate::llm::MAX_IMAGE_BYTES`] are dropped here with a notice:
+/// an absurd image must not reach history, where it would melt the context
+/// window and bloat the session file. The rest are written to the session's
+/// image store and announced to the surfaces as `announce(refs)` — an event
+/// carrying paths, never base64. Persistence is best-effort (see
+/// [`ImageStore::save_all`]); the model's copy is the base64 this returns, for
+/// the caller to attach to the message it is about to push.
+pub(crate) async fn absorb_images(
+    images: Vec<Image>,
+    store: Option<&Arc<ImageStore>>,
+    events: Option<&mpsc::Sender<AgentEvent>>,
+    announce: impl FnOnce(Vec<ImageRef>) -> AgentEvent,
+) -> Vec<Image> {
+    if images.is_empty() {
+        return images;
+    }
+    let (kept, dropped) = crate::images::split_oversized(images);
+    if !dropped.is_empty() {
+        let notice = crate::images::oversized_notice(&dropped);
+        tracing::warn!("{notice}");
+        if let Some(events) = events {
+            emit(events, AgentEvent::Notice(notice)).await;
+        }
+    }
+    let Some(store) = store else {
+        // No store (a registry driven directly, outside an agent): the images
+        // still reach the model, they just land nowhere for the surfaces.
+        return kept;
+    };
+    // Each surviving image comes back tagged with its path, so the session file
+    // records where it went and a replayed transcript needs no re-derivation.
+    let (kept, saved) = store.save_all(kept);
+    if !saved.is_empty()
+        && let Some(events) = events
+    {
+        emit(events, announce(saved)).await;
+    }
+    kept
+}
+
 /// Whether an LLM error is worth retrying after backoff. Typed provider
 /// errors classify themselves; unknown errors (mid-stream drops surface as
 /// plain `anyhow` context chains) stay transient for robustness.
@@ -420,6 +522,8 @@ enum Completion {
     Done {
         content: String,
         tool_calls: Vec<ToolCall>,
+        /// Images the model produced inline in this reply, in arrival order.
+        images: Vec<Image>,
     },
     Cancelled,
 }
@@ -542,6 +646,14 @@ pub struct RewindCandidate {
     pub files: Vec<PathBuf>,
 }
 
+/// Prefix of the system note carrying `session_start` hook output.
+///
+/// The note is context for the model, not conversation: surfaces that replay a
+/// session from disk (the GUI transcript) match on this to drop it, the way the
+/// TUI drops every system message when it reloads a transcript. Hook *events*
+/// are still reported, as one-line [`AgentEvent::HookFired`] notices.
+pub const SESSION_START_HOOK_NOTE: &str = "[session_start hook]";
+
 /// Number of most-recent messages preserved verbatim when compacting history.
 const KEEP_RECENT: usize = 10;
 
@@ -661,6 +773,16 @@ impl Agent {
             Arc::clone(&omakase),
         )));
 
+        // Images produced this session (by a tool or by the model) land under
+        // `~/.wizard/images/<session>/`, so every surface has a real file to
+        // render or link to.
+        let mut ctx = ToolContext::new(project_root)
+            .with_web(web)
+            .with_checkpoints(Arc::clone(&checkpoints));
+        if let Some(images) = open_image_store(&session.id) {
+            ctx = ctx.with_images(images);
+        }
+
         let mut agent = Self {
             client,
             model,
@@ -675,9 +797,7 @@ impl Agent {
             config,
             history: Vec::new(),
             session,
-            ctx: ToolContext::new(project_root)
-                .with_web(web)
-                .with_checkpoints(Arc::clone(&checkpoints)),
+            ctx,
             native_tools,
             skills,
             agents_md,
@@ -722,13 +842,14 @@ impl Agent {
         self.config.reasoning_effort = effort;
     }
 
-    /// Mark this agent as running on a surface that drains slash commands the
-    /// agent queues via `run_command` — the interactive TUI. Only then is the
-    /// `run_command` tool useful; headless and gateway runs leave it off so the
-    /// tool refuses rather than report success for a command nothing applies.
-    /// Preserved across per-turn context clones (`ToolContext::with_events`).
-    pub fn set_command_dispatch(&mut self, on: bool) {
-        self.ctx.dispatches_commands = on;
+    /// Declare which slash commands the surface behind this agent will run when
+    /// the agent queues one via `run_command` (see [`CommandDispatch`]). Only a
+    /// surface that drains the queue makes the tool useful; headless and gateway
+    /// runs leave it at `None` so the tool refuses rather than report success for
+    /// a command nothing applies. Preserved across per-turn context clones
+    /// (`ToolContext::with_events`).
+    pub fn set_command_dispatch(&mut self, dispatch: CommandDispatch) {
+        self.ctx.command_dispatch = dispatch;
     }
 
     /// Conversation history (system prompt included).
@@ -835,6 +956,9 @@ impl Agent {
         self.ctx.subagents = Arc::new(crate::tools::subagent_tasks::SubagentTaskRegistry::new());
         self.ctx.todos = Arc::new(std::sync::Mutex::new(Vec::new()));
         self.session = Session::create(&Config::sessions_dir()?)?;
+        // Images follow the session: the fresh conversation writes into its own
+        // directory, and the old one's files stay where its transcript points.
+        self.ctx.images = open_image_store(&self.session.id);
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
@@ -874,7 +998,7 @@ impl Agent {
     pub async fn fire_session_start(&mut self, events: &mpsc::Sender<AgentEvent>) {
         if let Some(extra) = self.hooks.session_start(self.mode, Some(events)).await {
             self.push(ChatMessage::system(format!(
-                "[session_start hook]\n{extra}"
+                "{SESSION_START_HOOK_NOTE}\n{extra}"
             )));
         }
     }
@@ -921,6 +1045,38 @@ impl Agent {
     /// and finished), oldest first, for `/bashes`.
     pub fn tasks(&self) -> Vec<crate::tools::tasks::Task> {
         self.ctx.tasks.list()
+    }
+
+    /// The agent's working todo list, for `/status` on a surface that does not
+    /// mirror the `TodoUpdated` events itself.
+    pub fn todos(&self) -> Vec<crate::tools::todo::TodoItem> {
+        self.ctx
+            .todos
+            .lock()
+            .map(|list| list.clone())
+            .unwrap_or_default()
+    }
+
+    /// The model client this agent talks to. A surface rebuilding the tool
+    /// registry (`/reload`) has to hand the subagent spawner the same client
+    /// the parent runs on, or its subagents answer from a different model than
+    /// the one `/model` and `/fusion` last set.
+    pub fn client(&self) -> &Arc<dyn LlmProvider> {
+        &self.client
+    }
+
+    /// Swap the model client mid-session (`/fusion`: the panel answers every
+    /// turn; toggling back restores the configured provider). The conversation
+    /// and the session file are untouched — on a surface whose chat *is* its
+    /// session file (the GUI), rotating either to change what answers would
+    /// strand the page on a session nothing writes to any more.
+    ///
+    /// The caller must also rebuild the tool registry against the new client
+    /// ([`build_tool_registry`]), or subagents keep spawning on the old one.
+    pub fn set_client(&mut self, client: Arc<dyn LlmProvider>, native_tools: bool) {
+        self.client = client;
+        self.native_tools = native_tools;
+        self.refresh_system_prompt();
     }
 
     /// Shared handle on the background-subagent registry, so a surface can
@@ -1182,10 +1338,22 @@ impl Agent {
         if let Err(err) = self.session.append_marker(turn, &input) {
             tracing::warn!("could not append turn marker: {err}");
         }
-        let attachments: Vec<crate::llm::ImageAttachment> = images
-            .iter()
-            .map(|path| crate::llm::image_attachment_from_path(path))
-            .collect();
+        // Images the user attached (pasted into the TUI, passed on the command
+        // line). They are read off disk here — size-capped and media-typed from
+        // their bytes — and ride the user message as `Image`s, the same shape a
+        // tool's or the model's own images travel in. One that cannot be read
+        // is reported and skipped: the rest of the turn still runs.
+        let mut attachments: Vec<crate::llm::Image> = Vec::with_capacity(images.len());
+        for path in images {
+            match crate::llm::Image::from_path(path) {
+                Ok(image) => attachments.push(image),
+                Err(err) => {
+                    let notice = format!("could not attach {}: {err}", path.display());
+                    tracing::warn!("{notice}");
+                    emit(events, AgentEvent::Notice(notice)).await;
+                }
+            }
+        }
         if attachments.is_empty() {
             self.push(ChatMessage::user(input));
         } else {
@@ -1216,7 +1384,7 @@ impl Agent {
             // system prompt's plan-mode block in step with the flag.
             self.sync_plan_prompt();
 
-            let (mut content, mut tool_calls) =
+            let (mut content, mut tool_calls, mut images) =
                 match self.stream_completion_with_retry(events).await? {
                     // Cancelled mid-stream: the partial completion is discarded
                     // (never entered history), so nothing dangles.
@@ -1224,27 +1392,30 @@ impl Agent {
                     Completion::Done {
                         content,
                         tool_calls,
-                    } => (content, tool_calls),
+                        images,
+                    } => (content, tool_calls, images),
                 };
 
             // Some reasoning models (xAI grok-4.3 after tool results) emit
             // only reasoning and stop, leaving the visible message empty.
             // Nudge once; if it stays empty, surface a notice instead of
-            // ending the turn silently.
-            if completion_is_empty(&content, &tool_calls) {
+            // ending the turn silently. A reply that produced an image but no
+            // text is not empty — it said what it had to say in pixels.
+            if images.is_empty() && completion_is_empty(&content, &tool_calls) {
                 // In-memory only (not `push`): the nudge must not pollute the
                 // persisted session history.
                 self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
                 let retried = self.stream_completion_with_retry(events).await;
                 self.history.pop();
-                let (retry_content, retry_calls) = match retried? {
+                let (retry_content, retry_calls, retry_images) = match retried? {
                     Completion::Cancelled => return Ok(DoneReason::Stopped),
                     Completion::Done {
                         content,
                         tool_calls,
-                    } => (content, tool_calls),
+                        images,
+                    } => (content, tool_calls, images),
                 };
-                if completion_is_empty(&retry_content, &retry_calls) {
+                if retry_images.is_empty() && completion_is_empty(&retry_content, &retry_calls) {
                     let _ = emit(
                         events,
                         AgentEvent::Error("model returned an empty response".to_string()),
@@ -1254,14 +1425,26 @@ impl Agent {
                 }
                 content = retry_content;
                 tool_calls = retry_calls;
+                images = retry_images;
             }
+
+            // Images the model generated: persisted and announced before the
+            // assistant message lands, so what history carries is exactly what
+            // the surfaces were told about.
+            let images = absorb_images(images, self.ctx.images.as_ref(), Some(events), |images| {
+                AgentEvent::Images {
+                    source: ImageSource::Assistant,
+                    images,
+                }
+            })
+            .await;
 
             let assistant = ChatMessage {
                 role: Role::Assistant,
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
                 tool_name: None,
-                images: Vec::new(),
+                images,
             };
             self.push(assistant);
 
@@ -1347,6 +1530,7 @@ impl Agent {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut images = Vec::new();
         let mut prompt_tokens = None;
         let mut completion_tokens = None;
         loop {
@@ -1359,6 +1543,10 @@ impl Agent {
                 },
             };
             let chunk = chunk.context("reading chat stream")?;
+            // Images the model generated (see `ChatChunk::images`). They are
+            // collected here and taken in by `absorb_images` once the reply is
+            // complete, so a cancelled or retried stream leaves nothing behind.
+            images.extend(chunk.images);
             if let Some(message) = chunk.message {
                 if !message.content.is_empty() {
                     if chunk.thinking {
@@ -1370,6 +1558,7 @@ impl Agent {
                         let _ = emit(events, AgentEvent::TextDelta(message.content)).await;
                     }
                 }
+                images.extend(message.images);
                 tool_calls.extend(message.tool_calls);
             }
             if chunk.prompt_eval_count.is_some() {
@@ -1396,6 +1585,7 @@ impl Agent {
         Ok(Completion::Done {
             content,
             tool_calls,
+            images,
         })
     }
 
@@ -1663,16 +1853,45 @@ impl Agent {
         call: &ToolCall,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Option<DoneReason> {
+        let name = call.function.name.clone();
         let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
-        match &outcome.output {
-            Some(output) => self.push(self.tool_feedback(&call.function.name, output)),
+        let images = match &outcome.output {
+            Some(output) => {
+                self.push(self.tool_feedback(&name, output));
+                output.images.clone()
+            }
             // No result (event receiver gone mid-batch): answer the call
             // anyway so the persisted history carries no dangling tool_use.
-            None => self.push(self.tool_feedback(
-                &call.function.name,
-                &ToolOutput::ok("(not executed — turn ended early)"),
-            )),
+            None => {
+                self.push(
+                    self.tool_feedback(&name, &ToolOutput::ok("(not executed — turn ended early)")),
+                );
+                Vec::new()
+            }
+        };
+
+        // Images a tool returned ride back to the model on a follow-up user
+        // message: user messages carry images uniformly across every provider,
+        // whereas a `tool` result cannot on OpenAI. A non-vision model simply
+        // ignores the attachment. They are persisted and announced first, so
+        // the surfaces see them attached to the tool card that produced them.
+        if !images.is_empty() {
+            let tool = name.clone();
+            let images = absorb_images(images, self.ctx.images.as_ref(), Some(events), |images| {
+                AgentEvent::Images {
+                    source: ImageSource::Tool(tool),
+                    images,
+                }
+            })
+            .await;
+            if !images.is_empty() {
+                self.push(ChatMessage::user_with_images(
+                    format!("Image(s) returned by `{name}`:"),
+                    images,
+                ));
+            }
         }
+
         if let Some(nudge) = outcome.nudge {
             self.push(ChatMessage::system(nudge));
         }
@@ -1799,6 +2018,20 @@ impl Drop for Agent {
     }
 }
 
+/// The image store for session `id` (`~/.wizard/images/<id>/`). A store that
+/// cannot be opened (no home directory) costs the surfaces their copy of an
+/// image, never the turn — the model still gets the base64 — so the failure is
+/// logged, not fatal.
+fn open_image_store(id: &str) -> Option<Arc<ImageStore>> {
+    match ImageStore::open(id) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            tracing::warn!("could not open the session image store: {err:#}");
+            None
+        }
+    }
+}
+
 /// Read the persistent memory index (MEMORY.md) for `project_root`, if any
 /// memories are saved. Failures are logged, not fatal — memory is an
 /// enhancement, never a reason a session cannot start.
@@ -1827,11 +2060,122 @@ fn read_memory_index(project_root: &Path) -> Option<String> {
 /// This is the shared agent-construction path used by both the sovereign
 /// headless runner ([`run_headless`]) and the messaging gateway
 /// ([`crate::gateway`]). `resume` reopens the latest session instead of
-/// starting a new one.
+/// starting a new one. Each builds exactly one agent, so each lets this path
+/// connect the MCP servers for it.
 pub async fn build_headless_agent(
     config: &Config,
     project_root: &Path,
     resume: bool,
+) -> Result<Agent> {
+    build_headless_agent_inner(config, project_root, resume, None, None).await
+}
+
+/// [`build_headless_agent`] with an explicit session instead of the
+/// latest-or-new resolution — the GUI server manages one session per task
+/// (created for a chosen workspace, or reopened by id) and hands it in.
+///
+/// `mcp` is the caller's already-connected manager. A process that builds more
+/// than one agent — the GUI, one per warm task — must connect its servers once
+/// and pass them here: connecting per build would run one copy of every
+/// configured MCP server *per agent*, each a real OS process. `None` connects a
+/// manager for this agent alone.
+pub async fn build_headless_agent_for_session(
+    config: &Config,
+    project_root: &Path,
+    session: Session,
+    mcp: Option<&McpManager>,
+) -> Result<Agent> {
+    build_headless_agent_inner(config, project_root, false, Some(session), mcp).await
+}
+
+/// The agent's whole tool set, freshly composed: native tools, scripted tools
+/// (`~/.wizard/tools`), the MCP tools `manager` is connected to, the subagent
+/// spawner, and the config-dependent `evolve` / `publish` tools.
+///
+/// Returns the registry and the spawn tool's shared model slot, which the caller
+/// must hand to [`Agent::bind_subagent_model`] — a fresh spawn tool reads the
+/// *configured* model until it is bound, and would quietly ignore `/model`.
+///
+/// This is what a build composes and what `/reload` recomposes, so a reloaded
+/// session has exactly the tools a fresh one does — no more (a second copy of
+/// every MCP server) and no fewer (`evolve` and `publish` silently dropped).
+pub async fn build_tool_registry(
+    config: &Config,
+    client: &Arc<dyn LlmProvider>,
+    hooks: &Arc<HookEngine>,
+    manager: &McpManager,
+) -> Result<(ToolRegistry, subagent::SharedActiveModel)> {
+    let mut base = ToolRegistry::with_native_tools();
+    match Config::scripted_tools_dir() {
+        Ok(dir) => {
+            if let Err(err) = base.load_scripted(&dir) {
+                tracing::warn!("loading scripted tools failed: {err}");
+            }
+        }
+        Err(err) => tracing::warn!("scripted tools dir unavailable: {err}"),
+    }
+    if let Err(err) = base.attach_mcp(manager).await {
+        tracing::warn!("attaching MCP tools failed: {err}");
+    }
+    base.apply_harness_overrides();
+
+    let subagents_dir = Config::subagents_dir()?;
+    let subagent_configs = subagent::available_configs(&subagents_dir);
+    let base = Arc::new(base);
+    let mut registry = subagent::scoped_registry(&base, None);
+    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
+        subagent_configs,
+        Arc::clone(client),
+        Arc::clone(&base),
+        Arc::clone(hooks),
+    ));
+    let subagent_model = spawn_tool.model_handle();
+    registry.register(spawn_tool);
+    registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
+        config.clone(),
+    )));
+    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
+        config.clone(),
+    )));
+    Ok((registry, subagent_model))
+}
+
+/// Skills from the repo/bundled roots plus `~/.wizard/skills` (user shadowing).
+/// A skill tree that will not load costs its skills, never the session.
+pub fn load_skills() -> Vec<Skill> {
+    let roots = crate::skills::default_roots();
+    crate::skills::load_skills(&roots).unwrap_or_else(|err| {
+        tracing::warn!("loading skills failed: {err}");
+        Vec::new()
+    })
+}
+
+/// Connect every server in `~/.wizard/mcp.toml`. Never hard-fails: a missing or
+/// broken config, or a server that will not come up, costs its tools — not the
+/// session.
+pub async fn connect_mcp() -> McpManager {
+    let config = match Config::mcp_config_path().and_then(|path| McpConfig::load(&path)) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!("could not load mcp.toml: {err:#}");
+            return McpManager::empty();
+        }
+    };
+    match McpManager::connect_all(&config).await {
+        Ok(manager) => manager,
+        Err(err) => {
+            tracing::warn!("MCP startup failed: {err:#}");
+            McpManager::empty()
+        }
+    }
+}
+
+async fn build_headless_agent_inner(
+    config: &Config,
+    project_root: &Path,
+    resume: bool,
+    session: Option<Session>,
+    mcp: Option<&McpManager>,
 ) -> Result<Agent> {
     let active = config.active();
     let model = active.model.clone();
@@ -1852,28 +2196,26 @@ pub async fn build_headless_agent(
         .await
         .with_context(|| format!("LLM health check failed for {}", client.label()))?;
 
-    let native_tools = match client.supports_native_tools(&model).await {
-        Ok(supported) => supported,
-        Err(err) => {
-            tracing::warn!(
-                "could not probe tool support for '{model}': {err}; assuming native tools"
-            );
-            true
-        }
-    };
+    let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     if !native_tools {
-        println!("model '{model}' lacks native tool calling; using the JSON tool protocol");
+        println!("using the JSON tool protocol for '{model}'");
     }
 
-    // Session first: the hook engine carries its id in every payload.
-    let sessions_dir = Config::sessions_dir()?;
-    let session = if resume {
-        match Session::open_latest(&sessions_dir)? {
-            Some(session) => session,
-            None => Session::create(&sessions_dir)?,
+    // Session first: the hook engine carries its id in every payload. An
+    // explicit session (GUI) wins; otherwise resolve latest-or-new here.
+    let session = match session {
+        Some(session) => session,
+        None => {
+            let sessions_dir = Config::sessions_dir()?;
+            if resume {
+                match Session::open_latest(&sessions_dir)? {
+                    Some(session) => session,
+                    None => Session::create(&sessions_dir)?,
+                }
+            } else {
+                Session::create(&sessions_dir)?
+            }
         }
-    } else {
-        Session::create(&sessions_dir)?
     };
 
     // Lifecycle hooks, shared by the agent's dispatcher and the subagent
@@ -1885,59 +2227,17 @@ pub async fn build_headless_agent(
     ));
 
     // Tools: natives + scripted + MCP, then the subagent spawner on top.
-    let mut base = ToolRegistry::with_native_tools();
-    match Config::scripted_tools_dir() {
-        Ok(dir) => {
-            if let Err(err) = base.load_scripted(&dir) {
-                tracing::warn!("loading scripted tools failed: {err}");
-            }
-        }
-        Err(err) => tracing::warn!("scripted tools dir unavailable: {err}"),
-    }
-    let manager = match Config::mcp_config_path().and_then(|path| McpConfig::load(&path)) {
-        Ok(mcp_config) => match McpManager::connect_all(&mcp_config).await {
-            Ok(manager) => manager,
-            Err(err) => {
-                tracing::warn!("MCP startup failed: {err}");
-                McpManager::empty()
-            }
-        },
-        Err(err) => {
-            tracing::warn!("could not load mcp.toml: {err}");
-            McpManager::empty()
+    let connected;
+    let manager = match mcp {
+        Some(manager) => manager,
+        None => {
+            connected = connect_mcp().await;
+            &connected
         }
     };
-    if let Err(err) = base.attach_mcp(&manager).await {
-        tracing::warn!("attaching MCP tools failed: {err}");
-    }
-    base.apply_harness_overrides();
+    let (registry, subagent_model) = build_tool_registry(config, &client, &hooks, manager).await?;
 
-    let subagents_dir = Config::subagents_dir()?;
-    let subagent_configs = subagent::available_configs(&subagents_dir);
-    let base = Arc::new(base);
-    let mut registry = subagent::scoped_registry(&base, None);
-    let spawn_tool = Arc::new(subagent::SpawnSubagentTool::new(
-        subagent_configs,
-        Arc::clone(&client),
-        Arc::clone(&base),
-        Arc::clone(&hooks),
-    ));
-    // Bound to the agent below so subagents follow `/model` switches.
-    let subagent_model = spawn_tool.model_handle();
-    registry.register(spawn_tool);
-    registry.register(Arc::new(crate::tools::evolve::EvolveTool::new(
-        config.clone(),
-    )));
-    registry.register(Arc::new(crate::tools::publish::PublishTool::new(
-        config.clone(),
-    )));
-
-    // Skills: repo/bundled roots + user (~/.wizard/skills), user shadowing.
-    let skill_roots = crate::skills::default_roots();
-    let skills = crate::skills::load_skills(&skill_roots).unwrap_or_else(|err| {
-        tracing::warn!("loading skills failed: {err}");
-        Vec::new()
-    });
+    let skills = load_skills();
 
     let mut agent = Agent::new(
         client,
@@ -2465,12 +2765,252 @@ mod tests {
     fn final_chunk(content: &str) -> ChatChunk {
         ChatChunk {
             message: (!content.is_empty()).then(|| ChatMessage::assistant(content)),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,
             eval_count: None,
             prompt_eval_count: None,
         }
+    }
+
+    /// A tiny PNG (a real magic number and some bytes behind it).
+    fn test_png() -> Image {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(b"a few pixels");
+        Image::from_bytes(&bytes).expect("a PNG")
+    }
+
+    /// A live chunk carrying a generated image — what an image-capable provider
+    /// emits on [`ChatChunk::images`].
+    fn image_chunk(images: Vec<Image>) -> ChatChunk {
+        ChatChunk {
+            message: None,
+            images,
+            thinking: false,
+            done: false,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// Every [`AgentEvent::Images`] a turn emitted, flattened.
+    fn drain_images(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<(ImageSource, ImageRef)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Images { source, images } = event {
+                out.extend(images.into_iter().map(|image| (source.clone(), image)));
+            }
+        }
+        out
+    }
+
+    /// A tool that returns `images` alongside its text.
+    struct ImageTool {
+        images: Vec<Image>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ImageTool {
+        fn name(&self) -> &str {
+            "generate_image"
+        }
+        fn description(&self) -> &str {
+            "Generate an image."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::ok_with_images(
+                "rendered 1 image",
+                self.images.clone(),
+            ))
+        }
+    }
+
+    /// One assistant message whose only tool call is `generate_image`.
+    fn calls_image_tool() -> ChatChunk {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: "generate_image".to_string(),
+                arguments: json!({}),
+            },
+        });
+        ChatChunk {
+            message: Some(assistant),
+            images: Vec::new(),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_generated_images_reach_history_disk_and_the_surfaces() {
+        // A provider that streams text and then an image, exactly as an
+        // image-capable endpoint does through `ChatChunk::images`.
+        let image = test_png();
+        let (mut agent, _provider, _tmp) = test_agent(vec![vec![
+            ChatChunk {
+                message: Some(ChatMessage::assistant("here you go")),
+                ..image_chunk(Vec::new())
+            },
+            image_chunk(vec![image.clone()]),
+            final_chunk(""),
+        ]]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("draw a cat", tx).await.expect("turn ok");
+
+        // In history, on the assistant message, as base64 — a vision model
+        // needs it there on the next turn.
+        let assistant = agent
+            .history()
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .expect("an assistant message");
+        assert_eq!(assistant.content, "here you go");
+        assert_eq!(assistant.images.len(), 1);
+        assert_eq!(assistant.images[0].b64, image.b64);
+        assert_eq!(assistant.images[0].mime, "image/png");
+
+        // Announced to the surfaces as a path, not base64.
+        let announced = drain_images(&mut rx);
+        assert_eq!(announced.len(), 1);
+        let (source, saved) = &announced[0];
+        assert_eq!(*source, ImageSource::Assistant);
+        assert_eq!(saved.mime, "image/png");
+        assert_eq!(
+            assistant.images[0].path.as_ref(),
+            Some(&saved.path),
+            "history records the same path the surfaces were given — a replayed \
+             transcript re-derives nothing"
+        );
+
+        // And on disk, under this session's image directory.
+        assert_eq!(
+            std::fs::read(&saved.path).expect("the image file"),
+            image.decode().unwrap()
+        );
+        assert!(
+            saved
+                .path
+                .starts_with(Config::images_dir().unwrap().join(&agent.session().id)),
+            "images are session-scoped: {}",
+            saved.path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_images_ride_back_on_a_following_user_message() {
+        // The convention every provider tolerates: the tool message carries the
+        // text, the images follow on a user message (a `tool` result cannot
+        // carry image blocks on OpenAI).
+        let image = test_png();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ImageTool {
+            images: vec![image.clone()],
+        }));
+
+        let tmp = TempDir::new();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![vec![calls_image_tool()], vec![final_chunk("done")]],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("make me a picture", tx).await.expect("turn");
+
+        let history = agent.history();
+        let tool_index = history
+            .iter()
+            .position(|message| message.role == Role::Tool)
+            .expect("a tool result");
+        assert_eq!(history[tool_index].content, "rendered 1 image");
+        assert!(
+            history[tool_index].images.is_empty(),
+            "the tool message carries the text only"
+        );
+        let follow_up = &history[tool_index + 1];
+        assert_eq!(follow_up.role, Role::User);
+        assert!(follow_up.content.contains("generate_image"));
+        assert_eq!(follow_up.images.len(), 1, "the model sees it");
+        assert_eq!(follow_up.images[0].b64, image.b64);
+
+        // The surfaces get the tool's images twice over: on ToolFinished (as
+        // base64, for free) and on Images (as a path, which is what they use).
+        let mut finished_images = Vec::new();
+        let mut announced = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolFinished { output, .. } => finished_images.extend(output.images),
+                AgentEvent::Images { source, images } => announced.push((source, images)),
+                _ => {}
+            }
+        }
+        assert_eq!(finished_images.len(), 1);
+        assert_eq!(finished_images[0].b64, image.b64);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].0, ImageSource::Tool("generate_image".into()));
+        let saved = &announced[0].1[0];
+        assert_eq!(
+            std::fs::read(&saved.path).expect("the image file"),
+            image.decode().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_image_is_dropped_with_a_notice_and_never_enters_history() {
+        // A runaway image must not melt the context window or the session file.
+        let huge = Image::new(
+            "A".repeat(crate::llm::MAX_IMAGE_BYTES / 3 * 4 + 8),
+            "image/png",
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ImageTool {
+            images: vec![huge, test_png()],
+        }));
+
+        let tmp = TempDir::new();
+        let (mut agent, _provider) = test_agent_in(
+            &tmp,
+            vec![vec![calls_image_tool()], vec![final_chunk("done")]],
+            Vec::new(),
+            registry,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        agent.run_turn("make me a picture", tx).await.expect("turn");
+
+        let follow_up = agent
+            .history()
+            .iter()
+            .find(|message| message.role == Role::User && !message.images.is_empty())
+            .expect("the images user message");
+        assert_eq!(
+            follow_up.images.len(),
+            1,
+            "the oversized image never reaches the model; the sane one does"
+        );
+        assert_eq!(follow_up.images[0].b64, test_png().b64);
+
+        let (_text, _errors, notices) = drain_events(&mut rx);
+        assert!(
+            notices.iter().any(|notice| notice.contains("oversized")),
+            "the drop is surfaced, not silent: {notices:?}"
+        );
     }
 
     /// `done: true` chunk carrying token counts alongside `content`.
@@ -2600,6 +3140,7 @@ mod tests {
                 tool_name: None,
                 images: Vec::new(),
             }),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,
@@ -4163,6 +4704,7 @@ mod tests {
                 tool_name: None,
                 images: Vec::new(),
             }),
+            images: Vec::new(),
             thinking: false,
             done: true,
             done_reason: None,

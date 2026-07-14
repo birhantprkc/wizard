@@ -79,25 +79,49 @@ full list up front (action \"write\" replaces the entire list), keep exactly \
 one item in_progress while you work on it, and mark items completed as soon \
 as they are done. Skip the list for trivial single-step tasks.";
 
-/// Memory guidance injected when the project has saved memories; the index
-/// (MEMORY.md) follows it.
+/// Memory guidance injected when the project has saved memories; the rules
+/// and then the index (MEMORY.md) follow it.
 const MEMORY_PROMPT_WITH_INDEX: &str = "\
-You have persistent project memory. The index below lists saved memories \
-(one per file). Use the `memory` tool with action \"read\" to recall \
-details, \"save\" to record new durable facts (user preferences, project \
-conventions, decisions not derivable from the code), and \"delete\" for \
-stale ones. Keep names kebab-case and descriptions one line. Don't save \
-things the repo already records.";
+You have persistent project memory. The index below lists every saved memory \
+(one markdown file each) with its type and a one-line description. Use the \
+`memory` tool with action \"read\" to recall a memory in full, \"save\" to \
+record a new durable fact or update an existing one, and \"delete\" to drop \
+one that turned out to be wrong.";
 
 /// Memory guidance injected when no memories exist yet, so memory
 /// bootstraps on first use.
 const MEMORY_PROMPT_EMPTY: &str = "\
 You have persistent project memory via the `memory` tool, but nothing is \
-saved for this project yet. When you learn a durable fact (user \
-preferences, project conventions, decisions not derivable from the code), \
-record it with action \"save\" (kebab-case name, one-line description); it \
-will appear in your system prompt next session. Don't save things the repo \
-already records.";
+saved for this project yet. When you learn a durable fact, record it with \
+action \"save\" — it appears in your system prompt next session, so the \
+memory you write now is the one you read then.";
+
+/// The rules that make memory worth having, injected whether or not anything
+/// is saved yet: what the types mean, how memories link to each other, and
+/// what must never be written down.
+const MEMORY_RULES: &str = "\
+Every memory has a type:
+- `user` — who the user is: their role, expertise, and standing preferences.
+- `feedback` — how you should work: corrections *and* confirmed approaches. \
+Include the why, not just the what.
+- `project` — ongoing work, goals, and constraints that are not derivable \
+from the code or the git history. Convert relative dates (\"next week\") to \
+absolute ones.
+- `reference` — a pointer to an external resource: a URL, a dashboard, a \
+ticket.
+
+Link related memories from a memory's body by name, `[[wiki-style]]`. A link \
+to a memory that does not exist yet is fine — it marks something worth \
+writing later, not an error. A `read` tells you which links resolve.
+
+A memory has to earn its place:
+- Never save what the repo already records: code structure, past fixes, \
+anything in the git history. Never save what only matters to the current \
+conversation.
+- Before saving, look for a memory that already covers the same ground and \
+update it (save over its name) instead of creating a near-duplicate.
+- Delete a memory that turns out to be wrong. Names are kebab-case, \
+descriptions are one line.";
 
 /// Resolve the base personality prompt for `mode`. An external override —
 /// `$WIZARD_SYSTEM_PROMPT` if set, otherwise `~/.wizard/system_prompt.md` —
@@ -174,13 +198,15 @@ pub fn build_system_prompt(
     }
 
     prompt.push_str("\n\n## Memory\n\n");
-    match memory_index {
-        Some(index) => {
-            prompt.push_str(MEMORY_PROMPT_WITH_INDEX);
-            prompt.push_str("\n\n### Memory index (MEMORY.md)\n\n");
-            prompt.push_str(index);
-        }
-        None => prompt.push_str(MEMORY_PROMPT_EMPTY),
+    prompt.push_str(match memory_index {
+        Some(_) => MEMORY_PROMPT_WITH_INDEX,
+        None => MEMORY_PROMPT_EMPTY,
+    });
+    prompt.push_str("\n\n");
+    prompt.push_str(MEMORY_RULES);
+    if let Some(index) = memory_index {
+        prompt.push_str("\n\n### Memory index (MEMORY.md)\n\n");
+        prompt.push_str(index);
     }
 
     prompt
@@ -294,7 +320,7 @@ mod tests {
     /// the `memory` tool.
     #[test]
     fn memory_index_is_injected_when_present() {
-        let index = "- [build-system](build-system.md) — uses cargo with lto\n";
+        let index = "- [build-system](build-system.md) [project] — uses cargo with lto\n";
         let prompt = build_system_prompt(Mode::Genie, &[], None, Some(index));
         assert!(prompt.contains("## Memory"));
         assert!(prompt.contains("### Memory index (MEMORY.md)"));
@@ -307,5 +333,24 @@ mod tests {
             !prompt.contains("### Memory index (MEMORY.md)"),
             "no index section without saved memories"
         );
+    }
+
+    /// The rules — the four types, the `[[link]]` convention, and what must
+    /// not be written down — are taught whether or not anything is saved yet.
+    /// Without them the model has a store and no idea what belongs in it.
+    #[test]
+    fn memory_rules_are_taught_with_and_without_an_index() {
+        for index in [None, Some("- [x](x.md) [user] — y\n")] {
+            let prompt = build_system_prompt(Mode::Genie, &[], None, index);
+            for kind in crate::memory::MemoryType::ALL {
+                assert!(
+                    prompt.contains(&format!("`{kind}`")),
+                    "the {kind} type is explained (index: {index:?})"
+                );
+            }
+            assert!(prompt.contains("[[wiki-style]]"));
+            assert!(prompt.contains("Never save what the repo already records"));
+            assert!(prompt.contains("update it (save over its name)"));
+        }
     }
 }

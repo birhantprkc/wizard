@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, MemoryType};
 
 use super::{
     MAX_OUTPUT_BYTES, Tool, ToolContext, ToolError, ToolOutput, parse_args, truncate_output,
@@ -22,6 +22,10 @@ pub struct MemoryArgs {
     pub action: String,
     /// Kebab-case memory name (the file is `<name>.md`).
     pub name: String,
+    /// What the memory is about: `user`, `feedback`, `project`, or
+    /// `reference` (save only). Named `type` on the wire.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     /// One-line summary shown in the index (save only).
     #[serde(default)]
     pub description: Option<String>,
@@ -46,6 +50,17 @@ impl MemoryTool {
             message: format!("action '{action}' requires '{field}'"),
         })
     }
+
+    /// The memory type for a save, rejecting an unknown one with the four
+    /// spellings the model may use.
+    fn kind(&self, args: &MemoryArgs) -> Result<MemoryType, ToolError> {
+        let raw = self.require(args.kind.as_deref(), "type", "save")?;
+        raw.parse()
+            .map_err(|err: anyhow::Error| ToolError::InvalidArgs {
+                tool: self.name().to_string(),
+                message: err.to_string(),
+            })
+    }
 }
 
 #[async_trait]
@@ -55,7 +70,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Persist facts about this project across sessions. Use action 'save' to record a durable fact (user preferences, project conventions, decisions), 'read' to recall a saved memory's full content, and 'delete' to drop a stale one. Saved memories appear in the system prompt's memory index next session. Names are kebab-case; descriptions are one line."
+        "Persist a fact about this project or its user across sessions. Actions: 'save' (record a durable fact), 'read' (recall one memory's full content, plus the memories it links to), 'delete' (drop one that is wrong or obsolete). Every save needs a type: 'user' — who the user is (role, expertise, preferences); 'feedback' — how you should work, both corrections and confirmed approaches, always with the why; 'project' — ongoing work, goals, and constraints not derivable from the code or git history, with relative dates written as absolute ones; 'reference' — a pointer to an external resource (URL, dashboard, ticket). Link related memories from the body with [[wiki-style]] names; a link to a memory that does not exist yet is fine, it marks one worth writing later. A memory must earn its place: do not save what the repo already records (code structure, past fixes, git history), or what only matters to this conversation. Before saving, check the memory index for an entry that covers the same ground and update it instead of creating a near-duplicate. Names are kebab-case; descriptions are one line. Saved memories appear in the system prompt's memory index next session."
     }
 
     fn parameters(&self) -> Value {
@@ -63,9 +78,14 @@ impl Tool for MemoryTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["save", "read", "delete"], "description": "What to do with the memory" },
-                "name": { "type": "string", "description": "Kebab-case memory name (lowercase letters, digits, hyphens)" },
+                "name": { "type": "string", "description": "Kebab-case memory name (lowercase letters, digits, hyphens). Reuse an existing name to update that memory in place." },
+                "type": {
+                    "type": "string",
+                    "enum": ["user", "feedback", "project", "reference"],
+                    "description": "What the memory is about (required for save): 'user' who the user is; 'feedback' how you should work, with the why; 'project' ongoing work, goals, constraints, dates absolute; 'reference' a pointer to an external resource"
+                },
                 "description": { "type": "string", "description": "One-line summary shown in the memory index (required for save)" },
-                "content": { "type": "string", "description": "The fact to remember, markdown allowed (required for save)" }
+                "content": { "type": "string", "description": "The fact to remember, markdown allowed, [[links]] to related memories allowed (required for save)" }
             },
             "required": ["action", "name"]
         })
@@ -80,19 +100,23 @@ impl Tool for MemoryTool {
 
         match args.action.as_str() {
             "save" => {
+                let kind = self.kind(&args)?;
                 let description =
                     self.require(args.description.as_deref(), "description", "save")?;
                 let content = self.require(args.content.as_deref(), "content", "save")?;
-                match store.save(&args.name, description, content) {
+                match store.save(&args.name, kind, description, content) {
                     Ok(()) => Ok(ToolOutput::ok(format!(
-                        "Saved memory '{}'. It will appear in the system prompt's memory index next session.",
+                        "Saved memory '{}' ({kind}). It will appear in the system prompt's memory index next session.",
                         args.name
                     ))),
                     Err(err) => Ok(ToolOutput::error(format!("{err:#}"))),
                 }
             }
             "read" => match store.read(&args.name) {
-                Ok(contents) => Ok(ToolOutput::ok(truncate_output(contents, MAX_OUTPUT_BYTES))),
+                Ok(contents) => {
+                    let output = format!("{contents}{}", link_trailer(&store, &contents));
+                    Ok(ToolOutput::ok(truncate_output(output, MAX_OUTPUT_BYTES)))
+                }
                 Err(err) => Ok(ToolOutput::error(format!("{err:#}"))),
             },
             "delete" => match store.delete(&args.name) {
@@ -105,6 +129,26 @@ impl Tool for MemoryTool {
             }),
         }
     }
+}
+
+/// The `[[links]]` a memory points at, appended to a `read` so a recall can
+/// follow them: each saved link is one more `read` away, and each unsaved one
+/// is a memory worth writing. Empty when the body links nowhere.
+fn link_trailer(store: &MemoryStore, contents: &str) -> String {
+    let links = store.links(contents);
+    if links.is_empty() {
+        return String::new();
+    }
+    let mut trailer = String::from("\nLinks:\n");
+    for link in links {
+        let state = if link.saved {
+            "saved — read it to follow the link"
+        } else {
+            "not saved yet"
+        };
+        trailer.push_str(&format!("- {} ({state})\n", link.name));
+    }
+    trailer
 }
 
 #[cfg(test)]
@@ -149,6 +193,7 @@ mod tests {
                 json!({
                     "action": "save",
                     "name": "test-style",
+                    "type": "feedback",
                     "description": "tests use TempDir",
                     "content": "Unit tests build their own temp dirs."
                 }),
@@ -157,8 +202,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert!(out.content.contains("Saved memory 'test-style'"));
-        assert_eq!(tmp.store().list().unwrap().len(), 1);
+        assert!(out.content.contains("Saved memory 'test-style' (feedback)"));
+        let entries = tmp.store().list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, MemoryType::Feedback);
 
         let out = MemoryTool
             .execute(
@@ -169,6 +216,7 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("description: tests use TempDir"));
+        assert!(out.content.contains("type: feedback"));
         assert!(
             out.content
                 .contains("Unit tests build their own temp dirs.")
@@ -185,6 +233,56 @@ mod tests {
         assert!(tmp.store().list().unwrap().is_empty());
     }
 
+    /// A `read` reports the memories the body links to, so the model can
+    /// follow them — including the ones nobody has written yet.
+    #[tokio::test]
+    async fn read_reports_the_links_a_memory_points_at() {
+        let tmp = TempProject::new();
+        tmp.store()
+            .save(
+                "deploy-flow",
+                MemoryType::Project,
+                "how we ship",
+                "Tagged releases only.",
+            )
+            .unwrap();
+        tmp.store()
+            .save(
+                "ci-gates",
+                MemoryType::Project,
+                "what CI enforces",
+                "Blocks a merge until [[deploy-flow]] is green; see [[release-notes]].",
+            )
+            .unwrap();
+
+        let out = MemoryTool
+            .execute(json!({ "action": "read", "name": "ci-gates" }), &tmp.ctx())
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content
+                .contains("- deploy-flow (saved — read it to follow the link)"),
+            "a saved link is one read away: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("- release-notes (not saved yet)"),
+            "a dangling link is a memory worth writing, not an error: {}",
+            out.content
+        );
+
+        // A memory that links nowhere gets no trailer.
+        let out = MemoryTool
+            .execute(
+                json!({ "action": "read", "name": "deploy-flow" }),
+                &tmp.ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.content.contains("Links:"));
+    }
+
     #[tokio::test]
     async fn read_missing_memory_is_a_tool_output_error() {
         let tmp = TempProject::new();
@@ -197,16 +295,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_requires_description_and_content() {
+    async fn save_requires_type_description_and_content() {
+        let tmp = TempProject::new();
+        for incomplete in [
+            json!({ "action": "save", "name": "incomplete" }),
+            json!({ "action": "save", "name": "incomplete", "type": "user" }),
+            json!({ "action": "save", "name": "incomplete", "type": "user", "description": "d" }),
+        ] {
+            let err = MemoryTool
+                .execute(incomplete.clone(), &tmp.ctx())
+                .await
+                .expect_err("an incomplete save must be rejected: {incomplete}");
+            assert!(matches!(err, ToolError::InvalidArgs { .. }));
+        }
+        assert!(tmp.store().list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_rejects_an_unknown_type() {
         let tmp = TempProject::new();
         let err = MemoryTool
             .execute(
-                json!({ "action": "save", "name": "incomplete" }),
+                json!({
+                    "action": "save",
+                    "name": "mystery",
+                    "type": "archived",
+                    "description": "d",
+                    "content": "c"
+                }),
                 &tmp.ctx(),
             )
             .await
-            .expect_err("save without description must be rejected");
-        assert!(matches!(err, ToolError::InvalidArgs { .. }));
+            .expect_err("an unknown type must be rejected");
+        assert!(
+            matches!(&err, ToolError::InvalidArgs { message, .. } if message.contains("user|feedback|project|reference")),
+            "the error names the types the model may use: {err}"
+        );
     }
 
     #[tokio::test]
@@ -227,6 +351,7 @@ mod tests {
                 json!({
                     "action": "save",
                     "name": "../evil",
+                    "type": "project",
                     "description": "d",
                     "content": "c"
                 }),

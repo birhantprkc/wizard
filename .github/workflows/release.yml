@@ -86,9 +86,67 @@ jobs:
           path: wizard-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # The desktop shell (`wizard app`): the same binary built with
+  # `--features desktop`, which links the system webview. A separate job and a
+  # separate asset, never a replacement for the six above — a webview build
+  # cannot start on a Linux box without libwebkit2gtk, and the plain binary must
+  # keep working everywhere.
+  #
+  # No musl target: a static binary and a dynamically linked system webview are
+  # a contradiction. No Windows target: the shell is Linux and macOS only.
+  desktop:
+    name: Build desktop (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # WebKitGTK (wry) and GTK 3 (tao). macOS needs nothing: WKWebView is part
+      # of the OS.
+      - name: Install WebKitGTK
+        if: contains(matrix.target, '-linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: Build (release, desktop)
+        run: cargo build --release --locked --features desktop --target ${{ matrix.target }}
+
+      # The binary inside keeps the name `wizard` — same as every other asset,
+      # so `wizard update` unpacks it with the same code path. The *asset* name
+      # is what distinguishes the build.
+      - name: Package
+        run: |
+          strip "target/${{ matrix.target }}/release/wizard"
+          tar -C "target/${{ matrix.target }}/release" \
+            -czf "wizard-desktop-${{ matrix.target }}.tar.gz" wizard
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wizard-desktop-${{ matrix.target }}
+          path: wizard-desktop-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
   release:
     name: Create GitHub release
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -109,4 +167,8 @@ jobs:
             wizard-aarch64-unknown-linux-musl.tar.gz
             wizard-x86_64-apple-darwin.tar.gz
             wizard-aarch64-apple-darwin.tar.gz
+            wizard-desktop-x86_64-unknown-linux-gnu.tar.gz
+            wizard-desktop-aarch64-unknown-linux-gnu.tar.gz
+            wizard-desktop-x86_64-apple-darwin.tar.gz
+            wizard-desktop-aarch64-apple-darwin.tar.gz
             checksums.txt

@@ -65,6 +65,12 @@
 #                                    (implies WIZARD_LOCAL)    (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
+#   WIZARD_APP                   1 = also install the native desktop app: a second
+#                                    binary, `wizard-desktop` (built --features
+#                                    desktop), plus a launcher entry, so Wizard
+#                                    opens from the dock like any app. Linux needs
+#                                    WebKitGTK; macOS needs nothing. `wizard`
+#                                    itself is untouched.       (default 0)
 #   WIZARD_VERSION               release tag to install, e.g. v0.4.0 (default: the
 #                                latest release). Pins the download to
 #                                releases/download/<tag>/ — use it for
@@ -109,6 +115,7 @@ WIZARD_LLAMACPP_NO_CUDA="${WIZARD_LLAMACPP_NO_CUDA:-0}"
 WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
+WIZARD_APP="${WIZARD_APP:-0}"
 WIZARD_VERSION="${WIZARD_VERSION:-}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
@@ -145,6 +152,9 @@ MEM_GB=0
 MEM_SOURCE=""
 BINARY_INSTALLED=0
 INSTALLED_PATH=""
+PLACED_PATH=""
+DESKTOP_INSTALLED=0
+DESKTOP_PATH=""
 
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
@@ -910,31 +920,33 @@ choose_byom_model() {
 # --- wizard binary ------------------------------------------------------
 
 place_binary() {
-    # $1 = path to the extracted binary
-    local src="$1"
+    # $1 = path to the extracted binary, $2 = name to install it as (default
+    # "wizard"; the desktop shell goes in beside it as "wizard-desktop").
+    # Sets PLACED_PATH to where it landed.
+    local src="$1" name="${2:-wizard}"
     chmod 755 "$src"
 
     if [ -d "$WIZARD_INSTALL_DIR" ] && [ -w "$WIZARD_INSTALL_DIR" ]; then
-        install -m 755 "$src" "${WIZARD_INSTALL_DIR}/wizard"
+        install -m 755 "$src" "${WIZARD_INSTALL_DIR}/${name}"
     elif [ ! -e "$WIZARD_INSTALL_DIR" ] && mkdir -p "$WIZARD_INSTALL_DIR" 2>/dev/null; then
-        install -m 755 "$src" "${WIZARD_INSTALL_DIR}/wizard"
+        install -m 755 "$src" "${WIZARD_INSTALL_DIR}/${name}"
     elif command -v sudo >/dev/null 2>&1; then
         say "Need elevated permissions to write to ${WIZARD_INSTALL_DIR}"
         sudo mkdir -p "$WIZARD_INSTALL_DIR"
-        sudo install -m 755 "$src" "${WIZARD_INSTALL_DIR}/wizard"
+        sudo install -m 755 "$src" "${WIZARD_INSTALL_DIR}/${name}"
     else
         local fallback="$HOME/.local/bin"
         warn "${WIZARD_INSTALL_DIR} is not writable and sudo is unavailable — installing to ${fallback} instead"
         mkdir -p "$fallback"
-        install -m 755 "$src" "${fallback}/wizard"
+        install -m 755 "$src" "${fallback}/${name}"
         case ":$PATH:" in
             *":${fallback}:"*) ;;
             *) warn "${fallback} is not on your PATH — add it to your shell profile" ;;
         esac
-        INSTALLED_PATH="${fallback}/wizard"
+        PLACED_PATH="${fallback}/${name}"
         return
     fi
-    INSTALLED_PATH="${WIZARD_INSTALL_DIR}/wizard"
+    PLACED_PATH="${WIZARD_INSTALL_DIR}/${name}"
 }
 
 download_release_asset() {
@@ -1020,6 +1032,7 @@ download_binary() {
                 continue
             fi
             place_binary "$bin"
+            INSTALLED_PATH="$PLACED_PATH"
             BINARY_INSTALLED=1
             say "Installed wizard to ${INSTALLED_PATH}"
             return
@@ -1122,8 +1135,109 @@ build_from_source() {
     "$bin" --version >/dev/null 2>&1 \
         || die "the built binary does not run ('wizard --version' failed) — the ${ref} ref may be broken"
     place_binary "$bin"
+    INSTALLED_PATH="$PLACED_PATH"
     BINARY_INSTALLED=1
     say "Installed wizard (built from source) to ${INSTALLED_PATH}"
+}
+
+# --- desktop app (WIZARD_APP=1) -----------------------------------------
+
+# The desktop shell (`wizard app`, a webview window over the same GUI) ships as
+# a *separate* binary, `wizard-desktop`, and never replaces `wizard`.
+#
+# It is built with --features desktop, which links the system webview
+# (WebKitGTK on Linux). A binary linked against a library the machine does not
+# have cannot start at all — not the TUI, not the CLI, not `--version`. Keeping
+# the two apart means a desktop app that cannot launch never takes Wizard down
+# with it, and the plain binary keeps its "runs anywhere" promise.
+
+have_webkitgtk() {
+    # Look for the runtime library the binary loads, not the -dev package.
+    ldconfig -p 2>/dev/null | grep -q 'libwebkit2gtk-4\.1\.so' && return 0
+    local dir
+    for dir in /usr/lib /usr/lib64 /lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+        [ -e "${dir}/libwebkit2gtk-4.1.so.0" ] && return 0
+    done
+    return 1
+}
+
+webkitgtk_hint() {
+    warn "the desktop app needs the system webview (WebKitGTK 4.1), which is not installed:"
+    printf '    Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0\n' >&2
+    printf '    Fedora:        sudo dnf install webkit2gtk4.1\n' >&2
+    printf '    Arch:          sudo pacman -S webkit2gtk-4.1\n' >&2
+    printf '    NixOS:         nix run github:%s -- app   (the flake carries it)\n' "$WIZARD_REPO" >&2
+    printf '\n' >&2
+}
+
+desktop_asset_name() {
+    case "$OS" in
+        macos) printf 'wizard-desktop-%s-apple-darwin.tar.gz' "$ARCH" ;;
+        # No musl desktop asset: a static binary cannot load a system webview.
+        *)     printf 'wizard-desktop-%s-unknown-linux-gnu.tar.gz' "$ARCH" ;;
+    esac
+}
+
+fetch_desktop_binary() {
+    # Prints the path to a runnable desktop binary on success; returns nonzero
+    # if it could not be obtained. Mirrors download_binary / build_from_source.
+    local asset bin src_dir
+    if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
+        src_dir="${TMP_DIR}/wizard-src"
+        [ -d "$src_dir" ] || return 1
+        say "Building the desktop shell from source (--features desktop) ..." >&2
+        ( cd "$src_dir" && cargo build --release --features desktop >&2 ) || return 1
+        bin="${src_dir}/target/release/wizard"
+    else
+        asset="$(desktop_asset_name)"
+        download_release_asset "$asset" "${TMP_DIR}/${asset}" || return 1
+        verify_checksum "${TMP_DIR}/${asset}" "$asset" >&2
+        local unpack="${TMP_DIR}/desktop"
+        mkdir -p "$unpack"
+        tar -xzf "${TMP_DIR}/${asset}" -C "$unpack" || return 1
+        bin="$(find "$unpack" -type f -name wizard | head -n1 || true)"
+    fi
+    [ -n "$bin" ] && [ -f "$bin" ] || return 1
+    chmod 755 "$bin"
+    # The sanity check also catches a missing WebKitGTK: the dynamic loader
+    # fails before main, so even `--version` exits nonzero.
+    "$bin" --version >/dev/null 2>&1 || return 1
+    printf '%s' "$bin"
+}
+
+install_desktop_app() {
+    [ "$WIZARD_APP" = "1" ] || return 0
+
+    printf '\n'
+    say "Desktop app (WIZARD_APP=1): the GUI in a native window"
+
+    if [ "$OS" = "linux" ] && ! have_webkitgtk; then
+        webkitgtk_hint
+        warn "skipping the desktop app — install WebKitGTK, then re-run with WIZARD_APP=1"
+        warn "('wizard gui' works today: the same interface, in your browser)"
+        return 0
+    fi
+
+    local bin
+    if ! bin="$(fetch_desktop_binary)"; then
+        warn "could not install the desktop app for ${OS}/${ARCH} (no runnable desktop build)"
+        warn "'wizard gui' still serves the same interface in your browser"
+        return 0
+    fi
+
+    place_binary "$bin" "wizard-desktop"
+    DESKTOP_PATH="$PLACED_PATH"
+    DESKTOP_INSTALLED=1
+    say "Installed wizard-desktop to ${DESKTOP_PATH}"
+
+    # Put it in the launcher (Linux: ~/.local/share/applications; macOS:
+    # ~/Applications/Wizard.app). Idempotent, and never fatal — a failure here
+    # leaves a working `wizard-desktop app` on the command line.
+    if "$DESKTOP_PATH" app --install; then
+        say "Wizard is in your launcher — search for it, or run 'wizard-desktop app'"
+    else
+        warn "could not add Wizard to the launcher — run '${DESKTOP_PATH} app --install' by hand"
+    fi
 }
 
 # --- config -------------------------------------------------------------
@@ -1466,8 +1580,12 @@ main() {
     install_toolchain
     write_config
     install_loadout
+    install_desktop_app
 
     printf '\n'
+    if [ "$DESKTOP_INSTALLED" = "1" ]; then
+        say "Desktop app installed. Open Wizard from your launcher, or run: wizard-desktop app"
+    fi
     if [ "$BINARY_INSTALLED" = "1" ]; then
         if [ "$WIZARD_MINIMAL" = "1" ]; then
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."

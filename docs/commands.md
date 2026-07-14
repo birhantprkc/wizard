@@ -1,8 +1,51 @@
-# Custom commands and @file references
+# Commands
 
-Two ways to put reusable text in front of the model: `/commands` you define as markdown files, and `@path` tokens that inline file contents. Both work identically in the TUI and in headless `-p` runs: one shared preprocessing pipeline (`src/commands.rs`) handles them.
+Wizard's built-in `/commands`, the custom ones you define as markdown files, and the `@path`
+tokens that inline file contents. All three live in `src/commands.rs`, and every surface —
+TUI, browser GUI, headless `-p` — reads them from there.
+
+## Built-in commands
+
+`COMMANDS` in `src/commands.rs` is the single source of truth: what a command is called, what
+it does, and how each surface runs it. The TUI's suggestion popup, the GUI's slash menu
+(`GET /api/commands`), and the allowlist the *agent* may invoke through its `run_command` tool
+are all derived from it. Two hand-kept lists is how two surfaces drift into offering
+different commands; there is one.
+
+The TUI runs every command — it is the surface they were written against. The GUI is the
+constrained one, and each command declares what it is there:
+
+| | command | browser GUI |
+|---|---|---|
+| **Against the agent** | `/model`, `/mode`, `/genie`, `/sovereign`, `/effort`, `/plan`, `/omakase`, `/compact`, `/goal`, `/status`, `/cost`, `/memory`, `/doctor`, `/bashes`, `/agents`, `/reload`, `/rewind`, `/fusion`, `/server`, `/evolve`, `/publish`, `/help` | `server` — a `command` frame; the reply is a `notice` in the chat |
+| **The page's own** | `/clear`, `/diff`, `/todos`, `/subagents`, `/dashboard`, `/resume`, `/settings`, `/provider`, `/login` | `client` — a panel, an overlay, a list |
+| **Terminal only** | `/vim`, `/quit`, `/exit` | `unavailable` — refused, with what the command is and why a browser is not where it runs |
+
+Where the two surfaces differ, the reason is the same one: **a GUI chat is its session file.**
+`/clear` rotates that file, and `/resume` picks another — so in a browser they are a new chat
+and the task list, not commands against the agent. `/rewind` truncates it, which is why the
+GUI's is the only command that has to tell the page its transcript changed underneath it (the
+`transcript_reset` frame — see `docs/gui-protocol.md`).
+
+### What the agent may run itself
+
+The `run_command` tool lets the model invoke these commands. Two gates apply, in order:
+
+1. `SlashCommand::agent_runnable` — the same on every surface. It refuses the interactive
+   pickers without their argument (`/effort` alone; `/effort high` is fine), the
+   session-ending and destructive commands (`/quit`, `/clear`, `/rewind`, `/resume`), and the
+   ones that reach outside the session to set the tool up (`/provider`, `/login`, `/publish`,
+   `/evolve`, `/server`).
+2. The surface's dispatch set — every command on the TUI, the `server` ones the executor
+   implements on the GUI, **none at all** headless (nothing there would drain the queue, so
+   the tool refuses rather than report a success that never happens).
+
+A command that fails either gate is refused **in the tool result**, which is the only thing
+the model reads before the turn ends. It is never silently dropped.
 
 ## Custom slash commands
+
+Two ways to put reusable text in front of the model: `/commands` you define as markdown files, and `@path` tokens that inline file contents. Both work identically in the TUI and in headless `-p` runs: one shared preprocessing pipeline (`src/commands.rs`) handles them.
 
 A custom command is a markdown file whose body is a prompt template:
 

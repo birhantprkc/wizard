@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::agent::{AgentEvent, DoneReason, PlanVerdict};
+use crate::agent::{AgentEvent, DoneReason, ImageSource, PlanVerdict};
+use crate::images::ImageRef;
 use crate::progress::TurnSpinner;
 
 /// `--output-format` values for headless (`-p`) runs.
@@ -32,6 +33,39 @@ pub enum OutputFormat {
     Json,
     /// One JSON object per line as events arrive (JSONL).
     StreamJson,
+}
+
+/// One line per image announced by [`AgentEvent::Images`]: what produced it and
+/// where it was written. A headless run has no canvas, so the path is the
+/// deliverable — it is printed, not the pixels.
+fn image_lines(source: &ImageSource, images: &[ImageRef]) -> Vec<String> {
+    images
+        .iter()
+        .map(|image| {
+            let from = match source.tool() {
+                Some(tool) => format!("image from `{tool}`"),
+                None => "image".to_string(),
+            };
+            format!(
+                "⏺ {from}: {} ({}, {} KB)",
+                image.path.display(),
+                image.mime,
+                image.bytes.div_ceil(1024)
+            )
+        })
+        .collect()
+}
+
+/// The `stream-json` frame for announced images. `run` is set when they came
+/// from inside a subagent run.
+fn image_json(run: Option<u64>, source: &ImageSource, images: &[ImageRef]) -> serde_json::Value {
+    json!({
+        "type": "images",
+        "run": run,
+        "source": source.as_str(),
+        "tool": source.tool(),
+        "images": images,
+    })
 }
 
 /// Process exit code for a finished headless run. Hard errors exit 1 from
@@ -130,8 +164,23 @@ impl EventSink for TextSink {
                 // Back to the model: it is thinking about the result.
                 self.spinner.show();
             }
+            AgentEvent::Images { source, images } => {
+                for line in image_lines(&source, &images) {
+                    self.spinner.println(&line);
+                }
+            }
             AgentEvent::SubagentRunStarted { run, name, .. } => {
                 self.subagents.insert(run, name);
+            }
+            AgentEvent::SubagentRunImages {
+                run,
+                source,
+                images,
+            } => {
+                let who = self.subagent_name(run).to_string();
+                for line in image_lines(&source, &images) {
+                    self.spinner.println(&format!("{who} ▸ {line}"));
+                }
             }
             AgentEvent::SubagentRunToolStarted { run, name, args } => {
                 let who = self.subagent_name(run);
@@ -288,6 +337,9 @@ pub struct JsonSink<W: Write + Send> {
     completion_tokens: u64,
     tool_calls: Vec<ToolCallsEntry>,
     errors: Vec<String>,
+    /// Images the run produced, in order — where they were written, so a script
+    /// consuming the summary can pick them up.
+    images: Vec<ImageRef>,
     /// Run id -> subagent name, so a subagent's tool calls aggregate under
     /// `<name> ▸ <tool>` in the summary, as they did when they were emitted on
     /// the parent's tool events.
@@ -312,6 +364,7 @@ impl<W: Write + Send> JsonSink<W> {
             completion_tokens: 0,
             tool_calls: Vec::new(),
             errors: Vec::new(),
+            images: Vec::new(),
             subagents: HashMap::new(),
         }
     }
@@ -403,6 +456,9 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                 self.completion_tokens += completion_tokens;
             }
             AgentEvent::Done { .. } => self.turns += 1,
+            AgentEvent::Images { images, .. } | AgentEvent::SubagentRunImages { images, .. } => {
+                self.images.extend(images);
+            }
             AgentEvent::ThinkingDelta(_)
             | AgentEvent::Notice(_)
             | AgentEvent::HookFired { .. }
@@ -433,6 +489,7 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                 "errors": entry.errors,
             })).collect::<Vec<_>>(),
             "errors": self.errors,
+            "images": self.images,
         });
         let _ = writeln!(self.out, "{summary}");
         let _ = self.out.flush();
@@ -524,6 +581,16 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "is_error": output.is_error,
                     "output": output.content,
                 }));
+            }
+            AgentEvent::Images { source, images } => {
+                self.emit(image_json(None, &source, &images));
+            }
+            AgentEvent::SubagentRunImages {
+                run,
+                source,
+                images,
+            } => {
+                self.emit(image_json(Some(run), &source, &images));
             }
             AgentEvent::StepCompleted { step } => {
                 self.emit(json!({"type": "step", "step": step}));
