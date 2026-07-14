@@ -16,6 +16,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -398,8 +399,23 @@ fn callback_ports() -> [u16; 2] {
 fn bind_callback_listener() -> Result<(TcpListener, u16)> {
     let ports = callback_ports();
     for port in ports {
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            return Ok((listener, port));
+        // Wait out a teardown before giving up on this port. Closing a listener
+        // does not hand its port back synchronously, so the sign-in that
+        // *replaces* a cancelled one — the GUI's retry — can find the port it
+        // just released still in the kernel's bind table. Without the grace the
+        // preferred port reads as taken and the flow quietly drifts onto the
+        // fallback, which is a worse address to be on for no reason at all.
+        let deadline = Instant::now() + oauth_callback::REBIND_GRACE;
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => return Ok((listener, port)),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
         }
     }
     let [preferred, fallback] = ports;

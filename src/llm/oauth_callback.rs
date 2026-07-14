@@ -35,6 +35,21 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The request line fits well inside this; only the GET target is needed.
 const MAX_REQUEST: usize = 8192;
 
+/// How long a bind waits out the kernel's teardown of a listener that has just
+/// been dropped.
+///
+/// Closing a listening socket does not hand its port back synchronously: the
+/// socket stays in the kernel's bind table until it is destroyed. So the sign-in
+/// that *replaces* a cancelled one — the GUI's retry, which cancels, waits for
+/// the old flow's task to finish, and only then binds the port it just released
+/// — can still find that port occupied, by nothing but a socket on its way out.
+/// Every syscall in that window raises the same `EADDRINUSE` a genuine conflict
+/// does, which is why waiting for the task is necessary but not sufficient.
+///
+/// Waiting it out is not the same as tolerating a conflict: a port somebody else
+/// owns is still owned when the grace runs out, and still an error.
+pub(crate) const REBIND_GRACE: Duration = Duration::from_millis(250);
+
 /// Cancels the sign-in it was minted for, freeing the callback port. Dropping
 /// it cancels too: a flow nobody holds a handle to is a flow nobody is waiting
 /// for.
@@ -231,17 +246,68 @@ pub(crate) fn serial_callback_port() -> std::sync::MutexGuard<'static, ()> {
 /// port out once: a successful bind proves it is free, and dropping the
 /// listener (nothing was ever accepted on it) gives it straight back to the
 /// caller.
+///
+/// The counter starts at a per-process offset, because a probe cannot *hold*
+/// the port it is vouching for — the code under test has to bind it a moment
+/// later, so the probe must let go. Within one process the counter makes that
+/// safe: a number is handed out once. Across two processes it is not, and two
+/// suites do run at once on this machine (a second checkout, CI beside a local
+/// run). From a fixed start they would deal out the same numbers, each probe
+/// would find the port free before the other bound it, and one of them would
+/// fail on a collision that says nothing about the code. A slice keyed by pid
+/// keeps them out of each other's numbers.
 #[cfg(test)]
 pub(crate) fn private_test_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(21_000);
-    for _ in 0..1_000 {
-        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert!(port < 30_000, "ran out of private test ports");
+    /// The private range, carved into per-process slices. 16384 + 64 * 64 =
+    /// 20480: clear of the ephemeral floor (32768) above, and clear of 21000
+    /// below it, where a checkout that predates this slicing starts its own
+    /// counter. Sixty-four ports is far more than any one process asks for.
+    const BASE: u16 = 16_384;
+    const SLICE: u16 = 64;
+    const SLICES: u16 = 64;
+
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU16> = std::sync::OnceLock::new();
+    let next = NEXT.get_or_init(|| {
+        let slice = (std::process::id() % u32::from(SLICES)) as u16;
+        std::sync::atomic::AtomicU16::new(BASE + slice * SLICE)
+    });
+
+    for _ in 0..SLICE {
+        let port = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            port < BASE + SLICES * SLICE,
+            "ran out of private test ports"
+        );
         if StdTcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
-    panic!("no free port in the private test range");
+    panic!("no free port in this process's slice of the private test range");
+}
+
+/// Take the shared test callback port, waiting out a teardown still in progress.
+///
+/// The tests that stand in for a sign-in queue on [`serial_callback_port`], so
+/// only one holds the port at a time — but the lock is released when a test
+/// ends, and the kernel does not destroy that test's listener on the same
+/// instant. The next test in the queue can therefore find the port still taken
+/// by a socket that is already closed. Production waits that out (xAI's
+/// `REBIND_GRACE`); a test that demands the port on its first syscall is holding
+/// itself to a rule the code under test does not have to meet, and fails on a
+/// race that means nothing.
+#[cfg(test)]
+pub(crate) fn take_test_port(port: u16) -> StdTcpListener {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match StdTcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return listener,
+            Err(err) if std::time::Instant::now() < deadline => {
+                assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("the test port never came back: {err}"),
+        }
+    }
 }
 
 #[cfg(test)]

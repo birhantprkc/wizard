@@ -505,22 +505,6 @@ fn callback_port() -> u16 {
     })
 }
 
-/// How long a bind waits out the kernel's teardown of a listener that has just
-/// been dropped.
-///
-/// Closing a listening socket does not hand its port back synchronously: the
-/// socket stays in the kernel's bind table until it is destroyed, which under
-/// load takes a couple of hundred microseconds. So the flow that *replaces* a
-/// cancelled one — the GUI's retry, which cancels, waits for the old flow's task
-/// to finish, and then binds the port it just released — can still find that
-/// port occupied, by nothing but a socket on its way out. Every syscall in that
-/// window is the same `EADDRINUSE` a genuine conflict raises, which is why
-/// waiting for the task is necessary but not sufficient.
-///
-/// Waiting it out is not the same as tolerating a conflict: a port somebody else
-/// owns is still owned when the grace runs out, and still an error.
-const REBIND_GRACE: Duration = Duration::from_millis(250);
-
 /// Bind [`callback_port`], or fail. There is nothing to fall back to: an
 /// ephemeral port yields a redirect_uri xAI has never heard of, so it would
 /// authorize against an address the browser is never sent to — a sign-in that
@@ -528,7 +512,7 @@ const REBIND_GRACE: Duration = Duration::from_millis(250);
 /// out the one conflict that is not one.
 async fn bind_callback_listener() -> Result<TcpListener> {
     let port = callback_port();
-    let deadline = Instant::now() + REBIND_GRACE;
+    let deadline = Instant::now() + oauth_callback::REBIND_GRACE;
     loop {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
@@ -925,7 +909,7 @@ mod tests {
         // The bind must fail loudly, naming the port that is in the way.
         let _serial = oauth_callback::serial_callback_port();
         let port = callback_port();
-        let _held = TcpListener::bind(("127.0.0.1", port)).expect("the test port is free");
+        let _held = oauth_callback::take_test_port(port);
         let err = runtime()
             .block_on(bind_callback_listener())
             .expect_err("the port is taken");
@@ -942,8 +926,7 @@ mod tests {
     #[test]
     fn a_port_released_a_moment_ago_is_bound_not_reported_as_a_conflict() {
         let _serial = oauth_callback::serial_callback_port();
-        let held =
-            TcpListener::bind(("127.0.0.1", callback_port())).expect("the test port is free");
+        let held = oauth_callback::take_test_port(callback_port());
         // Released from another thread, so the bind races the close exactly as
         // the GUI's retry races the flow it has just cancelled.
         std::thread::spawn(move || drop(held));
