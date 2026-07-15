@@ -423,7 +423,8 @@ stores is an `error` frame and no turn runs.
 
 A `where: "server"` command from `GET /api/commands`, applied to the live Agent. It takes
 the same slot a turn does (both need `&mut Agent`), so one sent mid-turn comes back as
-`error` "turn in progress" rather than queuing behind it.
+`error` "turn in progress" rather than queuing behind it. (User messages *do* queue —
+see the rules below.)
 
 The arguments are parsed by `SlashCommand::parse` — the parser the TUI's prompt uses — so an
 argument means here exactly what it means there, and a bad one is rejected in the same words.
@@ -469,7 +470,10 @@ It arrives before the `notice` describing what was restored, so a client that re
 sight of it and then appends the notice ends up with both.
 
 Rules:
-- One in-flight turn per task; `user_message` during a turn → `error` frame "turn in progress".
+- One in-flight turn per task; further `user_message` frames queue FIFO and run
+  when the current turn finishes (the server emits a `notice` "queued — will
+  send after this turn"). A mid-turn `command` frame still returns `error`
+  "turn in progress" — commands reconfigure the agent and want to run *now*.
 - `PlanReady`/`Interview` gates: forward frame, hold the oneshot, resolve on the matching
   client frame; if socket drops, auto-approve plan / skip interview (gateway behavior).
 - On WS attach mid-turn, server first replays buffered frames of the current turn. The

@@ -562,6 +562,19 @@ impl TaskShared {
         true
     }
 
+    /// Whether a turn is currently claimed (running or about to run).
+    fn is_turn_active(&self) -> bool {
+        self.lock().turn_active
+    }
+
+    /// Ensure the turn slot is claimed. The worker calls this at the start of
+    /// every request so a turn that was queued behind another still holds the
+    /// slot through `finish_turn` (submit may have left `turn_active` false in
+    /// the brief gap after the previous turn ended).
+    fn ensure_turn_active(&self) {
+        self.lock().turn_active = true;
+    }
+
     /// Release a claimed turn slot without running it (the worker is gone).
     fn abandon_turn(&self) {
         self.lock().turn_active = false;
@@ -1178,9 +1191,10 @@ impl TaskManager {
         Some(task.shared.clone())
     }
 
-    /// Queue one turn on task `id`. One in-flight turn per task: a second
-    /// `user_message` while one runs is refused with the protocol's error
-    /// text.
+    /// Queue one turn on task `id`. User messages stack FIFO behind any
+    /// in-flight turn — the worker runs them one at a time — so a second
+    /// `user_message` mid-turn is accepted and announced rather than refused.
+    /// Commands still take the exclusive slot (see [`TaskManager::submit_command`]).
     pub fn submit_turn(&self, id: &str, request: TurnRequest) -> Result<(), String> {
         self.submit(id, WorkerRequest::Turn(request))
     }
@@ -1198,14 +1212,36 @@ impl TaskManager {
         let Some(task) = tasks.get_mut(id) else {
             return Err(format!("task '{id}' is not live"));
         };
-        if !task.shared.try_begin_turn() {
+        let is_turn = matches!(request, WorkerRequest::Turn(_));
+        let already_active = task.shared.is_turn_active();
+        if already_active && !is_turn {
+            // Commands still refuse mid-turn: they want to reconfigure *now*.
             return Err("turn in progress".to_string());
         }
-        task.last_used = Instant::now();
+        if !already_active && !task.shared.try_begin_turn() {
+            // Lost a race with another submit; for a turn, still queue — the
+            // worker serializes. For a command, refuse.
+            if !is_turn {
+                return Err("turn in progress".to_string());
+            }
+        }
         if task.turn_tx.send(request).is_err() {
-            task.shared.abandon_turn();
+            // Worker is gone: only abandon if we were the ones holding the
+            // slot and nothing is running. If a turn was already active, leave
+            // its bookkeeping alone (it will fail its own channel ops).
+            if !already_active {
+                task.shared.abandon_turn();
+            }
             return Err("task worker exited".to_string());
         }
+        if already_active && is_turn {
+            // The worker will run this after the current turn. Surface it so
+            // the client isn't left wondering where its message went.
+            task.shared.push(Frame::Notice {
+                text: "queued — will send after this turn".to_string(),
+            });
+        }
+        task.last_used = Instant::now();
         Ok(())
     }
 
@@ -1370,6 +1406,10 @@ async fn run_worker(
         if let WorkerRequest::Turn(turn) = &request {
             shared.name_after_first_message(&turn.text);
         }
+        // A turn that was queued while another ran may arrive after
+        // `finish_turn` cleared the flag — re-claim so mid-turn submits still
+        // see an active slot.
+        shared.ensure_turn_active();
         shared.begin_turn();
         // Read the config per turn: a build that failed for want of a provider
         // must succeed on the next turn once Settings has configured one.
@@ -2599,6 +2639,20 @@ mod tests {
         assert!(!shared.try_begin_turn(), "second claim is refused");
         shared.finish_turn(false);
         assert!(shared.try_begin_turn(), "slot frees on turn end");
+    }
+
+    #[test]
+    fn ensure_turn_active_reclaims_after_finish() {
+        let shared = shared();
+        assert!(shared.try_begin_turn());
+        shared.finish_turn(false);
+        assert!(!shared.is_turn_active());
+        // A queued-behind turn arrives after the previous finish_turn: the
+        // worker re-claims before begin_turn so mid-turn submits still see an
+        // active slot.
+        shared.ensure_turn_active();
+        assert!(shared.is_turn_active());
+        assert!(!shared.try_begin_turn(), "already claimed");
     }
 
     #[test]

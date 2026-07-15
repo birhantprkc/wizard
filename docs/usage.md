@@ -66,6 +66,17 @@ agent sees. Only the interactive TUI applies these commands, so the tool is
 refused outright in headless `-p` runs, the gateway, and subagents — nothing is
 silently dropped.
 
+### Queued user messages
+
+While a turn is running you can keep typing and press **Enter**. The message
+lands in the transcript immediately, is announced with a "queued — will send
+after this turn" notice, and runs automatically once the current turn finishes
+(after any slash commands the agent itself queued via `run_command`). Multiple
+messages stack FIFO; the status bar shows `queued N` while any are waiting.
+The queue is capped (32); overflow keeps the composer text so nothing is lost.
+`/clear` and Ctrl-C interrupt both drop the queue — a cleared or interrupted
+conversation shouldn't auto-fire prompts that no longer apply.
+
 ## `wizard agents` and background subagents
 
 `wizard agents` opens the agent dashboard from the shell, the same view as

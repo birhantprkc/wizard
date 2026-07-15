@@ -966,6 +966,17 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             None => format!("step {}", app.status.step),
         };
         spans.push(Span::styled(format!("{step} · {elapsed}s"), dim()));
+        // How many user prompts are waiting behind this turn.
+        if !app.message_queue.is_empty() {
+            spans.push(Span::styled(" · ", dim()));
+            spans.push(Span::styled(
+                format!(
+                    "queued {}",
+                    app.message_queue.len()
+                ),
+                accent(),
+            ));
+        }
     }
     // Background tasks (`/bashes`): a persistent marker while any are
     // running, so a detached command doesn't silently vanish from view.
@@ -1041,7 +1052,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.show_diff {
         "PgUp/PgDn diff · Esc close"
     } else if app.status.busy {
-        "PgUp/PgDn scroll"
+        "PgUp/PgDn scroll · Enter queues"
     } else {
         "/ commands · ↑ history"
     };

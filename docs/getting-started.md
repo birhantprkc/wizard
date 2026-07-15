@@ -144,7 +144,7 @@ Type a task in natural language:
 
 Wizard reads files, applies changes, runs tests, and shows git diffs.
 
-**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol. Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing.
+**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol. Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing. Pressing Enter while a turn is already running queues the message — it lands in the transcript and runs automatically when the current turn finishes (see [Queued user messages](usage.md#queued-user-messages)).
 
 ## Configuration
 

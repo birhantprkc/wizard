@@ -2,6 +2,7 @@
 //! main loop. Rendering lives in [`crate::ui`]; raw events in
 //! [`crate::event`].
 
+use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +47,10 @@ use crate::tools::CommandDispatch;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::todo::TodoItem;
 use crate::vim::{self, Pending, VimMode, VimOp, VimState};
+
+/// How many user prompts may sit behind a running turn. Beyond this the next
+/// Enter is refused with a notice rather than growing without bound.
+const MESSAGE_QUEUE_CAP: usize = 32;
 
 /// One rendered entry in the chat transcript.
 #[derive(Debug, Clone)]
@@ -812,6 +817,13 @@ pub struct App {
     /// flight cannot be reconfigured, so the main loop drains and dispatches
     /// these once the turn ends and the agent is back in its slot.
     pub pending_agent_commands: Vec<String>,
+    /// User prompts submitted while a turn is already running. FIFO; the main
+    /// loop pops one after each turn finishes (and after any post-turn slash
+    /// commands the agent queued) so the next turn starts without the user
+    /// having to retype. Each entry is already preprocessed and has already
+    /// been written to the transcript + history on enqueue. Capped at
+    /// [`MESSAGE_QUEUE_CAP`].
+    pub message_queue: VecDeque<crate::commands::Preprocessed>,
     /// True while the background MCP connect is in flight (servers spawning,
     /// `initialize` round-trips). Drives a transient status-bar indicator so a
     /// message sent before the tools arrive isn't a silent surprise. Cleared on
@@ -914,6 +926,7 @@ impl App {
             compacting: false,
             mcp_merge_pending: false,
             pending_agent_commands: Vec::new(),
+            message_queue: VecDeque::new(),
             mcp_connecting: false,
             provider_health_error: None,
         }
@@ -3471,12 +3484,13 @@ impl App {
     /// Submit `input` as a user prompt: record it verbatim in history and
     /// the transcript, hand the preprocessed form (custom-command and `@file`
     /// expansion, plus any staged image attachments) to the agent.
+    ///
+    /// When a turn is already running the prompt is queued instead of rejected:
+    /// it still lands in the transcript (so the user sees their words) and the
+    /// main loop starts it once the current turn finishes. Rebuilds still
+    /// refuse — the agent slot is empty then, and a queued turn would only
+    /// bounce again.
     fn submit_prompt(&mut self, input: String) -> Option<AppAction> {
-        if self.status.busy {
-            // Rejected input never ran; do not record it in history.
-            self.notice("the agent is busy — wait for the current turn to finish");
-            return None;
-        }
         if self.rebuilding.is_some() {
             self.notice("the agent is rebuilding — try again in a moment");
             return None;
@@ -3489,11 +3503,35 @@ impl App {
                 prepared.images.push(path);
             }
         }
+        if self.status.busy {
+            if self.message_queue.len() >= MESSAGE_QUEUE_CAP {
+                self.notice(format!(
+                    "message queue is full ({MESSAGE_QUEUE_CAP}) — wait for a turn to finish"
+                ));
+                // Put the staged images back so the user doesn't lose them.
+                self.pending_images.append(&mut prepared.images);
+                return None;
+            }
+            self.push_history(&input);
+            self.clear_input();
+            self.transcript.push(TranscriptEntry::User(input));
+            self.scroll_to_bottom();
+            let position = self.message_queue.len() + 1;
+            self.message_queue.push_back(prepared);
+            self.notice(format!("queued — will send after this turn (#{position})"));
+            return None;
+        }
         self.push_history(&input);
         self.clear_input();
         self.transcript.push(TranscriptEntry::User(input));
         self.scroll_to_bottom();
         Some(AppAction::Submit(prepared))
+    }
+
+    /// Pop the next queued user prompt, if any. Used by the main loop once a
+    /// turn returns the agent and any post-turn agent commands have run.
+    pub fn pop_queued_message(&mut self) -> Option<crate::commands::Preprocessed> {
+        self.message_queue.pop_front()
     }
 
     /// Handle a bracketed paste: stage image file paths / data-URL images as
@@ -5298,6 +5336,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 &events,
             )
             .await;
+            // Then any user prompts that were typed mid-turn.
+            drain_message_queue(&mut app, &mut agent_slot, &mut agent_task, &events);
             continue;
         }
 
@@ -5376,49 +5416,19 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         let action = app.handle_event(event)?;
         if let Some(action) = action {
             match action {
-                AppAction::Submit(prepared) => match agent_slot.take() {
-                    Some(mut agent) => {
-                        app.status.busy = true;
-                        app.status.step = 0;
-                        app.streaming.clear();
-                        app.streaming_thinking.clear();
-                        app.turn_started = Some(Instant::now());
-                        app.roll_spinner_verb();
-
-                        // Bridge AgentEvent -> Event::Agent for the UI loop.
-                        let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
-                        let forward = events.sender();
-                        tokio::spawn(async move {
-                            while let Some(agent_event) = agent_rx.recv().await {
-                                if forward.send(Event::Agent(agent_event)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-
-                        let prompt = prepared.text;
-                        let images = prepared.images;
-                        agent_task = Some(tokio::spawn(async move {
-                            let fallback = agent_tx.clone();
-                            if let Err(err) =
-                                agent.run_turn_with_images(&prompt, images, agent_tx).await
-                            {
-                                // run_turn normally ends with Done itself;
-                                // on a hard error make sure the UI unblocks.
-                                let _ = fallback
-                                    .send(AgentEvent::Error(format!("turn failed: {err:#}")))
-                                    .await;
-                                let _ = fallback
-                                    .send(AgentEvent::Done {
-                                        reason: DoneReason::Stopped,
-                                    })
-                                    .await;
-                            }
-                            agent
-                        }));
+                AppAction::Submit(prepared) => {
+                    if !start_agent_turn(
+                        &mut app,
+                        &mut agent_slot,
+                        &mut agent_task,
+                        &events,
+                        prepared,
+                    ) {
+                        app.notice(
+                            "the agent is busy — wait for the current turn to finish",
+                        );
                     }
-                    None => app.notice("the agent is busy — wait for the current turn to finish"),
-                },
+                }
                 AppAction::Command(command) => {
                     CommandContext {
                         app: &mut app,
@@ -5444,6 +5454,10 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         app.status.busy = false;
                         app.status.step = 0;
                         app.turn_started = None;
+                        // Queued prompts belong to the interrupted conversation
+                        // flow — drop them so the rebuild doesn't auto-start a
+                        // turn the user may no longer want.
+                        app.message_queue.clear();
                         app.notice("interrupted");
                         app.rebuilding = Some("restarting agent".to_string());
                         let client = client.clone();
@@ -5631,6 +5645,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         )
         .await;
 
+        // After the agent is idle again, start the next user prompt that was
+        // typed mid-turn. Only one per event-loop iteration: the turn's Done
+        // will come back around and drain the rest. Agent commands above may
+        // themselves rebuild the agent (`/model`), so re-check the slot.
+        drain_message_queue(&mut app, &mut agent_slot, &mut agent_task, &events);
+
         if app.should_quit {
             break;
         }
@@ -5662,6 +5682,81 @@ struct CommandContext<'a> {
     mcp_path: &'a Path,
     genie_max_steps: StepBudget,
     events: &'a EventLoop,
+}
+
+/// Start one agent turn from a preprocessed prompt: take the agent out of its
+/// slot, mark the UI busy, and spawn the turn task. Returns `true` when the
+/// turn was started. On a missing agent the prepared prompt is re-queued so a
+/// later idle cycle can retry.
+fn start_agent_turn(
+    app: &mut App,
+    agent_slot: &mut Option<Agent>,
+    agent_task: &mut Option<JoinHandle<Agent>>,
+    events: &EventLoop,
+    prepared: crate::commands::Preprocessed,
+) -> bool {
+    let Some(mut agent) = agent_slot.take() else {
+        app.message_queue.push_front(prepared);
+        return false;
+    };
+    app.status.busy = true;
+    app.status.step = 0;
+    app.streaming.clear();
+    app.streaming_thinking.clear();
+    app.turn_started = Some(Instant::now());
+    app.roll_spinner_verb();
+
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let forward = events.sender();
+    tokio::spawn(async move {
+        while let Some(agent_event) = agent_rx.recv().await {
+            if forward.send(Event::Agent(agent_event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let prompt = prepared.text;
+    let images = prepared.images;
+    *agent_task = Some(tokio::spawn(async move {
+        let fallback = agent_tx.clone();
+        if let Err(err) = agent.run_turn_with_images(&prompt, images, agent_tx).await {
+            // run_turn normally ends with Done itself;
+            // on a hard error make sure the UI unblocks.
+            let _ = fallback
+                .send(AgentEvent::Error(format!("turn failed: {err:#}")))
+                .await;
+            let _ = fallback
+                .send(AgentEvent::Done {
+                    reason: DoneReason::Stopped,
+                })
+                .await;
+        }
+        agent
+    }));
+    true
+}
+
+/// If the agent is idle and a user prompt is waiting, start it. One message
+/// per call so the turn's Done comes back around and drains the rest.
+fn drain_message_queue(
+    app: &mut App,
+    agent_slot: &mut Option<Agent>,
+    agent_task: &mut Option<JoinHandle<Agent>>,
+    events: &EventLoop,
+) {
+    if app.status.busy || app.rebuilding.is_some() || agent_slot.is_none() {
+        return;
+    }
+    let Some(prepared) = app.pop_queued_message() else {
+        return;
+    };
+    let remaining = app.message_queue.len();
+    if start_agent_turn(app, agent_slot, agent_task, events, prepared) && remaining > 0 {
+        app.notice(format!(
+            "sending queued message ({remaining} still waiting)"
+        ));
+    }
 }
 
 /// Dispatch the slash commands the agent queued via `run_command`, in order,
@@ -6012,6 +6107,9 @@ impl CommandContext<'_> {
         self.app.transcript.clear();
         self.app.streaming.clear();
         self.app.streaming_thinking.clear();
+        // Drop any prompts queued behind a previous turn — a cleared
+        // conversation shouldn't auto-fire messages the user typed mid-turn.
+        self.app.message_queue.clear();
         self.app.scroll_to_bottom();
         // Mirror the agent's counter reset so the status bar drops the old
         // conversation's totals immediately (not after the next Usage event).
@@ -9173,13 +9271,69 @@ mod tests {
     }
 
     #[test]
-    fn busy_submit_is_not_recorded_in_history() {
+    fn busy_submit_queues_the_message() {
         let mut app = app();
         app.status.busy = true;
         type_str(&mut app, "queued message");
         let action = press(&mut app, KeyCode::Enter);
+        assert!(action.is_none(), "queued submit is not an AppAction");
+        assert_eq!(app.history, vec!["queued message".to_string()]);
+        assert_eq!(app.message_queue.len(), 1);
+        assert_eq!(app.message_queue[0].text, "queued message");
+        assert!(app.input.is_empty(), "composer clears on queue");
+        assert!(
+            matches!(
+                app.transcript.iter().find(|e| matches!(e, TranscriptEntry::User(_))),
+                Some(TranscriptEntry::User(t)) if t == "queued message"
+            ),
+            "queued text lands in the transcript"
+        );
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(TranscriptEntry::Notice(n)) if n.contains("queued")
+            ),
+            "a notice announces the queue position"
+        );
+    }
+
+    #[test]
+    fn busy_submit_respects_the_queue_cap() {
+        let mut app = app();
+        app.status.busy = true;
+        for i in 0..MESSAGE_QUEUE_CAP {
+            type_str(&mut app, &format!("msg {i}"));
+            let action = press(&mut app, KeyCode::Enter);
+            assert!(action.is_none());
+        }
+        assert_eq!(app.message_queue.len(), MESSAGE_QUEUE_CAP);
+        type_str(&mut app, "one too many");
+        let action = press(&mut app, KeyCode::Enter);
         assert!(action.is_none());
-        assert!(app.history.is_empty());
+        assert_eq!(app.message_queue.len(), MESSAGE_QUEUE_CAP);
+        assert_eq!(app.input, "one too many", "overflow keeps the composer");
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(TranscriptEntry::Notice(n)) if n.contains("full")
+            ),
+            "overflow surfaces a full-queue notice"
+        );
+    }
+
+    #[test]
+    fn pop_queued_message_is_fifo() {
+        let mut app = app();
+        app.status.busy = true;
+        type_str(&mut app, "first");
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "second");
+        press(&mut app, KeyCode::Enter);
+        let a = app.pop_queued_message().expect("first");
+        let b = app.pop_queued_message().expect("second");
+        assert_eq!(a.text, "first");
+        assert_eq!(b.text, "second");
+        assert!(app.pop_queued_message().is_none());
     }
 
     #[test]
