@@ -86,6 +86,10 @@ croner = "3"
 # File matching for list_files / skills discovery
 globset = "0.4"
 
+# Copy-on-write (reflink) file cloning for fast fleet worktrees. reflink_or_copy
+# falls back to a plain byte copy when the filesystem lacks FICLONE/clonefile.
+reflink-copy = "0.1"
+
 # Debug traces (~/.wizard/logs/)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1017,7 +1017,9 @@ async fn setup_slot(
         git::worktree_remove(root, &dest).await;
         let _ = std::fs::remove_dir_all(&dest);
     }
-    git::worktree_add(root, &dest, "HEAD")
+    // CoW-clone the working tree when the filesystem supports reflink; falls
+    // back to a plain checkout otherwise. Same clean-HEAD result either way.
+    git::worktree_add_cow(root, &dest, "HEAD")
         .await
         .with_context(|| format!("creating worktree for worker {index}"))?;
     let base = format!("fleet/{index}-{mission_slug}");
