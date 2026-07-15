@@ -2083,6 +2083,10 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.history_pos = None;
+        // Staged attachments belong to the composer's contents; emptying it
+        // drops them too, so a cancelled draft never carries a ghost image
+        // into the next submit.
+        self.pending_images.clear();
         self.sync_input_mode();
     }
 
@@ -2791,6 +2795,17 @@ impl App {
                 }
                 KeyCode::Char('t') => {
                     self.toggle_last_tool_card();
+                    return Ok(None);
+                }
+                // Attach an image from the clipboard — the explicit companion to
+                // the empty-paste path, for terminals (or a tmux passthrough)
+                // that don't forward an image paste at all. Not while collecting
+                // a masked field, where the clipboard would hold a secret.
+                KeyCode::Char('v') if !self.prompt_is_masked() => {
+                    if !self.attach_clipboard_image() {
+                        self.notice("no image on the clipboard to attach");
+                    }
+                    self.sync_input_mode();
                     return Ok(None);
                 }
                 KeyCode::Char('p') => {
@@ -3522,21 +3537,53 @@ impl App {
             }
         }
 
+        // An image paste the terminal can't deliver arrives as an empty paste:
+        // bracketed paste only carries text, so the image's bytes are left on
+        // the OS clipboard. Read them there and attach — the same affordance as
+        // Claude Code's `[Image #N]`. A genuinely empty paste finds nothing and
+        // stays silent.
+        if text.trim().is_empty() {
+            self.attach_clipboard_image();
+            self.sync_input_mode();
+            return;
+        }
+
         self.insert_str(text);
         self.sync_input_mode();
     }
 
-    /// Stage `path` for the next submit and insert a visible `[image: name]` token.
-    fn stage_image(&mut self, path: PathBuf, name: &str) {
-        if !self.pending_images.iter().any(|p| p == &path) {
-            self.pending_images.push(path);
+    /// Attach an image from the OS clipboard, if one is present, staging it for
+    /// the next submit and showing an `[Image #N]` token. Returns whether an
+    /// image was found — so an explicit Ctrl-V can report an empty clipboard
+    /// while an empty paste can stay quiet.
+    fn attach_clipboard_image(&mut self) -> bool {
+        let Some(bytes) = clipboard_image_bytes() else {
+            return false;
+        };
+        let ext = sniff_image_ext(&bytes).unwrap_or("png");
+        match save_image_bytes(&bytes, ext) {
+            Ok(path) => self.stage_image(path, "pasted image"),
+            Err(err) => self.notice(format!("could not attach pasted image: {err}")),
         }
-        let token = format!("[image: {name}]");
+        true
+    }
+
+    /// Stage `path` for the next submit and insert a numbered `[Image #N]`
+    /// token — the composer indicator Claude Code shows for a pasted image.
+    /// `label` names the source only for the confirmation notice.
+    fn stage_image(&mut self, path: PathBuf, label: &str) {
+        if self.pending_images.iter().any(|p| p == &path) {
+            self.notice(format!("{label} is already attached"));
+            return;
+        }
+        self.pending_images.push(path);
+        let n = self.pending_images.len();
+        let token = format!("[Image #{n}]");
         if !self.input.is_empty() && !self.input.chars().last().is_some_and(|c| c.is_whitespace()) {
             self.insert_char(' ');
         }
         self.insert_str(&token);
-        self.notice(format!("attached {name}"));
+        self.notice(format!("attached {label} as Image #{n}"));
     }
 
     /// Minimal Tab path-completion for `@path` tokens: complete the token
@@ -4146,12 +4193,10 @@ fn parse_data_image_url(text: &str) -> Option<(&str, &str)> {
     Some((mime, payload.trim()))
 }
 
-/// Write base64 image bytes under `~/.wizard/attachments/`.
-fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|err| format!("invalid base64: {err}"))?;
+/// Write raw image `bytes` under `~/.wizard/attachments/` with extension `ext`,
+/// enforcing the model's image size cap. Shared by the data-URL and OS-clipboard
+/// paste paths.
+fn save_image_bytes(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
     if bytes.len() > crate::llm::MAX_IMAGE_BYTES {
         return Err(format!(
             "image is {} bytes (max {} MB)",
@@ -4159,13 +4204,6 @@ fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
             crate::llm::MAX_IMAGE_BYTES / (1024 * 1024)
         ));
     }
-    let ext = match mime {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
-    };
     let dir = crate::config::Config::wizard_dir()
         .map_err(|err| err.to_string())?
         .join("attachments");
@@ -4182,6 +4220,152 @@ fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
     let path = dir.join(name);
     std::fs::write(&path, bytes).map_err(|err| format!("write {}: {err}", path.display()))?;
     Ok(path)
+}
+
+/// Decode a `data:image/...;base64,...` payload and save it under attachments.
+fn save_pasted_image_bytes(mime: &str, b64: &str) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|err| format!("invalid base64: {err}"))?;
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    };
+    save_image_bytes(&bytes, ext)
+}
+
+/// Identify a supported image format from its magic bytes, returning the file
+/// extension to save it under. Doubles as validation: bytes that are not one of
+/// the formats the model accepts return `None`, so junk on the clipboard is
+/// never staged.
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Read an image off the OS clipboard as raw bytes, if one is present.
+///
+/// Terminals cannot deliver pasted image *data* through bracketed paste — an
+/// image paste arrives as an empty paste — so the bytes have to be fetched from
+/// the system clipboard directly. Each platform shells out to the tool that can
+/// read binary clipboard content; a missing tool or a text-only clipboard just
+/// yields `None`.
+fn clipboard_image_bytes() -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_clipboard_bytes()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_clipboard_bytes()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        linux_clipboard_bytes()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        None
+    }
+}
+
+/// Run `cmd args`, returning captured stdout when it exits cleanly with output.
+#[cfg(unix)]
+fn capture(cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+}
+
+/// Read a clipboard image on Linux/BSD: Wayland (`wl-clipboard`) first, then
+/// X11 (`xclip`).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_clipboard_bytes() -> Option<Vec<u8>> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && let Some(types) = capture("wl-paste", &["--list-types"])
+    {
+        let listing = String::from_utf8_lossy(&types);
+        if let Some(ty) = listing.split_whitespace().find(|t| t.starts_with("image/"))
+            && let Some(bytes) = capture("wl-paste", &["--no-newline", "--type", ty])
+            && sniff_image_ext(&bytes).is_some()
+        {
+            return Some(bytes);
+        }
+    }
+    for ty in ["image/png", "image/jpeg"] {
+        if let Some(bytes) = capture("xclip", &["-selection", "clipboard", "-t", ty, "-o"])
+            && sniff_image_ext(&bytes).is_some()
+        {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Read a clipboard image on macOS: `pngpaste` if installed, else AppleScript
+/// writes the clipboard's PNG representation to a temp file we read back.
+#[cfg(target_os = "macos")]
+fn macos_clipboard_bytes() -> Option<Vec<u8>> {
+    if let Some(bytes) = capture("pngpaste", &["-"])
+        && sniff_image_ext(&bytes).is_some()
+    {
+        return Some(bytes);
+    }
+    let path = std::env::temp_dir().join(format!("wizard-clip-{}.png", std::process::id()));
+    let script = format!(
+        "try\n\
+             set png to (the clipboard as «class PNGf»)\n\
+         on error\n\
+             return\n\
+         end try\n\
+         set fh to open for access POSIX file \"{}\" with write permission\n\
+         set eof fh to 0\n\
+         write png to fh\n\
+         close access fh",
+        path.display()
+    );
+    let ok = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let bytes = ok.then(|| std::fs::read(&path).ok()).flatten();
+    let _ = std::fs::remove_file(&path);
+    bytes.filter(|b| sniff_image_ext(b).is_some())
+}
+
+/// Read a clipboard image on Windows via PowerShell's `System.Windows.Forms`
+/// clipboard, saved to a temp PNG we read back.
+#[cfg(target_os = "windows")]
+fn windows_clipboard_bytes() -> Option<Vec<u8>> {
+    let path = std::env::temp_dir().join(format!("wizard-clip-{}.png", std::process::id()));
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($img -ne $null) {{ $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png) }}",
+        path.display()
+    );
+    let ok = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let bytes = ok.then(|| std::fs::read(&path).ok()).flatten();
+    let _ = std::fs::remove_file(&path);
+    bytes.filter(|b| sniff_image_ext(b).is_some())
 }
 
 /// Whether a paste token looks like an image path (extension only — existence
@@ -7459,6 +7643,74 @@ mod tests {
         );
         assert_eq!(prepared.images.len(), 1);
         assert!(prepared.images[0].ends_with("shot.png"));
+    }
+
+    /// A 1x1 PNG for tests that only need a real image file on disk.
+    const MINI_PNG: [u8; 70] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
+        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0xd4, 0xef, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn pasting_image_paths_shows_numbered_indicators() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+        std::fs::write(tmp.path().join("b.png"), MINI_PNG).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+
+        app.handle_paste(&tmp.path().join("a.png").display().to_string());
+        app.handle_paste(&tmp.path().join("b.png").display().to_string());
+
+        assert!(app.input.contains("[Image #1]"), "input: {}", app.input);
+        assert!(app.input.contains("[Image #2]"), "input: {}", app.input);
+        assert_eq!(app.pending_images.len(), 2);
+    }
+
+    #[test]
+    fn pasting_the_same_image_twice_stages_it_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+
+        let token = tmp.path().join("a.png").display().to_string();
+        app.handle_paste(&token);
+        app.handle_paste(&token);
+
+        assert_eq!(app.pending_images.len(), 1);
+        assert!(!app.input.contains("[Image #2]"), "input: {}", app.input);
+    }
+
+    #[test]
+    fn clearing_the_composer_drops_staged_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+        let mut app = app();
+        app.project_root = tmp.path().to_path_buf();
+
+        app.handle_paste(&tmp.path().join("a.png").display().to_string());
+        assert_eq!(app.pending_images.len(), 1);
+
+        app.clear_input();
+        assert!(app.pending_images.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn sniff_identifies_supported_image_formats() {
+        assert_eq!(sniff_image_ext(&MINI_PNG), Some("png"));
+        assert_eq!(sniff_image_ext(&[0xff, 0xd8, 0xff, 0xe0]), Some("jpg"));
+        assert_eq!(sniff_image_ext(b"GIF89a\x01\x00"), Some("gif"));
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00]);
+        webp.extend_from_slice(b"WEBPVP8 ");
+        assert_eq!(sniff_image_ext(&webp), Some("webp"));
+        assert_eq!(sniff_image_ext(b"not an image at all"), None);
+        assert_eq!(sniff_image_ext(&[]), None);
     }
 
     #[test]
