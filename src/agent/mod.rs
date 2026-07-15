@@ -5,6 +5,7 @@
 //! The loop is UI-agnostic: it emits [`AgentEvent`]s over a channel that the
 //! Ratatui TUI (genie) or the headless runner (sovereign) consumes.
 
+pub mod breaker;
 pub mod mission;
 pub mod prompts;
 pub mod session;
@@ -44,8 +45,9 @@ pub enum DoneReason {
     TimeLimit,
     /// Stopped via the loop-control file or user interrupt.
     Stopped,
-    /// Circuit breaker: repeated identical failures (sovereign) or too many
-    /// consecutive failures of one tool.
+    /// Circuit breaker: the LLM endpoint breaker tripped (provider down), or
+    /// repeated identical failures (sovereign), or too many consecutive
+    /// failures of one tool.
     CircuitBreaker,
 }
 
@@ -571,6 +573,10 @@ fn subagent_note(task: &crate::tools::subagent_tasks::SubagentTaskResult) -> Str
 /// the tool dispatcher, and session persistence.
 pub struct Agent {
     client: Arc<dyn LlmProvider>,
+    /// Circuit breaker over the model endpoint (see [`breaker`]): bounds the
+    /// streaming retry loop when a provider is down instead of retrying it
+    /// forever, and recovers on its own. Reset on a provider switch.
+    llm_breaker: breaker::LlmBreaker,
     /// Active model tag (from `config.active().model`); switched by
     /// [`Agent::set_model`].
     model: String,
@@ -785,6 +791,7 @@ impl Agent {
 
         let mut agent = Self {
             client,
+            llm_breaker: breaker::LlmBreaker::new(),
             model,
             dispatcher: Dispatcher::new(
                 registry,
@@ -1076,6 +1083,9 @@ impl Agent {
     pub fn set_client(&mut self, client: Arc<dyn LlmProvider>, native_tools: bool) {
         self.client = client;
         self.native_tools = native_tools;
+        // A new endpoint starts with a clean breaker — don't inherit the old
+        // provider's failure history.
+        self.llm_breaker = breaker::LlmBreaker::new();
         self.refresh_system_prompt();
     }
 
@@ -1385,15 +1395,22 @@ impl Agent {
             self.sync_plan_prompt();
 
             let (mut content, mut tool_calls, mut images) =
-                match self.stream_completion_with_retry(events).await? {
+                match self.stream_completion_with_retry(events).await {
                     // Cancelled mid-stream: the partial completion is discarded
                     // (never entered history), so nothing dangles.
-                    Completion::Cancelled => return Ok(DoneReason::Stopped),
-                    Completion::Done {
+                    Ok(Completion::Cancelled) => return Ok(DoneReason::Stopped),
+                    Ok(Completion::Done {
                         content,
                         tool_calls,
                         images,
-                    } => (content, tool_calls, images),
+                    }) => (content, tool_calls, images),
+                    // Endpoint breaker open: end the turn as a circuit breaker
+                    // (rolled back and clean in sovereign) rather than a hard
+                    // error.
+                    Err(err) if err.is::<breaker::LlmBreakerOpen>() => {
+                        return Ok(DoneReason::CircuitBreaker);
+                    }
+                    Err(err) => return Err(err),
                 };
 
             // Some reasoning models (xAI grok-4.3 after tool results) emit
@@ -1407,13 +1424,17 @@ impl Agent {
                 self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
                 let retried = self.stream_completion_with_retry(events).await;
                 self.history.pop();
-                let (retry_content, retry_calls, retry_images) = match retried? {
-                    Completion::Cancelled => return Ok(DoneReason::Stopped),
-                    Completion::Done {
+                let (retry_content, retry_calls, retry_images) = match retried {
+                    Ok(Completion::Cancelled) => return Ok(DoneReason::Stopped),
+                    Ok(Completion::Done {
                         content,
                         tool_calls,
                         images,
-                    } => (content, tool_calls, images),
+                    }) => (content, tool_calls, images),
+                    Err(err) if err.is::<breaker::LlmBreakerOpen>() => {
+                        return Ok(DoneReason::CircuitBreaker);
+                    }
+                    Err(err) => return Err(err),
                 };
                 if retry_images.is_empty() && completion_is_empty(&retry_content, &retry_calls) {
                     let _ = emit(
@@ -1601,14 +1622,59 @@ impl Agent {
     ) -> Result<Completion> {
         let mut attempt: u32 = 0;
         loop {
+            // Fail fast when the endpoint breaker is open (tripped this turn or
+            // a prior one): don't dial a provider that is down. Past the
+            // cooldown, `check` admits a single recovery probe.
+            if let Err(open) = self.llm_breaker.check() {
+                let _ = emit(
+                    events,
+                    AgentEvent::Error(format!(
+                        "LLM circuit breaker open; provider still unavailable (retry in {}s)",
+                        open.retry_after.as_secs()
+                    )),
+                )
+                .await;
+                return Err(breaker::LlmBreakerOpen {
+                    retry_after: open.retry_after,
+                }
+                .into());
+            }
             match self.stream_completion(events).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    // A cancelled completion is a user interrupt, not a
+                    // provider outcome — it must not count toward the breaker.
+                    if !matches!(result, Completion::Cancelled) {
+                        self.llm_breaker.record(breaker::Outcome::Success);
+                    }
+                    return Ok(result);
+                }
                 Err(err) => {
                     if !error_is_transient(&err) {
+                        // Permanent (auth, bad request, missing model): fails
+                        // the turn now and never feeds the breaker.
                         return Err(err);
                     }
+                    self.llm_breaker.record(breaker::Outcome::Failure);
                     if !self.config.continuous && attempt >= 6 {
                         return Err(err);
+                    }
+                    // If that failure just tripped the breaker, end now (mapped
+                    // to DoneReason::CircuitBreaker) rather than sleeping a full
+                    // backoff before the next `check` would catch it — this is
+                    // what bounds continuous mode's otherwise-infinite retry.
+                    if self.llm_breaker.is_open() {
+                        let _ = emit(
+                            events,
+                            AgentEvent::Error(
+                                "LLM circuit breaker tripped after repeated failures; ending"
+                                    .to_string(),
+                            ),
+                        )
+                        .await;
+                        return Err(breaker::LlmBreakerOpen {
+                            retry_after: self.llm_breaker.cooldown(),
+                        }
+                        .into());
                     }
                     let secs = self.config.retry_max_secs.min(
                         self.config
@@ -2758,6 +2824,89 @@ mod tests {
         fn label(&self) -> String {
             "scripted:test".to_string()
         }
+    }
+
+    /// Provider whose every call fails with a transient error, to exercise the
+    /// endpoint circuit breaker's fail-fast.
+    #[derive(Debug)]
+    struct FailingProvider {
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<ChatStream> {
+            *self.calls.lock().unwrap() += 1;
+            // A transport failure (status None) is transient, so the retry loop
+            // keeps trying — until the breaker trips.
+            Err(crate::llm::ProviderError::transport("simulated outage").into())
+        }
+        async fn context_window(&self, _model: &str) -> Option<u32> {
+            None
+        }
+        fn label(&self) -> String {
+            "failing:test".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_down_provider_trips_the_breaker_instead_of_retrying_forever() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).expect("create session");
+        let hooks = Arc::new(HookEngine::new(Vec::new(), tmp.0.clone(), session.id.clone()));
+        let provider = Arc::new(FailingProvider {
+            calls: Mutex::new(0),
+        });
+        let client: Arc<dyn LlmProvider> = provider.clone();
+
+        // Continuous mode has no per-turn attempt cap: without the breaker this
+        // turn would retry forever. Zero backoff so the test never sleeps.
+        let mut config = Config::default();
+        config.continuous = true;
+        config.retry_base_secs = 0;
+        config.retry_max_secs = 0;
+
+        let mut agent = Agent::new(
+            client,
+            ToolRegistry::new(),
+            config,
+            Vec::new(),
+            tmp.0.clone(),
+            session,
+            true,
+            hooks,
+        )
+        .expect("build agent");
+        agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+
+        let (tx, _rx) = mpsc::channel(256);
+        // If the breaker were absent this would hang; reaching an assertion at
+        // all is half the proof.
+        let reason = agent
+            .run_turn("do something", tx)
+            .await
+            .expect("turn resolves");
+        assert_eq!(
+            reason,
+            DoneReason::CircuitBreaker,
+            "a down provider must end the turn as a circuit breaker, not hang"
+        );
+        // The loop stops dialing once the breaker trips at its threshold (8),
+        // rather than retrying without bound.
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            8,
+            "stopped at the trip threshold"
+        );
     }
 
     /// `done: true` chunk; `content` becomes the visible message when
