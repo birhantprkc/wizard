@@ -970,10 +970,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         if !app.message_queue.is_empty() {
             spans.push(Span::styled(" · ", dim()));
             spans.push(Span::styled(
-                format!(
-                    "queued {}",
-                    app.message_queue.len()
-                ),
+                format!("queued {}", app.message_queue.len()),
                 accent(),
             ));
         }

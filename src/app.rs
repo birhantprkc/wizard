@@ -5424,9 +5424,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         &events,
                         prepared,
                     ) {
-                        app.notice(
-                            "the agent is busy — wait for the current turn to finish",
-                        );
+                        app.notice("the agent is busy — wait for the current turn to finish");
                     }
                 }
                 AppAction::Command(command) => {
