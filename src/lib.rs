@@ -97,6 +97,16 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return bench::run(cmd.clone()).await;
     }
 
+    // MCP server: expose Wizard's native tools over stdio to another MCP
+    // client. Self-contained — no config, no onboarding, no LLM — so it
+    // dispatches before the config load like the other tooling subcommands.
+    if let Some(cli::Command::McpServe { scripted }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return mcp::serve::run(*scripted).await.map(|()| 0);
+    }
+
     // Usage rollup: reads ~/.wizard/usage.jsonl only.
     if let Some(cli::Command::Usage { since }) = &cli.command {
         return usage::run_cli(since.as_deref());

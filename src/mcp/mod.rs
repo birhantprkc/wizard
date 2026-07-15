@@ -4,6 +4,11 @@
 //!
 //! This is the supported path for computer use, browser control, database
 //! access, and any capability shipped as an MCP server — no rebuild needed.
+//!
+//! The inverse direction — Wizard *as* an MCP server, exposing its own tools
+//! to another client — lives in [`serve`].
+
+pub mod serve;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

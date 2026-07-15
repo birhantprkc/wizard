@@ -219,6 +219,15 @@ pub enum Command {
         cmd: HarnessCmd,
     },
 
+    /// Serve Wizard's native tools over stdio as an MCP server (JSON-RPC),
+    /// so any MCP client (Claude Code, Cursor, another Wizard) can call them.
+    /// Self-contained: no config, no LLM. Runs until stdin closes.
+    McpServe {
+        /// Also advertise agent-authored scripted tools from ~/.wizard/tools/.
+        #[arg(long)]
+        scripted: bool,
+    },
+
     /// Serve the browser GUI: a local web app (task sidebar, streaming
     /// conversation, git panel) over the same agent core as the TUI. Binds
     /// 127.0.0.1 only; agents are built lazily per task, so the server
@@ -716,6 +725,20 @@ mod tests {
     fn doctor_parses_as_a_subcommand() {
         let cli = parse(&["doctor"]).expect("doctor parses");
         assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn mcp_serve_parses_as_a_subcommand() {
+        let cli = parse(&["mcp-serve"]).expect("mcp-serve parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::McpServe { scripted: false })
+        ));
+        let cli = parse(&["mcp-serve", "--scripted"]).expect("--scripted parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::McpServe { scripted: true })
+        ));
     }
 
     #[test]
