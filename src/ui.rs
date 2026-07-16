@@ -2707,8 +2707,12 @@ fn render_markdown_inner(source: &str, highlight: bool, width: usize) -> Text<'s
         table_width: width,
         ..MarkdownRenderer::default()
     };
-    let options =
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_TABLES
+        // `$…$` / `$$…$$` emit InlineMath / DisplayMath so we can turn TeX
+        // into Unicode instead of dumping raw backslash soup in the TUI.
+        | Options::ENABLE_MATH;
     for event in Parser::new_ext(source, options) {
         renderer.event(event);
     }
@@ -2862,6 +2866,8 @@ impl MarkdownRenderer {
                 self.current
                     .push(Span::styled(code.to_string(), Style::default().fg(CODE)));
             }
+            MdEvent::InlineMath(tex) => self.push_math(&tex, false),
+            MdEvent::DisplayMath(tex) => self.push_math(&tex, true),
             // Table cells are single-line: fold breaks into a space.
             MdEvent::SoftBreak | MdEvent::HardBreak if self.in_table => self.push_text(" "),
             MdEvent::SoftBreak | MdEvent::HardBreak => {
@@ -2880,6 +2886,27 @@ impl MarkdownRenderer {
             }
             MdEvent::Html(html) | MdEvent::InlineHtml(html) => self.push_text(&html),
             _ => {}
+        }
+    }
+
+    /// Render TeX math as Unicode, italic so it reads as math rather than prose.
+    /// Display math (`$$…$$`) gets its own indented line; inside a table cell
+    /// both forms stay inline so the grid stays single-line per cell.
+    fn push_math(&mut self, tex: &str, display: bool) {
+        let rendered = latex_to_unicode(tex);
+        let style = Style::default()
+            .fg(CODE)
+            .add_modifier(Modifier::ITALIC);
+        if display && !self.in_table {
+            self.flush();
+            self.line_prefix();
+            self.current.push(Span::raw("  "));
+            self.current
+                .push(Span::styled(rendered, style));
+            self.end_line();
+            self.blank_line();
+        } else {
+            self.current.push(Span::styled(rendered, style));
         }
     }
 
@@ -3107,6 +3134,450 @@ impl MarkdownRenderer {
         }
         Text::from(self.lines)
     }
+}
+
+/// Convert a TeX math fragment to a readable Unicode string for the TUI.
+///
+/// Terminals can't run KaTeX. We strip font-selection wrappers (`\mathrm`,
+/// `\mathbf`, …), map a few blackboard/script sets unicodeit misses when they
+/// sit next to nested braces, then run `unicodeit` for the bulk of symbols,
+/// super/subscripts, and operators. Anything still untranslatable is left
+/// as-is so the formula stays copy-pastable.
+fn latex_to_unicode(tex: &str) -> String {
+    let trimmed = tex.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut s = trimmed.to_string();
+    // Drop pure-style wrappers so their contents become ordinary text that
+    // unicodeit can subscript (`z_{\mathrm{pos}}` → `z_{pos}` → `zₚₒₛ`).
+    for cmd in [
+        "mathrm",
+        "mathbf",
+        "boldsymbol",
+        "mathit",
+        "mathsf",
+        "mathtt",
+        "operatorname",
+        "text",
+        "textrm",
+        "textit",
+        "textbf",
+        "textsf",
+        "texttt",
+        "bm",
+        "mathbfit",
+    ] {
+        s = strip_latex_cmd(&s, cmd);
+    }
+    // Blackboard / fraktur / script single-letter sets unicodeit only maps as
+    // whole commands when the argument is a bare letter — expand them first.
+    s = expand_letter_set(&s, "mathbb", &MATHBB);
+    s = expand_letter_set(&s, "mathcal", &MATHCAL);
+    s = expand_letter_set(&s, "mathscr", &MATHCAL);
+    s = expand_letter_set(&s, "mathfrak", &MATHFRAK);
+    // Common aliases. Longest first so `\rightarrow` isn't half-eaten by `\to`.
+    // Only replace when the match is a whole TeX control word (next char is not
+    // an ASCII letter) — otherwise `\in` would nibble `\infty`/`\int`/…
+    let mut aliases = [
+        ("\\Leftrightarrow", "⇔"),
+        ("\\leftrightarrow", "↔"),
+        ("\\Rightarrow", "⇒"),
+        ("\\Leftarrow", "⇐"),
+        ("\\rightarrow", "→"),
+        ("\\leftarrow", "←"),
+        ("\\subseteq", "⊆"),
+        ("\\supseteq", "⊇"),
+        ("\\subset", "⊂"),
+        ("\\supset", "⊃"),
+        ("\\emptyset", "∅"),
+        ("\\partial", "∂"),
+        ("\\nabla", "∇"),
+        ("\\forall", "∀"),
+        ("\\exists", "∃"),
+        ("\\notin", "∉"),
+        ("\\approx", "≈"),
+        ("\\simeq", "≃"),
+        ("\\equiv", "≡"),
+        ("\\cong", "≅"),
+        ("\\parallel", "∥"),
+        ("\\perp", "⊥"),
+        ("\\otimes", "⊗"),
+        ("\\oplus", "⊕"),
+        ("\\ominus", "⊖"),
+        ("\\oslash", "⊘"),
+        ("\\cdots", "⋯"),
+        ("\\vdots", "⋮"),
+        ("\\ddots", "⋱"),
+        ("\\ldots", "…"),
+        ("\\times", "×"),
+        ("\\cdot", "·"),
+        ("\\bullet", "•"),
+        ("\\circ", "∘"),
+        ("\\ast", "∗"),
+        ("\\wedge", "∧"),
+        ("\\vee", "∨"),
+        ("\\mid", "∣"),
+        ("\\sim", "∼"),
+        ("\\neq", "≠"),
+        ("\\leq", "≤"),
+        ("\\geq", "≥"),
+        ("\\ll", "≪"),
+        ("\\gg", "≫"),
+        ("\\in", "∈"),
+        ("\\ni", "∋"),
+        ("\\cup", "∪"),
+        ("\\cap", "∩"),
+        ("\\neg", "¬"),
+        ("\\top", "⊤"),
+        ("\\bot", "⊥"),
+        ("\\infty", "∞"),
+        ("\\pm", "±"),
+        ("\\mp", "∓"),
+        ("\\ne", "≠"),
+        ("\\le", "≤"),
+        ("\\ge", "≥"),
+        ("\\to", "→"),
+    ];
+    aliases.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    for (from, to) in aliases {
+        s = replace_tex_cmd(&s, from, to);
+    }
+    // `^\top` → superscript T (transpose) rather than a caret + ⊤.
+    s = s.replace("^⊤", "ᵀ").replace("^{⊤}", "ᵀ");
+    // \frac{a}{b} → (a)/(b)  (unicodeit leaves \frac alone)
+    s = rewrite_frac(&s);
+    // \sqrt{x} → √(x)
+    s = rewrite_sqrt(&s);
+    let out = unicodeit::replace(&s);
+    // Collapse leftover empty braces and double spaces unicodeit can leave.
+    // Flatten unconverted `_{word}` / `^{word}` to `_word` / `^word` so mixed
+    // scripts (e.g. `zₚₒₛ` next to a non-subscriptable `neg`) stay readable.
+    let out = flatten_unconverted_scripts(&out);
+    let out = out.replace("{}", "").replace("  ", " ");
+    out.trim().to_string()
+}
+
+/// Turn leftover `_{abc}` / `^{abc}` into `_abc` / `^abc` (braces only gone when
+/// unicodeit couldn't map every character to a dedicated super/subscript).
+fn flatten_unconverted_scripts(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if (ch == '_' || ch == '^') && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some((body, after)) = take_balanced(&input[i + 2..]) {
+                out.push(ch);
+                out.push_str(body);
+                // `after` is a suffix of `input`; advance `i` by the matched span.
+                i = input.len() - after.len();
+                continue;
+            }
+        }
+        // Copy one UTF-8 char.
+        let next = input[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&input[i..i + next]);
+        i += next;
+    }
+    out
+}
+
+/// Blackboard-bold capitals (`\mathbb{R}` → ℝ).
+const MATHBB: &[(char, char)] = &[
+    ('A', '𝔸'),
+    ('B', '𝔹'),
+    ('C', 'ℂ'),
+    ('D', '𝔻'),
+    ('E', '𝔼'),
+    ('F', '𝔽'),
+    ('G', '𝔾'),
+    ('H', 'ℍ'),
+    ('I', '𝕀'),
+    ('J', '𝕁'),
+    ('K', '𝕂'),
+    ('L', '𝕃'),
+    ('M', '𝕄'),
+    ('N', 'ℕ'),
+    ('O', '𝕆'),
+    ('P', 'ℙ'),
+    ('Q', 'ℚ'),
+    ('R', 'ℝ'),
+    ('S', '𝕊'),
+    ('T', '𝕋'),
+    ('U', '𝕌'),
+    ('V', '𝕍'),
+    ('W', '𝕎'),
+    ('X', '𝕏'),
+    ('Y', '𝕐'),
+    ('Z', 'ℤ'),
+];
+
+/// Calligraphic / script capitals (`\mathcal{L}` → ℒ).
+const MATHCAL: &[(char, char)] = &[
+    ('A', '𝒜'),
+    ('B', 'ℬ'),
+    ('C', '𝒞'),
+    ('D', '𝒟'),
+    ('E', 'ℰ'),
+    ('F', 'ℱ'),
+    ('G', '𝒢'),
+    ('H', 'ℋ'),
+    ('I', 'ℐ'),
+    ('J', '𝒥'),
+    ('K', '𝒦'),
+    ('L', 'ℒ'),
+    ('M', 'ℳ'),
+    ('N', '𝒩'),
+    ('O', '𝒪'),
+    ('P', '𝒫'),
+    ('Q', '𝒬'),
+    ('R', 'ℛ'),
+    ('S', '𝒮'),
+    ('T', '𝒯'),
+    ('U', '𝒰'),
+    ('V', '𝒱'),
+    ('W', '𝒲'),
+    ('X', '𝒳'),
+    ('Y', '𝒴'),
+    ('Z', '𝒵'),
+];
+
+/// Fraktur capitals (`\mathfrak{g}` keeps lowercase as-is via the map).
+const MATHFRAK: &[(char, char)] = &[
+    ('A', '𝔄'),
+    ('B', '𝔅'),
+    ('C', 'ℭ'),
+    ('D', '𝔇'),
+    ('E', '𝔈'),
+    ('F', '𝔉'),
+    ('G', '𝔊'),
+    ('H', 'ℌ'),
+    ('I', 'ℑ'),
+    ('J', '𝔍'),
+    ('K', '𝔎'),
+    ('L', '𝔏'),
+    ('M', '𝔐'),
+    ('N', '𝔑'),
+    ('O', '𝔒'),
+    ('P', '𝔓'),
+    ('Q', '𝔔'),
+    ('R', 'ℜ'),
+    ('S', '𝔖'),
+    ('T', '𝔗'),
+    ('U', '𝔘'),
+    ('V', '𝔙'),
+    ('W', '𝔚'),
+    ('X', '𝔛'),
+    ('Y', '𝔜'),
+    ('Z', 'ℨ'),
+];
+
+/// Replace every `\cmd{…}` with its brace body (style wrappers only).
+fn strip_latex_cmd(input: &str, cmd: &str) -> String {
+    let needle = format!("\\{cmd}{{");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find(&needle) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + needle.len()..];
+        match take_balanced(rest) {
+            Some((body, after)) => {
+                out.push_str(body);
+                rest = after;
+            }
+            None => {
+                // Unbalanced — keep the command literal and stop scanning.
+                out.push_str(&needle);
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace `\cmd{X}` for single-letter `X` via `map`; multi-letter bodies stay.
+fn expand_letter_set(input: &str, cmd: &str, map: &[(char, char)]) -> String {
+    let needle = format!("\\{cmd}{{");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find(&needle) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + needle.len()..];
+        match take_balanced(rest) {
+            Some((body, after)) => {
+                let mut chars = body.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    if let Some((_, uni)) = map.iter().find(|(k, _)| *k == c) {
+                        out.push(*uni);
+                    } else {
+                        out.push(c);
+                    }
+                } else {
+                    // Multi-char body: keep original command so nothing is lost.
+                    out.push_str(&needle);
+                    out.push_str(body);
+                    out.push('}');
+                }
+                rest = after;
+            }
+            None => {
+                out.push_str(&needle);
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrite `\frac{num}{den}` → `(num)/(den)`.
+fn rewrite_frac(input: &str) -> String {
+    let needle = "\\frac{";
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find(needle) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + needle.len()..];
+        let Some((num, after_num)) = take_balanced(rest) else {
+            out.push_str(needle);
+            break;
+        };
+        rest = after_num;
+        if !rest.starts_with('{') {
+            out.push_str("\\frac{");
+            out.push_str(num);
+            out.push('}');
+            continue;
+        }
+        rest = &rest[1..];
+        let Some((den, after_den)) = take_balanced(rest) else {
+            out.push_str("\\frac{");
+            out.push_str(num);
+            out.push_str("}{");
+            break;
+        };
+        // Parenthesize only when the side has operators / multiple tokens.
+        out.push_str(&paren_if_needed(num));
+        out.push('/');
+        out.push_str(&paren_if_needed(den));
+        rest = after_den;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Rewrite `\sqrt{x}` → `√(x)` and `\sqrt[n]{x}` → `ⁿ√(x)`.
+fn rewrite_sqrt(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find("\\sqrt") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + "\\sqrt".len()..];
+        let mut index = String::new();
+        if rest.starts_with('[') {
+            if let Some(end) = rest.find(']') {
+                index.push_str(&rest[1..end]);
+                rest = &rest[end + 1..];
+            }
+        }
+        if rest.starts_with('{') {
+            rest = &rest[1..];
+            if let Some((body, after)) = take_balanced(rest) {
+                if !index.is_empty() {
+                    // Map simple digit indices to superscripts when possible.
+                    for ch in index.chars() {
+                        out.push(match ch {
+                            '0' => '⁰',
+                            '1' => '¹',
+                            '2' => '²',
+                            '3' => '³',
+                            '4' => '⁴',
+                            '5' => '⁵',
+                            '6' => '⁶',
+                            '7' => '⁷',
+                            '8' => '⁸',
+                            '9' => '⁹',
+                            _ => ch,
+                        });
+                    }
+                }
+                out.push('√');
+                out.push_str(&paren_if_needed(body));
+                rest = after;
+                continue;
+            }
+        }
+        // Fallback: leave the command text.
+        out.push_str("\\sqrt");
+        if !index.is_empty() {
+            out.push('[');
+            out.push_str(&index);
+            out.push(']');
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn paren_if_needed(body: &str) -> String {
+    let t = body.trim();
+    if t.is_empty() {
+        return "()".to_string();
+    }
+    // Already parenthesized, or a single atom (letter/digit/symbol run).
+    if (t.starts_with('(') && t.ends_with(')'))
+        || t.chars().count() == 1
+        || t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return t.to_string();
+    }
+    format!("({t})")
+}
+
+/// Replace every occurrence of a TeX control sequence `cmd` (e.g. `\in`) with
+/// `with`, but only at a control-word boundary — the character after the match
+/// must not be an ASCII letter. Stops `\in` from eating `\infty`/`\int`.
+fn replace_tex_cmd(input: &str, cmd: &str, with: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find(cmd) {
+        let after_cmd = &rest[at + cmd.len()..];
+        let next_is_letter = after_cmd
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
+        if next_is_letter {
+            // Not a whole command — copy through the match and keep scanning.
+            out.push_str(&rest[..at + cmd.len()]);
+            rest = after_cmd;
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(with);
+        rest = after_cmd;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Given input starting *after* an opening `{`, return `(body, rest_after_close)`.
+fn take_balanced(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 1usize;
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&input[..i], &input[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -3626,6 +4097,78 @@ mod tests {
         assert_eq!(widths.iter().sum::<usize>(), 20);
         assert!(widths[0] >= widths[1] && widths[0] >= widths[2]);
         assert!(widths.iter().all(|&w| w >= 1));
+    }
+
+    #[test]
+    fn latex_to_unicode_maps_greek_and_scripts() {
+        assert_eq!(latex_to_unicode(r"\alpha + \beta = \gamma"), "α + β = γ");
+        assert_eq!(latex_to_unicode(r"x^2 + y_1"), "x² + y₁");
+        assert_eq!(latex_to_unicode(r"\mathbb{E}[X]"), "𝔼[X]");
+        assert_eq!(latex_to_unicode(r"\mathbb{R}"), "ℝ");
+        // \frac becomes a slash form — readable in one terminal row.
+        assert_eq!(latex_to_unicode(r"\frac{1}{2}"), "1/2");
+        assert_eq!(latex_to_unicode(r"\sqrt{x}"), "√x");
+        // Whole-command matching: `\in` must not nibble `\infty`.
+        assert_eq!(latex_to_unicode(r"x \in \mathbb{R}"), "x ∈ ℝ");
+        assert_eq!(latex_to_unicode(r"\infty"), "∞");
+        assert_eq!(latex_to_unicode(r"A^\top"), "Aᵀ");
+    }
+
+    #[test]
+    fn latex_to_unicode_strips_font_wrappers() {
+        // The screenshot case: nested \mathrm/\mathbf/\boldsymbol + blackboard E.
+        let tex = r"\mathrm{Cov}(\mathbf{z}_{\mathrm{pos}}, \mathbf{z}_{\mathrm{neg}}) = \mathbb{E}[(\mathbf{z}_{\mathrm{pos}} - \boldsymbol{\mu}_{\mathrm{pos}})(\mathbf{z}_{\mathrm{neg}} - \boldsymbol{\mu}_{\mathrm{neg}})^\top]";
+        let out = latex_to_unicode(tex);
+        // No raw TeX commands or `$` left.
+        assert!(!out.contains('\\'), "still has backslash: {out}");
+        assert!(!out.contains("mathrm"), "{out}");
+        assert!(!out.contains("mathbf"), "{out}");
+        assert!(out.contains('𝔼'), "expected 𝔼 in {out}");
+        assert!(out.contains('μ') || out.contains("mu"), "expected mu in {out}");
+        // Transpose: superscript T preferred over caret+⊤.
+        assert!(
+            out.contains('ᵀ') || out.contains('⊤') || out.contains("^T"),
+            "expected transpose in {out}"
+        );
+        // pos fully maps to subscripts; neg has no subscript-g so falls back flat.
+        assert!(
+            out.contains("ₚₒₛ") || out.contains("_pos"),
+            "expected pos subscript form in {out}"
+        );
+        assert!(
+            out.contains("Cov"),
+            "expected Cov operator name kept, got {out}"
+        );
+    }
+
+    #[test]
+    fn markdown_inline_math_renders_as_unicode() {
+        let text = render_markdown(r"See $\alpha + \beta$ for details.");
+        let joined = flats(&text.lines).join("\n");
+        assert!(
+            joined.contains("α + β"),
+            "expected unicode math, got {joined:?}"
+        );
+        assert!(
+            !joined.contains('$') && !joined.contains('\\'),
+            "raw delimiters leaked: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_display_math_is_indented_on_own_line() {
+        let text = render_markdown("before\n\n$$\\sum_{i=1}^{n} x_i$$\n\nafter\n");
+        let flats = flats(&text.lines);
+        // Display math is its own indented line, not jammed into prose.
+        assert!(
+            flats.iter().any(|line| line.contains('∑') && line.starts_with("  ")),
+            "expected indented display math, got {flats:?}"
+        );
+        assert!(
+            flats.iter().any(|line| line.contains("before")),
+            "{flats:?}"
+        );
+        assert!(flats.iter().any(|line| line.contains("after")), "{flats:?}");
     }
 
     fn cs(text: &str) -> Vec<char> {

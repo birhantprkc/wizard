@@ -66,6 +66,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
+# Inline/display `$math$` → readable Unicode for the TUI (no TeX engine).
+unicodeit = "0.2"
 
 # Images in the TUI transcript (`src/image_view.rs`): terminal capability
 # detection plus the kitty / sixel / iTerm2 encoders, with unicode half-blocks
