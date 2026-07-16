@@ -51,14 +51,10 @@ pub async fn run(config: Config) -> Result<()> {
 
             let outgoing = tokio::io::stdout().compat_write();
             let incoming = tokio::io::stdin().compat();
-            let (conn, handle_io) = acp::AgentSideConnection::new(
-                server,
-                outgoing,
-                incoming,
-                |fut| {
+            let (conn, handle_io) =
+                acp::AgentSideConnection::new(server, outgoing, incoming, |fut| {
                     tokio::task::spawn_local(fut);
-                },
-            );
+                });
 
             // Pump the server's session updates out to the client, acking each
             // so a `prompt` handler can keep its updates ordered before its
@@ -122,9 +118,11 @@ impl acp::Agent for WizardAcp {
         // Echo the client's protocol version (both crate lines negotiate V1);
         // advertise Wizard with default capabilities — text prompts, no auth,
         // no client-side fs/terminal needed (Wizard does its own I/O).
-        Ok(acp::InitializeResponse::new(args.protocol_version).agent_info(
-            acp::Implementation::new("wizard", env!("CARGO_PKG_VERSION")).title("Wizard"),
-        ))
+        Ok(
+            acp::InitializeResponse::new(args.protocol_version).agent_info(
+                acp::Implementation::new("wizard", env!("CARGO_PKG_VERSION")).title("Wizard"),
+            ),
+        )
     }
 
     async fn authenticate(
@@ -164,10 +162,11 @@ impl acp::Agent for WizardAcp {
         Ok(acp::NewSessionResponse::new(session_id))
     }
 
-    async fn prompt(
-        &self,
-        args: acp::PromptRequest,
-    ) -> Result<acp::PromptResponse, acp::Error> {
+    // The `RefMut` is held across the turn's awaits on purpose: everything runs
+    // on one thread in a LocalSet, and a still-borrowed cell is how a second
+    // `prompt` on the same session gets rejected (see `try_borrow_mut` below).
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {
         let session_id = args.session_id.clone();
         let text = prompt_text(&args.prompt);
 
@@ -334,10 +333,9 @@ impl Translator {
                 let fields = acp::ToolCallUpdateFields::new()
                     .status(status)
                     .content(vec![acp::ToolCallContent::from(text)]);
-                self.send(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                    acp::ToolCallId::new(id),
-                    fields,
-                )))
+                self.send(acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(acp::ToolCallId::new(id), fields),
+                ))
                 .await;
             }
             AgentEvent::Error(message) => {
@@ -411,6 +409,13 @@ fn truncate(text: &str, cap: usize) -> String {
     format!("{}\n… (truncated)", &text[..end])
 }
 
+/// Map any error into an ACP internal error, logging the detail (the wire error
+/// is intentionally opaque).
+fn internal<E: std::fmt::Display>(err: E) -> acp::Error {
+    tracing::warn!("acp: {err}");
+    acp::Error::internal_error()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,11 +480,4 @@ mod tests {
         assert!(cut.ends_with("… (truncated)"));
         assert!(cut.len() < long.len());
     }
-}
-
-/// Map any error into an ACP internal error, logging the detail (the wire error
-/// is intentionally opaque).
-fn internal<E: std::fmt::Display>(err: E) -> acp::Error {
-    tracing::warn!("acp: {err}");
-    acp::Error::internal_error()
 }
