@@ -44,6 +44,7 @@ pub async fn run_cases(
     filter: Vec<String>,
     tags: Vec<String>,
     keep_worktrees: bool,
+    harness_json: bool,
 ) -> Result<i32> {
     let root = std::env::current_dir().context("determining current directory")?;
     let cases = select_cases(load_cases(&root)?, &filter, &tags)?;
@@ -73,14 +74,28 @@ pub async fn run_cases(
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
         bar.set_message(case.id.clone());
-        let result = run_case(&root, case, &template, &parent, &log_dir, keep_worktrees).await;
+        let result = run_case(
+            &root,
+            case,
+            &template,
+            &parent,
+            &log_dir,
+            keep_worktrees,
+            harness_json,
+        )
+        .await;
         bar.suspend(|| {
+            let tokens = result
+                .harness_tokens
+                .map(|t| format!("  {t} tok"))
+                .unwrap_or_default();
             println!(
-                "{:<id_width$}  {:<7}  harness {:.1}s  check {:.1}s",
+                "{:<id_width$}  {:<7}  harness {:.1}s  check {:.1}s{}",
                 result.id,
                 result.status.to_uppercase(),
                 result.harness_secs,
-                result.check_secs
+                result.check_secs,
+                tokens
             );
             if let Some(error) = &result.error {
                 println!("{:id_width$}  ({error})", "");
@@ -134,6 +149,7 @@ async fn run_case(
     parent: &Path,
     log_dir: &Path,
     keep_worktree: bool,
+    harness_json: bool,
 ) -> CaseResult {
     let mut result = CaseResult {
         id: case.id.clone(),
@@ -144,6 +160,8 @@ async fn run_case(
         harness_secs: 0.0,
         check_secs: 0.0,
         error: None,
+        harness_tokens: None,
+        harness_stop: None,
     };
 
     // Re-verify the stored sha up front: it catches refs lost to GC or a
@@ -163,13 +181,22 @@ async fn run_case(
     let harness_log = log_dir.join(format!("{}.harness.log", case.id));
     let check_log = log_dir.join(format!("{}.check.log", case.id));
     match run_shell(&command, &worktree, case.timeout_secs, &harness_log).await {
-        ShellOutcome::Finished { exit, secs } => {
+        ShellOutcome::Finished { exit, secs, stdout } => {
             result.harness_exit = exit;
             result.harness_secs = secs;
+            // Record the harness's own token usage and stop reason when asked
+            // (and when it emitted a JSON usage object), for cross-agent cost
+            // comparison. Never fails the case: a harness that emits no usage
+            // just leaves these None.
+            if harness_json {
+                let (tokens, stop) = parse_harness_usage(&stdout);
+                result.harness_tokens = tokens;
+                result.harness_stop = stop;
+            }
             // A nonzero harness exit still proceeds to the check: some
             // harnesses exit nonzero on benign conditions.
             match run_shell(&case.check, &worktree, case.check_timeout_secs, &check_log).await {
-                ShellOutcome::Finished { exit, secs } => {
+                ShellOutcome::Finished { exit, secs, .. } => {
                     result.check_exit = exit;
                     result.check_secs = secs;
                     if exit == Some(0) {
@@ -206,9 +233,71 @@ async fn run_case(
 
 /// How one `sh -c` invocation ended.
 enum ShellOutcome {
-    Finished { exit: Option<i32>, secs: f64 },
-    TimedOut { secs: f64 },
+    Finished {
+        exit: Option<i32>,
+        secs: f64,
+        /// Captured stdout, parsed for token usage under `--harness-json`.
+        stdout: String,
+    },
+    TimedOut {
+        secs: f64,
+    },
     SpawnFailed(String),
+}
+
+/// Extract `(total_tokens, stop_reason)` from a harness's JSON stdout. Handles
+/// both a single buffered object (`--output-format json`) and NDJSON
+/// (`streaming-json`, where the last usage-bearing line wins), and the usage
+/// shapes emitted by Wizard (`prompt_tokens`/`completion_tokens`), Grok Build /
+/// Anthropic (`input_tokens`/`output_tokens`), and OpenAI (`total_tokens`).
+fn parse_harness_usage(stdout: &str) -> (Option<u64>, Option<String>) {
+    // The whole stdout as one JSON object (possibly pretty-printed).
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        let fields = extract_usage(&value);
+        if fields.0.is_some() || fields.1.is_some() {
+            return fields;
+        }
+    }
+    // NDJSON: scan from the end for the last line carrying usage or a stop.
+    for line in stdout.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            let fields = extract_usage(&value);
+            if fields.0.is_some() || fields.1.is_some() {
+                return fields;
+            }
+        }
+    }
+    (None, None)
+}
+
+fn extract_usage(value: &serde_json::Value) -> (Option<u64>, Option<String>) {
+    let tokens = value.get("usage").and_then(token_count);
+    let stop = ["stopReason", "stop_reason", "reason"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(str::to_string);
+    (tokens, stop)
+}
+
+/// Total tokens from a usage object across the common vendor shapes.
+fn token_count(usage: &serde_json::Value) -> Option<u64> {
+    use serde_json::Value;
+    if let Some(total) = usage.get("total_tokens").and_then(Value::as_u64) {
+        return Some(total);
+    }
+    let pair = |a: &str, b: &str| -> Option<u64> {
+        let x = usage.get(a).and_then(Value::as_u64);
+        let y = usage.get(b).and_then(Value::as_u64);
+        match (x, y) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        }
+    };
+    pair("prompt_tokens", "completion_tokens").or_else(|| pair("input_tokens", "output_tokens"))
 }
 
 /// Run `sh -c <command>` in `cwd` with a wall-clock bound. `WIZARD_BENCH=1`
@@ -233,9 +322,11 @@ async fn run_shell(command: &str, cwd: &Path, timeout_secs: u64, log_path: &Path
     match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
         Ok(Ok(output)) => {
             write_shell_log(log_path, command, Some(&output));
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             ShellOutcome::Finished {
                 exit: output.status.code(),
                 secs: started.elapsed().as_secs_f64(),
+                stdout,
             }
         }
         Ok(Err(err)) => ShellOutcome::SpawnFailed(err.to_string()),
@@ -313,6 +404,38 @@ mod tests {
         let cases = vec![case("a", &[]), case("b", &["rust"])];
         let out = select_cases(cases, &[], &[]).expect("selects");
         assert_eq!(ids(&out), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_harness_usage_reads_wizards_own_json() {
+        // Wizard's `--output-format json`: prompt/completion + a `reason`.
+        let out = r#"{"result":"done","reason":"Completed","usage":{"prompt_tokens":1200,"completion_tokens":300}}"#;
+        assert_eq!(
+            parse_harness_usage(out),
+            (Some(1500), Some("Completed".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_harness_usage_reads_grok_anthropic_shape() {
+        // input/output tokens + camelCase stopReason (Grok Build / Anthropic).
+        let out = r#"{"text":"hi","stopReason":"end_turn","usage":{"input_tokens":900,"output_tokens":100}}"#;
+        assert_eq!(
+            parse_harness_usage(out),
+            (Some(1000), Some("end_turn".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_harness_usage_prefers_total_tokens_and_reads_ndjson() {
+        // streaming-json: the last usage-bearing line wins; total_tokens wins.
+        let out = "{\"type\":\"text\",\"text\":\"working\"}\n{\"type\":\"end\",\"usage\":{\"total_tokens\":4096}}\n";
+        assert_eq!(parse_harness_usage(out), (Some(4096), None));
+    }
+
+    #[test]
+    fn parse_harness_usage_is_none_for_plain_output() {
+        assert_eq!(parse_harness_usage("just some text, no json\n"), (None, None));
     }
 
     #[test]

@@ -579,6 +579,13 @@ pub enum BenchCmd {
         /// Keep the per-case worktrees for inspection instead of removing them.
         #[arg(long)]
         keep_worktrees: bool,
+
+        /// Parse the harness's stdout as JSON (`--output-format json` or
+        /// `streaming-json`) and record its reported token usage and stop
+        /// reason per case. Works with any agent that emits a usage object —
+        /// Wizard, Grok Build, Claude Code.
+        #[arg(long)]
+        harness_json: bool,
     },
 
     /// Remove a case by id.
@@ -1024,6 +1031,7 @@ mod tests {
                     case,
                     tag,
                     keep_worktrees,
+                    harness_json,
                 },
         }) = cli.command
         else {
@@ -1034,6 +1042,7 @@ mod tests {
         assert_eq!(case, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(tag, vec!["rust".to_string()]);
         assert!(!keep_worktrees);
+        assert!(!harness_json);
     }
 
     #[test]

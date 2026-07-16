@@ -90,6 +90,14 @@ pub struct CaseResult {
     pub check_secs: f64,
     /// Populated for status "error" (worktree / ref / spawn failures).
     pub error: Option<String>,
+    /// Total tokens the harness reported, when run with `--harness-json` and
+    /// the harness emitted a usage object. Lets a run compare agents by cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_tokens: Option<u64>,
+    /// The harness's own stop reason (`stopReason` / `stop_reason` / `reason`),
+    /// when run with `--harness-json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_stop: Option<String>,
 }
 
 /// A full `bench run` (`bench/results/<label>-<unix_ts>.json`).
@@ -153,7 +161,8 @@ pub async fn run(cmd: BenchCmd) -> Result<i32> {
             case,
             tag,
             keep_worktrees,
-        } => runner::run_cases(runner, label, case, tag, keep_worktrees).await,
+            harness_json,
+        } => runner::run_cases(runner, label, case, tag, keep_worktrees, harness_json).await,
         BenchCmd::Remove { id } => remove(&id).map(|()| 0),
         BenchCmd::Compare { a, b } => compare(&a, &b).map(|()| 0),
     }
@@ -536,6 +545,8 @@ mod tests {
             harness_secs: 1.0,
             check_secs: 0.1,
             error: None,
+            harness_tokens: None,
+            harness_stop: None,
         }
     }
 

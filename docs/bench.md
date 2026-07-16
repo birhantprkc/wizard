@@ -104,7 +104,23 @@ wizard bench run --label v2 \
 # A different agent entirely (Claude Code)
 wizard bench run --label claude \
     --runner 'claude -p {prompt} --dangerously-skip-permissions'
+
+# Grok Build (xAI's terminal agent)
+wizard bench run --label grok \
+    --runner 'grok -p {prompt} --output-format json' --harness-json
 ```
+
+### Recording token usage (`--harness-json`)
+
+Pass `--harness-json` when the harness emits a JSON usage object on stdout —
+`--output-format json` (one object) or `streaming-json` (NDJSON, the last
+usage-bearing line wins). The run then records each case's total tokens and
+stop reason alongside the pass/fail result, so you can compare agents by cost,
+not just correctness. It reads the usage shapes emitted by Wizard
+(`prompt_tokens` / `completion_tokens`), Grok Build and Anthropic
+(`input_tokens` / `output_tokens`), and OpenAI (`total_tokens`); a harness
+that emits no usage simply leaves the fields empty. The per-case line then
+shows a trailing `<n> tok`.
 
 Each case runs in its own detached worktree of `base_ref` under a temp dir,
 with stdin closed and `WIZARD_BENCH=1` in the environment. Harness and check
