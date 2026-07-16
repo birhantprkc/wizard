@@ -30,7 +30,7 @@ inline hints.
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
 | `/goal [text]` | Show or set the standing mission goal (drives sovereign/continuous mode; persists to `.wizard/mission.toml`) |
 | `/diff` | Toggle the git diff sidebar |
-| `/todos` | Toggle the todo side panel |
+| `/todos` | Toggle the todo overlay above the input |
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
 | `/memory [read\|forget <name>]` | List the saved project memories, show one, or forget one ([memory.md](memory.md)) |
 | `/status` | Session status: model, provider, mode, session id, usage, todo progress, background tasks |
@@ -218,8 +218,8 @@ The native `todo` tool lets the agent maintain a working todo list (action
 it; statuses: `pending` / `in_progress` / `completed`). It is read-only for
 the plan gate, so the agent can draft its list while planning.
 
-- **TUI**: a side panel mirrors the list (`/todos` toggles it; it auto-shows
-  on the first update).
+- **TUI**: a compact overlay just above the input mirrors the list (`/todos`
+  toggles it; it auto-shows on the first update).
 - **Headless**: each update prints `≡ todo: 2/5 done (current: <item>)`.
 - **Subagents** get the tool too, with their own isolated list.
 

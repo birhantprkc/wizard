@@ -3,8 +3,8 @@
 //! The agent maintains a working todo list for multi-step tasks: action
 //! `write` replaces the entire list, `read` returns it. State lives in
 //! [`ToolContext::todos`](super::ToolContext) (agent-local, never on disk),
-//! and every write emits [`AgentEvent::TodoUpdated`] so the TUI side panel
-//! and the headless printer can mirror progress. The tool is classified
+//! and every write emits [`AgentEvent::TodoUpdated`] so the TUI overlay
+//! above the composer and the headless printer can mirror progress. The tool is classified
 //! [`ToolAccess::ReadOnly`]: it touches nothing outside the agent, so todo
 //! upkeep stays available in plan mode — planning is exactly when the list
 //! gets drafted.

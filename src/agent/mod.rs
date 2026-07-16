@@ -219,8 +219,8 @@ pub enum AgentEvent {
     /// touching session lifetime totals.
     ContextSize { tokens: u64 },
     /// The todo list was replaced via the `todo` tool. Carries the full new
-    /// list; the TUI mirrors it in a side panel, headless prints a one-line
-    /// summary, the gateway ignores it.
+    /// list; the TUI mirrors it in a compact overlay above the composer,
+    /// headless prints a one-line summary, the gateway ignores it.
     TodoUpdated(Vec<crate::tools::todo::TodoItem>),
     /// A background task (`execute` with `run_in_background`) was just
     /// spawned. The TUI mirrors it into the dashboard's task list; other

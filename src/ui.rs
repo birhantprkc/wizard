@@ -1,7 +1,8 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
 //! Layout: chat transcript (with optional git diff sidebar) above the input
-//! line and a quiet status line. Floating layers: the command-suggestion
-//! popup and the model/mode/rewind/subagent picker.
+//! line and a quiet status line. Floating layers: the compact todo overlay
+//! just above the composer, the command-suggestion popup, and the
+//! model/mode/rewind/subagent picker.
 //!
 //! Design rules (do not regress):
 //! - **Transparent**: never paint a background color; everything renders on
@@ -80,25 +81,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         // Inside a subagent: its conversation takes over the main area and
         // renders exactly like the main chat.
         draw_pane(frame, app, pane, main_area);
-    } else if app.show_diff || app.show_todos {
+    } else if app.show_diff {
         let [chat_area, side_area] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(main_area);
         draw_transcript(frame, app, chat_area);
-        match (app.show_todos, app.show_diff) {
-            (true, true) => {
-                // Both panels share the sidebar: todos on top (sized to the
-                // list), the diff below.
-                let todo_height = (app.todos.len() as u16 + 1).clamp(2, side_area.height / 2);
-                let [todo_area, diff_area] =
-                    Layout::vertical([Constraint::Length(todo_height), Constraint::Min(1)])
-                        .areas(side_area);
-                draw_todo_sidebar(frame, app, todo_area);
-                draw_diff_sidebar(frame, app, diff_area);
-            }
-            (true, false) => draw_todo_sidebar(frame, app, side_area),
-            _ => draw_diff_sidebar(frame, app, side_area),
-        }
+        draw_diff_sidebar(frame, app, side_area);
     } else {
         draw_transcript(frame, app, main_area);
     }
@@ -109,8 +97,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     draw_status_bar(frame, app, status_area);
 
-    // Floating layers, back to front.
+    // Floating layers, back to front. Todos sit just above the composer (a
+    // few rows, full width) so the chat keeps its full width; suggestions
+    // stack on top when the user is typing a slash command.
     if !overlay_open(app) {
+        if app.show_todos {
+            draw_todo_overlay(frame, app, input_area);
+        }
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -788,13 +781,35 @@ fn tool_card_lines(
     }
 }
 
-/// Todo side panel (`/todos`, auto-shown on the first todo update): the
-/// agent's working list with status glyphs — ✓ completed (dim,
-/// struck-through), ▸ in progress (accent), ☐ pending.
-fn draw_todo_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+/// Compact todo overlay just above the composer (`/todos`, auto-shown on
+/// the first todo update). A few rows tall, full input width — Claude Code
+/// style — so the chat keeps its full width instead of losing a side panel.
+/// Glyphs: ✓ completed (dim, struck-through), ▸ in progress (accent), ☐ pending.
+fn draw_todo_overlay(frame: &mut Frame, app: &App, input_area: Rect) {
     let (done, total) = crate::tools::todo::progress(&app.todos);
-    let block = Block::new()
-        .borders(Borders::LEFT)
+    let item_rows = if app.todos.is_empty() {
+        1u16
+    } else {
+        app.todos.len() as u16
+    };
+    // +2 for the rounded border. Cap so a long list can't swallow the chat;
+    // leave at least one row of transcript above when the terminal is tall.
+    let max_height = input_area.y.saturating_sub(1).clamp(3, 12);
+    let height = (item_rows + 2).clamp(3, max_height);
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width,
+        height,
+    }
+    .intersection(frame.area());
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
             Span::styled(" ≡ ", accent()),
@@ -802,14 +817,32 @@ fn draw_todo_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 format!("todos {done}/{total}"),
                 Style::default().fg(TEXT_DIM),
             ),
-            Span::styled(" · esc closes", dim()),
+            Span::styled(" · esc", dim()),
         ]));
-    let inner_width = block.inner(area).width as usize;
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
+    let visible = inner.height as usize;
     let lines: Vec<Line<'static>> = if app.todos.is_empty() {
         vec![Line::from(Span::styled("(empty)", dim().italic()))]
     } else {
+        // Prefer the in-progress item and its neighbors when the list is
+        // taller than the overlay: scroll so the current work stays visible.
+        let focus = app
+            .todos
+            .iter()
+            .position(|item| item.status == crate::tools::todo::TodoStatus::InProgress)
+            .unwrap_or(0);
+        let start = if app.todos.len() <= visible {
+            0
+        } else {
+            focus
+                .saturating_sub(visible.saturating_sub(1) / 2)
+                .min(app.todos.len().saturating_sub(visible))
+        };
         app.todos
             .iter()
+            .skip(start)
+            .take(visible)
             .map(|item| {
                 use crate::tools::todo::TodoStatus;
                 let (glyph_style, text_style) = match item.status {
@@ -3732,6 +3765,58 @@ mod tests {
         // takes exactly the one row it needs.
         assert_eq!(rail_height(&bare), 0);
         assert_eq!(rail_height(&with_run), 1);
+    }
+
+    #[test]
+    fn todo_overlay_sits_above_the_composer_without_stealing_chat_width() {
+        use crate::tools::todo::{TodoItem, TodoStatus};
+
+        let mut app = App::new(crate::config::Config::default());
+        app.show_todos = true;
+        app.todos = vec![
+            TodoItem {
+                content: "done already".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "working on this".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "later".to_string(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        app.transcript
+            .push(TranscriptEntry::User("full-width chat line".to_string()));
+
+        let rows = render(&app);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("todos 1/3"),
+            "overlay title shows progress: {joined}"
+        );
+        assert!(
+            joined.contains("working on this"),
+            "current item is visible: {joined}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("full-width chat line")),
+            "transcript still shows under the overlay: {joined}"
+        );
+        // Chat keeps full width: the diff sidebar uses a LEFT border on the
+        // right 40%, so a pure todo-sidebar would leave an empty right column.
+        // With the overlay, the title/items span the full terminal width.
+        let title = rows
+            .iter()
+            .find(|r| r.contains("todos 1/3"))
+            .expect("title row");
+        // Title is left-anchored (not in a right-hand 40% pane starting ~col 48).
+        let title_col = title.find("todos 1/3").expect("title text");
+        assert!(
+            title_col < 20,
+            "todo overlay is left-anchored above the input, not a right sidebar: col={title_col} row={title:?}"
+        );
     }
 
     #[test]

@@ -663,8 +663,8 @@ pub struct App {
     /// here so PgUp/PgDn can page a diff that's taller than the pane; the
     /// renderer clamps it to the content height.
     pub diff_scroll: u16,
-    /// Todo side panel visibility (toggled by `/todos`; auto-shown on the
-    /// first todo update of the session).
+    /// Compact todo overlay above the composer (toggled by `/todos`;
+    /// auto-shown on the first todo update of the session).
     pub show_todos: bool,
     /// The agent's current todo list, mirrored from
     /// [`AgentEvent::TodoUpdated`].
@@ -2546,7 +2546,7 @@ impl App {
                         self.show_diff = false;
                         self.diff_scroll = 0;
                     } else if self.show_todos {
-                        // Then the todo sidebar (it auto-opens on the first
+                        // Then the todo overlay (it auto-opens on the first
                         // todo update, so it needs a way out that isn't
                         // `/todos`).
                         self.show_todos = false;
@@ -3323,7 +3323,7 @@ impl App {
                     self.show_diff = false;
                     self.diff_scroll = 0;
                 } else if self.show_todos {
-                    // Then the todo sidebar (it auto-opens on the first todo
+                    // Then the todo overlay (it auto-opens on the first todo
                     // update, so it needs a way out that isn't `/todos`).
                     self.show_todos = false;
                 } else if !self.scroll_follow {
@@ -4167,7 +4167,7 @@ impl App {
             }
             AgentEvent::TodoUpdated(items) => {
                 self.todos = items;
-                // Auto-show the panel the first time the agent starts a
+                // Auto-show the overlay the first time the agent starts a
                 // list; afterwards /todos controls visibility.
                 if !self.todos_seen && !self.todos.is_empty() {
                     self.todos_seen = true;
@@ -4895,7 +4895,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
-/todos                      toggle the todo side panel\n  \
+/todos                      toggle the todo overlay above the input\n  \
 /dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
 /memory [read|forget <name>] list, show, or forget saved project memories\n  \
@@ -5879,7 +5879,7 @@ impl CommandContext<'_> {
         }
     }
 
-    /// `/todos`: toggle the todo side panel.
+    /// `/todos`: toggle the compact todo overlay above the composer.
     fn toggle_todos(&mut self) {
         self.app.show_todos = !self.app.show_todos;
         if self.app.show_todos && self.app.todos.is_empty() {
@@ -8341,7 +8341,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_update_mirrors_the_list_and_auto_shows_the_panel_once() {
+    fn todo_update_mirrors_the_list_and_auto_shows_the_overlay_once() {
         use crate::tools::todo::{TodoItem, TodoStatus};
         let mut app = app();
         assert!(!app.show_todos);
@@ -8352,7 +8352,7 @@ mod tests {
         }];
         app.handle_agent_event(AgentEvent::TodoUpdated(items.clone()));
         assert_eq!(app.todos, items);
-        assert!(app.show_todos, "first update auto-shows the panel");
+        assert!(app.show_todos, "first update auto-shows the overlay");
 
         // The user hides it; later updates respect that.
         app.show_todos = false;
@@ -8362,14 +8362,14 @@ mod tests {
     }
 
     #[test]
-    fn esc_dismisses_the_todo_panel_after_the_diff_sidebar() {
+    fn esc_dismisses_the_todo_overlay_after_the_diff_sidebar() {
         let mut app = app();
         app.show_todos = true;
         press(&mut app, KeyCode::Esc);
-        assert!(!app.show_todos, "Esc dismisses the todo panel");
+        assert!(!app.show_todos, "Esc dismisses the todo overlay");
 
-        // With both sidebars open, Esc closes the diff first, todos second,
-        // and only then falls through to the input.
+        // Diff sidebar and todo overlay are independent: Esc closes the
+        // diff first, then the overlay, then falls through to the input.
         app.show_todos = true;
         app.show_diff = true;
         app.input = "draft".to_string();
@@ -8387,7 +8387,7 @@ mod tests {
         press(&mut app, KeyCode::Esc); // insert -> normal
         app.show_todos = true;
         press(&mut app, KeyCode::Esc);
-        assert!(!app.show_todos, "Normal-mode Esc dismisses the todo panel");
+        assert!(!app.show_todos, "Normal-mode Esc dismisses the todo overlay");
     }
 
     #[test]
