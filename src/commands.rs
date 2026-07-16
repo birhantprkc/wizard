@@ -705,7 +705,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "goal",
         args: "[text]",
-        description: "show or set the standing mission goal",
+        description: "show the standing goal, or set one and start working on it",
         takes_args: false,
         gui: Execution::Server,
         agent_arg: "",

@@ -1819,7 +1819,9 @@ fn set_goal(cwd: &Path, text: &str) -> Result<String, String> {
     mission
         .save(cwd)
         .map_err(|err| format!("could not save mission: {err:#}"))?;
-    Ok(format!("standing goal set:\n{text}"))
+    Ok(format!(
+        "standing goal set:\n{text}\nsend a message to start working toward it"
+    ))
 }
 
 /// `/status`: what this session is, in one notice.

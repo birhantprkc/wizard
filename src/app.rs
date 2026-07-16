@@ -3534,6 +3534,30 @@ impl App {
         self.message_queue.pop_front()
     }
 
+    /// Queue the first working turn for a freshly set `/goal`. The prompt
+    /// lands in the transcript and the message queue, so the main loop's
+    /// post-command drain starts it immediately when the agent is idle, or
+    /// right after the current turn otherwise.
+    pub fn queue_goal_kickoff(&mut self, goal: &str) {
+        if self.message_queue.len() >= MESSAGE_QUEUE_CAP {
+            self.notice(format!(
+                "goal saved, but the message queue is full ({MESSAGE_QUEUE_CAP}) — \
+                 work will not auto-start; send a message once a turn finishes"
+            ));
+            return;
+        }
+        let kickoff = format!(
+            "A standing goal was just set for this project:\n\n{goal}\n\n\
+             Start working toward it now: break it into concrete steps and \
+             begin executing them. Keep going until you reach a natural \
+             checkpoint, then summarize the progress made and what remains."
+        );
+        self.transcript.push(TranscriptEntry::User(kickoff.clone()));
+        self.scroll_to_bottom();
+        self.message_queue
+            .push_back(crate::commands::Preprocessed::text_only(kickoff));
+    }
+
     /// Handle a bracketed paste: stage image file paths / data-URL images as
     /// attachments, otherwise insert the text into the composer.
     fn handle_paste(&mut self, text: &str) {
@@ -4901,7 +4925,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /memory [read|forget <name>] list, show, or forget saved project memories\n  \
 /status                     show session status (model, usage, todos, tasks)\n  \
 /bashes                     list background tasks (id, status, command)\n  \
-/goal [text]                show or set the standing mission goal\n  \
+/goal [text]                show the standing goal, or set one and start working on it\n  \
 /settings                   open the settings menu (change config anytime)\n  \
 /vim                        toggle vim-style modal editing of the input line\n  \
 /doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
@@ -6065,7 +6089,8 @@ impl CommandContext<'_> {
     }
 
     /// `/goal <text>`: set (or replace) the standing mission goal,
-    /// non-destructively preserving cycles and existing progress notes.
+    /// non-destructively preserving cycles and existing progress notes, then
+    /// immediately start working toward it (queued behind any running turn).
     fn set_goal(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -6089,6 +6114,7 @@ impl CommandContext<'_> {
             return;
         }
         self.app.notice(format!("standing goal set:\n{text}"));
+        self.app.queue_goal_kickoff(&text);
     }
 
     fn clear(&mut self) {
@@ -8387,7 +8413,10 @@ mod tests {
         press(&mut app, KeyCode::Esc); // insert -> normal
         app.show_todos = true;
         press(&mut app, KeyCode::Esc);
-        assert!(!app.show_todos, "Normal-mode Esc dismisses the todo overlay");
+        assert!(
+            !app.show_todos,
+            "Normal-mode Esc dismisses the todo overlay"
+        );
     }
 
     #[test]
@@ -9316,6 +9345,44 @@ mod tests {
                 Some(TranscriptEntry::Notice(n)) if n.contains("full")
             ),
             "overflow surfaces a full-queue notice"
+        );
+    }
+
+    #[test]
+    fn goal_kickoff_queues_a_working_turn() {
+        let mut app = app();
+        app.queue_goal_kickoff("rewrite spore in assembly");
+        assert_eq!(app.message_queue.len(), 1);
+        assert!(
+            app.message_queue[0]
+                .text
+                .contains("rewrite spore in assembly")
+        );
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(TranscriptEntry::User(t)) if t.contains("rewrite spore in assembly")
+            ),
+            "the kickoff prompt lands in the transcript"
+        );
+    }
+
+    #[test]
+    fn goal_kickoff_respects_the_queue_cap() {
+        let mut app = app();
+        app.status.busy = true;
+        for i in 0..MESSAGE_QUEUE_CAP {
+            type_str(&mut app, &format!("msg {i}"));
+            press(&mut app, KeyCode::Enter);
+        }
+        app.queue_goal_kickoff("rewrite spore in assembly");
+        assert_eq!(app.message_queue.len(), MESSAGE_QUEUE_CAP);
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(TranscriptEntry::Notice(n)) if n.contains("full")
+            ),
+            "a full queue surfaces a notice instead of auto-starting"
         );
     }
 

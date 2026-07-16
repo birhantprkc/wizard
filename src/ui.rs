@@ -2894,15 +2894,12 @@ impl MarkdownRenderer {
     /// both forms stay inline so the grid stays single-line per cell.
     fn push_math(&mut self, tex: &str, display: bool) {
         let rendered = latex_to_unicode(tex);
-        let style = Style::default()
-            .fg(CODE)
-            .add_modifier(Modifier::ITALIC);
+        let style = Style::default().fg(CODE).add_modifier(Modifier::ITALIC);
         if display && !self.in_table {
             self.flush();
             self.line_prefix();
             self.current.push(Span::raw("  "));
-            self.current
-                .push(Span::styled(rendered, style));
+            self.current.push(Span::styled(rendered, style));
             self.end_line();
             self.blank_line();
         } else {
@@ -3172,10 +3169,10 @@ fn latex_to_unicode(tex: &str) -> String {
     }
     // Blackboard / fraktur / script single-letter sets unicodeit only maps as
     // whole commands when the argument is a bare letter — expand them first.
-    s = expand_letter_set(&s, "mathbb", &MATHBB);
-    s = expand_letter_set(&s, "mathcal", &MATHCAL);
-    s = expand_letter_set(&s, "mathscr", &MATHCAL);
-    s = expand_letter_set(&s, "mathfrak", &MATHFRAK);
+    s = expand_letter_set(&s, "mathbb", MATHBB);
+    s = expand_letter_set(&s, "mathcal", MATHCAL);
+    s = expand_letter_set(&s, "mathscr", MATHCAL);
+    s = expand_letter_set(&s, "mathfrak", MATHFRAK);
     // Common aliases. Longest first so `\rightarrow` isn't half-eaten by `\to`.
     // Only replace when the match is a whole TeX control word (next char is not
     // an ASCII letter) — otherwise `\in` would nibble `\infty`/`\int`/…
@@ -3266,14 +3263,16 @@ fn flatten_unconverted_scripts(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let ch = bytes[i] as char;
-        if (ch == '_' || ch == '^') && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some((body, after)) = take_balanced(&input[i + 2..]) {
-                out.push(ch);
-                out.push_str(body);
-                // `after` is a suffix of `input`; advance `i` by the matched span.
-                i = input.len() - after.len();
-                continue;
-            }
+        if (ch == '_' || ch == '^')
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'{'
+            && let Some((body, after)) = take_balanced(&input[i + 2..])
+        {
+            out.push(ch);
+            out.push_str(body);
+            // `after` is a suffix of `input`; advance `i` by the matched span.
+            i = input.len() - after.len();
+            continue;
         }
         // Copy one UTF-8 char.
         let next = input[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
@@ -3476,11 +3475,11 @@ fn rewrite_sqrt(input: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at + "\\sqrt".len()..];
         let mut index = String::new();
-        if rest.starts_with('[') {
-            if let Some(end) = rest.find(']') {
-                index.push_str(&rest[1..end]);
-                rest = &rest[end + 1..];
-            }
+        if rest.starts_with('[')
+            && let Some(end) = rest.find(']')
+        {
+            index.push_str(&rest[1..end]);
+            rest = &rest[end + 1..];
         }
         if rest.starts_with('{') {
             rest = &rest[1..];
@@ -4124,7 +4123,10 @@ mod tests {
         assert!(!out.contains("mathrm"), "{out}");
         assert!(!out.contains("mathbf"), "{out}");
         assert!(out.contains('𝔼'), "expected 𝔼 in {out}");
-        assert!(out.contains('μ') || out.contains("mu"), "expected mu in {out}");
+        assert!(
+            out.contains('μ') || out.contains("mu"),
+            "expected mu in {out}"
+        );
         // Transpose: superscript T preferred over caret+⊤.
         assert!(
             out.contains('ᵀ') || out.contains('⊤') || out.contains("^T"),
@@ -4161,7 +4163,9 @@ mod tests {
         let flats = flats(&text.lines);
         // Display math is its own indented line, not jammed into prose.
         assert!(
-            flats.iter().any(|line| line.contains('∑') && line.starts_with("  ")),
+            flats
+                .iter()
+                .any(|line| line.contains('∑') && line.starts_with("  ")),
             "expected indented display math, got {flats:?}"
         );
         assert!(

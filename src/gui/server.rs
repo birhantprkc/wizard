@@ -1369,7 +1369,9 @@ mod tests {
     #[test]
     fn help_lists_the_runnable_commands_and_names_the_terminal_only_ones() {
         let text = help_text();
-        assert!(text.contains("/goal [text] — show or set the standing mission goal"));
+        assert!(
+            text.contains("/goal [text] — show the standing goal, or set one and start working")
+        );
         assert!(text.contains("/diff"));
         assert!(
             !text.contains("\n  /vim"),
