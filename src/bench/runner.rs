@@ -435,7 +435,10 @@ mod tests {
 
     #[test]
     fn parse_harness_usage_is_none_for_plain_output() {
-        assert_eq!(parse_harness_usage("just some text, no json\n"), (None, None));
+        assert_eq!(
+            parse_harness_usage("just some text, no json\n"),
+            (None, None)
+        );
     }
 
     #[test]

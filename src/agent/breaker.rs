@@ -223,7 +223,10 @@ mod tests {
 
     fn breaker(threshold: u32, open: Duration) -> (LlmBreaker, Arc<MockClock>) {
         let clock = MockClock::new();
-        (LlmBreaker::with_clock(threshold, open, clock.clone()), clock)
+        (
+            LlmBreaker::with_clock(threshold, open, clock.clone()),
+            clock,
+        )
     }
 
     #[test]
@@ -246,7 +249,11 @@ mod tests {
         cb.record(Outcome::Success); // clears the streak
         cb.record(Outcome::Failure);
         cb.record(Outcome::Failure);
-        assert_eq!(cb.state(), BreakerState::Closed, "only 2 failures since reset");
+        assert_eq!(
+            cb.state(),
+            BreakerState::Closed,
+            "only 2 failures since reset"
+        );
     }
 
     #[test]
@@ -279,6 +286,9 @@ mod tests {
         assert!(cb.check().is_ok()); // → half-open
         cb.record(Outcome::Failure);
         assert_eq!(cb.state(), BreakerState::Open);
-        assert!(cb.check().is_err(), "the cooldown restarts on a failed probe");
+        assert!(
+            cb.check().is_err(),
+            "the cooldown restarts on a failed probe"
+        );
     }
 }

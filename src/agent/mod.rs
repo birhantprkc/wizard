@@ -2862,7 +2862,11 @@ mod tests {
     async fn a_down_provider_trips_the_breaker_instead_of_retrying_forever() {
         let tmp = TempDir::new();
         let session = Session::create(&tmp.0).expect("create session");
-        let hooks = Arc::new(HookEngine::new(Vec::new(), tmp.0.clone(), session.id.clone()));
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            session.id.clone(),
+        ));
         let provider = Arc::new(FailingProvider {
             calls: Mutex::new(0),
         });

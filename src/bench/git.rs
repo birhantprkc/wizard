@@ -90,8 +90,7 @@ pub async fn worktree_add(repo: &Path, dest: &Path, ref_: &str) -> Result<()> {
 /// the tracked files, then `git reset --hard` to reconcile the index and
 /// restore any source-dirty paths to `ref_`.
 pub async fn worktree_add_cow(repo: &Path, dest: &Path, ref_: &str) -> Result<()> {
-    let (repo_buf, dest_buf, ref_buf) =
-        (repo.to_path_buf(), dest.to_path_buf(), ref_.to_string());
+    let (repo_buf, dest_buf, ref_buf) = (repo.to_path_buf(), dest.to_path_buf(), ref_.to_string());
     let fast = tokio::task::spawn_blocking(move || cow_populate(&repo_buf, &dest_buf, &ref_buf))
         .await
         .context("cow worktree task panicked")?;

@@ -74,7 +74,10 @@ async fn handle(registry: &ToolRegistry, ctx: &ToolContext, request: &Value) -> 
     // Absence of `id` marks a notification (e.g. `notifications/initialized`):
     // never answered.
     let id = request.get("id")?.clone();
-    let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     let result = match method {
         "initialize" => Ok(initialize_result()),
@@ -259,7 +262,9 @@ mod tests {
         });
         let resp = handle(&registry(), &ctx, &req).await.expect("answered");
         assert_eq!(resp["result"]["isError"], json!(false));
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
         assert!(text.contains("hi there"), "got: {text}");
     }
 
