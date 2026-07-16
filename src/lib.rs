@@ -4,6 +4,7 @@
 //! extensible tool set (native + scripted + MCP) and tiered self-extension.
 //! See `docs/architecture.md` for the full design.
 
+pub mod acp;
 pub mod agent;
 pub mod app;
 pub mod bench;
@@ -128,6 +129,17 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return gui::run(config, *port, *no_open, assets.clone())
             .await
             .map(|()| 0);
+    }
+
+    // ACP server: an editor drives Wizard over stdin/stdout, so it must not
+    // onboard or open a TUI. Loads config directly (defaults on a fresh
+    // install) like the GUI, then serves until the client closes the pipe.
+    if let Some(cli::Command::Acp) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        let config = config::Config::load()?;
+        return acp::run(config).await.map(|()| 0);
     }
 
     // The desktop shell is the same GUI server in a webview window, so it

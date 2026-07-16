@@ -228,6 +228,11 @@ pub enum Command {
         scripted: bool,
     },
 
+    /// Run Wizard as an Agent Client Protocol (ACP) agent over stdio, so ACP
+    /// editors (Zed, Neovim, Emacs) can embed it. Loads config but never
+    /// onboards or opens a TUI — stdin/stdout carry the JSON-RPC protocol.
+    Acp,
+
     /// Serve the browser GUI: a local web app (task sidebar, streaming
     /// conversation, git panel) over the same agent core as the TUI. Binds
     /// 127.0.0.1 only; agents are built lazily per task, so the server
@@ -746,6 +751,12 @@ mod tests {
             cli.command,
             Some(Command::McpServe { scripted: true })
         ));
+    }
+
+    #[test]
+    fn acp_parses_as_a_subcommand() {
+        let cli = parse(&["acp"]).expect("acp parses");
+        assert!(matches!(cli.command, Some(Command::Acp)));
     }
 
     #[test]
