@@ -2870,10 +2870,12 @@ mod tests {
 
         // Continuous mode has no per-turn attempt cap: without the breaker this
         // turn would retry forever. Zero backoff so the test never sleeps.
-        let mut config = Config::default();
-        config.continuous = true;
-        config.retry_base_secs = 0;
-        config.retry_max_secs = 0;
+        let config = Config {
+            continuous: true,
+            retry_base_secs: 0,
+            retry_max_secs: 0,
+            ..Config::default()
+        };
 
         let mut agent = Agent::new(
             client,
