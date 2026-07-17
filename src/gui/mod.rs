@@ -186,3 +186,38 @@ pub(crate) fn open_browser(url: &str) {
         tracing::warn!("could not open the browser via {opener}: {err}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Port 0 asks the OS for a free port; the server must report the port it
+    /// got, not the 0 it asked with — the desktop shell points a webview at it.
+    #[tokio::test]
+    async fn bind_reports_the_port_the_os_picked_and_refuses_a_taken_one() {
+        let server = GuiServer::bind(Config::default(), 0, None)
+            .await
+            .expect("bind an ephemeral port");
+        let addr = server.addr();
+        assert_eq!(addr.ip(), std::net::IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_ne!(addr.port(), 0);
+        assert_eq!(server.url(), format!("http://127.0.0.1:{}", addr.port()));
+
+        let err = match GuiServer::bind(Config::default(), addr.port(), None).await {
+            Ok(_) => panic!("the port is held by the first server"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("--port"), "the error names the way out: {err}");
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_an_assets_override_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("assets");
+        let err = match GuiServer::bind(Config::default(), 0, Some(missing)).await {
+            Ok(_) => panic!("no assets directory, no server"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("not a directory"), "{err}");
+    }
+}

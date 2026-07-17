@@ -406,6 +406,16 @@ mod tests {
     }
 
     #[test]
+    fn split_counts_characters_not_bytes() {
+        // Telegram's cap is in characters; a byte-based split would cut a
+        // multibyte character in half and panic (or produce invalid UTF-8).
+        let text = "é".repeat(10);
+        let chunks = split_message(&text, 4);
+        assert_eq!(chunks, vec!["éééé", "éééé", "éé"]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
     fn split_hard_splits_an_overlong_line() {
         let line = "x".repeat(25);
         let chunks = split_message(&line, 10);

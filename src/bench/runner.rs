@@ -442,6 +442,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_harness_usage_last_usage_line_wins_in_ndjson() {
+        let out = "{\"usage\":{\"total_tokens\":100}}\n\
+                   {\"type\":\"text\"}\n\
+                   {\"usage\":{\"total_tokens\":250},\"stop_reason\":\"end\"}\n";
+        assert_eq!(
+            parse_harness_usage(out),
+            (Some(250), Some("end".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_harness_usage_reads_pretty_printed_json() {
+        // A buffered `--output-format json` object spanning lines: the NDJSON
+        // scan cannot parse any single line, the whole-stdout parse must.
+        let out =
+            "{\n  \"reason\": \"Completed\",\n  \"usage\": {\n    \"total_tokens\": 42\n  }\n}\n";
+        assert_eq!(
+            parse_harness_usage(out),
+            (Some(42), Some("Completed".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_harness_usage_counts_a_one_sided_token_pair() {
+        let out = r#"{"usage":{"input_tokens":900}}"#;
+        assert_eq!(parse_harness_usage(out), (Some(900), None));
+    }
+
+    #[test]
     fn select_cases_by_id_tag_and_their_union() {
         let all = || {
             vec![
@@ -492,17 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_plain_string() {
+    fn shell_escape_always_quotes_and_escapes_embedded_quotes() {
         assert_eq!(shell_escape("hello world"), "'hello world'");
-    }
-
-    #[test]
-    fn shell_escape_single_quotes() {
         assert_eq!(shell_escape("it's a test"), r"'it'\''s a test'");
-    }
-
-    #[test]
-    fn shell_escape_empty_string() {
         assert_eq!(shell_escape(""), "''");
     }
 

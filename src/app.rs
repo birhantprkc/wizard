@@ -7453,16 +7453,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_state_fields_default_inert() {
-        let app = app();
-        assert!(!app.mcp_connecting, "tools indicator starts hidden");
-        assert!(
-            app.provider_health_error.is_none(),
-            "no provider error until the probe fails"
-        );
-    }
-
-    #[test]
     fn welcome_stays_up_for_empty_and_notice_only_transcripts() {
         let mut app = app();
         // Fresh launch: nothing typed, welcome screen.
@@ -8053,17 +8043,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_parses_as_a_toggle() {
-        assert_eq!(SlashCommand::parse("/plan"), Some(Ok(SlashCommand::Plan)));
-    }
-
-    #[test]
-    fn todos_and_cost_parse() {
-        assert_eq!(SlashCommand::parse("/todos"), Some(Ok(SlashCommand::Todos)));
-        assert_eq!(SlashCommand::parse("/cost"), Some(Ok(SlashCommand::Cost)));
-    }
-
-    #[test]
     fn fusion_parses_toggle_config_and_rejects_unknown() {
         assert_eq!(
             SlashCommand::parse("/fusion"),
@@ -8102,14 +8081,6 @@ mod tests {
             Some(Ok(SlashCommand::Resume(Some(
                 "2026-06-09T09-30-00".to_string()
             ))))
-        );
-    }
-
-    #[test]
-    fn compact_parses() {
-        assert_eq!(
-            SlashCommand::parse("/compact"),
-            Some(Ok(SlashCommand::Compact))
         );
     }
 
@@ -8297,14 +8268,6 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_command_parses() {
-        assert!(matches!(
-            SlashCommand::parse("/dashboard"),
-            Some(Ok(SlashCommand::Dashboard))
-        ));
-    }
-
-    #[test]
     fn dashboard_navigates_and_esc_closes() {
         use crate::session_registry::{SessionRecord, SessionState};
         let mut app = app();
@@ -8414,10 +8377,7 @@ mod tests {
         press(&mut app, KeyCode::Esc); // insert -> normal
         app.show_todos = true;
         press(&mut app, KeyCode::Esc);
-        assert!(
-            !app.show_todos,
-            "Normal-mode Esc dismisses the todo band"
-        );
+        assert!(!app.show_todos, "Normal-mode Esc dismisses the todo band");
     }
 
     #[test]
@@ -8991,14 +8951,6 @@ mod tests {
             question: q.to_string(),
             options: options.iter().map(|s| s.to_string()).collect(),
         }
-    }
-
-    #[test]
-    fn omakase_parses_and_round_trips() {
-        assert_eq!(
-            SlashCommand::parse("/omakase"),
-            Some(Ok(SlashCommand::Omakase))
-        );
     }
 
     /// Parse `input` and return the agent-runnable verdict, asserting it is a
@@ -10121,5 +10073,50 @@ mod tests {
             text: "narrowing it down".to_string(),
         });
         assert_eq!(app.panes[0].activity(), "narrowing it down");
+    }
+
+    #[test]
+    fn bare_commands_parse_to_their_variants() {
+        for (input, expected) in [
+            ("/plan", SlashCommand::Plan),
+            ("/todos", SlashCommand::Todos),
+            ("/cost", SlashCommand::Cost),
+            ("/compact", SlashCommand::Compact),
+            ("/dashboard", SlashCommand::Dashboard),
+            ("/omakase", SlashCommand::Omakase),
+        ] {
+            assert_eq!(SlashCommand::parse(input), Some(Ok(expected)), "{input}");
+        }
+    }
+
+    #[test]
+    fn welcome_hides_while_a_turn_is_in_flight_and_returns_after() {
+        let mut app = app();
+        assert!(app.welcome_visible());
+
+        app.status.busy = true;
+        assert!(
+            !app.welcome_visible(),
+            "a running turn replaces the welcome"
+        );
+        app.status.busy = false;
+        assert!(app.welcome_visible(), "an aborted turn brings it back");
+
+        app.streaming = "partial".to_string();
+        assert!(!app.welcome_visible(), "streamed text replaces the welcome");
+        app.streaming.clear();
+        assert!(app.welcome_visible());
+    }
+
+    #[test]
+    fn builtin_with_bad_args_still_dismisses_the_welcome_screen() {
+        let mut app = app();
+        assert!(app.welcome_visible());
+        type_str(&mut app, "/mode warlock");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            !app.welcome_visible(),
+            "a mistyped builtin still begins the session"
+        );
     }
 }

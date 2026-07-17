@@ -291,4 +291,21 @@ mod tests {
             "the cooldown restarts on a failed probe"
         );
     }
+
+    #[test]
+    fn outcomes_recorded_while_open_do_not_disturb_the_cooldown() {
+        let (cb, clock) = breaker(1, Duration::from_millis(50));
+        cb.record(Outcome::Failure); // trips at t0
+        clock.advance(Duration::from_millis(30));
+        // Stray outcomes while open (calls not gated through `check`) must
+        // neither close the breaker nor restart its cooldown.
+        cb.record(Outcome::Failure);
+        cb.record(Outcome::Success);
+        assert_eq!(cb.state(), BreakerState::Open);
+        clock.advance(Duration::from_millis(25)); // t0 + 55ms
+        assert!(
+            cb.check().is_ok(),
+            "the cooldown still runs from the original trip"
+        );
+    }
 }

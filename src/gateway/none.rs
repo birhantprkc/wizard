@@ -33,3 +33,27 @@ impl Gateway for NoneGateway {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_use_reports_how_to_configure_a_gateway() {
+        let mut gateway = NoneGateway;
+        let poll_err = gateway.poll().await.expect_err("nothing to poll");
+        let message = format!("{poll_err:#}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("telegram"), "{message}");
+
+        let send_err = gateway.send(1, "hi").await.expect_err("nowhere to send");
+        assert!(format!("{send_err:#}").contains("config.toml"));
+    }
+
+    #[tokio::test]
+    async fn typing_is_a_harmless_no_op() {
+        // serve() fires the typing hint before every turn; a transport
+        // without one must not fail the turn over it.
+        NoneGateway.typing(1).await.expect("default typing is Ok");
+    }
+}

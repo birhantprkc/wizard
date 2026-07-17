@@ -301,6 +301,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_and_dirty_reports_state_and_never_errors() {
+        let (tmp, repo) = dirty_repo();
+        let (sha, dirty) = head_and_dirty(&repo).await.expect("inside a repo");
+        assert_eq!(sha.len(), 40, "full sha: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{sha}");
+        assert!(dirty, "tracked edit + untracked file mean dirty");
+
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "absorb"]);
+        let (sha_after, dirty) = head_and_dirty(&repo).await.expect("inside a repo");
+        assert!(!dirty, "clean after committing everything");
+        assert_ne!(sha_after, sha, "HEAD moved with the commit");
+
+        let outside = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(head_and_dirty(&outside).await, None, "no repo, no record");
+    }
+
+    #[tokio::test]
+    async fn rev_parse_resolves_refs_and_rejects_garbage() {
+        let (_tmp, repo) = dirty_repo();
+        let sha = rev_parse(&repo, "HEAD").await.expect("HEAD resolves");
+        assert_eq!(sha.len(), 40, "full sha: {sha}");
+        let by_prefix = rev_parse(&repo, &sha[..12]).await.expect("prefix resolves");
+        assert_eq!(by_prefix, sha, "a short prefix expands to the full sha");
+
+        let err = rev_parse(&repo, "no-such-ref")
+            .await
+            .expect_err("an unknown ref fails");
+        assert!(format!("{err:#}").contains("no-such-ref"), "{err:#}");
+    }
+
+    #[tokio::test]
     async fn worktree_add_cow_produces_a_clean_checkout() {
         let (tmp, repo) = dirty_repo();
         // Mirror the fleet layout: the worktrees parent dir exists first.

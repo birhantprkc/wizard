@@ -209,6 +209,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreachable_chat_errors_with_the_start_hint() {
+        // The connect failure bubbles out of the inner OpenAI-compatible
+        // client; reframe must prepend the "start llama-server" hint.
+        let provider = LlamaCppProvider::new("http://127.0.0.1:1", "m");
+        let request = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![crate::llm::ChatMessage::user("hi")],
+            tools: Vec::new(),
+            stream: true,
+            options: None,
+        };
+        let err = match provider.chat_stream(request).await {
+            Ok(_) => panic!("must fail"),
+            Err(err) => err,
+        };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("llama-server -m"), "got: {chain}");
+        assert!(chain.contains("http://127.0.0.1:1"), "got: {chain}");
+    }
+
+    #[tokio::test]
     async fn health_failure_is_actionable() {
         // Port 1 on localhost: connection refused immediately, no server needed.
         let provider = LlamaCppProvider::new("http://127.0.0.1:1", "m");

@@ -836,29 +836,48 @@ mod tests {
         }
     }
 
-    /// Provider that replays canned chunk sequences (or a permanent error)
+    /// Provider that replays canned chunk sequences (or scripted failures)
     /// and records the requests it received.
     struct ScriptedProvider {
         responses: Mutex<VecDeque<Vec<ChatChunk>>>,
         requests: Mutex<Vec<ChatRequest>>,
-        /// When set, every chat_stream call fails with this HTTP status.
-        fail_status: Option<u16>,
+        /// Upcoming chat_stream calls that fail with `fail_status` before the
+        /// scripted responses resume; `u32::MAX` fails every call.
+        fail: Mutex<u32>,
+        fail_status: u16,
+        /// What `supports_native_tools` reports.
+        native_tools: bool,
     }
 
     impl ScriptedProvider {
         fn new(responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
-            Arc::new(Self {
-                responses: Mutex::new(responses.into()),
-                requests: Mutex::new(Vec::new()),
-                fail_status: None,
-            })
+            Self::build(responses, 0, 0, true)
         }
 
         fn failing(status: u16) -> Arc<Self> {
+            Self::build(Vec::new(), u32::MAX, status, true)
+        }
+
+        fn flaky(status: u16, failures: u32, responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            Self::build(responses, failures, status, true)
+        }
+
+        fn without_native_tools(responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            Self::build(responses, 0, 0, false)
+        }
+
+        fn build(
+            responses: Vec<Vec<ChatChunk>>,
+            fail: u32,
+            fail_status: u16,
+            native_tools: bool,
+        ) -> Arc<Self> {
             Arc::new(Self {
-                responses: Mutex::new(VecDeque::new()),
+                responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
-                fail_status: Some(status),
+                fail: Mutex::new(fail),
+                fail_status,
+                native_tools,
             })
         }
     }
@@ -870,7 +889,7 @@ mod tests {
         }
 
         async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
-            Ok(true)
+            Ok(self.native_tools)
         }
 
         async fn list_models(&self) -> Result<Vec<String>> {
@@ -879,8 +898,18 @@ mod tests {
 
         async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
             self.requests.lock().unwrap().push(request);
-            if let Some(status) = self.fail_status {
-                return Err(crate::llm::ProviderError::http(status, "scripted failure").into());
+            {
+                let mut fail = self.fail.lock().unwrap();
+                if *fail > 0 {
+                    if *fail != u32::MAX {
+                        *fail -= 1;
+                    }
+                    return Err(crate::llm::ProviderError::http(
+                        self.fail_status,
+                        "scripted failure",
+                    )
+                    .into());
+                }
             }
             let chunks = self
                 .responses
@@ -1208,5 +1237,371 @@ mod tests {
             1,
             "a 401 is never retried"
         );
+    }
+
+    fn test_hooks(tmp: &TempDir) -> Arc<HookEngine> {
+        Arc::new(HookEngine::new(Vec::new(), tmp.0.clone(), "test".into()))
+    }
+
+    /// `done: true` chunk carrying one tool call alongside `content`.
+    fn tool_call_chunk(name: &str, content: &str) -> ChatChunk {
+        let mut message = ChatMessage::assistant(content);
+        message.tool_calls.push(ToolCall {
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: json!({}),
+            },
+        });
+        ChatChunk {
+            message: Some(message),
+            images: Vec::new(),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    #[test]
+    fn invalid_manifests_are_skipped_and_the_rest_load() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("bad.toml"), "name = \"broken").unwrap();
+        std::fs::write(
+            tmp.0.join("good.toml"),
+            "name = \"helper\"\ndescription = \"d\"\nsystem_prompt = \"p\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.0.join("ignored.txt"), "not toml").unwrap();
+
+        let configs = load_dir(&tmp.0).expect("load ok");
+        assert_eq!(configs.len(), 1, "the bad manifest costs itself only");
+        assert_eq!(configs[0].name, "helper");
+        assert_eq!(
+            configs[0].max_steps,
+            crate::config::StepBudget::new(15),
+            "an omitted budget gets the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_subagent_is_rejected_with_the_roster() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(Vec::new());
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let tool = SpawnSubagentTool::new(
+            vec![worker()],
+            client,
+            Arc::new(ToolRegistry::new()),
+            test_hooks(&tmp),
+        );
+
+        let err = tool
+            .execute(
+                json!({ "subagent": "nope", "task": "anything" }),
+                &ToolContext::new(&tmp.0),
+            )
+            .await
+            .expect_err("unknown name is invalid args");
+        let message = err.to_string();
+        assert!(message.contains("unknown subagent 'nope'"), "{message}");
+        assert!(
+            message.contains("worker"),
+            "the roster is listed: {message}"
+        );
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "no model call for a bad name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_exhausts_its_step_budget_reports_an_error_summary() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("probe", "")],
+            vec![tool_call_chunk("probe", "still digging")],
+        ]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        let mut config = worker();
+        config.max_steps = crate::config::StepBudget::new(2);
+        let tool =
+            SpawnSubagentTool::new(vec![config], client, Arc::new(registry), test_hooks(&tmp));
+
+        let output = tool
+            .execute(
+                json!({ "subagent": "worker", "task": "dig" }),
+                &ToolContext::new(&tmp.0),
+            )
+            .await
+            .expect("tool output");
+        assert!(output.is_error, "a budget stop is an error result");
+        assert!(
+            output.content.contains("hit its step budget"),
+            "{}",
+            output.content
+        );
+        assert!(output.content.contains("2 step(s)"), "{}", output.content);
+        assert!(
+            output.content.contains("still digging"),
+            "the last text the subagent produced is the report: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_errors_back_off_and_retry_until_the_stream_recovers() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::flaky(429, 2, vec![vec![chunk("recovered", false, true)]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let ctx = ToolContext::new(&tmp.0);
+
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "report",
+            &SpawnOptions::default(),
+            &client,
+            &ToolRegistry::new(),
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("run recovers");
+        assert!(result.completed);
+        assert_eq!(result.output, "recovered");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            3,
+            "two transient failures, then the success"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_budget_bounds_transient_failures_and_closes_the_pane() {
+        use crate::agent::AgentEvent;
+
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::failing(503);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+
+        let run = next_run_id();
+        let err = spawn(
+            run,
+            &worker(),
+            "report",
+            &SpawnOptions::default(),
+            &client,
+            &ToolRegistry::new(),
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect_err("the budget bounds a persistent outage");
+        assert!(format!("{err:#}").contains("chat failed"), "{err:#}");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            (RETRY_ATTEMPTS + 1) as usize,
+            "initial attempt plus the retry budget"
+        );
+
+        let mut done = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SubagentRunDone {
+                run: id,
+                completed,
+                error,
+                ..
+            } = event
+            {
+                done = Some((id, completed, error));
+            }
+        }
+        let (id, completed, error) = done.expect("the pane is closed out");
+        assert_eq!(id, run);
+        assert!(!completed);
+        assert!(
+            error
+                .expect("error carried on the terminal event")
+                .contains("scripted failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_restricts_a_spawned_run_to_read_only_tools() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("mutate", "")],
+            vec![chunk("gave up on writing", false, true)],
+        ]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        registry.register(Arc::new(FakeTool {
+            name: "mutate",
+            access: ToolAccess::Edit,
+        }));
+        let tool =
+            SpawnSubagentTool::new(vec![worker()], client, Arc::new(registry), test_hooks(&tmp));
+
+        let output = tool
+            .execute(
+                json!({ "subagent": "worker", "task": "explore", "plan_mode": true }),
+                &ToolContext::new(&tmp.0),
+            )
+            .await
+            .expect("tool output");
+        assert!(!output.is_error);
+
+        let requests = provider.requests.lock().unwrap();
+        let advertised: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|spec| spec.function.name.as_str())
+            .collect();
+        assert_eq!(advertised, ["probe"], "only read-only tools are offered");
+        let feedback = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool feedback");
+        assert!(
+            feedback.content.contains("unknown tool: mutate"),
+            "the write tool does not exist inside the run: {}",
+            feedback.content
+        );
+    }
+
+    #[tokio::test]
+    async fn json_protocol_runs_tools_for_models_without_native_calling() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::without_native_tools(vec![
+            vec![chunk(r#"{"tool": "probe", "arguments": {}}"#, false, true)],
+            vec![chunk("all done", false, true)],
+        ]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let ctx = ToolContext::new(&tmp.0);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "look around",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+        assert!(result.completed);
+        assert_eq!(result.output, "all done");
+        assert_eq!(result.steps_used, 2);
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].tools.is_empty(), "no native tool specs sent");
+        let system = &requests[0].messages[0].content;
+        assert!(
+            system.contains("do not have native function calling"),
+            "the JSON protocol is taught: {system}"
+        );
+        assert!(
+            system.contains("`probe`"),
+            "the roster is rendered: {system}"
+        );
+        let feedback = requests[1]
+            .messages
+            .last()
+            .expect("second request has messages");
+        assert_eq!(feedback.role, Role::User, "results ride user messages");
+        assert!(
+            feedback.content.contains("Tool result for `probe`"),
+            "{}",
+            feedback.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreground_run_streams_run_scoped_events_in_order() {
+        use crate::agent::AgentEvent;
+
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("probe", "scouting")],
+            vec![chunk("the report", false, true)],
+        ]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+
+        let run = next_run_id();
+        let result = spawn(
+            run,
+            &worker(),
+            "scout",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+        assert!(result.completed);
+        assert_eq!(result.steps_used, 2);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 5, "run-scoped events only: {events:?}");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::SubagentRunText { run: id, text } if *id == run && text == "scouting"
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::SubagentRunToolStarted { run: id, name, .. }
+                if *id == run && name == "probe"
+        ));
+        assert!(matches!(
+            &events[2],
+            AgentEvent::SubagentRunToolFinished { run: id, name, output }
+                if *id == run && name == "probe" && !output.is_error
+        ));
+        assert!(matches!(
+            &events[3],
+            AgentEvent::SubagentRunStep { run: id, step: 1 } if *id == run
+        ));
+        assert!(matches!(
+            &events[4],
+            AgentEvent::SubagentRunDone { run: id, completed: true, steps_used: 2, error: None, output }
+                if *id == run && output == "the report"
+        ));
     }
 }

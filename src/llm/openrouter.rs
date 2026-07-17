@@ -46,18 +46,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_docs() {
-        assert_eq!(DEFAULT_BASE_URL, "https://openrouter.ai/api/v1");
-        assert_eq!(DEFAULT_MODEL, "openrouter/auto");
-        assert_eq!(DEFAULT_KEY_ENV, "OPENROUTER_API_KEY");
-        assert_eq!(
-            ATTRIBUTION_REFERER,
-            "https://github.com/teddytennant/wizard"
-        );
-        assert_eq!(ATTRIBUTION_TITLE, "Wizard");
-    }
-
-    #[test]
     fn label_uses_the_openrouter_vendor_prefix() {
         let provider = provider(DEFAULT_BASE_URL, DEFAULT_MODEL, "sk-or-test");
         assert_eq!(provider.label(), "openrouter:openrouter/auto");

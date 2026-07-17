@@ -688,6 +688,36 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "read_file");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["temperature"], 0.5);
+    }
+
+    #[test]
+    fn empty_and_image_only_user_messages_keep_the_api_shape() {
+        // The API rejects an empty text block, so an image-only user message
+        // must carry no text part — while an empty text-only message keeps
+        // its (empty) text block, and an empty assistant turn still sends one
+        // block rather than an empty content array.
+        let (_system, messages) = build_messages(&[
+            ChatMessage::user_with_images("", vec![crate::llm::Image::new("QUJD", "image/png")]),
+            ChatMessage::user(""),
+            ChatMessage::assistant(""),
+        ]);
+        let image_only = messages[0]["content"].as_array().expect("blocks");
+        assert_eq!(image_only.len(), 1);
+        assert_eq!(image_only[0]["type"], "image");
+        let empty_user = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(empty_user.len(), 1);
+        assert_eq!(empty_user[0]["type"], "text");
+        let empty_assistant = messages[2]["content"].as_array().expect("blocks");
+        assert_eq!(empty_assistant.len(), 1);
+        assert_eq!(empty_assistant[0]["text"], "");
+    }
+
+    #[test]
+    fn an_unmatched_tool_result_falls_back_to_a_name_derived_id() {
+        let (_system, messages) = build_messages(&[ChatMessage::tool_result("read_file", "data")]);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["tool_use_id"], "toolu_read_file");
     }
 
     #[tokio::test]
@@ -768,6 +798,113 @@ mod tests {
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
         assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reassembles_frames_split_across_reads() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"type\":\"content_block_delta\",\"index\":0,\"del".to_vec()),
+            Ok(
+                b"ta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\ndata: {\"type\":\"mess"
+                    .to_vec(),
+            ),
+            Ok(b"age_stop\"}\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").content, "Hi");
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_events_are_skipped() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {not json at all\n\n".to_vec()),
+            Ok(b"event: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec()),
+            Ok(
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: {\"type\":\"message_stop\"}\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").content, "ok");
+        assert!(chunks.next().await.expect("final").expect("ok").done);
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_without_message_stop_still_finishes_the_stream() {
+        // A connection that drops early must still yield the final chunk —
+        // including a trailing line the peer never newline-terminated.
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"
+                .to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").content, "partial");
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert_eq!(last.done_reason, None);
+        assert!(last.message.is_none());
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_input_that_is_not_json_degrades_to_a_string_argument() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"execute\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"not json\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(
+                b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"list\"}}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: {\"type\":\"message_stop\"}\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        let calls = last.message.expect("message").tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "execute");
+        assert_eq!(
+            calls[0].function.arguments,
+            Value::String("not json".to_string())
+        );
+        // A tool_use block that never received input gets empty arguments.
+        assert_eq!(calls[1].function.name, "list");
+        assert_eq!(calls[1].function.arguments, json!({}));
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_transport_error_surfaces_as_an_error() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"
+                    .to_vec(),
+            ),
+            Err(anyhow!("connection reset")),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        assert!(chunks.next().await.expect("text").is_ok());
+        let err = chunks.next().await.expect("item").expect_err("error");
+        assert!(err.to_string().contains("connection reset"));
     }
 
     #[test]

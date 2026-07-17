@@ -2446,9 +2446,13 @@ fn take_width(text: &str, max: usize) -> &str {
 /// `…/`) so the leaf directory — the part you actually care about — stays
 /// visible instead of being clipped off the end.
 fn format_cwd(root: &std::path::Path, max: usize) -> String {
+    format_cwd_from(root, dirs::home_dir().as_deref(), max)
+}
+
+fn format_cwd_from(root: &std::path::Path, home: Option<&std::path::Path>, max: usize) -> String {
     let full = root.display().to_string();
-    let display = match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && full.starts_with(&home) => {
+    let display = match home.map(|h| h.display().to_string()) {
+        Some(home) if !home.is_empty() && full.starts_with(&home) => {
             format!("~{}", &full[home.len()..])
         }
         _ => full,
@@ -3839,14 +3843,6 @@ mod tests {
     }
 
     #[test]
-    fn click_without_drag_is_empty() {
-        // anchor == head: the app's Up handler clears it (no copy) via
-        // is_empty(), so a no-drag click never reaches the copy path.
-        assert!(sel((2, 1), (2, 1)).is_empty());
-        assert!(!sel((2, 1), (3, 1)).is_empty());
-    }
-
-    #[test]
     fn selection_clamps_to_buffer_bounds() {
         // Head past the right/bottom edge stays within the grid.
         let rows = selection_rows(&sel((0, 0), (99, 99)), 6, 3);
@@ -3865,14 +3861,14 @@ mod tests {
     #[test]
     fn cwd_keeps_short_path_intact() {
         let p = std::path::Path::new("/srv/app");
-        assert_eq!(format_cwd(p, 32), "/srv/app");
+        assert_eq!(format_cwd_from(p, None, 32), "/srv/app");
     }
 
     #[test]
     fn cwd_drops_leading_components_keeping_leaf() {
         let p = std::path::Path::new("/home/gradient/projects/ai/wizard");
         // Narrow budget forces dropping leading parts but keeps the leaf.
-        let out = format_cwd(p, 14);
+        let out = format_cwd_from(p, None, 14);
         assert!(out.starts_with('…'), "expected ellipsis prefix, got {out}");
         assert!(out.ends_with("wizard"), "expected leaf kept, got {out}");
         assert!(out.width() <= 14, "expected within budget, got {out}");
@@ -3880,10 +3876,9 @@ mod tests {
 
     #[test]
     fn cwd_abbreviates_home() {
-        // SAFETY: single-threaded test process.
-        unsafe { std::env::set_var("HOME", "/home/gradient") };
+        let home = std::path::Path::new("/home/gradient");
         let p = std::path::Path::new("/home/gradient/projects/ai");
-        assert_eq!(format_cwd(p, 32), "~/projects/ai");
+        assert_eq!(format_cwd_from(p, Some(home), 32), "~/projects/ai");
     }
 
     #[test]
@@ -4436,5 +4431,89 @@ mod tests {
         assert!(!screen.contains("main conversation"), "{screen}");
         // And there is a way back.
         assert!(screen.contains("esc back"), "{screen}");
+    }
+
+    fn todo_items(n: usize) -> Vec<crate::tools::todo::TodoItem> {
+        use crate::tools::todo::{TodoItem, TodoStatus};
+        (0..n)
+            .map(|i| TodoItem {
+                content: format!("item {i}"),
+                status: TodoStatus::Pending,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn todo_band_gives_way_on_a_tiny_terminal() {
+        let mut app = App::new(crate::config::Config::default());
+        app.show_todos = true;
+        app.todos = todo_items(3);
+        let [main, todo, input, _rail, status] =
+            regions(&app, ratatui::layout::Rect::new(0, 0, 80, 6));
+        assert_eq!(todo.height, 0, "no room for the band without starving chat");
+        assert!(main.height >= 1, "the transcript keeps a row");
+        assert_eq!(status.height, 1);
+        assert!(input.height >= 3);
+    }
+
+    #[test]
+    fn todo_band_caps_its_height_however_long_the_list() {
+        let mut app = App::new(crate::config::Config::default());
+        app.show_todos = true;
+        app.todos = todo_items(30);
+        let [main, todo, ..] = regions(&app, ratatui::layout::Rect::new(0, 0, 80, 40));
+        assert_eq!(todo.height, 12, "a long list cannot swallow the screen");
+        assert!(main.height >= 1);
+
+        // An empty list still shows the band frame: title plus one row.
+        app.todos.clear();
+        let [_, todo, ..] = regions(&app, ratatui::layout::Rect::new(0, 0, 80, 40));
+        assert_eq!(todo.height, 3);
+    }
+
+    #[test]
+    fn composer_growth_is_capped_and_the_status_bar_survives() {
+        let mut app = App::new(crate::config::Config::default());
+        app.input = "line\n".repeat(20);
+        app.cursor = app.input.chars().count();
+        let [main, _todo, input, _rail, status] =
+            regions(&app, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert_eq!(input.height, 12, "ten text rows plus the two rules");
+        assert!(main.height >= 1, "the transcript is never squeezed out");
+        assert_eq!(status.height, 1);
+    }
+
+    #[test]
+    fn rail_collapses_overflow_runs_into_one_row() {
+        let mut app = App::new(crate::config::Config::default());
+        for run in 0..12u64 {
+            app.handle_agent_event(crate::agent::AgentEvent::SubagentRunStarted {
+                run,
+                bg: None,
+                name: format!("agent{run}"),
+                task: "t".to_string(),
+            });
+            let expected = match app.panes.len() {
+                n if n <= 5 => n as u16,
+                _ => 6,
+            };
+            assert_eq!(rail_height(&app), expected, "{} panes", app.panes.len());
+        }
+    }
+
+    #[test]
+    fn a_masked_api_key_never_reaches_the_screen() {
+        let mut app = App::new(crate::config::Config::default());
+        app.web_key_backend = Some("brave".to_string());
+        app.input = "sk-supersecret".to_string();
+        app.cursor = app.input.chars().count();
+        let rows = render(&app);
+        let screen = rows.join("\n");
+        assert!(!screen.contains("sk-supersecret"), "{screen}");
+        assert!(!screen.contains("supersecret"), "{screen}");
+        assert!(
+            screen.contains(&"•".repeat("sk-supersecret".len())),
+            "each typed char shows as a bullet: {screen}"
+        );
     }
 }

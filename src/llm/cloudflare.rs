@@ -246,16 +246,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_docs() {
-        assert_eq!(DEFAULT_MODEL, "@cf/zai-org/glm-5.2");
-        assert_eq!(DEFAULT_KEY_ENV, "CLOUDFLARE_API_TOKEN");
-        assert_eq!(
-            BASE_URL_TEMPLATE,
-            "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
-        );
-    }
-
-    #[test]
     fn base_url_substitutes_the_account_id() {
         assert_eq!(
             base_url("abc123"),

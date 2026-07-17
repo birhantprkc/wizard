@@ -1605,4 +1605,553 @@ mod tests {
         assert!(!host_is_local("[::1"));
         assert!(!host_is_local("[::1]x"));
     }
+
+    /* ------------------------------------------------------------------ */
+    /* The served router: real sockets on 127.0.0.1:0, so the guard, the  */
+    /* extractors and the error mapping run exactly as a browser hits them */
+    /* ------------------------------------------------------------------ */
+
+    use std::net::SocketAddr;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use crate::gui::settings::ConfigStore;
+    use crate::gui::tasks::TaskManager;
+
+    /// State over a fresh store, heartbeating nowhere (a test run must not
+    /// advertise itself as a live session).
+    fn state_in(cwd: &FsPath) -> Arc<GuiState> {
+        let store = Arc::new(ConfigStore::new(Config::default()));
+        Arc::new(GuiState {
+            manager: TaskManager::with_registry(
+                Arc::clone(&store),
+                Arc::new(tokio::sync::RwLock::new(crate::mcp::McpManager::empty())),
+                None,
+            ),
+            config: store,
+            cwd: cwd.to_path_buf(),
+            assets_dir: None,
+            sign_in: Arc::new(oauth::SignIn::default()),
+        })
+    }
+
+    async fn serve(state: Arc<GuiState>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind the test server");
+        let addr = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        addr
+    }
+
+    /// One HTTP/1.1 exchange: status, lowercased header block, body.
+    async fn send_bytes(addr: SocketAddr, request: Vec<u8>) -> (u16, String, String) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(&request).await.expect("write the request");
+        read_response(&mut stream).await
+    }
+
+    async fn read_response(stream: &mut TcpStream) -> (u16, String, String) {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let split = loop {
+            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos;
+            }
+            let n = stream.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "the server closed before finishing the headers");
+            raw.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("a status line");
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|len| len.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = raw[split + 4..].to_vec();
+        while body.len() < length {
+            let n = stream.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "the server closed mid-body");
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(length);
+        (status, head, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> (u16, String, String) {
+        send_bytes(
+            addr,
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        )
+        .await
+    }
+
+    async fn with_body(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, String, String) {
+        send_bytes(
+            addr,
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+        .await
+    }
+
+    fn parsed(body: &str) -> Value {
+        serde_json::from_str(body).unwrap_or_else(|err| panic!("{err}: {body}"))
+    }
+
+    #[tokio::test]
+    async fn the_guard_fronts_every_route_it_serves() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        // A rebound Host is refused on the page, the API, and the WS upgrade
+        // path alike: the predicate is unit-tested above, this is the proof the
+        // middleware actually fronts the routes.
+        for path in ["/", "/api/workspace", "/api/tasks/x/ws"] {
+            let (status, _, _) = send_bytes(
+                addr,
+                format!("GET {path} HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+                    .into_bytes(),
+            )
+            .await;
+            assert_eq!(status, 403, "{path} answered a rebound Host");
+        }
+        let (status, _, _) = send_bytes(
+            addr,
+            "GET /api/workspace HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Origin: https://evil.example\r\nConnection: close\r\n\r\n"
+                .into(),
+        )
+        .await;
+        assert_eq!(status, 403, "a foreign Origin is refused on a local Host");
+
+        let (status, _, body) = get(addr, "/api/workspace").await;
+        assert_eq!(status, 200);
+        assert_eq!(parsed(&body)["cwd"], cwd.path().display().to_string());
+    }
+
+    #[tokio::test]
+    async fn code_assets_are_served_uncached_and_fonts_cached_hard() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        let (status, head, body) = get(addr, "/").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("content-type: text/html"), "{head}");
+        assert!(head.contains("cache-control: no-store"), "{head}");
+        assert!(!body.is_empty());
+
+        let (status, head, _) = get(addr, "/app.js").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("content-type: text/javascript"), "{head}");
+        assert!(head.contains("cache-control: no-store"), "{head}");
+
+        let (status, head, _) = get(addr, "/fonts/inter.woff2").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("content-type: font/woff2"), "{head}");
+        assert!(head.contains("immutable"), "a font never changes: {head}");
+
+        let (status, _, body) = get(addr, "/fonts/comic-sans.woff2").await;
+        assert_eq!(status, 404);
+        assert!(body.contains("no font"), "{body}");
+
+        let (status, head, _) = get(addr, "/favicon.ico").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("image/svg"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn creating_a_task_validates_the_cwd_and_lists_it_back() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        for bad in ["relative/path", "/definitely/not/a/dir"] {
+            let (status, _, body) = with_body(
+                addr,
+                "POST",
+                "/api/tasks",
+                &format!(r#"{{ "cwd": "{bad}" }}"#),
+            )
+            .await;
+            assert_eq!(status, 400, "{bad}");
+            assert!(body.contains("error"), "{body}");
+        }
+
+        let (status, _, _) = with_body(addr, "POST", "/api/tasks", "{ not json").await;
+        assert_eq!(status, 400, "malformed JSON is refused, not defaulted");
+
+        // No cwd in the body: the chat opens where the server was launched.
+        let (status, _, body) = with_body(addr, "POST", "/api/tasks", "{}").await;
+        assert_eq!(status, 201);
+        let created = parsed(&body);
+        assert_eq!(created["cwd"], cwd.path().display().to_string());
+        let workspace = cwd.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(created["workspace"], workspace.as_ref());
+        let id = created["id"].as_str().expect("an id").to_string();
+        assert!(!id.is_empty());
+
+        // An empty chat has nothing for the sidebar; a first message makes it a
+        // session on disk, merged with this manager's live state.
+        Session::open_by_id(&Config::sessions_dir().unwrap(), &id)
+            .unwrap()
+            .expect("the session file exists")
+            .append(&crate::llm::ChatMessage::user("hello gui"))
+            .unwrap();
+        let (status, _, body) = get(addr, "/api/tasks").await;
+        assert_eq!(status, 200);
+        let row = parsed(&body)
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .find(|row| row["id"] == id.as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("the new task is listed: {body}"));
+        assert_eq!(row["state"], "idle", "live state, not the on-disk default");
+        assert_eq!(row["title"], "hello gui");
+        assert_eq!(row["workspace"], workspace.as_ref());
+
+        let (status, _, body) = get(addr, &format!("/api/tasks/{id}")).await;
+        assert_eq!(status, 200);
+        let detail = parsed(&body);
+        assert_eq!(detail["cwd"], cwd.path().display().to_string());
+        let items = detail["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "the replayed transcript: {body}");
+        assert_eq!(items[0]["kind"], "user");
+        assert_eq!(items[0]["text"], "hello gui");
+
+        let (status, _, _) = get(addr, "/api/tasks/2020-01-01T00-00-00").await;
+        assert_eq!(status, 404, "a session that does not exist is a 404");
+    }
+
+    /* --- the WebSocket, over a real upgrade --- */
+
+    async fn ws_upgrade(addr: SocketAddr, id: &str) -> (u16, String, TcpStream) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "GET /api/tasks/{id}/ws HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        // One byte at a time: the first WS frame can coalesce with the 101
+        // header block, and an over-read here would swallow it.
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("closed during the handshake");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let status: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("a status line");
+        (status, head, stream)
+    }
+
+    async fn read_ws_text(stream: &mut TcpStream) -> String {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.expect("frame header");
+        assert_eq!(header[0], 0x81, "one unfragmented text frame");
+        let mut length = u64::from(header[1] & 0x7f);
+        if length == 126 {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await.expect("length");
+            length = u64::from(u16::from_be_bytes(extended));
+        }
+        let mut payload = vec![0u8; length as usize];
+        stream.read_exact(&mut payload).await.expect("payload");
+        String::from_utf8(payload).expect("text")
+    }
+
+    async fn send_ws_text(stream: &mut TcpStream, text: &str) {
+        let mask = [7u8, 13, 42, 9];
+        let mut frame = vec![0x81];
+        match text.len() {
+            len if len < 126 => frame.push(0x80 | len as u8),
+            len => {
+                frame.push(0x80 | 126);
+                frame.extend((len as u16).to_be_bytes());
+            }
+        }
+        frame.extend(mask);
+        frame.extend(text.bytes().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+        stream.write_all(&frame).await.expect("send frame");
+    }
+
+    #[tokio::test]
+    async fn the_task_socket_upgrades_snapshots_state_and_answers_bad_frames() {
+        let cwd = tempfile::tempdir().unwrap();
+        let state = state_in(cwd.path());
+        let id = state
+            .manager
+            .create_task(cwd.path(), None, None)
+            .expect("an empty chat");
+        let addr = serve(state).await;
+
+        let (status, _, _) = ws_upgrade(addr, "2020-01-01T00-00-00").await;
+        assert_eq!(status, 404, "an unknown id is refused before the upgrade");
+
+        let (status, head, mut socket) = ws_upgrade(addr, &id).await;
+        assert_eq!(status, 101);
+        assert!(head.contains("sec-websocket-accept"), "{head}");
+
+        let frame = parsed(&read_ws_text(&mut socket).await);
+        assert_eq!(frame["type"], "state", "attach opens with the snapshot");
+        assert_eq!(frame["state"], "idle");
+
+        // A frame that is not the protocol's is answered on this socket, not
+        // dropped — the page cannot fix what it never hears about.
+        send_ws_text(&mut socket, "certainly not json").await;
+        let frame = parsed(&read_ws_text(&mut socket).await);
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("unrecognized frame"),
+            "{frame}"
+        );
+
+        // A verdict with no plan pending is a protocol error, not a hang.
+        send_ws_text(
+            &mut socket,
+            r#"{ "type": "plan_verdict", "approve": true }"#,
+        )
+        .await;
+        let frame = parsed(&read_ws_text(&mut socket).await);
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"].as_str().unwrap().contains("no plan"),
+            "{frame}"
+        );
+    }
+
+    /// The one test that writes providers and credentials: the config file and
+    /// the credential store are process-shared in tests, so the whole lifecycle
+    /// runs serially here.
+    #[tokio::test]
+    async fn the_settings_routes_edit_the_config_and_probe_saved_providers_honestly() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        let (status, _, body) =
+            with_body(addr, "PATCH", "/api/settings", r#"{ "max_steps": 1001 }"#).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("at most 1000"), "{body}");
+
+        let (status, _, body) =
+            with_body(addr, "PATCH", "/api/settings", r#"{ "max_steps": 250 }"#).await;
+        assert_eq!(status, 200);
+        assert_eq!(parsed(&body)["max_steps"], 250);
+
+        let (status, _, body) = with_body(
+            addr,
+            "POST",
+            "/api/providers",
+            r#"{ "name": " ", "kind": "openai", "base_url": "http://127.0.0.1:9", "model": "m" }"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body.contains("needs a name"), "{body}");
+
+        let (status, _, body) = with_body(
+            addr,
+            "POST",
+            "/api/providers",
+            r#"{ "name": "p", "kind": "warpdrive", "base_url": "http://127.0.0.1:9", "model": "m" }"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert!(body.contains("unknown provider kind"), "{body}");
+
+        // A backend that refuses the connection still saves — a typo'd endpoint
+        // must leave an editable row — and the probe says plainly that it failed.
+        // Port 9 (discard) on loopback refuses instantly; nothing leaves the box.
+        let (status, _, body) = with_body(
+            addr,
+            "POST",
+            "/api/providers",
+            r#"{ "name": "route-stub", "kind": "openai", "base_url": "http://127.0.0.1:9",
+                 "model": "m", "api_key": "sk-route-test" }"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let saved = parsed(&body);
+        assert_eq!(saved["probe"]["ok"], false);
+        assert!(saved["probe"]["error"].as_str().is_some(), "{saved}");
+        assert_eq!(saved["settings"]["first_run"], false);
+        assert_eq!(saved["settings"]["active"], "route-stub");
+        assert_eq!(saved["settings"]["providers"][0]["name"], "route-stub");
+        assert_eq!(saved["settings"]["providers"][0]["key"], "stored");
+        assert_eq!(
+            crate::credentials::get("route-stub").as_deref(),
+            Some("sk-route-test")
+        );
+
+        // Editing without retyping the key keeps the stored one.
+        let (status, _, body) = with_body(
+            addr,
+            "POST",
+            "/api/providers",
+            r#"{ "name": "route-stub", "kind": "openai", "base_url": "http://127.0.0.1:9",
+                 "model": "m2" }"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(parsed(&body)["settings"]["providers"][0]["key"], "stored");
+        assert_eq!(
+            crate::credentials::get("route-stub").as_deref(),
+            Some("sk-route-test")
+        );
+
+        let (status, _, body) = with_body(addr, "POST", "/api/providers/route-stub/test", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(parsed(&body)["ok"], false);
+
+        let (status, _, _) = with_body(addr, "POST", "/api/providers/ghost/test", "").await;
+        assert_eq!(status, 404, "an unknown provider is not probed");
+
+        // Deleting forgets the provider and its stored key with it.
+        let (status, _, body) = with_body(addr, "DELETE", "/api/providers/route-stub", "").await;
+        assert_eq!(status, 200);
+        let settings = parsed(&body);
+        assert_eq!(settings["providers"].as_array().unwrap().len(), 0);
+        assert_eq!(settings["first_run"], true);
+        assert_eq!(crate::credentials::get("route-stub"), None);
+    }
+
+    #[tokio::test]
+    async fn the_commands_route_merges_the_workspace_customs() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join(".wizard/commands")).unwrap();
+        std::fs::write(
+            cwd.path().join(".wizard/commands/ship.md"),
+            "Ship $ARGUMENTS carefully",
+        )
+        .unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        let (status, _, _) = get(addr, "/api/commands?cwd=/not/a/dir").await;
+        assert_eq!(status, 400);
+
+        let (status, _, body) =
+            get(addr, &format!("/api/commands?cwd={}", cwd.path().display())).await;
+        assert_eq!(status, 200);
+        let listing = parsed(&body);
+        let rows = listing["commands"].as_array().expect("rows");
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("/{name} is offered: {body}"))
+        };
+        assert_eq!(row("goal")["where"], "server");
+        assert_eq!(row("ship")["where"], "prompt");
+        assert_eq!(row("ship")["args"], "<args>");
+    }
+
+    const BOUNDARY: &str = "wizard-test-boundary";
+
+    async fn post_upload(
+        addr: SocketAddr,
+        id: &str,
+        parts: &[(&str, &[u8])],
+    ) -> (u16, String, String) {
+        let mut body: Vec<u8> = Vec::new();
+        for (name, bytes) in parts {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        let mut request = format!(
+            "POST /api/tasks/{id}/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+             Content-Type: multipart/form-data; boundary={BOUNDARY}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        send_bytes(addr, request).await
+    }
+
+    #[tokio::test]
+    async fn the_upload_route_checks_the_id_shape_and_lands_files_by_their_bytes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+        // `%2E%2E` decodes to `..`: an id that is a traversal, not a session.
+        let (status, _, body) = post_upload(addr, "%2E%2E", &[("a.png", &png)]).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("not a task id"), "{body}");
+
+        let (status, _, body) = post_upload(addr, "2026-07-17T00-00-01", &[]).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("no files"), "{body}");
+
+        // The name says PDF; the bytes say PNG. The bytes win, end to end.
+        let (status, _, body) =
+            post_upload(addr, "2026-07-17T00-00-01", &[("shot.pdf", &png)]).await;
+        assert_eq!(status, 200);
+        let upload = parsed(&body);
+        assert_eq!(upload["attachments"][0]["kind"], "image");
+        assert_eq!(upload["attachments"][0]["mime"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn client_paths_that_name_no_workspace_or_store_are_400s() {
+        let cwd = tempfile::tempdir().unwrap();
+        let addr = serve(state_in(cwd.path())).await;
+
+        for path in [
+            "/api/git?cwd=/not/a/dir",
+            "/api/git/branches?cwd=/not/a/dir",
+            "/api/git/diff?cwd=/not/a/dir&path=a.txt",
+        ] {
+            let (status, _, body) = get(addr, path).await;
+            assert_eq!(status, 400, "{path}");
+            assert!(body.contains("not a directory"), "{path}: {body}");
+        }
+        let (status, _, _) = with_body(
+            addr,
+            "POST",
+            "/api/git/checkout",
+            r#"{ "cwd": "/not/a/dir", "branch": "main" }"#,
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        let (status, _, _) = get(addr, "/api/image?path=/etc/passwd").await;
+        assert_eq!(status, 400, "a path outside the store is refused");
+        let (status, _, _) = get(addr, "/api/image").await;
+        assert_eq!(status, 400, "a missing query is a bad request");
+    }
 }

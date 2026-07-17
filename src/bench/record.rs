@@ -68,3 +68,70 @@ fn append(project_root: &Path, record: &TrajectoryRecord) -> Result<()> {
         .with_context(|| format!("appending to {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::super::read_trajectories;
+    use super::*;
+
+    fn record(prompt: &str) -> TrajectoryRecord {
+        TrajectoryRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: Utc::now(),
+            prompt: prompt.to_string(),
+            git_ref: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            dirty: false,
+            done_reason: "Completed".to_string(),
+            duration_secs: 1.5,
+            model: "test-model".to_string(),
+            mode: "sovereign".to_string(),
+        }
+    }
+
+    #[test]
+    fn append_creates_the_log_and_never_truncates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        assert!(
+            read_trajectories(root)
+                .expect("missing log reads")
+                .is_empty(),
+            "no log yet"
+        );
+
+        append(root, &record("first")).expect("first append creates .wizard/");
+        append(root, &record("second")).expect("second append");
+        let text = std::fs::read_to_string(trajectories_path(root)).expect("log exists");
+        assert_eq!(text.lines().count(), 2, "one line per record: {text:?}");
+        assert!(text.ends_with('\n'), "every line is terminated: {text:?}");
+
+        let records = read_trajectories(root).expect("read back");
+        let prompts: Vec<&str> = records.iter().map(|r| r.prompt.as_str()).collect();
+        assert_eq!(prompts, vec!["first", "second"], "append order preserved");
+    }
+
+    #[test]
+    fn a_corrupt_line_does_not_brick_the_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        append(root, &record("before")).expect("append");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(trajectories_path(root))
+                .expect("open log");
+            file.write_all(b"{not json at all\n\n").expect("corrupt it");
+        }
+        append(root, &record("after")).expect("append past the corruption");
+
+        let records = read_trajectories(root).expect("read back");
+        let prompts: Vec<&str> = records.iter().map(|r| r.prompt.as_str()).collect();
+        assert_eq!(
+            prompts,
+            vec!["before", "after"],
+            "good records survive a corrupt line"
+        );
+    }
+}

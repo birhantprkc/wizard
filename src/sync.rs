@@ -1251,6 +1251,123 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_bundle_version_is_rejected_even_when_signed() {
+        let dst = tempfile::tempdir().expect("tempdir");
+        let keydir = tempfile::tempdir().expect("tempdir");
+        let key = load_or_generate_key(keydir.path()).expect("key");
+        let manifest = Manifest {
+            version: BUNDLE_VERSION + 1,
+            created_at: Utc::now().to_rfc3339(),
+            wizard_version: "99.0.0".to_string(),
+            host: "future".to_string(),
+            includes_credentials: false,
+            public_key: BASE64.encode(key.verifying_key().to_bytes()),
+            files: Vec::new(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let signature = BASE64.encode(key.sign(&manifest_bytes).to_bytes());
+        let bundle =
+            assemble_bundle(&manifest_bytes, &signature, &BTreeMap::new()).expect("assemble");
+
+        let err = pull_bundle(dst.path(), &bundle, "test", false)
+            .expect_err("a future version must fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("unsupported bundle version"), "{message}");
+        assert!(
+            message.contains("update wizard"),
+            "tells the user the way out: {message}"
+        );
+    }
+
+    #[test]
+    fn corrupt_signature_encoding_is_rejected() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        seed_wizard_dir(src.path());
+        let bundle = pack_to_bytes(src.path(), false);
+        let raw = parse_bundle(&bundle).expect("parse");
+
+        let not_base64 = assemble_bundle(&raw.manifest_bytes, "!!!not base64!!!", &raw.payload)
+            .expect("assemble");
+        let err = pull_bundle(dst.path(), &not_base64, "test", false).expect_err("bad encoding");
+        assert!(format!("{err:#}").contains("manifest.sig"), "{err:#}");
+
+        let wrong_length =
+            assemble_bundle(&raw.manifest_bytes, &BASE64.encode([0u8; 10]), &raw.payload)
+                .expect("assemble");
+        let err = pull_bundle(dst.path(), &wrong_length, "test", false).expect_err("short sig");
+        assert!(format!("{err:#}").contains("64-byte"), "{err:#}");
+        assert!(!dst.path().join("config.toml").exists(), "nothing written");
+    }
+
+    #[test]
+    fn payload_size_mismatch_is_detected() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        seed_wizard_dir(src.path());
+        let bundle = pack_to_bytes(src.path(), false);
+        let raw = parse_bundle(&bundle).expect("parse");
+
+        let mut payload = raw.payload.clone();
+        payload.insert(
+            "config.toml".to_string(),
+            b"longer than the manifest says".to_vec(),
+        );
+        let tampered =
+            assemble_bundle(&raw.manifest_bytes, &raw.signature, &payload).expect("assemble");
+        let err = pull_bundle(dst.path(), &tampered, "test", false).expect_err("size lies");
+        assert!(format!("{err:#}").contains("size mismatch"), "{err:#}");
+        assert!(!dst.path().join("config.toml").exists(), "nothing written");
+    }
+
+    #[test]
+    fn duplicate_payload_entries_are_rejected_at_parse_time() {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        append_entry(&mut tar, "payload/config.toml", b"first").expect("append");
+        append_entry(&mut tar, "payload/config.toml", b"second").expect("append");
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let Err(err) = parse_bundle(&bytes) else {
+            panic!("duplicates must fail");
+        };
+        assert!(
+            format!("{err:#}").contains("duplicate payload entry"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn manifest_listing_a_path_twice_is_rejected() {
+        let dst = tempfile::tempdir().expect("tempdir");
+        let keydir = tempfile::tempdir().expect("tempdir");
+        let key = load_or_generate_key(keydir.path()).expect("key");
+        let data = b"model = \"x\"\n";
+        let entry = || ManifestEntry {
+            path: "config.toml".to_string(),
+            sha256: sha256_hex(data),
+            size: data.len() as u64,
+        };
+        let manifest = Manifest {
+            version: BUNDLE_VERSION,
+            created_at: Utc::now().to_rfc3339(),
+            wizard_version: "0.0.0".to_string(),
+            host: "test".to_string(),
+            includes_credentials: false,
+            public_key: BASE64.encode(key.verifying_key().to_bytes()),
+            files: vec![entry(), entry()],
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let signature = BASE64.encode(key.sign(&manifest_bytes).to_bytes());
+        let payload = BTreeMap::from([("config.toml".to_string(), data.to_vec())]);
+        let bundle = assemble_bundle(&manifest_bytes, &signature, &payload).expect("assemble");
+
+        let err = pull_bundle(dst.path(), &bundle, "test", false).expect_err("double listing");
+        assert!(format!("{err:#}").contains("twice"), "{err:#}");
+        assert!(!dst.path().join("config.toml").exists(), "nothing written");
+    }
+
+    #[test]
     fn tofu_pins_first_key_and_rejects_a_different_one() {
         let src_a = tempfile::tempdir().expect("tempdir");
         let src_c = tempfile::tempdir().expect("tempdir");

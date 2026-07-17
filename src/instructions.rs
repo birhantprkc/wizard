@@ -244,6 +244,16 @@ mod tests {
     }
 
     #[test]
+    fn global_file_on_the_ancestor_chain_is_included_once() {
+        let tmp = TempDir::new();
+        let project = tmp.0.join("proj");
+        let global = project.join("WIZARD.md");
+        write(&global, "solo rules");
+        let out = load_with_global(&project, Some(&global)).expect("found");
+        assert_eq!(out.matches("solo rules").count(), 1, "no duplicate: {out}");
+    }
+
+    #[test]
     fn missing_everything_yields_none() {
         let tmp = TempDir::new();
         let project = tmp.0.join("empty");

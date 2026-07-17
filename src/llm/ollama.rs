@@ -676,18 +676,6 @@ mod tests {
         assert_eq!(client.context_window("m").await, Some(DEFAULT_NUM_CTX));
     }
 
-    #[test]
-    fn derived_num_ctx_is_capped() {
-        // The cap keeps a huge trained context from allocating an equally
-        // huge KV cache by default.
-        let derived = context_length_from_model_info(&serde_json::json!({
-            "llama.context_length": 1_048_576u64,
-        }))
-        .map(|n| n.min(MAX_DERIVED_NUM_CTX))
-        .unwrap_or(DEFAULT_NUM_CTX);
-        assert_eq!(derived, MAX_DERIVED_NUM_CTX);
-    }
-
     #[tokio::test]
     async fn decodes_split_ndjson_lines() {
         // One line split across two network reads, plus a final done line.

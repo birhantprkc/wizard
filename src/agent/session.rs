@@ -1013,4 +1013,52 @@ mod tests {
         assert_eq!(repair_dangling_tool_calls(&mut messages), 0);
         assert_eq!(messages.len(), before.len());
     }
+
+    #[test]
+    fn peek_reads_the_tail_and_clips_long_messages() {
+        // peek resolves ids against the sessions dir (test-redirected under
+        // a per-process temp home), so create the session there.
+        let dir = crate::config::Config::sessions_dir().unwrap();
+        let session = Session::create(&dir).unwrap();
+        session.append(&ChatMessage::user("first")).unwrap();
+        session.append(&ChatMessage::assistant("second")).unwrap();
+        session
+            .append(&ChatMessage::user("x".repeat(5000)))
+            .unwrap();
+
+        let peeked = peek(&session.id, 2);
+        assert_eq!(peeked.len(), 2, "only the requested tail");
+        assert_eq!(peeked[0], ("assistant".to_string(), "second".to_string()));
+        assert_eq!(peeked[1].0, "user");
+        assert!(
+            peeked[1].1.ends_with(" …") && peeked[1].1.chars().count() < 5000,
+            "one huge message cannot dominate the peek panel"
+        );
+
+        assert!(peek("no-such-session", 5).is_empty(), "unknown id is empty");
+        let _ = std::fs::remove_file(session.path());
+    }
+
+    #[test]
+    fn entries_replays_header_markers_and_messages_in_file_order() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        session.append_marker(1, "the prompt").unwrap();
+        session.append(&ChatMessage::user("the prompt")).unwrap();
+        session.append(&ChatMessage::assistant("reply")).unwrap();
+
+        let entries = session.entries().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(&entries[0], SessionEntry::Header(header) if !header.cwd.is_empty()));
+        assert!(matches!(&entries[1], SessionEntry::Marker(marker) if marker.turn == 1));
+        assert!(matches!(
+            &entries[2],
+            SessionEntry::Message(record)
+                if record.message.role == Role::User && record.message.content == "the prompt"
+        ));
+        assert!(matches!(
+            &entries[3],
+            SessionEntry::Message(record) if record.message.role == Role::Assistant
+        ));
+    }
 }

@@ -2775,6 +2775,9 @@ mod tests {
         requests: Mutex<Vec<ChatRequest>>,
         /// Reported context window (None = unknown, like a local model).
         context_window: Option<u32>,
+        /// Upcoming chat_stream calls that fail with a transient transport
+        /// error before the scripted responses resume.
+        fail: Mutex<u32>,
     }
 
     impl ScriptedProvider {
@@ -2783,6 +2786,7 @@ mod tests {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
                 context_window: None,
+                fail: Mutex::new(0),
             })
         }
 
@@ -2791,7 +2795,14 @@ mod tests {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
                 context_window: Some(window),
+                fail: Mutex::new(0),
             })
+        }
+
+        fn flaky(failures: u32, responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            let provider = Self::new(responses);
+            *provider.fail.lock().unwrap() = failures;
+            provider
         }
     }
 
@@ -2811,6 +2822,13 @@ mod tests {
 
         async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
             self.requests.lock().unwrap().push(request);
+            {
+                let mut fail = self.fail.lock().unwrap();
+                if *fail > 0 {
+                    *fail -= 1;
+                    return Err(crate::llm::ProviderError::transport("scripted flake").into());
+                }
+            }
             let chunks = self
                 .responses
                 .lock()
@@ -5117,5 +5135,192 @@ mod tests {
 
         assert_eq!(reason, DoneReason::MaxSteps);
         assert_eq!(calls.lock().unwrap().len(), 3, "stopped at the cap");
+    }
+
+    /// Streaming (not-done) chunk carrying a text or thinking delta.
+    fn delta_chunk(content: &str, thinking: bool) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage::assistant(content)),
+            images: Vec::new(),
+            thinking,
+            done: false,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_assembles_split_deltas_and_keeps_thinking_out_of_history() {
+        let (mut agent, _provider, _tmp) = test_agent(vec![vec![
+            delta_chunk("pondering deeply", true),
+            delta_chunk("Hel", false),
+            delta_chunk("lo world", false),
+            final_chunk(""),
+        ]]);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("hi", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        let mut text = String::new();
+        let mut thinking = String::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                AgentEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Hello world", "split deltas reassemble in order");
+        assert_eq!(thinking, "pondering deeply", "reasoning is surfaced");
+
+        let assistant = agent
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .expect("assistant message");
+        assert_eq!(assistant.content, "Hello world");
+        let persisted = agent.session().load_messages().expect("session readable");
+        assert!(
+            persisted.iter().all(|m| !m.content.contains("pondering")),
+            "thinking never reaches history or disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_stream_failure_emits_stream_retrying_then_recovers() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::flaky(1, vec![vec![final_chunk("second try")]]);
+        let mut agent =
+            test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+        agent.config.retry_base_secs = 0;
+        agent.config.retry_max_secs = 0;
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+        assert_eq!(provider.requests.lock().unwrap().len(), 2, "retried once");
+
+        let mut retrying = 0;
+        let mut text = String::new();
+        let mut errors = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::StreamRetrying => retrying += 1,
+                AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                AgentEvent::Error(message) => errors.push(message),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            retrying, 1,
+            "consumers are told to drop their partial buffer exactly once"
+        );
+        assert_eq!(text, "second try");
+        assert!(
+            errors.iter().any(|e| e.contains("retrying")),
+            "the outage is surfaced: {errors:?}"
+        );
+        assert!(
+            !agent.llm_breaker.is_open(),
+            "one flake never trips the breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_falls_back_to_truncating_the_middle() {
+        // The summarization call streams an empty reply, which counts as a
+        // summary failure — the middle span is dropped instead.
+        let (mut agent, _provider, _tmp) = test_agent(vec![vec![final_chunk("")]]);
+        let extra = KEEP_RECENT + 5;
+        for i in 0..extra {
+            agent.history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        let before = agent.history.len();
+
+        let outcome = agent.compact_now().await;
+        match &outcome {
+            CompactOutcome::Truncated { count, error } => {
+                assert_eq!(*count, before - 1 - KEEP_RECENT);
+                assert!(error.contains("empty summary"), "{error}");
+            }
+            other => panic!("expected truncation, got {other:?}"),
+        }
+        assert!(outcome.describe().contains("truncation"));
+
+        assert_eq!(agent.history.len(), 1 + KEEP_RECENT);
+        assert!(
+            agent
+                .history
+                .iter()
+                .all(|m| !m.content.contains("[Compacted progress summary]")),
+            "no summary note on the fallback path"
+        );
+        assert_eq!(agent.history[0].role, Role::System);
+        assert_eq!(
+            agent.history.last().unwrap().content,
+            format!("msg {}", extra - 1),
+            "the recent tail survives verbatim"
+        );
+        assert_eq!(
+            agent.usage().last_prompt_tokens(),
+            None,
+            "stale prompt size cleared even on the fallback path"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_summarization_chains_oversized_spans_through_chunk_summaries() {
+        let (mut agent, provider, _tmp) = test_agent(vec![
+            vec![final_chunk("summary of part one")],
+            vec![final_chunk("summary of everything")],
+        ]);
+        // One middle message larger than a single summarization chunk, made of
+        // multibyte characters so the split must respect char boundaries.
+        agent.history.push(ChatMessage::user("é".repeat(15_000)));
+        for i in 0..KEEP_RECENT {
+            agent.history.push(ChatMessage::user(format!("tail {i}")));
+        }
+
+        let outcome = agent.compact_now().await;
+        assert_eq!(outcome, CompactOutcome::Summarized(1));
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one summarization pass per chunk");
+        let second_blob = &requests[1].messages[1].content;
+        assert!(
+            second_blob.contains("[Progress summary of the transcript so far]"),
+            "the second pass sees the first pass's summary"
+        );
+        assert!(second_blob.contains("summary of part one"));
+        assert!(second_blob.contains("[Transcript continues]"));
+        drop(requests);
+
+        assert!(
+            agent.history.iter().any(|m| m
+                .content
+                .contains("[Compacted progress summary]\nsummary of everything")),
+            "the final rolling summary is what lands in history"
+        );
+    }
+
+    #[test]
+    fn leaving_plan_mode_also_leaves_omakase() {
+        let tmp = TempDir::new();
+        let (mut agent, _provider) =
+            test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+
+        agent.set_omakase(true);
+        assert!(agent.plan_mode(), "omakase implies plan mode");
+        assert!(agent.omakase());
+        assert!(agent.history[0].content.contains("Omakase"));
+        assert!(agent.history[0].content.contains("PLAN MODE"));
+
+        agent.set_plan_mode(false);
+        assert!(!agent.omakase(), "no omakase without the plan phase");
+        assert!(!agent.history[0].content.contains("Omakase"));
+        assert!(!agent.history[0].content.contains("PLAN MODE"));
     }
 }

@@ -343,6 +343,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cloud_provider_with_no_key_anywhere_is_reported_missing() {
+        // A distinctive name: the credential store is shared process-wide in
+        // tests, and this provider must have no stored key.
+        let unkeyed = provider("settings-test-unkeyed");
+        assert!(matches!(key_source(&unkeyed), KeySource::Missing));
+
+        // An env fallback that names an unset variable is no key either — the
+        // Settings page must say "missing", not "env".
+        let mut env_only = provider("settings-test-env");
+        env_only.api_key_env = Some("WIZARD_TEST_KEY_THAT_IS_NEVER_SET".to_string());
+        assert!(matches!(key_source(&env_only), KeySource::Missing));
+    }
+
+    #[test]
     fn presets_are_all_valid_provider_kinds() {
         for preset in PRESETS {
             let kind: ProviderKind = toml::from_str(&format!("kind = \"{}\"", preset.kind))

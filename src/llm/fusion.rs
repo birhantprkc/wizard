@@ -358,6 +358,40 @@ mod tests {
         }
     }
 
+    /// A panel member whose backend is down: every chat attempt errors.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl LlmProvider for FailingProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
+            anyhow::bail!("panel member down")
+        }
+        fn label(&self) -> String {
+            "failing".to_string()
+        }
+    }
+
+    fn chunk(text: &str, thinking: bool, done: bool) -> ChatChunk {
+        ChatChunk {
+            message: Some(ChatMessage::assistant(text)),
+            images: Vec::new(),
+            thinking,
+            done,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        }
+    }
+
     fn user_req(text: &str, with_tool: bool) -> ChatRequest {
         let tools = if with_tool {
             vec![crate::llm::ToolSpec::function(
@@ -434,6 +468,62 @@ mod tests {
             .iter()
             .any(|m| matches!(m.role, Role::System) && m.content.contains("answer from alice"));
         assert!(injected, "panel drafts injected into the synthesis request");
+    }
+
+    #[tokio::test]
+    async fn a_failing_panel_member_does_not_break_the_turn() {
+        let (synth, synth_seen) = StubProvider::new("synth");
+        let panel = vec![PanelMember {
+            name: "down".to_string(),
+            provider: Arc::new(FailingProvider),
+            model: "m".to_string(),
+        }];
+        let fusion =
+            FusionProvider::new(panel, synth, "m-synth".to_string(), 1, "fusion".to_string())
+                .unwrap();
+        let out = collect_text(fusion.chat_stream(user_req("Q", false)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out, "answer from synth");
+        assert_eq!(synth_seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn render_query_flattens_history_for_the_panel() {
+        let messages = vec![
+            ChatMessage::system("hidden instructions"),
+            ChatMessage::user_with_images(
+                "what is this?",
+                vec![crate::llm::Image::new("QUJD", "image/png")],
+            ),
+            ChatMessage::assistant(""),
+            ChatMessage::assistant("an owl"),
+            ChatMessage::tool_result("execute", "ok"),
+        ];
+        let query = render_query(&messages);
+        assert!(!query.contains("hidden instructions"), "{query}");
+        assert!(
+            query.contains("User: what is this? [1 image(s) not shown to the panel]"),
+            "{query}"
+        );
+        assert!(query.contains("Assistant: an owl"), "{query}");
+        assert!(query.contains("[tool execute result] ok"), "{query}");
+        assert_eq!(
+            query.matches("Assistant:").count(),
+            1,
+            "empty assistant turns are dropped: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_text_skips_thinking_and_stops_at_done() {
+        let stream: ChatStream = Box::pin(stream::iter(vec![
+            Ok(chunk("pondering", true, false)),
+            Ok(chunk("an", false, false)),
+            Ok(chunk("swer", false, true)),
+            Ok(chunk("never read", false, false)),
+        ]));
+        assert_eq!(collect_text(stream).await.unwrap(), "answer");
     }
 
     #[tokio::test]

@@ -1209,6 +1209,110 @@ mod tests {
         assert!(agent_commands().contains(&"model"));
     }
 
+    #[test]
+    fn non_slash_input_is_not_a_command_and_unknown_words_error() {
+        assert_eq!(SlashCommand::parse("just a prompt"), None);
+        assert_eq!(SlashCommand::parse(""), None);
+        assert_eq!(
+            SlashCommand::parse("  /help  "),
+            Some(Ok(SlashCommand::Help))
+        );
+        assert!(
+            matches!(SlashCommand::parse("/frobnicate"), Some(Err(message)) if message.contains("unknown command"))
+        );
+    }
+
+    #[test]
+    fn effort_parses_levels_aliases_and_any_case() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(parse("/effort"), Ok(SlashCommand::Effort(None)));
+        assert_eq!(
+            parse("/effort HIGH"),
+            Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::High))))
+        );
+        assert_eq!(
+            parse("/effort med"),
+            Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::Medium))))
+        );
+        assert_eq!(parse("/effort off"), Ok(SlashCommand::Effort(Some(None))));
+        assert_eq!(
+            parse("/effort default"),
+            Ok(SlashCommand::Effort(Some(None)))
+        );
+        assert!(
+            matches!(parse("/effort extreme"), Err(message) if message.contains("unknown effort"))
+        );
+    }
+
+    #[test]
+    fn evolve_requires_a_description_and_takes_deep() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(
+            parse("/evolve add a linter tool"),
+            Ok(SlashCommand::Evolve {
+                deep: false,
+                description: "add a linter tool".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("/evolve --deep browser control"),
+            Ok(SlashCommand::Evolve {
+                deep: true,
+                description: "browser control".to_string(),
+            })
+        );
+        assert!(matches!(parse("/evolve"), Err(message) if message.contains("usage")));
+        assert!(matches!(parse("/evolve --deep"), Err(message) if message.contains("usage")));
+    }
+
+    #[test]
+    fn rewind_takes_a_turn_number_or_opens_the_picker() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(parse("/rewind"), Ok(SlashCommand::Rewind(None)));
+        assert_eq!(parse("/rewind 3"), Ok(SlashCommand::Rewind(Some(3))));
+        assert!(matches!(parse("/rewind three"), Err(message) if message.contains("usage")));
+        assert!(matches!(parse("/rewind -1"), Err(message) if message.contains("usage")));
+    }
+
+    #[test]
+    fn provider_add_parses_kind_and_arity() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(
+            parse("/provider"),
+            Ok(SlashCommand::Provider(ProviderAction::Menu))
+        );
+        assert_eq!(
+            parse("/provider add local ollama http://localhost:11434 qwen3:8b"),
+            Ok(SlashCommand::Provider(ProviderAction::Add {
+                name: "local".to_string(),
+                kind: ProviderKind::Ollama,
+                base_url: "http://localhost:11434".to_string(),
+                model: "qwen3:8b".to_string(),
+                api_key_env: None,
+            }))
+        );
+        assert_eq!(
+            parse("/provider add or openrouter https://openrouter.ai/api/v1 auto OPENROUTER_KEY"),
+            Ok(SlashCommand::Provider(ProviderAction::Add {
+                name: "or".to_string(),
+                kind: ProviderKind::OpenRouter,
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                model: "auto".to_string(),
+                api_key_env: Some("OPENROUTER_KEY".to_string()),
+            }))
+        );
+        assert!(
+            matches!(parse("/provider add local ollama"), Err(message) if message.contains("usage"))
+        );
+        assert!(
+            matches!(parse("/provider add x bogus url model"), Err(message) if message.contains("unknown provider kind"))
+        );
+        assert!(matches!(parse("/provider use"), Err(message) if message.contains("usage")));
+        assert!(
+            matches!(parse("/provider frob"), Err(message) if message.contains("unknown /provider subcommand"))
+        );
+    }
+
     /// `/memory` lists, `/memory read <name>` shows one, `/memory forget
     /// <name>` deletes one. A subcommand without the name it needs is a usage
     /// error, not a memory named nothing.
@@ -1402,16 +1506,13 @@ mod tests {
     }
 
     #[test]
-    fn tilde_paths_resolve_against_home() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let name = format!("wizard-atref-test-{}.txt", std::process::id());
-        let path = home.join(&name);
-        std::fs::write(&path, "tilde ok").unwrap();
-        let out = expand_file_refs(&format!("@~/{name}"), Path::new("/nonexistent-root"));
-        std::fs::remove_file(&path).unwrap();
-        assert!(out.text.contains("tilde ok"), "got: {}", out.text);
+    fn resolve_handles_tilde_absolute_and_relative_paths() {
+        let root = Path::new("/project");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(resolve("~/notes.md", root), home.join("notes.md"));
+        }
+        assert_eq!(resolve("/etc/hosts", root), PathBuf::from("/etc/hosts"));
+        assert_eq!(resolve("src/lib.rs", root), root.join("src/lib.rs"));
     }
 
     #[test]
@@ -1437,6 +1538,18 @@ mod tests {
             shot.canonicalize().unwrap_or(shot),
             "image path is absolute"
         );
+    }
+
+    #[test]
+    fn cap_lands_on_a_char_boundary() {
+        // '€' is 3 bytes; a cap that falls mid-char must back off, not panic.
+        let raw = "€€€";
+        let (cut, truncated) = cap_bytes(raw, 4);
+        assert_eq!(cut, "€");
+        assert!(truncated);
+        let (whole, truncated) = cap_bytes(raw, 9);
+        assert_eq!(whole, raw);
+        assert!(!truncated);
     }
 
     #[test]

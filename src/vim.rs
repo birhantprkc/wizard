@@ -320,4 +320,33 @@ mod tests {
         let c = cv("foo");
         assert!(resolve_motion('z', 1, &c, 0).is_none());
     }
+
+    #[test]
+    fn h_and_l_clamp_at_the_line_edges() {
+        let c = cv("abc");
+        let m = resolve_motion('l', 99, &c, 1).unwrap();
+        assert_eq!(m.target, 3, "l stops at the end of the line");
+        assert_eq!((m.start, m.end), (1, 3));
+        let m = resolve_motion('h', 99, &c, 2).unwrap();
+        assert_eq!(m.target, 0, "h stops at the start of the line");
+        assert_eq!((m.start, m.end), (0, 2));
+    }
+
+    #[test]
+    fn word_forward_from_a_blank_lands_on_the_next_word() {
+        let c = cv("a   bc");
+        assert_eq!(word_forward(&c, 1), 4);
+        assert_eq!(word_forward(&c, c.len()), c.len());
+    }
+
+    #[test]
+    fn undo_stack_stays_bounded_dropping_the_oldest() {
+        let mut vim = VimState::default();
+        for i in 0..UNDO_LIMIT + 5 {
+            vim.push_undo(&format!("snap {i}"), i);
+        }
+        assert_eq!(vim.undo.len(), UNDO_LIMIT);
+        assert_eq!(vim.undo[0].0, "snap 5", "the oldest snapshots fell off");
+        assert_eq!(vim.undo.last().unwrap().1, UNDO_LIMIT + 4);
+    }
 }

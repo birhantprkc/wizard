@@ -213,3 +213,111 @@ empty file falls back to that default.
   destructive experiments are always recoverable.
 "
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::agent::subagent::SubagentConfig;
+
+    #[test]
+    fn export_writes_a_complete_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        export(dir.path()).expect("export");
+
+        let prompt =
+            std::fs::read_to_string(dir.path().join("system_prompt.md")).expect("system prompt");
+        assert!(!prompt.trim().is_empty());
+        assert!(prompt.ends_with('\n'));
+
+        // One non-empty description file per native tool, named after the tool
+        // — the "keep names stable" contract HARNESS.md documents.
+        let expected: BTreeSet<String> = ToolRegistry::with_native_tools()
+            .specs()
+            .iter()
+            .map(|spec| spec.function.name.clone())
+            .collect();
+        let descriptions = dir.path().join("tool_descriptions");
+        let mut exported = BTreeSet::new();
+        for entry in std::fs::read_dir(&descriptions).expect("descriptions dir") {
+            let path = entry.expect("entry").path();
+            assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
+            let body = std::fs::read_to_string(&path).expect("description");
+            assert!(!body.trim().is_empty(), "empty description: {path:?}");
+            exported.insert(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("stem")
+                    .to_string(),
+            );
+        }
+        assert_eq!(exported, expected);
+
+        let doc = std::fs::read_to_string(dir.path().join("HARNESS.md")).expect("HARNESS.md");
+        assert!(doc.contains("--harness-dir"));
+
+        // The builtin worker subagent round-trips, and every exported TOML
+        // keeps its `name` matching the file stem.
+        let subagents = dir.path().join("subagents");
+        let worker = std::fs::read_to_string(subagents.join("worker.toml")).expect("worker.toml");
+        let worker: SubagentConfig = toml::from_str(&worker).expect("worker parses");
+        assert_eq!(worker.name, "worker");
+        for entry in std::fs::read_dir(&subagents).expect("subagents dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("subagent toml");
+            let config: SubagentConfig = toml::from_str(&raw).expect("subagent parses");
+            assert_eq!(
+                Some(config.name.as_str()),
+                path.file_stem().and_then(|s| s.to_str()),
+                "subagent name must match its file stem: {path:?}"
+            );
+        }
+
+        // Every exported skill directory carries its SKILL.md.
+        for entry in std::fs::read_dir(dir.path().join("skills")).expect("skills dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                assert!(
+                    path.join("SKILL.md").is_file(),
+                    "skill without SKILL.md: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn export_overwrites_stale_components_and_keeps_unrelated_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("system_prompt.md"), "stale").expect("seed");
+        std::fs::write(dir.path().join("keep.txt"), "mine").expect("seed");
+        export(dir.path()).expect("export");
+        let prompt =
+            std::fs::read_to_string(dir.path().join("system_prompt.md")).expect("system prompt");
+        assert_ne!(prompt, "stale");
+        let kept = std::fs::read_to_string(dir.path().join("keep.txt")).expect("keep.txt");
+        assert_eq!(kept, "mine");
+    }
+
+    #[test]
+    fn copy_dir_recurses_into_nested_directories() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(src.join("sub/deep")).expect("mkdirs");
+        std::fs::write(src.join("a.txt"), "top").expect("write");
+        std::fs::write(src.join("sub/deep/b.txt"), "nested").expect("write");
+        let dst = root.path().join("dst");
+        copy_dir(&src, &dst).expect("copy");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).expect("a"),
+            "top"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/deep/b.txt")).expect("b"),
+            "nested"
+        );
+    }
+}

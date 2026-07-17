@@ -251,6 +251,64 @@ mod tests {
         assert_eq!(tools[0].manifest.name, "good");
     }
 
+    #[test]
+    fn load_rejects_empty_name_and_missing_script() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("noname.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            tmp.0.join("noname.toml"),
+            "name = \"  \"\ndescription = \"x\"\nscript = \"noname.sh\"\n",
+        )
+        .unwrap();
+        let err = ScriptedTool::load(&tmp.0.join("noname.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("empty tool name"), "{err:#}");
+
+        std::fs::write(
+            tmp.0.join("ghost.toml"),
+            "name = \"ghost\"\ndescription = \"x\"\nscript = \"ghost.sh\"\n",
+        )
+        .unwrap();
+        let err = ScriptedTool::load(&tmp.0.join("ghost.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn failing_script_reports_stderr_and_exit_code_as_error() {
+        let tmp = TempDir::new();
+        std::fs::write(
+            tmp.0.join("fail.sh"),
+            "#!/bin/sh\necho \"went wrong\" >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.0.join("fail.toml"),
+            "name = \"fail\"\ndescription = \"x\"\nscript = \"fail.sh\"\ninterpreter = \"sh\"\n",
+        )
+        .unwrap();
+        let tool = ScriptedTool::load(&tmp.0.join("fail.toml")).unwrap();
+        let ctx = ToolContext::new(&tmp.0);
+        let out = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("went wrong"), "{}", out.content);
+        assert!(out.content.contains("exit code: 3"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn interpreter_flags_are_split_and_passed() {
+        let tmp = TempDir::new();
+        std::fs::write(tmp.0.join("strict.sh"), "false\necho reached\n").unwrap();
+        std::fs::write(
+            tmp.0.join("strict.toml"),
+            "name = \"strict\"\ndescription = \"x\"\nscript = \"strict.sh\"\ninterpreter = \"sh -e\"\n",
+        )
+        .unwrap();
+        let tool = ScriptedTool::load(&tmp.0.join("strict.toml")).unwrap();
+        let ctx = ToolContext::new(&tmp.0);
+        let out = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.is_error, "sh -e stops at the failing command");
+        assert!(!out.content.contains("reached"), "{}", out.content);
+    }
+
     #[tokio::test]
     async fn scripted_tool_passes_args_json() {
         let tmp = TempDir::new();

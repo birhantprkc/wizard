@@ -612,6 +612,52 @@ mod tests {
     }
 
     #[test]
+    fn load_cases_sorts_by_id_and_surfaces_parse_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        assert!(
+            load_cases(root).expect("missing dir loads").is_empty(),
+            "missing cases dir is an empty set"
+        );
+
+        let dir = cases_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["zeta", "alpha"] {
+            let case = BenchCase {
+                id: id.to_string(),
+                prompt: "p".to_string(),
+                base_ref: "deadbeef".to_string(),
+                check: "true".to_string(),
+                timeout_secs: 10,
+                check_timeout_secs: 10,
+                tags: Vec::new(),
+                source: "manual".to_string(),
+                created: Utc::now(),
+                notes: None,
+            };
+            std::fs::write(
+                dir.join(format!("{id}.toml")),
+                toml::to_string_pretty(&case).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("README.txt"), "not a case").unwrap();
+        let ids: Vec<String> = load_cases(root)
+            .expect("loads")
+            .into_iter()
+            .map(|case| case.id)
+            .collect();
+        assert_eq!(ids, vec!["alpha", "zeta"], "sorted, non-toml ignored");
+
+        std::fs::write(dir.join("broken.toml"), "id = unquoted garbage").unwrap();
+        let err = load_cases(root).expect_err("a malformed case is an error");
+        assert!(
+            format!("{err:#}").contains("broken.toml"),
+            "error names the file: {err:#}"
+        );
+    }
+
+    #[test]
     fn summarize_aggregation_math() {
         let results = summarize(
             "label".to_string(),

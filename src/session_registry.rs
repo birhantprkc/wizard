@@ -325,4 +325,24 @@ mod tests {
         let tmp = TempDir::new();
         assert!(list_from(&tmp.0.join("missing")).is_empty());
     }
+
+    #[test]
+    fn terminal_records_age_out_after_the_retention_window() {
+        let tmp = TempDir::new();
+        let ancient = SessionRecord {
+            updated_unix: now_unix() - RETAIN_SECS - 5,
+            ..record("ancient", SessionState::Completed)
+        };
+        std::fs::write(
+            tmp.0.join("ancient.json"),
+            serde_json::to_vec(&ancient).unwrap(),
+        )
+        .unwrap();
+
+        assert!(list_from(&tmp.0).is_empty());
+        assert!(
+            !tmp.0.join("ancient.json").exists(),
+            "the expired record's file is pruned"
+        );
+    }
 }

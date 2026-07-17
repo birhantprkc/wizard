@@ -1323,6 +1323,24 @@ mod tests {
         assert!(chunks.next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn malformed_lines_and_comments_are_skipped() {
+        // SSE keep-alive comments and unparseable payloads must not end or
+        // fail the stream the real deltas are riding on.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b": keep-alive\n\n".to_vec()),
+            Ok(b"data: {broken json\n\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        let first = chunks.next().await.expect("content").expect("ok");
+        assert_eq!(first.message.expect("message").content, "ok");
+        assert!(chunks.next().await.expect("final").expect("ok").done);
+        assert!(chunks.next().await.is_none());
+    }
+
     #[test]
     fn context_window_table_covers_openai_xai_and_unknowns() {
         assert_eq!(context_window("gpt-4o"), Some(128_000));

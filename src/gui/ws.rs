@@ -190,7 +190,9 @@ mod tests {
         let png = images.join("a1b2c3d4.png");
         std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
 
-        let secret = Config::wizard_dir().unwrap().join("credentials.toml");
+        // Not named `credentials.toml`: that file is the process-shared
+        // credential store other tests read and write.
+        let secret = Config::wizard_dir().unwrap().join("ws-test-secret.toml");
         std::fs::write(&secret, "key = 'sk-1'").unwrap();
 
         // A path inside the store passes the guard. (The task is not live in
@@ -206,7 +208,7 @@ mod tests {
         // An absolute path outside the store, a traversal out of it, and a
         // symlink pointing out of it: all refused, and none of them reaches the
         // turn.
-        let traversal = images.join("../../credentials.toml");
+        let traversal = images.join("../../ws-test-secret.toml");
         let symlink = images.join("escape.png");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, &symlink).ok();

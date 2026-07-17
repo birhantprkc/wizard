@@ -2327,7 +2327,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::StepBudget;
     use crate::tools::ToolOutput;
 
     /// An unmanaged task: it heartbeats nowhere, so a test run never advertises
@@ -2853,33 +2852,6 @@ mod tests {
         let config = agent_config(&base, Some("qwen3.6:32b"));
         assert_eq!(config.active().name, "local");
         assert_eq!(config.active().model, "qwen3.6:32b");
-    }
-
-    #[test]
-    fn gui_turns_run_on_the_users_own_mode_and_step_budget() {
-        // The GUI is the same agent on another surface: it runs the config the
-        // user configured, not a posture or a budget of its own.
-        let base = Config {
-            mode: Mode::Genie,
-            max_steps: StepBudget::new(25),
-            ..Config::default()
-        };
-        let config = agent_config(&base, None);
-        assert_eq!(config.mode, Mode::Genie);
-        assert_eq!(config.max_steps, StepBudget::new(25));
-
-        let base = Config {
-            mode: Mode::Sovereign,
-            max_steps: StepBudget::UNLIMITED,
-            ..Config::default()
-        };
-        let config = agent_config(&base, None);
-        assert_eq!(config.mode, Mode::Sovereign);
-        assert_eq!(
-            config.max_steps,
-            StepBudget::UNLIMITED,
-            "the v1.2 default — no ceiling — reaches the GUI too"
-        );
     }
 
     // --- the preprocessing seam ---

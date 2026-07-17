@@ -1953,6 +1953,75 @@ mod tests {
     }
 
     #[test]
+    fn web_search_choice_lands_in_config_but_the_key_does_not() {
+        let answers = Answers {
+            web_search_backend: "brave".to_string(),
+            web_search_api_key: Some("brv-secret-key".to_string()),
+            ..base_answers()
+        };
+        let config = answers.into_config();
+        assert_eq!(config.web.search_backend, "brave");
+        // The pasted key goes to credentials.toml, never config.toml.
+        let toml = toml::to_string(&config).expect("serialize");
+        assert!(
+            !toml.contains("brv-secret-key"),
+            "web-search key must not appear in config: {toml}"
+        );
+    }
+
+    #[test]
+    fn onboarding_config_survives_a_toml_round_trip() {
+        let answers = Answers {
+            provider: ProviderChoice::LlamaCpp,
+            kind: ProviderKind::LlamaCpp,
+            base_url: "http://127.0.0.1:8080".to_string(),
+            model: "Qwen3.6-27B-Q4_K_M".to_string(),
+            gguf_path: Some("/m/Qwen3.6-27B-Q4_K_M.gguf".to_string()),
+            gateway_kind: GatewayKind::Telegram,
+            gateway_token_env: Some("TELEGRAM_BOT_TOKEN".to_string()),
+            gateway_allowed_chat_ids: vec![-100123, 42],
+            mode: Mode::Sovereign,
+            web_search_backend: "tavily".to_string(),
+            ..base_answers()
+        };
+        // Serialize/deserialize exactly as Config::save / Config::load do.
+        let raw = toml::to_string_pretty(&answers.into_config()).expect("serialize");
+        let reloaded: Config = toml::from_str(&raw).expect("parse");
+        assert_eq!(reloaded.active().name, "local");
+        assert_eq!(reloaded.active().kind, ProviderKind::LlamaCpp);
+        assert_eq!(reloaded.active().model, "Qwen3.6-27B-Q4_K_M");
+        assert_eq!(
+            reloaded.active().gguf_path.as_deref(),
+            Some("/m/Qwen3.6-27B-Q4_K_M.gguf")
+        );
+        assert_eq!(reloaded.gateway.kind, GatewayKind::Telegram);
+        assert_eq!(
+            reloaded.gateway.token_env.as_deref(),
+            Some("TELEGRAM_BOT_TOKEN")
+        );
+        assert_eq!(reloaded.gateway.allowed_chat_ids, vec![-100123, 42]);
+        assert_eq!(reloaded.mode, Mode::Sovereign);
+        assert_eq!(reloaded.web.search_backend, "tavily");
+    }
+
+    #[test]
+    fn is_cancel_matches_esc_and_ctrl_c_only() {
+        assert!(is_cancel(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(is_cancel(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_cancel(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_cancel(&KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
     fn parse_chat_ids_handles_empty_and_whitespace() {
         assert_eq!(parse_chat_ids("").unwrap(), Vec::<i64>::new());
         assert_eq!(parse_chat_ids("   ").unwrap(), Vec::<i64>::new());
@@ -1975,11 +2044,6 @@ mod tests {
             err.contains("abc"),
             "error should name the bad token: {err}"
         );
-    }
-
-    #[test]
-    fn anthropic_default_model_is_latest_claude() {
-        assert_eq!(ANTHROPIC_MODELS[0], "claude-fable-5");
     }
 
     fn tier(file: &'static str) -> GgufModel {

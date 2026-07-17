@@ -413,4 +413,31 @@ mod tests {
         assert!(text.contains("spawn_subagent"));
         assert!(text.contains("memory"));
     }
+
+    /// Models on the JSON protocol only know the tools this section names —
+    /// it must carry the roster with each tool's argument schema, and stay
+    /// bare when no tools are registered.
+    #[test]
+    fn tool_protocol_renders_the_roster_with_schemas() {
+        let specs = vec![ToolSpec::function(
+            "read_file",
+            "Read a file.",
+            serde_json::json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        )];
+        let section = render_tool_protocol(&specs);
+        assert!(section.contains("You do not have native function calling"));
+        assert!(section.contains("## Available tools"));
+        assert!(section.contains("`read_file`: Read a file."));
+        assert!(
+            section.contains("\"path\""),
+            "the argument schema is inlined"
+        );
+
+        let bare = render_tool_protocol(&[]);
+        assert!(bare.contains("You do not have native function calling"));
+        assert!(
+            !bare.contains("## Available tools"),
+            "no roster section without tools"
+        );
+    }
 }

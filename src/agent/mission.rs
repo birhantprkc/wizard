@@ -181,4 +181,17 @@ mod tests {
         // The oldest survivor is the expected front entry.
         assert_eq!(mission.notes.first().expect("non-empty notes"), "note-10");
     }
+
+    #[test]
+    fn corrupt_mission_file_is_an_error_not_a_fresh_mission() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(control_dir(&tmp.0)).unwrap();
+        std::fs::write(mission_path(&tmp.0), "goal = ").unwrap();
+
+        let err = Mission::load(&tmp.0).expect_err("corruption surfaces");
+        assert!(
+            format!("{err:#}").contains("parsing mission file"),
+            "a broken mission must not silently restart the loop from zero: {err:#}"
+        );
+    }
 }

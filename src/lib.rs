@@ -327,6 +327,13 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
 /// headless-with-prompt sovereign run. A non-interactive run never onboards,
 /// so piping into Wizard never blocks.
 fn should_onboard(cli: &cli::Cli) -> Result<bool> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    should_onboard_given(cli, interactive)
+}
+
+/// Testable core of [`should_onboard`]; `interactive` is whether stdin and
+/// stdout are both terminals.
+fn should_onboard_given(cli: &cli::Cli, interactive: bool) -> Result<bool> {
     // Subcommands (bench) are dispatched before this is ever consulted; the
     // check here is a defensive guarantee that they can never onboard.
     if cli.command.is_some() {
@@ -335,7 +342,6 @@ fn should_onboard(cli: &cli::Cli) -> Result<bool> {
     if cli.publish || cli.evolve || cli.gateway || cli.login.is_some() {
         return Ok(false);
     }
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !interactive {
         return Ok(false);
     }
@@ -347,4 +353,55 @@ fn should_onboard(cli: &cli::Cli) -> Result<bool> {
         cli.prompt.is_some() && (cli.mode == Some(Mode::Sovereign) || cli.continuous);
     let config_missing = !config::Config::path()?.exists();
     Ok(config_missing && !headless_with_prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> cli::Cli {
+        cli::Cli::try_parse_from(args).expect("cli parses")
+    }
+
+    #[test]
+    fn onboard_flag_forces_onboarding_in_an_interactive_terminal() {
+        assert!(should_onboard_given(&parse(&["wizard", "--onboard"]), true).unwrap());
+    }
+
+    #[test]
+    fn non_interactive_runs_never_onboard() {
+        assert!(!should_onboard_given(&parse(&["wizard", "--onboard"]), false).unwrap());
+        assert!(!should_onboard_given(&parse(&["wizard"]), false).unwrap());
+    }
+
+    #[test]
+    fn subcommands_never_onboard() {
+        assert!(!should_onboard_given(&parse(&["wizard", "doctor"]), true).unwrap());
+        assert!(!should_onboard_given(&parse(&["wizard", "agents"]), true).unwrap());
+    }
+
+    #[test]
+    fn dedicated_run_modes_suppress_onboarding() {
+        for args in [
+            &["wizard", "--gateway"][..],
+            &["wizard", "--publish"],
+            &["wizard", "--evolve"],
+            &["wizard", "--login", "xai"],
+        ] {
+            assert!(
+                !should_onboard_given(&parse(args), true).unwrap(),
+                "{args:?} must not onboard"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_sovereign_prompts_skip_onboarding_even_when_interactive() {
+        let sovereign = parse(&["wizard", "--mode", "sovereign", "-p", "task"]);
+        assert!(!should_onboard_given(&sovereign, true).unwrap());
+        let continuous = parse(&["wizard", "--continuous", "-p", "task"]);
+        assert!(!should_onboard_given(&continuous, true).unwrap());
+    }
 }

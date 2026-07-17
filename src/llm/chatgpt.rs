@@ -683,6 +683,45 @@ mod tests {
         assert_eq!(body["tools"][0]["parameters"]["type"], "object");
     }
 
+    #[test]
+    fn user_images_become_input_image_parts() {
+        let body = provider().build_request_body(&request(
+            vec![ChatMessage::user_with_images(
+                "look",
+                vec![crate::llm::Image::new("QUJD", "image/png")],
+            )],
+            Vec::new(),
+        ));
+        let content = &body["input"][0]["content"];
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn reasoning_effort_rides_in_the_reasoning_field() {
+        let mut with_effort = request(vec![ChatMessage::user("hi")], Vec::new());
+        with_effort.options = Some(crate::llm::ChatOptions {
+            temperature: None,
+            num_ctx: None,
+            reasoning_effort: Some("high".to_string()),
+        });
+        let body = provider().build_request_body(&with_effort);
+        assert_eq!(body["reasoning"]["effort"], "high");
+
+        let without =
+            provider().build_request_body(&request(vec![ChatMessage::user("hi")], Vec::new()));
+        assert!(without.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn an_unmatched_tool_result_falls_back_to_a_name_derived_call_id() {
+        let (_instructions, input) = build_input(&[ChatMessage::tool_result("read_file", "out")]);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_read_file");
+    }
+
     #[tokio::test]
     async fn decodes_text_and_a_tool_call() {
         let parts: Vec<Result<Vec<u8>>> = vec![
@@ -712,6 +751,69 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments["path"], "a.rs");
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_are_flagged_thinking() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hmm\"}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_vec()),
+        ];
+        let mut out = decode_sse(stream::iter(parts).boxed());
+
+        let first = out.next().await.expect("reasoning").expect("ok");
+        assert!(first.thinking, "reasoning delta is flagged");
+        assert_eq!(first.message.expect("message").content, "hmm");
+        let second = out.next().await.expect("text").expect("ok");
+        assert!(!second.thinking, "visible text is not flagged");
+        assert!(out.next().await.expect("final").expect("ok").done);
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn eof_and_split_frames_still_finish_the_stream() {
+        // No `response.completed`, a frame split mid-JSON, and no trailing
+        // newline: the decoder must reassemble, flush, and synthesize the
+        // final chunk anyway. Unparseable function_call arguments become null.
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"type\":\"response.outpu".to_vec()),
+            Ok(b"t_text.delta\",\"delta\":\"Hi\"}\n\n".to_vec()),
+            Ok(
+                b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"go\",\"arguments\":\"not json\"}}"
+                    .to_vec(),
+            ),
+        ];
+        let mut out = decode_sse(stream::iter(parts).boxed());
+
+        let first = out.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").content, "Hi");
+        let last = out.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        let calls = last.message.expect("message").tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "go");
+        assert_eq!(calls[0].function.arguments, Value::Null);
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_events_are_skipped() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {broken json\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"response.created\"}\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n".to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut out = decode_sse(stream::iter(parts).boxed());
+
+        let first = out.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").content, "ok");
+        assert!(out.next().await.expect("final").expect("ok").done);
+        assert!(out.next().await.is_none());
     }
 
     #[tokio::test]
