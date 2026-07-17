@@ -1289,7 +1289,7 @@ const MOCK_COMMANDS = [
   { name: 'server', args: '[status|start|stop]', detail: 'manage the local llama-server', where: 'server' },
   { name: 'login', args: '<xai>', detail: 'sign in to a provider account (xAI OAuth)', where: 'client' },
   { name: 'diff', detail: 'toggle the git diff sidebar', where: 'client' },
-  { name: 'todos', detail: 'toggle the todo overlay above the input', where: 'client' },
+  { name: 'todos', detail: 'toggle the todo list above the input', where: 'client' },
   { name: 'dashboard', detail: 'session manager: all live wizard sessions on this machine', where: 'client' },
   { name: 'cost', detail: 'show session token usage and cost', where: 'server' },
   { name: 'memory', detail: 'show saved project memories', where: 'server' },

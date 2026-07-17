@@ -1,7 +1,7 @@
 //! Ratatui rendering: pure functions from [`App`] state to widgets.
-//! Layout: chat transcript (with optional git diff sidebar) above the input
-//! line and a quiet status line. Floating layers: the compact todo overlay
-//! just above the composer, the command-suggestion popup, and the
+//! Layout: chat transcript (with optional git diff sidebar), optional todo
+//! band above the composer, the input line, the subagent rail, and a quiet
+//! status line. Floating layers: the command-suggestion popup and the
 //! model/mode/rewind/subagent picker.
 //!
 //! Design rules (do not regress):
@@ -13,6 +13,9 @@
 //!   (✓/✗), never color.
 //! - **No heavy boxes**: borderless sections separated by padding and dim
 //!   rules; rounded dim borders only on floating layers.
+//! - **Todos never cover chat**: when shown, the todo list is a reserved
+//!   layout band above the composer, so the transcript shrinks instead of
+//!   painting under a floating panel.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -75,7 +78,7 @@ fn accent() -> Style {
 /// Render one frame. The only entry point the main loop calls; everything
 /// else in this module is a helper.
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [main_area, input_area, rail_area, status_area] = regions(app, frame.area());
+    let [main_area, todo_area, input_area, rail_area, status_area] = regions(app, frame.area());
 
     if let Some(pane) = app.attached_pane() {
         // Inside a subagent: its conversation takes over the main area and
@@ -91,19 +94,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_transcript(frame, app, main_area);
     }
 
+    // Todos are a reserved band (not a floating overlay), so chat text never
+    // paints underneath them. Height is 0 when hidden.
+    if todo_area.height > 0 {
+        draw_todo_band(frame, app, todo_area);
+    }
     draw_input(frame, app, input_area);
     if rail_area.height > 0 {
         draw_rail(frame, app, rail_area);
     }
     draw_status_bar(frame, app, status_area);
 
-    // Floating layers, back to front. Todos sit just above the composer (a
-    // few rows, full width) so the chat keeps its full width; suggestions
-    // stack on top when the user is typing a slash command.
+    // Floating layers: suggestions stack just above the composer when the
+    // user is typing a slash command. Todos no longer float — they own a
+    // layout slot above the input.
     if !overlay_open(app) {
-        if app.show_todos {
-            draw_todo_overlay(frame, app, input_area);
-        }
         draw_suggestions(frame, app, input_area);
     }
     if app.picker.is_some() {
@@ -142,9 +147,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// The rows a frame is laid out into, top to bottom: the transcript body, the
-/// composer, the subagent rail, and the status line. One place, so what [`draw`]
-/// paints and what anything else measures cannot drift apart.
-pub fn regions(app: &App, area: Rect) -> [Rect; 4] {
+/// optional todo band, the composer, the subagent rail, and the status line.
+/// One place, so what [`draw`] paints and what anything else measures cannot
+/// drift apart. Index 0 is always the transcript body (callers that only need
+/// that use `regions(...)[0]`).
+pub fn regions(app: &App, area: Rect) -> [Rect; 5] {
     // The composer grows with its content (hard line breaks plus soft-wrapped
     // continuations) up to MAX_INPUT_ROWS, then scrolls vertically. +2 for the
     // rules above/below.
@@ -154,13 +161,42 @@ pub fn regions(app: &App, area: Rect) -> [Rect; 4] {
     // The rail sits between the composer and the status bar: one row per
     // subagent, so the dots are always in the same place, right under the bar.
     let rail_rows = rail_height(app);
+    let todo_rows = todo_height(app, area.height, input_rows + 2, rail_rows);
     Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(todo_rows),
         Constraint::Length(input_rows + 2),
         Constraint::Length(rail_rows),
         Constraint::Length(1),
     ])
     .areas(area)
+}
+
+/// Rows reserved for the todo band (0 when hidden). Caps so a long list
+/// cannot swallow the transcript; leaves room for the composer, rail, status
+/// bar, and at least one row of chat.
+fn todo_height(app: &App, total_height: u16, input_rows: u16, rail_rows: u16) -> u16 {
+    if !app.show_todos {
+        return 0;
+    }
+    let item_rows = if app.todos.is_empty() {
+        1u16
+    } else {
+        app.todos.len() as u16
+    };
+    // +2 for the rounded border. Floor of 3 keeps the title + one item row.
+    let desired = (item_rows + 2).max(3);
+    // Keep at least 1 transcript row + composer + rail + status above the
+    // hard floor so chat never disappears under the band.
+    let reserved = 1u16
+        .saturating_add(input_rows)
+        .saturating_add(rail_rows)
+        .saturating_add(1);
+    let available = total_height.saturating_sub(reserved);
+    if available < 3 {
+        return 0;
+    }
+    desired.min(available).min(12)
 }
 
 /// Per-row spans `(y, start_x, end_x_exclusive)` a selection covers over a grid
@@ -781,32 +817,16 @@ fn tool_card_lines(
     }
 }
 
-/// Compact todo overlay just above the composer (`/todos`, auto-shown on
-/// the first todo update). A few rows tall, full input width — Claude Code
-/// style — so the chat keeps its full width instead of losing a side panel.
-/// Glyphs: ✓ completed (dim, struck-through), ▸ in progress (accent), ☐ pending.
-fn draw_todo_overlay(frame: &mut Frame, app: &App, input_area: Rect) {
-    let (done, total) = crate::tools::todo::progress(&app.todos);
-    let item_rows = if app.todos.is_empty() {
-        1u16
-    } else {
-        app.todos.len() as u16
-    };
-    // +2 for the rounded border. Cap so a long list can't swallow the chat;
-    // leave at least one row of transcript above when the terminal is tall.
-    let max_height = input_area.y.saturating_sub(1).clamp(3, 12);
-    let height = (item_rows + 2).clamp(3, max_height);
-    let area = Rect {
-        x: input_area.x,
-        y: input_area.y.saturating_sub(height),
-        width: input_area.width,
-        height,
-    }
-    .intersection(frame.area());
+/// Compact todo band just above the composer (`/todos`, auto-shown on the
+/// first todo update). A few rows tall, full input width — Claude Code style —
+/// reserved in the layout so the transcript shrinks above it instead of being
+/// painted over. Glyphs: ✓ completed (dim, struck-through), ▸ in progress
+/// (accent), ☐ pending.
+fn draw_todo_band(frame: &mut Frame, app: &App, area: Rect) {
     if area.height < 3 || area.width < 8 {
         return;
     }
-    frame.render_widget(Clear, area);
+    let (done, total) = crate::tools::todo::progress(&app.todos);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -826,7 +846,7 @@ fn draw_todo_overlay(frame: &mut Frame, app: &App, input_area: Rect) {
         vec![Line::from(Span::styled("(empty)", dim().italic()))]
     } else {
         // Prefer the in-progress item and its neighbors when the list is
-        // taller than the overlay: scroll so the current work stays visible.
+        // taller than the band: scroll so the current work stays visible.
         let focus = app
             .todos
             .iter()
@@ -4315,7 +4335,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_overlay_sits_above_the_composer_without_stealing_chat_width() {
+    fn todo_band_sits_above_the_composer_without_covering_chat() {
         use crate::tools::todo::{TodoItem, TodoStatus};
 
         let mut app = App::new(crate::config::Config::default());
@@ -4341,7 +4361,7 @@ mod tests {
         let joined = rows.join("\n");
         assert!(
             joined.contains("todos 1/3"),
-            "overlay title shows progress: {joined}"
+            "band title shows progress: {joined}"
         );
         assert!(
             joined.contains("working on this"),
@@ -4349,11 +4369,11 @@ mod tests {
         );
         assert!(
             rows.iter().any(|r| r.contains("full-width chat line")),
-            "transcript still shows under the overlay: {joined}"
+            "transcript still shows above the band: {joined}"
         );
         // Chat keeps full width: the diff sidebar uses a LEFT border on the
         // right 40%, so a pure todo-sidebar would leave an empty right column.
-        // With the overlay, the title/items span the full terminal width.
+        // With the band, the title/items span the full terminal width.
         let title = rows
             .iter()
             .find(|r| r.contains("todos 1/3"))
@@ -4362,7 +4382,33 @@ mod tests {
         let title_col = title.find("todos 1/3").expect("title text");
         assert!(
             title_col < 20,
-            "todo overlay is left-anchored above the input, not a right sidebar: col={title_col} row={title:?}"
+            "todo band is left-anchored above the input, not a right sidebar: col={title_col} row={title:?}"
+        );
+
+        // The band owns layout rows: chat text must appear *above* the todo
+        // title, never on the same rows (which would mean the panel covered it).
+        let chat_row = rows
+            .iter()
+            .position(|r| r.contains("full-width chat line"))
+            .expect("chat row");
+        let todo_row = rows
+            .iter()
+            .position(|r| r.contains("todos 1/3"))
+            .expect("todo title row");
+        assert!(
+            chat_row < todo_row,
+            "chat text must sit above the todo band (chat={chat_row}, todo={todo_row}): {joined}"
+        );
+
+        // And regions must reserve non-zero height for the band while chat
+        // still gets at least one row.
+        let [main, todo, input, _rail, _status] =
+            regions(&app, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert!(main.height >= 1, "transcript keeps a row");
+        assert!(todo.height >= 3, "todo band is reserved: {}", todo.height);
+        assert!(
+            todo.y + todo.height == input.y,
+            "todo band sits directly above the composer"
         );
     }
 

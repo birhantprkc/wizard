@@ -663,8 +663,9 @@ pub struct App {
     /// here so PgUp/PgDn can page a diff that's taller than the pane; the
     /// renderer clamps it to the content height.
     pub diff_scroll: u16,
-    /// Compact todo overlay above the composer (toggled by `/todos`;
-    /// auto-shown on the first todo update of the session).
+    /// Compact todo band above the composer (toggled by `/todos`;
+    /// auto-shown on the first todo update of the session). Reserves layout
+    /// rows so it never covers transcript text.
     pub show_todos: bool,
     /// The agent's current todo list, mirrored from
     /// [`AgentEvent::TodoUpdated`].
@@ -2546,7 +2547,7 @@ impl App {
                         self.show_diff = false;
                         self.diff_scroll = 0;
                     } else if self.show_todos {
-                        // Then the todo overlay (it auto-opens on the first
+                        // Then the todo band (it auto-opens on the first
                         // todo update, so it needs a way out that isn't
                         // `/todos`).
                         self.show_todos = false;
@@ -3323,7 +3324,7 @@ impl App {
                     self.show_diff = false;
                     self.diff_scroll = 0;
                 } else if self.show_todos {
-                    // Then the todo overlay (it auto-opens on the first todo
+                    // Then the todo band (it auto-opens on the first todo
                     // update, so it needs a way out that isn't `/todos`).
                     self.show_todos = false;
                 } else if !self.scroll_follow {
@@ -4919,7 +4920,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /login xai                  sign in with your xAI account (OAuth, no API key)\n  \
 /reload                     reload skills, scripted tools, and MCP servers\n  \
 /diff                       toggle the git diff sidebar\n  \
-/todos                      toggle the todo overlay above the input\n  \
+/todos                      toggle the todo list above the input\n  \
 /dashboard                  session manager: all live wizard sessions on this machine\n  \
 /cost                       show session token usage and cost\n  \
 /memory [read|forget <name>] list, show, or forget saved project memories\n  \
@@ -5903,7 +5904,7 @@ impl CommandContext<'_> {
         }
     }
 
-    /// `/todos`: toggle the compact todo overlay above the composer.
+    /// `/todos`: toggle the compact todo band above the composer.
     fn toggle_todos(&mut self) {
         self.app.show_todos = !self.app.show_todos;
         if self.app.show_todos && self.app.todos.is_empty() {
@@ -8392,9 +8393,9 @@ mod tests {
         let mut app = app();
         app.show_todos = true;
         press(&mut app, KeyCode::Esc);
-        assert!(!app.show_todos, "Esc dismisses the todo overlay");
+        assert!(!app.show_todos, "Esc dismisses the todo band");
 
-        // Diff sidebar and todo overlay are independent: Esc closes the
+        // Diff sidebar and todo band are independent: Esc closes the
         // diff first, then the overlay, then falls through to the input.
         app.show_todos = true;
         app.show_diff = true;
@@ -8415,7 +8416,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(
             !app.show_todos,
-            "Normal-mode Esc dismisses the todo overlay"
+            "Normal-mode Esc dismisses the todo band"
         );
     }
 

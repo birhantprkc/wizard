@@ -75,7 +75,7 @@ pub enum SlashCommand {
     Subagents,
     /// Toggle the git diff sidebar.
     Diff,
-    /// Toggle the compact todo overlay above the composer.
+    /// Toggle the compact todo band above the composer.
     Todos,
     /// Toggle the machine-wide session manager: every live Wizard session on
     /// the machine, grouped by state.
@@ -657,7 +657,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "todos",
         args: "",
-        description: "toggle the todo overlay above the input",
+        description: "toggle the todo list above the input",
         takes_args: false,
         gui: Execution::Client,
         agent_arg: "",
