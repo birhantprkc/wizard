@@ -143,6 +143,13 @@ pub struct ToolContext {
     /// agent queues one via `run_command`. Set by the surface's agent builder;
     /// [`CommandDispatch::None`] everywhere else.
     pub command_dispatch: CommandDispatch,
+    /// The agent's token counters, set by the agent at construction. Shared
+    /// (not owned) because the spend a tool delegates to a model is the
+    /// parent's spend: [`crate::agent::subagent::spawn`] records every
+    /// subagent model call here, so `/cost` and the status bar account for a
+    /// fan-out (`spawn_subagent`, every `/ultra` candidate and judge) instead
+    /// of reporting the main loop alone. `None` outside an agent.
+    pub usage: Option<Arc<crate::usage::UsageTracker>>,
 }
 
 impl ToolContext {
@@ -157,6 +164,7 @@ impl ToolContext {
             checkpoints: None,
             images: None,
             command_dispatch: CommandDispatch::None,
+            usage: None,
         }
     }
 
@@ -183,6 +191,13 @@ impl ToolContext {
     /// construction).
     pub fn with_images(mut self, store: Arc<crate::images::ImageStore>) -> Self {
         self.images = Some(store);
+        self
+    }
+
+    /// This context with the agent's token counters attached (agent
+    /// construction), so a tool that delegates to a model bills the parent.
+    pub fn with_usage(mut self, usage: Arc<crate::usage::UsageTracker>) -> Self {
+        self.usage = Some(usage);
         self
     }
 
