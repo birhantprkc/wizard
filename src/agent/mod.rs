@@ -1199,6 +1199,11 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::TODO_PROMPT);
         }
+        // Always teach context stewardship: auto-compaction + session JSONL
+        // are always on, and the agent should compact / reset deliberately
+        // rather than wait for the window to overflow.
+        prompt.push_str("\n\n");
+        prompt.push_str(prompts::CONTEXT_PROMPT);
         if self.plan_mode() {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::PLAN_MODE_PROMPT);
@@ -4472,6 +4477,24 @@ mod tests {
             !agent.history[0].content.contains("## Working todo list"),
             "no instruction without the tool"
         );
+    }
+
+    /// Context stewardship is always on: every agent needs to know how to
+    /// compact and reset on task change, whether or not `run_command` is in the
+    /// registry (headless still auto-compacts and can use subagents/memory).
+    #[test]
+    fn context_management_instruction_is_always_injected() {
+        let tmp = TempDir::new();
+        for registry in [ToolRegistry::with_native_tools(), ToolRegistry::new()] {
+            let (agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), registry);
+            assert!(
+                agent.history[0]
+                    .content
+                    .contains("## Context management (you own your window)"),
+                "context block missing from system prompt"
+            );
+            assert!(agent.history[0].content.contains("/compact"));
+        }
     }
 
     #[tokio::test]

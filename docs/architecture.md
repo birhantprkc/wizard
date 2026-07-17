@@ -137,6 +137,9 @@ When the active provider is llama.cpp and nothing answers at its `base_url`, Wiz
 A turn runs until the model stops calling tools. `max_steps = 0` (the default) puts no ceiling on that; a positive `max_steps` caps the round trips and ends the turn in `DoneReason::MaxSteps` when the budget is spent. Either way a turn is also bounded by a user interrupt or the sovereign loop-control file (`DoneReason::Stopped`), the `--max-hours` limit (`TimeLimit`), and the circuit breaker after repeated identical failures (`CircuitBreaker`).
 
 Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
+Auto-compaction and the agent's own `/compact` (via `run_command`) shrink the
+in-memory history while leaving the JSONL intact — prior conversation is always
+recoverable from disk. See [Agent-managed context](usage.md#agent-managed-context).
 
 ### Images
 

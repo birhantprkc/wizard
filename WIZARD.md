@@ -106,6 +106,35 @@ what's installed and what each one does, run `/agents`. If you keep needing a
 specialist that doesn't exist, that's a cue to climb the ladder and `evolve` one
 into `~/.wizard/subagents/`.
 
+## 2.6. Context management
+
+Your conversation history is finite. Wizard already persists every turn to
+`~/.wizard/sessions/<id>.jsonl` and auto-compacts older history when the byte
+or token threshold is hit — treat that as a safety net, not a plan. Steer the
+window yourself:
+
+1. **Stay lean every step.** Prefer short tool output. Delegate noisy multi-step
+   work to subagents so intermediate steps never enter your context.
+2. **Compact when the thread is still useful but bloated.** After a long
+   investigation, a finished sub-goal, or when older tool dumps drown the
+   current task, call `run_command` with `/compact`. That summarizes older
+   history into a progress note and keeps the recent tail verbatim. Prefer this
+   over asking the user to clear.
+3. **When the task changes, do not drag the old thread along.** Save durable
+   facts with the `memory` tool, rewrite the todo list for the new task, then
+   `/compact`. The full prior transcript remains on disk as the session JSONL.
+   Only if the new task must not see the old work at all, ask the user for
+   `/clear` (you cannot run it yourself) — it rotates to a fresh session file
+   and keeps the previous JSONL under `~/.wizard/sessions/`.
+4. **Do not re-read what compaction already summarized** unless you need a
+   specific detail; open the relevant file instead.
+5. **Check pressure.** `/status` reports the current context size on interactive
+   surfaces. Compact proactively before the automatic threshold if the next
+   steps need headroom.
+
+Headless / gateway / continuous runs still auto-compact; `run_command` is only
+available interactively, so there lean harder on lean tool output and subagents.
+
 ## 3. Self-ownership: fork, then distribute
 
 Wizard is built so a user can own their own evolved Wizard. When Wizard's own

@@ -54,7 +54,11 @@ The agent can run these same commands itself with the native `run_command`
 tool — it passes a command line exactly as you would type it (e.g.
 `/effort high`, `/model claude-sonnet-5`, `/compact`, `/reload`). So the agent
 can raise its own reasoning effort for a hard task, switch models, compact its
-context, or reload skills without you stepping in.
+context, or reload skills without you stepping in. Compaction is the main
+lever for agent-managed context: when a thread is bloated or the task changes,
+the agent is instructed to `/compact` (and save durable facts with `memory`)
+rather than wait for the automatic threshold. See
+[Agent-managed context](#agent-managed-context).
 
 Because a turn already in flight can't be reconfigured, a queued command runs
 the moment that turn finishes — effort, model, and mode changes therefore take
@@ -210,6 +214,26 @@ cannot overflow the window mid-turn. The most recent messages (including the
 in-flight turn's tool results) are always preserved verbatim, and the
 summary is instructed to carry over the todo list state and the plan file
 path (`.wizard/plan.md`).
+
+## Agent-managed context
+
+Wizard already persists every turn to `~/.wizard/sessions/<id>.jsonl` and
+auto-compacts as above. The agent is also taught — via a block in its system
+prompt — to steward that window deliberately instead of waiting for the
+threshold:
+
+| Situation | What the agent should do |
+|-----------|--------------------------|
+| Long investigation, finished sub-goal, or older tool dumps drowning the current task | `run_command` → `/compact` (summarizes older history into a progress note; recent tail stays verbatim) |
+| User pivots to an unrelated task | Save durable facts with `memory`, rewrite the todo list, then `/compact`. Full prior transcript remains on disk as the session JSONL |
+| New task must not see the old work at all | Ask the user for `/clear` (agent cannot run it). `/clear` rotates to a fresh session file; the previous JSONL is kept under `~/.wizard/sessions/` |
+| Noisy multi-step work | `spawn_subagent` so intermediate steps never enter the parent context — only the final report does |
+| Need a pressure check | `run_command` → `/status` (interactive surfaces) reports the current context size |
+
+`run_command` is only available on interactive surfaces (TUI / GUI). Headless
+`-p`, the gateway, and continuous mode still auto-compact; there the agent
+leans harder on lean tool output and subagents. Prefer compacting over asking
+the user to clear whenever the prior thread is still useful as a summary.
 
 ## Todo list
 

@@ -110,7 +110,10 @@ below keep it safe.
   restarting model server is waited out.
 - **Context compaction.** When the conversation grows past `compact_threshold_bytes`,
   older history is summarized into a compact progress note so a run can continue
-  indefinitely without overflowing the model's context window.
+  indefinitely without overflowing the model's context window. The agent is also
+  taught to compact deliberately (and to save durable facts with `memory` when the
+  task changes); every turn is already on disk as session JSONL under
+  `~/.wizard/sessions/`. See [Agent-managed context](usage.md#agent-managed-context).
 - **Self-evolution + re-exec.** When the agent calls `evolve` (adding a skill, MCP
   server, scripted tool, or subagent, or rebuilding its own binary with `deep`), the
   loop saves the mission, re-execs into the freshly built image to load the new

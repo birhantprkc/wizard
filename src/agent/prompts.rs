@@ -79,6 +79,52 @@ full list up front (action \"write\" replaces the entire list), keep exactly \
 one item in_progress while you work on it, and mark items completed as soon \
 as they are done. Skip the list for trivial single-step tasks.";
 
+/// Always appended: how the agent should steward its own context window.
+/// Wizard already auto-compacts, persists every session as JSONL, and exposes
+/// `/compact` via `run_command` — this block teaches the model *when* to lean
+/// on those, so long or multi-topic sessions do not drown in pollution.
+pub const CONTEXT_PROMPT: &str = "\
+## Context management (you own your window)
+
+Your conversation history is finite. Wizard already persists every turn to \
+`~/.wizard/sessions/<id>.jsonl` and auto-compacts older history when the \
+byte or token threshold is hit — treat that as a safety net, not a plan. \
+Steer the window yourself:
+
+1. **Stay lean every step.** Prefer short tool output (pipe through \
+`head`/`tail`/`wc`, write bulky data to a file and summarize). Delegate \
+noisy multi-step work to `spawn_subagent` so intermediate steps never enter \
+your context — only the final report does.
+2. **Compact when the thread is still useful but bloated.** After a long \
+investigation, a finished sub-goal, or when older tool dumps are drowning \
+the current task, call `run_command` with `/compact`. That summarizes older \
+history into a progress note (goal, decisions, files touched, open next \
+steps, todo state) and keeps the recent tail verbatim. Prefer this over \
+asking the user to clear.
+3. **When the task changes, do not drag the old thread along.** If the user \
+pivots to an unrelated task, or you are done with a self-contained unit of \
+work and the next one needs a clean slate:
+   - Save any durable facts with the `memory` tool (preferences, project \
+constraints, standing decisions) — only what should survive sessions.
+   - Rewrite the todo list for the new task (or clear it to empty).
+   - Call `/compact` so the prior conversation collapses into one progress \
+summary. The full prior transcript remains on disk as the session JSONL; \
+nothing is lost.
+   - Only if the new task must not see the old work at all, tell the user \
+that `/clear` rotates to a fresh session file (the previous JSONL is kept \
+under `~/.wizard/sessions/`). You cannot run `/clear` yourself — it is the \
+user's call — so compact + memory is your default reset.
+4. **Do not re-read what compaction already summarized** unless you need a \
+specific detail; open the relevant file or the session JSONL instead of \
+replaying the whole investigation.
+5. **Check pressure.** `/status` (via `run_command` on interactive surfaces) \
+reports the current context size. Compact proactively before the automatic \
+threshold if the next steps need headroom.
+
+Headless / gateway / continuous runs still auto-compact; `run_command` is \
+only available on interactive surfaces, so there lean harder on lean tool \
+output and subagents.";
+
 /// Memory guidance injected when the project has saved memories; the rules
 /// and then the index (MEMORY.md) follow it.
 const MEMORY_PROMPT_WITH_INDEX: &str = "\
@@ -352,5 +398,19 @@ mod tests {
             assert!(prompt.contains("Never save what the repo already records"));
             assert!(prompt.contains("update it (save over its name)"));
         }
+    }
+
+    /// The context-management block is a free-standing constant the agent loop
+    /// appends after the composed base prompt. Sanity-check the guidance that
+    /// models actually need is present, so a rewrite cannot silently drop it.
+    #[test]
+    fn context_prompt_teaches_compact_and_task_change_hygiene() {
+        let text = CONTEXT_PROMPT;
+        assert!(text.contains("## Context management"));
+        assert!(text.contains("/compact"));
+        assert!(text.contains("~/.wizard/sessions/"));
+        assert!(text.contains("When the task changes"));
+        assert!(text.contains("spawn_subagent"));
+        assert!(text.contains("memory"));
     }
 }
