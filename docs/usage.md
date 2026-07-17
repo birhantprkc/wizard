@@ -37,6 +37,7 @@ inline hints.
 | `/doctor` | Environment diagnostics, same checks as `wizard doctor` ([doctor.md](doctor.md)) |
 | `/provider …` | Add, remove, or switch LLM providers; no arguments opens the interactive menu |
 | `/fusion [config]` | Toggle model fusion, or configure the panel ([fusion.md](fusion.md)) |
+| `/ultra [config]` | Toggle mixture of agents, or configure the roster ([ultra.md](ultra.md)) |
 | `/server [status\|start\|stop]` | Manage the local llama-server |
 | `/login <provider>` | OAuth sign-in for providers that support it (currently `xai`) |
 | `/publish [branch]` | Fork Wizard to your GitHub and get a one-line installer ([market.md](market.md)) |

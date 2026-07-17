@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, Mode, ProviderKind, ReasoningEffort};
+use crate::config::{Config, Mode, ProviderKind, ReasoningEffort, UltraConfig};
 use crate::import_claude::ImportSelection;
 
 /* ---------------------------------------------------------------------- */
@@ -104,6 +104,10 @@ pub enum SlashCommand {
     /// `/fusion [config]` — toggle model fusion (a panel of providers debate
     /// then a synthesizer answers), or open the panel configurator.
     Fusion(FusionAction),
+    /// `/ultra [config]` — toggle mixture of agents (N read-only subagents draft
+    /// the turn on the *active* model, a judge compares the drafts, and the main
+    /// agent executes from the verdict), or open the roster editor.
+    Ultra(UltraAction),
     /// `/provider ...` — add, remove, or switch LLM providers.
     Provider(ProviderAction),
     /// Finalize an interactive provider setup: add the provider (storing the
@@ -140,6 +144,20 @@ pub enum FusionAction {
     Toggle,
     /// `/fusion config` — open the panel/synthesizer configurator.
     Config,
+}
+
+/// What an `/ultra` subcommand does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UltraAction {
+    /// `/ultra` (no args) — toggle mixture-of-agents mode on/off.
+    Toggle,
+    /// `/ultra config` — open the lens/judge roster editor.
+    Config,
+    /// Save the roster chosen at that editor. Not a typed command: the picker
+    /// emits it on Enter, which is why it carries the whole [`UltraConfig`]
+    /// rather than a name. Every field of it is `Eq`, so `SlashCommand` stays
+    /// `Eq`.
+    Apply(UltraConfig),
 }
 
 /// What a `/provider` subcommand does.
@@ -358,6 +376,13 @@ impl SlashCommand {
                     "unknown /fusion subcommand '{other}' — use /fusion or /fusion config"
                 )),
             },
+            "ultra" => match args.first().copied() {
+                None => Ok(Self::Ultra(UltraAction::Toggle)),
+                Some("config") => Ok(Self::Ultra(UltraAction::Config)),
+                Some(other) => Err(format!(
+                    "unknown /ultra subcommand '{other}' — use /ultra or /ultra config"
+                )),
+            },
             "server" => parse_server(&args),
             "login" => match args.first() {
                 Some(provider) => Ok(Self::Login((*provider).to_string())),
@@ -405,7 +430,8 @@ impl SlashCommand {
             | Settings
             | Vim
             | Help
-            | Fusion(FusionAction::Toggle) => Ok(()),
+            | Fusion(FusionAction::Toggle)
+            | Ultra(UltraAction::Toggle) => Ok(()),
 
             // Interactive pickers: there is no human at the keyboard mid-turn,
             // so require the argument that names the choice directly.
@@ -414,6 +440,9 @@ impl SlashCommand {
             Effort(None) => Err("name a level, e.g. `/effort high`".into()),
             Fusion(FusionAction::Config) => {
                 Err("`/fusion config` opens an interactive editor; use `/fusion` to toggle".into())
+            }
+            Ultra(UltraAction::Config | UltraAction::Apply(_)) => {
+                Err("`/ultra config` opens an interactive editor; use `/ultra` to toggle".into())
             }
             Agents => Err(
                 "`/agents` opens a picker for the user; spawn subagents with the spawn tool".into(),
@@ -626,6 +655,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "fusion",
         args: "[config]",
         description: "toggle model fusion, or configure the panel",
+        takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "ultra",
+        args: "[config]",
+        description: "toggle mixture of agents, or configure the roster",
         takes_args: false,
         gui: Execution::Server,
         agent_arg: "",

@@ -23,7 +23,7 @@ use crate::agent::session::Session;
 use crate::agent::{
     Agent, AgentEvent, CancelHandle, DoneReason, PlanVerdict, build_headless_agent_for_session,
 };
-use crate::commands::{Execution, FusionAction, ServerAction, SlashCommand};
+use crate::commands::{Execution, FusionAction, ServerAction, SlashCommand, UltraAction};
 use crate::config::{Config, Mode, ProviderKind};
 use crate::gui::settings::ConfigStore;
 use crate::gui::transcript::summarize_tool;
@@ -863,6 +863,12 @@ impl TaskShared {
             AgentEvent::OmakaseProceeding { plan } => self.push(Frame::Notice {
                 text: format!("omakase — executing the agent's own plan:\n\n{plan}"),
             }),
+            // The `/ultra` pre-phase's drafts and verdict. The GUI has no
+            // collapsed transcript card, so the durable copy of the fan-out
+            // the user paid several× a normal turn for is a notice frame.
+            AgentEvent::UltraGuidance { label, guidance } => self.push(Frame::Notice {
+                text: format!("{label}\n\n{guidance}"),
+            }),
             AgentEvent::TaskStarted { id, command } => self.push(Frame::TaskEvent {
                 phase: "started",
                 label: format!("#{id} {command}"),
@@ -1677,6 +1683,12 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
             "`/fusion config` is a TUI picker; set the panel under [fusion] in \
              ~/.wizard/config.toml, then /fusion to turn it on",
         ),
+        SlashCommand::Ultra(UltraAction::Toggle) => toggle_ultra(agent, ctx),
+        SlashCommand::Ultra(UltraAction::Config | UltraAction::Apply(_)) => error(
+            shared,
+            "`/ultra config` is a TUI picker; set the roster under [ultra] in \
+             ~/.wizard/config.toml, then /ultra to turn it on",
+        ),
         SlashCommand::Server(action) => server_command(action, ctx.config, shared).await,
         SlashCommand::Evolve { deep, description } => {
             evolve(deep, description, ctx.config, shared).await
@@ -2060,6 +2072,44 @@ async fn toggle_fusion(agent: &mut Agent, ctx: &mut CommandCtx<'_>) {
     }
     *ctx.fusion = !*ctx.fusion;
     notice(shared, label);
+}
+
+/// Toggle `/ultra`: mixture of agents. Where `/fusion` swaps the client and
+/// therefore rebuilds against it, ultra changes nothing about *which* model
+/// answers — the candidates fan out over the client and model already active.
+/// So this is a plain flag on the live agent: no rebuild, no session reset,
+/// and the conversation in front of the user survives the toggle.
+fn toggle_ultra(agent: &mut Agent, ctx: &mut CommandCtx<'_>) {
+    let shared = ctx.shared;
+    if agent.ultra() {
+        agent.set_ultra(None);
+        return notice(shared, "ultra off — one agent per turn again, no pre-phase");
+    }
+    if *ctx.fusion {
+        return notice(
+            shared,
+            "ultra cannot run on top of fusion — every candidate would re-run the whole panel; \
+             /fusion to turn fusion off first",
+        );
+    }
+    // `build_ultra` is the sole validation gate for `[ultra]`, so a roster the
+    // user hand-edited into an unusable state surfaces here, at the toggle,
+    // instead of at the top of their next turn.
+    match ctx.config.build_ultra() {
+        Ok(engine) => {
+            let engine = Arc::new(engine);
+            let label = engine.label();
+            agent.set_ultra(Some(engine));
+            notice(
+                shared,
+                format!(
+                    "{label} — each turn now drafts on the active model, compares, then acts; \
+                     /ultra to turn off"
+                ),
+            );
+        }
+        Err(err) => error(shared, format!("could not start ultra: {err:#}")),
+    }
 }
 
 /// `/server [status|start|stop]`: the local llama-server's lifecycle. It is a
