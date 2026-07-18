@@ -199,7 +199,8 @@ empty file falls back to that default.
   Bundle skills shadow bundled and user skills by name; new directories add
   new skills.
 - `subagents/<name>.toml` — spawnable subagent definitions (`name`,
-  `description`, `system_prompt`, optional `tool_scope`, `max_steps`).
+  `description`, `system_prompt`, optional `tool_scope`; optional `max_steps`
+  only if you want a hard cap — default is unlimited).
   Bundle definitions shadow user-defined and built-in ones by name.
 
 ## Editing rules for evolution loops

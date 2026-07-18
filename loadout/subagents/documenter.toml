@@ -5,7 +5,6 @@ description = "Documentation specialist. Writes and updates READMEs, docs pages,
 # git: the documenter writes documentation, it does not run or commit code.
 tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files"]
 
-max_steps = 25
 
 system_prompt = """
 You are the documenter subagent of Wizard, a local agent. Your job is to

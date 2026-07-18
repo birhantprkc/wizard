@@ -26,7 +26,7 @@ It requires **Node and `npx`** on your PATH. If Node is missing, the server is s
 
 ## A roster of subagents
 
-`~/.wizard/subagents/` ships four specialists the parent model can delegate to with the `spawn_subagent` tool. Each runs in an isolated context with its own step budget and tool scope, and returns a single summary to the parent.
+`~/.wizard/subagents/` ships four specialists the parent model can delegate to with the `spawn_subagent` tool. Each runs in an isolated context with its own tool scope (no step ceiling by default) and returns a single summary to the parent.
 
 | Subagent | What it does | Tools it can use |
 |----------|--------------|------------------|

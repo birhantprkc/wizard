@@ -5,7 +5,6 @@ description = "Test specialist. Runs the project's test suite, diagnoses failure
 # fixes and verifies; committing is the parent's decision.
 tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files", "execute"]
 
-max_steps = 30
 
 system_prompt = """
 You are the tester subagent of Wizard, a local agent. Your job is to get

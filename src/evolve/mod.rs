@@ -230,8 +230,8 @@ or, for a remote server:
 3. "scripted_tool" — a small executable script exposed as a tool. The tool's arguments arrive as a single JSON string in argv[1]; the script prints its result to stdout:
 {"channel":"scripted_tool","name":"snake_case_name","description":"what it does","interpreter":"bash","script_name":"snake_case_name.sh","script_content":"#!/usr/bin/env bash\n...","parameters":{"type":"object","properties":{"arg":{"type":"string","description":"..."}},"required":["arg"]},"timeout_secs":120}
 
-4. "subagent" — a named, reusable sub-worker with its own prompt, tool scope, and step budget:
-{"channel":"subagent","name":"reviewer","description":"what it is for","system_prompt":"You are ...","tool_scope":["read_file","search_files","git_diff"],"max_steps":15}
+4. "subagent" — a named, reusable sub-worker with its own prompt and tool scope (no step ceiling by default; optional positive `max_steps` caps it):
+{"channel":"subagent","name":"reviewer","description":"what it is for","system_prompt":"You are ...","tool_scope":["read_file","search_files","git_diff"]}
 
 Native tool names available for "tool_scope": read_file, write_file, edit_file, list_files, search_files, execute, git_status, git_diff. Omit "tool_scope" (or use null) to grant the full set.
 
@@ -504,7 +504,7 @@ impl Evolver {
             description: proposal.description,
             system_prompt: proposal.system_prompt,
             tool_scope: proposal.tool_scope,
-            max_steps: StepBudget::new(proposal.max_steps.unwrap_or(15)),
+            max_steps: StepBudget::new(proposal.max_steps.unwrap_or(0)),
         };
         let dir = Config::wizard_dir()?.join("subagents");
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

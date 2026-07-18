@@ -1,8 +1,10 @@
 //! Subagents: isolated sub-contexts for parallel or decomposed work.
 //!
-//! Each subagent gets its own message history, step budget, and tool scope.
-//! The result returns to the parent as a single tool result, so a multi-step
-//! sub-task costs the parent one turn of context.
+//! Each subagent gets its own message history and tool scope. By default a
+//! sub-loop has no step ceiling (same as the parent turn); an optional
+//! `max_steps` on the definition can still cap a specialist. The result
+//! returns to the parent as a single tool result, so a multi-step sub-task
+//! costs the parent one turn of context.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -68,16 +70,17 @@ pub struct SubagentConfig {
     /// Tool names this subagent may call. `None` = the parent's full set.
     #[serde(default)]
     pub tool_scope: Option<Vec<String>>,
-    /// Step budget for the sub-loop. Unlike the parent turn, a subagent runs
-    /// with nobody watching it, so it keeps a finite default; set `0` for a
-    /// subagent that should run to completion however long that takes.
+    /// Optional step ceiling for the sub-loop. Defaults to unlimited (`0`) —
+    /// the subagent runs until it finishes, the parent kills it, or a hard
+    /// error stops it. Set a positive number only when a specialist should
+    /// be hard-capped.
     #[serde(default = "SubagentConfig::default_max_steps")]
     pub max_steps: StepBudget,
 }
 
 impl SubagentConfig {
     fn default_max_steps() -> StepBudget {
-        StepBudget::new(15)
+        StepBudget::UNLIMITED
     }
 }
 
@@ -88,7 +91,7 @@ pub struct SubagentResult {
     /// The subagent's final answer text.
     pub output: String,
     pub steps_used: u32,
-    /// False when the sub-loop hit its step budget or errored out.
+    /// False when the sub-loop hit an optional step budget or errored out.
     pub completed: bool,
 }
 
@@ -294,7 +297,7 @@ async fn record_usage(ctx: &ToolContext, progress: Option<&Progress>, step: &Ste
 type Progress = tokio::sync::mpsc::Sender<crate::agent::AgentEvent>;
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
-/// scoped registry, own step budget. The parent's lifecycle `hooks` apply to
+/// scoped registry, optional step budget. The parent's lifecycle `hooks` apply to
 /// the subagent's tool calls too.
 ///
 /// The subagent reports back to the parent model as one tool result, but its
@@ -1432,8 +1435,8 @@ mod tests {
         assert_eq!(configs[0].name, "helper");
         assert_eq!(
             configs[0].max_steps,
-            crate::config::StepBudget::new(15),
-            "an omitted budget gets the default"
+            crate::config::StepBudget::UNLIMITED,
+            "an omitted budget is unlimited"
         );
     }
 

@@ -1912,7 +1912,7 @@ fn agents_report() -> String {
             Some(names) => names.join(", "),
         };
         text.push_str(&format!(
-            "  {} — {} · {scope} · {} steps\n",
+            "  {} — {} · {scope} · {}\n",
             config.name, config.description, config.max_steps
         ));
     }

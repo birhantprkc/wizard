@@ -375,7 +375,7 @@ the parent turn is blocked on it. Tool calls pair by `call_id` within their run,
 `summary` is built exactly like the parent's tool cards'.
 
 `subagent_run_done` distinguishes the three endings: `completed: true` (it reported back),
-`completed: false` with `error: null` (it spent its step budget), and `error` set (it died).
+`completed: false` with `error: null` (it hit an optional step budget, if one was set), and `error` set (it died).
 `output` is its final report — the step that made no tool call, which therefore never
 streamed as a `subagent_run_text`.
 

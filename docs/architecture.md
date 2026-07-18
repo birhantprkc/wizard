@@ -190,7 +190,7 @@ Wizard is both an MCP client and an MCP server:
 
 Isolated workers for parallel or decomposed work:
 
-- Each subagent gets its own history, step budget, and tool scope
+- Each subagent gets its own history and tool scope (no step ceiling by default)
 - Results return to the parent as one tool result
 - `spawn_subagent` can detach (`background: true`); the report lands when finished
 - Runs emit `SubagentRun*` events; the TUI demuxes them onto the [subagent rail](usage.md#the-subagent-rail)

@@ -1255,7 +1255,6 @@ description = "Code-review specialist. Reads a diff or set of files and reports 
 # Read/search/git tools only — the reviewer inspects, it does not change code.
 tool_scope = ["read_file", "list_files", "search_files", "git_status", "git_diff"]
 
-max_steps = 20
 
 system_prompt = """
 You are the reviewer subagent of Wizard, a local agent. Your one job is
@@ -1294,7 +1293,6 @@ description = "Web research specialist. Uses the Playwright browser (MCP) to rea
 # the Playwright browser MCP tools (navigate / click / type / snapshot) shipped
 # in mcp.toml. Without scope it can reach those browser tools.
 
-max_steps = 25
 
 system_prompt = """
 You are the researcher subagent of Wizard, a local agent. Your job is to
@@ -1331,7 +1329,6 @@ description = "Test specialist. Runs the project's test suite, diagnoses failure
 # fixes and verifies; committing is the parent's decision.
 tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files", "execute"]
 
-max_steps = 30
 
 system_prompt = """
 You are the tester subagent of Wizard, a local agent. Your job is to get
@@ -1370,7 +1367,6 @@ description = "Documentation specialist. Writes and updates READMEs, docs pages,
 # git: the documenter writes documentation, it does not run or commit code.
 tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_files"]
 
-max_steps = 25
 
 system_prompt = """
 You are the documenter subagent of Wizard, a local agent. Your job is to

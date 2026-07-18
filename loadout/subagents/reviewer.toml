@@ -4,7 +4,6 @@ description = "Code-review specialist. Reads a diff or set of files and reports 
 # Read/search/git tools only — the reviewer inspects, it does not change code.
 tool_scope = ["read_file", "list_files", "search_files", "git_status", "git_diff"]
 
-max_steps = 20
 
 system_prompt = """
 You are the reviewer subagent of Wizard, a local agent. Your one job is

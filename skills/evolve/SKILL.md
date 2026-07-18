@@ -87,7 +87,7 @@ name = "reviewer"
 description = "Audits diffs for security issues"
 system_prompt = "You are a security reviewer. Examine the diff for injection, authz, and secret-handling flaws. Report findings with file:line."
 # tool_scope = ["read_file", "search_files", "git_diff"]  # omit = all tools
-max_steps = 15
+# max_steps = 0  # default: unlimited; set a positive number only to hard-cap
 ```
 
 Keep `tool_scope` as narrow as the job allows; subagents run with

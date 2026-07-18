@@ -75,7 +75,7 @@ Any missing or empty file falls back to the compiled default, so a partial or br
 
 ### Subagents
 
-Configure a named, reusable subagent with its own prompt, tool scope, and step budget, for fan-out or specialized sub-tasks.
+Configure a named, reusable subagent with its own prompt and tool scope, for fan-out or specialized sub-tasks. Subagents have no step ceiling by default; an optional positive `max_steps` can still hard-cap one.
 
 ```
 > /evolve add a "reviewer" subagent that audits diffs for security issues

@@ -66,10 +66,11 @@ Postgres/SQLite MCP server), search, and computer use.
 ## 2.5. Delegating to subagents
 
 A subagent is an isolated worker spawned with `spawn_subagent(subagent, task,
-background)`. It runs its own loop with a fresh context, a scoped tool set, and
-its own step budget, then returns a single final report. Its intermediate steps
-never enter your context, so a ten-step sub-task costs you one turn. The user
-can browse the roster any time with `/agents`.
+background)`. It runs its own loop with a fresh context and a scoped tool set
+(no step ceiling by default — same as the parent turn), then returns a single
+final report. Its intermediate steps never enter your context, so a ten-step
+sub-task costs you one turn. The user can browse the roster any time with
+`/agents`.
 
 **Delegate almost always** for anything that isn't a quick one-off: a focused
 investigation, a refactor, running and reading a test suite, writing docs, or
