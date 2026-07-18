@@ -61,9 +61,9 @@ const FONTS: [FontAsset; 2] = [
     },
 ];
 
-/// The GUI's five assets, embedded at compile time so the binary stays
+/// The GUI's assets, embedded at compile time so the binary stays
 /// self-contained.
-const ASSETS: [Asset; 5] = [
+const ASSETS: [Asset; 15] = [
     Asset {
         name: "index.html",
         mime: "text/html; charset=utf-8",
@@ -89,6 +89,56 @@ const ASSETS: [Asset; 5] = [
         mime: "text/javascript; charset=utf-8",
         body: include_str!("../../gui/assets/icons.js"),
     },
+    Asset {
+        name: "dom.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/dom.js"),
+    },
+    Asset {
+        name: "markdown.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/markdown.js"),
+    },
+    Asset {
+        name: "transcript.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/transcript.js"),
+    },
+    Asset {
+        name: "pane.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/pane.js"),
+    },
+    Asset {
+        name: "context.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/context.js"),
+    },
+    Asset {
+        name: "subagents.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/subagents.js"),
+    },
+    Asset {
+        name: "attach.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/attach.js"),
+    },
+    Asset {
+        name: "palette.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/palette.js"),
+    },
+    Asset {
+        name: "composer.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/composer.js"),
+    },
+    Asset {
+        name: "settings.js",
+        mime: "text/javascript; charset=utf-8",
+        body: include_str!("../../gui/assets/settings.js"),
+    },
 ];
 
 /// The favicon, served at `/favicon.ico` for clients that probe the classic
@@ -105,6 +155,16 @@ pub(crate) fn router(state: Arc<GuiState>) -> Router {
         .route("/app.js", get(serve_asset))
         .route("/api.js", get(serve_asset))
         .route("/icons.js", get(serve_asset))
+        .route("/dom.js", get(serve_asset))
+        .route("/markdown.js", get(serve_asset))
+        .route("/transcript.js", get(serve_asset))
+        .route("/pane.js", get(serve_asset))
+        .route("/context.js", get(serve_asset))
+        .route("/subagents.js", get(serve_asset))
+        .route("/attach.js", get(serve_asset))
+        .route("/palette.js", get(serve_asset))
+        .route("/composer.js", get(serve_asset))
+        .route("/settings.js", get(serve_asset))
         .route("/fonts/{name}", get(serve_font))
         .route("/favicon.ico", get(favicon))
         .route("/api/tasks", get(list_tasks).post(create_task))

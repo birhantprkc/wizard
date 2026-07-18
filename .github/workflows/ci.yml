@@ -20,16 +20,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Needs only the checkout, so it runs before toolchain setup.
+      - name: File-size ratchet
+        run: contrib/check-file-size.sh
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
+      # Prebuilt binary — no cargo-install-from-source in CI.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
       # Steps ordered cheapest-first so failures surface fast:
-      # fmt -> clippy -> test -> release build.
+      # machete -> fmt -> clippy -> test -> release build.
       # --locked makes Cargo.lock drift a hard failure instead of a
       # silent re-resolve.
+      - name: Unused dependencies
+        run: cargo machete
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -75,10 +87,10 @@ jobs:
         run: cargo check --locked --features desktop
 
   shellcheck:
-    name: Shellcheck installers
+    name: Shellcheck scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: shellcheck
-        run: shellcheck install.sh install-byom.sh
+        run: shellcheck install.sh install-byom.sh contrib/check-file-size.sh

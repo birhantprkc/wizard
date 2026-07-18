@@ -43,7 +43,7 @@ wizard/
 │   ├── main.rs / lib.rs     # entry, surface dispatch
 │   ├── cli.rs               # clap argument parsing
 │   ├── config.rs            # ~/.wizard/config.toml
-│   ├── app.rs / ui.rs / event.rs / vim.rs
+│   ├── app/ / ui.rs / event.rs / vim.rs
 │   ├── agent/               # tool-calling loop, prompts, subagents, mission, ultra
 │   ├── server.rs            # llama-server lifecycle
 │   ├── llm/                 # LlmProvider + per-vendor clients (incl. fusion, oauth)
@@ -129,7 +129,7 @@ Streaming tokens, native tool calls, and a prompt-based JSON fallback when the m
 
 When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself (TUI/headless/gateway startup and after `/provider use` switches to llamacpp). Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group, logs to `~/.wizard/llama-server.log`, and records its PID in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s. `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling.
 
-### Agent loop (`agent/mod.rs`)
+### Agent loop (`agent/turn.rs`)
 
 ```
 ┌─────────────────────────────────────────┐
@@ -219,7 +219,7 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 
 ### Surfaces
 
-- **TUI** (`app.rs`, `ui.rs`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
+- **TUI** (`app/`, `ui.rs`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
 - **Headless** (`agent` + `output.rs`): text / JSON / stream-json ([headless.md](headless.md))
 - **GUI / app** (`gui/`, `desktop.rs`): same agent core over HTTP/WS; system webview for `wizard app` ([desktop.md](desktop.md))
 - **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md))
