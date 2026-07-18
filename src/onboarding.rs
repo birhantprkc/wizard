@@ -331,7 +331,10 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             "BYOM — llama.cpp",
             "bring your own model: any GGUF, your server URL",
         ),
-        Opt::new("BYOM — Ollama", "bring your own model: any Ollama tag"),
+        Opt::new(
+            "BYOM — Ollama",
+            "bring your own model: any Ollama tag, pulled on first run",
+        ),
     ];
     let provider = match select(
         terminal,
@@ -917,17 +920,37 @@ fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     }))
 }
 
-fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
-    let (suggested, explanation) = hardware::suggest_model();
-    let mut models: Vec<(String, String)> = vec![(
-        suggested.clone(),
-        "recommended for this machine".to_string(),
-    )];
+/// Model rows for the BYOM — Ollama picker: models already pulled first (a
+/// model created with `ollama create` shows up here), then the
+/// hardware-suggested tier and the remaining known tiers, which Wizard pulls
+/// on first run when missing.
+fn ollama_model_options(installed: &[String], suggested: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for tag in installed {
+        let detail = if tag == suggested {
+            "already pulled — recommended for this machine"
+        } else {
+            "already pulled"
+        };
+        rows.push((tag.clone(), detail.to_string()));
+    }
+    if !installed.iter().any(|tag| tag == suggested) {
+        rows.push((
+            suggested.to_string(),
+            "recommended for this machine — pulled on first run".to_string(),
+        ));
+    }
     for tier in OLLAMA_TIERS {
-        if *tier != suggested {
-            models.push(((*tier).to_string(), String::new()));
+        if *tier != suggested && !installed.iter().any(|tag| tag == tier) {
+            rows.push(((*tier).to_string(), "pulled on first run".to_string()));
         }
     }
+    rows
+}
+
+fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let (suggested, explanation) = hardware::suggest_model();
+    let models = ollama_model_options(&installed_ollama_models(), &suggested);
     let model = match pick_model(terminal, &explanation, &models, &suggested)? {
         Some(model) => model,
         None => return Ok(None),
@@ -1280,7 +1303,14 @@ fn print_summary(config: &Config) {
             }
         },
         ProviderKind::Ollama => {
-            println!("  • pull the model:  ollama pull {}", provider.model);
+            if crate::llm::ollama::model_installed(&provider.model, &installed_ollama_models()) {
+                println!("  • model already pulled: {}", provider.model);
+            } else {
+                println!(
+                    "  • first run pulls the model for you (model: {})",
+                    provider.model
+                );
+            }
         }
         ProviderKind::Openai
         | ProviderKind::Anthropic
@@ -2121,5 +2151,49 @@ mod tests {
                 gguf_path: "/m/big.gguf".to_string()
             }
         );
+    }
+
+    #[test]
+    fn ollama_picker_lists_installed_models_first() {
+        let installed = vec!["my-coder:latest".to_string(), "qwen3.5:9b".to_string()];
+        let rows = ollama_model_options(&installed, "qwen3.6:27b");
+        let tags: Vec<&str> = rows.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "my-coder:latest",
+                "qwen3.5:9b",
+                "qwen3.6:27b",
+                "qwen3.6:35b"
+            ]
+        );
+        assert_eq!(rows[0].1, "already pulled");
+        assert!(rows[2].1.contains("recommended"));
+        assert!(rows[2].1.contains("pulled on first run"));
+        assert_eq!(rows[3].1, "pulled on first run");
+    }
+
+    #[test]
+    fn ollama_picker_marks_an_installed_suggestion_without_repeating_it() {
+        let rows = ollama_model_options(&["qwen3.6:27b".to_string()], "qwen3.6:27b");
+        assert_eq!(rows[0].0, "qwen3.6:27b");
+        assert!(rows[0].1.contains("already pulled"));
+        assert!(rows[0].1.contains("recommended"));
+        assert_eq!(
+            rows.iter().filter(|(tag, _)| tag == "qwen3.6:27b").count(),
+            1,
+            "the suggestion must not reappear as a download row"
+        );
+    }
+
+    #[test]
+    fn ollama_picker_with_nothing_installed_leads_with_the_suggestion() {
+        let rows = ollama_model_options(&[], "qwen3.5:9b");
+        assert_eq!(rows[0].0, "qwen3.5:9b");
+        assert!(rows[0].1.contains("recommended"));
+        assert!(rows.iter().all(|(_, detail)| detail.contains("first run")));
+        // Every known tier is offered exactly once.
+        let tags: Vec<&str> = rows.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert_eq!(tags, vec!["qwen3.5:9b", "qwen3.6:35b", "qwen3.6:27b"]);
     }
 }

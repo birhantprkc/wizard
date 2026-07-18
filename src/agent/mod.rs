@@ -2399,6 +2399,18 @@ async fn build_headless_agent_inner(
         wait.finish(outcome.is_ok());
         outcome?;
     }
+    // Ollama's analog: a configured tag that is not pulled yet is pulled now
+    // (loopback hosts only — never download onto a remote server).
+    if active.kind == ProviderKind::Ollama && crate::server::local_port(&active.base_url).is_some()
+    {
+        let wait =
+            crate::progress::ServerSpinner::start_with("Checking the local model…", "model ready");
+        let outcome = crate::llm::ollama::OllamaClient::new(active.base_url.clone())
+            .ensure_model(&model, &wait)
+            .await;
+        wait.finish(outcome.is_ok());
+        outcome?;
+    }
     client
         .health()
         .await
