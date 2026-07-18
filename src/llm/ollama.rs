@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use super::provider::LlmProvider;
 use super::{ChatChunk, ChatOptions, ChatRequest, ProviderError};
+use crate::server::{ByteProgress, Progress};
 
 /// Boxed NDJSON chunk stream returned by [`OllamaClient::chat_stream`].
 /// Re-exported from [`crate::llm`] so existing `ollama::ChatStream` paths
@@ -265,6 +266,68 @@ impl OllamaClient {
         context_length_from_model_info(info.model_info.as_ref()?)
     }
 
+    /// Make sure `model` is available locally: a no-op when `/api/tags`
+    /// already lists it (a bare `name` counts as `name:latest`), otherwise
+    /// pull it with [`OllamaClient::pull_model`]. The setup paths call this
+    /// so a freshly onboarded tag materializes on first run, mirroring how a
+    /// missing GGUF is downloaded for llama.cpp.
+    pub async fn ensure_model(&self, model: &str, progress: &dyn Progress) -> Result<()> {
+        let installed = self.list_models().await?;
+        if model_installed(model, &installed) {
+            return Ok(());
+        }
+        self.pull_model(model, progress).await
+    }
+
+    /// Pull `model` through Ollama's native streaming API (`POST /api/pull`,
+    /// NDJSON progress lines), rendering layer downloads as byte-counted
+    /// bars. Fails on transport errors, non-success statuses, and in-band
+    /// `{"error": ...}` lines (e.g. an unknown tag). Interrupted pulls
+    /// resume server-side on the next attempt.
+    pub async fn pull_model(&self, model: &str, progress: &dyn Progress) -> Result<()> {
+        progress.status(&format!(
+            "model '{model}' is not pulled yet — pulling it now (one-time)…"
+        ));
+        let response = self
+            .http
+            .post(self.url("/api/pull"))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|e| self.transport_error(e))?;
+        if !response.status().is_success() {
+            return Err(self.status_error(response, Some(model)).await);
+        }
+
+        let mut render = PullRender::new(progress, model);
+        let mut done = false;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                anyhow!(e).context(format!(
+                    "the pull of '{model}' was interrupted — re-run to resume"
+                ))
+            })?;
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                done |= apply_pull_line(&mut render, model, &String::from_utf8_lossy(&line))?;
+            }
+        }
+        // Flush a trailing line without a newline at EOF.
+        done |= apply_pull_line(&mut render, model, &String::from_utf8_lossy(&buf))?;
+        render.close();
+
+        // No explicit success line: trust the server's model list over the
+        // transcript before declaring failure.
+        if !done && !model_installed(model, &self.list_models().await.unwrap_or_default()) {
+            bail!("the pull of '{model}' ended without success — re-run to resume");
+        }
+        progress.status(&format!("pulled {model}"));
+        Ok(())
+    }
+
     /// Start a streaming chat completion (`POST /api/chat`, NDJSON).
     /// Yields [`ChatChunk`]s until one with `done == true`; the caller
     /// accumulates `message.content` deltas and collects `tool_calls`.
@@ -379,6 +442,146 @@ struct TagsResponse {
 #[derive(Debug, Deserialize)]
 struct ModelTag {
     name: String,
+}
+
+/// Whether `tag` is present in `installed` (the `/api/tags` names). A tag
+/// without an explicit version means `:latest` — matching how Ollama
+/// resolves bare names — so `"llama3"` matches an installed
+/// `"llama3:latest"` and vice versa, while `"qwen3.5"` does *not* match
+/// `"qwen3.5:9b"`.
+pub fn model_installed(tag: &str, installed: &[String]) -> bool {
+    fn canonical(tag: &str) -> std::borrow::Cow<'_, str> {
+        // The version separator is the colon after the last `/`, so a
+        // registry port (`host:port/name`) is not mistaken for a version.
+        let name = tag.rsplit('/').next().unwrap_or(tag);
+        if name.contains(':') {
+            std::borrow::Cow::Borrowed(tag)
+        } else {
+            std::borrow::Cow::Owned(format!("{tag}:latest"))
+        }
+    }
+    let want = canonical(tag);
+    installed.iter().any(|have| canonical(have) == want)
+}
+
+/// One NDJSON progress line from `POST /api/pull`. Layer downloads carry
+/// `digest`/`total`/`completed`; milestones ("pulling manifest", "verifying
+/// sha256 digest", "success") carry only `status`; failures carry `error`.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+struct PullLine {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    completed: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Parse one `/api/pull` NDJSON line.
+fn parse_pull_line(line: &str) -> Result<PullLine> {
+    serde_json::from_str(line).with_context(|| {
+        let preview: String = line.chars().take(200).collect();
+        format!("unparseable line from Ollama pull: {preview}")
+    })
+}
+
+/// Feed one raw pull line into `render`. Returns whether it was the final
+/// `"success"` line; blank lines are skipped; in-band errors bail.
+fn apply_pull_line(render: &mut PullRender, model: &str, raw: &str) -> Result<bool> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    let line = parse_pull_line(raw)?;
+    if let Some(error) = line.error {
+        bail!("Ollama could not pull '{model}': {error}");
+    }
+    let success = line.status.as_deref() == Some("success");
+    if !success {
+        render.apply(&line);
+    }
+    Ok(success)
+}
+
+/// Renders pull progress onto a [`Progress`] sink: one byte-counted bar per
+/// layer digest (Ollama reports each blob separately), plain status lines
+/// for the milestones in between.
+struct PullRender<'a> {
+    sink: &'a dyn Progress,
+    model: &'a str,
+    bar: Option<PullBar>,
+    last_status: String,
+}
+
+/// The open byte bar for one layer digest.
+struct PullBar {
+    digest: String,
+    guard: Box<dyn ByteProgress>,
+    completed: u64,
+}
+
+impl<'a> PullRender<'a> {
+    fn new(sink: &'a dyn Progress, model: &'a str) -> Self {
+        Self {
+            sink,
+            model,
+            bar: None,
+            last_status: String::new(),
+        }
+    }
+
+    /// Advance the display for one progress line.
+    fn apply(&mut self, line: &PullLine) {
+        match (line.digest.as_deref(), line.total) {
+            (Some(digest), Some(total)) => {
+                if self.bar.as_ref().is_none_or(|bar| bar.digest != digest) {
+                    self.close();
+                    let label = format!("pulling {} ({})", self.model, short_digest(digest));
+                    self.bar = Some(PullBar {
+                        digest: digest.to_string(),
+                        guard: self.sink.bytes(&label, Some(total)),
+                        completed: 0,
+                    });
+                }
+                let bar = self.bar.as_mut().expect("bar was just ensured");
+                let completed = line.completed.unwrap_or(0).min(total);
+                if completed > bar.completed {
+                    bar.guard.inc(completed - bar.completed);
+                    bar.completed = completed;
+                }
+            }
+            // A layer line before its size is known — wait for totals.
+            (Some(_), None) => {}
+            (None, _) => {
+                if let Some(status) = line.status.as_deref()
+                    && status != self.last_status
+                {
+                    self.close();
+                    self.last_status = status.to_string();
+                    self.sink.status(status);
+                }
+            }
+        }
+    }
+
+    /// Finish the open byte bar, if any.
+    fn close(&mut self) {
+        if let Some(bar) = self.bar.take() {
+            bar.guard.finish("");
+        }
+    }
+}
+
+/// Compact display form of a layer digest: `sha256:ab12cd34…`.
+fn short_digest(digest: &str) -> String {
+    match digest.split_once(':') {
+        Some((algo, hex)) if hex.len() > 8 => format!("{algo}:{}…", &hex[..8]),
+        _ => digest.to_string(),
+    }
 }
 
 /// `POST /api/show` response body (subset we care about). Older Ollama
@@ -643,6 +846,155 @@ mod tests {
         let provider = err.downcast_ref::<ProviderError>().expect("shared type");
         assert_eq!(provider.status, Some(404));
         assert!(!provider.is_transient());
+    }
+
+    #[test]
+    fn model_installed_treats_a_bare_name_as_latest() {
+        let installed = vec![
+            "llama3:latest".to_string(),
+            "qwen3.5:9b".to_string(),
+            "myuser/coder".to_string(),
+        ];
+        assert!(model_installed("llama3", &installed), "bare = :latest");
+        assert!(model_installed("llama3:latest", &installed));
+        assert!(model_installed("qwen3.5:9b", &installed), "exact tag");
+        assert!(
+            model_installed("myuser/coder:latest", &installed),
+            "installed side normalizes too"
+        );
+        assert!(
+            !model_installed("qwen3.5", &installed),
+            "a bare name never matches a versioned tag"
+        );
+        assert!(!model_installed("qwen3.6:27b", &installed));
+        assert!(!model_installed("llama3", &[]));
+    }
+
+    #[test]
+    fn pull_lines_parse_layers_milestones_and_errors() {
+        let layer = parse_pull_line(
+            r#"{"status":"pulling ab12","digest":"sha256:ab12","total":100,"completed":25}"#,
+        )
+        .expect("layer line");
+        assert_eq!(layer.digest.as_deref(), Some("sha256:ab12"));
+        assert_eq!(layer.total, Some(100));
+        assert_eq!(layer.completed, Some(25));
+
+        let milestone = parse_pull_line(r#"{"status":"verifying sha256 digest"}"#).expect("status");
+        assert_eq!(milestone.status.as_deref(), Some("verifying sha256 digest"));
+        assert_eq!(milestone.digest, None);
+
+        let error = parse_pull_line(r#"{"error":"pull model manifest: file does not exist"}"#)
+            .expect("error line");
+        assert_eq!(
+            error.error.as_deref(),
+            Some("pull model manifest: file does not exist")
+        );
+
+        assert!(parse_pull_line("not json").is_err());
+    }
+
+    /// [`Progress`] sink that records every call as a plain string.
+    #[derive(Default)]
+    struct Recording(Arc<Mutex<Vec<String>>>);
+
+    impl Progress for Recording {
+        fn status(&self, line: &str) {
+            self.0.lock().unwrap().push(format!("status:{line}"));
+        }
+        fn bytes(&self, label: &str, total: Option<u64>) -> Box<dyn crate::server::ByteProgress> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("bar:{label}:{}", total.unwrap_or(0)));
+            Box::new(RecordingBar(Arc::clone(&self.0)))
+        }
+    }
+
+    struct RecordingBar(Arc<Mutex<Vec<String>>>);
+
+    impl ByteProgress for RecordingBar {
+        fn inc(&self, n: u64) {
+            self.0.lock().unwrap().push(format!("inc:{n}"));
+        }
+        fn finish(self: Box<Self>, _msg: &str) {
+            self.0.lock().unwrap().push("finish".to_string());
+        }
+    }
+
+    #[test]
+    fn pull_render_opens_one_bar_per_layer_and_ticks_deltas() {
+        let sink = Recording::default();
+        let mut render = PullRender::new(&sink, "my-model");
+        let lines = [
+            r#"{"status":"pulling manifest"}"#,
+            // First layer: two progress lines — one bar, delta-ticked.
+            r#"{"status":"pulling ab","digest":"sha256:abcdef012345","total":100,"completed":40}"#,
+            r#"{"status":"pulling ab","digest":"sha256:abcdef012345","total":100,"completed":100}"#,
+            // Second layer: a new bar.
+            r#"{"status":"pulling cd","digest":"sha256:cd","total":10,"completed":10}"#,
+            r#"{"status":"verifying sha256 digest"}"#,
+            r#"{"status":"writing manifest"}"#,
+        ];
+        let mut done = false;
+        for line in lines {
+            done |= apply_pull_line(&mut render, "my-model", line).expect("line applies");
+        }
+        assert!(!done, "no success line yet");
+        done = apply_pull_line(&mut render, "my-model", r#"{"status":"success"}"#).expect("ok");
+        assert!(done, "success line reported");
+        render.close();
+
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "status:pulling manifest",
+                "bar:pulling my-model (sha256:abcdef01…):100",
+                "inc:40",
+                "inc:60",
+                "finish", // first layer bar closed by the second layer
+                "bar:pulling my-model (sha256:cd):10",
+                "inc:10",
+                "finish", // second layer bar closed by the milestone
+                "status:verifying sha256 digest",
+                "status:writing manifest",
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_render_skips_blank_lines_and_regressions() {
+        let sink = Recording::default();
+        let mut render = PullRender::new(&sink, "m");
+        assert!(!apply_pull_line(&mut render, "m", "  \n").expect("blank ok"));
+        // completed going backwards (Ollama re-verifying) never underflows.
+        for line in [
+            r#"{"digest":"sha256:ab","total":100,"completed":50}"#,
+            r#"{"digest":"sha256:ab","total":100,"completed":30}"#,
+        ] {
+            apply_pull_line(&mut render, "m", line).expect("applies");
+        }
+        render.close();
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["bar:pulling m (sha256:ab):100", "inc:50", "finish"]
+        );
+    }
+
+    #[test]
+    fn in_band_pull_errors_bail_with_the_model_name() {
+        let sink = Recording::default();
+        let mut render = PullRender::new(&sink, "bogus:tag");
+        let err = apply_pull_line(
+            &mut render,
+            "bogus:tag",
+            r#"{"error":"pull model manifest: file does not exist"}"#,
+        )
+        .expect_err("error line must fail");
+        assert!(err.to_string().contains("bogus:tag"));
+        assert!(err.to_string().contains("file does not exist"));
     }
 
     #[test]

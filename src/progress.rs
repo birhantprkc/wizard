@@ -151,11 +151,14 @@ impl Default for TurnSpinner {
     }
 }
 
-/// Progress reporter for llama-server startup (spawn + model load): a
-/// spinner whose message tracks the latest status on a terminal, plain
-/// stdout lines otherwise (matching the previous behavior for scripts).
+/// Progress reporter for slow setup waits — llama-server startup (spawn +
+/// model load) and Ollama model pulls: a spinner whose message tracks the
+/// latest status on a terminal, plain stdout lines otherwise (matching the
+/// previous behavior for scripts).
 pub struct ServerSpinner {
     bar: ProgressBar,
+    /// Closing message shown when the wait succeeded and actually waited.
+    ready: String,
     /// Whether any status line arrived — i.e. the server was actually
     /// spawned or waited on rather than already answering.
     waited: AtomicBool,
@@ -166,31 +169,38 @@ pub struct ServerSpinner {
 }
 
 impl ServerSpinner {
-    /// Start the spinner. The fast path (server already ready) finishes it
-    /// before a status ever lands, leaving no output.
+    /// Start the llama-server spinner. The fast path (server already ready)
+    /// finishes it before a status ever lands, leaving no output.
     pub fn start() -> Self {
+        Self::start_with("Starting llama-server…", "llama-server ready")
+    }
+
+    /// Start the spinner with custom initial and closing messages (e.g. the
+    /// Ollama model check/pull at startup).
+    pub fn start_with(starting: &str, ready: &str) -> Self {
         let bar = ProgressBar::new_spinner()
             .with_style(spinner_style())
-            .with_message("Starting llama-server…");
+            .with_message(starting.to_string());
         bar.enable_steady_tick(TICK_INTERVAL);
         Self {
             bar,
+            ready: ready.to_string(),
             waited: AtomicBool::new(false),
             enabled: std::io::stderr().is_terminal(),
         }
     }
 
     /// Finish the wait. A successful wait that actually had to spawn or
-    /// poll leaves a final "llama-server ready" status (plain println on
-    /// non-terminals); the fast path and failures clear silently — errors
-    /// are reported by the caller.
+    /// poll leaves the closing status (plain println on non-terminals); the
+    /// fast path and failures clear silently — errors are reported by the
+    /// caller.
     pub fn finish(&self, ok: bool) {
         if ok && self.waited.load(Ordering::SeqCst) {
             if self.enabled {
-                self.bar.finish_with_message("llama-server ready");
+                self.bar.finish_with_message(self.ready.clone());
             } else {
                 self.bar.finish_and_clear();
-                println!("llama-server ready");
+                println!("{}", self.ready);
             }
         } else {
             self.bar.finish_and_clear();

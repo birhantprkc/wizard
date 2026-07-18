@@ -1,10 +1,12 @@
 # Bring your own model (BYOM)
 
-Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights. The default install ships no model at all, and Wizard's managed local option (onboarding's Local pick, or `WIZARD_LOCAL=1` at install) downloads only official Qwen GGUF quants. Custom weights are always your call, and swapping them in is easy on both local backends.
+Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights.
+
+The primary BYOM path is onboarding: run `wizard --onboard` (or just `wizard` with no config) and pick one of the two BYOM providers — llama.cpp for any GGUF, Ollama for any model tag. Onboarding records the choice; the first run materializes it: a missing known-tier GGUF is downloaded, and a missing Ollama tag is pulled through Ollama's API, both with visible progress. Custom weights are always your call, and Wizard's managed local option (onboarding's Local pick, or `WIZARD_LOCAL=1` at install) downloads only official Qwen GGUF quants.
 
 ## Any GGUF with llama.cpp (the default local backend)
 
-With the llama.cpp default there is no special installer: `llama-server` loads any GGUF directly. Download one (Hugging Face hosts Q4_K_M-class quants of most open models) and point the provider at it in `~/.wizard/config.toml`:
+With the llama.cpp default there is no special installer: `llama-server` loads any GGUF directly. Run `wizard --onboard`, pick "BYOM — llama.cpp", and choose "Type a custom GGUF path…" in the model step; GGUFs already in `~/.wizard/models/` are listed first. Or point the provider at the file in `~/.wizard/config.toml` yourself:
 
 ```toml
 [[providers]]
@@ -15,81 +17,24 @@ model = "my-coder-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/my-coder-Q4_K_M.gguf"
 ```
 
-Wizard starts `llama-server` with that file automatically (see [getting started](getting-started.md#first-run)). Alternatively:
-
-- Run `wizard --onboard` and pick "Type a custom GGUF path…" in the model step; it lists GGUFs already in `~/.wizard/models/` first.
-- Override per run with `WIZARD_GGUF_PATH=/path/to/model.gguf` (and `WIZARD_MODEL=<tag>` for the label).
+Wizard starts `llama-server` with that file automatically (see [getting started](getting-started.md#first-run)). Override per run with `WIZARD_GGUF_PATH=/path/to/model.gguf` (and `WIZARD_MODEL=<tag>` for the label).
 
 Prefer a model that supports tool calling; Wizard spawns the server with `--jinja` so OpenAI-style tool calls work, and falls back to a prompt-based JSON tool protocol for models without native support.
 
-## BYOM with Ollama
+## Any Ollama tag
 
-If you run Ollama instead (a fine-tune, a private registry tag, a local GGUF via Modelfile), use the main installer's BYOM flavor.
+Run `wizard --onboard` and pick "BYOM — Ollama". The model picker lists what an existing Ollama install already has pulled first (including models you created yourself), then the hardware-suggested tiers; "Type a custom tag…" takes anything else — a library model from [ollama.com/library](https://ollama.com/library) (`qwen3-coder:30b`, `deepseek-r1:32b`, …) or a registry tag under a user or org namespace (`myorg/internal-coder:latest`).
 
-### Install with BYOM
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
-```
-
-With `WIZARD_BYOM=1`, the installer:
-
-1. Installs Ollama if needed and starts it
-2. Does not pull any model automatically: it walks you through model selection first (set `WIZARD_MODEL=<tag>` to skip the prompts, e.g. for non-interactive installs)
-3. Installs the `wizard` binary (same as the default flavor)
-4. Writes your choice to `~/.wizard/config.toml`: a fresh config gets a full `[[providers]]` Ollama entry; an existing config keeps everything else and only has its `model =` line(s) updated
-5. Lays down the [default loadout](loadout.md) (browser MCP + subagents), each file only if absent
-
-The old `install-byom.sh` URL still works: it is now a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`).
-
-### Interactive flow
-
-```
-==> Wizard BYOM Setup
-
-Choose how to configure your model:
-
-  1) Pull an existing Ollama library model
-  2) Pull a custom Ollama registry tag
-  3) Create from a local Modelfile
-  4) Use a model already installed (skip pull)
-
-Selection [1-4]: 2
-Enter Ollama model tag (e.g. myuser/my-model:27b): myuser/coder-v2
-==> Pulling myuser/coder-v2 ...
-```
-
-The rest of the install (binary, config, loadout) then proceeds and ends with `==> Done. Run: wizard`.
-
-### Option 1: Ollama library model
-
-Pick any model from [ollama.com/library](https://ollama.com/library):
-
-```bash
-# Examples
-ollama pull qwen3.6:27b
-ollama pull qwen3-coder:30b
-ollama pull deepseek-r1:32b
-```
-
-The BYOM install runs `ollama pull` for you and sets `model` in config.
-
-### Option 2: Custom registry tag
-
-For models published to Ollama Hub under a user or org namespace:
-
-```bash
-ollama pull myorg/internal-coder:latest
-```
+If the chosen tag is not installed yet, the first `wizard` run pulls it via Ollama's streaming API with a progress bar — no manual `ollama pull` step. This automatic pull only ever targets a local Ollama (loopback `base_url`); see [remote servers](#remote-servers).
 
 Requirements:
 
-- The model must support tool calling (required for Wizard's agent loop)
-- Chat template must be compatible with Ollama's `/api/chat` endpoint
+- Tool calling is strongly recommended (Wizard probes for it and falls back to the JSON tool protocol without it)
+- The chat template must be compatible with Ollama's `/api/chat` endpoint
 
-### Option 3: Local Modelfile
+### Custom models via Modelfile
 
-Create a `Modelfile` pointing at a GGUF on disk or HuggingFace:
+To run your own weights under Ollama (a fine-tune, a GGUF on disk or Hugging Face), create the model yourself, then pick it in onboarding — it shows up in the picker as already pulled:
 
 ```dockerfile
 # Modelfile.example
@@ -99,25 +44,18 @@ PARAMETER num_ctx 131072
 SYSTEM You are a careful assistant. Use tools precisely.
 ```
 
-Then:
-
 ```bash
 ollama create my-coder -f Modelfile.example
+wizard --onboard   # pick "BYOM — Ollama", then my-coder
 ```
 
-The BYOM install sets `model = "my-coder"` in config.
-
-### HuggingFace GGUF via URL
+A `FROM` line can also point at a Hugging Face URL:
 
 ```dockerfile
 FROM https://huggingface.co/SomeOrg/SomeModel/resolve/main/model-Q4_K_M.gguf
 PARAMETER temperature 0.6
 PARAMETER num_ctx 65536
 ```
-
-### Option 4: Already installed
-
-If `ollama list` shows your model, select it directly. No pull step.
 
 ### Manual configuration
 
@@ -140,6 +78,22 @@ Verify the model works:
 ollama run my-custom-model "write a hello world in Rust"
 wizard -p "list files in the current directory"
 ```
+
+## The installer's BYOM flavor
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
+```
+
+With `WIZARD_BYOM=1`, the installer:
+
+1. Installs Ollama if needed and starts it
+2. Installs the `wizard` binary (same as the default flavor)
+3. Lays down the [default loadout](loadout.md) (browser MCP + subagents), each file only if absent
+
+No model is chosen at install time: the first `wizard` run opens onboarding, and the tag you pick there is pulled on first run. For headless/non-interactive installs, set `WIZARD_MODEL=<tag>`: the installer pulls that tag and writes the config itself (a fresh config gets a full `[[providers]]` Ollama entry; an existing config keeps everything else and only has its `model =` line(s) updated), so no onboarding is needed.
+
+The old `install-byom.sh` URL still works: it is a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`).
 
 ## Model requirements
 
@@ -176,7 +130,7 @@ base_url = "http://gpu-server.local:11434"
 model = "qwen3.6:27b"
 ```
 
-Ensure the model is loaded/pulled on that server, not just locally.
+The automatic first-run pull applies only to loopback URLs — Wizard never downloads models onto a remote server. Ensure the model is loaded/pulled on that server yourself.
 
 ## Disclaimer
 
@@ -186,10 +140,8 @@ The default `install.sh` one-liner downloads no model weights; Wizard's managed 
 
 ## Switching back to official models
 
-Run `wizard --onboard` and pick the recommended tier, or re-run the installer with the local flavor: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards:
+Run `wizard --onboard` and pick the recommended tier — it is downloaded (llama.cpp) or pulled (Ollama) on the next run. Or re-run the installer with the local flavor: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_LOCAL=1 bash
 ```
-
-On Ollama: `ollama pull qwen3.6:27b` and set `model = "qwen3.6:27b"`.

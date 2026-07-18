@@ -5141,6 +5141,19 @@ async fn try_provider(provider: &ProviderConfig) -> Result<Arc<dyn LlmProvider>>
         wait.finish(outcome.is_ok());
         outcome?;
     }
+    // Ollama gets the same first-run hand for the model itself: a configured
+    // tag that is not pulled yet (onboarding's BYOM pick, a hand-written
+    // config) is pulled now with visible progress. Loopback hosts only —
+    // Wizard never downloads models onto a remote server.
+    if provider.kind == ProviderKind::Ollama && server::local_port(&provider.base_url).is_some() {
+        let wait =
+            crate::progress::ServerSpinner::start_with("Checking the local model…", "model ready");
+        let outcome = crate::llm::ollama::OllamaClient::new(provider.base_url.clone())
+            .ensure_model(&provider.model, &wait)
+            .await;
+        wait.finish(outcome.is_ok());
+        outcome?;
+    }
     client
         .health()
         .await

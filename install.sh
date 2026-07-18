@@ -35,12 +35,14 @@
 #                     Ollama-based variant (install Ollama, start it, pull the
 #                     auto-tiered model) and implies this flavor — no need to
 #                     also set WIZARD_LOCAL.
-#   WIZARD_BYOM=1     bring your own model — install Ollama if absent and pick
-#                     any Ollama-compatible model interactively (library tag,
-#                     custom registry tag, local Modelfile, or one already
-#                     installed), then write the config. You choose the model:
-#                     Wizard does not ship, endorse, or maintain third-party
-#                     model weights; you are responsible for their licenses.
+#   WIZARD_BYOM=1     bring your own model — install Ollama if absent, start
+#                     it, and install the binary. Model choice happens in
+#                     wizard's onboarding on the first run, which pulls the
+#                     tag you pick. Set WIZARD_MODEL=<tag> for a headless
+#                     install: the tag is pulled and the config written here,
+#                     no prompts. You choose the model: Wizard does not ship,
+#                     endorse, or maintain third-party model weights; you are
+#                     responsible for their licenses.
 #   WIZARD_MINIMAL=1  binary only — like the default but also skips the
 #                     loadout; the first `wizard` run starts onboarding
 #
@@ -55,8 +57,8 @@
 #   WIZARD_BESPOKE               deprecated alias for WIZARD_MINIMAL
 #   WIZARD_MODEL                 local flavors: force a specific model tier
 #                                (default auto-detected; with WIZARD_BYOM=1:
-#                                use this tag as-is and skip the interactive
-#                                prompts)
+#                                pull this tag and write the config instead of
+#                                deferring to onboarding)
 #   WIZARD_SKIP_MODEL_PULL       1 = local flavors: skip the model download (default 0)
 #   WIZARD_SKIP_LLAMACPP_INSTALL 1 = WIZARD_LOCAL: llama-server managed elsewhere (default 0)
 #   WIZARD_LLAMACPP_NO_CUDA      1 = never compile a CUDA llama-server; use the
@@ -165,22 +167,6 @@ trap cleanup EXIT
 say()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
-
-# Interactive prompt that works under `curl | bash` (stdin is the script,
-# so read from the controlling terminal instead).
-ask() {
-    # $1 = variable name, $2 = prompt text
-    local _var="$1" _msg="$2" _reply
-    printf '%s' "$_msg" >/dev/tty
-    IFS= read -r _reply </dev/tty
-    eval "$_var=\$_reply"
-}
-
-require_tty() {
-    if [ ! -e /dev/tty ] || ! { true </dev/tty; } 2>/dev/null; then
-        die "BYOM setup is interactive and needs a terminal. Either run it from an interactive shell, or set WIZARD_MODEL=<tag> to skip the prompts."
-    fi
-}
 
 # --- platform detection -------------------------------------------------
 
@@ -811,112 +797,6 @@ pull_model() {
         || die "failed to pull ${MODEL} — check connectivity, then run 'ollama pull ${MODEL}' manually"
 }
 
-# --- BYOM model selection (WIZARD_BYOM=1, interactive) --------------------
-
-pull_model_tag() {
-    # $1 = tag to pull
-    command -v ollama >/dev/null 2>&1 \
-        || die "ollama binary not found — cannot pull '$1'"
-    say "Pulling $1 ..."
-    ollama pull "$1" \
-        || die "failed to pull '$1' — check the tag and your connectivity, then re-run"
-}
-
-choose_byom_model() {
-    if [ -n "$WIZARD_MODEL" ]; then
-        MODEL="$WIZARD_MODEL"
-        say "Model set via WIZARD_MODEL: ${MODEL} (no pull — make sure it is available in Ollama)"
-        return
-    fi
-
-    require_tty
-
-    printf '\n==> Wizard BYOM Setup\n\n' >/dev/tty
-    printf 'Choose how to configure your model:\n\n' >/dev/tty
-    printf '  1) Pull an existing Ollama library model\n' >/dev/tty
-    printf '  2) Pull a custom Ollama registry tag\n' >/dev/tty
-    printf '  3) Create from a local Modelfile\n' >/dev/tty
-    printf '  4) Use a model already installed (skip pull)\n' >/dev/tty
-    printf '\n' >/dev/tty
-
-    local choice
-    while true; do
-        ask choice "Selection [1-4]: "
-        case "$choice" in
-            1 | 2 | 3 | 4) break ;;
-            *) printf 'Please enter 1, 2, 3, or 4.\n' >/dev/tty ;;
-        esac
-    done
-
-    case "$choice" in
-        1)
-            local tag
-            while true; do
-                ask tag "Enter Ollama library model (e.g. qwen3.6:27b, qwen3-coder:30b, deepseek-r1:32b): "
-                [ -n "$tag" ] && break
-            done
-            pull_model_tag "$tag"
-            MODEL="$tag"
-            ;;
-        2)
-            local tag
-            while true; do
-                ask tag "Enter Ollama model tag (e.g. myuser/my-model:27b): "
-                [ -n "$tag" ] && break
-            done
-            pull_model_tag "$tag"
-            MODEL="$tag"
-            say "Note: Wizard's agent loop works best with models that support tool calling."
-            ;;
-        3)
-            command -v ollama >/dev/null 2>&1 \
-                || die "ollama binary not found — cannot create a model from a Modelfile"
-            local mf name
-            while true; do
-                ask mf "Path to Modelfile: "
-                [ -z "$mf" ] && continue
-                # Expand a leading ~ since the answer is not shell-expanded
-                # (the literal ~ in the patterns is intentional: it is what
-                # the user typed, not a path we expect the shell to expand).
-                # shellcheck disable=SC2088
-                case "$mf" in
-                    "~/"*) mf="$HOME/${mf#\~/}" ;;
-                    "~")   mf="$HOME" ;;
-                esac
-                if [ -f "$mf" ]; then
-                    break
-                fi
-                printf 'No such file: %s\n' "$mf" >/dev/tty
-            done
-            while true; do
-                ask name "Name for the new model (e.g. my-coder): "
-                [ -n "$name" ] && break
-            done
-            say "Creating ${name} from ${mf} ..."
-            ollama create "$name" -f "$mf" \
-                || die "ollama create failed — check the Modelfile and try again"
-            MODEL="$name"
-            ;;
-        4)
-            if command -v ollama >/dev/null 2>&1; then
-                printf '\nInstalled models:\n\n' >/dev/tty
-                ollama list >/dev/tty 2>/dev/null || true
-                printf '\n' >/dev/tty
-            fi
-            local name
-            while true; do
-                ask name "Model name to use: "
-                [ -n "$name" ] && break
-            done
-            if command -v ollama >/dev/null 2>&1 \
-                && ! ollama list 2>/dev/null | awk 'NR > 1 {print $1}' | grep -Fxq "$name"; then
-                warn "'$name' does not appear in 'ollama list' — Wizard will fail at startup if it is missing"
-            fi
-            MODEL="$name"
-            ;;
-    esac
-}
-
 # --- wizard binary ------------------------------------------------------
 
 place_binary() {
@@ -1245,11 +1125,12 @@ install_desktop_app() {
 write_config() {
     local cfg="$HOME/.wizard/config.toml"
     mkdir -p "$HOME/.wizard"
-    # Only the local and BYOM flavors write a config. The default and minimal
-    # flavors leave it to onboarding on the first `wizard` run.
+    # Only the local flavors and a BYOM install with WIZARD_MODEL set write a
+    # config. The default, minimal, and plain BYOM flavors leave it to
+    # onboarding on the first `wizard` run (BYOM's model choice lives there).
     if [ "$WIZARD_MINIMAL" = "1" ] \
         || { [ "$WIZARD_LOCAL" != "1" ] && [ "$WIZARD_USE_OLLAMA" != "1" ] \
-            && [ "$WIZARD_BYOM" != "1" ]; }; then
+            && { [ "$WIZARD_BYOM" != "1" ] || [ -z "$MODEL" ]; }; }; then
         if [ -f "$cfg" ]; then
             say "A config already exists at ${cfg} — leaving it untouched"
             say "Run 'wizard --onboard' to reconfigure from scratch"
@@ -1530,13 +1411,13 @@ EOF
 main() {
     say "Wizard installer"
     if [ "$WIZARD_MINIMAL" = "1" ] && [ "$WIZARD_BYOM" = "1" ]; then
-        die "WIZARD_MINIMAL=1 and WIZARD_BYOM=1 conflict — pick one: minimal installs the binary only (onboarding on first run), BYOM sets up Ollama with a model of your choice"
+        die "WIZARD_MINIMAL=1 and WIZARD_BYOM=1 conflict — pick one: minimal installs the binary only (onboarding on first run), BYOM also sets up Ollama"
     fi
     if [ "$WIZARD_LOCAL" = "1" ] && [ "$WIZARD_MINIMAL" = "1" ]; then
         die "WIZARD_LOCAL=1 and WIZARD_MINIMAL=1 conflict — pick one: local preinstalls llama.cpp and an auto-tiered model, minimal installs the binary only (onboarding on first run)"
     fi
     if [ "$WIZARD_LOCAL" = "1" ] && [ "$WIZARD_BYOM" = "1" ]; then
-        die "WIZARD_LOCAL=1 and WIZARD_BYOM=1 conflict — pick one: local preinstalls llama.cpp with an auto-tiered model, BYOM sets up Ollama with a model of your choice"
+        die "WIZARD_LOCAL=1 and WIZARD_BYOM=1 conflict — pick one: local preinstalls llama.cpp with an auto-tiered model, BYOM sets up Ollama and leaves the model choice to onboarding"
     fi
     require_curl
     detect_platform
@@ -1548,10 +1429,18 @@ main() {
     if [ "$WIZARD_MINIMAL" = "1" ]; then
         say "Minimal install (WIZARD_MINIMAL=1): binary only — no model runtime, model, config, or loadout"
     elif [ "$WIZARD_BYOM" = "1" ]; then
-        say "BYOM install (WIZARD_BYOM=1): bring your own Ollama model"
+        say "BYOM install (WIZARD_BYOM=1): Ollama + binary — model choice happens in onboarding"
         install_ollama
         start_ollama
-        choose_byom_model
+        # WIZARD_MODEL=<tag> is the headless path: pull the tag and write the
+        # config here, no onboarding needed. Without it, no model and no
+        # config: the first `wizard` run opens onboarding, which pulls the
+        # tag you pick.
+        if [ -n "$WIZARD_MODEL" ]; then
+            MODEL="$WIZARD_MODEL"
+            say "Model set via WIZARD_MODEL: ${MODEL}"
+            pull_model
+        fi
     elif [ "$WIZARD_USE_OLLAMA" = "1" ]; then
         say "Using Ollama as the local provider (WIZARD_USE_OLLAMA=1)"
         install_ollama
@@ -1589,6 +1478,8 @@ main() {
     if [ "$BINARY_INSTALLED" = "1" ]; then
         if [ "$WIZARD_MINIMAL" = "1" ]; then
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
+        elif [ "$WIZARD_BYOM" = "1" ] && [ -z "$MODEL" ]; then
+            say "Done. Run 'wizard' — pick your Ollama model in onboarding; it is pulled on first run."
         elif [ "$WIZARD_BYOM" = "1" ] || [ "$WIZARD_USE_OLLAMA" = "1" ]; then
             say "Done. Run: wizard"
         elif [ "$WIZARD_LOCAL" = "1" ]; then

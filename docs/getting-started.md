@@ -38,7 +38,7 @@ The same script has four mutually exclusive flavors:
 | (default) | binary + loadout; no model, no config. The first `wizard` run starts [onboarding](#first-run) |
 | `WIZARD_LOCAL=1` | the default plus a preinstalled local stack: llama.cpp runtime + VRAM-tiered Qwen GGUF + `config.toml` |
 | `WIZARD_MINIMAL=1` | binary only: no loadout either; onboarding on first run as with the default |
-| `WIZARD_BYOM=1` | Ollama runtime + a model of your choice (interactive, or `WIZARD_MODEL=<tag>`) + binary + config + loadout; see [byom.md](byom.md) |
+| `WIZARD_BYOM=1` | Ollama runtime + binary + loadout; model choice happens in onboarding, which pulls the tag you pick on first run (or set `WIZARD_MODEL=<tag>` to pull + write the config headlessly); see [byom.md](byom.md) |
 
 `WIZARD_USE_OLLAMA=1` is the Ollama variant of the local flavor (installs Ollama, starts it, pulls the same auto-tiered model) and implies it: no need to also set `WIZARD_LOCAL`. Combining `WIZARD_LOCAL`, `WIZARD_MINIMAL`, or `WIZARD_BYOM` is an error. `WIZARD_BESPOKE=1` is a deprecated alias for `WIZARD_MINIMAL=1`; it's stricter than the old bespoke flavor, which still installed the model runtime. Minimal installs nothing but the binary and leaves everything to onboarding.
 
@@ -86,9 +86,9 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0`; pin it for reproducible installs or to roll back to an earlier release |
 | `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
-| `WIZARD_BYOM` | `0` | Set to `1` to bring your own Ollama model (conflicts with `WIZARD_MINIMAL`) |
+| `WIZARD_BYOM` | `0` | Set to `1` to set up Ollama and bring your own model — picked in onboarding unless `WIZARD_MODEL` is set (conflicts with `WIZARD_MINIMAL` and `WIZARD_LOCAL`) |
 | `WIZARD_BESPOKE` | `0` | Deprecated alias for `WIZARD_MINIMAL` |
-| `WIZARD_MODEL` | auto-detected | Local flavors: force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, use this tag as-is and skip the interactive prompts |
+| `WIZARD_MODEL` | auto-detected | Local flavors: force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, pull this tag and write the config instead of deferring to onboarding |
 | `WIZARD_SKIP_MODEL_PULL` | `0` | Local flavors: set to `1` to skip the model download |
 | `WIZARD_SKIP_LLAMACPP_INSTALL` | `0` | With `WIZARD_LOCAL=1`: set to `1` if `llama-server` is managed elsewhere |
 | `WIZARD_LLAMACPP_NO_CUDA` | `0` | Set to `1` to never compile a CUDA `llama-server`; use the prebuilt Vulkan/CPU build instead |
@@ -116,7 +116,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (your own model tag), for bringing a model you already have. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (any model tag — installed models are listed, and a missing tag is pulled automatically on first run), for bringing your own model. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
