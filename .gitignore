@@ -13,3 +13,5 @@ demo/frame-*.png
 demo/demo.mp4
 # per-project wizard runtime state (checkpoints, etc.)
 .wizard/
+# generate_image tool output
+/generated/
