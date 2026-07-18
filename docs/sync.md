@@ -1,6 +1,6 @@
 # `wizard sync`: move state between machines
 
-`wizard sync` packs Wizard's portable state — config, skills, custom commands, subagents, and scripted tools — into a signed bundle that another machine can verify and apply.
+`wizard sync` packs Wizard's portable state (config, skills, custom commands, subagents, and scripted tools) into a signed bundle that another machine can verify and apply.
 
 | Command | What it does |
 |---------|--------------|
@@ -34,6 +34,7 @@ Paths are relative to `~/.wizard/`. Pieces missing on the packing machine are sk
 | `config.toml`, `mcp.toml`, the system prompt file | always |
 | `skills/`, `commands/`, `subagents/`, `tools/` | always |
 | `credentials.toml`, `xai_oauth.json` (API keys, OAuth tokens) | only with `--include-credentials` |
+| `chatgpt_oauth.json` | never (not packed today) |
 | `sessions/`, `logs/`, `models/`, `memory/`, `sync/`, the evolution log, caches | never |
 
 `--include-credentials` puts your API keys and OAuth tokens in the bundle. The bundle file is then written with mode 0600 and pack prints a warning: the bundle is signed but **not encrypted**, so anyone who obtains it can read the keys. Transfer such a bundle privately (`scp`), never over a public URL.

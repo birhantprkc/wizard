@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/wizard/<ref>/install.sh | W
 | `WIZARD_REF` | `main` | Branch or tag to clone and build. |
 | `WIZARD_BUILD_FROM_SOURCE` | `0` | Set to `1` to build the binary from source instead of downloading a release asset. Fork installers always set this to `1`, since forks don't ship prebuilt release binaries unless you cut releases yourself. |
 
-The installer clones your fork at `WIZARD_REF`, ensures a Rust toolchain (installs via `rustup --profile minimal` if `cargo` is absent), runs `cargo build --release`, and places the resulting binary. It works on any machine with internet access and a supported OS (currently Linux x86_64/aarch64). Build time is a few minutes the first time.
+The installer clones your fork at `WIZARD_REF`, ensures a Rust toolchain (installs via `rustup --profile minimal` if `cargo` is absent), runs `cargo build --release`, and places the resulting binary. It works on any machine with internet access and a supported OS (Linux and macOS, x86_64 and aarch64). Build time is a few minutes the first time.
 
 ---
 

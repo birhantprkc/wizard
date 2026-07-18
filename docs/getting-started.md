@@ -86,7 +86,7 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 | `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0`; pin it for reproducible installs or to roll back to an earlier release |
 | `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |
-| `WIZARD_BYOM` | `0` | Set to `1` to set up Ollama and bring your own model — picked in onboarding unless `WIZARD_MODEL` is set (conflicts with `WIZARD_MINIMAL` and `WIZARD_LOCAL`) |
+| `WIZARD_BYOM` | `0` | Set to `1` to set up Ollama and bring your own model, picked in onboarding unless `WIZARD_MODEL` is set (conflicts with `WIZARD_MINIMAL` and `WIZARD_LOCAL`) |
 | `WIZARD_BESPOKE` | `0` | Deprecated alias for `WIZARD_MINIMAL` |
 | `WIZARD_MODEL` | auto-detected | Local flavors: force a model tier (`qwen3.6:35b`, `qwen3.6:27b`, `qwen3.5:9b`); with `WIZARD_BYOM=1`, pull this tag and write the config instead of deferring to onboarding |
 | `WIZARD_SKIP_MODEL_PULL` | `0` | Local flavors: set to `1` to skip the model download |
@@ -108,7 +108,7 @@ These override `~/.wizard/config.toml` for a single run:
 | `WIZARD_MODEL` | Override the model tag |
 | `WIZARD_LLAMACPP_HOST` | Override the llama-server URL (default `http://127.0.0.1:11435`) |
 | `WIZARD_GGUF_PATH` | Override the GGUF file Wizard uses when it starts `llama-server` |
-| `WIZARD_OLLAMA_HOST` | Point Wizard at an Ollama host (also switches the synthesized local provider to Ollama) |
+| `WIZARD_OLLAMA_HOST` | Override `ollama_host` for explicitly configured Ollama providers (does not change the synthesized local default, which stays llama.cpp) |
 
 ## First run
 
@@ -116,7 +116,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (any model tag — installed models are listed, and a missing tag is pulled automatically on first run), for bringing your own model. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (any model tag, installed models are listed, and a missing tag is pulled automatically on first run), for bringing your own model. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
@@ -144,7 +144,7 @@ Type a task in natural language:
 
 Wizard reads files, applies changes, runs tests, and shows git diffs.
 
-**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol. Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing. Pressing Enter while a turn is already running queues the message — it lands in the transcript and runs automatically when the current turn finishes (see [Queued user messages](usage.md#queued-user-messages)).
+**Enter** sends the message; **Shift+Enter** inserts a newline for multi-line prompts (the composer grows to fit, then scrolls). Shift+Enter needs a terminal that supports the keyboard-enhancement protocol. Wizard enables it on launch when available; where it isn't, **Alt+Enter** does the same thing. Pressing Enter while a turn is already running queues the message, it lands in the transcript and runs automatically when the current turn finishes (see [Queued user messages](usage.md#queued-user-messages)).
 
 ## Configuration
 
@@ -272,9 +272,19 @@ You can use xAI without an API key by signing in with your xAI account (OAuth 2.
 wizard --login xai     # or /login xai from inside the TUI
 ```
 
-Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. On success it adds the `xai-oauth` provider and switches the live agent to it; no `/provider add` needed.
+Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. On success it adds the `xai-oauth` provider and switches the live agent to it; no `/provider add` needed. The browser GUI can start the same flow from Settings (see [Desktop app](desktop.md) / the GUI protocol).
 
 Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come back with HTTP 403, use the API-key flavor (`kind = "xai"` with `XAI_API_KEY`) instead.
+
+### Signing in with a ChatGPT account
+
+ChatGPT subscription access is OAuth too (OpenAI's Codex backend, not the public Chat Completions API):
+
+```bash
+wizard --login chatgpt     # or /login chatgpt from inside the TUI
+```
+
+Tokens land in `~/.wizard/chatgpt_oauth.json` (mode 0600). On success Wizard adds a `chatgptoauth` provider pointed at `chatgpt.com/backend-api/codex`. The GUI Settings sign-in path accepts `chatgpt` the same way as `xai`. You still need a plan that the Codex backend accepts; a failed exchange or 403 is the usual signal that the account is not eligible.
 
 ## Headless mode
 

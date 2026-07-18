@@ -39,15 +39,19 @@ wizard doctor && wizard --mode sovereign -p "task"
 
 ## `/status`
 
-A one-shot snapshot of the running TUI session:
+A one-shot snapshot of the running session. The TUI prints something like:
 
 ```
 model: qwen3-30b
 provider: local (LlamaCpp @ http://127.0.0.1:11435)
 mode: genie
+effort: default
 session: 2026-06-11T09-30-00
 usage: 1200 prompt + 240 completion tokens
 background tasks: 1 running
 todos: 2/5 done
 plan mode: off
+ultra: off
 ```
+
+The browser GUI adds a `context: N tokens` line (the size of the next model call, not a session lifetime sum) and a `steps:` line for the configured step budget. For a live next-call estimate in the TUI, use the status bar token readout instead of `/status`. Lifetime prompt/completion totals and cost estimates stay on `/cost`.

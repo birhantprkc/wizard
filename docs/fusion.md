@@ -45,9 +45,10 @@ synthesizer = "claude"             # the sole tool-caller
 rounds = 1                         # critique rounds (edit here; default 1)
 ```
 
-If `[fusion]` is unset, `/fusion` derives a default panel from your first two
-configured providers (synthesizer = the first). With a single provider it
-degrades to a passthrough rather than erroring. `rounds` has no UI: edit it in
+If `[fusion]` is unset, `/fusion` derives a default panel from your configured
+providers: the first two when you have two or more (synthesizer = the first),
+or a one-member panel when you only have one. An empty panel is the real
+passthrough case (synthesizer alone, no debate). `rounds` has no UI: edit it in
 the config file (default 1, usually the sweet spot).
 
 ## Cost

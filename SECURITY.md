@@ -5,27 +5,33 @@ Wizard is an agent that runs shell commands, writes files, and (if you ask it to
 ## The short version
 
 - Everything Wizard does runs **as you**, with your privileges. There is no sandbox.
-- **There is no per-action approval gate, by design.** Every tool call runs as soon as the model makes it, in both modes. Sovereign mode additionally runs non-interactively and continuously, self-directing with no human in the loop.
+- **There is no per-action y/n approval gate, by design.** In normal genie and sovereign use, tool calls run as soon as the model makes them. Plan mode still blocks non-read-only tools until a plan is approved, and hooks can block or rewrite calls. Sovereign mode is headless and autonomous for one task; perpetual self-direction is `--continuous` (which implies sovereign).
 - MCP servers and scripted tools are programs you chose to run. Wizard scrubs their environment and bounds their time, but it cannot make an untrustworthy program trustworthy.
 - Deep `/evolve` is gated by a clean `cargo build` and a smoke test, and keeps the old binary for one-`mv` rollback. There is no diff-approval step.
-- API keys live in environment variables or `~/.wizard/credentials.toml` (written atomically, file mode 0600). `config.toml` only ever names the env var, never the key.
+- API keys live in environment variables or `~/.wizard/credentials.toml` (written atomically, file mode 0600). OAuth sessions land in `~/.wizard/xai_oauth.json` and `~/.wizard/chatgpt_oauth.json` (also mode 0600). `config.toml` only ever names the env var, never the key.
 
 ## No approval gate
 
-Wizard has no per-action confirmation, in either mode (genie or sovereign). Every file write, shell command, MCP call, scripted tool, and `/evolve` runs the moment the model calls it. The state-changing tools are:
+Wizard has no per-action y/n confirmation in either mode (genie or sovereign). Outside of plan mode and blocking hooks, every file write, shell command, MCP call, scripted tool, and `/evolve` runs the moment the model calls it. The state-changing tools include:
 
 - **File writes:** `write_file` and `edit_file`
 - **Shell:** `execute` (this is also how git commits, pushes, and any other command happen)
 - **Scripted tools:** agent-authored scripts in `~/.wizard/tools/`
 - **MCP tools:** every tool served by an MCP server
 - **Subagents:** spawning a subagent (which runs its own loop, equally ungated)
+- **Memory / images / tasks:** `memory`, `generate_image`, `task_kill`, `subagent_kill`, plus evolve and publish when registered
 - **`/evolve`:** runtime and deep evolutions run without confirmation
 
-Read-only tools (`read_file`, `list_files`, `search_files`, `git_status`, `git_diff`) are always non-destructive.
+Read-only tools include `read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, and also status-style helpers such as `todo`, `web_fetch`, `web_search`, `task_output`, and `subagent_status`. MCP, scripted, and spawn tools are execute-class.
 
-There is no config key that restores a y/n gate. Earlier releases had an `auto_approve` flag; it was removed, and a config that still carries it loads fine: the key is ignored and never written back.
+Two gates still exist, and they are intentional:
 
-**Sovereign mode** adds non-interactive continuous operation on top of this: it completes the task then keeps going, self-directing and self-improving via `evolve` with no human in the loop, persisting a durable mission. A confused or prompt-injected model (in either mode) can run arbitrary commands as you. Only run Wizard on tasks and machines where that is acceptable, and prefer a container or VM for anything you would not run by hand (see "No sandbox" below).
+- **Plan mode** keeps non-read-only tools blocked until the agent presents a plan and you approve it (`exit_plan`).
+- **Hooks** (`pre_tool_use`) can block or rewrite a call before it runs.
+
+There is no config key that restores a y/n gate for ordinary execute/edit. Earlier releases had an `auto_approve` flag; it was removed, and a config that still carries it loads fine: the key is ignored and never written back.
+
+**Sovereign mode** is headless and autonomous for a single task: no TUI, no per-action gate, one mission, then exit. **Continuous mode** (`--continuous`, implies sovereign) is the perpetual loop: it keeps going after the task, self-directs, can self-improve via `evolve`, and persists a durable mission under `<project>/.wizard/mission.toml`. A confused or prompt-injected model (in any mode) can run arbitrary commands as you. Only run Wizard on tasks and machines where that is acceptable, and prefer a container or VM for anything you would not run by hand (see "No sandbox" below).
 
 Tool calls run with your full privileges. The boundary that matters is the machine and task you point Wizard at, not a prompt.
 
@@ -68,7 +74,7 @@ Be clear about what the smoke test is: it proves the new binary launches and rep
 - **Signed manifest.** Bundles are ed25519-signed: the manifest lists the sha256 of every file, `manifest.sig` signs the manifest, and the bundle embeds the sender's public key. Each machine's key seed lives at `~/.wizard/sync/key` (mode 0600).
 - **All-or-nothing verification.** `pull` checks the signature, then the trust list, then every file hash; nothing is written to `~/.wizard/` unless all of it passes.
 - **Trust on first use.** Like SSH: the first pull pins the sender's public key into `~/.wizard/sync/trusted_keys` and prints its fingerprint for out-of-band comparison (`wizard sync key` on the source machine). Later pulls reject bundles signed by unknown keys.
-- **Signed, not encrypted.** Anyone who obtains a bundle can read it. Credentials (`credentials.toml`, `xai_oauth.json`) are excluded by default; `--include-credentials` opts them in, writes the bundle file 0600, and prints a warning. Transfer such a bundle privately (`scp`), never over a public URL.
+- **Signed, not encrypted.** Anyone who obtains a bundle can read it. Credentials (`credentials.toml`, `xai_oauth.json`) are excluded by default; `--include-credentials` opts them in, writes the bundle file 0600, and prints a warning. ChatGPT OAuth (`chatgpt_oauth.json`) is not packed today. Transfer such a bundle privately (`scp`), never over a public URL.
 
 Be clear about what pinning a key means: a bundle carries commands, subagents, and scripted tools, which later run with your privileges. Trusting a machine's key in `trusted_keys` trusts whoever controls that machine to ship that state to this one.
 

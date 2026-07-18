@@ -16,7 +16,7 @@ Genie is the interactive, conversational mode. It's eager and creative ("your wi
 - Full Ratatui interface with chat history and tool output panels
 - Executes all tool calls directly; there is no per-action y/n prompt
 - Temperature: 0.8 (more creative responses)
-- Loop limit: none by default (`max_steps = 0`) — a turn runs until the model stops calling tools; Esc interrupts it
+- Loop limit: none by default (`max_steps = 0`). A turn runs until the model stops calling tools; Esc interrupts it
 - Best for: collaboration, exploration, incremental changes
 
 ### Flags
@@ -45,18 +45,16 @@ wizard
 wizard --mode sovereign -p "implement rate limiting on all API routes"
 ```
 
-Sovereign mode is the autonomous, proactive agent. It runs with minimal human intervention and keeps working until the task is done or limits are hit.
+Sovereign mode is the autonomous, proactive agent. It runs headless for a single task with minimal human intervention and keeps working until that task is done or limits are hit. It does **not** keep going after "done"; that is continuous mode (below).
 
 ### Behavior
 
-- Can run headless (no TUI) or with a minimal status display; on a terminal,
-  a busy spinner (same configurable verbs as the TUI's `[ui] spinner_verbs`)
-  shows while the model thinks or a tool runs
-- Auto-approves all tool calls
+- Runs headless (no TUI). On a terminal, a busy spinner (same configurable verbs as the TUI's `[ui] spinner_verbs`) shows while the model thinks or a tool runs
+- Auto-approves all tool calls (no per-action y/n)
 - Temperature: 0.6 (tighter tool-call formatting)
 - Loop limit: none by default; a `max_steps` capped below 100 is raised to 100, since nobody is at the prompt to say "continue"
 - Circuit breaker: stops after 3 consecutive identical failures
-- Best for: long-running refactors, test suites, multi-file features
+- Best for: long-running refactors, test suites, multi-file features, CI/scripted runs
 
 ### Flags
 
@@ -179,17 +177,18 @@ The status bar shows `PLAN` while plan mode is active, or `OMAKASE` in omakase m
 
 ```bash
 wizard --mode sovereign --plan -p "refactor the config loader"
+wizard --omakase -p "ship the smallest fix that passes the suite"
 ```
 
 | Knob | Effect |
 |------|--------|
 | `--plan` (flag) | This run starts in plan mode |
-| `--omakase` (flag) | This run starts in omakase mode (implies `--plan`) |
+| `--omakase` (flag) | Sets `omakase` + `plan_first` in config. The GUI applies chef's-choice on the agent; headless, continuous, and the gateway currently turn on plan mode from `plan_first` and still auto-approve `exit_plan` (the usual unattended plan-then-execute path). Full chef's-choice prompting (no interview, self-justifying plan) is live in the TUI, the GUI, and via the gateway's `/omakase` chat toggle |
 | `plan_first = true` (config) | Every session starts in plan mode |
-| `omakase = true` (config) | Every session starts in omakase mode (implies `plan_first`) |
+| `omakase = true` (config) | Implies `plan_first`. Applied as chef's-choice on TUI/GUI agent construction; headless/gateway use the plan_first path above unless `/omakase` is toggled on the gateway |
 | `plan_each_cycle = true` (config) | Continuous mode re-enters plan mode at the top of every cycle |
 
-With no human in the loop, `exit_plan` is auto-approved: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute, a natural two-phase plan-then-execute turn. (Omakase makes this explicit: the agent always decides for itself, with or without a human present.) The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
+With no human in the loop, `exit_plan` is auto-approved on the plain plan path: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute. Omakase, where it is fully applied, makes the agent decide for itself (no interview, plan written to `.wizard/plan.md` and surfaced before execution). The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
 
 The last presented plan is always available at `<project>/.wizard/plan.md`.
 
@@ -202,7 +201,7 @@ The last presented plan is always available at `<project>/.wizard/plan.md`.
 /genie             # shorthand for /mode genie
 ```
 
-Mode changes affect prompting, interaction style, and — if `max_steps` is capped — the step budget. Switching writes the new mode to `~/.wizard/config.toml`, so it survives a restart.
+Mode changes affect prompting, interaction style, and, if `max_steps` is capped, the step budget. Switching writes the new mode to `~/.wizard/config.toml`, so it survives a restart.
 
 ## System prompts
 
@@ -223,4 +222,4 @@ Both prompts include loaded skills from the `skills/` directory and any project-
 | Large multi-file refactor | Sovereign |
 | CI/automation/scripted runs | Sovereign |
 | Learning what the agent will do | Genie |
-| Overnight autonomous work | Sovereign |
+| Overnight autonomous work | Continuous (`--continuous`) |

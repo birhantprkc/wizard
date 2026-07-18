@@ -1,6 +1,6 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui front end on top of a provider-agnostic agent loop with an extensible tool set (native tools + MCP servers + scripted tools) and tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
+Wizard is a single-binary Rust application: a Ratatui TUI, a headless/sovereign loop, a browser GUI, and several other surfaces (ACP, MCP server, gateway, fleet, scheduler) on top of one provider-agnostic agent loop. The tool set is native tools plus MCP servers plus scripted tools, with tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, xAI (key or OAuth), ChatGPT OAuth, OpenRouter, Cloudflare Workers AI, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
 
 ## High-level overview
 
@@ -12,12 +12,16 @@ flowchart TB
     end
 
     subgraph runtime [wizard binary]
-        CLI[clap CLI] --> Mode{mode}
+        CLI[clap CLI] --> Mode{surface}
         Mode -->|genie| TUI[ratatui TUI]
-        Mode -->|sovereign| Headless[autonomous loop]
+        Mode -->|sovereign / continuous| Headless[autonomous loop]
+        Mode -->|gui / app| GUI[browser GUI]
+        Mode -->|acp / mcp-serve / gateway| Other[other surfaces]
         TUI --> Agent[agent loop]
         Headless --> Agent
-        Agent --> LLM["llama-server /v1 (OpenAI-compatible)"]
+        GUI --> Agent
+        Other --> Agent
+        Agent --> LLM["active LlmProvider"]
         Agent -.spawns when down.-> Server[llama-server lifecycle]
         Agent --> Tools[tool registry]
         Agent --> MCP[MCP client]
@@ -25,65 +29,67 @@ flowchart TB
         Agent --> Skills[skills loader]
         TUI --> Evolve["/evolve"]
         Evolve -->|tier 1| Live[register skill / MCP / scripted tool + reload]
-        Evolve -->|tier 2 --deep| Build[fetch source + cargo build + exec restart]
+        Evolve -->|tier 2 --deep| Build[fetch source + cargo build + install + restart]
     end
 
     install --> runtime
 ```
 
-## Crate layout (planned)
+## Source layout
 
 ```
 wizard/
 ├── src/
-│   ├── main.rs          # entry, terminal setup
-│   ├── cli.rs           # argument parsing
-│   ├── config.rs        # ~/.wizard/config.toml
-│   ├── app.rs           # TUI state machine
-│   ├── ui.rs            # ratatui rendering
-│   ├── event.rs         # keyboard/mouse events
-│   ├── agent/
-│   │   ├── mod.rs       # tool-calling loop
-│   │   ├── prompts.rs   # genie vs sovereign system prompts
-│   │   ├── subagent.rs  # isolated sub-context spawner
-│   │   └── session.rs   # JSONL session persistence
-│   ├── server.rs        # llama-server lifecycle: spawn / health / stop
-│   ├── llm/
-│   │   ├── provider.rs  # LlmProvider trait
-│   │   ├── llamacpp.rs  # llama-server client (default; wraps the OpenAI client)
-│   │   ├── openai.rs    # OpenAI-compatible streaming client
-│   │   ├── ollama.rs    # Ollama native /api/chat client
-│   │   └── anthropic.rs # Anthropic client
-│   ├── mcp/
-│   │   └── mod.rs       # MCP client (stdio / HTTP tool servers)
-│   ├── tools/
-│   │   ├── file.rs      # read, write, edit, list, search
-│   │   ├── shell.rs     # execute commands
-│   │   ├── git.rs       # status, diff
-│   │   └── registry.rs  # unified native + scripted + MCP tool registry
-│   ├── evolve/
-│   │   └── mod.rs       # tiered self-extension pipeline
-│   └── skills/
-│       └── mod.rs       # skills/*.md loader
-├── skills/              # bundled skill definitions
-├── loadout/             # canonical default loadout (mcp.toml, subagents/)
-├── install.sh           # the one installer (default / local / BYOM / minimal flavors)
-└── install-byom.sh      # back-compat shim: install.sh with WIZARD_BYOM=1
+│   ├── main.rs / lib.rs     # entry, surface dispatch
+│   ├── cli.rs               # clap argument parsing
+│   ├── config.rs            # ~/.wizard/config.toml
+│   ├── app.rs / ui.rs / event.rs / vim.rs
+│   ├── agent/               # tool-calling loop, prompts, subagents, mission, ultra
+│   ├── server.rs            # llama-server lifecycle
+│   ├── llm/                 # LlmProvider + per-vendor clients (incl. fusion, oauth)
+│   ├── mcp/                 # MCP client and mcp-serve server
+│   ├── tools/               # native tools + registry + scripted
+│   ├── evolve/              # tiered self-extension + publish
+│   ├── gui/                 # browser GUI HTTP/WS server
+│   ├── gateway/             # messaging bot (Telegram)
+│   ├── fleet/               # parallel worktree workers
+│   ├── schedule.rs          # cron-scheduled headless runs
+│   ├── bench/               # trajectory record/replay
+│   ├── hooks/               # pre/post tool hooks
+│   ├── acp.rs               # Agent Client Protocol surface
+│   ├── desktop.rs           # wizard app (system webview)
+│   ├── sync.rs              # signed config bundles
+│   ├── memory.rs / checkpoint.rs / usage.rs / update.rs / …
+│   └── skills/              # bundled skill loader
+├── skills/                  # bundled skill definitions
+├── loadout/                 # default mcp.toml + subagents
+├── docs/
+├── install.sh
+└── install-byom.sh          # back-compat shim: install.sh with WIZARD_BYOM=1
 ```
 
 ## Components
 
 ### CLI (`cli.rs`)
 
-Parses arguments and selects run mode:
+Parses arguments and selects the surface:
 
-| Flag | Purpose |
+| Flag / command | Purpose |
 |------|---------|
 | `--mode genie\|sovereign` | Personality |
-| `-p, --prompt` | Initial task (headless or pre-fill) |
-| `--evolve` | Self-extension mode |
-| `--max-hours` | Time limit (sovereign mode) |
+| `-p, --prompt` | Initial task (headless or TUI pre-fill) |
+| `--continuous` | Perpetual sovereign loop (implies sovereign) |
+| `--plan` / `--omakase` | Start in plan mode / chef's-choice plan mode |
+| `--evolve` / `--deep` | Self-extension mode |
+| `--publish` | Fork-and-distribute |
+| `--max-hours` / `--loop` | Sovereign run limits |
 | `--cwd` | Project root override |
+| `--bg` | Detached background session (dashboard) |
+| `--output-format text\|json\|stream-json` | Headless output |
+| `wizard gui` / `wizard app` | Browser GUI / desktop webview |
+| `wizard acp` | Agent Client Protocol over stdio |
+| `wizard mcp-serve` | Expose native tools as an MCP server |
+| `wizard agents` / `doctor` / `usage` / `update` / `sync` / `fleet` / `schedule` / `bench` / … | Utility subcommands |
 
 ### Config (`config.rs`)
 
@@ -103,23 +109,25 @@ model = "Qwen3.6-27B-Q4_K_M"
 gguf_path = "/home/you/.wizard/models/Qwen3.6-27B-Q4_K_M.gguf"
 ```
 
-When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:11435` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry).
+When no `[[providers]]` are configured, Wizard synthesizes a local llama.cpp provider at `http://127.0.0.1:11435` (legacy `model` / `ollama_host`-only files included; Ollama is opt-in via an explicit `[[providers]]` entry). `WIZARD_OLLAMA_HOST` overrides `ollama_host` for explicit Ollama providers; it does not flip the synthesized default off llama.cpp.
 
-At TUI startup, a missing or unstartable local backend isn't fatal. Wizard falls back in order: any configured cloud provider, then one synthesized from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then the interactive onboarding wizard. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
+At TUI startup, a missing or unstartable local backend is not fatal. Wizard falls back in order: any configured cloud provider, then one synthesized from known API key env vars, then interactive onboarding. The fallback becomes the session's active provider in memory; only onboarding writes config to disk.
 
 ### LLM clients (`llm/`)
 
-All providers implement the `LlmProvider` trait (health, model listing, streaming chat). The default, `llm/llamacpp.rs`, drives llama.cpp's `llama-server` through its OpenAI-compatible `/v1/chat/completions` endpoint (it composes the `llm/openai.rs` client rather than duplicating it) and probes the server's native `GET /health`:
+All providers implement the `LlmProvider` trait (health, model listing, streaming chat, optional context-window probe). Clients include:
 
-- Streaming token delivery to the TUI
-- Native tool-call round-trips, with a prompt-based JSON fallback when the model lacks native tool support
-- Actionable errors when the server is down (`llama-server -m <model.gguf> --port 11435`)
+- `llamacpp.rs`: default local path; OpenAI-compatible `/v1` plus native `/health` and `/props`
+- `openai.rs`: generic OpenAI-compatible endpoints
+- `anthropic.rs`, `ollama.rs`, `openrouter.rs`, `xai` (via openai + oauth), `cloudflare.rs`
+- `chatgpt.rs` / `chatgpt_oauth.rs`: ChatGPT subscription via Codex backend
+- `fusion.rs`: multi-provider debate panel as one `LlmProvider`
 
-`llm/ollama.rs` is a thin `reqwest` client over Ollama's native `/api/chat` endpoint (not the `/v1` shim; the native endpoint exposes Ollama's streaming and `tool_calls` fields directly), with its own health probe (`GET /api/tags`) and no `ollama-rs` dependency. `llm/anthropic.rs` covers the Anthropic API.
+Streaming tokens, native tool calls, and a prompt-based JSON fallback when the model lacks native tools all live behind the same trait.
 
 ### llama-server lifecycle (`server.rs`)
 
-When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself, at TUI/headless/gateway startup and after `/provider use` switches to a llama.cpp provider. Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group (it survives Wizard's exit and Ctrl-C), logs to `~/.wizard/llama-server.log`, and its PID is recorded in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s (503 = model still loading). `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling, so a recycled PID can never kill an unrelated process.
+When the active provider is llama.cpp and nothing answers at its `base_url`, Wizard starts `llama-server` itself (TUI/headless/gateway startup and after `/provider use` switches to llamacpp). Requirements: the URL points at this machine, `llama-server` is on `PATH`, and the provider's `gguf_path` exists. The child is detached in its own process group, logs to `~/.wizard/llama-server.log`, and records its PID in `~/.wizard/llama-server.pid`. Readiness is polled at `GET /health` for up to 60 s. `/server status|start|stop` manages it from the TUI; `stop` verifies the recorded PID is still a `llama-server` before signalling.
 
 ### Agent loop (`agent/mod.rs`)
 
@@ -129,31 +137,22 @@ When the active provider is llama.cpp and nothing answers at its `base_url`, Wiz
 │     system prompt + skills + history    │
 │  2. Stream completion from the provider │
 │  3. Parse tool calls from response      │
-│  4. Execute tools → append results        │
+│  4. Execute tools → append results      │
 │  5. Repeat until the model is done      │
 └─────────────────────────────────────────┘
 ```
 
-A turn runs until the model stops calling tools. `max_steps = 0` (the default) puts no ceiling on that; a positive `max_steps` caps the round trips and ends the turn in `DoneReason::MaxSteps` when the budget is spent. Either way a turn is also bounded by a user interrupt or the sovereign loop-control file (`DoneReason::Stopped`), the `--max-hours` limit (`TimeLimit`), and the circuit breaker after repeated identical failures (`CircuitBreaker`).
+A turn runs until the model stops calling tools. `max_steps = 0` (the default) puts no ceiling on that; a positive `max_steps` caps the round trips. A turn is also bounded by a user interrupt or the sovereign loop-control file, the `--max-hours` limit, and the circuit breaker after repeated identical failures.
 
-Sessions are appended to `~/.wizard/sessions/<timestamp>.jsonl` after each turn.
-Auto-compaction and the agent's own `/compact` (via `run_command`) shrink the
-in-memory history while leaving the JSONL intact — prior conversation is always
-recoverable from disk. See [Agent-managed context](usage.md#agent-managed-context).
+Sessions append to `~/.wizard/sessions/<timestamp>.jsonl` after each turn. Auto-compaction and the agent's own `/compact` (via `run_command`) shrink in-memory history while leaving the JSONL intact. See [Agent-managed context](usage.md#agent-managed-context).
+
+Genie is the interactive TUI personality. Sovereign is headless autonomy for one task. Continuous (`--continuous`) is perpetual sovereign: durable mission under `<project>/.wizard/mission.toml`, sleep-and-wake on provider blips, context compaction, and re-exec after evolve. Details in [modes.md](modes.md).
 
 ### Images
 
-Images move through the loop in both directions. A tool returns them on its `ToolOutput`
-(`images: Vec<Image>`); a model generates them, and its provider emits them on the streaming
-`ChatChunk` (`images` — the seam an image endpoint plugs into). Either way the agent takes
-custody in one place, `agent::absorb_images`: it drops anything over the size cap, writes the
-rest to `~/.wizard/images/<session>/<content-hash>.<ext>`, and announces them as
-`AgentEvent::Images` — a path, a media type, a size, never base64.
+Images move through the loop in both directions. A tool returns them on `ToolOutput`; a model generates them and the provider emits them on the stream. The agent takes custody in `agent::absorb_images`: drops anything over the size cap, writes the rest to `~/.wizard/images/<session>/<content-hash>.<ext>`, and announces `AgentEvent::Images` (path, media type, size; never base64 on the wire to the UI).
 
-The base64 stays on the `ChatMessage` in history, where a vision model needs it, and the path
-is recorded next to it so a replayed transcript needs no re-derivation. A tool's images ride
-back to the model on a *following user message*, not on the tool result: OpenAI's tool role
-takes no image blocks, but a user message carries images on every provider.
+Base64 stays on the `ChatMessage` in history for vision models. A tool's images ride back to the model on a following user message, not on the tool result (OpenAI's tool role takes no image blocks).
 
 ### Tools (`tools/`)
 
@@ -164,110 +163,107 @@ takes no image blocks, but a user message carries images on every provider.
 | `edit_file` | Search-and-replace edit |
 | `list_files` | Directory listing with glob filter |
 | `search_files` | Ripgrep/grep content search |
-| `execute` | Run shell command with timeout; `run_in_background` detaches it as a background task ([tasks.md](tasks.md)) |
-| `git_status` | Working tree status |
-| `git_diff` | Staged/unstaged diff |
-| `web_fetch` | Fetch a URL, HTML converted to markdown; SSRF-guarded ([web.md](web.md)) |
-| `web_search` | Web search via DuckDuckGo (default), Brave, Tavily, or xAI Grok ([web.md](web.md)) |
-| `generate_image` | Generate an image via xAI Imagine (or any OpenAI-compatible images endpoint); saves under `generated/` ([image.md](image.md)) |
-| `task_output` | Status and buffered output of a background task ([tasks.md](tasks.md)) |
-| `task_kill` | Kill a running background task ([tasks.md](tasks.md)) |
-| `run_command` | Run one of Wizard's own slash commands (e.g. `/effort high`, `/model`, `/compact`); dispatched by the TUI after the turn ([usage.md](usage.md#agent-run-slash-commands)) |
+| `execute` | Run shell command with timeout; `run_in_background` detaches ([tasks.md](tasks.md)) |
+| `git_status` / `git_diff` | Working tree status and diffs |
+| `web_fetch` / `web_search` | HTTP fetch and search ([web.md](web.md)) |
+| `generate_image` | Image generation ([image.md](image.md)) |
+| `memory` / `todo` | Durable project memory and working todo list |
+| `task_output` / `task_kill` | Background shell task controls |
+| `subagent_status` / `subagent_kill` | Background subagent controls |
+| `run_command` | Queue a Wizard slash command for the attached surface ([usage.md](usage.md#agent-run-slash-commands)) |
+| `spawn_subagent` | Fan out work to a named subagent (agent registry, not mcp-serve) |
+| `exit_plan` / `interview` | Plan-mode completion and clarifying questions |
+| `evolve` / `publish` | Self-extension and fork-and-distribute |
 
-Neither mode has a per-action approval gate. Genie is conversational and interactive; sovereign works continuously without human input.
+There is no per-action y/n gate outside plan mode and hooks. Genie is conversational; sovereign/continuous run unattended. Plan mode keeps non-read-only tools blocked until `exit_plan` is approved (or omakase auto-approves).
 
-Beyond these built-ins, the registry also serves scripted tools (agent-authored scripts in `~/.wizard/tools/`, run through the `execute` sandbox; the Hermes `execute_code` analog) and MCP tools (see below). All three kinds present the same interface to the agent loop, so the model calls them identically.
+Beyond the built-ins, the registry also serves scripted tools (`~/.wizard/tools/`) and MCP tools. All three kinds present the same interface to the agent loop.
 
-### MCP client (`mcp/`)
+### MCP (`mcp/`)
 
-Wizard speaks the Model Context Protocol as a client, so external capabilities plug in without recompiling the binary:
+Wizard is both an MCP client and an MCP server:
 
-- Servers are declared in `~/.wizard/mcp.toml` (stdio or HTTP transport)
-- On startup (and on `/reload`), Wizard lists each server's tools and merges them into the registry
-- This is the supported path for computer use, browser control, database access, and any other capability shipped as an MCP server
-- `/evolve` can register a new MCP server live (tier 1) without a rebuild
+- **Client:** servers in `~/.wizard/mcp.toml` (stdio or HTTP). On startup and `/reload`, tools are listed and merged into the registry. This is the path for browser control, computer use, databases, and similar.
+- **Server:** `wizard mcp-serve` exposes the native tool set over stdio. See [mcp.md](mcp.md).
 
 ### Subagents (`agent/subagent.rs`)
 
-The agent can spawn isolated subagents for parallel or decomposed work:
+Isolated workers for parallel or decomposed work:
 
-- Each subagent gets its own message history, step budget, and tool scope
-- Results return to the parent as a single tool result, so a multi-step sub-task costs the parent one turn of context
-- `spawn_subagent` can detach a run into the background: the parent keeps working (and the user keeps chatting) while the subagent runs, and its report lands in context when it finishes
-- Every run emits `SubagentRun*` events keyed by a run id; the TUI demuxes them into one pane per run on the [subagent rail](usage.md#the-subagent-rail), headless surfaces print them inline as `<name> ▸ <tool>`
-- Sovereign mode uses these to fan out across multi-file tasks; [fleet mode](fleet.md) coordinates parallel workers over git worktrees
+- Each subagent gets its own history, step budget, and tool scope
+- Results return to the parent as one tool result
+- `spawn_subagent` can detach (`background: true`); the report lands when finished
+- Runs emit `SubagentRun*` events; the TUI demuxes them onto the [subagent rail](usage.md#the-subagent-rail)
+- Fleet mode coordinates parallel workers over git worktrees ([fleet.md](fleet.md))
 
 ### Skills (`skills/`)
 
-Markdown files with frontmatter that get injected into the system prompt:
-
-```
-skills/
-├── coding/SKILL.md     # general coding guidelines
-└── evolve/SKILL.md     # self-extension instructions
-```
-
-Skills are loaded at startup and on `/reload`.
+Markdown files with frontmatter injected into the system prompt. Loaded at startup and on `/reload`. Bundled skills live under the repo's `skills/`; user skills under `~/.wizard/skills/`.
 
 ### Self-extension (`evolve/`)
 
-Triggered by `/evolve` in the TUI or `--evolve` on the CLI. Self-extension is split into two tiers so it works on the prebuilt binary, not just dev installs. Full walkthrough in [evolve.md](evolve.md).
+Triggered by `/evolve`, the `evolve` tool, or `--evolve` on the CLI. Two tiers; full walkthrough in [evolve.md](evolve.md).
 
-**Tier 1, runtime extension (default; no recompile).** Adds a skill, registers an MCP server, authors a scripted tool, or configures a subagent. Changes are written under `~/.wizard/` and activated by `/reload`. This covers most new capability (including computer use, via MCP) and works on every install.
+**Tier 1 (runtime, default).** Skill, MCP server, scripted tool, or subagent under `~/.wizard/`, activated by `/reload`.
 
-**Tier 2, deep evolve (`/evolve --deep`; recompiles core).** For changes that require new Rust in the core:
+**Tier 2 (deep, `--deep`).**
 
-1. Locate source (`~/.wizard/src`; cloned from the repo on first use)
-2. Ensure a Rust toolchain (installed via `rustup` on first use if absent; see [Install scripts](#install-scripts))
-3. Agent proposes a unified diff over its own source
-4. `cargo build --release`
-5. Replace the running process via `exec` (hot-reload)
+1. Locate source at `~/.wizard/src` (clone on first use; `WIZARD_SOURCE_REPO` overrides the URL)
+2. Ensure a Rust toolchain (`rustup --profile minimal` if needed)
+3. Propose a unified diff (file-selection turn, then diff-authoring turn)
+4. `cargo build --release` and a `--version` smoke test
+5. Install over the running binary (keep `<name>.prev`); fall back to the build tree if the install path is not writable
+6. Restart into the new binary when the surface supports it (CLI `exec`-replace, continuous re-exec marker; interactive sessions report and expect a restart)
 
-If no toolchain or source is available and it can't be provisioned, deep evolve falls back to Tier 1 with a clear message. Evolution events are logged to `~/.wizard/evolution.jsonl`.
+Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard/src` to a GitHub fork ([market.md](market.md)).
 
-### TUI (`app.rs`, `ui.rs`, `event.rs`)
+### Surfaces
 
-Ratatui + crossterm terminal UI:
-
-- Chat panel with streaming markdown
-- Tool invocation cards (collapsible)
-- Git diff sidebar
-- Subagent rail under the composer: one row per run, openable as a full chat view of that subagent's own transcript
-- Status bar: model, mode, step count
-- Command mode for `/slash` commands
+- **TUI** (`app.rs`, `ui.rs`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
+- **Headless** (`agent` + `output.rs`): text / JSON / stream-json ([headless.md](headless.md))
+- **GUI / app** (`gui/`, `desktop.rs`): same agent core over HTTP/WS; system webview for `wizard app` ([desktop.md](desktop.md))
+- **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md))
+- **Gateway** (`gateway/`): Telegram bot turns ([gateway.md](gateway.md))
+- **Fleet / schedule / bench / sync / doctor / update**: see the matching docs pages
 
 ## Data on disk
 
 | Path | Contents |
 |------|----------|
 | `~/.wizard/config.toml` | User configuration |
+| `~/.wizard/credentials.toml` | API keys (mode 0600) |
+| `~/.wizard/xai_oauth.json` / `chatgpt_oauth.json` | OAuth sessions (mode 0600) |
 | `~/.wizard/models/*.gguf` | Downloaded GGUF model files |
-| `~/.wizard/llama.cpp/` | llama.cpp release tree installed by `install.sh` |
-| `~/.wizard/llama-server.log` | Output of llama-servers Wizard spawned |
-| `~/.wizard/llama-server.pid` | PID of the llama-server Wizard spawned |
-| `~/.wizard/mcp.toml` | MCP server declarations (Playwright browser by default) |
-| `~/.wizard/subagents/*.toml` | Subagent definitions (default roster: reviewer, researcher, tester, documenter) |
+| `~/.wizard/llama.cpp/` | llama.cpp release tree from the installer |
+| `~/.wizard/llama-server.log` / `.pid` | Managed llama-server |
+| `~/.wizard/mcp.toml` | MCP server declarations |
+| `~/.wizard/subagents/*.toml` | Subagent definitions |
 | `~/.wizard/tools/` | Agent-authored scripted tools |
-| `~/.wizard/src/` | Source checkout for deep evolve (created on demand) |
+| `~/.wizard/src/` | Source checkout for deep evolve |
 | `~/.wizard/sessions/*.jsonl` | Chat history |
-| `~/.wizard/images/<session>/` | Images produced in a session (tool output or model-generated), named by content hash |
-| `~/.wizard/evolution.jsonl` | Self-extension log |
-| `~/.wizard/sync/key` | Ed25519 signing-key seed for `wizard sync` (mode 0600; see [sync.md](sync.md)) |
-| `~/.wizard/sync/trusted_keys` | Public keys `wizard sync pull` accepts, one per line, pinned on first use |
-| `~/.wizard/sync/backups/` | Timestamped backups of files overwritten by `wizard sync pull` |
+| `~/.wizard/memory/<project>/` | Durable project memory |
+| `~/.wizard/images/<session>/` | Session images |
+| `~/.wizard/evolution.jsonl` | Self-extension / publish log |
+| `~/.wizard/usage.jsonl` | Token usage log |
+| `~/.wizard/running/` | Live session heartbeats for `wizard agents` |
+| `~/.wizard/sync/` | Sync key, trusted keys, pull backups |
 | `~/.wizard/logs/` | Debug traces |
-| `.wizard/loop-control` | Sovereign-mode run control (per project) |
-| `.wizard/checkpoints/` | Per-file edit snapshots powering `/rewind` (per project; see [checkpoints.md](checkpoints.md)) |
+| `<project>/.wizard/loop-control` | Sovereign/continuous run control |
+| `<project>/.wizard/mission.toml` | Continuous-mode durable mission |
+| `<project>/.wizard/plan.md` | Last plan-mode plan |
+| `<project>/.wizard/checkpoints/` | Per-file edit snapshots for `/rewind` |
 
 ## Install scripts
 
-### `install.sh` (the one installer)
+### `install.sh`
 
-By default it installs the binary and the [default loadout](loadout.md) (browser MCP + subagents, embedded as heredocs mirroring `loadout/`): no model, no config, no Rust toolchain. The first `wizard` run opens onboarding to pick a provider. Flavors: `WIZARD_LOCAL=1` preinstalls the local stack non-interactively (llama.cpp's `llama-server` from official ggml-org releases, a VRAM-tiered Qwen 3 GGUF, and `config.toml`; no server starts at install time, Wizard spawns it on first run), `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor and implies it, `WIZARD_BYOM=1` sets up Ollama and defers the model choice to onboarding (`WIZARD_MODEL=<tag>` pulls and configures it headlessly), and `WIZARD_MINIMAL=1` installs the binary only (onboarding on first run; `WIZARD_BESPOKE=1` is a deprecated alias). The toolchain required for deep evolve (Tier 2) installs via `rustup --profile minimal` on the first `/evolve --deep` (~0.5–1 GB). Set `WIZARD_WITH_TOOLCHAIN=1` to install it at setup time instead (e.g. for air-gapped machines).
+By default: binary + [default loadout](loadout.md) (browser MCP + subagents). No model, no config, no Rust toolchain. First `wizard` run opens onboarding.
 
-### `install-byom.sh` (back-compat shim)
+Flavors: `WIZARD_LOCAL=1` preinstalls the local stack; `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor; `WIZARD_BYOM=1` sets up Ollama and defers the model choice; `WIZARD_MINIMAL=1` is binary only (`WIZARD_BESPOKE=1` is a deprecated alias). Deep-evolve toolchain installs on first `/evolve --deep`, or eagerly with `WIZARD_WITH_TOOLCHAIN=1`.
 
-Kept so the old BYOM one-liner URL still works: it downloads `install.sh` and runs it with `WIZARD_BYOM=1`. With the llama.cpp default, "bring your own model" usually just means pointing `gguf_path` at any GGUF; see [byom.md](byom.md).
+### `install-byom.sh`
+
+Back-compat shim: downloads `install.sh` and runs it with `WIZARD_BYOM=1`.
 
 ## Dependencies
 
@@ -275,27 +271,26 @@ Kept so the old BYOM one-liner URL still works: it downloads `install.sh` and ru
 |-------|------|
 | `ratatui` + `crossterm` | Terminal UI |
 | `tokio` | Async runtime |
-| `reqwest` | Provider HTTP (llama-server, Ollama, cloud) |
+| `reqwest` | Provider HTTP |
+| `axum` | GUI HTTP/WS |
 | `clap` | CLI parsing |
 | `serde` / `serde_json` | Serialization |
 | `toml` + `dirs` | Config |
 | `syntect` | Syntax highlighting in diffs |
 
-Target release binary: **< 60 MB** (strip + LTO).
+Target release binary: well under 60 MB stripped (current builds are much smaller).
 
 ## Security model
 
-- Inference goes to the active provider and nowhere else: a local server (llama.cpp or Ollama) with the local option, or the configured cloud API
-- Beyond the active provider, the core makes outbound calls only for the things you invoke: the native web tools (`web_fetch` / `web_search`, [web.md](web.md)), the messaging gateway, the GGUF/model download during install, and deep evolve's source clone. MCP servers and scripted tools you add can make their own network and system calls; they run with your privileges, so only register ones you trust
-- The `execute` tool runs real shell commands and cannot be confined to the working directory (absolute paths, `cd ..`, and pipes are all reachable). Treat tool execution as full local access, not a sandbox
-- Both modes execute tool calls (writes, shell, git, and `/evolve` changes) directly: there is no approval gate. The modes differ in interactivity and continuity: genie is conversational; **sovereign works unattended and self-directs continuously**. Run either mode only on tasks and repos where unattended local command execution is acceptable
-- Official Qwen 3.6 models retain their safety training
+- Inference goes to the active provider and nowhere else
+- Beyond the active provider, the core makes outbound calls only for things you invoke: native web tools, the messaging gateway, model download at install, deep evolve's source clone. MCP servers and scripted tools you add can make their own calls; they run with your privileges
+- The `execute` tool runs real shell commands and cannot be confined to the working directory. Treat tool execution as full local access
+- There is no per-action y/n gate outside plan mode and hooks. Genie is interactive; sovereign runs one task unattended; continuous is perpetual. Prefer a container or VM for untrusted work. Full threat model in [SECURITY.md](../SECURITY.md)
 
-## Roadmap additions
+## Roadmap-shaped ideas
 
-Not yet built, in no particular order:
+Not commitments, just directions that have come up:
 
 - Plugin marketplace (dynamic `.so` / WASM)
-- `ollama launch wizard` (Ollama-native launcher integration)
-- tree-sitter symbol search
-- Remote subagent execution
+- Richer ACP surface (images, todos, subagent events)
+- Deeper GUI parity with every TUI command

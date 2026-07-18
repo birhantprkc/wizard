@@ -93,11 +93,12 @@ When a change needs new Rust in Wizard itself (a new built-in tool kind, a proto
 
 The pipeline:
 
-1. **Locate source**: `~/.wizard/src`, cloned from the repo on first use.
+1. **Locate source**: `~/.wizard/src`, cloned from the upstream repo on first use (override the clone URL with `WIZARD_SOURCE_REPO` if you want a fork or mirror).
 2. **Ensure a toolchain**: if `cargo` is absent, install it via `rustup --profile minimal` (~0.5–1 GB, first deep evolve only). The default installer ships no toolchain; you pay for the compiler only if you use this tier.
 3. **Propose a diff** over Wizard's own source, in two model turns: a file-selection turn picks the relevant files from the repository listing (with a keyword-matching fallback when it fails), then the diff-authoring turn sees those files' actual contents (up to 8 files under a ~96 kB budget) so its hunks match the real source and survive `git apply --check`.
-4. **`cargo build --release`.**
-5. **`exec`-replace** the running process with the new binary.
+4. **`cargo build --release`**, then a **`--version` smoke test** on the fresh binary. Build or smoke failure reverts the diff and leaves the running binary alone.
+5. **Install** the new binary over the running executable (keeping the prior one as `<name>.prev` in the same directory). If the install path is not writable, Wizard keeps the build under `~/.wizard/src/target/release/wizard` and runs from there instead.
+6. **Restart into the new binary** when the surface supports it: the CLI path (`wizard --evolve --deep`) `exec`-replaces immediately; continuous mode writes an `evolve-reexec` marker and re-execs at a safe boundary; the interactive TUI/tool path reports the install and expects a restart (or continuous's own re-exec).
 
 If there's no toolchain or source and one can't be provisioned (offline, no `rustup`), deep evolve falls back to Tier 1 and says so, rather than failing.
 

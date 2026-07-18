@@ -33,13 +33,13 @@ inline hints.
 | `/todos` | Toggle the todo list above the input |
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
 | `/memory [read\|forget <name>]` | List the saved project memories, show one, or forget one ([memory.md](memory.md)) |
-| `/status` | Session status: model, provider, mode, session id, usage, todo progress, background tasks |
+| `/status` | Session status: model, provider, mode, effort, session id, usage, todo progress, background tasks, plan/omakase, ultra (GUI also prints current context tokens) |
 | `/doctor` | Environment diagnostics, same checks as `wizard doctor` ([doctor.md](doctor.md)) |
 | `/provider …` | Add, remove, or switch LLM providers; no arguments opens the interactive menu |
 | `/fusion [config]` | Toggle model fusion, or configure the panel ([fusion.md](fusion.md)) |
 | `/ultra [config]` | Toggle mixture of agents, or configure the roster ([ultra.md](ultra.md)) |
 | `/server [status\|start\|stop]` | Manage the local llama-server |
-| `/login <provider>` | OAuth sign-in for providers that support it (currently `xai`) |
+| `/login <provider>` | OAuth sign-in for providers that support it (`xai`, `chatgpt`) |
 | `/publish [branch]` | Fork Wizard to your GitHub and get a one-line installer ([market.md](market.md)) |
 | `/settings` | Open the in-app settings menu |
 | `/vim` | Toggle modal (vim-style) editing of the input composer |
@@ -52,7 +52,7 @@ references.
 ### Agent-run slash commands
 
 The agent can run these same commands itself with the native `run_command`
-tool — it passes a command line exactly as you would type it (e.g.
+tool, it passes a command line exactly as you would type it (e.g.
 `/effort high`, `/model claude-sonnet-5`, `/compact`, `/reload`). So the agent
 can raise its own reasoning effort for a hard task, switch models, compact its
 context, or reload skills without you stepping in. Compaction is the main
@@ -62,24 +62,24 @@ rather than wait for the automatic threshold. See
 [Agent-managed context](#agent-managed-context).
 
 Because a turn already in flight can't be reconfigured, a queued command runs
-the moment that turn finishes — effort, model, and mode changes therefore take
+the moment that turn finishes, effort, model, and mode changes therefore take
 effect on the **next** turn. Commands that need you at an interactive picker
 (`/effort` with no argument), that end or rewind the session (`/quit`,
 `/clear`, `/rewind`, `/resume`), or that set up providers (`/provider`,
 `/login`, `/publish`, `/evolve`) stay your call and are refused with a note the
 agent sees. Only the interactive TUI applies these commands, so the tool is
-refused outright in headless `-p` runs, the gateway, and subagents — nothing is
+refused outright in headless `-p` runs, the gateway, and subagents, nothing is
 silently dropped.
 
 ### Queued user messages
 
 While a turn is running you can keep typing and press **Enter**. The message
-lands in the transcript immediately, is announced with a "queued — will send
-after this turn" notice, and runs automatically once the current turn finishes
+lands in the transcript immediately, is announced with a "queued (will send
+after this turn)" notice, and runs automatically once the current turn finishes
 (after any slash commands the agent itself queued via `run_command`). Multiple
 messages stack FIFO; the status bar shows `queued N` while any are waiting.
 The queue is capped (32); overflow keeps the composer text so nothing is lost.
-`/clear` and Ctrl-C interrupt both drop the queue — a cleared or interrupted
+`/clear` and Ctrl-C interrupt both drop the queue, a cleared or interrupted
 conversation shouldn't auto-fire prompts that no longer apply.
 
 ## `wizard agents` and background subagents
@@ -105,7 +105,7 @@ background `execute` tasks run (`/bashes` lists those).
 
 ## The subagent rail
 
-Every subagent run — foreground or background — gets a row on the rail, which
+Every subagent run, foreground or background, gets a row on the rail, which
 sits between the composer and the status bar. It costs no screen space until
 something has been delegated.
 
@@ -121,16 +121,16 @@ its latest message), the elapsed clock, and `+N`: how much it has done since
 you last looked at it. Five rows show at most, then a `+N more` marker.
 
 Enter opens the selected run: that subagent's own conversation replaces the
-main chat — its messages and its collapsible tool cards, drawn by the same
-renderer — under a header naming the run.
+main chat, its messages and its collapsible tool cards, drawn by the same
+renderer, under a header naming the run.
 
 ```text
  ▌ researcher · running · 0:42 · 6 steps
    find the latest Tokio release notes  esc back · ↑↓ next agent
 ```
 
-↑/↓ keep walking the runs once you are inside one — each takes over the screen
-in turn, wrapping around — so browsing does not end when you open something.
+↑/↓ keep walking the runs once you are inside one, each takes over the screen
+in turn, wrapping around, so browsing does not end when you open something.
 Esc is only for leaving.
 
 A foreground run is marked `· foreground` there: the parent turn is blocked
@@ -153,7 +153,7 @@ A finished run rests on the rail for a few seconds and then retires, so the rail
 stays a picture of live work rather than a log of every subagent the session
 ever ran. Nothing is lost: a run's report is the output of the `spawn_subagent`
 card in the main chat, which a background run writes back to when it lands. A
-run you are watching never retires under you — its clock starts when you leave.
+run you are watching never retires under you, its clock starts when you leave.
 
 ↓ only enters the rail when you are not part-way through input history, where
 it keeps walking history. Any key the rail does not use returns focus to the
@@ -172,7 +172,7 @@ Wizard accumulates the prompt/completion token counts every provider reports
 on its final stream chunk.
 
 - **TUI**: the status bar shows how many tokens the **next** model call will
-  load into context (`12.3k tok`) — the last reported prompt size, falling
+  load into context (`12.3k tok`), the last reported prompt size, falling
   back to a char/4 estimate of the remaining history after `/clear` or
   `/compact`. It is *not* a session-lifetime sum (those double-count multi-step
   history and stay inflated after a clear). `/cost` still prints the full
@@ -219,8 +219,8 @@ path (`.wizard/plan.md`).
 ## Agent-managed context
 
 Wizard already persists every turn to `~/.wizard/sessions/<id>.jsonl` and
-auto-compacts as above. The agent is also taught — via a block in its system
-prompt — to steward that window deliberately instead of waiting for the
+auto-compacts as above. The agent is also taught, via a block in its system
+prompt, to steward that window deliberately instead of waiting for the
 threshold:
 
 | Situation | What the agent should do |
@@ -228,8 +228,8 @@ threshold:
 | Long investigation, finished sub-goal, or older tool dumps drowning the current task | `run_command` → `/compact` (summarizes older history into a progress note; recent tail stays verbatim) |
 | User pivots to an unrelated task | Save durable facts with `memory`, rewrite the todo list, then `/compact`. Full prior transcript remains on disk as the session JSONL |
 | New task must not see the old work at all | Ask the user for `/clear` (agent cannot run it). `/clear` rotates to a fresh session file; the previous JSONL is kept under `~/.wizard/sessions/` |
-| Noisy multi-step work | `spawn_subagent` so intermediate steps never enter the parent context — only the final report does |
-| Need a pressure check | `run_command` → `/status` (interactive surfaces) reports the current context size |
+| Noisy multi-step work | `spawn_subagent` so intermediate steps never enter the parent context, only the final report does |
+| Need a pressure check | Look at the TUI status bar's token readout (next-call context estimate), or `run_command` → `/status` on the GUI (which prints a `context: N tokens` line). Session lifetime totals stay on `/cost` |
 
 `run_command` is only available on interactive surfaces (TUI / GUI). Headless
 `-p`, the gateway, and continuous mode still auto-compact; there the agent
@@ -245,7 +245,7 @@ the plan gate, so the agent can draft its list while planning.
 
 - **TUI**: a compact band just above the input mirrors the list (`/todos`
   toggles it; it auto-shows on the first update). The band reserves layout
-  space so it never covers chat text — the transcript shrinks above it.
+  space so it never covers chat text, the transcript shrinks above it.
 - **Headless**: each update prints `≡ todo: 2/5 done (current: <item>)`.
 - **Subagents** get the tool too, with their own isolated list.
 
