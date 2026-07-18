@@ -181,11 +181,6 @@ impl ImageCache {
         Self::new(Some(Picker::halfblocks()))
     }
 
-    /// Nothing can be drawn: an image is its caption line and no more.
-    pub fn text_only() -> Self {
-        Self::new(None)
-    }
-
     /// The protocol images are drawn with, or `None` when they are not drawn.
     pub fn protocol(&self) -> Option<ProtocolType> {
         self.picker.as_ref().map(Picker::protocol_type)
@@ -523,7 +518,7 @@ mod tests {
     #[test]
     fn no_terminal_support_means_no_rows_are_reserved() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cache = ImageCache::text_only();
+        let mut cache = ImageCache::new(None);
         assert_eq!(cache.protocol(), None);
         assert_eq!(
             cache.layout(&quartered_png(dir.path(), 64), budget(60, 16)),

@@ -276,8 +276,7 @@ fn rejects_temperature(model: &str) -> bool {
 /// not carry call ids.
 ///
 /// User messages with [`ChatMessage::images`] become multimodal content arrays
-/// (`text` + `image_url` data-URLs). Paths that fail to load fall back to a
-/// text note so the turn still proceeds.
+/// (`text` + `image_url` data-URLs).
 fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
     let mut pending: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
     let mut seq: u64 = 0;

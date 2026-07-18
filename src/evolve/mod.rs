@@ -238,7 +238,7 @@ Native tool names available for "tool_scope": read_file, write_file, edit_file, 
 Picking a channel: use a skill for knowledge or process, an mcp_server for capabilities that live outside Wizard, a scripted_tool for small executable glue, and a subagent for a specialized, reusable sub-worker. Keep names short and filesystem-safe. Make the artifact complete and immediately usable."##;
 
 /// System prompt for the deep-evolve (Tier 2) diff-authoring turn.
-const DEEP_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve engineer. Wizard is a single-binary Rust 2024 agent (Ratatui TUI + Ollama-backed agent loop) and you are modifying its own source checkout. Produce ONE unified diff that implements the requested change.
+const DEEP_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve engineer. Wizard is a single-binary Rust 2024 agent (Ratatui TUI + multi-provider agent loop) and you are modifying its own source checkout. Produce ONE unified diff that implements the requested change.
 
 Rules:
 - Output ONLY the diff, inside a single ```diff fenced code block. No other text.
@@ -516,7 +516,7 @@ impl Evolver {
 
     // ---- Deep-evolve pipeline (tier 2) ----
 
-    /// The full Tier-2 pipeline: source + toolchain, diff proposal, approval,
+    /// The full Tier-2 pipeline: source + toolchain, diff proposal,
     /// build, install. Falls back to Tier 1 when source/toolchain cannot be
     /// provisioned. Logs its own events (it needs the diff and build result).
     async fn run_deep(&mut self, request: &EvolveRequest) -> Result<EvolveOutcome> {

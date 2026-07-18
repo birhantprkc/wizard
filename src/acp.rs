@@ -189,24 +189,21 @@ impl acp::Agent for WizardAcp {
             updates: self.updates.clone(),
             next_call_id: Rc::clone(&self.next_call_id),
             open_calls: HashMap::new(),
-            saw_error: false,
         };
         let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
         let collector = async {
             while let Some(event) = events_rx.recv().await {
                 translator.handle(event).await;
             }
-            translator
         };
         // Stream while the turn runs — the bounded channel back-pressures, so
         // draining concurrently is required, not optional.
-        let (result, translator) = tokio::join!(agent.run_turn(&text, events_tx), collector);
+        let (result, ()) = tokio::join!(agent.run_turn(&text, events_tx), collector);
         let reason = result.map_err(internal)?;
 
         Ok(acp::PromptResponse::new(stop_reason(
             reason,
             cancel.is_cancelled(),
-            translator.saw_error,
         )))
     }
 
@@ -220,9 +217,9 @@ impl acp::Agent for WizardAcp {
     }
 }
 
-/// Map a `DoneReason` (plus whether the user cancelled and whether an error was
-/// streamed) to the ACP stop reason.
-fn stop_reason(reason: DoneReason, cancelled: bool, _saw_error: bool) -> acp::StopReason {
+/// Map a `DoneReason` (plus whether the user cancelled) to the ACP stop
+/// reason.
+fn stop_reason(reason: DoneReason, cancelled: bool) -> acp::StopReason {
     match reason {
         DoneReason::Completed => acp::StopReason::EndTurn,
         DoneReason::MaxSteps => acp::StopReason::MaxTurnRequests,
@@ -261,7 +258,6 @@ struct Translator {
     /// Per tool name: a FIFO of (call id, args) from starts awaiting their
     /// finishes — the event stream carries no id tying the two together.
     open_calls: HashMap<String, VecDeque<(String, Value)>>,
-    saw_error: bool,
 }
 
 impl Translator {
@@ -338,14 +334,7 @@ impl Translator {
                 ))
                 .await;
             }
-            AgentEvent::Error(message) => {
-                self.saw_error = true;
-                self.send(acp::SessionUpdate::AgentMessageChunk(
-                    acp::ContentChunk::new(acp::ContentBlock::from(format!("[wizard] {message}"))),
-                ))
-                .await;
-            }
-            AgentEvent::Notice(message) => {
+            AgentEvent::Error(message) | AgentEvent::Notice(message) => {
                 self.send(acp::SessionUpdate::AgentMessageChunk(
                     acp::ContentChunk::new(acp::ContentBlock::from(format!("[wizard] {message}"))),
                 ))
@@ -459,15 +448,15 @@ mod tests {
     #[test]
     fn stop_reason_maps_done_reasons() {
         assert_eq!(
-            stop_reason(DoneReason::Completed, false, false),
+            stop_reason(DoneReason::Completed, false),
             acp::StopReason::EndTurn
         );
         assert_eq!(
-            stop_reason(DoneReason::Stopped, true, false),
+            stop_reason(DoneReason::Stopped, true),
             acp::StopReason::Cancelled
         );
         assert_eq!(
-            stop_reason(DoneReason::MaxSteps, false, false),
+            stop_reason(DoneReason::MaxSteps, false),
             acp::StopReason::MaxTurnRequests
         );
     }

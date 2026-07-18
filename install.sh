@@ -18,7 +18,7 @@
 #
 # Flavors (mutually exclusive):
 #   WIZARD_LOCAL=1    preinstall the local stack non-interactively (headless
-#                     boxes, provisioning scripts; what the default used to do):
+#                     boxes, provisioning scripts):
 #                       1. Install llama.cpp's `llama-server` if absent, using
 #                          the GPU: on NVIDIA it compiles a CUDA build (when
 #                          nvcc is present); on other GPUs it installs a Vulkan

@@ -1,7 +1,8 @@
-//! Wizard — a single-binary, fully local agent.
+//! Wizard — a single-binary agent.
 //!
-//! A Ratatui front end on top of an Ollama-backed agent loop with an
-//! extensible tool set (native + scripted + MCP) and tiered self-extension.
+//! A Ratatui front end on top of a multi-provider agent loop (local
+//! llama.cpp/Ollama or remote APIs) with an extensible tool set
+//! (native + scripted + MCP) and tiered self-extension.
 //! See `docs/architecture.md` for the full design.
 
 pub mod acp;

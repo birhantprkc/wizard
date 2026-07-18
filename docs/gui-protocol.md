@@ -156,9 +156,8 @@ reason in both cases — **a GUI task is keyed by its session id**:
 The rest of the `client` set (`diff`, `todos`, `subagents`, `dashboard`, `settings`,
 `provider`, `login`) are windows the page owns; the server has no hand on them.
 
-`/mode` no longer takes `plan`. It never did in the TUI — plan is a posture on top of a mode,
-not a mode — and `/plan` and `/omakase` now toggle it here as they do there. A client that
-hardcoded `/mode plan` must send `/plan`.
+`/mode` takes `genie|sovereign`; plan is a posture toggled by `/plan` / `/omakase`, not a
+mode. A client that hardcoded `/mode plan` must send `/plan`.
 
 ## Settings
 
@@ -447,6 +446,7 @@ The server answers with the frames the protocol already has; there is no command
 | `rewind` | `notice` listing the turns there is something to go back to |
 | `rewind <turn>` | **`transcript_reset`** (see below), then `notice` (what was restored) and `context` |
 | `fusion` | `notice`; every turn now runs through the panel. `fusion config` is refused: the panel editor is a TUI picker |
+| `ultra` | `notice`; every turn now runs through the roster. `ultra config` is refused: the roster editor is a TUI picker |
 | `server [status\|start\|stop]` | `notice`; download and load progress arrive as further notices |
 | `evolve [--deep] <desc>`, `publish [branch]` | `notice` at the start and at the end. Both run in the command's own slot, so the task reads `working` until they land |
 | `help` | `notice`, derived from the same table this menu is |

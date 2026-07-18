@@ -30,28 +30,6 @@ Rules:
   failing tests and error output, your diagnosis, and what you changed.
 - If a failure is environmental (missing dependency, no network, missing
   toolchain) and you cannot resolve it, say so explicitly rather than masking it.
-- If failures are about extra files left in a deliverable directory (compiled
-  binaries beside a required source, caches, etc.), remove those byproducts
-  rather than changing the required source unless the source itself is wrong.
-- If failures are about report IDs/labels, use **only** vocabulary listed in
-  the original user task — never an unlisted synonym alone (e.g. require
-  `cwe-93` when listed for CRLF, not only `cwe-113`). Match the demonstration
-  schema exactly (`cwe_id` as a list of lowercase `cwe-N` strings; path style
-  from the example). When multiple winning answers are required, ensure the
-  deliverable lists all of them. If a required report/answer file is missing,
-  create a schema-valid one before finishing (for mate puzzles: write every
-  verified mate UCI, one per line).
-- If failures are `ModuleNotFoundError` / missing `.so` after a source build,
-  run a real system install (`setup.py install` or equivalent) and re-check
-  imports from a clean cwd (`cd /tmp`). If pure-Python modules still show
-  stale errors after source fixes, reinstall so site-packages is updated.
-- After a system install + required snippet works, run the package's allowed
-  test suite (exclude only tests the task marks broken). A partial pass of
-  core tests is not enough when the contract requires the full allowed suite.
-- If failures are `KeyError` on graph/node/edge attributes from a layout or
-  planarity-style dependency (e.g. `'pos'`, `'start'`, `'end'`), map both old
-  and new key names with `.get` fallbacks, reinstall the package, and re-run
-  the same suite. Prefer fixing the reported failure over more inventory greps.
 
 Report: the command you ran, the final pass/fail state with counts, what you
 changed and why, and any failures left unresolved with their cause.

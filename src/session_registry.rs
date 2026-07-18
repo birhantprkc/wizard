@@ -2,8 +2,8 @@
 //!
 //! Every running Wizard TUI heartbeats a small JSON record to
 //! `~/.wizard/running/<id>.json`, refreshed every few seconds. The
-//! `/dashboard` reads the directory to list every live session on the machine
-//! (Milestone 1 of the agent-view feature). Records whose last heartbeat is
+//! `/dashboard` reads the directory to list every live session on the machine.
+//! Records whose last heartbeat is
 //! older than [`STALE`] are treated as exited and pruned — a clean exit removes
 //! its own file, and a crash ages out.
 

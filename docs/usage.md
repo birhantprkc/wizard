@@ -39,7 +39,7 @@ inline hints.
 | `/fusion [config]` | Toggle model fusion, or configure the panel ([fusion.md](fusion.md)) |
 | `/ultra [config]` | Toggle mixture of agents, or configure the roster ([ultra.md](ultra.md)) |
 | `/server [status\|start\|stop]` | Manage the local llama-server |
-| `/login <provider>` | OAuth sign-in for providers that support it (`xai`, `chatgpt`) |
+| `/login <provider>` | OAuth sign-in; the TUI command accepts `xai` only. ChatGPT OAuth is `wizard --login chatgpt` from the shell, or the GUI Settings flow |
 | `/publish [branch]` | Fork Wizard to your GitHub and get a one-line installer ([market.md](market.md)) |
 | `/settings` | Open the in-app settings menu |
 | `/vim` | Toggle modal (vim-style) editing of the input composer |
@@ -67,9 +67,9 @@ effect on the **next** turn. Commands that need you at an interactive picker
 (`/effort` with no argument), that end or rewind the session (`/quit`,
 `/clear`, `/rewind`, `/resume`), or that set up providers (`/provider`,
 `/login`, `/publish`, `/evolve`) stay your call and are refused with a note the
-agent sees. Only the interactive TUI applies these commands, so the tool is
-refused outright in headless `-p` runs, the gateway, and subagents, nothing is
-silently dropped.
+agent sees. Only the interactive surfaces (TUI and GUI) apply these commands;
+the tool is refused outright in headless `-p` runs, the gateway, and subagents,
+nothing is silently dropped.
 
 ### Queued user messages
 
@@ -202,7 +202,7 @@ on its final stream chunk.
 
 ## Token-aware compaction
 
-History compaction now triggers on **either** the byte threshold
+History compaction triggers on **either** the byte threshold
 (`compact_threshold_bytes`, default 48 kB) **or** the last prompt exceeding
 ~80% of the model's context window, when the window is known:
 

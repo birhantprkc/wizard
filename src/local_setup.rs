@@ -203,9 +203,14 @@ async fn asset_url(http: &reqwest::Client, variant: &str) -> Option<String> {
         .text()
         .await
         .ok()?;
+    find_asset_url_in(&body, variant)
+}
+
+/// Scan a releases-API body for the first asset URL matching `variant`. The
+/// body quotes each asset's browser_download_url; the first match in document
+/// order is the newest release carrying this variant.
+fn find_asset_url_in(body: &str, variant: &str) -> Option<String> {
     let needle = format!("-bin-{variant}.tar.gz");
-    // The API body quotes each asset's browser_download_url; the first match
-    // in document order is the newest release carrying this variant.
     body.split('"')
         .find(|token| {
             token.starts_with("https://") && token.contains("/llama-b") && token.ends_with(&needle)
@@ -398,15 +403,7 @@ mod tests {
             {"browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b1000/llama-b1000-bin-ubuntu-x64.tar.gz"},
             {"browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b999/llama-b999-bin-ubuntu-x64.tar.gz"}
         "#;
-        let needle = "-bin-ubuntu-x64.tar.gz";
-        let url = body
-            .split('"')
-            .find(|token| {
-                token.starts_with("https://")
-                    && token.contains("/llama-b")
-                    && token.ends_with(needle)
-            })
-            .unwrap();
+        let url = find_asset_url_in(body, "ubuntu-x64").unwrap();
         assert!(url.contains("b1000"), "newest release wins: {url}");
         assert!(url.ends_with("llama-b1000-bin-ubuntu-x64.tar.gz"));
     }

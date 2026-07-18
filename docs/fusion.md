@@ -4,8 +4,7 @@ Model fusion runs several providers as a debate panel, then a synthesizer merges
 their answers into one. Each panel provider answers the turn independently and
 critiques the others over N rounds. The synthesizer then produces the final,
 tool-capable answer, using the panel's drafts as guidance. Independent models
-fused this way tend to beat the best single model in the panel, since they catch
-each other's mistakes.
+catch each other's mistakes in the critique rounds.
 
 Fusion is just another provider under the hood (a `FusionProvider` implementing
 the same `LlmProvider` trait), so the agent loop, tools, modes, and streaming are

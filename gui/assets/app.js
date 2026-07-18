@@ -1401,10 +1401,6 @@ function renderTranscript() {
       appendWorkedSection(item.label || 'Worked');
     } else if (item.type === 'text') {
       appendMessage(chat, item.text);
-    } else if (item.type === 'thinking') {
-      endStream(chat);
-      chat.group = null;
-      appendThinkingBlock(chat, item.text, true);
     } else if (item.type === 'tool') {
       appendToolCall(chat, item);
     } else if (item.type === 'images') {
@@ -1633,8 +1629,7 @@ function renderContextPanel() {
   // --- Context ---
   // The tokens the NEXT model call will carry, from the `context` frame. The
   // Goal card's `N tokens` above is the session's lifetime spend, from `usage`,
-  // and the two are deliberately not the same readout: reporting one as the
-  // other is the bug main just fixed in the TUI.
+  // and the two are deliberately not the same readout.
   ctx.meterPct = h('span', { class: 'ctx-header-right' }, '');
   ctx.meterFill = h('span', { class: 'meter-fill' });
   ctx.meterBar = h('span', { class: 'meter' }, ctx.meterFill);

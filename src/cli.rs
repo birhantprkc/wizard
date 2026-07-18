@@ -586,7 +586,7 @@ pub enum BenchCmd {
         keep_worktrees: bool,
 
         /// Parse the harness's stdout as JSON (`--output-format json` or
-        /// `streaming-json`) and record its reported token usage and stop
+        /// `stream-json`) and record its reported token usage and stop
         /// reason per case. Works with any agent that emits a usage object —
         /// Wizard, Grok Build, Claude Code.
         #[arg(long)]

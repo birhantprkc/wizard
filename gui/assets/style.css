@@ -1909,20 +1909,6 @@ button.ghost-chip:hover {
 /* Composer: model menu, stop button                                    */
 /* ------------------------------------------------------------------ */
 
-.spinner-btn {
-  margin: 0 2px;
-}
-.spinner-btn:not(.active) {
-  cursor: default;
-  background: none;
-}
-.spinner-btn.active:hover {
-  background: var(--hover-2);
-}
-.spinner-btn .spinner-icon {
-  margin: 0;
-}
-
 .menu-anchor {
   position: relative;
   display: inline-flex;

@@ -422,8 +422,9 @@ pub struct UpdateConfig {
     /// takes effect on the next launch.
     #[serde(default = "default_update_auto")]
     pub auto: bool,
-    /// GitHub `owner/repo` to check for releases (default
-    /// `teddytennant/wizard`); point a fork elsewhere.
+    /// GitHub `owner/repo` for the passive startup check and auto-update
+    /// (default `teddytennant/wizard`). `wizard update` always uses the
+    /// default repo.
     #[serde(default = "default_update_repo")]
     pub repo: String,
     /// Hours between startup checks (default 24); a cache under

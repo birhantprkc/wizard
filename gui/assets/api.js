@@ -123,8 +123,7 @@
 
 /**
  * The `context` frame: what the NEXT model call will carry. Distinct from
- * `usage`, which is the session's lifetime spend — conflating the two is what
- * the TUI got wrong before main's 0ed201b, so the two readouts stay apart here.
+ * `usage`, the session's lifetime spend — the two readouts stay apart.
  * @typedef {Object} ContextSize
  * @property {number} tokens
  * @property {number|null} window  The model's context window; null when unknown.
@@ -155,12 +154,11 @@
  *  - {type:'user',     text, attachments}       user prompt quote card
  *  - {type:'worked',   label}                   collapsible "Worked ..." divider
  *  - {type:'text',     text}                    agent narration paragraph
- *  - {type:'thinking', text}                    collapsed reasoning block
  *  - {type:'tool',     ...ToolCall}             tool row
  *  - {type:'images',   ...ImageBatch}           images, inline or on a tool's card
  *  - {type:'notice',   text}                    muted system row
  * @typedef {Object} TranscriptItem
- * @property {'user'|'worked'|'text'|'thinking'|'tool'|'images'|'notice'} type
+ * @property {'user'|'worked'|'text'|'tool'|'images'|'notice'} type
  * @property {string} [text]
  * @property {string} [label]
  */
@@ -685,10 +683,6 @@ export class RealApi {
           ensureWorked();
           transcript.push({ type: 'text', text: item.text || '' });
           break;
-        case 'thinking':
-          ensureWorked();
-          transcript.push({ type: 'thinking', text: item.text || '' });
-          break;
         case 'tool': {
           const call = classifyTool(item.name || 'tool', item.args || {});
           if (call.hidden) break;
@@ -963,7 +957,7 @@ export class RealApi {
     return this._json('/api/login');
   }
 
-  /** PATCH /api/settings: `{mode?, max_steps?}` → the new settings. */
+  /** PATCH /api/settings: `{max_steps?}` → the new settings. */
   async saveSettings(patch) {
     return this._json('/api/settings', {
       method: 'PATCH',
@@ -1286,6 +1280,7 @@ const MOCK_COMMANDS = [
   { name: 'publish', args: '[branch]', detail: 'fork & publish your Wizard, get a one-line installer', where: 'server' },
   { name: 'provider', detail: 'add or switch LLM providers (interactive)', where: 'client' },
   { name: 'fusion', args: '[config]', detail: 'toggle model fusion, or configure the panel', where: 'server' },
+  { name: 'ultra', args: '[config]', detail: 'toggle mixture of agents, or configure the roster', where: 'server' },
   { name: 'server', args: '[status|start|stop]', detail: 'manage the local llama-server', where: 'server' },
   { name: 'login', args: '<xai>', detail: 'sign in to a provider account (xAI OAuth)', where: 'client' },
   { name: 'diff', detail: 'toggle the git diff sidebar', where: 'client' },
@@ -1322,6 +1317,7 @@ const MOCK_NOTICES = {
   evolve: (a) => `Evolve: ${a || '(nothing to build)'} — skill written and registered.`,
   publish: (a) => `Published to ${a || 'main'}.`,
   fusion: () => 'Fusion on: every turn now runs through the panel.',
+  ultra: () => 'Ultra on: each turn now drafts on the active model, compares, then acts.',
   server: (a) => `Local llama-server: ${a === 'stop' ? 'stopped' : a === 'start' ? 'running on :8080' : 'not running'}.`,
   cost: () => 'Session spend: 24,310 prompt · 3,120 completion tokens.',
   memory: () => 'Project memories: 3 notes in .wizard/memory.md.',
@@ -1354,7 +1350,7 @@ export class MockApi {
     /** What the next turn would carry; grows with the conversation, and drops
      *  when /compact or /rewind takes a scythe to it. @type {ContextSize} */
     this._context = { tokens: 24310, window: 200000 };
-    /** The GUI's step budget. 0 = no limit, as v1.2's default now is. */
+    /** The GUI's step budget. 0 = no limit (the default). */
     this._maxSteps = 0;
     /** Session-unique subagent run ids, as the server's are. */
     this._runs = 0;

@@ -382,7 +382,7 @@ pub trait Tool: Send + Sync {
         ToolKind::Native
     }
 
-    /// Wire-format spec sent to Ollama in the request `tools` array.
+    /// Wire-format spec sent to the active provider in the request `tools` array.
     fn spec(&self) -> ToolSpec {
         ToolSpec::function(self.name(), self.description(), self.parameters())
     }

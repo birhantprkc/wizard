@@ -98,7 +98,7 @@ auto-approval inside their isolated context.
 Only when the change requires new Rust in Wizard's core (a new built-in
 tool kind, a protocol change, a TUI panel). The pipeline: source checkout
 at `~/.wizard/src` (cloned on first use), just-in-time minimal Rust
-toolchain if `cargo` is absent, propose a diff, approval, `cargo build
+toolchain if `cargo` is absent, propose a diff, `cargo build
 --release`, then exec-replace the running process. If no toolchain or
 source can be provisioned, fall back to Tier 1 and say so. Do not fail.
 

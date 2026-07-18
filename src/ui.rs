@@ -106,8 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_bar(frame, app, status_area);
 
     // Floating layers: suggestions stack just above the composer when the
-    // user is typing a slash command. Todos no longer float — they own a
-    // layout slot above the input.
+    // user is typing a slash command.
     if !overlay_open(app) {
         draw_suggestions(frame, app, input_area);
     }
@@ -1508,8 +1507,9 @@ fn fmt_age(secs: u64) -> String {
 
 /// Machine-wide session manager (`/dashboard`): every live Wizard session on
 /// the machine, grouped by state, refreshed from the registry while open.
-/// Modal — ↑/↓ move the selection, Esc/q close. Dispatch and attach arrive in
-/// later milestones.
+/// Modal — ↑/↓ move the selection, Ctrl-X stops the selected session, typing
+/// + Enter dispatches a background session, Esc clears the input or closes.
+/// Attach arrives in a later milestone.
 fn draw_dashboard(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -1775,10 +1775,10 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
 
         // Name column is fixed-width so the activity text lines up down the
         // rail and reads as a column, not a ragged list.
-        let name = clip(&pane.name, 12);
+        let name = truncate_width(&pane.name, 12);
         let meta_width = clock.len() + unread.len() + 4;
         let activity_width = (area.width as usize).saturating_sub(18 + meta_width).max(8);
-        let activity = clip(
+        let activity = truncate_width(
             pane.activity().trim().lines().next().unwrap_or(""),
             activity_width,
         );
@@ -1849,7 +1849,7 @@ fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area: Rect) {
             Line::from(vec![
                 Span::styled("   ", dim()),
                 Span::styled(
-                    clip(&pane.task, area.width.saturating_sub(6) as usize),
+                    truncate_width(&pane.task, area.width.saturating_sub(6) as usize),
                     dim().italic(),
                 ),
                 Span::styled(format!("  {hint}"), dim()),
@@ -2512,18 +2512,6 @@ fn truncate_width(text: &str, max: usize) -> String {
     out
 }
 
-/// Clip a plain string to `max` columns, ending in `…` when cut. Counts chars,
-/// not bytes, so it never splits a multi-byte character.
-fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
-    out.push('…');
-    out
-}
-
 /// Truncate a styled line to `max` display columns, appending a dim `…`
 /// when cut so clipped content is visible as such (used by the diff
 /// sidebar, where long lines would otherwise just stop mid-word).
@@ -2718,17 +2706,10 @@ fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 
 /// Render completed markdown to styled terminal text (fenced code blocks
-/// syntax-highlighted, foreground colors only). Tables size themselves to
-/// their content — callers that know the viewport should prefer
-/// [`render_markdown_at`].
-pub fn render_markdown(source: &str) -> Text<'static> {
-    render_markdown_at(source, usize::MAX)
-}
-
-/// Like [`render_markdown`], but tables lay out into at most `width` display
-/// columns: columns shrink proportionally and long cells wrap inside their
-/// column so a narrow terminal keeps a coherent grid instead of soft-wrapping
-/// mid-row.
+/// syntax-highlighted, foreground colors only). Tables lay out into at most
+/// `width` display columns: columns shrink proportionally and long cells wrap
+/// inside their column so a narrow terminal keeps a coherent grid instead of
+/// soft-wrapping mid-row.
 pub fn render_markdown_at(source: &str, width: usize) -> Text<'static> {
     render_markdown_inner(source, true, width)
 }
@@ -3657,143 +3638,24 @@ fn fit_column_widths(widths: &mut [usize], budget: usize) {
 
 /// Word-wrap a single table cell into lines of at most `width` display
 /// columns, preserving span styles. Falls back to hard char splits only
-/// when one word exceeds the budget (mirrors [`wrap_lines`]).
+/// when one word exceeds the budget. A thin adapter over [`LineWrapper`]
+/// (the transcript word-wrap core) with no hanging indent.
 fn wrap_cell(cell: CellSpans, width: usize) -> Vec<CellSpans> {
     let width = width.max(1);
     if spans_width(&cell) <= width {
         return vec![cell];
     }
-
-    // Flatten to (char, style) so a wrap can split mid-span cleanly.
-    let mut chars: Vec<(char, Style)> = Vec::new();
+    let mut wrapper = LineWrapper::new(width, 0, &Line::default());
     for span in &cell {
-        let style = span.style;
         for ch in span.content.chars() {
-            chars.push((ch, style));
+            wrapper.feed(ch, span.style);
         }
     }
-
-    let mut lines: Vec<CellSpans> = Vec::new();
-    let mut current: Vec<(char, Style)> = Vec::new();
-    let mut used = 0usize;
-    let mut word: Vec<(char, Style)> = Vec::new();
-    let mut word_cols = 0usize;
-    let mut spaces: Vec<(char, Style)> = Vec::new();
-    let mut space_cols = 0usize;
-
-    let emit = |current: &mut Vec<(char, Style)>, lines: &mut Vec<CellSpans>| {
-        lines.push(chars_to_spans(std::mem::take(current)));
-    };
-
-    let hard_split = |current: &mut Vec<(char, Style)>,
-                      used: &mut usize,
-                      word: &mut Vec<(char, Style)>,
-                      lines: &mut Vec<CellSpans>| {
-        for (wch, wstyle) in word.drain(..) {
-            let w = wch.width().unwrap_or(0);
-            if w > 0 && *used + w > width && *used > 0 {
-                emit(current, lines);
-                *used = 0;
-            }
-            current.push((wch, wstyle));
-            *used += w;
-        }
-    };
-
-    let commit_word = |current: &mut Vec<(char, Style)>,
-                       used: &mut usize,
-                       word: &mut Vec<(char, Style)>,
-                       word_cols: &mut usize,
-                       spaces: &mut Vec<(char, Style)>,
-                       space_cols: &mut usize,
-                       lines: &mut Vec<CellSpans>| {
-        if word.is_empty() {
-            return;
-        }
-        if *used + *space_cols + *word_cols <= width {
-            current.append(spaces);
-            *used += *space_cols;
-            *space_cols = 0;
-            current.append(word);
-            *used += *word_cols;
-            *word_cols = 0;
-            return;
-        }
-        if *used > 0 {
-            spaces.clear();
-            *space_cols = 0;
-            emit(current, lines);
-            *used = 0;
-        } else {
-            current.append(spaces);
-            *used += *space_cols;
-            *space_cols = 0;
-        }
-        if *used + *word_cols <= width {
-            current.append(word);
-            *used += *word_cols;
-            *word_cols = 0;
-        } else {
-            hard_split(current, used, word, lines);
-            *word_cols = 0;
-        }
-    };
-
-    for (ch, style) in chars {
-        if ch == ' ' {
-            commit_word(
-                &mut current,
-                &mut used,
-                &mut word,
-                &mut word_cols,
-                &mut spaces,
-                &mut space_cols,
-                &mut lines,
-            );
-            spaces.push((ch, style));
-            space_cols += 1;
-            continue;
-        }
-        let ch_w = ch.width().unwrap_or(0);
-        if ch_w == 0 && word.is_empty() && !spaces.is_empty() {
-            spaces.push((ch, style));
-            continue;
-        }
-        word.push((ch, style));
-        word_cols += ch_w;
-    }
-    commit_word(
-        &mut current,
-        &mut used,
-        &mut word,
-        &mut word_cols,
-        &mut spaces,
-        &mut space_cols,
-        &mut lines,
-    );
-    if used + space_cols <= width {
-        current.append(&mut spaces);
-    }
-    if !current.is_empty() || lines.is_empty() {
-        emit(&mut current, &mut lines);
-    }
-    lines
-}
-
-/// Collapse a run of (char, style) pairs into spans, merging adjacent equal styles.
-fn chars_to_spans(chars: Vec<(char, Style)>) -> CellSpans {
-    let mut spans: CellSpans = Vec::new();
-    for (ch, style) in chars {
-        match spans.last_mut() {
-            Some(span) if span.style == style => {
-                let mut s = span.content.to_string();
-                s.push(ch);
-                *span = Span::styled(s, style);
-            }
-            _ => spans.push(Span::styled(ch.to_string(), style)),
-        }
-    }
-    spans
+    wrapper
+        .finish()
+        .into_iter()
+        .map(|line| line.spans)
+        .collect()
 }
 
 #[cfg(test)]
@@ -4009,7 +3871,7 @@ mod tests {
 
     #[test]
     fn markdown_table_renders_as_aligned_grid() {
-        let text = render_markdown(TABLE);
+        let text = render_markdown_at(TABLE, usize::MAX);
         assert_eq!(
             flats(&text.lines),
             vec![
@@ -4023,13 +3885,13 @@ mod tests {
 
     #[test]
     fn markdown_table_right_aligns_column_by_padding_left() {
-        let text = render_markdown("| a | num |\n|---|--:|\n| b | 7 |\n");
+        let text = render_markdown_at("| a | num |\n|---|--:|\n| b | 7 |\n", usize::MAX);
         assert_eq!(flats(&text.lines), vec!["a │ num", "──┼────", "b │   7"]);
     }
 
     #[test]
     fn markdown_table_preserves_inline_styling() {
-        let text = render_markdown(TABLE);
+        let text = render_markdown_at(TABLE, usize::MAX);
         let header = span_style(&text.lines[0], "Field");
         assert!(header.add_modifier.contains(Modifier::BOLD));
         let strong = span_style(&text.lines[2], "Capital");
@@ -4040,7 +3902,7 @@ mod tests {
 
     #[test]
     fn markdown_table_pads_ragged_rows_as_empty_cells() {
-        let text = render_markdown("| a | b | c |\n|---|---|---|\n| long-cell |\n");
+        let text = render_markdown_at("| a | b | c |\n|---|---|---|\n| long-cell |\n", usize::MAX);
         let widths: Vec<usize> = flats(&text.lines)
             .iter()
             .map(|line| UnicodeWidthStr::width(line.as_str()))
@@ -4174,7 +4036,7 @@ mod tests {
 
     #[test]
     fn markdown_inline_math_renders_as_unicode() {
-        let text = render_markdown(r"See $\alpha + \beta$ for details.");
+        let text = render_markdown_at(r"See $\alpha + \beta$ for details.", usize::MAX);
         let joined = flats(&text.lines).join("\n");
         assert!(
             joined.contains("α + β"),
@@ -4188,7 +4050,7 @@ mod tests {
 
     #[test]
     fn markdown_display_math_is_indented_on_own_line() {
-        let text = render_markdown("before\n\n$$\\sum_{i=1}^{n} x_i$$\n\nafter\n");
+        let text = render_markdown_at("before\n\n$$\\sum_{i=1}^{n} x_i$$\n\nafter\n", usize::MAX);
         let flats = flats(&text.lines);
         // Display math is its own indented line, not jammed into prose.
         assert!(

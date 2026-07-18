@@ -17,7 +17,7 @@ constrained one, and each command declares what it is there:
 
 | | command | browser GUI |
 |---|---|---|
-| **Against the agent** | `/model`, `/mode`, `/genie`, `/sovereign`, `/effort`, `/plan`, `/omakase`, `/compact`, `/goal`, `/status`, `/cost`, `/memory`, `/doctor`, `/bashes`, `/agents`, `/reload`, `/rewind`, `/fusion`, `/server`, `/evolve`, `/publish`, `/help` | `server` — a `command` frame; the reply is a `notice` in the chat |
+| **Against the agent** | `/model`, `/mode`, `/genie`, `/sovereign`, `/effort`, `/plan`, `/omakase`, `/compact`, `/goal`, `/status`, `/cost`, `/memory`, `/doctor`, `/bashes`, `/agents`, `/reload`, `/rewind`, `/fusion`, `/ultra`, `/server`, `/evolve`, `/publish`, `/help` | `server` — a `command` frame; the reply is a `notice` in the chat |
 | **The page's own** | `/clear`, `/diff`, `/todos`, `/subagents`, `/dashboard`, `/resume`, `/settings`, `/provider`, `/login` | `client` — a panel, an overlay, a list |
 | **Terminal only** | `/vim`, `/quit`, `/exit` | `unavailable` — refused, with what the command is and why a browser is not where it runs |
 

@@ -141,11 +141,8 @@ fn load_files(paths: &[PathBuf]) -> Vec<HookDef> {
 }
 
 /// What one hook execution did, surfaced via [`AgentEvent::HookFired`].
-/// Plain successes ([`HookOutcome::Ok`]) are not reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
-    /// Exit 0 with no pipeline effect.
-    Ok,
     /// `pre_tool_use` rewrote the tool arguments.
     UpdatedArgs,
     /// Stdout was appended as extra context.
@@ -160,7 +157,6 @@ pub enum HookOutcome {
 impl fmt::Display for HookOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HookOutcome::Ok => write!(f, "ok"),
             HookOutcome::UpdatedArgs => write!(f, "updated args"),
             HookOutcome::AppendedContext => write!(f, "appended context"),
             HookOutcome::Blocked(reason) => write!(f, "blocked — {reason}"),
@@ -381,34 +377,6 @@ impl HookEngine {
         }
     }
 
-    /// `post_tool_use` without the tool result: the payload omits
-    /// `tool_output`/`is_error`. Compatibility entry point for call sites not
-    /// yet passing the result; prefer [`Self::post_tool_use_with_output`].
-    pub async fn post_tool_use(
-        &self,
-        tool: &str,
-        args: &Value,
-        mode: Mode,
-        events: Option<&mpsc::Sender<AgentEvent>>,
-    ) -> Option<String> {
-        match self
-            .fire(
-                HookEvent::PostToolUse,
-                Some((tool, args)),
-                None,
-                mode,
-                false,
-                true,
-                events,
-            )
-            .await
-        {
-            FireResult::Continue(extra) => extra,
-            // Unreachable: post_tool_use is not blockable.
-            FireResult::Block(_) => None,
-        }
-    }
-
     /// `user_prompt_submit` with the user message in the payload as `prompt`,
     /// so hooks can block or annotate a turn based on what was asked. May
     /// veto the turn or add context to the message.
@@ -424,30 +392,6 @@ impl HookEngine {
                 HookEvent::UserPromptSubmit,
                 None,
                 Some(extra),
-                mode,
-                true,
-                true,
-                events,
-            )
-            .await
-        {
-            FireResult::Continue(extra) => PromptSubmit::Continue(extra),
-            FireResult::Block(reason) => PromptSubmit::Block(reason),
-        }
-    }
-
-    /// `user_prompt_submit` without the prompt in the payload. Compatibility
-    /// entry point; prefer [`Self::user_prompt_submit_with_prompt`].
-    pub async fn user_prompt_submit(
-        &self,
-        mode: Mode,
-        events: Option<&mpsc::Sender<AgentEvent>>,
-    ) -> PromptSubmit {
-        match self
-            .fire(
-                HookEvent::UserPromptSubmit,
-                None,
-                None,
                 mode,
                 true,
                 true,
@@ -636,8 +580,8 @@ impl HookEngine {
         }
     }
 
-    /// Surface one hook's outcome. Warnings also land in the log; plain
-    /// successes stay silent so default behavior is unchanged.
+    /// Surface one hook's outcome. Warnings also land in the log; callers
+    /// skip this for plain successes, so default behavior is unchanged.
     async fn report(
         &self,
         events: Option<&mpsc::Sender<AgentEvent>>,
@@ -647,9 +591,6 @@ impl HookEngine {
     ) {
         if let HookOutcome::Warning(why) = &outcome {
             tracing::warn!("hook {} ({}): {why}", event.name(), hook.def.command);
-        }
-        if outcome == HookOutcome::Ok {
-            return;
         }
         if let Some(events) = events {
             let _ = events
@@ -920,25 +861,5 @@ mod tests {
         );
         assert!(payload.contains(r#""is_error":true"#), "{payload}");
         assert!(payload.contains(r#""tool_name":"execute""#), "{payload}");
-    }
-
-    #[tokio::test]
-    async fn legacy_entry_points_omit_the_new_fields() {
-        let engine = engine(vec![
-            def(HookEvent::PostToolUse, None, "cat"),
-            def(HookEvent::UserPromptSubmit, None, "cat"),
-        ]);
-        let payload = engine
-            .post_tool_use("execute", &json!({}), Mode::default(), None)
-            .await
-            .expect("cat echoes the payload");
-        assert!(!payload.contains("tool_output"), "{payload}");
-        assert!(!payload.contains("is_error"), "{payload}");
-        match engine.user_prompt_submit(Mode::default(), None).await {
-            PromptSubmit::Continue(Some(payload)) => {
-                assert!(!payload.contains(r#""prompt":"#), "{payload}")
-            }
-            other => panic!("expected appended context, got: {other:?}"),
-        }
     }
 }

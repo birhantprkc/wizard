@@ -4,7 +4,8 @@
 //! cursor), so this is single-line vim: `hjkl`/`w`/`b`/`e`/`0`/`^`/`$`
 //! motions, the `d`/`c`/`y` operators with motions, `x`/`r`/`p` and the
 //! `i`/`a`/`I`/`A` insert transitions. `j`/`k` (no line to move to) recall
-//! input history, the natural single-line analog.
+//! input history; `j` outside a history browse drops into the subagent rail,
+//! like plain ↓.
 //!
 //! [`VimState`] holds the mode and the small amount of pending state a modal
 //! editor needs (an operator awaiting its motion, a count prefix, the yank

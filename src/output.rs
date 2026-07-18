@@ -105,9 +105,9 @@ pub trait EventSink: Send {
 // text
 // ---------------------------------------------------------------------------
 
-/// The default human-readable printer (previously inlined in
-/// `run_headless`): streams deltas, prints tool one-liners, auto-approves
-/// plans, and shares the run's busy spinner so lines never tear it.
+/// The default human-readable printer: streams deltas, prints tool
+/// one-liners, auto-approves plans, and shares the run's busy spinner so
+/// lines never tear it.
 pub struct TextSink {
     spinner: Arc<TurnSpinner>,
     prompt_tokens: u64,

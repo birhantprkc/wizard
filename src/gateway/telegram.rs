@@ -174,102 +174,85 @@ impl Telegram {
     /// types yield a short rejection reply (best-effort) and no inbound.
     async fn message_to_inbound(&self, message: Message) -> Option<Inbound> {
         let chat_id = message.chat.id;
-        let caption = message.caption.filter(|c| !c.trim().is_empty());
-        let text = message.text.filter(|t| !t.trim().is_empty());
+        let caption = message.caption.clone().filter(|c| !c.trim().is_empty());
 
-        // Pure text.
-        if let Some(text) = text {
+        let Some((text, fetch)) = classify_message(&message) else {
+            // Stickers, voice, video notes, etc.: acknowledge rather than silence.
+            tracing::info!("unsupported Telegram message type from chat {chat_id}");
+            if let Err(err) = self.send(chat_id, UNSUPPORTED_REPLY).await {
+                tracing::warn!("failed to send unsupported-type reply: {err:#}");
+            }
+            return None;
+        };
+        let Some(file_id) = fetch else {
             return Some(Inbound {
                 chat_id,
                 text,
                 attachments: Vec::new(),
             });
-        }
-
-        // Photo: Telegram sends several sizes; take the largest (last).
-        if let Some(photos) = message.photo.as_ref().filter(|p| !p.is_empty()) {
-            let largest = &photos[photos.len() - 1];
-            match self.download_file(&largest.file_id).await {
-                Ok(path) => {
-                    let text = caption.unwrap_or_else(|| PHOTO_ONLY_PROMPT.to_string());
-                    return Some(Inbound {
-                        chat_id,
-                        text,
-                        attachments: vec![path],
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!("failed to download Telegram photo: {err:#}");
-                    // Still deliver caption-only so the agent can respond.
-                    if let Some(text) = caption {
-                        return Some(Inbound {
-                            chat_id,
-                            text,
-                            attachments: Vec::new(),
-                        });
-                    }
-                    return None;
-                }
-            }
-        }
-
-        // Image document (or any document with a caption / image mime).
-        if let Some(doc) = message.document {
-            let is_image = doc
-                .mime_type
-                .as_deref()
-                .is_some_and(|m| m.starts_with("image/"))
-                || doc.file_name.as_deref().is_some_and(is_image_filename);
-            if is_image || caption.is_some() {
-                match self.download_file(&doc.file_id).await {
-                    Ok(path) => {
-                        let text = caption.unwrap_or_else(|| {
-                            if is_image {
-                                PHOTO_ONLY_PROMPT.to_string()
-                            } else {
-                                format!(
-                                    "Please look at the attached file ({}).",
-                                    doc.file_name.as_deref().unwrap_or("document")
-                                )
-                            }
-                        });
-                        return Some(Inbound {
-                            chat_id,
-                            text,
-                            attachments: vec![path],
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to download Telegram document: {err:#}");
-                        if let Some(text) = caption {
-                            return Some(Inbound {
-                                chat_id,
-                                text,
-                                attachments: Vec::new(),
-                            });
-                        }
-                        return None;
-                    }
-                }
-            }
-        }
-
-        // Caption-only (no media we recognized) — still useful.
-        if let Some(text) = caption {
-            return Some(Inbound {
+        };
+        match self.download_file(&file_id).await {
+            Ok(path) => Some(Inbound {
                 chat_id,
                 text,
-                attachments: Vec::new(),
-            });
+                attachments: vec![path],
+            }),
+            Err(err) => {
+                tracing::warn!("failed to download Telegram attachment: {err:#}");
+                // Still deliver caption-only so the agent can respond.
+                caption.map(|text| Inbound {
+                    chat_id,
+                    text,
+                    attachments: Vec::new(),
+                })
+            }
         }
-
-        // Stickers, voice, video notes, etc.: acknowledge rather than silence.
-        tracing::info!("unsupported Telegram message type from chat {chat_id}");
-        if let Err(err) = self.send(chat_id, UNSUPPORTED_REPLY).await {
-            tracing::warn!("failed to send unsupported-type reply: {err:#}");
-        }
-        None
     }
+}
+
+/// Pure classification of a message: the text to deliver plus the Telegram
+/// file id to download (if any). `None` means nothing routable (sticker,
+/// voice, ...).
+fn classify_message(message: &Message) -> Option<(String, Option<String>)> {
+    let caption = message.caption.clone().filter(|c| !c.trim().is_empty());
+    let text = message.text.clone().filter(|t| !t.trim().is_empty());
+
+    // Pure text.
+    if let Some(text) = text {
+        return Some((text, None));
+    }
+
+    // Photo: Telegram sends several sizes; take the largest (last).
+    if let Some(photos) = message.photo.as_ref().filter(|p| !p.is_empty()) {
+        let largest = &photos[photos.len() - 1];
+        let text = caption.unwrap_or_else(|| PHOTO_ONLY_PROMPT.to_string());
+        return Some((text, Some(largest.file_id.clone())));
+    }
+
+    // Image document (or any document with a caption / image mime).
+    if let Some(doc) = message.document.as_ref() {
+        let is_image = doc
+            .mime_type
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"))
+            || doc.file_name.as_deref().is_some_and(is_image_filename);
+        if is_image || caption.is_some() {
+            let text = caption.unwrap_or_else(|| {
+                if is_image {
+                    PHOTO_ONLY_PROMPT.to_string()
+                } else {
+                    format!(
+                        "Please look at the attached file ({}).",
+                        doc.file_name.as_deref().unwrap_or("document")
+                    )
+                }
+            });
+            return Some((text, Some(doc.file_id.clone())));
+        }
+    }
+
+    // Caption-only (no media we recognized) — still useful.
+    caption.map(|text| (text, None))
 }
 
 #[async_trait]
@@ -454,50 +437,6 @@ struct FileInfo {
     file_path: Option<String>,
 }
 
-/// Pure helpers for unit tests: turn a parsed [`Message`] into an inbound
-/// without network I/O. Photo/document messages are represented as text +
-/// empty attachments here; the live path downloads files.
-#[cfg(test)]
-fn inbound_from_message_fields(
-    chat_id: i64,
-    text: Option<String>,
-    caption: Option<String>,
-    has_photo: bool,
-    has_document: bool,
-) -> Option<Inbound> {
-    let caption = caption.filter(|c| !c.trim().is_empty());
-    let text = text.filter(|t| !t.trim().is_empty());
-    if let Some(text) = text {
-        return Some(Inbound {
-            chat_id,
-            text,
-            attachments: Vec::new(),
-        });
-    }
-    if has_photo {
-        return Some(Inbound {
-            chat_id,
-            text: caption.unwrap_or_else(|| PHOTO_ONLY_PROMPT.to_string()),
-            attachments: Vec::new(), // live path fills this after download
-        });
-    }
-    if has_document {
-        return Some(Inbound {
-            chat_id,
-            text: caption.unwrap_or_else(|| PHOTO_ONLY_PROMPT.to_string()),
-            attachments: Vec::new(),
-        });
-    }
-    if let Some(text) = caption {
-        return Some(Inbound {
-            chat_id,
-            text,
-            attachments: Vec::new(),
-        });
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,16 +511,10 @@ mod tests {
         assert!(msg.text.is_none());
         assert_eq!(msg.photo.as_ref().map(|p| p.len()), Some(2));
 
-        let inbound = inbound_from_message_fields(
-            msg.chat.id,
-            msg.text.clone(),
-            msg.caption.clone(),
-            msg.photo.as_ref().is_some_and(|p| !p.is_empty()),
-            msg.document.is_some(),
-        )
-        .expect("caption+photo becomes inbound");
-        assert_eq!(inbound.chat_id, 42);
-        assert_eq!(inbound.text, "describe this");
+        let (text, fetch) = classify_message(msg).expect("caption+photo becomes inbound");
+        assert_eq!(text, "describe this");
+        // The largest (last) photo size is the one fetched.
+        assert_eq!(fetch.as_deref(), Some("large"));
     }
 
     #[test]
@@ -600,15 +533,9 @@ mod tests {
         }"#;
         let body: GetUpdates = serde_json::from_str(raw).expect("valid payload");
         let msg = body.result[0].message.as_ref().expect("message");
-        let inbound = inbound_from_message_fields(
-            msg.chat.id,
-            msg.text.clone(),
-            msg.caption.clone(),
-            true,
-            false,
-        )
-        .expect("photo-only becomes inbound");
-        assert_eq!(inbound.text, PHOTO_ONLY_PROMPT);
+        let (text, fetch) = classify_message(msg).expect("photo-only becomes inbound");
+        assert_eq!(text, PHOTO_ONLY_PROMPT);
+        assert_eq!(fetch.as_deref(), Some("only"));
     }
 
     #[test]
@@ -636,15 +563,24 @@ mod tests {
             msg.document.as_ref().unwrap().mime_type.as_deref(),
             Some("image/png")
         );
-        let inbound = inbound_from_message_fields(
-            msg.chat.id,
-            msg.text.clone(),
-            msg.caption.clone(),
-            false,
-            true,
-        )
-        .expect("document becomes inbound");
-        assert_eq!(inbound.text, "scan this");
+        let (text, fetch) = classify_message(msg).expect("document becomes inbound");
+        assert_eq!(text, "scan this");
+        assert_eq!(fetch.as_deref(), Some("doc1"));
+
+        // The is_image/mime gate: a non-image document without a caption is
+        // not routable.
+        let plain = Message {
+            chat: Chat { id: 9 },
+            text: None,
+            caption: None,
+            photo: None,
+            document: Some(Document {
+                file_id: "doc2".to_string(),
+                file_name: Some("notes.txt".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }),
+        };
+        assert!(classify_message(&plain).is_none());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # Wizard GUI design spec
 
 A dark, three-pane agent workspace: chat list, conversation, git/goal rail. It began as a
-copy of a reference screenshot (`~/.claude/image-cache/83725a5a-…/1.png`); what it is now is
-described below, and where the two disagree, this wins.
+copy of a reference screenshot; what it is now is described below, and where the two
+disagree, this wins.
 
 The thing it should feel like is an instrument, not a product page. That means: dense but
 breathing, hairlines instead of boxes inside boxes, no colour that is not carrying meaning,

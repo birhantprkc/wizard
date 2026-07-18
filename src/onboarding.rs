@@ -40,36 +40,10 @@ const TEXT_DIM: Color = Color::Gray;
 // Pure logic (unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Which provider family the user picked in step 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderChoice {
-    /// Local llama.cpp `llama-server` — the one-click "Local" pick resolves
-    /// here too (Wizard downloads the model and installs llama-server itself).
-    LlamaCpp,
-    /// Local Ollama server.
-    Ollama,
-    /// OpenAI or any OpenAI-compatible endpoint.
-    Openai,
-    /// Anthropic Messages API.
-    Anthropic,
-    /// OpenRouter with a plain API key.
-    OpenRouter,
-    /// Cloudflare Workers AI with an API token (account-scoped endpoint).
-    Cloudflare,
-    /// xAI (Grok) with a plain API key.
-    Xai,
-    /// xAI via account sign-in (OAuth, `wizard --login xai`).
-    XaiOauth,
-    /// A custom OpenAI-compatible endpoint (base URL entered by hand).
-    Custom,
-}
-
 /// The collected answers from the wizard. Converting this into a [`Config`]
 /// ([`Answers::into_config`]) is pure and unit-tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answers {
-    /// Provider family chosen.
-    pub provider: ProviderChoice,
     /// Provider id stored in [`ProviderConfig::name`] (e.g. `"local"`).
     pub provider_name: String,
     /// Backend kind for the single configured provider.
@@ -499,7 +473,6 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     };
 
     Ok(Some(Answers {
-        provider: collected.provider,
         provider_name: collected.provider_name,
         kind: collected.kind,
         base_url: collected.base_url,
@@ -640,7 +613,6 @@ fn collect_claude_import(terminal: &mut Tui) -> Result<Option<ImportSelection>> 
 
 /// Per-provider answers gathered in step 2.
 struct ProviderAnswers {
-    provider: ProviderChoice,
     provider_name: String,
     kind: ProviderKind,
     base_url: String,
@@ -804,7 +776,6 @@ fn collect_local_auto() -> ProviderAnswers {
         &suggested_tag,
     ) {
         LocalPlan::LlamaCpp { gguf_path } => ProviderAnswers {
-            provider: ProviderChoice::LlamaCpp,
             provider_name: "local".to_string(),
             kind: ProviderKind::LlamaCpp,
             base_url: LLAMACPP_BASE_URL.to_string(),
@@ -813,7 +784,6 @@ fn collect_local_auto() -> ProviderAnswers {
             gguf_path: Some(gguf_path),
         },
         LocalPlan::Ollama { model } => ProviderAnswers {
-            provider: ProviderChoice::Ollama,
             provider_name: "local".to_string(),
             kind: ProviderKind::Ollama,
             base_url: OLLAMA_BASE_URL.to_string(),
@@ -910,7 +880,6 @@ fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
     };
 
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::LlamaCpp,
         provider_name: "local".to_string(),
         kind: ProviderKind::LlamaCpp,
         base_url,
@@ -956,7 +925,6 @@ fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Ollama,
         provider_name: "local".to_string(),
         kind: ProviderKind::Ollama,
         base_url: OLLAMA_BASE_URL.to_string(),
@@ -1000,7 +968,6 @@ fn collect_openai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Openai,
         provider_name: "openai".to_string(),
         kind: ProviderKind::Openai,
         base_url: OPENAI_BASE_URL.to_string(),
@@ -1044,7 +1011,6 @@ fn collect_anthropic(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Anthropic,
         provider_name: "claude".to_string(),
         kind: ProviderKind::Anthropic,
         base_url: ANTHROPIC_BASE_URL.to_string(),
@@ -1078,7 +1044,6 @@ fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::OpenRouter,
         provider_name: "openrouter".to_string(),
         kind: ProviderKind::OpenRouter,
         base_url: OPENROUTER_BASE_URL.to_string(),
@@ -1129,7 +1094,6 @@ fn collect_cloudflare(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Cloudflare,
         provider_name: "cloudflare".to_string(),
         kind: ProviderKind::Cloudflare,
         base_url: crate::llm::cloudflare::base_url(&account_id),
@@ -1168,7 +1132,6 @@ fn collect_xai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Xai,
         provider_name: "xai".to_string(),
         kind: ProviderKind::Xai,
         base_url: XAI_BASE_URL.to_string(),
@@ -1203,7 +1166,6 @@ fn collect_xai_oauth(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::XaiOauth,
         provider_name: "xai".to_string(),
         kind: ProviderKind::XaiOauth,
         base_url: XAI_BASE_URL.to_string(),
@@ -1242,7 +1204,6 @@ fn collect_custom(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(api_key_env)
     };
     Ok(Some(ProviderAnswers {
-        provider: ProviderChoice::Custom,
         provider_name: "custom".to_string(),
         kind: ProviderKind::Openai,
         base_url,
@@ -1755,7 +1716,6 @@ mod tests {
 
     fn base_answers() -> Answers {
         Answers {
-            provider: ProviderChoice::Ollama,
             provider_name: "local".to_string(),
             kind: ProviderKind::Ollama,
             base_url: OLLAMA_BASE_URL.to_string(),
@@ -1795,7 +1755,6 @@ mod tests {
     #[test]
     fn llamacpp_answers_carry_gguf_and_skip_legacy_ollama_fields() {
         let answers = Answers {
-            provider: ProviderChoice::LlamaCpp,
             kind: ProviderKind::LlamaCpp,
             base_url: "http://127.0.0.1:9090".to_string(),
             model: "Qwen3.6-27B-Q4_K_M".to_string(),
@@ -1848,7 +1807,6 @@ mod tests {
     #[test]
     fn cloud_answers_do_not_touch_legacy_ollama_fields() {
         let answers = Answers {
-            provider: ProviderChoice::Anthropic,
             provider_name: "claude".to_string(),
             kind: ProviderKind::Anthropic,
             base_url: ANTHROPIC_BASE_URL.to_string(),
@@ -1875,7 +1833,6 @@ mod tests {
     fn xai_answers_build_the_expected_providers() {
         // API-key flavor.
         let answers = Answers {
-            provider: ProviderChoice::Xai,
             provider_name: "xai".to_string(),
             kind: ProviderKind::Xai,
             base_url: XAI_BASE_URL.to_string(),
@@ -1891,7 +1848,6 @@ mod tests {
 
         // OAuth flavor: no API key env; credentials come from the token file.
         let answers = Answers {
-            provider: ProviderChoice::XaiOauth,
             provider_name: "xai".to_string(),
             kind: ProviderKind::XaiOauth,
             base_url: XAI_BASE_URL.to_string(),
@@ -1911,7 +1867,6 @@ mod tests {
     #[test]
     fn openrouter_answers_build_the_expected_provider() {
         let answers = Answers {
-            provider: ProviderChoice::OpenRouter,
             provider_name: "openrouter".to_string(),
             kind: ProviderKind::OpenRouter,
             base_url: OPENROUTER_BASE_URL.to_string(),
@@ -1937,7 +1892,6 @@ mod tests {
     #[test]
     fn cloudflare_answers_build_the_expected_provider() {
         let answers = Answers {
-            provider: ProviderChoice::Cloudflare,
             provider_name: "cloudflare".to_string(),
             kind: ProviderKind::Cloudflare,
             base_url: crate::llm::cloudflare::base_url("acc123"),
@@ -2002,7 +1956,6 @@ mod tests {
     #[test]
     fn onboarding_config_survives_a_toml_round_trip() {
         let answers = Answers {
-            provider: ProviderChoice::LlamaCpp,
             kind: ProviderKind::LlamaCpp,
             base_url: "http://127.0.0.1:8080".to_string(),
             model: "Qwen3.6-27B-Q4_K_M".to_string(),

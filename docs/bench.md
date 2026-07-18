@@ -113,7 +113,7 @@ wizard bench run --label grok \
 ### Recording token usage (`--harness-json`)
 
 Pass `--harness-json` when the harness emits a JSON usage object on stdout —
-`--output-format json` (one object) or `streaming-json` (NDJSON, the last
+`--output-format json` (one object) or `stream-json` (NDJSON, the last
 usage-bearing line wins). The run then records each case's total tokens and
 stop reason alongside the pass/fail result, so you can compare agents by cost,
 not just correctness. It reads the usage shapes emitted by Wizard

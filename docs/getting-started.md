@@ -14,7 +14,7 @@ The installer:
 2. Downloads the `wizard` binary from GitHub releases and verifies its SHA-256 against the release's `checksums.txt` (a mismatch aborts the install)
 3. Lays down the [default loadout](loadout.md): `~/.wizard/mcp.toml` (Playwright browser MCP) and `~/.wizard/subagents/*.toml` (reviewer, researcher, tester, documenter), each file only if it is not already present
 
-It installs no model and writes no config; the first `wizard` run starts onboarding. To preinstall the local stack instead (non-interactive; what the default used to do), set `WIZARD_LOCAL=1`:
+It installs no model and writes no config; the first `wizard` run starts onboarding. To preinstall the local stack instead (non-interactive), set `WIZARD_LOCAL=1`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_LOCAL=1 bash
@@ -281,7 +281,7 @@ Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come ba
 ChatGPT subscription access is OAuth too (OpenAI's Codex backend, not the public Chat Completions API):
 
 ```bash
-wizard --login chatgpt     # or /login chatgpt from inside the TUI
+wizard --login chatgpt
 ```
 
 Tokens land in `~/.wizard/chatgpt_oauth.json` (mode 0600). On success Wizard adds a `chatgptoauth` provider pointed at `chatgpt.com/backend-api/codex`. The GUI Settings sign-in path accepts `chatgpt` the same way as `xai`. You still need a plan that the Codex backend accepts; a failed exchange or 403 is the usual signal that the account is not eligible.

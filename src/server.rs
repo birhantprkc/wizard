@@ -147,9 +147,10 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) 
     };
     // A model that cannot fit in this machine's RAM is refused up front —
     // before a multi-GB download, and before llama-server gets OOM-killed
-    // halfway through loading it. [`spawn`] passes no GPU-offload flags, so
-    // the weights load into system memory even on GPU machines. Undetectable
-    // RAM or an unknown model size skips the check.
+    // halfway through loading it. The check is a RAM-only heuristic: on GPU
+    // machines [`spawn`] offloads layers to VRAM, but the model is still
+    // staged through system memory during load. Undetectable RAM or an
+    // unknown model size skips the check.
     if let Some(ram_gb) = crate::hardware::usable_ram_gb()
         && let Some(model_gb) = model_size_gb(Path::new(gguf))
         && model_gb + FIT_HEADROOM_GB > ram_gb

@@ -153,8 +153,7 @@ impl Default for TurnSpinner {
 
 /// Progress reporter for slow setup waits — llama-server startup (spawn +
 /// model load) and Ollama model pulls: a spinner whose message tracks the
-/// latest status on a terminal, plain stdout lines otherwise (matching the
-/// previous behavior for scripts).
+/// latest status on a terminal, plain stdout lines otherwise.
 pub struct ServerSpinner {
     bar: ProgressBar,
     /// Closing message shown when the wait succeeded and actually waited.
@@ -163,8 +162,7 @@ pub struct ServerSpinner {
     /// spawned or waited on rather than already answering.
     waited: AtomicBool,
     /// Whether stderr is a terminal. When false the spinner draws nothing
-    /// and status falls back to plain `println!` lines (matching the prior
-    /// behavior for scripts and piped runs).
+    /// and status falls back to plain `println!` lines.
     enabled: bool,
 }
 
@@ -343,14 +341,6 @@ pub fn fleet_bars(slots: usize) -> (MultiProgress, Vec<ProgressBar>) {
 mod tests {
     use super::*;
     use crate::config::UiConfig;
-
-    #[test]
-    fn styles_construct_without_panicking() {
-        let _ = spinner_style();
-        let _ = bar_style();
-        let _ = download_style(true);
-        let _ = download_style(false);
-    }
 
     #[test]
     fn download_bar_counts_in_both_modes() {

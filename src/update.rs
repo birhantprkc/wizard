@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, UpdateConfig};
 
-/// Default GitHub repo serving Wizard releases (overridable via `[update].repo`
-/// so a fork can point elsewhere).
+/// GitHub repo serving Wizard releases. `[update].repo` overrides this for the
+/// passive startup check and auto-update only; `wizard update` always uses it.
 const DEFAULT_REPO: &str = "teddytennant/wizard";
 
 /// HTTP timeout for the passive startup check — short so a hung network can
@@ -45,7 +45,11 @@ pub fn current_version() -> &'static str {
 /// a trailing `.0` patch is dropped, so `0.7.0` reads as `0.7` while
 /// `0.7.1` stays `0.7.1`. Cosmetic only — never used for version comparison.
 pub fn display_version() -> &'static str {
-    let version = current_version();
+    short_version(current_version())
+}
+
+/// Drop a trailing `.0` patch component (`0.7.0` → `0.7`; `0.7.1` unchanged).
+fn short_version(version: &str) -> &str {
     version.strip_suffix(".0").unwrap_or(version)
 }
 
@@ -728,9 +732,9 @@ mod tests {
 
     #[test]
     fn display_version_drops_a_trailing_zero_patch_only() {
-        assert_eq!("0.7.0".strip_suffix(".0").unwrap_or("0.7.0"), "0.7");
-        assert_eq!("0.7.1".strip_suffix(".0").unwrap_or("0.7.1"), "0.7.1");
-        assert_eq!("0.10.0".strip_suffix(".0").unwrap_or("0.10.0"), "0.10");
+        assert_eq!(short_version("0.7.0"), "0.7");
+        assert_eq!(short_version("0.7.1"), "0.7.1");
+        assert_eq!(short_version("0.10.0"), "0.10");
         // The compiled version stays a full, parseable semver for comparison.
         assert!(semver::Version::parse(current_version()).is_ok());
         // The display never adds a component the real version lacks.

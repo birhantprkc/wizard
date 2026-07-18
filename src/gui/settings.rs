@@ -259,7 +259,8 @@ pub fn remove_provider(config: &mut Config, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A `~/.wizard/credentials.toml` entry, or its removal when `key` is empty.
+/// Store a `~/.wizard/credentials.toml` entry; an empty `key` is ignored
+/// (an edit that leaves the field blank keeps the stored key).
 pub fn store_key(name: &str, key: &str) -> Result<()> {
     if key.trim().is_empty() {
         return Ok(());

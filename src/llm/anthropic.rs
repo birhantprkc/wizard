@@ -127,7 +127,7 @@ impl AnthropicProvider {
 /// `tool_result` block correlated back to the matching `tool_use` id by name.
 ///
 /// User messages with [`ChatMessage::images`] include Anthropic `image` source
-/// blocks (base64). Paths that fail to load fall back to a text note.
+/// blocks (base64).
 fn build_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     use std::collections::VecDeque;
 

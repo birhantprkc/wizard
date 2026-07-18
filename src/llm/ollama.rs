@@ -14,13 +14,8 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 
 use super::provider::LlmProvider;
-use super::{ChatChunk, ChatOptions, ChatRequest, ProviderError};
+use super::{ChatChunk, ChatOptions, ChatRequest, ChatStream, ProviderError};
 use crate::server::{ByteProgress, Progress};
-
-/// Boxed NDJSON chunk stream returned by [`OllamaClient::chat_stream`].
-/// Re-exported from [`crate::llm`] so existing `ollama::ChatStream` paths
-/// keep compiling.
-pub use super::ChatStream;
 
 /// How long to wait for a TCP/TLS connection before declaring Ollama down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

@@ -309,6 +309,19 @@ async fn exchange_code(code: &str, redirect_uri: &str, verifier: &str) -> Result
         .context("parsing the ChatGPT token response")
 }
 
+/// The token endpoint refused the grant (HTTP 400/401): it is revoked or
+/// expired for good, so refreshing again can never succeed. The caller clears
+/// the stored tokens so the next run re-prompts for sign-in.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the ChatGPT session was revoked or expired (HTTP {status}: {body}); \
+     run `wizard --login chatgpt` to sign in again"
+)]
+pub struct RevokedGrant {
+    pub status: u16,
+    pub body: String,
+}
+
 /// Refresh an access token (JSON body, per Codex). Returns the tokens to
 /// persist; the caller merges them (a refresh may omit the refresh token).
 pub async fn refresh(refresh_token: &str) -> Result<TokenResponse> {
@@ -323,8 +336,16 @@ pub async fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         .send()
         .await
         .context("refreshing the ChatGPT token")?;
-    if !response.status().is_success() {
-        let status = response.status();
+    let status = response.status();
+    if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
+        let body = response.text().await.unwrap_or_default();
+        return Err(RevokedGrant {
+            status: status.as_u16(),
+            body,
+        }
+        .into());
+    }
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         bail!("ChatGPT token refresh failed (HTTP {status}): {body}");
     }
@@ -507,6 +528,24 @@ mod tests {
         assert_eq!(account_id_from_id_token("not.a.jwt"), None);
         let token = id_token_with(json!({ "chatgpt_plan_type": "pro" }));
         assert_eq!(account_id_from_id_token(&token), None);
+    }
+
+    #[test]
+    fn clear_tokens_removes_the_file_and_tolerates_absence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chatgpt_oauth.json");
+        let tokens = StoredTokens {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt".to_string()),
+            id_token: None,
+            account_id: None,
+        };
+        save_tokens(&path, &tokens).expect("save");
+        assert!(load_tokens(&path).expect("load").is_some());
+
+        clear_tokens(&path).expect("clear");
+        assert!(load_tokens(&path).expect("load after clear").is_none());
+        clear_tokens(&path).expect("clearing a missing file is fine");
     }
 
     #[test]

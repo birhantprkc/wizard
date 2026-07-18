@@ -72,7 +72,10 @@ const STDIO_ENV_DENYLIST: &[&str] = &[
 ];
 
 /// Native tool names an MCP tool must never shadow in the registry; a tool
-/// advertised under one of these is namespaced `server__tool`.
+/// advertised under one of these is namespaced `server__tool`. Must cover
+/// everything `ToolRegistry::with_native_tools` registers plus
+/// `spawn_subagent` (registered at runtime by the agent) — a unit test
+/// enforces this.
 const RESERVED_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
@@ -82,6 +85,16 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "execute",
     "git_status",
     "git_diff",
+    "memory",
+    "todo",
+    "web_fetch",
+    "web_search",
+    "generate_image",
+    "task_output",
+    "task_kill",
+    "subagent_status",
+    "subagent_kill",
+    "run_command",
     "spawn_subagent",
 ];
 
@@ -1227,6 +1240,24 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_tool_names_match_the_native_registry() {
+        let mut expected: HashSet<&str> = vec![crate::agent::subagent::SPAWN_SUBAGENT_TOOL_NAME]
+            .into_iter()
+            .collect();
+        let registry = crate::tools::registry::ToolRegistry::with_native_tools();
+        let specs = registry.specs();
+        for spec in &specs {
+            expected.insert(spec.function.name.as_str());
+        }
+        let reserved: HashSet<&str> = RESERVED_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(
+            reserved, expected,
+            "RESERVED_TOOL_NAMES must track ToolRegistry::with_native_tools \
+             (plus spawn_subagent)"
+        );
+    }
 
     #[test]
     fn config_load_missing_file_is_empty() {

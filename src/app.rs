@@ -23,12 +23,9 @@ use crate::agent::{
     session::Session, subagent, ultra,
 };
 use crate::cli::Cli;
-// The built-in command table and its parser live in [`crate::commands`], the
-// one module every surface reads them from. Re-exported here because `/…` is
-// still the TUI's own language: `crate::app::SlashCommand` is where the rest of
-// the tree has always found it.
+// The built-in command table and its parser live in [`crate::commands`].
 use crate::commands::CustomCommand;
-pub use crate::commands::{
+use crate::commands::{
     COMMANDS, CommandSpec, FusionAction, MemoryAction, ProviderAction, ServerAction, SlashCommand,
     UltraAction,
 };
@@ -236,6 +233,58 @@ impl SubagentPane {
 /// giant minified line counts as 1 by `lines()` but fills the screen anyway).
 fn collapse_long(content: &str) -> bool {
     content.lines().count() > 6 || content.chars().count() > 600
+}
+
+/// Fill the newest still-open [`TranscriptEntry::ToolCard`] for `name` with
+/// `output`. Long successful outputs start collapsed, and so do errors — the
+/// ✗ glyph carries the signal without dumping the payload; a click or Ctrl-T
+/// expands it. Returns the output back when no open card matched, so the
+/// caller can decide what to do with it.
+fn fill_open_card(
+    transcript: &mut [TranscriptEntry],
+    name: &str,
+    output: crate::tools::ToolOutput,
+) -> Option<crate::tools::ToolOutput> {
+    let card = transcript.iter_mut().rev().find_map(|entry| match entry {
+        TranscriptEntry::ToolCard {
+            name: card_name,
+            output: slot,
+            is_error,
+            collapsed,
+            ..
+        } if *card_name == name && slot.is_none() => Some((slot, is_error, collapsed)),
+        _ => None,
+    });
+    match card {
+        Some((slot, is_error, collapsed)) => {
+            *is_error = output.is_error;
+            *collapsed = output.is_error || collapse_long(&output.content);
+            *slot = Some(output.content);
+            None
+        }
+        None => Some(output),
+    }
+}
+
+/// One step of the shared stick-to-bottom scroll rule. Positive `delta` moves
+/// toward older content (up); negative toward the live tail (down). `current`
+/// is the stored first-visible-line offset from the top. Returns the new
+/// `(scroll, follow)` pair: leaving the bottom clears follow so new output
+/// does not yank the view; returning to the bottom re-enables it (and resets
+/// the offset to 0).
+fn scroll_step(follow: bool, current: u16, max: u16, delta: i16) -> (u16, bool) {
+    let current = if follow { max } else { current.min(max) };
+    // Top-anchored: older content is a smaller start offset.
+    let next = if delta >= 0 {
+        current.saturating_sub(delta as u16)
+    } else {
+        current.saturating_add(delta.unsigned_abs()).min(max)
+    };
+    if next >= max {
+        (0, true)
+    } else {
+        (next, false)
+    }
 }
 
 /// The images on a replayed message, as the references the live
@@ -1785,33 +1834,14 @@ impl App {
         self.retire_finished_panes();
     }
 
-    /// Scroll the pane at `index` by `delta` lines. Positive moves toward older
-    /// content (up); negative toward the live tail (down). Leaving the bottom
-    /// clears follow so new output does not yank the view; returning to the
-    /// bottom re-enables it. `scroll` is the first visible line from the top.
+    /// Scroll the pane at `index` by `delta` lines, per [`scroll_step`].
     fn scroll_pane(&mut self, index: usize, delta: i16) {
         let Some(pane) = self.panes.get_mut(index) else {
             return;
         };
         let max = pane.max_scroll.get();
-        let current = if pane.scroll_follow {
-            max
-        } else {
-            pane.scroll.min(max)
-        };
-        // Top-anchored: older content is a smaller start offset.
-        let next = if delta >= 0 {
-            current.saturating_sub(delta as u16)
-        } else {
-            current.saturating_add(delta.unsigned_abs()).min(max)
-        };
-        if next >= max {
-            pane.scroll = 0;
-            pane.scroll_follow = true;
-        } else {
-            pane.scroll = next;
-            pane.scroll_follow = false;
-        }
+        (pane.scroll, pane.scroll_follow) =
+            scroll_step(pane.scroll_follow, pane.scroll, max, delta);
     }
 
     /// Jump a pane (or the main transcript when no pane is attached) to the
@@ -1828,28 +1858,11 @@ impl App {
         self.scroll_follow = true;
     }
 
-    /// Scroll the main transcript by `delta` lines. Positive moves toward older
-    /// content (up); negative toward the live tail (down). Same stick-to-bottom
-    /// rule as [`Self::scroll_pane`].
+    /// Scroll the main transcript by `delta` lines, per [`scroll_step`].
     fn scroll_transcript(&mut self, delta: i16) {
         let max = self.transcript_max_scroll.get();
-        let current = if self.scroll_follow {
-            max
-        } else {
-            self.scroll.min(max)
-        };
-        let next = if delta >= 0 {
-            current.saturating_sub(delta as u16)
-        } else {
-            current.saturating_add(delta.unsigned_abs()).min(max)
-        };
-        if next >= max {
-            self.scroll = 0;
-            self.scroll_follow = true;
-        } else {
-            self.scroll = next;
-            self.scroll_follow = false;
-        }
+        (self.scroll, self.scroll_follow) =
+            scroll_step(self.scroll_follow, self.scroll, max, delta);
     }
 
     /// Close out every pane still marked running, because the turn that owned
@@ -4058,43 +4071,17 @@ impl App {
                 });
             }
             AgentEvent::ToolFinished { name, output } => {
-                let card = self
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        TranscriptEntry::ToolCard {
-                            name: card_name,
-                            output: slot,
-                            is_error,
-                            collapsed,
-                            ..
-                        } if *card_name == name && slot.is_none() => {
-                            Some((slot, is_error, collapsed))
-                        }
-                        _ => None,
+                if let Some(output) = fill_open_card(&mut self.transcript, &name, output) {
+                    // No matching running card (e.g. denied before start
+                    // was emitted) — record the result standalone.
+                    let collapsed = output.is_error || collapse_long(&output.content);
+                    self.transcript.push(TranscriptEntry::ToolCard {
+                        name,
+                        args: Value::Null,
+                        output: Some(output.content),
+                        is_error: output.is_error,
+                        collapsed,
                     });
-                match card {
-                    Some((slot, is_error, collapsed)) => {
-                        *is_error = output.is_error;
-                        // Long successful outputs start collapsed, and so do
-                        // errors — the ✗ glyph carries the signal without
-                        // dumping the payload; a click or Ctrl-T expands it.
-                        *collapsed = output.is_error || collapse_long(&output.content);
-                        *slot = Some(output.content);
-                    }
-                    None => {
-                        // No matching running card (e.g. denied before start
-                        // was emitted) — record the result standalone.
-                        let collapsed = output.is_error || collapse_long(&output.content);
-                        self.transcript.push(TranscriptEntry::ToolCard {
-                            name,
-                            args: Value::Null,
-                            output: Some(output.content),
-                            is_error: output.is_error,
-                            collapsed,
-                        });
-                    }
                 }
             }
             AgentEvent::Images { source, images } => {
@@ -4281,29 +4268,9 @@ impl App {
                 let Some(index) = self.pane_index(run) else {
                     return;
                 };
-                let card = self.panes[index]
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        TranscriptEntry::ToolCard {
-                            name: card_name,
-                            output: slot,
-                            is_error,
-                            collapsed,
-                            ..
-                        } if *card_name == name && slot.is_none() => {
-                            Some((slot, is_error, collapsed))
-                        }
-                        _ => None,
-                    });
-                // Same collapse policy as the main transcript: errors and long
-                // payloads land folded, so a pane stays skimmable.
-                if let Some((slot, is_error, collapsed)) = card {
-                    *is_error = output.is_error;
-                    *collapsed = output.is_error || collapse_long(&output.content);
-                    *slot = Some(output.content);
-                }
+                // Same collapse policy as the main transcript; a miss (no
+                // open card in the pane) is dropped.
+                fill_open_card(&mut self.panes[index].transcript, &name, output);
             }
             AgentEvent::SubagentRunImages {
                 run,
@@ -5006,6 +4973,46 @@ async fn build_agent(
     Ok(agent)
 }
 
+/// Rebuild the agent from the current session on a background task (crash and
+/// forced-interrupt recovery), so the TUI stays responsive. The outcome lands
+/// via [`Event::AgentRebuilt`]: `success_notice` on success, a "/quit and
+/// relaunch" notice on failure.
+fn spawn_session_rebuild(
+    app: &mut App,
+    client: &Arc<dyn LlmProvider>,
+    skills: &[Skill],
+    project_root: &Path,
+    manager: &Arc<Mutex<McpManager>>,
+    notify: mpsc::Sender<Event>,
+    success_notice: &str,
+) {
+    app.rebuilding = Some("restarting agent".to_string());
+    let client = Arc::clone(client);
+    let config = app.config.clone();
+    let skills = skills.to_vec();
+    let project_root = project_root.to_path_buf();
+    let manager = Arc::clone(manager);
+    let session = SessionTarget::Id(app.session_id.clone());
+    let success_notice = success_notice.to_string();
+    tokio::spawn(async move {
+        let manager = manager.lock().await;
+        let rebuild =
+            match build_agent(&client, &config, &skills, &project_root, &manager, session).await {
+                Ok(agent) => AgentRebuild {
+                    agent: Some(agent),
+                    model: None,
+                    notice: success_notice,
+                },
+                Err(err) => AgentRebuild {
+                    agent: None,
+                    model: None,
+                    notice: format!("could not restart the agent: {err:#} — /quit and relaunch"),
+                },
+            };
+        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
+    });
+}
+
 /// Re-arm `/ultra` on a freshly built agent, and a no-op when ultra is off.
 ///
 /// [`build_agent`] hands back an agent with ultra unset, so every rebuild — a
@@ -5153,7 +5160,7 @@ click a tool card           expand / collapse its output\n  \
 Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
 Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-G                      edit the prompt in $EDITOR\n  \
-Ctrl-C                      quit";
+Ctrl-C                      interrupt · press twice to quit";
 
 // ---------------------------------------------------------------------------
 // Genie-mode entry point
@@ -5834,42 +5841,15 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     // own pane.
                     app.notice(format!("agent task crashed: {err}"));
                     app.fail_running_panes("the turn crashed");
-                    // Rebuild off the event loop so the TUI stays responsive.
-                    app.rebuilding = Some("restarting agent".to_string());
-                    let client = client.clone();
-                    let config = app.config.clone();
-                    let skills = skills.clone();
-                    let project_root = project_root.clone();
-                    let manager = Arc::clone(&manager);
-                    let notify = events.sender();
-                    let session = SessionTarget::Id(app.session_id.clone());
-                    tokio::spawn(async move {
-                        let manager = manager.lock().await;
-                        let rebuild = match build_agent(
-                            &client,
-                            &config,
-                            &skills,
-                            &project_root,
-                            &manager,
-                            session,
-                        )
-                        .await
-                        {
-                            Ok(agent) => AgentRebuild {
-                                agent: Some(agent),
-                                model: None,
-                                notice: "agent restarted from the last session".to_string(),
-                            },
-                            Err(err) => AgentRebuild {
-                                agent: None,
-                                model: None,
-                                notice: format!(
-                                    "could not restart the agent: {err:#} — /quit and relaunch"
-                                ),
-                            },
-                        };
-                        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-                    });
+                    spawn_session_rebuild(
+                        &mut app,
+                        &client,
+                        &skills,
+                        &project_root,
+                        &manager,
+                        events.sender(),
+                        "agent restarted from the last session",
+                    );
                 }
             }
         }
@@ -5902,35 +5882,15 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             // no longer want.
             app.message_queue.clear();
             app.notice("interrupted");
-            app.rebuilding = Some("restarting agent".to_string());
-            let client = client.clone();
-            let config = app.config.clone();
-            let skills = skills.clone();
-            let project_root = project_root.clone();
-            let manager = Arc::clone(&manager);
-            let notify = events.sender();
-            let session = SessionTarget::Id(app.session_id.clone());
-            tokio::spawn(async move {
-                let manager = manager.lock().await;
-                let rebuild =
-                    match build_agent(&client, &config, &skills, &project_root, &manager, session)
-                        .await
-                    {
-                        Ok(agent) => AgentRebuild {
-                            agent: Some(agent),
-                            model: None,
-                            notice: "ready".to_string(),
-                        },
-                        Err(err) => AgentRebuild {
-                            agent: None,
-                            model: None,
-                            notice: format!(
-                                "could not restart the agent: {err:#} — /quit and relaunch"
-                            ),
-                        },
-                    };
-                let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-            });
+            spawn_session_rebuild(
+                &mut app,
+                &client,
+                &skills,
+                &project_root,
+                &manager,
+                events.sender(),
+                "ready",
+            );
         }
 
         // Dispatch any slash commands the agent queued via `run_command` during
@@ -8702,8 +8662,8 @@ mod tests {
 
     #[test]
     fn agents_and_subagents_parse_to_distinct_commands() {
-        // /agents opens the roster picker; /subagents opens the in-session
-        // monitor — they are no longer aliases.
+        // /agents opens the roster picker; /subagents opens the
+        // in-session monitor.
         assert!(matches!(
             SlashCommand::parse("/agents"),
             Some(Ok(SlashCommand::Agents))
@@ -10450,6 +10410,18 @@ mod tests {
         assert_eq!(app.panes[0].scroll, 0);
         assert!(app.input.is_empty());
         assert_eq!(app.attached, Some(0));
+    }
+
+    #[test]
+    fn scroll_step_clamps_and_tracks_follow() {
+        // Following the tail: scrolling up unsticks and moves off the bottom.
+        assert_eq!(scroll_step(true, 0, 10, 3), (7, false));
+        // Scrolling further up clamps at the oldest content.
+        assert_eq!(scroll_step(false, 2, 10, 5), (0, false));
+        // Scrolling down past the bottom clamps and re-enables follow.
+        assert_eq!(scroll_step(false, 8, 10, -5), (0, true));
+        // While following, scrolling down stays stuck to the bottom.
+        assert_eq!(scroll_step(true, 0, 10, -1), (0, true));
     }
 
     #[test]

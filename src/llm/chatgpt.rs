@@ -80,7 +80,17 @@ impl ChatgptTokens {
         let Some(refresh_token) = current.refresh_token.clone() else {
             return Ok(None);
         };
-        let response = chatgpt_oauth::refresh(&refresh_token).await?;
+        let response = match chatgpt_oauth::refresh(&refresh_token).await {
+            Ok(response) => response,
+            // A revoked/expired grant never refreshes again: forget the stored
+            // tokens so the next run re-prompts for sign-in (as xai_oauth does).
+            Err(err) if err.is::<chatgpt_oauth::RevokedGrant>() => {
+                let _ = chatgpt_oauth::clear_tokens(&self.path);
+                *self.cache.lock().await = None;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         // A refresh may omit the refresh token or id_token; keep what we had.
         let id_token = response.id_token.or(current.id_token);
         let account_id = id_token

@@ -128,9 +128,9 @@ window yourself:
    and keeps the previous JSONL under `~/.wizard/sessions/`.
 4. **Do not re-read what compaction already summarized** unless you need a
    specific detail; open the relevant file instead.
-5. **Check pressure.** `/status` reports the current context size on interactive
-   surfaces. Compact proactively before the automatic threshold if the next
-   steps need headroom.
+5. **Check pressure.** The TUI status bar shows the next-call context estimate;
+   on the GUI, `/status` prints a `context: N tokens` line. Compact proactively
+   before the automatic threshold if the next steps need headroom.
 
 Headless / gateway / continuous runs still auto-compact; `run_command` is only
 available interactively, so there lean harder on lean tool output and subagents.

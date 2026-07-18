@@ -62,16 +62,23 @@ Unit contents (`contrib/wizard-gateway.service`):
 ```ini
 [Unit]
 Description=Wizard Telegram gateway
+Documentation=https://github.com/teddytennant/wizard/blob/main/docs/gateway.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# Default WorkingDirectory is the home directory. The gateway agent operates on
+# this path as its project root. Override either:
+#   - WorkingDirectory=/path/to/your/project
+#   - Environment=WIZARD_GATEWAY_CWD=/path/to/your/project
 WorkingDirectory=%h
+# Prefer the user-local install; fall back to PATH if you installed elsewhere.
 ExecStart=%h/.local/bin/wizard --gateway
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
+# Uncomment and set when WorkingDirectory is not the project you want:
 # Environment=WIZARD_GATEWAY_CWD=%h/your/project
 
 [Install]

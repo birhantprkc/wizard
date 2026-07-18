@@ -82,7 +82,7 @@ impl SubagentConfig {
 }
 
 /// Outcome of a subagent run, summarized for the parent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SubagentResult {
     pub name: String,
     /// The subagent's final answer text.

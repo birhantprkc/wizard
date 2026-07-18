@@ -1,6 +1,6 @@
 [Unit]
 Description=Wizard Telegram gateway
-Documentation=file://%h/projects/ai/wizard/docs/gateway.md
+Documentation=https://github.com/teddytennant/wizard/blob/main/docs/gateway.md
 After=network-online.target
 Wants=network-online.target
 
