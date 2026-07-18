@@ -2539,7 +2539,13 @@ impl App {
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.vim.count = None;
-                    self.history_next();
+                    if self.history_pos.is_some() {
+                        self.history_next();
+                    } else {
+                        // Not browsing history: like plain ↓, drop into the
+                        // subagent rail when there is one.
+                        self.focus_rail();
+                    }
                 }
 
                 // --- insert transitions ---
@@ -2988,12 +2994,31 @@ impl App {
                 // subagents. Opening one is not supposed to end the browse —
                 // you keep arrowing and each run takes over the screen in
                 // turn, wrapping around, so there is never a reason to back
-                // out to the rail just to see the next one.
+                // out to the rail just to see the next one. j/k join in under
+                // vim Normal mode, where letters are motions rather than text.
                 KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.step_pane(index, -1);
                     return Ok(None);
                 }
                 KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.step_pane(index, 1);
+                    return Ok(None);
+                }
+                KeyCode::Char('k')
+                    if self.vim.is_normal()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.step_pane(index, -1);
+                    return Ok(None);
+                }
+                KeyCode::Char('j')
+                    if self.vim.is_normal()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.step_pane(index, 1);
                     return Ok(None);
                 }
@@ -3028,16 +3053,28 @@ impl App {
         if let Some(index) = self.rail_focus
             && self.attached.is_none()
         {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             match key.code {
                 // Arrows only — no j/k. The rail is a focus you land in from a
                 // live text composer, so every letter has to fall through and
                 // be typed; binding letters here would eat the first character
-                // of "just do X".
+                // of "just do X". Vim Normal mode is the exception: letters
+                // are motions there, not text, so j/k mirror ↑/↓.
                 KeyCode::Up => {
                     self.rail_select(-1);
                     return Ok(None);
                 }
                 KeyCode::Down => {
+                    self.rail_select(1);
+                    return Ok(None);
+                }
+                KeyCode::Char('k') if plain && self.vim.is_normal() => {
+                    self.rail_select(-1);
+                    return Ok(None);
+                }
+                KeyCode::Char('j') if plain && self.vim.is_normal() => {
                     self.rail_select(1);
                     return Ok(None);
                 }
@@ -10173,6 +10210,75 @@ mod tests {
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.rail_focus, None);
         assert_eq!(app.input, "x");
+    }
+
+    #[test]
+    fn vim_normal_j_and_k_drive_the_rail_like_arrows() {
+        let mut app = app_with_panes(2);
+        app.toggle_vim();
+        press(&mut app, KeyCode::Esc);
+        assert!(app.vim.is_normal());
+
+        // j from the composer drops into the rail, then walks it down,
+        // clamping at the bottom just like ↓.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, Some(0));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, Some(1));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, Some(1));
+
+        // k walks back up; off the top it returns to the composer.
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.rail_focus, Some(0));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.rail_focus, None);
+
+        // Insert mode is still text: on the rail, j hands focus back and
+        // types.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, Some(0));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.rail_focus, None);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.input, "j");
+    }
+
+    #[test]
+    fn vim_normal_j_finishes_history_before_dropping_into_the_rail() {
+        let mut app = app_with_panes(1);
+        app.toggle_vim();
+        app.history.push("earlier".to_string());
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.input, "earlier");
+        // Mid-history j walks forward (back to the empty draft) rather than
+        // jumping to the rail.
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, None);
+        assert!(app.input.is_empty());
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.rail_focus, Some(0));
+    }
+
+    #[test]
+    fn vim_normal_j_keeps_walking_subagents_while_attached() {
+        let mut app = app_with_panes(2);
+        app.toggle_vim();
+        press(&mut app, KeyCode::Esc);
+        app.attach_pane(0);
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.attached, Some(1));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.attached, Some(0));
+
+        // In insert mode the composer under the pane is live again: j types.
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.attached, Some(0));
+        assert_eq!(app.input, "j");
     }
 
     #[test]
