@@ -1507,9 +1507,9 @@ fn fmt_age(secs: u64) -> String {
 
 /// Machine-wide session manager (`/dashboard`): every live Wizard session on
 /// the machine, grouped by state, refreshed from the registry while open.
-/// Modal — ↑/↓ move the selection, Ctrl-X stops the selected session, typing
-/// + Enter dispatches a background session, Esc clears the input or closes.
-/// Attach arrives in a later milestone.
+/// Modal — ↑/↓ move the selection, Ctrl-X stops the selected session,
+/// typing + Enter dispatches a background session, Esc clears the input or
+/// closes. Attach arrives in a later milestone.
 fn draw_dashboard(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
