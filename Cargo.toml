@@ -98,10 +98,9 @@ globset = "0.4"
 # falls back to a plain byte copy when the filesystem lacks FICLONE/clonefile.
 reflink-copy = "0.1"
 
-# Debug traces (~/.wizard/logs/)
+# Tracing facade for internal diagnostics. No subscriber is installed, so
+# events are dropped at runtime; kept for the call sites across src/.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 
 # Web tools: HTML → markdown for web_fetch, result scraping for web_search
 htmd = "0.5"
