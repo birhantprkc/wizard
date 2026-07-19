@@ -737,9 +737,10 @@ impl CommandContext<'_> {
         };
         match agent.rewind_to(turn) {
             Ok(restored) => {
-                // The rewound turns no longer exist: reset the transcript
-                // view to match the truncated conversation.
-                self.app.transcript.clear();
+                // The rewound turns no longer exist: replay the truncated
+                // conversation into the transcript view (same as `/resume`).
+                let messages = agent.session().load_messages().unwrap_or_default();
+                self.app.load_transcript(messages);
                 self.app.streaming.clear();
                 self.app.streaming_thinking.clear();
                 self.app.scroll_to_bottom();
