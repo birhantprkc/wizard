@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
 
-One command installs the `wizard` binary. The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or bring a key for OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
+One command installs the `wizard` binary. The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or sign in with an xAI or ChatGPT account, or bring a key for xAI, OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
 
 > **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
 
@@ -18,7 +18,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 
 ## What it does
 
-- **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so OpenAI, Anthropic, xAI, OpenRouter, Cloudflare Workers AI, Ollama, and any OpenAI-compatible endpoint (Groq, vLLM, LM Studio, …) all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
+- **Any model, switchable live.** Speaks the OpenAI-compatible chat API (streaming + native tool calls, with a prompt-based JSON fallback), so xAI, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras, OpenRouter, Cloudflare Workers AI, Ollama, and any OpenAI-compatible endpoint (vLLM, LM Studio, …) all work. `/provider` switches the live agent between them; keys live in env vars or `~/.wizard/credentials.toml` (mode 0600), never in plaintext config. → [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
 - **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you, including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
 - **Model fusion (`/fusion`).** Run a panel of your providers as a debate — the members critique each other's drafts — and synthesize one tool-capable answer. → [Fusion](docs/fusion.md)
 - **Mixture of agents (`/ultra`).** Fan a turn out to N read-only subagents on the model you're already using (each with a different lens, each reading the actual repo), have a judge compare their drafts, then execute from the verdict. → [Ultra](docs/ultra.md)

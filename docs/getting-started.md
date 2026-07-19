@@ -116,7 +116,7 @@ These override `~/.wizard/config.toml` for a single run:
 wizard
 ```
 
-With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), xAI (Grok), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (any model tag, installed models are listed, and a missing tag is pulled automatically on first run), for bringing your own model. Re-run it any time with `wizard --onboard`.
+With no config present (the default and minimal installs), the first launch opens onboarding: a Ratatui wizard that asks which provider to use (provider, model, messaging gateway, mode) and writes `~/.wizard/config.toml`. xAI (Grok) is listed first — account sign-in, then API key. Picking Local is one step: Wizard detects your hardware, downloads a GGUF sized to it, and installs and starts `llama-server` itself (or reuses an existing Ollama install). The other options take an API key: OpenRouter, Cloudflare Workers AI (GLM 5.2), OpenAI, Anthropic, a **More cloud providers** list (Google Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras), or any OpenAI-compatible endpoint. Alongside them sit two BYOM picks, llama.cpp (your own GGUF and server URL) and Ollama (any model tag, installed models are listed, and a missing tag is pulled automatically on first run), for bringing your own model. Re-run it any time with `wizard --onboard`.
 
 With a config present (after onboarding, or a `WIZARD_LOCAL=1` install), launching Wizard with a local llama.cpp provider:
 
@@ -227,14 +227,15 @@ Or pick the local Ollama option in onboarding (`wizard --onboard`). Wizard speak
 
 ## Using a cloud or remote provider
 
-Any OpenAI-compatible endpoint, OpenRouter, Cloudflare Workers AI, Anthropic, or xAI works. The simplest path is `/provider` inside the TUI: it opens a menu of your configured providers (Enter switches to one) with an **Add provider…** entry that walks you through each type. Pick xAI (API key or account sign-in), OpenRouter, Cloudflare Workers AI, OpenAI, Anthropic, or an OpenAI-compatible custom endpoint; you type the API key inline (hidden) and it is stored in `~/.wizard/credentials.toml` (file mode 0600). xAI account sign-in runs the OAuth flow and adds the provider for you.
+Any OpenAI-compatible endpoint, OpenRouter, Cloudflare Workers AI, Anthropic, or xAI works. The simplest path is `/provider` inside the TUI: it opens a menu of your configured providers (Enter switches to one) with an **Add provider…** entry that walks you through each type. Pick xAI (API key or account sign-in), OpenRouter, Cloudflare Workers AI, OpenAI, Anthropic, one of the OpenAI-compatible presets (Google Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras), or an OpenAI-compatible custom endpoint; you type the API key inline (hidden) and it is stored in `~/.wizard/credentials.toml` (file mode 0600). xAI account sign-in runs the OAuth flow and adds the provider for you.
 
 The same thing is scriptable with explicit arguments:
 
 ```
-/provider add openai openai https://api.openai.com/v1 gpt-4o OPENAI_API_KEY
 /provider add xai xai https://api.x.ai/v1 grok-4.5 XAI_API_KEY
-/provider use openai
+/provider add openai openai https://api.openai.com/v1 gpt-5.6-sol OPENAI_API_KEY
+/provider add gemini openai https://generativelanguage.googleapis.com/v1beta/openai gemini-3.5-flash GEMINI_API_KEY
+/provider use xai
 ```
 
 With `/provider add`, the last argument names the environment variable holding your API key (export it before launching, `export OPENAI_API_KEY=sk-...`); the key itself is never written to disk. The interactive menu instead stores the key in `~/.wizard/credentials.toml`. Onboarding offers the same choices interactively. The default install puts down no local stack, so picking a cloud provider on first run is all there is to it.

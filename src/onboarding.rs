@@ -149,17 +149,27 @@ pub fn parse_chat_ids(input: &str) -> Result<Vec<i64>, String> {
 }
 
 /// OpenAI model options offered in the picker (first is the default).
-const OPENAI_MODELS: &[&str] = &["gpt-4o", "gpt-4o-mini", "o1"];
+const OPENAI_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.3-codex",
+];
 /// Anthropic model options offered in the picker (first is the default — the
 /// latest Claude).
 const ANTHROPIC_MODELS: &[&str] = &[
     "claude-fable-5",
     "claude-opus-4-8",
-    "claude-sonnet-4-6",
+    "claude-sonnet-5",
     "claude-haiku-4-5",
 ];
 /// xAI (Grok) model options offered in the picker (first is the default).
-const XAI_MODELS: &[&str] = &["grok-4.5", "grok-4.3", "grok-code-fast-1"];
+const XAI_MODELS: &[&str] = &[
+    "grok-4.5",
+    "grok-4.3",
+    "grok-4.20-0309-reasoning",
+    "grok-build-0.1",
+];
 /// Ollama tier options offered alongside the hardware-suggested default.
 const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
 
@@ -280,14 +290,16 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// Drive the sequence of steps. Returns `Ok(None)` as soon as any step is
 /// cancelled.
 fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
-    // Step 1 — provider. "Local" is one pick: no further model questions —
-    // Wizard self-configures llama.cpp (or an Ollama install that already has
-    // a model) and downloads a hardware-sized GGUF on first run. The BYOM
-    // local flavors sit alongside the cloud providers for people who want to
-    // bring their own model and pick the pieces themselves.
+    // Step 1 — provider, xAI first. "Local" is one pick: no further model
+    // questions — Wizard self-configures llama.cpp (or an Ollama install that
+    // already has a model) and downloads a hardware-sized GGUF on first run.
+    // The BYOM local flavors sit alongside the cloud providers for people who
+    // want to bring their own model and pick the pieces themselves.
     let provider_options = [
+        Opt::new("xAI account sign-in", "grok-4.5 via OAuth, no API key"),
+        Opt::new("xAI (Grok), API key", "grok-4.5 via XAI_API_KEY"),
         Opt::new(
-            "Local (recommended)",
+            "Local",
             "one pick — llama.cpp & Ollama set up for you, model sized to this machine; \
              private, no API key",
         ),
@@ -296,10 +308,12 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             "Cloudflare Workers AI",
             "GLM 5.2 via CLOUDFLARE_API_TOKEN (+ account id)",
         ),
-        Opt::new("xAI (Grok), API key", "grok-4.5 via XAI_API_KEY"),
-        Opt::new("xAI account sign-in", "grok-4.5 via OAuth, no API key"),
-        Opt::new("OpenAI / OpenAI-compatible", "gpt-4o and friends"),
+        Opt::new("OpenAI / OpenAI-compatible", "gpt-5.6 family and friends"),
         Opt::new("Anthropic (Claude)", "claude-fable-5"),
+        Opt::new(
+            "More cloud providers",
+            "Gemini, DeepSeek, Groq, Mistral, Kimi, GLM, …",
+        ),
         Opt::new("Custom OpenAI-compatible endpoint", "any base URL"),
         Opt::new(
             "BYOM — llama.cpp",
@@ -324,20 +338,20 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     // Step 2 — model (+ key env / base url, depending on provider). The
     // one-click local pick asks nothing further.
     let collected = match provider {
-        0 => collect_local_auto(),
-        1 => match collect_openrouter(terminal)? {
+        0 => match collect_xai_oauth(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        2 => match collect_cloudflare(terminal)? {
+        1 => match collect_xai(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        3 => match collect_xai(terminal)? {
+        2 => collect_local_auto(),
+        3 => match collect_openrouter(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        4 => match collect_xai_oauth(terminal)? {
+        4 => match collect_cloudflare(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
@@ -349,11 +363,15 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             Some(c) => c,
             None => return Ok(None),
         },
-        7 => match collect_custom(terminal)? {
+        7 => match collect_compat_menu(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
-        8 => match collect_llamacpp(terminal)? {
+        8 => match collect_custom(terminal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+        9 => match collect_llamacpp(terminal)? {
             Some(c) => c,
             None => return Ok(None),
         },
@@ -1171,6 +1189,74 @@ fn collect_xai_oauth(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: XAI_BASE_URL.to_string(),
         model,
         api_key_env: None,
+        gguf_path: None,
+    }))
+}
+
+/// The "More cloud providers" submenu: every OpenAI-compatible preset from
+/// [`crate::llm::compat::PRESETS`], then the usual model + key-env questions.
+fn collect_compat_menu(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let options: Vec<Opt> = crate::llm::compat::PRESETS
+        .iter()
+        .map(|preset| Opt::new(preset.label, preset.detail))
+        .collect();
+    let index = match select(
+        terminal,
+        "Provider",
+        "All OpenAI-compatible — pick one.",
+        &options,
+        0,
+    )? {
+        Some(index) => index,
+        None => return Ok(None),
+    };
+    collect_compat(terminal, &crate::llm::compat::PRESETS[index])
+}
+
+/// Model + key-env questions for one OpenAI-compatible preset.
+fn collect_compat(
+    terminal: &mut Tui,
+    preset: &crate::llm::compat::CompatPreset,
+) -> Result<Option<ProviderAnswers>> {
+    let models: Vec<(String, String)> = preset
+        .models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                (*m).to_string(),
+                if i == 0 {
+                    "default".to_string()
+                } else {
+                    String::new()
+                },
+            )
+        })
+        .collect();
+    let model = match pick_model(
+        terminal,
+        &format!("{} model.", preset.label),
+        &models,
+        preset.default_model(),
+    )? {
+        Some(model) => model,
+        None => return Ok(None),
+    };
+    let api_key_env = match text_input(
+        terminal,
+        "API key env var",
+        "Wizard reads your key from this env var (never stored on disk).",
+        preset.key_env,
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    Ok(Some(ProviderAnswers {
+        provider_name: preset.name.to_string(),
+        kind: ProviderKind::Openai,
+        base_url: preset.base_url.to_string(),
+        model,
+        api_key_env: Some(api_key_env),
         gguf_path: None,
     }))
 }

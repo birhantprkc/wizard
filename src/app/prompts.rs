@@ -44,6 +44,9 @@ pub(super) const ULTRA_JUDGE_ROW: &str = ultra::JUDGE_NAME;
 /// The level-2 provider-type menu: `(label, detail)` in dispatch order. The
 /// Enter handler in [`App::handle_key`] matches on the row index, so this
 /// order is the single source of truth for both rendering and dispatch.
+/// The OpenAI-compatible presets from [`crate::llm::compat::PRESETS`] are
+/// appended after these rows (rendering and dispatch both offset by
+/// `PROVIDER_TYPES.len()`).
 pub(super) const PROVIDER_TYPES: &[(&str, &str)] = &[
     ("xAI (Grok) — sign in", "OAuth · no API key"),
     (

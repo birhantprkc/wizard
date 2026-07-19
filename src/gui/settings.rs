@@ -56,7 +56,7 @@ pub const PRESETS: &[Preset] = &[
         label: "OpenAI",
         kind: "openai",
         base_url: "https://api.openai.com/v1",
-        model: "gpt-5.2",
+        model: "gpt-5.6-sol",
         needs_key: true,
         needs_base_url: false,
     },
@@ -106,6 +106,25 @@ pub const PRESETS: &[Preset] = &[
         needs_base_url: false,
     },
 ];
+
+/// Every preset the Settings page offers: the dedicated-kind rows above,
+/// followed by the OpenAI-compatible cloud providers from
+/// [`crate::llm::compat::PRESETS`].
+pub fn presets() -> Vec<Preset> {
+    PRESETS
+        .iter()
+        .cloned()
+        .chain(crate::llm::compat::PRESETS.iter().map(|preset| Preset {
+            name: preset.name,
+            label: preset.label,
+            kind: "openai",
+            base_url: preset.base_url,
+            model: preset.default_model(),
+            needs_key: true,
+            needs_base_url: false,
+        }))
+        .collect()
+}
 
 /// Where a provider's API key comes from, for the Settings page's key column.
 /// The order mirrors [`ProviderConfig`]'s own resolution: the credential file
@@ -359,7 +378,7 @@ mod tests {
 
     #[test]
     fn presets_are_all_valid_provider_kinds() {
-        for preset in PRESETS {
+        for preset in presets() {
             let kind: ProviderKind = toml::from_str(&format!("kind = \"{}\"", preset.kind))
                 .map(|v: KindProbe| v.kind)
                 .unwrap_or_else(|err| panic!("preset {}: {err}", preset.name));

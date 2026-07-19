@@ -447,13 +447,20 @@ pub(crate) fn context_window(model: &str) -> Option<u32> {
     if model.starts_with("grok-4.5") {
         return Some(500_000);
     }
-    if model.starts_with("grok-4") {
+    // grok-4.3 and the grok-4.20 snapshots are 1M-context.
+    if model.starts_with("grok-4.3") || model.starts_with("grok-4.2") {
+        return Some(1_000_000);
+    }
+    if model.starts_with("grok-4") || model.starts_with("grok-build") {
         return Some(256_000);
     }
     if model.starts_with("grok") {
         return Some(131_072);
     }
     // OpenAI.
+    if model.starts_with("gpt-5.6") {
+        return Some(1_000_000);
+    }
     if model.starts_with("gpt-5") {
         return Some(400_000);
     }
@@ -465,6 +472,20 @@ pub(crate) fn context_window(model: &str) -> Option<u32> {
     }
     if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
         return Some(200_000);
+    }
+    // Cross-vendor tags served through OpenAI-compatible endpoints
+    // (the compat presets and OpenRouter).
+    if model.starts_with("gemini-3") || model.starts_with("gemini-2.5") {
+        return Some(1_048_576);
+    }
+    if model.starts_with("deepseek-v4") {
+        return Some(1_000_000);
+    }
+    if model.starts_with("kimi-k3") {
+        return Some(1_000_000);
+    }
+    if model.starts_with("minimax-m2") {
+        return Some(204_800);
     }
     None
 }
@@ -1346,10 +1367,17 @@ mod tests {
         assert_eq!(context_window("gpt-4o-mini"), Some(128_000));
         assert_eq!(context_window("gpt-4.1"), Some(1_047_576));
         assert_eq!(context_window("gpt-5"), Some(400_000));
+        assert_eq!(context_window("gpt-5.6-sol"), Some(1_000_000));
         assert_eq!(context_window("o3-mini"), Some(200_000));
         assert_eq!(context_window("grok-3"), Some(131_072));
-        assert_eq!(context_window("grok-4.3"), Some(256_000));
+        assert_eq!(context_window("grok-4.3"), Some(1_000_000));
+        assert_eq!(context_window("grok-4.20-0309-reasoning"), Some(1_000_000));
         assert_eq!(context_window("grok-4.5"), Some(500_000));
+        assert_eq!(context_window("grok-build-0.1"), Some(256_000));
+        assert_eq!(context_window("gemini-3.5-flash"), Some(1_048_576));
+        assert_eq!(context_window("deepseek-v4-pro"), Some(1_000_000));
+        assert_eq!(context_window("kimi-k3"), Some(1_000_000));
+        assert_eq!(context_window("minimax-m2.7"), Some(204_800));
         assert_eq!(context_window("qwen3-8b"), None, "local tags stay unknown");
         assert_eq!(context_window(""), None);
     }

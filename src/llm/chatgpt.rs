@@ -28,7 +28,7 @@ use super::{
 };
 
 /// Static fallback model list; the live list comes from `GET /models`.
-const FALLBACK_MODELS: &[&str] = &["gpt-5.2", "gpt-5.5", "gpt-5.6-luna"];
+const FALLBACK_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
 
 /// Manages the stored OAuth tokens: hands out the bearer + account id, and
 /// refreshes proactively (near expiry) or after a 401.

@@ -26,7 +26,12 @@ const API_VERSION: &str = "2023-06-01";
 /// current Claude model's 64k output ceiling.
 const MAX_TOKENS: u32 = 32_000;
 /// Static fallback model list when `GET /v1/models` is unavailable.
-const FALLBACK_MODELS: &[&str] = &["claude-fable-5"];
+const FALLBACK_MODELS: &[&str] = &[
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+];
 
 /// Client bound to one Anthropic-compatible endpoint.
 #[derive(Debug, Clone)]
@@ -304,15 +309,21 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
-/// Context-window table for Anthropic models: every `claude-*` model has a
-/// 200k window, with 1M-context variants flagged in the model name. Unknown
-/// (non-claude) tags report `None`.
+/// Context-window table for Anthropic models. The current generation
+/// (Fable 5 / Mythos 5, Opus 4.8, Sonnet 5) has a 1M window, as do older
+/// variants flagged `1m` in the model name; every other `claude-*` model has
+/// 200k. Unknown (non-claude) tags report `None`.
 fn context_window(model: &str) -> Option<u32> {
     let model = model.to_ascii_lowercase();
     if !model.starts_with("claude") {
         return None;
     }
-    if model.contains("1m") {
+    if model.contains("1m")
+        || model.contains("fable")
+        || model.contains("mythos")
+        || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-sonnet-5")
+    {
         Some(1_000_000)
     } else {
         Some(200_000)
@@ -909,7 +920,10 @@ mod tests {
 
     #[test]
     fn context_window_table_covers_claude_and_unknowns() {
-        assert_eq!(context_window("claude-fable-5"), Some(200_000));
+        assert_eq!(context_window("claude-fable-5"), Some(1_000_000));
+        assert_eq!(context_window("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(context_window("claude-sonnet-5"), Some(1_000_000));
+        assert_eq!(context_window("claude-haiku-4-5"), Some(200_000));
         assert_eq!(context_window("Claude-Opus-4"), Some(200_000));
         assert_eq!(context_window("claude-sonnet-4-5[1m]"), Some(1_000_000));
         assert_eq!(context_window("gpt-4o"), None);

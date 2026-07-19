@@ -586,7 +586,7 @@ struct SettingsResponse {
     /// field. `0` is the default and means no limit.
     max_steps: u32,
     providers: Vec<SettingsProvider>,
-    presets: &'static [settings::Preset],
+    presets: Vec<settings::Preset>,
 }
 
 #[derive(Debug, Serialize)]
@@ -619,7 +619,7 @@ fn settings_response(config: &Config) -> SettingsResponse {
                 active: provider.name == active,
             })
             .collect(),
-        presets: settings::PRESETS,
+        presets: settings::presets(),
     }
 }
 

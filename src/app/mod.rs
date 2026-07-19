@@ -865,7 +865,8 @@ impl App {
 
     /// Open the provider-type picker (level 2): the menu of provider kinds to
     /// add. Rows are dispatched by index against the fixed order in
-    /// [`PROVIDER_TYPES`], so the labels stay human-readable.
+    /// [`PROVIDER_TYPES`], followed by the OpenAI-compatible presets from
+    /// [`crate::llm::compat::PRESETS`], so the labels stay human-readable.
     pub fn open_provider_type_picker(&mut self) {
         let items: Vec<PickerItem> = PROVIDER_TYPES
             .iter()
@@ -874,6 +875,11 @@ impl App {
                 detail: (*detail).to_string(),
                 current: false,
             })
+            .chain(crate::llm::compat::PRESETS.iter().map(|preset| PickerItem {
+                value: format!("{} — API key", preset.label),
+                detail: preset.detail.to_string(),
+                current: false,
+            }))
             .collect();
         self.picker = Some(Picker {
             kind: PickerKind::ProviderType,
@@ -2804,7 +2810,24 @@ impl App {
                                         ]),
                                     });
                                 }
-                                _ => {}
+                                // OpenAI-compatible presets (Gemini, DeepSeek,
+                                // Groq, …) appended after the fixed rows — the
+                                // default model is preset, so only the key is
+                                // asked for.
+                                index => {
+                                    if let Some(preset) = crate::llm::compat::PRESETS
+                                        .get(index - PROVIDER_TYPES.len())
+                                    {
+                                        self.begin_provider_prompt(ProviderPrompt {
+                                            kind: ProviderKind::Openai,
+                                            name: preset.name.to_string(),
+                                            base_url: preset.base_url.to_string(),
+                                            model: preset.default_model().to_string(),
+                                            api_key: None,
+                                            queue: VecDeque::from([PromptField::ApiKey]),
+                                        });
+                                    }
+                                }
                             }
                             return Ok(None);
                         }

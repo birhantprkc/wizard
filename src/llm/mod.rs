@@ -6,6 +6,7 @@ pub mod anthropic;
 pub mod chatgpt;
 pub mod chatgpt_oauth;
 pub mod cloudflare;
+pub mod compat;
 pub mod fusion;
 pub mod llamacpp;
 pub mod oauth_callback;
