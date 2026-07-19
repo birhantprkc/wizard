@@ -8,9 +8,11 @@
 //! - **Transparent**: never paint a background color; everything renders on
 //!   `Color::Reset` so the user's terminal background shows through.
 //!   Selection reads through an accent marker + bold, not opaque slabs.
-//! - **Monochrome**: white accent plus dim grays only — no hues anywhere.
-//!   Emphasis reads through brightness and bold, semantics through glyphs
-//!   (✓/✗), never color.
+//! - **Monochrome**: white accent plus dim grays only — no hues anywhere
+//!   in chrome or chat. Emphasis reads through brightness and bold,
+//!   semantics through glyphs (✓/✗). **Exception:** the `/diff` sidebar
+//!   uses conventional green additions / red deletions (and pane status
+//!   already uses green/red for done/failed).
 //! - **No heavy boxes**: borderless sections separated by padding and dim
 //!   rules; rounded dim borders only on floating layers.
 //! - **Todos never cover chat**: when shown, the todo list is a reserved
@@ -887,8 +889,9 @@ fn draw_todo_band(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Git diff sidebar (`/diff`): separated from the chat by a single dim
-/// rule, syntax-highlighted (foreground colors only). Lines wider than
-/// the sidebar are cut with a dim `…` instead of clipping silently.
+/// rule, with conventional green additions / red deletions (foreground
+/// only). Lines wider than the sidebar are cut with a dim `…` instead of
+/// clipping silently.
 fn draw_diff_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::new()
         .borders(Borders::LEFT)
@@ -2559,42 +2562,39 @@ fn syntect_assets() -> &'static (SyntaxSet, Option<Theme>) {
     })
 }
 
-/// Syntax-highlight a unified diff via syntect for terminal display.
+/// Color a unified diff for the `/diff` sidebar: green additions, red
+/// deletions, dim context. Prefix-based (not syntect) so the colors stay
+/// conventional regardless of the monochrome code-highlight theme.
 pub fn highlight_diff(diff: &str) -> Text<'static> {
-    let (syntaxes, theme) = syntect_assets();
-    let syntax = syntaxes
-        .find_syntax_by_name("Diff")
-        .or_else(|| syntaxes.find_syntax_by_extension("diff"));
-
-    let (Some(syntax), Some(theme)) = (syntax, theme.as_ref()) else {
-        return fallback_diff(diff);
-    };
-
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for line in LinesWithEndings::from(diff) {
-        match highlighter.highlight_line(line, syntaxes) {
-            Ok(ranges) => {
-                let spans: Vec<Span<'static>> = ranges
-                    .into_iter()
-                    .map(|(style, content)| {
-                        Span::styled(
-                            content.trim_end_matches('\n').to_string(),
-                            syntect_style(style),
-                        )
-                    })
-                    .collect();
-                lines.push(Line::from(spans));
-            }
-            Err(_) => lines.push(Line::raw(line.trim_end_matches('\n').to_string())),
-        }
-    }
+    let lines: Vec<Line<'static>> = diff
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), diff_line_style(line))))
+        .collect();
     Text::from(lines)
+}
+
+/// Style for one unified-diff line. File headers (`---`/`+++`) are checked
+/// before bare `+`/`-` so they don't paint as add/delete.
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("@@") {
+        accent()
+    } else if line.starts_with("diff ") || line.starts_with("index ") {
+        Style::default().fg(TEXT_DIM).bold()
+    } else {
+        dim()
+    }
 }
 
 /// Map a syntect style to ratatui, collapsing the theme's foreground to its
 /// grayscale luminance (the UI is monochrome) and keeping font modifiers —
-/// backgrounds would paint over the terminal transparency.
+/// backgrounds would paint over the terminal transparency. Used for fenced
+/// code blocks in chat; diffs go through [`highlight_diff`] instead.
 fn syntect_style(style: syntect::highlighting::Style) -> Style {
     let fg = style.foreground;
     let luma = (u32::from(fg.r) * 299 + u32::from(fg.g) * 587 + u32::from(fg.b) * 114) / 1000;
@@ -2610,30 +2610,6 @@ fn syntect_style(style: syntect::highlighting::Style) -> Style {
         out = out.add_modifier(Modifier::UNDERLINED);
     }
     out
-}
-
-/// Plain prefix-based diff coloring used when syntect assets are missing.
-fn fallback_diff(diff: &str) -> Text<'static> {
-    let lines: Vec<Line<'static>> = diff
-        .lines()
-        .map(|line| {
-            let style = if line.starts_with("+++") || line.starts_with("---") {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else if line.starts_with('+') {
-                Style::default().fg(Color::White)
-            } else if line.starts_with('-') {
-                Style::default().fg(TEXT_DIM)
-            } else if line.starts_with("@@") {
-                accent()
-            } else if line.starts_with("diff ") || line.starts_with("index ") {
-                Style::default().fg(TEXT_DIM).bold()
-            } else {
-                dim()
-            };
-            Line::from(Span::styled(line.to_string(), style))
-        })
-        .collect();
-    Text::from(lines)
 }
 
 /// Highlight one fenced code block, memoized: completed blocks are
@@ -3732,6 +3708,67 @@ mod tests {
         assert_eq!(a.chars().count(), 20, "bar spans the full width");
         assert!(a.contains('█') && a.contains('░'), "has lit and dim cells");
         assert_ne!(a, b, "the lit window moves with the tick");
+    }
+
+    #[test]
+    fn highlight_diff_uses_red_and_green() {
+        // /diff must paint conventional red deletions / green additions so
+        // the sidebar is readable at a glance (not grayscale monochrome).
+        let text = highlight_diff(
+            "diff --git a/a.txt b/a.txt\n\
+             --- a/a.txt\n\
+             +++ b/a.txt\n\
+             @@ -1,2 +1,2 @@\n\
+              context\n\
+             -old\n\
+             +new\n",
+        );
+        let styles: Vec<(String, Style)> = text
+            .lines
+            .iter()
+            .map(|line| {
+                let content = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>();
+                let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                (content, style)
+            })
+            .collect();
+
+        assert_eq!(
+            styles.iter().find(|(c, _)| c == "-old").map(|(_, s)| *s),
+            Some(Style::default().fg(Color::Red)),
+            "deletions are red"
+        );
+        assert_eq!(
+            styles.iter().find(|(c, _)| c == "+new").map(|(_, s)| *s),
+            Some(Style::default().fg(Color::Green)),
+            "additions are green"
+        );
+        // File headers must not be mis-classified as add/delete.
+        assert_eq!(
+            styles
+                .iter()
+                .find(|(c, _)| c.starts_with("--- "))
+                .map(|(_, s)| *s),
+            Some(Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)),
+        );
+        assert_eq!(
+            styles
+                .iter()
+                .find(|(c, _)| c.starts_with("+++ "))
+                .map(|(_, s)| *s),
+            Some(Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)),
+        );
+        assert_eq!(
+            styles
+                .iter()
+                .find(|(c, _)| c.starts_with("@@"))
+                .map(|(_, s)| *s),
+            Some(accent()),
+        );
     }
 
     #[test]
