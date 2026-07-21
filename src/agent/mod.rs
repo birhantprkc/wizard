@@ -2291,8 +2291,6 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         // loop also drains at the top of every step).
         agent.drain_background_tasks(&tx).await;
 
-        let turn_started = Instant::now();
-        let turn_prompt = input.clone();
         // First checkpoint turn of this cycle, for rollback_failed_cycles
         // (run_turn assigns the next id via begin_turn).
         let cycle_first_turn = agent.checkpoints().current_turn() + 1;
@@ -2309,22 +2307,6 @@ pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
         {
             Ok(reason) => {
                 final_reason = reason;
-                // Record the completed turn as a benchmark candidate
-                // (`wizard bench promote`). Infallible and silent inside
-                // bench replays, so it can never affect the run itself.
-                crate::bench::record::record(
-                    &project_root,
-                    &turn_prompt,
-                    &format!("{reason:?}"),
-                    turn_started.elapsed(),
-                    &model,
-                    if config.continuous {
-                        "continuous"
-                    } else {
-                        "sovereign"
-                    },
-                )
-                .await;
                 match reason {
                     DoneReason::MaxSteps => {
                         input = "Continue the task from where you left off. If it is already \

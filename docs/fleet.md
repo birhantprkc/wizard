@@ -30,8 +30,7 @@ planning and synthesis turns drive a real in-process agent); `status` and
    - **claiming**: the coordinator claims tasks for workers by atomically
      renaming `queue/<id>.json` into `claimed/` and spawns
      `wizard --mode sovereign -p "<task>" --cwd <worktree> --output-format json`
-     with `WIZARD_FLEET=1` (which also suppresses trajectory recording, so
-     worker runs never pollute `.wizard/trajectories.jsonl`), at most N
+     with `WIZARD_FLEET=1`, at most N
      children at a time. Worker prompts end with: commit your changes with a
      descriptive message; do not push.
    - **reaping**: when a child exits, its exit code, branch, and parsed JSON

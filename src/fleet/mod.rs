@@ -33,7 +33,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, PlanVerdict, build_headless_agent};
-use crate::bench::git;
+use crate::git_util as git;
 use crate::cli::FleetCmd;
 use crate::config::Config;
 

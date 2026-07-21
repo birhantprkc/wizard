@@ -8,7 +8,6 @@
 pub mod acp;
 pub mod agent;
 pub mod app;
-pub mod bench;
 pub mod checkpoint;
 pub mod cli;
 pub mod commands;
@@ -21,6 +20,7 @@ pub mod event;
 pub mod evolve;
 pub mod fleet;
 pub mod gateway;
+pub mod git_util;
 pub mod gui;
 pub mod hardware;
 pub mod harness;
@@ -87,16 +87,6 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return harness::run(cmd.clone()).map(|()| 0);
-    }
-
-    // Bench is self-contained tooling: it must work with no config and no
-    // LLM, so dispatch before onboarding and before the config load. Its
-    // exit code is nonzero when any replayed case failed, so it can gate CI.
-    if let Some(cli::Command::Bench { cmd }) = &cli.command {
-        if let Some(dir) = &cli.cwd {
-            std::env::set_current_dir(dir)?;
-        }
-        return bench::run(cmd.clone()).await;
     }
 
     // MCP server: expose Wizard's native tools over stdio to another MCP
@@ -335,7 +325,7 @@ fn should_onboard(cli: &cli::Cli) -> Result<bool> {
 /// Testable core of [`should_onboard`]; `interactive` is whether stdin and
 /// stdout are both terminals.
 fn should_onboard_given(cli: &cli::Cli, interactive: bool) -> Result<bool> {
-    // Subcommands (bench) are dispatched before this is ever consulted; the
+    // Subcommands are dispatched before this is ever consulted; the
     // check here is a defensive guarantee that they can never onboard.
     if cli.command.is_some() {
         return Ok(false);

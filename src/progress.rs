@@ -1,8 +1,8 @@
 //! Progress reporting for Wizard's plain-terminal surfaces.
 //!
 //! The interactive genie TUI draws its own spinner (`src/ui.rs`); everything
-//! here covers the paths that print to a normal terminal instead — bench
-//! replays, headless sovereign turns, and llama-server startup waits — with
+//! here covers the paths that print to a normal terminal instead — headless
+//! sovereign turns, fleet workers, and llama-server startup waits — with
 //! one shared look: the TUI's braille frames, white accent, dim text.
 //!
 //! All drawing goes to stderr and indicatif hides itself when stderr is not
@@ -33,7 +33,7 @@ fn spinner_style() -> ProgressStyle {
         .tick_chars(TICK_CHARS)
 }
 
-/// Counted-bar style (bench cases): position/length, current item, elapsed.
+/// Counted-bar style (fleet slots, multi-item work): position/length, current item, elapsed.
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "{spinner:.white} [{bar:24.white/black}] {pos}/{len} {msg:.dim} {elapsed:.dim}",

@@ -110,7 +110,7 @@ pub struct Cli {
 
 impl Cli {
     /// Names of top-level flags set on this invocation that a self-contained
-    /// subcommand (bench, doctor, schedule, scheduler, fleet, usage, evolve,
+    /// subcommand (doctor, schedule, scheduler, fleet, usage, evolve,
     /// update, sync) would silently ignore. `--cwd` is honored everywhere and
     /// excluded.
     /// [`crate::run`] turns a non-empty result into a hard error rather than
@@ -172,13 +172,6 @@ impl Cli {
 /// Top-level subcommands. Absent for the classic flag-driven modes.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
-    /// Benchmark harness: record real tasks, replay them against any agent
-    /// CLI, compare pass rates.
-    Bench {
-        #[command(subcommand)]
-        cmd: BenchCmd,
-    },
-
     /// Diagnose the environment: config, providers, MCP servers, tools,
     /// hooks, writable state dirs, checkpoints. Exits 0 when no check
     /// failed.
@@ -378,7 +371,7 @@ pub enum EvolveCmd {
     },
 }
 
-/// `wizard harness` subcommands. Self-contained like bench: no config load,
+/// `wizard harness` subcommands. Self-contained: no config load,
 /// no onboarding, no LLM.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum HarnessCmd {
@@ -418,7 +411,7 @@ pub enum FleetCmd {
     Stop,
 }
 
-/// `wizard schedule` subcommands. Like bench, these are self-contained:
+/// `wizard schedule` subcommands. Self-contained:
 /// they edit `~/.wizard/schedule.toml` directly and never load
 /// `~/.wizard/config.toml` or trigger onboarding.
 #[derive(Debug, Clone, clap::Subcommand)]
@@ -477,135 +470,6 @@ pub enum ScheduleCmd {
     Run {
         /// Entry name as shown by `wizard schedule list`.
         name: String,
-    },
-}
-
-/// `wizard bench` subcommands. Self-contained: no flag here depends on the
-/// top-level flags (which are not global), and none of them load
-/// `~/.wizard/config.toml` or trigger onboarding.
-#[derive(Debug, Clone, clap::Subcommand)]
-pub enum BenchCmd {
-    /// Create a benchmark case by hand.
-    Add {
-        /// Case id; `[a-zA-Z0-9_-]+` only (it becomes a file and worktree name).
-        #[arg(long)]
-        id: String,
-
-        /// Task prompt handed to the harness command.
-        #[arg(long)]
-        prompt: String,
-
-        /// Shell command run in the replayed worktree; exit 0 means pass.
-        #[arg(long)]
-        check: String,
-
-        /// Git ref to replay from; resolved to a full commit sha at add time.
-        #[arg(long, default_value = "HEAD")]
-        git_ref: String,
-
-        /// Harness timeout in seconds.
-        #[arg(long, default_value_t = 900)]
-        timeout: u64,
-
-        /// Check-command timeout in seconds.
-        #[arg(long, default_value_t = 300)]
-        check_timeout: u64,
-
-        /// Tag for grouping cases (repeatable).
-        #[arg(long = "tag")]
-        tag: Vec<String>,
-
-        /// Free-form notes stored with the case.
-        #[arg(long)]
-        notes: Option<String>,
-    },
-
-    /// List cases (and recorded trajectories with --trajectories).
-    List {
-        /// Also show the last 20 recorded trajectories.
-        #[arg(long)]
-        trajectories: bool,
-
-        /// Show only cases carrying this tag (repeatable).
-        #[arg(long = "tag")]
-        tag: Vec<String>,
-    },
-
-    /// Promote a recorded trajectory into a case by attaching a check command.
-    Promote {
-        /// Trajectory id or unique id-prefix (see `wizard bench list --trajectories`).
-        trajectory: String,
-
-        /// Shell command run in the replayed worktree; exit 0 means pass.
-        #[arg(long)]
-        check: String,
-
-        /// Case id; defaults to the trajectory id.
-        #[arg(long)]
-        id: Option<String>,
-
-        /// Harness timeout in seconds.
-        #[arg(long, default_value_t = 900)]
-        timeout: u64,
-
-        /// Check-command timeout in seconds.
-        #[arg(long, default_value_t = 300)]
-        check_timeout: u64,
-
-        /// Tag for grouping cases (repeatable).
-        #[arg(long = "tag")]
-        tag: Vec<String>,
-
-        /// Free-form notes stored with the case.
-        #[arg(long)]
-        notes: Option<String>,
-    },
-
-    /// Replay cases against a harness command in isolated git worktrees.
-    Run {
-        /// Harness command template; `{prompt}` is replaced with the
-        /// shell-quoted case prompt. Defaults to this binary in sovereign mode.
-        #[arg(long)]
-        runner: Option<String>,
-
-        /// Label stored in the result file name and summary.
-        #[arg(long, default_value = "run")]
-        label: String,
-
-        /// Run only this case id (repeatable; default: all cases).
-        #[arg(long = "case")]
-        case: Vec<String>,
-
-        /// Run only cases carrying this tag (repeatable; combines with
-        /// --case as a union).
-        #[arg(long = "tag")]
-        tag: Vec<String>,
-
-        /// Keep the per-case worktrees for inspection instead of removing them.
-        #[arg(long)]
-        keep_worktrees: bool,
-
-        /// Parse the harness's stdout as JSON (`--output-format json` or
-        /// `stream-json`) and record its reported token usage and stop
-        /// reason per case. Works with any agent that emits a usage object —
-        /// Wizard, Grok Build, Claude Code.
-        #[arg(long)]
-        harness_json: bool,
-    },
-
-    /// Remove a case by id.
-    Remove {
-        /// Case id as shown by `wizard bench list`.
-        id: String,
-    },
-
-    /// Compare two result files case-by-case.
-    Compare {
-        /// First result JSON (baseline).
-        a: PathBuf,
-
-        /// Second result JSON.
-        b: PathBuf,
     },
 }
 
@@ -993,92 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn bench_add_parses_with_defaults() {
-        let cli = parse(&["bench", "add", "--id", "x", "--prompt", "y", "--check", "z"])
-            .expect("bench add parses");
-        let Some(Command::Bench {
-            cmd:
-                BenchCmd::Add {
-                    id,
-                    prompt,
-                    check,
-                    git_ref,
-                    timeout,
-                    check_timeout,
-                    tag,
-                    notes,
-                },
-        }) = cli.command
-        else {
-            panic!("expected bench add");
-        };
-        assert_eq!(id, "x");
-        assert_eq!(prompt, "y");
-        assert_eq!(check, "z");
-        assert_eq!(git_ref, "HEAD");
-        assert_eq!(timeout, 900);
-        assert_eq!(check_timeout, 300);
-        assert!(tag.is_empty());
-        assert_eq!(notes, None);
-    }
-
-    #[test]
-    fn bench_add_requires_id_prompt_and_check() {
-        let err = parse(&["bench", "add", "--id", "x"]).expect_err("missing args rejected");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn bench_run_parses_repeatable_case_and_tag_filters() {
-        let cli = parse(&[
-            "bench", "run", "--runner", "true", "--case", "a", "--case", "b", "--tag", "rust",
-        ])
-        .expect("bench run parses");
-        let Some(Command::Bench {
-            cmd:
-                BenchCmd::Run {
-                    runner,
-                    label,
-                    case,
-                    tag,
-                    keep_worktrees,
-                    harness_json,
-                },
-        }) = cli.command
-        else {
-            panic!("expected bench run");
-        };
-        assert_eq!(runner.as_deref(), Some("true"));
-        assert_eq!(label, "run");
-        assert_eq!(case, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(tag, vec!["rust".to_string()]);
-        assert!(!keep_worktrees);
-        assert!(!harness_json);
-    }
-
-    #[test]
-    fn bench_list_and_remove_parse() {
-        let cli = parse(&["bench", "list", "--tag", "smoke"]).expect("bench list parses");
-        let Some(Command::Bench {
-            cmd: BenchCmd::List { trajectories, tag },
-        }) = cli.command
-        else {
-            panic!("expected bench list");
-        };
-        assert!(!trajectories);
-        assert_eq!(tag, vec!["smoke".to_string()]);
-
-        let cli = parse(&["bench", "remove", "touch-case"]).expect("bench remove parses");
-        let Some(Command::Bench {
-            cmd: BenchCmd::Remove { id },
-        }) = cli.command
-        else {
-            panic!("expected bench remove");
-        };
-        assert_eq!(id, "touch-case");
-    }
-
-    #[test]
     fn schedule_enable_and_disable_parse() {
         let cli = parse(&["schedule", "enable", "nightly"]).expect("schedule enable parses");
         let Some(Command::Schedule {
@@ -1138,20 +916,7 @@ mod tests {
         let cli = parse(&["--plan", "--max-hours", "2", "fleet", "status"]).expect("parses");
         assert_eq!(cli.ignored_top_level_flags(), vec!["--plan", "--max-hours"]);
 
-        let cli = parse(&["--output-format", "json", "bench", "list"]).expect("parses");
+        let cli = parse(&["--output-format", "json", "doctor"]).expect("parses");
         assert_eq!(cli.ignored_top_level_flags(), vec!["--output-format"]);
-    }
-
-    #[test]
-    fn bench_compare_parses_positional_paths() {
-        let cli = parse(&["bench", "compare", "a.json", "b.json"]).expect("bench compare parses");
-        let Some(Command::Bench {
-            cmd: BenchCmd::Compare { a, b },
-        }) = cli.command
-        else {
-            panic!("expected bench compare");
-        };
-        assert_eq!(a, PathBuf::from("a.json"));
-        assert_eq!(b, PathBuf::from("b.json"));
     }
 }

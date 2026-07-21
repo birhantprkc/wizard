@@ -29,7 +29,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - **Agent-managed context.** Sessions are JSONL under `~/.wizard/sessions/`; auto-compaction keeps long runs inside the window; the agent is instructed to `/compact` (via `run_command`) when a thread is bloated, to save durable facts with `memory` and compact when the task changes, and to keep tool output lean so history stays useful. → [Agent-managed context](docs/usage.md#agent-managed-context)
 - **Browser GUI and a desktop app** *(preview)*. `wizard gui` serves the same agent core as the TUI on 127.0.0.1: the transcript, a subagent rail you can open a running agent from, and a git panel whose changed files open their diff. `wizard app` puts that in a native window through the system webview (no bundled Chromium, ~10MB rather than ~200MB), and `wizard app --install` adds Wizard to your launcher. Still settling; the TUI remains the surface everything ships to first. → [Desktop app](docs/desktop.md)
 - **Persistent memory.** The agent keeps what it learns as plain markdown under `~/.wizard/memory/<project>/`: typed (`user` / `feedback` / `project` / `reference`), linked with `[[name]]`, indexed into the system prompt each session. `/memory` reads it back; it is your file, not a black box. → [Memory](docs/memory.md)
-- **`wizard bench`.** Records your real tasks as trajectories and replays them in isolated git worktrees to score builds and models against each other. "The new model is better" becomes a number. → [Bench](docs/bench.md)
+- **Harness evolution (AHE).** The shipped defaults were improved offline by an evaluate→analyze→improve loop (80% → 100% pass@1 on a Terminal-Bench sample). The old local `wizard bench` trajectory runner is gone — AHE superseded it. → [Self-extension / harness](docs/evolve.md)
 - **Messaging gateway.** Run headless as a bot you talk to from your phone (Telegram), each inbound message a sovereign agent turn in your project. → [Gateway](docs/gateway.md)
 - **Make it your own.** After a deep evolve modifies its source, `/publish` forks upstream to your GitHub and hands out a one-line installer for your variant. → [Fork and distribute](docs/market.md)
 
@@ -60,7 +60,6 @@ You thought you needed an interpreter and to write your TUI in bloated TypeScrip
 - [Self-extension](docs/evolve.md): `/evolve` tiers, gates, rollback
 - [Fusion](docs/fusion.md): the `/fusion` debate panel
 - [Ultra](docs/ultra.md): the `/ultra` mixture of agents
-- [Bench](docs/bench.md): record/replay trajectories to score builds and models
 - [Bring your own model](docs/byom.md): any GGUF, or custom Ollama models
 - [Custom commands & @files](docs/commands.md): your own `/commands`; `@path` file references
 - [Memory](docs/memory.md): what Wizard remembers between sessions, and `/memory`

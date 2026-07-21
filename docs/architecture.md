@@ -54,7 +54,7 @@ wizard/
 │   ├── gateway/             # messaging bot (Telegram)
 │   ├── fleet/               # parallel worktree workers
 │   ├── schedule.rs          # cron-scheduled headless runs
-│   ├── bench/               # trajectory record/replay
+│   ├── git_util.rs          # shared async git / worktree helpers
 │   ├── hooks/               # pre/post tool hooks
 │   ├── acp.rs               # Agent Client Protocol surface
 │   ├── desktop.rs           # wizard app (system webview)
@@ -89,7 +89,7 @@ Parses arguments and selects the surface:
 | `wizard gui` / `wizard app` | Browser GUI / desktop webview |
 | `wizard acp` | Agent Client Protocol over stdio |
 | `wizard mcp-serve` | Expose native tools as an MCP server |
-| `wizard agents` / `doctor` / `usage` / `update` / `sync` / `fleet` / `schedule` / `bench` / … | Utility subcommands |
+| `wizard agents` / `doctor` / `usage` / `update` / `sync` / `fleet` / `schedule` / … | Utility subcommands |
 
 ### Config (`config.rs`)
 
@@ -224,7 +224,7 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 - **GUI / app** (`gui/`, `desktop.rs`): same agent core over HTTP/WS; system webview for `wizard app` ([desktop.md](desktop.md))
 - **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md))
 - **Gateway** (`gateway/`): Telegram bot turns ([gateway.md](gateway.md))
-- **Fleet / schedule / bench / sync / doctor / update**: see the matching docs pages
+- **Fleet / schedule / sync / doctor / update**: see the matching docs pages
 
 ## Data on disk
 

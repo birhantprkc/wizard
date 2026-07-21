@@ -2,7 +2,7 @@
 
 Cron-style scheduled runs. Entries live in `~/.wizard/schedule.toml`; the
 `wizard scheduler` daemon fires each one as a headless wizard child process
-at its cron times. Like `bench` and `doctor`, the schedule commands are
+at its cron times. Like `doctor`, the schedule commands are
 self-contained: they never load `~/.wizard/config.toml`, never trigger
 onboarding, and need no LLM in this process. The spawned jobs load their
 own config exactly like a user-invoked `wizard --mode sovereign -p "..."`.

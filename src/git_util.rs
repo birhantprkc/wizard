@@ -1,5 +1,5 @@
-//! Minimal async git helpers for the bench harness: ref resolution, dirty
-//! detection for the recorder, and worktree lifecycle for replays.
+//! Minimal async git helpers shared by fleet: ref resolution, dirty
+//! detection, and worktree lifecycle.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -29,7 +29,7 @@ pub async fn rev_parse(repo: &Path, ref_: &str) -> Result<String> {
 
 /// HEAD sha plus whether the working tree is dirty (`git status --porcelain`
 /// non-empty); `None` outside a git repo or on any git failure. Never errors
-/// because it backs the trajectory recorder, which must not be able to fail.
+/// so callers can treat git metadata as best-effort.
 pub async fn head_and_dirty(repo: &Path) -> Option<(String, bool)> {
     let head = Command::new("git")
         .arg("-C")
