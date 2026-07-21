@@ -877,13 +877,11 @@ impl CommandContext<'_> {
     /// background-subagent registry so the report lands in history when done.
     fn fork(&mut self, task: String) {
         if self.app.rebuilding.is_some() {
-            self.app
-                .notice("cannot fork while the agent is rebuilding");
+            self.app.notice("cannot fork while the agent is rebuilding");
             return;
         }
         if self.app.pending_fork.is_some() {
-            self.app
-                .notice("already starting a /fork — wait a moment");
+            self.app.notice("already starting a /fork — wait a moment");
             return;
         }
         self.app.notice(format!("forking: {task}"));

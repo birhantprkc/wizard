@@ -33,9 +33,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, PlanVerdict, build_headless_agent};
-use crate::git_util as git;
 use crate::cli::FleetCmd;
 use crate::config::Config;
+use crate::git_util as git;
 
 /// Supervision tick: reap children, enforce the watchdog, claim tasks,
 /// check the stop sentinel, touch the heartbeat.

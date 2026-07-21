@@ -1938,7 +1938,9 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].content, "you are the parent");
         assert!(
-            messages[3].content.contains("summarize the auth discussion"),
+            messages[3]
+                .content
+                .contains("summarize the auth discussion"),
             "fork brief carries the task: {}",
             messages[3].content
         );
@@ -1958,7 +1960,7 @@ mod tests {
             "parent tools kept: {tool_names:?}"
         );
         assert!(
-            !tool_names.iter().any(|n| *n == SPAWN_SUBAGENT_TOOL_NAME),
+            !tool_names.contains(&SPAWN_SUBAGENT_TOOL_NAME),
             "spawn stripped: {tool_names:?}"
         );
     }

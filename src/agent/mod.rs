@@ -149,11 +149,7 @@ impl ForkContext {
     /// `events` should be a channel the surface is already listening on
     /// (turn-forwarded or a dedicated idle collector). When `None`, the fork
     /// still runs and still reports via the registry — it just has no pane.
-    pub async fn spawn(
-        self,
-        task: &str,
-        events: Option<mpsc::Sender<AgentEvent>>,
-    ) -> Result<u32> {
+    pub async fn spawn(self, task: &str, events: Option<mpsc::Sender<AgentEvent>>) -> Result<u32> {
         let task = task.trim();
         anyhow::ensure!(!task.is_empty(), "empty fork task");
 

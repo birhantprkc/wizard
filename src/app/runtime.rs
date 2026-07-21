@@ -598,9 +598,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         match ctx.spawn(&task, Some(progress)).await {
                             Ok(id) => {
                                 let _ = notify
-                                    .send(Event::Notice(format!(
-                                        "fork #{id} started: {task}"
-                                    )))
+                                    .send(Event::Notice(format!("fork #{id} started: {task}")))
                                     .await;
                             }
                             Err(err) => {
