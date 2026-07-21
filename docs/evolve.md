@@ -1,13 +1,13 @@
 # Self-extension (`/evolve`)
 
-Wizard can extend itself. `/evolve` lets the agent add new capabilities: a skill, an external tool server, a scripted tool, a subagent, or, when needed, new Rust in its own core.
+Wizard can extend itself. `/evolve` lets the agent add new capabilities: a skill, an external tool server, a LuaJIT scripted tool, a subagent, or, when needed, new Rust in its own core.
 
 The design borrows from the two self-modifying agents that pioneered this pattern:
 
 - **[Pi](https://newsletter.pragmaticengineer.com/p/building-pi-and-what-makes-self-modifying)** modifies its own installed source in place and `/reload`s it live, which works because it's interpreted (Node/TS) and has no compile step.
 - **[Hermes](https://hermes-agent.nousresearch.com/docs/)** never recompiles. It adds capability through portable skills, MCP servers (the channel for things like computer use), programmatic scripted tools (`execute_code`), and isolated subagents.
 
-Wizard is compiled Rust, so it can't edit-and-reload its own core the way Pi does. It uses Hermes' model for the common case and recompiles only when a change has to live in the binary, which gives two tiers.
+Wizard is compiled Rust for the core and the TUI — you do **not** need a TypeScript interpreter or a bloated Electron runtime to extend it. Tier-1 scripted tools run through **embedded LuaJIT**, the just-in-time compiler, in-process: Pi-style live reload for glue, without shipping Node. Deep evolve still recompiles only when a change has to live in the Rust binary. Two tiers.
 
 ---
 
@@ -44,15 +44,38 @@ command = "uvx"
 args = ["mcp-computer-use"]
 ```
 
-### Scripted tools
+### Scripted tools (LuaJIT by default)
 
-The agent authors a small script (the Hermes `execute_code` analog), saved to `~/.wizard/tools/` and run through the `execute` sandbox. Good for glue and project-specific automation that doesn't warrant an MCP server.
+The agent authors a small script (the Hermes `execute_code` analog), saved to `~/.wizard/tools/` and run by Wizard. **The default runtime is embedded LuaJIT** — the just-in-time compiler ships inside the binary, so evolve glue needs no `bash`/`python`/`node` on `PATH` and does not spawn a child interpreter.
 
 ```
-> /evolve add a tool that renders a mermaid diagram to PNG
+> /evolve add a tool that slugifies a string
 ```
 
-Saved as `~/.wizard/tools/mermaid-png.sh` with a manifest describing its name, arguments, and description; exposed as a normal tool after `/reload`.
+Saved as `~/.wizard/tools/slugify.lua` with a manifest; exposed as a normal tool after `/reload`. Arguments arrive as the Lua global `args`; print results with `print(...)` (or `return` a value). Host helpers live under `wizard` (`read_file`, `write_file`, `json_encode`, `json_decode`, `runtime`).
+
+```toml
+# ~/.wizard/tools/slugify.toml
+name = "slugify"
+description = "Slugify a string"
+script = "slugify.lua"
+runtime = "luajit"
+
+[parameters]
+type = "object"
+required = ["text"]
+[parameters.properties.text]
+type = "string"
+```
+
+```lua
+-- ~/.wizard/tools/slugify.lua
+local s = tostring(args.text or ""):lower()
+s = s:gsub("[^%w]+", "-"):gsub("^%-", ""):gsub("%-$", "")
+print(s)
+```
+
+Shell, Python, and Node scripts still work when you set an external `interpreter` in the manifest — LuaJIT is the default, not a mandate.
 
 ### System prompt override
 
@@ -116,7 +139,7 @@ WIZARD_WITH_TOOLCHAIN=1 curl -fsSL https://raw.githubusercontent.com/teddytennan
 |--------------|------|------------|
 | Add knowledge or a workflow | Skill (1) | No |
 | Add an external capability (computer use, browser, DB) | MCP (1) | No |
-| Add small glue/automation | Scripted tool (1) | No |
+| Add small glue/automation | Scripted tool (LuaJIT) | No |
 | Add a specialized sub-worker | Subagent (1) | No |
 | Change Wizard's own built-in behavior or UI | Deep (2) | Yes |
 

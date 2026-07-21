@@ -35,6 +35,88 @@ use crate::tools::{CommandDispatch, ToolContext, ToolOutput, registry::ToolRegis
 
 use session::Session;
 
+/// Everything a `/btw` side question needs, owned so it can run without
+/// borrowing the live [`Agent`]. Surfaces snapshot this before parking the
+/// agent in a turn task so a side question can still fire mid-turn.
+#[derive(Clone)]
+pub struct SideQuestionContext {
+    pub client: Arc<dyn LlmProvider>,
+    pub model: String,
+    /// Conversation the answer is grounded in (system prompt at index 0).
+    pub messages: Vec<ChatMessage>,
+    /// Reasoning effort forwarded on the forked call, when set.
+    pub reasoning_effort: Option<String>,
+}
+
+/// System reminder prepended to a `/btw` user message. Mirrors Claude Code's
+/// side-question constraints: one shot, no tools, answer from context only.
+const SIDE_QUESTION_REMINDER: &str = "\
+This is a side question from the user (\"/btw\"). Answer it directly in a \
+single response.\n\
+\n\
+CRITICAL CONSTRAINTS:\n\
+- You have NO tools — you cannot read files, run commands, search, or take \
+any actions.\n\
+- This is a one-off response — there will be no follow-up turns.\n\
+- Answer only from what you already know in the conversation context and \
+your own knowledge.\n\
+- NEVER say things like \"Let me try…\", \"I'll now…\", \"Let me check…\", \
+or promise to take any action.\n\
+- If you don't know, say so — do not offer to look it up or investigate.\n\
+\n\
+Simply answer the question with the information you have.";
+
+impl SideQuestionContext {
+    /// Fork a single tool-less completion over a copy of `messages` plus the
+    /// side question. The main conversation is never written.
+    pub async fn ask(&self, question: &str) -> Result<String> {
+        let question = question.trim();
+        anyhow::ensure!(!question.is_empty(), "empty side question");
+
+        let mut messages = self.messages.clone();
+        messages.push(ChatMessage::user(format!(
+            "{SIDE_QUESTION_REMINDER}\n\n{question}"
+        )));
+
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages,
+            tools: Vec::new(),
+            stream: true,
+            options: Some(ChatOptions {
+                // Slightly cooler than a normal turn: side questions are
+                // factual asides, not creative work.
+                temperature: Some(0.3),
+                num_ctx: None,
+                reasoning_effort: self.reasoning_effort.clone(),
+            }),
+        };
+
+        let mut stream = self
+            .client
+            .chat_stream(request)
+            .await
+            .context("starting /btw side question")?;
+        let mut answer = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading /btw stream")?;
+            if let Some(message) = chunk.message
+                && !chunk.thinking
+            {
+                answer.push_str(&message.content);
+            }
+            if chunk.done {
+                break;
+            }
+        }
+        let answer = answer.trim().to_string();
+        if answer.is_empty() {
+            anyhow::bail!("empty /btw reply");
+        }
+        Ok(answer)
+    }
+}
+
 /// Why an agent turn (or sovereign run) ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoneReason {
@@ -535,6 +617,67 @@ impl CancelHandle {
     }
 }
 
+/// Cooperative "background the foreground command" handle. Cloneable and
+/// thread-safe: the TUI keeps a clone (see [`Agent::background_gate`]) and
+/// calls [`BackgroundGate::request`] on Ctrl-B; a running `execute` selects
+/// on it and promotes the child into the background task registry without
+/// interrupting the turn. One-shot per arming — after a promote (or a
+/// clear at the next tool call) the gate is inert until the next request.
+///
+/// Unlike [`CancelHandle`], firing this does **not** end the turn: the tool
+/// returns immediately with a background-task notice and the agent keeps
+/// working (or finishes its step) while the command keeps running.
+#[derive(Clone, Default)]
+pub struct BackgroundGate(Arc<BackgroundGateState>);
+
+impl std::fmt::Debug for BackgroundGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackgroundGate")
+    }
+}
+
+#[derive(Default)]
+struct BackgroundGateState {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl BackgroundGate {
+    /// Ask the in-flight foreground `execute` (if any) to promote itself to
+    /// a background task. No-op when nothing is listening.
+    pub fn request(&self) {
+        self.0.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether a promote has been requested since the last clear.
+    pub fn is_requested(&self) -> bool {
+        self.0.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once a promote is requested (immediately if it already was).
+    pub async fn requested(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Clear a stale request so the next tool call starts clean. Called at
+    /// the start of every foreground `execute` and at the start of every
+    /// turn (alongside [`CancelHandle::clear`]).
+    pub fn clear(&self) {
+        self.0
+            .flag
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A background completion surfaced to the model, returned by
 /// [`Agent::drain_finished_notifications`] so surfaces can render it.
 #[derive(Debug)]
@@ -643,6 +786,10 @@ pub struct Agent {
     /// Cooperative cancellation of the running turn (see
     /// [`Agent::cancel_handle`]). Cleared at the start of every turn.
     cancel: CancelHandle,
+    /// Cooperative "background the foreground command" gate (see
+    /// [`Agent::background_gate`]). Cleared at the start of every turn; the
+    /// TUI fires it on Ctrl-B while an `execute` is in flight.
+    background: BackgroundGate,
     /// The spawn tool's shared model slot, when bound
     /// ([`Agent::bind_subagent_model`]): `/model` switches write through so
     /// subagents run on the parent's active model.
@@ -811,10 +958,12 @@ impl Agent {
         // Images produced this session (by a tool or by the model) land under
         // `~/.wizard/images/<session>/`, so every surface has a real file to
         // render or link to.
+        let background = BackgroundGate::default();
         let mut ctx = ToolContext::new(project_root)
             .with_web(web)
             .with_checkpoints(Arc::clone(&checkpoints))
-            .with_usage(Arc::clone(&usage));
+            .with_usage(Arc::clone(&usage))
+            .with_background(background.clone());
         if let Some(images) = open_image_store(&session.id) {
             ctx = ctx.with_images(images);
         }
@@ -849,6 +998,7 @@ impl Agent {
             usage_log: crate::usage::default_log_path(),
             checkpoints,
             cancel: CancelHandle::default(),
+            background,
             subagent_model: None,
             ultra: None,
         };
@@ -1015,6 +1165,22 @@ impl Agent {
         self.cancel.clone()
     }
 
+    /// Handle for backgrounding a foreground `execute` mid-flight (Ctrl-B).
+    /// The surface clones it before spawning `run_turn` and calls
+    /// [`BackgroundGate::request`]; the running command promotes itself into
+    /// the background task registry and returns immediately so the turn can
+    /// keep going. No-op when nothing is listening.
+    pub fn background_gate(&self) -> BackgroundGate {
+        self.background.clone()
+    }
+
+    /// Shared handle on the background-shell-task registry, so a surface can
+    /// kill a task or open its live output while a turn holds the agent —
+    /// same pattern as [`Self::subagent_registry`].
+    pub fn task_registry(&self) -> Arc<crate::tools::tasks::TaskRegistry> {
+        Arc::clone(&self.ctx.tasks)
+    }
+
     /// Bind the spawn tool's shared model slot (see
     /// [`subagent::SpawnSubagentTool::model_handle`]) so subagents run on
     /// this agent's active model, including after `/model` switches.
@@ -1101,6 +1267,35 @@ impl Agent {
     /// the one `/model` and `/fusion` last set.
     pub fn client(&self) -> &Arc<dyn LlmProvider> {
         &self.client
+    }
+
+    /// Active model tag (what the next completion will call).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Snapshot of everything a [`SideQuestionContext`] needs to answer a
+    /// `/btw` without borrowing the agent. Surfaces clone this before parking
+    /// the agent in a turn task so a side question can run *while* the turn is
+    /// in flight — the whole point of `/btw`.
+    pub fn side_question_context(&self) -> SideQuestionContext {
+        SideQuestionContext {
+            client: Arc::clone(&self.client),
+            model: self.model.clone(),
+            messages: self.history.clone(),
+            reasoning_effort: self
+                .config
+                .reasoning_effort
+                .map(|effort| effort.as_str().to_string()),
+        }
+    }
+
+    /// Answer a one-shot side question (`/btw`) against the live history. Does
+    /// **not** push the exchange into history or the session file — that is
+    /// the feature. Prefer [`SideQuestionContext`] when the agent is out of
+    /// its slot mid-turn.
+    pub async fn answer_side_question(&self, question: &str) -> Result<String> {
+        self.side_question_context().ask(question).await
     }
 
     /// Swap the model client mid-session (`/fusion`: the panel answers every
@@ -4573,6 +4768,50 @@ mod tests {
         assert!(
             agent.drain_finished_notifications().is_empty(),
             "each finish is reported exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn side_question_answers_without_touching_history_or_session() {
+        let (agent, provider, _tmp) = test_agent(vec![vec![final_chunk("forty-two")]]);
+        let before = agent.history().len();
+        let session_bytes_before = std::fs::metadata(agent.session().path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let answer = agent
+            .answer_side_question("what is 6 * 7?")
+            .await
+            .expect("side question answers");
+        assert_eq!(answer, "forty-two");
+
+        // History and the session file are untouched — that is the whole point.
+        assert_eq!(agent.history().len(), before, "history unchanged");
+        let session_bytes_after = std::fs::metadata(agent.session().path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            session_bytes_after, session_bytes_before,
+            "session file unchanged"
+        );
+
+        // The forked call carried no tools and included the conversation.
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty(), "side questions are tool-less");
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.contains("what is 6 * 7?")),
+            "question reached the model"
+        );
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.contains("NO tools")),
+            "system reminder constrains the model"
         );
     }
 

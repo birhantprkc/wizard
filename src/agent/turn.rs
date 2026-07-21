@@ -62,8 +62,11 @@ impl Agent {
             let _ = emit(&events, AgentEvent::Error(warning)).await;
         }
         // Arm cancellation for this turn; a stale request from a previous
-        // turn must not kill this one.
+        // turn must not kill this one. Same for the background-promote gate
+        // so a leftover Ctrl-B does not instantly background the first
+        // command of the next turn.
         self.cancel.clear();
+        self.background.clear();
         self.usage.begin_turn();
         let result = match self.turn_inner(input, &images, &events).await {
             Ok(reason) => {

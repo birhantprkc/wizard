@@ -93,6 +93,10 @@ pub enum SlashCommand {
     /// `/bashes` — list background tasks (`execute` with
     /// `run_in_background`), running and finished, with id/status/command.
     Bashes,
+    /// `/btw <question>` — one-shot side question against the current
+    /// conversation context. The exchange is *not* appended to history or
+    /// the session file (token-cheap asides mid-task).
+    Btw(String),
     /// `/goal [text]` — show the standing mission goal, or set it. `None`
     /// shows the current goal; `Some` sets it (drives sovereign/continuous
     /// mode), persisting to `<project_root>/.wizard/mission.toml`.
@@ -357,6 +361,26 @@ impl SlashCommand {
             "doctor" => Ok(Self::Doctor),
             "status" => Ok(Self::Status),
             "bashes" => Ok(Self::Bashes),
+            "btw" => {
+                // Keep the question intact (spaces, punctuation) rather than
+                // rejoining whitespace-split tokens — the whole rest of the
+                // line is the question.
+                let rest = input
+                    .trim()
+                    .strip_prefix('/')
+                    .unwrap_or(input)
+                    .trim_start();
+                let question = rest
+                    .strip_prefix("btw")
+                    .unwrap_or("")
+                    .trim_start()
+                    .to_string();
+                if question.is_empty() {
+                    Err("usage: /btw <question>".to_string())
+                } else {
+                    Ok(Self::Btw(question))
+                }
+            }
             "goal" => {
                 let text = args.join(" ");
                 if text.is_empty() {
@@ -432,6 +456,12 @@ impl SlashCommand {
             | Help
             | Fusion(FusionAction::Toggle)
             | Ultra(UltraAction::Toggle) => Ok(()),
+
+            // A side question is the user's aside; the agent already has the
+            // conversation and should not spend a turn asking itself.
+            Btw(_) => Err(
+                "`/btw` is a user side-question; answer from context yourself".into(),
+            ),
 
             // Interactive pickers: there is no human at the keyboard mid-turn,
             // so require the argument that names the choice directly.
@@ -608,6 +638,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "",
         description: "summarize older history into a progress note now",
         takes_args: false,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "btw",
+        args: "<question>",
+        description: "ask a side question without adding it to the conversation",
+        takes_args: true,
         gui: Execution::Server,
         agent_arg: "",
     },
@@ -1383,6 +1421,25 @@ mod tests {
         assert!(
             matches!(parse("/memory purge"), Err(message) if message.contains("unknown /memory subcommand"))
         );
+    }
+
+    /// `/btw` keeps the whole rest of the line (spaces and all) as the
+    /// question, and refuses a bare `/btw` with a usage error.
+    #[test]
+    fn btw_keeps_the_full_question_and_refuses_an_empty_one() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(
+            parse("/btw what is the default timeout?"),
+            Ok(SlashCommand::Btw("what is the default timeout?".into()))
+        );
+        assert_eq!(
+            parse("/btw   keep  internal   spaces?"),
+            Ok(SlashCommand::Btw("keep  internal   spaces?".into()))
+        );
+        assert_eq!(parse("/btw"), Err("usage: /btw <question>".to_string()));
+        assert_eq!(parse("/btw   "), Err("usage: /btw <question>".to_string()));
+        // A side question is the user's call — the agent may not queue one.
+        assert!(SlashCommand::Btw("hi".into()).agent_runnable().is_err());
     }
 
     #[test]

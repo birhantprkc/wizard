@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentEvent, CancelHandle, DoneReason};
+use crate::agent::{Agent, AgentEvent, CancelHandle, DoneReason, SideQuestionContext};
 use crate::commands::SlashCommand;
 use crate::config::{Config, StepBudget};
 use crate::event::{Event, EventLoop};
@@ -84,6 +84,11 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         )
         .await?,
     );
+    // Seed so `/btw` works before any turn has run (system prompt alone is
+    // enough context for a factual aside).
+    let mut side_question_snapshot: Option<SideQuestionContext> = agent_slot
+        .as_ref()
+        .map(|agent| agent.side_question_context());
     // `--plan` / `plan_first = true`: the session starts in plan mode (the
     // App mirror is set from the same config in App::new below).
     if config.plan_first
@@ -288,6 +293,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 if was_compacting {
                     app.status.context_tokens = agent.context_tokens();
                 }
+                // Fresh agent owns the conversation again; any mid-turn
+                // snapshot is stale.
+                side_question_snapshot = Some(agent.side_question_context());
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -312,8 +320,14 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 &mut agent_task,
                 &mut agent_cancel,
                 &mut interrupt_at,
+                &mut side_question_snapshot,
                 &events,
             );
+            continue;
+        }
+
+        if let Event::BtwFinished = event {
+            app.btw_inflight = false;
             continue;
         }
 
@@ -399,6 +413,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         &mut agent_task,
                         &mut agent_cancel,
                         &mut interrupt_at,
+                        &mut side_question_snapshot,
                         &events,
                         prepared,
                     ) {
@@ -510,6 +525,39 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             }
         }
 
+        // `/btw`: fork a one-shot, tool-less completion against a snapshot of
+        // the conversation. Works while a turn holds the agent — that is the
+        // point — by reading the mid-turn snapshot kept below, falling back to
+        // the live agent when idle.
+        if let Some(question) = app.pending_btw.take() {
+            let ctx = agent_slot
+                .as_ref()
+                .map(|agent| agent.side_question_context())
+                .or_else(|| side_question_snapshot.clone());
+            match ctx {
+                Some(ctx) => {
+                    app.btw_inflight = true;
+                    let notify = events.sender();
+                    tokio::spawn(async move {
+                        let notice = match ctx.ask(&question).await {
+                            Ok(answer) => format!("/btw {question}\n{answer}"),
+                            Err(err) => format!("/btw failed: {err:#}"),
+                        };
+                        let _ = notify.send(Event::Notice(notice)).await;
+                        let _ = notify.send(Event::BtwFinished).await;
+                    });
+                }
+                None => {
+                    // No agent in the slot and no mid-turn snapshot — still
+                    // try a bare context from the idle agent once it's back,
+                    // but right now there's nothing to ask against.
+                    app.notice(
+                        "no conversation context for /btw yet — wait for the agent to finish rebuilding",
+                    );
+                }
+            }
+        }
+
         if turn_done && let Some(handle) = agent_task.take() {
             // Whatever ended it — a finished turn, or a cooperative interrupt
             // that landed — this turn is no longer interruptible.
@@ -517,6 +565,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             interrupt_at = None;
             match handle.await {
                 Ok(agent) => {
+                    // Latest history is back in the slot; refresh the
+                    // mid-turn snapshot so a follow-up `/btw` sees it.
+                    side_question_snapshot = Some(agent.side_question_context());
                     agent_slot = Some(agent);
                     // The provider just served a turn, so any earlier health
                     // warning was transient — drop it so it self-heals.
@@ -625,6 +676,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             &mut agent_task,
             &mut agent_cancel,
             &mut interrupt_at,
+            &mut side_question_snapshot,
             &events,
         );
 
@@ -657,6 +709,7 @@ fn start_agent_turn(
     agent_task: &mut Option<JoinHandle<Agent>>,
     agent_cancel: &mut Option<CancelHandle>,
     interrupt_at: &mut Option<Instant>,
+    side_question_snapshot: &mut Option<SideQuestionContext>,
     events: &EventLoop,
     prepared: crate::commands::Preprocessed,
 ) -> bool {
@@ -664,6 +717,9 @@ fn start_agent_turn(
         app.message_queue.push_front(prepared);
         return false;
     };
+    // Capture conversation context *before* the agent leaves its slot so a
+    // mid-turn `/btw` still has something to ground against.
+    *side_question_snapshot = Some(agent.side_question_context());
     app.status.busy = true;
     app.status.step = 0;
     app.streaming.clear();
@@ -716,6 +772,7 @@ fn drain_message_queue(
     agent_task: &mut Option<JoinHandle<Agent>>,
     agent_cancel: &mut Option<CancelHandle>,
     interrupt_at: &mut Option<Instant>,
+    side_question_snapshot: &mut Option<SideQuestionContext>,
     events: &EventLoop,
 ) {
     if app.status.busy || app.rebuilding.is_some() || agent_slot.is_none() {
@@ -731,6 +788,7 @@ fn drain_message_queue(
         agent_task,
         agent_cancel,
         interrupt_at,
+        side_question_snapshot,
         events,
         prepared,
     ) && remaining > 0

@@ -48,7 +48,7 @@ MCP tool calls run without confirmation, like every other tool.
 
 What Wizard does **not** do: an MCP server is an arbitrary program *you* configured Wizard to run. It executes with your full privileges, can open its own network connections, read your files, and do anything else your user can. The environment scrubbing limits accidental secret leakage and one specific injection vector; it does not contain a server that is itself malicious. Register only servers you trust, the same way you would vet anything you pipe to `sh`.
 
-The same applies to scripted tools: they are scripts under `~/.wizard/tools/` that run as you.
+The same applies to scripted tools: they are scripts under `~/.wizard/tools/` that run as you. LuaJIT tools run in-process inside the Wizard binary; tools with an external `interpreter` spawn that process as you.
 
 ## Deep `/evolve` (self-recompilation)
 

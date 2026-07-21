@@ -127,6 +127,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /rewind [turn]              rewind files and conversation to before a turn\n  \
 /resume                     reopen and continue a past session\n  \
 /compact                    summarize older history into a progress note now\n  \
+/btw <question>             ask a side question without adding it to the conversation\n  \
 /agents                     browse subagents and delegate to one\n  \
 /subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
@@ -207,6 +208,7 @@ impl CommandContext<'_> {
             SlashCommand::Resume(None) => self.app.open_resume_picker(),
             SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
             SlashCommand::Compact => self.request_compact(),
+            SlashCommand::Btw(question) => self.btw(question),
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
@@ -845,6 +847,25 @@ impl CommandContext<'_> {
             return;
         }
         self.app.pending_compact = true;
+    }
+
+    /// `/btw <question>`: one-shot side question. Unlike most commands this is
+    /// allowed *while a turn is running* — that is the point — so it does not
+    /// go through [`Self::agent_unavailable`]. The main loop owns the client
+    /// and either the live agent or a mid-turn snapshot of its history.
+    fn btw(&mut self, question: String) {
+        if self.app.rebuilding.is_some() {
+            self.app
+                .notice("cannot ask a side question while the agent is rebuilding");
+            return;
+        }
+        if self.app.pending_btw.is_some() || self.app.btw_inflight {
+            self.app.notice("already answering a /btw — wait for it to finish");
+            return;
+        }
+        // A light "working on it" marker; the answer arrives as its own notice.
+        self.app.notice("answering /btw…");
+        self.app.pending_btw = Some(question);
     }
 
     fn switch_mode(&mut self, mode: Mode) {

@@ -133,6 +133,11 @@ tao = { version = "0.35", optional = true, default-features = false, features = 
 # `wizard app --devtools` has to work in the binary people actually install.
 wry = { version = "0.55", optional = true, features = ["devtools"] }
 
+# Embedded LuaJIT for self-extension: scripted tools and evolve glue run through
+# the just-in-time compiler in-process. Vendored so the binary has no system
+# libluajit dependency; `send` so Lua handles can cross await points.
+mlua = { version = "0.11", default-features = false, features = ["luajit", "vendored", "send", "serialize"] }
+
 # Process-group kill for background tasks (`task_kill`, timeouts)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -146,3 +151,4 @@ strip = true
 lto = true
 codegen-units = 1
 opt-level = 3
+

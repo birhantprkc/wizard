@@ -49,6 +49,10 @@ pub enum Event {
     /// because [`ProviderConfig`](crate::config::ProviderConfig) is large next
     /// to the input variants.
     ProviderActivated(Box<crate::config::ProviderConfig>),
+    /// A background `/btw` side-question finished. The answer (or error) was
+    /// already sent as [`Event::Notice`]; this only clears the in-flight flag
+    /// so another `/btw` can run.
+    BtwFinished,
 }
 
 /// Owns the merged event channel. A background task pumps crossterm's

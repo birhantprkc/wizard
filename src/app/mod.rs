@@ -293,6 +293,13 @@ pub struct App {
     /// True while a background `/compact` is running: the status bar shows an
     /// animated progress bar instead of its usual contents.
     pub compacting: bool,
+    /// Set by `/btw <question>`; the main loop answers it off the event loop
+    /// against a snapshot of the conversation (so it works mid-turn too).
+    /// Cleared once the task is spawned.
+    pub pending_btw: Option<String>,
+    /// True while a background `/btw` is in flight, so a second one is refused
+    /// rather than stacked.
+    pub btw_inflight: bool,
     /// Set when the background MCP connect finishes while a turn is running
     /// (so the agent is out of its slot and can't take the rebuilt registry
     /// yet). The main loop merges the MCP tools once the turn returns the
@@ -411,6 +418,8 @@ impl App {
             pending_edit_prompt: false,
             pending_compact: false,
             compacting: false,
+            pending_btw: None,
+            btw_inflight: false,
             mcp_merge_pending: false,
             pending_agent_commands: Vec::new(),
             message_queue: VecDeque::new(),
@@ -2254,7 +2263,8 @@ impl App {
             Event::AgentRebuilt(_)
             | Event::ProviderActivated(_)
             | Event::McpConnected { .. }
-            | Event::ProviderHealthFailed(_) => Ok(None),
+            | Event::ProviderHealthFailed(_)
+            | Event::BtwFinished => Ok(None),
         }
     }
 

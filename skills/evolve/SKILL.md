@@ -50,33 +50,50 @@ On `/reload`, Wizard connects and merges the server's tools into the
 registry (name collisions become `server__tool`). Verify the `command` (or
 `url`) actually exists on this machine before registering it.
 
-### Scripted tools
+### Scripted tools (LuaJIT)
 
-Author a script plus a TOML manifest, both in `~/.wizard/tools/`. The
-manifest is `<name>.toml` beside the script:
+Author a `.lua` script plus a TOML manifest, both in `~/.wizard/tools/`.
+Wizard embeds LuaJIT — the just-in-time compiler — so the script runs
+in-process. No external interpreter, no Node, no bloated TypeScript
+runtime. The manifest is `<name>.toml` beside the script:
 
 ```toml
-name = "mermaid-png"
-description = "Render a mermaid diagram source file to a PNG"
-script = "mermaid-png.sh"   # filename, relative to ~/.wizard/tools/
-# interpreter = "bash"      # optional; otherwise the script must be executable
+name = "slugify"
+description = "Slugify a string"
+script = "slugify.lua"
+runtime = "luajit"          # default when the script ends in .lua
 # timeout_secs = 60
 
 [parameters]                # JSON Schema for the arguments
 type = "object"
-required = ["input", "output"]
-[parameters.properties.input]
+required = ["text"]
+[parameters.properties.text]
 type = "string"
-description = "Path to the .mmd source file"
-[parameters.properties.output]
-type = "string"
-description = "Path for the rendered PNG"
+description = "Input text"
 ```
 
-The tool receives its arguments as a single JSON object string in `argv[1]`,
-parsed inside the script (e.g. with `jq`). Print results to stdout and
-exit non-zero on failure. Test the script once with `execute` before
-declaring the evolution done.
+```lua
+-- slugify.lua
+-- globals: args (table), cwd (string), wizard.* helpers
+local s = tostring(args.text or ""):lower()
+s = s:gsub("[^%w]+", "-"):gsub("^%-", ""):gsub("%-$", "")
+print(s)
+-- or: return s
+```
+
+Contract:
+- `args` is the JSON object the model passed, decoded as a Lua table.
+- `cwd` is the project root (string).
+- `wizard.read_file(path)`, `wizard.write_file(path, contents)`,
+  `wizard.json_encode(value)`, `wizard.json_decode(str)`,
+  `wizard.runtime` (`"luajit"`).
+- `print(...)` becomes the tool's stdout; a non-nil `return` is used when
+  nothing was printed. Prefix output with `error:` to mark soft failure.
+
+External interpreters (bash/python/node) still work if you set
+`interpreter = "bash"` (etc.) and point `script` at a non-Lua file — use
+that only when the job truly needs the host shell or a native CLI. Prefer
+Lua for new evolve glue. Test once before declaring the evolution done.
 
 ### Subagents
 

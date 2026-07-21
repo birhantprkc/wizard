@@ -2,16 +2,18 @@
 //! [`ToolContext`](super::ToolContext), plus the `task_output` and
 //! `task_kill` tools.
 //!
-//! The `execute` tool with `run_in_background: true` spawns a detached child
-//! and registers it here. A monitor task captures stdout/stderr into a
-//! tail-capped buffer, enforces the [`BACKGROUND_TIMEOUT`], and records the
-//! exit. The agent loop calls [`TaskRegistry::drain_completed`] at the top of
-//! every step to notify the model of finished tasks exactly once.
+//! The `execute` tool with `run_in_background: true` (or a mid-flight Ctrl-B
+//! promote) spawns a detached child and registers it here. A monitor task
+//! captures stdout/stderr into a tail-capped buffer, enforces the
+//! [`BACKGROUND_TIMEOUT`], and records the exit. The agent loop calls
+//! [`TaskRegistry::drain_completed`] at the top of every step to notify the
+//! model of finished tasks exactly once. Surfaces poll [`TaskRegistry::output`]
+//! / [`TaskRegistry::output_full`] for a live tail (the bash rail pane).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -73,6 +75,10 @@ pub struct Task {
     pub id: u32,
     pub command: String,
     pub status: TaskStatus,
+    /// When the task was registered (for elapsed clocks on the rail).
+    pub started: Instant,
+    /// When the task finished, if it has.
+    pub finished: Option<Instant>,
 }
 
 /// A finished task as returned by [`TaskRegistry::drain_completed`] —
@@ -117,6 +123,11 @@ impl TailBuffer {
         let start = self.buf.len().saturating_sub(bytes);
         String::from_utf8_lossy(&self.buf[start..]).into_owned()
     }
+
+    /// Full buffer as lossy UTF-8 (already capped at [`OUTPUT_CAP_BYTES`]).
+    fn as_str(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
 }
 
 /// Internal per-task state (snapshot exposed as [`Task`]).
@@ -129,6 +140,11 @@ struct TaskEntry {
     reported: bool,
     /// Signals the monitor to kill the child. Consumed on first kill.
     kill: Option<oneshot::Sender<()>>,
+    started: Instant,
+    finished: Option<Instant>,
+    /// Generation counter bumped on every output append, so a surface can
+    /// poll cheaply ("has anything new landed since I last rendered?").
+    output_gen: u64,
 }
 
 impl TaskEntry {
@@ -137,6 +153,8 @@ impl TaskEntry {
             id,
             command: self.command.clone(),
             status: self.status,
+            started: self.started,
+            finished: self.finished,
         }
     }
 }
@@ -168,6 +186,9 @@ impl TaskRegistry {
                 output: TailBuffer::with_cap(OUTPUT_CAP_BYTES),
                 reported: false,
                 kill: None,
+                started: Instant::now(),
+                finished: None,
+                output_gen: 0,
             },
         );
         id
@@ -239,15 +260,17 @@ impl TaskRegistry {
         if let Some(entry) = self.lock().get_mut(&id) {
             if entry.status == TaskStatus::Running {
                 entry.status = status;
+                entry.finished = Some(Instant::now());
             }
             entry.kill = None;
         }
     }
 
     /// Append captured output to a task's tail buffer.
-    fn append_output(&self, id: u32, data: &[u8]) {
+    pub fn append_output(&self, id: u32, data: &[u8]) {
         if let Some(entry) = self.lock().get_mut(&id) {
             entry.output.append(data);
+            entry.output_gen = entry.output_gen.saturating_add(1);
         }
     }
 
@@ -272,6 +295,15 @@ impl TaskRegistry {
         self.lock()
             .get(&id)
             .map(|entry| (entry.snapshot(id), entry.output.tail(tail_bytes)))
+    }
+
+    /// Snapshot plus the full buffered output and the current generation
+    /// counter. The TUI bash pane uses the generation to skip re-renders when
+    /// nothing new has landed.
+    pub fn output_full(&self, id: u32) -> Option<(Task, String, u64)> {
+        self.lock()
+            .get(&id)
+            .map(|entry| (entry.snapshot(id), entry.output.as_str(), entry.output_gen))
     }
 
     /// Request termination of a running task. Returns false when the task is

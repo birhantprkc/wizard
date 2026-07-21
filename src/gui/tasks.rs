@@ -1673,6 +1673,16 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
             );
         }
         SlashCommand::Bashes => notice(shared, bashes_report(agent)),
+        SlashCommand::Btw(question) => {
+            // Runs against the live agent (commands wait for turns to finish
+            // on this surface). The exchange never enters history — same
+            // contract as the TUI.
+            notice(shared, format!("answering /btw…"));
+            match agent.answer_side_question(&question).await {
+                Ok(answer) => notice(shared, format!("/btw {question}\n{answer}")),
+                Err(err) => error(shared, format!("/btw failed: {err:#}")),
+            }
+        }
         SlashCommand::Agents => notice(shared, agents_report()),
         SlashCommand::Reload => reload(agent, ctx).await,
         SlashCommand::Rewind(None) => notice(shared, rewind_candidates(agent)),

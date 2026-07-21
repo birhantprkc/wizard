@@ -24,6 +24,7 @@ inline hints.
 | `/rewind [turn]` | Restore file checkpoints and truncate history; no argument opens the turn picker ([checkpoints.md](checkpoints.md)) |
 | `/resume [id]` | Reopen a past session and continue it; no argument opens the session picker |
 | `/compact` | Summarize older history into a progress note now, instead of waiting for the automatic threshold |
+| `/btw <question>` | Ask a quick side question against the current conversation without adding the exchange to history or the session file (token-cheap asides mid-task; works while a turn is running) |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
 | `/subagents` | Focus the subagent rail below the composer (same as ↓); from inside a subagent's pane, back out to the chat |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |

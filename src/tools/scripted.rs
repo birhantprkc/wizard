@@ -2,6 +2,12 @@
 //! (the Hermes `execute_code` analog). Each tool is a script file plus a
 //! sibling `<name>.toml` manifest; `/evolve` writes them and `/reload`
 //! picks them up — no rebuild.
+//!
+//! **Default runtime is embedded LuaJIT.** A `.lua` script (or
+//! `runtime = "luajit"`) runs in-process through the just-in-time compiler
+//! Wizard ships — no external interpreter on `PATH`, no Node/Python tax.
+//! Shell/Python/JS tools still work when the manifest sets an external
+//! `interpreter`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
+use super::lua::{self as luajit};
 use super::shell::{DEFAULT_TIMEOUT, MAX_TIMEOUT, render_command_result, run_command};
 use super::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 
@@ -19,12 +26,20 @@ use super::{Tool, ToolContext, ToolError, ToolKind, ToolOutput};
 /// next to it.
 ///
 /// ```toml
-/// name = "mermaid-png"
-/// description = "Render a mermaid diagram to PNG"
-/// script = "mermaid-png.sh"
+/// name = "slugify"
+/// description = "Slugify a string"
+/// script = "slugify.lua"   # .lua → embedded LuaJIT (default for /evolve)
+/// # runtime = "luajit"     # optional explicit marker
 ///
-/// [parameters]            # JSON Schema (TOML-encoded) for the arguments
+/// [parameters]             # JSON Schema (TOML-encoded) for the arguments
 /// type = "object"
+/// ```
+///
+/// External interpreters remain available for legacy glue:
+///
+/// ```toml
+/// script = "mermaid-png.sh"
+/// interpreter = "bash"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptManifest {
@@ -35,11 +50,17 @@ pub struct ScriptManifest {
     /// Script filename, relative to the manifest's directory.
     pub script: String,
     /// Interpreter to run the script with (default: execute directly,
-    /// relying on the shebang).
+    /// relying on the shebang). Ignored when the script is LuaJIT-hosted
+    /// (see [`Self::runtime`] / `.lua` extension).
     #[serde(default)]
     pub interpreter: Option<String>,
-    /// JSON Schema for the arguments object. The arguments are passed to the
-    /// script as a single JSON string in argv[1].
+    /// Host runtime. `"luajit"` / `"lua"` / `"embedded"` forces the in-process
+    /// LuaJIT path; omit to auto-detect from the script extension.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// JSON Schema for the arguments object. For external interpreters the
+    /// arguments are passed as a single JSON string in argv[1]; for LuaJIT
+    /// they arrive as the global `args` table.
     #[serde(default = "ScriptManifest::default_parameters")]
     pub parameters: Value,
     /// Timeout in seconds (default 120).
@@ -159,6 +180,41 @@ impl Tool for ScriptedTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let timeout = self
+            .manifest
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TIMEOUT)
+            .clamp(Duration::from_secs(1), MAX_TIMEOUT);
+
+        // Prefer the embedded LuaJIT path whenever the script is Lua (by
+        // extension, runtime field, or interpreter name). This is the default
+        // channel /evolve writes.
+        if luajit::is_luajit_tool(
+            &self.script_path,
+            self.manifest.interpreter.as_deref(),
+            self.manifest.runtime.as_deref(),
+        ) {
+            let source = std::fs::read_to_string(&self.script_path).map_err(|err| {
+                ToolError::Execution {
+                    tool: self.name().to_string(),
+                    source: anyhow::Error::new(err).context(format!(
+                        "reading LuaJIT script {}",
+                        self.script_path.display()
+                    )),
+                }
+            })?;
+            return luajit::run_scripted_async(
+                self.name(),
+                &source,
+                &self.script_path,
+                &args,
+                &ctx.cwd,
+                timeout,
+            )
+            .await;
+        }
+
         let args_json = serde_json::to_string(&args).map_err(|err| ToolError::InvalidArgs {
             tool: self.name().to_string(),
             message: format!("arguments are not serializable as JSON: {err}"),
@@ -180,13 +236,6 @@ impl Tool for ScriptedTool {
             None => Command::new(&self.script_path),
         };
         command.arg(&args_json).current_dir(&ctx.cwd);
-
-        let timeout = self
-            .manifest
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_TIMEOUT)
-            .clamp(Duration::from_secs(1), MAX_TIMEOUT);
 
         let result = run_command(self.name(), command, timeout).await?;
         Ok(render_command_result(&result))
@@ -324,5 +373,50 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("args: {\"key\":\"value\"}"));
+    }
+
+    #[tokio::test]
+    async fn luajit_scripted_tool_runs_in_process() {
+        let tmp = TempDir::new();
+        std::fs::write(
+            tmp.0.join("greet.lua"),
+            "print('hi from', args.who)\nprint(wizard.runtime)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.0.join("greet.toml"),
+            "name = \"greet\"\ndescription = \"lua greet\"\nscript = \"greet.lua\"\n",
+        )
+        .unwrap();
+
+        let tool = ScriptedTool::load(&tmp.0.join("greet.toml")).unwrap();
+        let ctx = ToolContext::new(&tmp.0);
+        let out = tool
+            .execute(serde_json::json!({ "who": "luajit" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("hi from"), "{}", out.content);
+        assert!(out.content.contains("luajit"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn runtime_field_forces_luajit_even_for_non_lua_extension() {
+        let tmp = TempDir::new();
+        // Deliberately not .lua — runtime wins.
+        std::fs::write(tmp.0.join("weird.tool"), "return args.n + 1\n").unwrap();
+        std::fs::write(
+            tmp.0.join("weird.toml"),
+            "name = \"weird\"\ndescription = \"x\"\nscript = \"weird.tool\"\nruntime = \"luajit\"\n",
+        )
+        .unwrap();
+        let tool = ScriptedTool::load(&tmp.0.join("weird.toml")).unwrap();
+        let ctx = ToolContext::new(&tmp.0);
+        let out = tool
+            .execute(serde_json::json!({ "n": 40 }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("41"), "{}", out.content);
     }
 }

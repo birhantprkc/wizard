@@ -177,7 +177,7 @@ Base64 stays on the `ChatMessage` in history for vision models. A tool's images 
 
 There is no per-action y/n gate outside plan mode and hooks. Genie is conversational; sovereign/continuous run unattended. Plan mode keeps non-read-only tools blocked until `exit_plan` is approved (or omakase auto-approves).
 
-Beyond the built-ins, the registry also serves scripted tools (`~/.wizard/tools/`) and MCP tools. All three kinds present the same interface to the agent loop.
+Beyond the built-ins, the registry also serves scripted tools (`~/.wizard/tools/`, default runtime **embedded LuaJIT**) and MCP tools. All three kinds present the same interface to the agent loop.
 
 ### MCP (`mcp/`)
 
@@ -238,7 +238,7 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 | `~/.wizard/llama-server.log` / `.pid` | Managed llama-server |
 | `~/.wizard/mcp.toml` | MCP server declarations |
 | `~/.wizard/subagents/*.toml` | Subagent definitions |
-| `~/.wizard/tools/` | Agent-authored scripted tools |
+| `~/.wizard/tools/` | Agent-authored scripted tools (LuaJIT by default) |
 | `~/.wizard/src/` | Source checkout for deep evolve |
 | `~/.wizard/sessions/*.jsonl` | Chat history |
 | `~/.wizard/memory/<project>/` | Durable project memory |

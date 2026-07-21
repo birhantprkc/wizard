@@ -22,7 +22,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - **Runs models locally, fully managed.** Pick Local and Wizard downloads a GGUF sized to your VRAM, then starts, supervises, and reuses `llama-server` for you, including a Metal build on Apple Silicon. → [Model tiers](docs/getting-started.md#model-tiers-automatic) · [Bring your own model](docs/byom.md)
 - **Model fusion (`/fusion`).** Run a panel of your providers as a debate — the members critique each other's drafts — and synthesize one tool-capable answer. → [Fusion](docs/fusion.md)
 - **Mixture of agents (`/ultra`).** Fan a turn out to N read-only subagents on the model you're already using (each with a different lens, each reading the actual repo), have a judge compare their drafts, then execute from the verdict. → [Ultra](docs/ultra.md)
-- **Self-extension (`/evolve`).** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload`. Gated by a clean `cargo build` and a smoke test, it can also rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
+- **Self-extension (`/evolve`), powered by LuaJIT.** Add skills, MCP servers, scripted tools, and subagents as plain files that go live on `/reload`. Scripted tools default to **embedded LuaJIT** — the just-in-time compiler runs your glue in-process, no external interpreter on `PATH`. Gated by a clean `cargo build` and a smoke test, Wizard can also rebuild its own binary. Every change is logged, and the prior binary is kept one `mv` from rollback. → [Self-extension](docs/evolve.md)
 - **Runtime MCP, both directions.** stdio and HTTP MCP servers merge into the tool registry without a rebuild: the path for computer use, browser control, and databases. Wizard also serves *its own* tools over stdio (`wizard mcp-serve`), so any MCP client can call them. → [MCP](docs/mcp.md)
 - **Editor embedding (ACP).** `wizard acp` runs Wizard as an [Agent Client Protocol](https://agentclientprotocol.com/) agent, so ACP editors (Zed, Neovim, Emacs) drive it as their coding agent, streaming assistant text, reasoning, and tool calls into the editor. → [ACP](docs/acp.md)
 - **Genie / Sovereign modes, plus `--continuous`.** An interactive direct-action TUI (genie), headless autonomous runs (sovereign), or a perpetual mission (`--continuous`) that compacts its own context and self-heals through outages. → [Modes](docs/modes.md)
@@ -33,7 +33,11 @@ One command installs the `wizard` binary. The first run asks which provider you 
 - **Messaging gateway.** Run headless as a bot you talk to from your phone (Telegram), each inbound message a sovereign agent turn in your project. → [Gateway](docs/gateway.md)
 - **Make it your own.** After a deep evolve modifies its source, `/publish` forks upstream to your GitHub and hands out a one-line installer for your variant. → [Fork and distribute](docs/market.md)
 
-**Smaller attack surface by construction.** A single memory-safe Rust binary: no interpreter to inject into, no garbage-collected runtime. Every install also converges on a different `/evolve` loadout, so there's no uniform tool surface to target. Read [SECURITY.md](SECURITY.md) before autonomous runs; tools execute with your privileges.
+**Smaller attack surface by construction.** A single memory-safe Rust binary with an embedded LuaJIT for self-extension — not a garbage-collected app runtime, not a separate interpreter process to inject into. Every install also converges on a different `/evolve` loadout, so there's no uniform tool surface to target. Read [SECURITY.md](SECURITY.md) before autonomous runs; tools execute with your privileges.
+
+### haha suckers
+
+You thought you needed an interpreter and to write your TUI in bloated TypeScript. No. Just have the just-in-time compiler for LuaJIT. Wizard is Rust + Ratatui for the surface, and when it extends itself the glue is Lua that the **JIT compiles** — in-process, fast, no Node, no Electron, no shipping a second runtime next to the binary. Self-extension without the bloat tax.
 
 ---
 
@@ -72,7 +76,7 @@ One command installs the `wizard` binary. The first run asks which provider you 
 
 ## Development
 
-Rust 2024, Ratatui, Tokio. Single binary, < 60 MB stripped.
+Rust 2024, Ratatui, Tokio, embedded LuaJIT (`mlua`). Single binary, < 60 MB stripped.
 
 ```bash
 git clone https://github.com/teddytennant/wizard

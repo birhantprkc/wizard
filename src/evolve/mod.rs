@@ -191,6 +191,10 @@ struct ScriptedToolProposal {
     description: String,
     #[serde(default)]
     interpreter: Option<String>,
+    /// Host runtime. `"luajit"` (default) runs in-process; omit alongside a
+    /// `.lua` script_name for the same effect.
+    #[serde(default)]
+    runtime: Option<String>,
     /// Script file name (sanitized; derived from `name` when omitted).
     #[serde(default)]
     script_name: Option<String>,
@@ -227,15 +231,15 @@ Channels and their exact JSON shapes:
 or, for a remote server:
 {"channel":"mcp_server","name":"server-name","transport":"http","url":"https://example.com/mcp"}
 
-3. "scripted_tool" — a small executable script exposed as a tool. The tool's arguments arrive as a single JSON string in argv[1]; the script prints its result to stdout:
-{"channel":"scripted_tool","name":"snake_case_name","description":"what it does","interpreter":"bash","script_name":"snake_case_name.sh","script_content":"#!/usr/bin/env bash\n...","parameters":{"type":"object","properties":{"arg":{"type":"string","description":"..."}},"required":["arg"]},"timeout_secs":120}
+3. "scripted_tool" — a small LuaJIT script exposed as a tool. Wizard embeds LuaJIT (the just-in-time compiler); scripts run in-process, no external interpreter. Tool arguments arrive as the global Lua table `args`; the project root is the string `cwd`; helpers live under `wizard` (`wizard.read_file`, `wizard.write_file`, `wizard.json_encode`, `wizard.json_decode`, `wizard.runtime`). Print results with `print(...)` (or `return` a value). Prefer Lua. Only set an external `interpreter` (bash/python/…) when the job truly needs one:
+{"channel":"scripted_tool","name":"snake_case_name","description":"what it does","runtime":"luajit","script_name":"snake_case_name.lua","script_content":"-- LuaJIT tool\nlocal n = args.n or 0\nprint(n * 2)\n","parameters":{"type":"object","properties":{"n":{"type":"number","description":"..."}},"required":["n"]},"timeout_secs":120}
 
 4. "subagent" — a named, reusable sub-worker with its own prompt and tool scope (no step ceiling by default; optional positive `max_steps` caps it):
 {"channel":"subagent","name":"reviewer","description":"what it is for","system_prompt":"You are ...","tool_scope":["read_file","search_files","git_diff"]}
 
 Native tool names available for "tool_scope": read_file, write_file, edit_file, list_files, search_files, execute, git_status, git_diff. Omit "tool_scope" (or use null) to grant the full set.
 
-Picking a channel: use a skill for knowledge or process, an mcp_server for capabilities that live outside Wizard, a scripted_tool for small executable glue, and a subagent for a specialized, reusable sub-worker. Keep names short and filesystem-safe. Make the artifact complete and immediately usable."##;
+Picking a channel: use a skill for knowledge or process, an mcp_server for capabilities that live outside Wizard, a scripted_tool (LuaJIT by default) for small executable glue, and a subagent for a specialized, reusable sub-worker. Keep names short and filesystem-safe. Make the artifact complete and immediately usable. For scripted_tool always prefer Lua (`.lua`, `runtime: "luajit"`) unless the user explicitly needs a shell/Python/Node script."##;
 
 /// System prompt for the deep-evolve (Tier 2) diff-authoring turn.
 const DEEP_SYSTEM_PROMPT: &str = r#"You are Wizard's deep-evolve engineer. Wizard is a single-binary Rust 2024 agent (Ratatui TUI + multi-provider agent loop) and you are modifying its own source checkout. Produce ONE unified diff that implements the requested change.
@@ -426,7 +430,8 @@ impl Evolver {
     }
 
     /// Write the script plus its `<name>.toml` manifest under
-    /// `~/.wizard/tools/`.
+    /// `~/.wizard/tools/`. Defaults to embedded LuaJIT (`.lua` +
+    /// `runtime = "luajit"`) so evolve glue needs no external interpreter.
     fn add_scripted_tool(&self, proposal: ScriptedToolProposal) -> Result<EvolveOutcome> {
         if proposal.script_content.trim().is_empty() {
             bail!("the proposed scripted tool has an empty script");
@@ -441,12 +446,52 @@ impl Evolver {
             .map(str::trim)
             .filter(|i| !i.is_empty())
             .map(str::to_string);
+        let runtime = proposal
+            .runtime
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(|r| r.to_ascii_lowercase());
+
+        // Default channel is LuaJIT: if the model omitted both runtime and a
+        // non-Lua interpreter, host it in-process.
+        let wants_luajit = match (runtime.as_deref(), interpreter.as_deref()) {
+            (Some(r), _) if r == "luajit" || r == "lua" || r == "embedded" => true,
+            (Some(r), _) if r == "external" || r == "process" || r == "shell" => false,
+            (None, Some(i)) => {
+                let i = i.to_ascii_lowercase();
+                i.contains("luajit") || i == "lua" || i.ends_with("/lua") || i.ends_with("/luajit")
+            }
+            (None, None) => {
+                // Peek at script_name / content shebang before defaulting.
+                let name = proposal.script_name.as_deref().unwrap_or("");
+                let content = proposal.script_content.trim_start();
+                if name.ends_with(".lua") || content.starts_with("--") {
+                    true
+                } else if content.starts_with("#!")
+                    || name.ends_with(".sh")
+                    || name.ends_with(".py")
+                    || name.ends_with(".js")
+                {
+                    false
+                } else {
+                    // Bare proposal with no signals → LuaJIT.
+                    true
+                }
+            }
+            _ => false,
+        };
+
         let script_file = match proposal.script_name.as_deref().map(str::trim) {
             Some(name) if !name.is_empty() => sanitize_file_name(name)?,
             _ => format!(
                 "{}.{}",
                 slugify(&proposal.name, '-')?,
-                script_extension(interpreter.as_deref())
+                if wants_luajit {
+                    "lua"
+                } else {
+                    script_extension(interpreter.as_deref())
+                }
             ),
         };
         let script_path = dir.join(&script_file);
@@ -455,17 +500,29 @@ impl Evolver {
         if !content.ends_with('\n') {
             content.push('\n');
         }
-        // A script with neither a shebang nor an interpreter cannot run;
-        // default the interpreter to `sh` rather than write a dud tool.
-        let interpreter =
-            interpreter.or_else(|| (!content.starts_with("#!")).then(|| "sh".to_string()));
+
+        // External scripts with neither a shebang nor an interpreter cannot
+        // run; default the interpreter to `sh` rather than write a dud tool.
+        // LuaJIT tools need neither.
+        let interpreter = if wants_luajit {
+            None
+        } else {
+            interpreter.or_else(|| (!content.starts_with("#!")).then(|| "sh".to_string()))
+        };
+        let runtime = if wants_luajit {
+            Some("luajit".to_string())
+        } else {
+            runtime.filter(|r| r != "luajit" && r != "lua" && r != "embedded")
+        };
 
         std::fs::write(&script_path, content)
             .with_context(|| format!("writing {}", script_path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            // Lua tools are not executed as binaries; still mark readable.
+            let mode = if wants_luajit { 0o644 } else { 0o755 };
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(mode))
                 .with_context(|| format!("chmod {}", script_path.display()))?;
         }
 
@@ -478,6 +535,7 @@ impl Evolver {
             description: proposal.description,
             script: script_file,
             interpreter,
+            runtime,
             parameters,
             timeout_secs: proposal.timeout_secs,
         };
@@ -1576,6 +1634,14 @@ fn script_extension(interpreter: Option<&str>) -> &'static str {
     match interpreter {
         Some(i) if i.contains("python") => "py",
         Some(i) if i.contains("node") || i.contains("deno") || i.contains("bun") => "js",
+        Some(i)
+            if i.contains("luajit")
+                || i == "lua"
+                || i.ends_with("/lua")
+                || i.ends_with("/luajit") =>
+        {
+            "lua"
+        }
         _ => "sh",
     }
 }
@@ -1744,6 +1810,7 @@ pub fn describe_outcome(outcome: &EvolveOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
 
     #[test]
     fn slugify_normalizes_names() {
@@ -1838,7 +1905,87 @@ mod tests {
         assert_eq!(script_extension(Some("python3")), "py");
         assert_eq!(script_extension(Some("node")), "js");
         assert_eq!(script_extension(Some("bash")), "sh");
+        assert_eq!(script_extension(Some("luajit")), "lua");
         assert_eq!(script_extension(None), "sh");
+    }
+
+    #[test]
+    fn add_scripted_tool_defaults_to_embedded_luajit() {
+        let config = Config::default();
+        let evolver = Evolver::new(config);
+        let outcome = evolver
+            .add_scripted_tool(ScriptedToolProposal {
+                name: "double_it".into(),
+                description: "double a number".into(),
+                interpreter: None,
+                runtime: None,
+                script_name: None,
+                script_content: "print((args.n or 0) * 2)".into(),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "n": { "type": "number" } }
+                })),
+                timeout_secs: None,
+            })
+            .expect("write lua tool");
+        let EvolveOutcome::ScriptedToolAdded { name, path } = outcome else {
+            panic!("expected ScriptedToolAdded, got {outcome:?}");
+        };
+        assert_eq!(name, "double_it");
+        let manifest_raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            manifest_raw.contains("luajit") || manifest_raw.contains(".lua"),
+            "manifest should mark LuaJIT:\n{manifest_raw}"
+        );
+        let manifest: ScriptManifest = toml::from_str(&manifest_raw).unwrap();
+        assert!(
+            manifest.script.ends_with(".lua"),
+            "script file should be .lua, got {}",
+            manifest.script
+        );
+        assert_eq!(manifest.runtime.as_deref(), Some("luajit"));
+        assert!(manifest.interpreter.is_none());
+
+        // And it actually runs through the embedded JIT.
+        let tool = crate::tools::scripted::ScriptedTool::load(&path).unwrap();
+        let cwd = path.parent().unwrap().to_path_buf();
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tool.execute(
+                serde_json::json!({ "n": 21 }),
+                &crate::tools::ToolContext::new(&cwd),
+            ))
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("42"), "{}", out.content);
+    }
+
+    #[test]
+    fn add_scripted_tool_keeps_external_shell_when_asked() {
+        let config = Config::default();
+        let evolver = Evolver::new(config);
+        let outcome = evolver
+            .add_scripted_tool(ScriptedToolProposal {
+                name: "echo_shell".into(),
+                description: "shell echo".into(),
+                interpreter: Some("sh".into()),
+                runtime: None,
+                script_name: Some("echo_shell.sh".into()),
+                script_content: "#!/bin/sh\necho hi\n".into(),
+                parameters: None,
+                timeout_secs: None,
+            })
+            .expect("write shell tool");
+        let EvolveOutcome::ScriptedToolAdded { path, .. } = outcome else {
+            panic!("expected ScriptedToolAdded");
+        };
+        let manifest: ScriptManifest =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(manifest.script.ends_with(".sh"));
+        assert_eq!(manifest.interpreter.as_deref(), Some("sh"));
+        assert!(manifest.runtime.is_none());
     }
 
     #[test]
@@ -1993,6 +2140,7 @@ mod tests {
             description: "d".to_string(),
             script: "hello.sh".to_string(),
             interpreter: None,
+            runtime: None,
             parameters: serde_json::json!({"type": "object", "properties": {}}),
             timeout_secs: None,
         };

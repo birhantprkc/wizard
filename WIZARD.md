@@ -30,8 +30,8 @@ with no recompile.
 2. **MCP server.** The capability lives outside Wizard: browsers, computer
    use, databases, search, cloud APIs. Register a Model Context Protocol
    server. **This is the right rung for browser use** (see §2).
-3. **Scripted tool.** A small, self-contained shell/Python/JS helper exposed
-   as a tool.
+3. **Scripted tool.** A small, self-contained LuaJIT helper exposed as a
+   tool (embedded just-in-time compiler; shell/Python only when needed).
 4. **Subagent.** A reusable specialist worker with its own prompt and tool
    scope. See §2.5 for when and how to delegate to one.
 5. **Deep evolve (source).** None of the above fit and the capability must

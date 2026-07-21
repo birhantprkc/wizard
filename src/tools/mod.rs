@@ -9,6 +9,7 @@ pub mod file;
 pub mod git;
 pub mod image;
 pub mod interview;
+pub mod lua;
 pub mod memory;
 pub mod plan;
 pub mod publish;
@@ -125,6 +126,11 @@ pub struct ToolContext {
     /// approval round-trip) can reach it. `None` outside the dispatch
     /// pipeline (subagents, direct registry execution).
     pub events: Option<tokio::sync::mpsc::Sender<crate::agent::AgentEvent>>,
+    /// Cooperative "background the current foreground command" handle. The
+    /// TUI keeps a clone (see [`crate::agent::Agent::background_gate`]) and
+    /// fires it on Ctrl-B; a running `execute` selects on it and promotes the
+    /// child into the background task registry. `None` outside an agent.
+    pub background: Option<crate::agent::BackgroundGate>,
     /// Settings for the native web tools (`[web]` in `config.toml`), set by
     /// the agent at construction; defaults elsewhere.
     pub web: Arc<crate::config::WebConfig>,
@@ -160,6 +166,7 @@ impl ToolContext {
             subagents: Arc::new(subagent_tasks::SubagentTaskRegistry::new()),
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
             events: None,
+            background: None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
             images: None,
@@ -207,6 +214,13 @@ impl ToolContext {
             events: Some(events),
             ..self.clone()
         }
+    }
+
+    /// This context with the session's background-promote gate attached
+    /// (agent construction).
+    pub fn with_background(mut self, gate: crate::agent::BackgroundGate) -> Self {
+        self.background = Some(gate);
+        self
     }
 }
 

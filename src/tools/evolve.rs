@@ -43,13 +43,15 @@ impl Tool for EvolveTool {
     fn description(&self) -> &str {
         "Add a NEW capability to yourself when the current task needs one you \
          lack. By default (deep=false) this performs a fast runtime extension — \
-         it adds a skill, MCP server, scripted tool, or subagent under \
-         ~/.wizard/ with no recompile. Set deep=true ONLY when the capability \
-         genuinely requires changing Wizard's own Rust source: this rebuilds and \
-         replaces the running binary, is much slower, and is gated by a build \
-         plus smoke test (falling back to a runtime extension if no toolchain or \
-         source is available). The `description` argument is a precise \
-         natural-language specification of the capability you want."
+         it adds a skill, MCP server, scripted tool (LuaJIT by default), or \
+         subagent under ~/.wizard/ with no recompile. Scripted tools run through \
+         the embedded LuaJIT just-in-time compiler unless an external interpreter \
+         is required. Set deep=true ONLY when the capability genuinely requires \
+         changing Wizard's own Rust source: this rebuilds and replaces the \
+         running binary, is much slower, and is gated by a build plus smoke test \
+         (falling back to a runtime extension if no toolchain or source is \
+         available). The `description` argument is a precise natural-language \
+         specification of the capability you want."
     }
 
     fn parameters(&self) -> Value {
