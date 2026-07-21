@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "One line. Your sovereign agent. Self-extending. Bring any model."
 repository = "https://github.com/teddytennant/wizard"
+build = "build.rs"
 
 [features]
 default = []
