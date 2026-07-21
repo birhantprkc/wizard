@@ -59,14 +59,12 @@ pub fn run_scripted(
     let start = std::time::Instant::now();
     loop {
         if join.is_finished() {
-            return join
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(ToolError::Execution {
-                        tool: tool.to_string(),
-                        source: anyhow::anyhow!("LuaJIT worker panicked"),
-                    })
-                });
+            return join.join().unwrap_or_else(|_| {
+                Err(ToolError::Execution {
+                    tool: tool.to_string(),
+                    source: anyhow::anyhow!("LuaJIT worker panicked"),
+                })
+            });
         }
         if start.elapsed() >= timeout {
             // The worker cannot be safely aborted mid-Lua (no kill for a
@@ -193,16 +191,10 @@ fn run_lua_blocking(
         .eval::<LuaValue>()
         .map_err(|err| ToolError::Execution {
             tool: tool.to_string(),
-            source: anyhow::anyhow!(
-                "LuaJIT error in {}:\n{err}",
-                script_path.display()
-            ),
+            source: anyhow::anyhow!("LuaJIT error in {}:\n{err}", script_path.display()),
         })?;
 
-    let printed = stdout
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let printed = stdout.lock().map(|g| g.clone()).unwrap_or_default();
 
     let content = if !printed.is_empty() {
         printed
@@ -323,7 +315,11 @@ fn lua_value_to_json_string(lua: &Lua, value: LuaValue) -> mlua::Result<String> 
 }
 
 /// True when a scripted tool should run through the embedded LuaJIT runtime.
-pub fn is_luajit_tool(script_path: &Path, interpreter: Option<&str>, runtime: Option<&str>) -> bool {
+pub fn is_luajit_tool(
+    script_path: &Path,
+    interpreter: Option<&str>,
+    runtime: Option<&str>,
+) -> bool {
     if runtime.is_some_and(|r| {
         let r = r.trim().to_ascii_lowercase();
         r == "luajit" || r == "lua" || r == "embedded"
@@ -389,7 +385,11 @@ mod tests {
         )
         .unwrap();
         assert!(!out.is_error);
-        assert!(out.content.trim() == "42" || out.content.contains("42"), "{}", out.content);
+        assert!(
+            out.content.trim() == "42" || out.content.contains("42"),
+            "{}",
+            out.content
+        );
     }
 
     #[test]

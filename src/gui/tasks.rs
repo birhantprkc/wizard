@@ -1677,7 +1677,7 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
             // Runs against the live agent (commands wait for turns to finish
             // on this surface). The exchange never enters history — same
             // contract as the TUI.
-            notice(shared, format!("answering /btw…"));
+            notice(shared, "answering /btw…".to_string());
             match agent.answer_side_question(&question).await {
                 Ok(answer) => notice(shared, format!("/btw {question}\n{answer}")),
                 Err(err) => error(shared, format!("/btw failed: {err:#}")),

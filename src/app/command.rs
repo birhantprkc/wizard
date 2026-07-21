@@ -860,7 +860,8 @@ impl CommandContext<'_> {
             return;
         }
         if self.app.pending_btw.is_some() || self.app.btw_inflight {
-            self.app.notice("already answering a /btw — wait for it to finish");
+            self.app
+                .notice("already answering a /btw — wait for it to finish");
             return;
         }
         // A light "working on it" marker; the answer arrives as its own notice.

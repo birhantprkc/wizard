@@ -703,6 +703,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
 /// slot, mark the UI busy, and spawn the turn task. Returns `true` when the
 /// turn was started. On a missing agent the prepared prompt is re-queued so a
 /// later idle cycle can retry.
+#[allow(clippy::too_many_arguments)]
 fn start_agent_turn(
     app: &mut App,
     agent_slot: &mut Option<Agent>,

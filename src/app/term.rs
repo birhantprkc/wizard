@@ -220,7 +220,7 @@ fn copy_via_native(text: &str) -> Result<()> {
     candidates.extend_from_slice(&[
         ("xclip", &["-selection", "clipboard"]),
         ("xsel", &["--clipboard", "--input"]),
-        ("pbcopy", &[]), // macOS
+        ("pbcopy", &[]),   // macOS
         ("clip.exe", &[]), // Windows (WSL / native)
     ]);
     if !wayland {
@@ -262,9 +262,7 @@ fn pipe_to(cmd: &str, args: &[&str], bytes: &[u8]) -> Result<()> {
         // Drop stdin to close the pipe so tools that read to EOF (wl-copy,
         // pbcopy) finish rather than hanging.
     }
-    let status = child
-        .wait()
-        .with_context(|| format!("waiting for {cmd}"))?;
+    let status = child.wait().with_context(|| format!("waiting for {cmd}"))?;
     if status.success() {
         Ok(())
     } else {

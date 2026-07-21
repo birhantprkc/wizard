@@ -195,15 +195,14 @@ impl Tool for ScriptedTool {
             self.manifest.interpreter.as_deref(),
             self.manifest.runtime.as_deref(),
         ) {
-            let source = std::fs::read_to_string(&self.script_path).map_err(|err| {
-                ToolError::Execution {
+            let source =
+                std::fs::read_to_string(&self.script_path).map_err(|err| ToolError::Execution {
                     tool: self.name().to_string(),
                     source: anyhow::Error::new(err).context(format!(
                         "reading LuaJIT script {}",
                         self.script_path.display()
                     )),
-                }
-            })?;
+                })?;
             return luajit::run_scripted_async(
                 self.name(),
                 &source,

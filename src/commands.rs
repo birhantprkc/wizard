@@ -365,11 +365,7 @@ impl SlashCommand {
                 // Keep the question intact (spaces, punctuation) rather than
                 // rejoining whitespace-split tokens — the whole rest of the
                 // line is the question.
-                let rest = input
-                    .trim()
-                    .strip_prefix('/')
-                    .unwrap_or(input)
-                    .trim_start();
+                let rest = input.trim().strip_prefix('/').unwrap_or(input).trim_start();
                 let question = rest
                     .strip_prefix("btw")
                     .unwrap_or("")
