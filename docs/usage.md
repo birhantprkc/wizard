@@ -25,6 +25,7 @@ inline hints.
 | `/resume [id]` | Reopen a past session and continue it; no argument opens the session picker |
 | `/compact` | Summarize older history into a progress note now, instead of waiting for the automatic threshold |
 | `/btw <question>` | Ask a quick side question against the current conversation without adding the exchange to history or the session file (token-cheap asides mid-task; works while a turn is running) |
+| `/fork <task>` | Spawn a background side quest that inherits the full conversation context (history, tools, system prompt). Runs in parallel without interrupting the main session; its report is injected into history when finished (works while a turn is running) |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
 | `/subagents` | Focus the subagent rail below the composer (same as ↓); from inside a subagent's pane, back out to the chat |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
@@ -82,6 +83,22 @@ messages stack FIFO; the status bar shows `queued N` while any are waiting.
 The queue is capped (32); overflow keeps the composer text so nothing is lost.
 `/clear` and Ctrl-C interrupt both drop the queue, a cleared or interrupted
 conversation shouldn't auto-fire prompts that no longer apply.
+
+### `/fork` vs `/btw` vs `spawn_subagent`
+
+Three ways to peel work off the main thread, each with a different contract:
+
+| | Context | Tools | Lands in history? | Who starts it |
+|---|---|---|---|---|
+| `/btw <question>` | Full conversation (snapshot) | None — one-shot answer | No (token-cheap aside) | You, mid-turn OK |
+| `/fork <task>` | Full conversation (snapshot) | Parent's tools (minus nested spawn / surface-bound tools) | Yes — report injected when the fork finishes | You, mid-turn OK |
+| `spawn_subagent` | Only the `task` string you write | Chosen subagent's scope | Yes — same background drain as `/fork` | The agent |
+
+`/fork` is the "true parallel agent" path: you stay in the main thread, the
+fork inherits everything it needs with zero re-explanation, and its findings
+come back as a system note the main model sees on its next turn (or on the
+idle drain if you're between turns). Watch it on the subagent rail (`/subagents`
+or ↓); kill it from there the same way as any other background subagent.
 
 ## `wizard agents` and background subagents
 

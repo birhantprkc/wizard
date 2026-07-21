@@ -300,6 +300,9 @@ pub struct App {
     /// True while a background `/btw` is in flight, so a second one is refused
     /// rather than stacked.
     pub btw_inflight: bool,
+    /// Set by `/fork <task>`; the main loop detaches a side quest that inherits
+    /// the full conversation (so it works mid-turn too). Cleared once spawned.
+    pub pending_fork: Option<String>,
     /// Set when the background MCP connect finishes while a turn is running
     /// (so the agent is out of its slot and can't take the rebuilt registry
     /// yet). The main loop merges the MCP tools once the turn returns the
@@ -420,6 +423,7 @@ impl App {
             compacting: false,
             pending_btw: None,
             btw_inflight: false,
+            pending_fork: None,
             mcp_merge_pending: false,
             pending_agent_commands: Vec::new(),
             message_queue: VecDeque::new(),
@@ -3657,8 +3661,13 @@ impl App {
             } => {
                 self.status.background_subagents =
                     self.status.background_subagents.saturating_sub(1);
+                let kind = if name == crate::agent::subagent::FORK_NAME {
+                    "fork"
+                } else {
+                    "background subagent"
+                };
                 self.notice(format!(
-                    "background subagent #{id} '{name}' {}: {task}",
+                    "{kind} #{id} '{name}' {}: {task}",
                     if completed {
                         "finished"
                     } else {

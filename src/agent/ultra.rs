@@ -605,6 +605,7 @@ async fn run_one(
         // mid-session `/model`.
         model: Some(model.to_string()),
         read_only: true,
+        ..Default::default()
     };
     tokio::select! {
         biased;

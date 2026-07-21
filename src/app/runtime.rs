@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, AgentEvent, CancelHandle, DoneReason, SideQuestionContext};
+use crate::agent::{
+    Agent, AgentEvent, CancelHandle, DoneReason, FinishedNotification, ForkContext,
+    SideQuestionContext,
+};
 use crate::commands::SlashCommand;
 use crate::config::{Config, StepBudget};
 use crate::event::{Event, EventLoop};
@@ -84,11 +87,17 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         )
         .await?,
     );
-    // Seed so `/btw` works before any turn has run (system prompt alone is
-    // enough context for a factual aside).
+    // Seed so `/btw` and `/fork` work before any turn has run (system prompt
+    // alone is enough context for a factual aside or a first side quest).
     let mut side_question_snapshot: Option<SideQuestionContext> = agent_slot
         .as_ref()
         .map(|agent| agent.side_question_context());
+    let mut fork_snapshot: Option<ForkContext> =
+        agent_slot.as_ref().map(|agent| agent.fork_context());
+    // When no turn is in flight, fork progress still needs a live channel so
+    // the subagent rail can open panes. The collector below forwards into the
+    // main event loop; recreated whenever the previous one ends.
+    let mut idle_fork_tx: Option<mpsc::Sender<AgentEvent>> = None;
     // `--plan` / `plan_first = true`: the session starts in plan mode (the
     // App mirror is set from the same config in App::new below).
     if config.plan_first
@@ -296,6 +305,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 // Fresh agent owns the conversation again; any mid-turn
                 // snapshot is stale.
                 side_question_snapshot = Some(agent.side_question_context());
+                fork_snapshot = Some(agent.fork_context());
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
@@ -321,6 +331,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 &mut agent_cancel,
                 &mut interrupt_at,
                 &mut side_question_snapshot,
+                &mut fork_snapshot,
+                &mut idle_fork_tx,
                 &events,
             );
             continue;
@@ -414,6 +426,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                         &mut agent_cancel,
                         &mut interrupt_at,
                         &mut side_question_snapshot,
+                        &mut fork_snapshot,
+                        &mut idle_fork_tx,
                         &events,
                         prepared,
                     ) {
@@ -558,6 +572,84 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             }
         }
 
+        // `/fork`: detach a side quest that inherits the full conversation.
+        // Works mid-turn via the snapshot captured when the turn started.
+        // Progress streams on the turn's event channel while a turn is running,
+        // or on a dedicated idle collector otherwise.
+        if let Some(task) = app.pending_fork.take() {
+            let ctx = agent_slot
+                .as_ref()
+                .map(|agent| agent.fork_context())
+                .or_else(|| fork_snapshot.clone());
+            match ctx {
+                Some(ctx) => {
+                    // Prefer the live turn's forwarder when one is up; otherwise
+                    // ensure an idle collector so panes still open between turns.
+                    let progress = if agent_task.is_some() {
+                        // A turn is running: its forwarder is already pumping
+                        // AgentEvents into the loop. We don't hold that sender
+                        // here, so open a sibling collector on the same path.
+                        ensure_idle_fork_tx(&mut idle_fork_tx, &events)
+                    } else {
+                        ensure_idle_fork_tx(&mut idle_fork_tx, &events)
+                    };
+                    let notify = events.sender();
+                    tokio::spawn(async move {
+                        match ctx.spawn(&task, Some(progress)).await {
+                            Ok(id) => {
+                                let _ = notify
+                                    .send(Event::Notice(format!(
+                                        "fork #{id} started: {task}"
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = notify
+                                    .send(Event::Notice(format!("/fork failed: {err:#}")))
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                None => {
+                    app.notice(
+                        "no conversation context for /fork yet — wait for the agent to finish rebuilding",
+                    );
+                }
+            }
+        }
+
+        // Between turns, drain any background tasks/subagents (including forks)
+        // that finished while the agent was idle, so their reports land in
+        // history without waiting for the next user message.
+        if agent_task.is_none()
+            && let Some(agent) = agent_slot.as_mut()
+        {
+            for notification in agent.drain_finished_notifications() {
+                match notification {
+                    FinishedNotification::Task(task) => {
+                        app.handle_agent_event(AgentEvent::TaskFinished {
+                            id: task.id,
+                            command: task.command,
+                            status: task.status,
+                        });
+                    }
+                    FinishedNotification::Subagent(task) => {
+                        app.handle_agent_event(AgentEvent::SubagentFinished {
+                            id: task.id,
+                            name: task.name,
+                            task: task.task,
+                            completed: task.completed,
+                            output: task.output,
+                        });
+                    }
+                }
+            }
+            // Keep the mid-turn snapshots current after any history injection.
+            fork_snapshot = Some(agent.fork_context());
+            side_question_snapshot = Some(agent.side_question_context());
+        }
+
         if turn_done && let Some(handle) = agent_task.take() {
             // Whatever ended it — a finished turn, or a cooperative interrupt
             // that landed — this turn is no longer interruptible.
@@ -566,8 +658,9 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             match handle.await {
                 Ok(agent) => {
                     // Latest history is back in the slot; refresh the
-                    // mid-turn snapshot so a follow-up `/btw` sees it.
+                    // mid-turn snapshots so a follow-up `/btw` or `/fork` sees it.
                     side_question_snapshot = Some(agent.side_question_context());
+                    fork_snapshot = Some(agent.fork_context());
                     agent_slot = Some(agent);
                     // The provider just served a turn, so any earlier health
                     // warning was transient — drop it so it self-heals.
@@ -677,6 +770,8 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             &mut agent_cancel,
             &mut interrupt_at,
             &mut side_question_snapshot,
+            &mut fork_snapshot,
+            &mut idle_fork_tx,
             &events,
         );
 
@@ -711,6 +806,8 @@ fn start_agent_turn(
     agent_cancel: &mut Option<CancelHandle>,
     interrupt_at: &mut Option<Instant>,
     side_question_snapshot: &mut Option<SideQuestionContext>,
+    fork_snapshot: &mut Option<ForkContext>,
+    idle_fork_tx: &mut Option<mpsc::Sender<AgentEvent>>,
     events: &EventLoop,
     prepared: crate::commands::Preprocessed,
 ) -> bool {
@@ -719,8 +816,12 @@ fn start_agent_turn(
         return false;
     };
     // Capture conversation context *before* the agent leaves its slot so a
-    // mid-turn `/btw` still has something to ground against.
+    // mid-turn `/btw` or `/fork` still has something to ground against.
     *side_question_snapshot = Some(agent.side_question_context());
+    *fork_snapshot = Some(agent.fork_context());
+    // A turn brings its own event forwarder; drop any idle collector so we
+    // don't keep two pumps alive for the same surface.
+    *idle_fork_tx = None;
     app.status.busy = true;
     app.status.step = 0;
     app.streaming.clear();
@@ -729,6 +830,9 @@ fn start_agent_turn(
     app.roll_spinner_verb();
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
+    // Keep a clone so mid-turn `/fork` can stream into the same forwarder
+    // the turn uses (panes open while the main turn is still running).
+    let turn_events = agent_tx.clone();
     let forward = events.sender();
     tokio::spawn(async move {
         while let Some(agent_event) = agent_rx.recv().await {
@@ -737,6 +841,10 @@ fn start_agent_turn(
             }
         }
     });
+    // Stash the turn's event sender as the idle_fork_tx so a mid-turn /fork
+    // finds it. (When the turn ends, start_agent_turn's next call or the idle
+    // drain path replaces it.)
+    *idle_fork_tx = Some(turn_events);
 
     // Cloned before the agent moves into the task: Ctrl-C stops the turn
     // through this, and only falls back to aborting the task (which loses
@@ -765,8 +873,34 @@ fn start_agent_turn(
     true
 }
 
+/// Ensure a collector is pumping `AgentEvent`s into the main event loop while
+/// no turn is running (or as a sibling of a running turn's forwarder). Returns
+/// a sender the fork can stream into.
+fn ensure_idle_fork_tx(
+    idle_fork_tx: &mut Option<mpsc::Sender<AgentEvent>>,
+    events: &EventLoop,
+) -> mpsc::Sender<AgentEvent> {
+    if let Some(tx) = idle_fork_tx.as_ref()
+        && !tx.is_closed()
+    {
+        return tx.clone();
+    }
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let forward = events.sender();
+    tokio::spawn(async move {
+        while let Some(agent_event) = rx.recv().await {
+            if forward.send(Event::Agent(agent_event)).await.is_err() {
+                break;
+            }
+        }
+    });
+    *idle_fork_tx = Some(tx.clone());
+    tx
+}
+
 /// If the agent is idle and a user prompt is waiting, start it. One message
 /// per call so the turn's Done comes back around and drains the rest.
+#[allow(clippy::too_many_arguments)]
 fn drain_message_queue(
     app: &mut App,
     agent_slot: &mut Option<Agent>,
@@ -774,6 +908,8 @@ fn drain_message_queue(
     agent_cancel: &mut Option<CancelHandle>,
     interrupt_at: &mut Option<Instant>,
     side_question_snapshot: &mut Option<SideQuestionContext>,
+    fork_snapshot: &mut Option<ForkContext>,
+    idle_fork_tx: &mut Option<mpsc::Sender<AgentEvent>>,
     events: &EventLoop,
 ) {
     if app.status.busy || app.rebuilding.is_some() || agent_slot.is_none() {
@@ -790,6 +926,8 @@ fn drain_message_queue(
         agent_cancel,
         interrupt_at,
         side_question_snapshot,
+        fork_snapshot,
+        idle_fork_tx,
         events,
         prepared,
     ) && remaining > 0

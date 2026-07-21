@@ -97,6 +97,10 @@ pub enum SlashCommand {
     /// conversation context. The exchange is *not* appended to history or
     /// the session file (token-cheap asides mid-task).
     Btw(String),
+    /// `/fork <task>` — spawn a background side quest that inherits the full
+    /// conversation context (history, tools, system prompt). Runs in parallel
+    /// with the main session; its report is injected into history when done.
+    Fork(String),
     /// `/goal [text]` — show the standing mission goal, or set it. `None`
     /// shows the current goal; `Some` sets it (drives sovereign/continuous
     /// mode), persisting to `<project_root>/.wizard/mission.toml`.
@@ -377,6 +381,21 @@ impl SlashCommand {
                     Ok(Self::Btw(question))
                 }
             }
+            "fork" => {
+                // Same whole-rest-of-line rule as `/btw`: the side-quest brief
+                // keeps its spaces and punctuation.
+                let rest = input.trim().strip_prefix('/').unwrap_or(input).trim_start();
+                let task = rest
+                    .strip_prefix("fork")
+                    .unwrap_or("")
+                    .trim_start()
+                    .to_string();
+                if task.is_empty() {
+                    Err("usage: /fork <task>".to_string())
+                } else {
+                    Ok(Self::Fork(task))
+                }
+            }
             "goal" => {
                 let text = args.join(" ");
                 if text.is_empty() {
@@ -457,6 +476,14 @@ impl SlashCommand {
             // conversation and should not spend a turn asking itself.
             Btw(_) => Err(
                 "`/btw` is a user side-question; answer from context yourself".into(),
+            ),
+
+            // A fork is the user's parallel side quest; the agent already has
+            // `spawn_subagent` for its own background work.
+            Fork(_) => Err(
+                "`/fork` is a user side-quest; use `spawn_subagent` for your own \
+                 background work"
+                    .into(),
             ),
 
             // Interactive pickers: there is no human at the keyboard mid-turn,
@@ -641,6 +668,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "btw",
         args: "<question>",
         description: "ask a side question without adding it to the conversation",
+        takes_args: true,
+        gui: Execution::Server,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "fork",
+        args: "<task>",
+        description: "spawn a background side quest that inherits full conversation context",
         takes_args: true,
         gui: Execution::Server,
         agent_arg: "",
@@ -1436,6 +1471,27 @@ mod tests {
         assert_eq!(parse("/btw   "), Err("usage: /btw <question>".to_string()));
         // A side question is the user's call — the agent may not queue one.
         assert!(SlashCommand::Btw("hi".into()).agent_runnable().is_err());
+    }
+
+    /// `/fork` keeps the whole rest of the line as the side-quest brief, and
+    /// refuses a bare `/fork` with a usage error. The agent may not invoke it
+    /// (it already has `spawn_subagent`).
+    #[test]
+    fn fork_keeps_the_full_task_and_refuses_an_empty_one() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(
+            parse("/fork read the docs and summarize auth"),
+            Ok(SlashCommand::Fork(
+                "read the docs and summarize auth".into()
+            ))
+        );
+        assert_eq!(
+            parse("/fork   keep  internal   spaces"),
+            Ok(SlashCommand::Fork("keep  internal   spaces".into()))
+        );
+        assert_eq!(parse("/fork"), Err("usage: /fork <task>".to_string()));
+        assert_eq!(parse("/fork   "), Err("usage: /fork <task>".to_string()));
+        assert!(SlashCommand::Fork("hi".into()).agent_runnable().is_err());
     }
 
     #[test]

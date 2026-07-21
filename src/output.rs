@@ -283,8 +283,13 @@ impl EventSink for TextSink {
                 completed,
                 ..
             } => {
+                let kind = if name == crate::agent::subagent::FORK_NAME {
+                    "fork"
+                } else {
+                    "background subagent"
+                };
                 self.spinner.println(&format!(
-                    "⏺ background subagent #{id} '{name}' {}: {task}",
+                    "⏺ {kind} #{id} '{name}' {}: {task}",
                     if completed {
                         "finished"
                     } else {

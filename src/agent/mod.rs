@@ -48,6 +48,28 @@ pub struct SideQuestionContext {
     pub reasoning_effort: Option<String>,
 }
 
+/// Everything a `/fork` side quest needs, owned so it can spawn without
+/// borrowing the live [`Agent`]. Surfaces snapshot this before parking the
+/// agent in a turn task so a fork can still fire mid-turn — same pattern as
+/// [`SideQuestionContext`], but with tools, hooks, and the background-subagent
+/// registry so the fork can work and report back.
+#[derive(Clone)]
+pub struct ForkContext {
+    pub client: Arc<dyn LlmProvider>,
+    pub model: String,
+    /// Snapshot of the parent conversation (system prompt at index 0).
+    pub messages: Vec<ChatMessage>,
+    /// Parent tool set at snapshot time (shallow `Arc` clone of each tool).
+    pub registry: ToolRegistry,
+    /// Lifecycle hooks shared with the parent.
+    pub hooks: Arc<HookEngine>,
+    /// Parent tool context (cwd, tasks, subagents, usage, images, …). The fork
+    /// registers on `subagents` so its report drains into the parent history.
+    pub ctx: ToolContext,
+    /// Restrict the fork to read-only tools (parent was in plan mode).
+    pub read_only: bool,
+}
+
 /// System reminder prepended to a `/btw` user message. Mirrors Claude Code's
 /// side-question constraints: one shot, no tools, answer from context only.
 const SIDE_QUESTION_REMINDER: &str = "\
@@ -114,6 +136,98 @@ impl SideQuestionContext {
             anyhow::bail!("empty /btw reply");
         }
         Ok(answer)
+    }
+}
+
+impl ForkContext {
+    /// Detach a `/fork` side quest against this snapshot. Registers on the
+    /// parent's background-subagent registry and streams progress through
+    /// `events` (when provided) so the surface can open a pane. Returns the
+    /// background-registry id immediately; the report lands in the parent
+    /// history the next time background subagents are drained.
+    ///
+    /// `events` should be a channel the surface is already listening on
+    /// (turn-forwarded or a dedicated idle collector). When `None`, the fork
+    /// still runs and still reports via the registry — it just has no pane.
+    pub async fn spawn(
+        self,
+        task: &str,
+        events: Option<mpsc::Sender<AgentEvent>>,
+    ) -> Result<u32> {
+        let task = task.trim();
+        anyhow::ensure!(!task.is_empty(), "empty fork task");
+
+        let run = subagent::next_run_id();
+        let options = subagent::SpawnOptions {
+            model: Some(self.model.clone()),
+            read_only: self.read_only,
+            inherited_history: None, // spawn_fork sets this itself
+        };
+
+        let name = subagent::FORK_NAME.to_string();
+        let task_owned = task.to_string();
+        let client = Arc::clone(&self.client);
+        let registry = self.registry;
+        let hooks = Arc::clone(&self.hooks);
+        let history = self.messages;
+        // Carry the surface's event channel into the fork's tool context so
+        // SubagentRun* progress streams to the same place the parent does.
+        let mut fut_ctx = self.ctx.clone();
+        fut_ctx.events = events.clone();
+        let fut_options = options;
+        let fut_task = task_owned.clone();
+        let fut = async move {
+            match subagent::spawn_fork(
+                run,
+                &fut_task,
+                history,
+                &fut_options,
+                &client,
+                &registry,
+                &hooks,
+                &fut_ctx,
+            )
+            .await
+            {
+                Ok(result) => crate::tools::subagent_tasks::SubagentRunResult {
+                    completed: result.completed,
+                    output: result.output,
+                    steps_used: result.steps_used,
+                    error: None,
+                },
+                Err(err) => crate::tools::subagent_tasks::SubagentRunResult {
+                    completed: false,
+                    output: format!("fork failed: {err:#}"),
+                    steps_used: 0,
+                    error: Some(format!("{err:#}")),
+                },
+            }
+        };
+
+        let id = self.ctx.subagents.reserve(&name, task);
+        if let Some(events) = &events {
+            emit(
+                events,
+                AgentEvent::SubagentRunStarted {
+                    run,
+                    bg: Some(id),
+                    name: name.clone(),
+                    task: task_owned.clone(),
+                },
+            )
+            .await;
+            emit(
+                events,
+                AgentEvent::SubagentStarted {
+                    id,
+                    name: name.clone(),
+                    task: task_owned.clone(),
+                },
+            )
+            .await;
+        }
+        self.ctx.subagents.attach(id, fut);
+        Ok(id)
     }
 }
 
@@ -711,8 +825,16 @@ fn subagent_note(task: &crate::tools::subagent_tasks::SubagentTaskResult) -> Str
         None if task.completed => "completed".to_string(),
         None => "hit its step budget".to_string(),
     };
+    // `/fork` side quests share the background-subagent drain path; label them
+    // so the main model (and the user reading the transcript) can tell a
+    // user-spawned fork from a `spawn_subagent` delegation at a glance.
+    let kind = if task.name == subagent::FORK_NAME {
+        "fork"
+    } else {
+        "background subagent"
+    };
     format!(
-        "[background subagent #{} '{}' {} after {} step(s)] {}\n\n{}",
+        "[{kind} #{} '{}' {} after {} step(s)] {}\n\n{}",
         task.id, task.name, status, task.steps_used, task.task, task.output
     )
 }
@@ -1290,12 +1412,40 @@ impl Agent {
         }
     }
 
+    /// Snapshot of everything a [`ForkContext`] needs to spawn a `/fork` side
+    /// quest without borrowing the agent. Same mid-turn pattern as
+    /// [`Self::side_question_context`]: surfaces clone this before the agent
+    /// leaves its slot so a fork can still fire while a turn is running.
+    pub fn fork_context(&self) -> ForkContext {
+        ForkContext {
+            client: Arc::clone(&self.client),
+            model: self.model.clone(),
+            messages: self.history.clone(),
+            registry: self.dispatcher.registry().snapshot(),
+            hooks: Arc::clone(&self.hooks),
+            ctx: self.ctx.clone(),
+            read_only: self.plan_mode(),
+        }
+    }
+
     /// Answer a one-shot side question (`/btw`) against the live history. Does
     /// **not** push the exchange into history or the session file — that is
     /// the feature. Prefer [`SideQuestionContext`] when the agent is out of
     /// its slot mid-turn.
     pub async fn answer_side_question(&self, question: &str) -> Result<String> {
         self.side_question_context().ask(question).await
+    }
+
+    /// Spawn a `/fork` side quest against the live history. Detaches into the
+    /// background-subagent registry and returns its id immediately; the report
+    /// is injected into history the next time background subagents drain.
+    /// Prefer [`ForkContext`] when the agent is out of its slot mid-turn.
+    pub async fn spawn_fork(
+        &self,
+        task: &str,
+        events: Option<mpsc::Sender<AgentEvent>>,
+    ) -> Result<u32> {
+        self.fork_context().spawn(task, events).await
     }
 
     /// Swap the model client mid-session (`/fusion`: the panel answers every

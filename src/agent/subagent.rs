@@ -212,6 +212,100 @@ pub struct SpawnOptions {
     pub model: Option<String>,
     /// Restrict the subagent to read-only tools (plan mode).
     pub read_only: bool,
+    /// When set, seed the run from the parent conversation instead of a fresh
+    /// system prompt + bare task. Used by [`spawn_fork`] (`/fork`): the side
+    /// quest inherits history, tools, and prompt, then appends its brief.
+    pub inherited_history: Option<Vec<ChatMessage>>,
+}
+
+/// Built-in name for a `/fork` side-quest run (shown on the subagent rail and
+/// in the background-subagent report injected into the parent).
+pub const FORK_NAME: &str = "fork";
+
+/// Tools a fork must never call: nesting another spawn would recurse forever,
+/// and interactive / surface-bound tools have no user attached to answer them.
+const FORK_TOOL_DENYLIST: &[&str] = &[
+    SPAWN_SUBAGENT_TOOL_NAME,
+    "run_command",
+    "exit_plan",
+    "interview",
+];
+
+/// System reminder appended as the user message that launches a `/fork`
+/// side quest. The parent conversation stays untouched; this brief is only
+/// in the fork's own history.
+const FORK_BRIEF: &str = "\
+This is a forked side quest from the user (\"/fork\"). You inherit the full \
+conversation above — history, tools, and system prompt — and run in parallel \
+with the main session.\n\
+\n\
+CRITICAL CONSTRAINTS:\n\
+- Complete the side quest end-to-end using your tools, then reply with a \
+concise final report of what you found or changed.\n\
+- Do not ask the user questions; make reasonable decisions and note them in \
+your report.\n\
+- Do not try to steer the main conversation or wait on it — you are a \
+detached worker. Your report is injected back into the main session when \
+you finish.\n\
+- Stay focused on the side quest below; ignore unrelated open work unless it \
+blocks you.";
+
+/// Parent tool set with the tools a fork must never call stripped (see
+/// [`FORK_TOOL_DENYLIST`]).
+pub fn fork_registry(parent: &ToolRegistry) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for spec in parent.specs() {
+        let name = spec.function.name.as_str();
+        if FORK_TOOL_DENYLIST.contains(&name) {
+            continue;
+        }
+        if let Some(tool) = parent.get(name) {
+            registry.register(Arc::clone(tool));
+        }
+    }
+    registry
+}
+
+/// Config used by every `/fork` run: general-purpose worker, full remaining
+/// tool set, no step ceiling.
+pub fn fork_config() -> SubagentConfig {
+    SubagentConfig {
+        name: FORK_NAME.to_string(),
+        description: "User-spawned side quest that inherits the full conversation \
+                      context and reports back when finished."
+            .to_string(),
+        // Unused when `inherited_history` is set — the parent's system prompt
+        // already sits at history[0]. Kept as a safe fallback if a caller
+        // ever spawns a fork without history.
+        system_prompt: "You are a focused fork of Wizard. Complete the given side \
+                        quest end-to-end, then reply with a concise final report."
+            .to_string(),
+        tool_scope: None,
+        max_steps: SubagentConfig::default_max_steps(),
+    }
+}
+
+/// Run a `/fork` side quest: same loop as [`spawn`], but seeded with the
+/// parent's conversation and a stripped tool set. Streams progress as
+/// `SubagentRun*` events and returns one final report for the parent.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_fork(
+    run: u64,
+    task: &str,
+    history: Vec<ChatMessage>,
+    options: &SpawnOptions,
+    client: &Arc<dyn LlmProvider>,
+    registry: &ToolRegistry,
+    hooks: &HookEngine,
+    ctx: &ToolContext,
+) -> Result<SubagentResult> {
+    let config = fork_config();
+    let mut options = options.clone();
+    options.inherited_history = Some(history);
+    // Forks always scope down from a denylisted snapshot so a parent that
+    // still has `spawn_subagent` registered cannot recurse through the fork.
+    let scoped = fork_registry(registry);
+    spawn(run, &config, task, &options, client, &scoped, hooks, ctx).await
 }
 
 /// One model round-trip: stream a completion, skipping reasoning
@@ -329,16 +423,39 @@ pub async fn spawn(
     }
     let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
 
-    let mut system_prompt = config.system_prompt.clone();
-    if !native_tools {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&prompts::render_tool_protocol(&scoped.specs()));
-    }
-
-    let mut history = vec![
-        ChatMessage::system(system_prompt),
-        ChatMessage::user(task.to_string()),
-    ];
+    let mut history = match &options.inherited_history {
+        // `/fork`: seed from the parent's conversation, then append the
+        // side-quest brief. The parent's system prompt (and any mid-session
+        // notes) stay at the front; we only add the fork instruction + task.
+        Some(parent_history) => {
+            let mut history = parent_history.clone();
+            // When the parent is on the JSON tool protocol, refresh the tool
+            // list against *this* run's scoped registry so the fork doesn't
+            // advertise tools we stripped (spawn_subagent, exit_plan, …).
+            if !native_tools
+                && let Some(system) = history.first_mut()
+                && system.role == Role::System
+            {
+                system.content.push_str("\n\n");
+                system
+                    .content
+                    .push_str(&prompts::render_tool_protocol(&scoped.specs()));
+            }
+            history.push(ChatMessage::user(format!("{FORK_BRIEF}\n\n{task}")));
+            history
+        }
+        None => {
+            let mut system_prompt = config.system_prompt.clone();
+            if !native_tools {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&prompts::render_tool_protocol(&scoped.specs()));
+            }
+            vec![
+                ChatMessage::system(system_prompt),
+                ChatMessage::user(task.to_string()),
+            ]
+        }
+    };
 
     // The subagent reports back to the model as one tool result, but its
     // step-by-step activity streams to the surface as run-scoped events so the
@@ -346,8 +463,15 @@ pub async fn spawn(
     // `events: None` so they don't double-emit (todos, background tasks) or
     // leak into the parent's transcript; we emit our own run-scoped pair.
     let progress = ctx.events.clone();
+    // Forks keep the parent's todo list (shared work, shared status bar);
+    // ordinary subagents get a fresh one so their scratch todos never leak.
+    let todos = if options.inherited_history.is_some() {
+        Arc::clone(&ctx.todos)
+    } else {
+        Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new()))
+    };
     let ctx = ToolContext {
-        todos: Arc::new(std::sync::Mutex::new(crate::tools::todo::TodoList::new())),
+        todos,
         events: None,
         // A subagent has no surface to drive; it must never dispatch the
         // parent's slash commands even if the parent's ctx enabled it.
@@ -738,6 +862,7 @@ impl Tool for SpawnSubagentTool {
         let options = SpawnOptions {
             model: self.active_model(),
             read_only: args.plan_mode,
+            ..Default::default()
         };
 
         let config = self
@@ -1153,6 +1278,7 @@ mod tests {
         let options = SpawnOptions {
             model: Some("parent-active-model".to_string()),
             read_only: false,
+            ..Default::default()
         };
         let result = spawn(
             next_run_id(),
@@ -1759,5 +1885,114 @@ mod tests {
             AgentEvent::SubagentRunDone { run: id, completed: true, steps_used: 2, error: None, output }
                 if *id == run && output == "the report"
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_fork_inherits_parent_history_and_strips_nested_spawn() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![vec![chunk("forked report", false, true)]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let ctx = ToolContext::new(&tmp.0);
+
+        // Parent tool set includes spawn_subagent and a normal tool; the fork
+        // must keep the normal one and drop spawn.
+        let mut parent_registry = ToolRegistry::new();
+        parent_registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent_registry.register(Arc::new(SpawnSubagentTool::new(
+            builtin_configs(),
+            Arc::clone(&client),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&hooks),
+        )));
+
+        let parent_history = vec![
+            ChatMessage::system("you are the parent".to_string()),
+            ChatMessage::user("we were discussing auth".to_string()),
+            ChatMessage::assistant("right, the login flow"),
+        ];
+
+        let result = spawn_fork(
+            next_run_id(),
+            "summarize the auth discussion",
+            parent_history.clone(),
+            &SpawnOptions::default(),
+            &client,
+            &parent_registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("fork ok");
+        assert!(result.completed);
+        assert_eq!(result.name, FORK_NAME);
+        assert_eq!(result.output, "forked report");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one model call");
+        let messages = &requests[0].messages;
+        // Parent system + user + assistant + fork brief.
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "you are the parent");
+        assert!(
+            messages[3].content.contains("summarize the auth discussion"),
+            "fork brief carries the task: {}",
+            messages[3].content
+        );
+        assert!(
+            messages[3].content.contains("/fork"),
+            "fork brief identifies itself: {}",
+            messages[3].content
+        );
+        // Tools advertised to the fork must exclude spawn_subagent.
+        let tool_names: Vec<_> = requests[0]
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            tool_names.contains(&"probe"),
+            "parent tools kept: {tool_names:?}"
+        );
+        assert!(
+            !tool_names.iter().any(|n| *n == SPAWN_SUBAGENT_TOOL_NAME),
+            "spawn stripped: {tool_names:?}"
+        );
+    }
+
+    #[test]
+    fn fork_registry_strips_the_denylist() {
+        let mut parent = ToolRegistry::new();
+        parent.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "run_command",
+            access: ToolAccess::Execute,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "exit_plan",
+            access: ToolAccess::Execute,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "interview",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: SPAWN_SUBAGENT_TOOL_NAME,
+            access: ToolAccess::Execute,
+        }));
+
+        let scoped = fork_registry(&parent);
+        let names: Vec<_> = scoped
+            .specs()
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        assert_eq!(names, vec!["probe".to_string()]);
     }
 }

@@ -21,7 +21,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::agent::session::Session;
 use crate::agent::{
-    Agent, AgentEvent, CancelHandle, DoneReason, PlanVerdict, build_headless_agent_for_session,
+    Agent, AgentEvent, CancelHandle, DoneReason, FinishedNotification, PlanVerdict,
+    build_headless_agent_for_session,
 };
 use crate::commands::{Execution, FusionAction, ServerAction, SlashCommand, UltraAction};
 use crate::config::{Config, Mode, ProviderKind};
@@ -1502,10 +1503,15 @@ async fn run_worker(
                 for line in shared.take_pending_commands() {
                     apply_command(&mut agent_for_turn, parse_command_line(&line), &mut ctx).await;
                 }
+                // Surface any background subagents/forks that finished during
+                // the turn (or between this turn and the last) so their reports
+                // land in history without waiting for another user message.
+                drain_finished_into_frames(&mut agent_for_turn, &shared);
                 shared.finish_turn(false);
             }
             WorkerRequest::Command(command) => {
                 apply_command(&mut agent_for_turn, command, &mut ctx).await;
+                drain_finished_into_frames(&mut agent_for_turn, &shared);
                 shared.finish_turn(false);
             }
         }
@@ -1526,6 +1532,32 @@ fn parse_command_line(line: &str) -> CommandRequest {
     CommandRequest {
         name: name.to_string(),
         args: args.trim().to_string(),
+    }
+}
+
+/// Drain finished background tasks and subagents (including `/fork` side
+/// quests) into history and emit the matching UI frames. Same path the TUI
+/// runs on its idle tick and the agent loop runs at the top of every step.
+fn drain_finished_into_frames(agent: &mut Agent, shared: &TaskShared) {
+    for notification in agent.drain_finished_notifications() {
+        match notification {
+            FinishedNotification::Task(task) => {
+                shared.handle_event(AgentEvent::TaskFinished {
+                    id: task.id,
+                    command: task.command,
+                    status: task.status,
+                });
+            }
+            FinishedNotification::Subagent(task) => {
+                shared.handle_event(AgentEvent::SubagentFinished {
+                    id: task.id,
+                    name: task.name,
+                    task: task.task,
+                    completed: task.completed,
+                    output: task.output,
+                });
+            }
+        }
     }
 }
 
@@ -1682,6 +1714,32 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
                 Ok(answer) => notice(shared, format!("/btw {question}\n{answer}")),
                 Err(err) => error(shared, format!("/btw failed: {err:#}")),
             }
+        }
+        SlashCommand::Fork(task) => {
+            // Detach a side quest that inherits the full conversation. Progress
+            // streams through a collector into the same frames a background
+            // subagent would; the report lands in history on the next drain
+            // (end of this command path, or the next turn's top-of-loop).
+            notice(shared, format!("forking: {task}"));
+            let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
+            let collector_shared = Arc::clone(shared);
+            let collector = tokio::spawn(async move {
+                while let Some(event) = events_rx.recv().await {
+                    collector_shared.handle_event(event);
+                }
+            });
+            match agent.spawn_fork(&task, Some(events_tx)).await {
+                Ok(id) => notice(shared, format!("fork #{id} started: {task}")),
+                Err(err) => error(shared, format!("/fork failed: {err:#}")),
+            }
+            // Don't join the collector — the fork outlives this command and
+            // keeps streaming. Dropping our end of the join handle is fine;
+            // the task ends when the fork drops its last event sender.
+            drop(collector);
+            // Surface any already-finished background work (unlikely this
+            // soon, but keeps the drain path consistent with the TUI idle
+            // tick).
+            drain_finished_into_frames(agent, shared);
         }
         SlashCommand::Agents => notice(shared, agents_report()),
         SlashCommand::Reload => reload(agent, ctx).await,

@@ -128,6 +128,7 @@ const HELP_TEXT: &str = "available commands:\n  \
 /resume                     reopen and continue a past session\n  \
 /compact                    summarize older history into a progress note now\n  \
 /btw <question>             ask a side question without adding it to the conversation\n  \
+/fork <task>                spawn a background side quest that inherits full context\n  \
 /agents                     browse subagents and delegate to one\n  \
 /subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
@@ -209,6 +210,7 @@ impl CommandContext<'_> {
             SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
             SlashCommand::Compact => self.request_compact(),
             SlashCommand::Btw(question) => self.btw(question),
+            SlashCommand::Fork(task) => self.fork(task),
             SlashCommand::Agents => self.open_agents_picker(),
             SlashCommand::Reload => self.reload().await,
             SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
@@ -867,6 +869,25 @@ impl CommandContext<'_> {
         // A light "working on it" marker; the answer arrives as its own notice.
         self.app.notice("answering /btw…");
         self.app.pending_btw = Some(question);
+    }
+
+    /// `/fork <task>`: background side quest that inherits the full conversation.
+    /// Allowed mid-turn (same as `/btw`); the main loop snapshots a
+    /// [`crate::agent::ForkContext`] and detaches the run into the parent's
+    /// background-subagent registry so the report lands in history when done.
+    fn fork(&mut self, task: String) {
+        if self.app.rebuilding.is_some() {
+            self.app
+                .notice("cannot fork while the agent is rebuilding");
+            return;
+        }
+        if self.app.pending_fork.is_some() {
+            self.app
+                .notice("already starting a /fork — wait a moment");
+            return;
+        }
+        self.app.notice(format!("forking: {task}"));
+        self.app.pending_fork = Some(task);
     }
 
     fn switch_mode(&mut self, mode: Mode) {

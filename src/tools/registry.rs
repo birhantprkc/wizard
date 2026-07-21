@@ -33,10 +33,27 @@ pub struct ToolRegistry {
     order: Vec<String>,
 }
 
+impl Clone for ToolRegistry {
+    /// Shallow snapshot: each tool is an `Arc`, so this is a cheap handle clone
+    /// (used by `/fork` so a mid-turn side-quest can keep the parent's tool set
+    /// without borrowing the live dispatcher).
+    fn clone(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            order: self.order.clone(),
+        }
+    }
+}
+
 impl ToolRegistry {
     /// Empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cheap handle clone of every registered tool (see [`Clone`]).
+    pub fn snapshot(&self) -> Self {
+        self.clone()
     }
 
     /// Registry pre-populated with all native tools
