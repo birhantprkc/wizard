@@ -15,8 +15,7 @@ use std::path::Path;
 /// only writable install location on `PATH` is `$PREFIX/bin`. Detected the same
 /// way `install.sh` does so installer and runtime stay in lockstep.
 pub fn is_termux() -> bool {
-    if std::env::var_os("TERMUX_VERSION").is_some()
-        || std::env::var_os("TERMUX_APP_PID").is_some()
+    if std::env::var_os("TERMUX_VERSION").is_some() || std::env::var_os("TERMUX_APP_PID").is_some()
     {
         return true;
     }
