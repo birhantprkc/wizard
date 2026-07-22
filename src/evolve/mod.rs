@@ -750,9 +750,32 @@ impl Evolver {
         if find_cargo().is_some() {
             return Ok(());
         }
+        // rustup may be on PATH (or only as a proxy under ~/.cargo/bin) with
+        // no default toolchain — try to finish that install before downloading
+        // a fresh rustup. Skip on Termux: rustup's host triples target glibc
+        // desktop Linux, not Android/Bionic (`pkg install rust` is the path).
+        if !is_termux_host() {
+            if let Some(ru) = find_rustup() {
+                self.status("Found rustup without a working cargo; running `rustup default stable`…");
+                let status = Command::new(&ru)
+                    .args(["default", "stable"])
+                    .status()
+                    .context("running rustup default stable")?;
+                if status.success() && find_cargo().is_some() {
+                    return Ok(());
+                }
+            }
+        } else {
+            bail!(
+                "no working Rust toolchain on Termux. Install with \
+                 `pkg install rust git clang make pkg-config openssl`, and if a \
+                 broken rustup install is shadowing it, remove `~/.cargo` and \
+                 `~/.rustup` then retry"
+            );
+        }
         self.status("No Rust toolchain found; installing one via rustup (--profile minimal)…");
-        let status = if command_exists("rustup") {
-            Command::new("rustup")
+        let status = if let Some(ru) = find_rustup() {
+            Command::new(ru)
                 .args(["toolchain", "install", "stable", "--profile", "minimal"])
                 .status()
                 .context("running rustup toolchain install")?
@@ -761,7 +784,7 @@ impl Evolver {
                 .arg("-c")
                 .arg(
                     "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                     | sh -s -- -y --profile minimal --default-toolchain stable",
+                     | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path",
                 )
                 .status()
                 .context("running the rustup installer")?
@@ -1661,21 +1684,90 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Locate `cargo`: on `PATH`, or in `~/.cargo/bin` (a just-in-time rustup
-/// install may not be on `PATH` yet in this process).
-fn find_cargo() -> Option<PathBuf> {
-    if command_exists("cargo") {
-        return Some(PathBuf::from("cargo"));
+/// Rough Termux/Android host probe — mirrors `install.sh`'s `is_termux`.
+fn is_termux_host() -> bool {
+    if std::env::var_os("TERMUX_VERSION").is_some() || std::env::var_os("TERMUX_APP_PID").is_some()
+    {
+        return true;
     }
-    let candidate = dirs::home_dir()?.join(".cargo").join("bin").join("cargo");
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        if prefix.contains("com.termux") {
+            return true;
+        }
+    }
+    std::path::Path::new("/data/data/com.termux/files/usr").is_dir()
+}
+
+/// `true` when `path --version` exits successfully. A rustup *proxy* can
+/// exist on `PATH` while no default toolchain is configured — `which cargo`
+/// succeeds, `cargo --version` does not (Termux + leftover `~/.cargo/bin`).
+fn cargo_binary_works(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Locate `rustup` on `PATH` or under `~/.cargo/bin`.
+fn find_rustup() -> Option<PathBuf> {
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            let candidate = dir.join("rustup");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let candidate = dirs::home_dir()?.join(".cargo").join("bin").join("rustup");
     candidate.is_file().then_some(candidate)
 }
 
-/// `PATH` with `~/.cargo/bin` appended, so a freshly rustup-installed
-/// toolchain resolves `rustc` during the build.
+/// Locate a working `cargo`: each `PATH` entry first (so a Termux/distro
+/// cargo wins over a broken rustup shim in `~/.cargo/bin`), then
+/// `~/.cargo/bin` as a last resort for a just-in-time rustup install that
+/// is not yet on `PATH` in this process.
+fn find_cargo() -> Option<PathBuf> {
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            let candidate = dir.join("cargo");
+            if cargo_binary_works(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    let candidate = dirs::home_dir()?.join(".cargo").join("bin").join("cargo");
+    cargo_binary_works(&candidate).then_some(candidate)
+}
+
+/// `PATH` with the directory of the chosen `cargo` prepended, and
+/// `~/.cargo/bin` available when that is the working toolchain. When a
+/// non-rustup cargo wins (Termux `pkg install rust`), `~/.cargo/bin` is
+/// *not* prepended — a broken rustup shim there must not shadow `rustc`.
 fn augmented_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
+    if let Some(cargo) = find_cargo() {
+        if let Some(dir) = cargo.parent() {
+            let dir = dir.to_path_buf();
+            paths.retain(|p| p != &dir);
+            paths.insert(0, dir.clone());
+            // Drop ~/.cargo/bin when it is not the chosen toolchain's dir,
+            // so a leftover rustup proxy cannot win for rustc/clippy/etc.
+            if let Some(home) = dirs::home_dir() {
+                let cargo_bin = home.join(".cargo").join("bin");
+                if cargo_bin != dir {
+                    paths.retain(|p| p != &cargo_bin);
+                }
+            }
+            return std::env::join_paths(paths).unwrap_or(current);
+        }
+    }
     if let Some(home) = dirs::home_dir() {
         let cargo_bin = home.join(".cargo").join("bin");
         if !paths.contains(&cargo_bin) {
@@ -2257,5 +2349,32 @@ mod tests {
         assert_eq!(events[0].description, "first");
         assert_eq!(events[1].description, "second");
         assert!(matches!(events[1].outcome, EvolveOutcome::Denied));
+    }
+
+    #[test]
+    fn cargo_binary_works_rejects_failing_shim() {
+        let tmp = TempDir::new();
+        let bad = tmp.0.join("cargo");
+        std::fs::write(&bad, "#!/bin/sh\necho broken >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bad).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bad, perms).unwrap();
+        }
+        assert!(!cargo_binary_works(&bad));
+        assert!(!cargo_binary_works(&tmp.0.join("missing")));
+
+        let good = tmp.0.join("good-cargo");
+        std::fs::write(&good, "#!/bin/sh\necho 'cargo 1.0'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&good).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&good, perms).unwrap();
+        }
+        assert!(cargo_binary_works(&good));
     }
 }

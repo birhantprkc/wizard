@@ -251,6 +251,11 @@ termux_banner() {
     printf '\n' >&2
     printf '    pkg install rust git clang make pkg-config openssl curl\n' >&2
     printf '\n' >&2
+    warn "Use Termux's rust package — not rustup. A leftover ~/.cargo/bin with"
+    warn "no default toolchain shadows pkg's cargo and breaks the build; fix with:"
+    printf '\n' >&2
+    printf '    rm -rf ~/.cargo ~/.rustup\n' >&2
+    printf '\n' >&2
     warn "Local GGUF / stock llama-server and Ollama curl installs are not supported here;"
     warn "use a cloud provider in onboarding, or put a Termux-built llama-server on PATH."
     warn "Desktop app (WIZARD_APP) is skipped — use the TUI."
@@ -1003,23 +1008,121 @@ download_binary() {
 
 # --- rust toolchain (optional, for deep evolve) -------------------------
 
+# True when $1 (default: cargo on PATH) runs and can print a version.
+# A rustup *proxy* can exist on PATH while no default toolchain is
+# configured — `command -v cargo` succeeds, `cargo --version` does not.
+cargo_works() {
+    local c="${1:-cargo}"
+    if [ "$c" = "cargo" ]; then
+        command -v cargo >/dev/null 2>&1 || return 1
+    else
+        [ -x "$c" ] || [ -f "$c" ] || return 1
+    fi
+    "$c" --version >/dev/null 2>&1
+}
+
+# Put $1 first on PATH. When it is not ~/.cargo/bin, drop ~/.cargo/bin so a
+# broken rustup shim cannot shadow a working Termux/distro cargo/rustc.
+prefer_bin_dir() {
+    local dir="$1"
+    local newpath="$dir"
+    local p
+    local oifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2086
+    for p in $PATH; do
+        [ -z "$p" ] && continue
+        [ "$p" = "$dir" ] && continue
+        if [ "$dir" != "$HOME/.cargo/bin" ] && [ "$p" = "$HOME/.cargo/bin" ]; then
+            continue
+        fi
+        newpath="$newpath:$p"
+    done
+    IFS="$oifs"
+    export PATH="$newpath"
+}
+
+# Walk PATH (and ~/.cargo/bin) for an executable cargo that actually runs.
+# Prints the absolute path on stdout. Returns 1 when none work.
+find_working_cargo() {
+    local dir candidate
+    local oifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2086
+    for dir in $PATH; do
+        [ -z "$dir" ] && continue
+        candidate="$dir/cargo"
+        if cargo_works "$candidate"; then
+            IFS="$oifs"
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    IFS="$oifs"
+    candidate="$HOME/.cargo/bin/cargo"
+    if cargo_works "$candidate"; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
 ensure_rust_toolchain() {
-    # Add ~/.cargo/bin to PATH for this session in case rustup was previously
-    # installed without modifying the shell profile (--no-modify-path).
-    case ":${PATH}:" in
-        *":$HOME/.cargo/bin:"*) ;;
-        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
-    esac
-    if command -v cargo >/dev/null 2>&1; then
-        say "Rust toolchain already present (cargo found)"
+    # Do NOT prepend ~/.cargo/bin before probing. A partial rustup install
+    # leaves cargo/rustc shims there that fail with:
+    #   rustup could not choose a version of cargo to run
+    # and would shadow a working Termux (`pkg install rust`) or distro cargo.
+    local cargo_path dir
+    if cargo_path="$(find_working_cargo)"; then
+        dir="$(cd "$(dirname "$cargo_path")" && pwd)"
+        prefer_bin_dir "$dir"
+        say "Rust toolchain already present (cargo found at ${cargo_path})"
         return
     fi
+
+    # rustup present but no default toolchain — common after a interrupted
+    # install or a hand-copied ~/.cargo. Skip this on Termux: rustup's
+    # default host triples target glibc desktop Linux, not Android/Bionic.
+    if ! is_termux; then
+        local ru=""
+        if command -v rustup >/dev/null 2>&1; then
+            ru="$(command -v rustup)"
+        elif [ -x "$HOME/.cargo/bin/rustup" ]; then
+            ru="$HOME/.cargo/bin/rustup"
+        fi
+        if [ -n "$ru" ]; then
+            say "Found rustup without a working cargo — running 'rustup default stable' ..."
+            if "$ru" default stable; then
+                prefer_bin_dir "$HOME/.cargo/bin"
+                if cargo_path="$(find_working_cargo)"; then
+                    say "Rust toolchain ready (rustup default stable)"
+                    return
+                fi
+            fi
+            warn "'rustup default stable' did not yield a working cargo; will try a fresh rustup install"
+        fi
+    fi
+
+    if is_termux; then
+        die "No working Rust toolchain found on Termux.
+
+Install the Termux package toolchain (not rustup):
+
+    pkg install rust git clang make pkg-config openssl curl
+
+If a broken rustup install is shadowing it, remove the shims and retry:
+
+    rm -rf \"\$HOME/.cargo\" \"\$HOME/.rustup\"
+
+Then re-run the Wizard installer."
+    fi
+
     say "Installing minimal Rust toolchain via rustup ..."
     curl -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path \
         || die "rustup installation failed — install Rust manually from https://rustup.rs"
-    export PATH="$HOME/.cargo/bin:$PATH"
-    command -v cargo >/dev/null 2>&1 \
+    prefer_bin_dir "$HOME/.cargo/bin"
+    cargo_works cargo \
         || die "cargo not found after rustup install — check ~/.cargo/bin"
     say "Rust toolchain installed under ~/.cargo"
 }
