@@ -130,7 +130,6 @@ const HELP_TEXT: &str = "available commands:\n  \
 /btw <question>             ask a side question without adding it to the conversation\n  \
 /fork <task>                spawn a background side quest that inherits full context\n  \
 /agents                     browse subagents and delegate to one\n  \
-/subagents                  monitor the subagents running in this session\n  \
 /evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
 /publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
 /provider                   add or switch LLM providers (interactive picker)\n  \
@@ -187,7 +186,6 @@ impl CommandContext<'_> {
             SlashCommand::Diff => self.toggle_diff().await,
             SlashCommand::Todos => self.toggle_todos(),
             SlashCommand::Dashboard => self.toggle_dashboard(),
-            SlashCommand::Subagents => self.toggle_subagents(),
             SlashCommand::Cost => self.cost(),
             SlashCommand::Memory(action) => self.memory(action),
             SlashCommand::Doctor => self.doctor().await,
@@ -283,20 +281,6 @@ impl CommandContext<'_> {
         if self.app.show_dashboard {
             self.app.refresh_sessions();
             self.app.refresh_peek();
-        }
-    }
-
-    /// `/subagents`: jump to the rail. The rail is always on screen while
-    /// subagents exist, so this is a shortcut for ↓ — it takes you straight
-    /// to the first running one.
-    fn toggle_subagents(&mut self) {
-        if self.app.attached.is_some() {
-            self.app.detach_pane();
-            return;
-        }
-        if !self.app.focus_rail() {
-            self.app
-                .notice("no subagents yet — the agent spawns them with `spawn_subagent`");
         }
     }
 

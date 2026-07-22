@@ -27,7 +27,6 @@ inline hints.
 | `/btw <question>` | Ask a quick side question against the current conversation without adding the exchange to history or the session file (token-cheap asides mid-task; works while a turn is running) |
 | `/fork <task>` | Spawn a background side quest that inherits the full conversation context (history, tools, system prompt). Runs in parallel without interrupting the main session; its report is injected into history when finished (works while a turn is running) |
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
-| `/subagents` | Focus the subagent rail below the composer (same as ↓); from inside a subagent's pane, back out to the chat |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
 | `/goal [text]` | Show or set the standing mission goal (drives sovereign/continuous mode; persists to `.wizard/mission.toml`) |
@@ -97,8 +96,9 @@ Three ways to peel work off the main thread, each with a different contract:
 `/fork` is the "true parallel agent" path: you stay in the main thread, the
 fork inherits everything it needs with zero re-explanation, and its findings
 come back as a system note the main model sees on its next turn (or on the
-idle drain if you're between turns). Watch it on the subagent rail (`/subagents`
-or ↓); kill it from there the same way as any other background subagent.
+idle drain if you're between turns). Watch it on the subagent rail below the
+composer (↓ focuses it); kill it from there the same way as any other
+background subagent.
 
 ## `wizard agents` and background subagents
 

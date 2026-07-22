@@ -955,17 +955,20 @@ fn rewind_picker_esc_cancels() {
 }
 
 #[test]
-fn agents_and_subagents_parse_to_distinct_commands() {
-    // /agents opens the roster picker; /subagents opens the
-    // in-session monitor.
+fn agents_parses_to_the_roster_picker() {
+    // /agents opens the roster picker. Live runs are watched on the
+    // subagent rail below the composer — no separate slash command.
     assert!(matches!(
         SlashCommand::parse("/agents"),
         Some(Ok(SlashCommand::Agents))
     ));
-    assert!(matches!(
-        SlashCommand::parse("/subagents"),
-        Some(Ok(SlashCommand::Subagents))
-    ));
+    assert!(
+        matches!(
+            SlashCommand::parse("/subagents"),
+            Some(Err(message)) if message.contains("unknown command")
+        ),
+        "/subagents was removed; the rail is always on screen"
+    );
 }
 
 #[test]

@@ -70,9 +70,6 @@ pub enum SlashCommand {
     /// `/agents` — open the subagent roster picker (browse the available
     /// subagents and what each does; Enter pre-fills a delegation request).
     Agents,
-    /// `/subagents` — toggle the in-session subagent monitor: the subagents
-    /// that have run (or are running) this session, with live status.
-    Subagents,
     /// Toggle the git diff sidebar.
     Diff,
     /// Toggle the compact todo band above the composer.
@@ -356,7 +353,6 @@ impl SlashCommand {
             "resume" => Ok(Self::Resume(args.first().map(|s| s.to_string()))),
             "compact" => Ok(Self::Compact),
             "agents" => Ok(Self::Agents),
-            "subagents" => Ok(Self::Subagents),
             "diff" => Ok(Self::Diff),
             "todos" => Ok(Self::Todos),
             "dashboard" => Ok(Self::Dashboard),
@@ -453,7 +449,6 @@ impl SlashCommand {
             | Goal(_)
             | Diff
             | Todos
-            | Subagents
             | Dashboard
             | Cost
             // Every `/memory` action — list, read, forget — is one the `memory`
@@ -686,14 +681,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "browse subagents and delegate to one",
         takes_args: false,
         gui: Execution::Server,
-        agent_arg: "",
-    },
-    CommandSpec {
-        name: "subagents",
-        args: "",
-        description: "monitor the subagents running in this session",
-        takes_args: false,
-        gui: Execution::Client,
         agent_arg: "",
     },
     CommandSpec {

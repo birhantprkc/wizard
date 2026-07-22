@@ -1769,7 +1769,6 @@ async fn apply_command(agent: &mut Agent, request: CommandRequest, ctx: &mut Com
         SlashCommand::Clear
         | SlashCommand::Diff
         | SlashCommand::Todos
-        | SlashCommand::Subagents
         | SlashCommand::Dashboard
         | SlashCommand::Resume(_)
         | SlashCommand::Settings
@@ -3620,7 +3619,6 @@ mod tests {
         for name in [
             "diff",
             "todos",
-            "subagents",
             "settings",
             "dashboard",
             "resume",

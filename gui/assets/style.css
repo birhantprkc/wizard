@@ -924,24 +924,6 @@ button.ghost-chip:hover {
   padding: 0;
 }
 
-/* The section a slash command just pointed at (`/subagents`). It was already on
-   screen, so all that is left to add is where to look — and an outline, not a
-   background, because nothing in the panel may shift to say it. */
-@keyframes ctx-flash {
-  from {
-    outline-color: var(--text-faint);
-  }
-  to {
-    outline-color: transparent;
-  }
-}
-.ctx-section.flash {
-  outline: 1px solid transparent;
-  outline-offset: 6px;
-  border-radius: var(--r-sm);
-  animation: ctx-flash 1.4s ease-out;
-}
-
 .ctx-header {
   display: flex;
   align-items: center;

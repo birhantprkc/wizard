@@ -103,9 +103,6 @@ function runClientCommand(def, args, line) {
     case 'clear':
       newChatHere();
       return;
-    case 'subagents':
-      revealSubagents();
-      return;
     case 'dashboard':
       showRunningChats();
       return;
@@ -124,27 +121,6 @@ function runClientCommand(def, args, line) {
     default:
       appendSystemRow(chat, `${line} is not implemented in the GUI.`, 'error');
   }
-}
-
-/** Draw the eye to a part of the context panel that is already on screen: a
- *  command that reveals a panel still has to say which part of it. */
-function flashSection(section) {
-  if (!section) return;
-  section.scrollIntoView({ block: 'nearest' });
-  section.classList.remove('flash');
-  void section.offsetWidth; // restart the animation when the same section is flashed twice
-  section.classList.add('flash');
-}
-
-/** `/subagents`: the panel's Subagents section is where a run is watched from —
- *  each row opens that run's own pane. */
-function revealSubagents() {
-  $('app').classList.remove('panel-collapsed');
-  if (!state.subagents.length) {
-    appendSystemRow(chat, 'No subagent has run in this chat.');
-    return;
-  }
-  flashSection(ctx && ctx.subagentSection);
 }
 
 /**

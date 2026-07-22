@@ -1275,7 +1275,6 @@ const MOCK_COMMANDS = [
   { name: 'resume', detail: 'reopen and continue a past session', where: 'client' },
   { name: 'compact', detail: 'summarize older history into a progress note now', where: 'server' },
   { name: 'agents', detail: 'browse subagents and delegate to one', where: 'server' },
-  { name: 'subagents', detail: 'monitor the subagents running in this session', where: 'client' },
   { name: 'evolve', args: '[--deep] <desc>', detail: 'self-extend: add a skill, tool, or MCP server', where: 'server' },
   { name: 'publish', args: '[branch]', detail: 'fork & publish your Wizard, get a one-line installer', where: 'server' },
   { name: 'provider', detail: 'add or switch LLM providers (interactive)', where: 'client' },
@@ -1478,8 +1477,8 @@ export class MockApi {
       },
       { type: 'tool_result', result: { callId, status: 'ok' } },
       { type: 'todo', items: todo(1) },
-      // One delegation, streamed as its own run: the panel's Subagents section —
-      // what `/subagents` reveals — is empty until something has run in the chat.
+      // One delegation, streamed as its own run: the panel's Subagents section
+      // is empty until something has run in the chat.
       { type: 'subagent_run', info: { run, bg: null, name: 'reviewer', task: 'Check the diff for regressions' } },
       { type: 'subagent_text', run, text: 'Reading the changed files against HEAD.' },
       {

@@ -153,7 +153,7 @@ reason in both cases — **a GUI task is keyed by its session id**:
   the same object, clearing one means starting the other.
 - `resume` — the task list *is* the session picker.
 
-The rest of the `client` set (`diff`, `todos`, `subagents`, `dashboard`, `settings`,
+The rest of the `client` set (`diff`, `todos`, `dashboard`, `settings`,
 `provider`, `login`) are windows the page owns; the server has no hand on them.
 
 `/mode` takes `genie|sovereign`; plan is a posture toggled by `/plan` / `/omakase`, not a
