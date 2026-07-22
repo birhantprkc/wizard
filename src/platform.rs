@@ -21,10 +21,10 @@ pub fn is_termux() -> bool {
     }
     // `PREFIX` is always set inside a Termux session; require the Termux app
     // data path so a coincidental `PREFIX` on a desktop host does not trip this.
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        if prefix.contains("com.termux") {
-            return true;
-        }
+    if let Ok(prefix) = std::env::var("PREFIX")
+        && prefix.contains("com.termux")
+    {
+        return true;
     }
     Path::new("/data/data/com.termux/files/usr").is_dir()
 }
