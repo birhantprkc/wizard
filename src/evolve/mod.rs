@@ -1692,10 +1692,10 @@ fn is_termux_host() -> bool {
     {
         return true;
     }
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        if prefix.contains("com.termux") {
-            return true;
-        }
+    if let Ok(prefix) = std::env::var("PREFIX")
+        && prefix.contains("com.termux")
+    {
+        return true;
     }
     std::path::Path::new("/data/data/com.termux/files/usr").is_dir()
 }
@@ -1754,21 +1754,21 @@ fn find_cargo() -> Option<PathBuf> {
 fn augmented_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
-    if let Some(cargo) = find_cargo() {
-        if let Some(dir) = cargo.parent() {
-            let dir = dir.to_path_buf();
-            paths.retain(|p| p != &dir);
-            paths.insert(0, dir.clone());
-            // Drop ~/.cargo/bin when it is not the chosen toolchain's dir,
-            // so a leftover rustup proxy cannot win for rustc/clippy/etc.
-            if let Some(home) = dirs::home_dir() {
-                let cargo_bin = home.join(".cargo").join("bin");
-                if cargo_bin != dir {
-                    paths.retain(|p| p != &cargo_bin);
-                }
+    if let Some(cargo) = find_cargo()
+        && let Some(dir) = cargo.parent()
+    {
+        let dir = dir.to_path_buf();
+        paths.retain(|p| p != &dir);
+        paths.insert(0, dir.clone());
+        // Drop ~/.cargo/bin when it is not the chosen toolchain's dir,
+        // so a leftover rustup proxy cannot win for rustc/clippy/etc.
+        if let Some(home) = dirs::home_dir() {
+            let cargo_bin = home.join(".cargo").join("bin");
+            if cargo_bin != dir {
+                paths.retain(|p| p != &cargo_bin);
             }
-            return std::env::join_paths(paths).unwrap_or(current);
         }
+        return std::env::join_paths(paths).unwrap_or(current);
     }
     if let Some(home) = dirs::home_dir() {
         let cargo_bin = home.join(".cargo").join("bin");
