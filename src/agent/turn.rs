@@ -636,7 +636,9 @@ impl Agent {
         )
         .await
         {
-            self.push(self.tool_feedback(name, &ToolOutput::ok("(not executed — turn ended early)")));
+            self.push(
+                self.tool_feedback(name, &ToolOutput::ok("(not executed — turn ended early)")),
+            );
             return Some(DoneReason::Stopped);
         }
 
@@ -647,7 +649,10 @@ impl Agent {
                 format!(
                     "{}; {}",
                     outcome.describe(),
-                    pressure.signal_line().trim_start_matches(CONTEXT_PRESSURE_HEADING).trim()
+                    pressure
+                        .signal_line()
+                        .trim_start_matches(CONTEXT_PRESSURE_HEADING)
+                        .trim()
                 )
             }
             crate::agent::CompactOutcome::Summarized(_)
@@ -655,7 +660,10 @@ impl Agent {
                 format!(
                     "{}. Next-call pressure: {}",
                     outcome.describe(),
-                    pressure.signal_line().trim_start_matches(CONTEXT_PRESSURE_HEADING).trim()
+                    pressure
+                        .signal_line()
+                        .trim_start_matches(CONTEXT_PRESSURE_HEADING)
+                        .trim()
                 )
             }
         };
@@ -719,8 +727,7 @@ impl Agent {
     /// Drop any ephemeral pressure note left from the last completion.
     fn drop_pressure_signal(&mut self) {
         self.history.retain(|message| {
-            !(message.role == Role::System
-                && message.content.starts_with(CONTEXT_PRESSURE_HEADING))
+            !(message.role == Role::System && message.content.starts_with(CONTEXT_PRESSURE_HEADING))
         });
     }
 

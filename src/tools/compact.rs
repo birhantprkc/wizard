@@ -69,11 +69,7 @@ mod tests {
         let ctx = ToolContext::new(std::env::temp_dir());
         let out = tool.execute(json!({}), &ctx).await.unwrap();
         assert!(out.is_error);
-        assert!(
-            out.content.contains("main agent loop"),
-            "{}",
-            out.content
-        );
+        assert!(out.content.contains("main agent loop"), "{}", out.content);
     }
 
     #[test]
