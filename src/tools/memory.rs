@@ -70,7 +70,12 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Persist a fact about this project or its user across sessions. Actions: 'save' (record a durable fact), 'read' (recall one memory's full content, plus the memories it links to), 'delete' (drop one that is wrong or obsolete). Every save needs a type: 'user' — who the user is (role, expertise, preferences); 'feedback' — how you should work, both corrections and confirmed approaches, always with the why; 'project' — ongoing work, goals, and constraints not derivable from the code or git history, with relative dates written as absolute ones; 'reference' — a pointer to an external resource (URL, dashboard, ticket). Link related memories from the body with [[wiki-style]] names; a link to a memory that does not exist yet is fine, it marks one worth writing later. A memory must earn its place: do not save what the repo already records (code structure, past fixes, git history), or what only matters to this conversation. Before saving, check the memory index for an entry that covers the same ground and update it instead of creating a near-duplicate. Names are kebab-case; descriptions are one line. Saved memories appear in the system prompt's memory index next session."
+        "Persist a fact about this project or its user across sessions. Actions: \
+         'save' (record or update a durable fact — needs type, description, content), \
+         'read' (full body plus linked memories), 'delete' (drop a wrong/obsolete one). \
+         Types: user, feedback, project, reference. Rules for what belongs in memory \
+         are in the system prompt Memory section — follow those; do not restate them \
+         here. Names are kebab-case; descriptions are one line."
     }
 
     fn parameters(&self) -> Value {

@@ -80,50 +80,29 @@ one item in_progress while you work on it, and mark items completed as soon \
 as they are done. Skip the list for trivial single-step tasks.";
 
 /// Always appended: how the agent should steward its own context window.
-/// Wizard already auto-compacts, persists every session as JSONL, and exposes
-/// `/compact` via `run_command` — this block teaches the model *when* to lean
-/// on those, so long or multi-topic sessions do not drown in pollution.
+/// Single home for this guidance (not repeated in WIZARD.md).
 pub const CONTEXT_PROMPT: &str = "\
 ## Context management (you own your window)
 
-Your conversation history is finite. Wizard already persists every turn to \
-`~/.wizard/sessions/<id>.jsonl` and auto-compacts older history when the \
-byte or token threshold is hit — treat that as a safety net, not a plan. \
-Steer the window yourself:
+History is finite. Sessions persist under `~/.wizard/sessions/<id>.jsonl` and \
+auto-compact at a threshold — treat that as a safety net, not a plan.
 
-1. **Stay lean every step.** Prefer short tool output (pipe through \
-`head`/`tail`/`wc`, write bulky data to a file and summarize). Delegate \
-noisy multi-step work to `spawn_subagent` so intermediate steps never enter \
-your context — only the final report does.
-2. **Compact when the thread is still useful but bloated.** After a long \
-investigation, a finished sub-goal, or when older tool dumps are drowning \
-the current task, call `run_command` with `/compact`. That summarizes older \
-history into a progress note (goal, decisions, files touched, open next \
-steps, todo state) and keeps the recent tail verbatim. Prefer this over \
-asking the user to clear.
-3. **When the task changes, do not drag the old thread along.** If the user \
-pivots to an unrelated task, or you are done with a self-contained unit of \
-work and the next one needs a clean slate:
-   - Save any durable facts with the `memory` tool (preferences, project \
-constraints, standing decisions) — only what should survive sessions.
-   - Rewrite the todo list for the new task (or clear it to empty).
-   - Call `/compact` so the prior conversation collapses into one progress \
-summary. The full prior transcript remains on disk as the session JSONL; \
-nothing is lost.
-   - Only if the new task must not see the old work at all, tell the user \
-that `/clear` rotates to a fresh session file (the previous JSONL is kept \
-under `~/.wizard/sessions/`). You cannot run `/clear` yourself — it is the \
-user's call — so compact + memory is your default reset.
-4. **Do not re-read what compaction already summarized** unless you need a \
-specific detail; open the relevant file or the session JSONL instead of \
-replaying the whole investigation.
-5. **Check pressure.** `/status` (via `run_command` on interactive surfaces) \
-reports the current context size. Compact proactively before the automatic \
-threshold if the next steps need headroom.
+1. **Stay lean.** Short tool output (`head`/`tail`/`wc`, or `/tmp` + summarize). \
+Delegate noisy multi-step work to `spawn_subagent` so only the final report \
+enters your context.
+2. **Compact when bloated.** After a long investigation or finished sub-goal, \
+`run_command` `/compact` (progress note + recent tail). Prefer that over asking \
+the user to clear.
+3. **On task change:** save durable facts with `memory`, rewrite/clear the todo \
+list, then `/compact`. Full transcript stays on disk. Only if the new task must \
+not see the old work at all, tell the user `/clear` (you cannot run it).
+4. **Don't re-read** what compaction already summarized — open the file or \
+session JSONL for a specific detail.
+5. **Check pressure.** `/status` (interactive) reports context size; compact \
+before the automatic threshold if you need headroom.
 
-Headless / gateway / continuous runs still auto-compact; `run_command` is \
-only available on interactive surfaces, so there lean harder on lean tool \
-output and subagents.";
+Headless/gateway/continuous still auto-compact; without `run_command`, lean on \
+short output and subagents.";
 
 /// Memory guidance injected when the project has saved memories; the rules
 /// and then the index (MEMORY.md) follow it.
@@ -216,9 +195,11 @@ fn read_prompt_override(path: &Path) -> Option<String> {
 /// Compose the full system prompt for `mode`: personality prompt, then the
 /// bundled `WIZARD.md` charter, then a rendered skills section, then the
 /// project's instruction hierarchy (`agents_md`, assembled by
-/// [`crate::instructions`] from WIZARD.md/AGENTS.md/CLAUDE.md files), then
-/// the persistent memory section (`memory_index` is the project's
-/// MEMORY.md, when any memories are saved).
+/// [`crate::instructions`] from WIZARD.md/AGENTS.md/CLAUDE.md files — with
+/// any section that is just a re-copy of the bundled charter dropped so the
+/// in-repo `WIZARD.md` is not injected twice), then the persistent memory
+/// section (`memory_index` is the project's MEMORY.md, when any memories are
+/// saved).
 pub fn build_system_prompt(
     mode: Mode,
     skills: &[Skill],
@@ -238,9 +219,12 @@ pub fn build_system_prompt(
         prompt.push_str(&skills_section);
     }
 
-    if let Some(agents_md) = agents_md {
+    // Project instructions may include the same WIZARD.md that is already
+    // bundled above (wizard's own checkout, or a copied ~/.wizard/WIZARD.md).
+    // Drop those duplicate sections; keep real project-specific rules.
+    if let Some(filtered) = agents_md.and_then(|raw| filter_charter_dupes(raw, WIZARD_CHARTER)) {
         prompt.push_str("\n\n## Project instructions\n\n");
-        prompt.push_str(agents_md);
+        prompt.push_str(&filtered);
     }
 
     prompt.push_str("\n\n## Memory\n\n");
@@ -256,6 +240,71 @@ pub fn build_system_prompt(
     }
 
     prompt
+}
+
+/// Drop instruction sections whose body matches the bundled charter
+/// (whitespace-normalized). Returns `None` when nothing project-specific
+/// remains — so a checkout whose only instruction file is the same WIZARD.md
+/// already injected as the charter does not pay for it twice.
+fn filter_charter_dupes(agents_md: &str, charter: &str) -> Option<String> {
+    let charter_norm = normalize_prompt_section(charter);
+    if charter_norm.is_empty() {
+        let trimmed = agents_md.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    // instructions::load prefixes each file with
+    // `<!-- instructions from PATH -->\n`. Scan line-by-line and flush on each
+    // header so every file is judged independently.
+    let mut kept: Vec<String> = Vec::new();
+    let mut current_header: Option<String> = None;
+    let mut current_body = String::new();
+
+    let flush = |header: &mut Option<String>, body: &mut String, out: &mut Vec<String>| {
+        let text = std::mem::take(body);
+        let text = text.trim();
+        let header = header.take();
+        if text.is_empty() {
+            return;
+        }
+        if normalize_prompt_section(text) == charter_norm {
+            return;
+        }
+        match header {
+            Some(h) => out.push(format!("{h}\n{text}")),
+            None => out.push(text.to_string()),
+        }
+    };
+
+    for line in agents_md.lines() {
+        if let Some(rest) = line.strip_prefix("<!-- instructions from ")
+            && let Some(path) = rest.strip_suffix(" -->")
+        {
+            flush(&mut current_header, &mut current_body, &mut kept);
+            current_header = Some(format!("<!-- instructions from {path} -->"));
+            continue;
+        }
+        if !current_body.is_empty() {
+            current_body.push('\n');
+        }
+        current_body.push_str(line);
+    }
+    flush(&mut current_header, &mut current_body, &mut kept);
+
+    // No section headers (raw agents_md string in tests): treat the whole
+    // block as one section — already handled by the flush above when there
+    // were no headers and current_body held everything.
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("\n\n"))
+    }
+}
+
+/// Collapse runs of whitespace so trivial formatting drift does not defeat
+/// charter-duplicate detection (e.g. trailing newlines from file reads).
+fn normalize_prompt_section(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Instructions appended to the system prompt when the model lacks native
@@ -326,6 +375,52 @@ mod tests {
             charter_pos < agents_pos,
             "charter must appear before project instructions"
         );
+    }
+
+    /// A project-instructions block that is only a re-copy of the bundled
+    /// charter (the common case when working inside the wizard checkout) must
+    /// not appear a second time under "## Project instructions".
+    #[test]
+    fn project_instructions_drop_bundled_charter_duplicate() {
+        let fake_load = format!(
+            "<!-- instructions from /tmp/proj/WIZARD.md -->\n{}",
+            WIZARD_CHARTER.trim_end()
+        );
+        let prompt = build_system_prompt(Mode::Genie, &[], Some(&fake_load), None);
+        assert!(
+            prompt.contains("## Wizard charter (WIZARD.md)"),
+            "charter still injected once"
+        );
+        assert_eq!(
+            prompt.matches("build the capability").count(),
+            1,
+            "prime-directive marker must appear exactly once, not twice: {}",
+            prompt.matches("build the capability").count()
+        );
+        assert!(
+            !prompt.contains("## Project instructions"),
+            "empty after filtering — no project-instructions section"
+        );
+    }
+
+    /// Real project rules sitting next to a charter-identical section are kept;
+    /// only the charter copy is dropped.
+    #[test]
+    fn project_instructions_keep_non_charter_sections() {
+        let mixed = format!(
+            "<!-- instructions from /tmp/WIZARD.md -->\n{}\n\n\
+             <!-- instructions from /tmp/proj/AGENTS.md -->\n# Local rules\nuse cargo nextest\n",
+            WIZARD_CHARTER.trim_end()
+        );
+        let prompt = build_system_prompt(Mode::Genie, &[], Some(&mixed), None);
+        assert!(prompt.contains("## Project instructions"));
+        assert!(prompt.contains("use cargo nextest"));
+        assert!(prompt.contains("<!-- instructions from /tmp/proj/AGENTS.md -->"));
+        assert!(
+            !prompt.contains("<!-- instructions from /tmp/WIZARD.md -->"),
+            "charter-identical section dropped"
+        );
+        assert_eq!(prompt.matches("build the capability").count(), 1);
     }
 
     /// `read_prompt_override` returns trimmed contents for a non-empty file,
@@ -409,7 +504,7 @@ mod tests {
         assert!(text.contains("## Context management"));
         assert!(text.contains("/compact"));
         assert!(text.contains("~/.wizard/sessions/"));
-        assert!(text.contains("When the task changes"));
+        assert!(text.contains("On task change"));
         assert!(text.contains("spawn_subagent"));
         assert!(text.contains("memory"));
     }

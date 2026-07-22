@@ -219,22 +219,15 @@ impl Tool for ExecuteTool {
     }
 
     fn description(&self) -> &str {
-        r#"Run a shell command in the project root and return its stdout, stderr, and exit code. Killed on timeout. With run_in_background, the command is detached as a background task: the call returns a task id immediately, you are notified when it finishes, and task_output / task_kill manage it meanwhile.
+        r#"Run a shell command in the project root and return its stdout, stderr, and exit code. Killed on timeout. With run_in_background, detaches as an agent-managed background task (task_output / task_kill); you are notified when it finishes.
 
 Tips:
-- Prefer compact commands: print summaries, not full pixel maps, huge dumps, or entire binaries. Pipe through `head`/`tail` when exploring.
-- Put large intermediate output in `/tmp/...` and print only what you need next.
-- After compiling to verify a source deliverable, remove build products from the deliverable directory (or compile to `/tmp`) before finishing.
-- Non-zero exit is normal diagnostic signal — read stderr and adapt; do not treat it as a crash of the agent.
-- **Durable services** (HTTP on a fixed port, QEMU, anything external tests must still reach after you finish): use shell detachment, e.g. `nohup <cmd> > /var/log/... 2>&1 &`, then verify with `curl`/`ss`/`pgrep`. Do **not** use `run_in_background=true` for those — that mode is agent-managed and does not guarantee the process survives the session.
-- Use `run_in_background=true` for agent-scoped long jobs you will poll (`task_output`) or cancel (`task_kill`), such as long builds while you keep working — not for production daemons left for a verifier.
-- After installing a Python package with extensions into the system env, re-check from a clean directory (`cd /tmp && python3 -c "import ..."`) so a local checkout on `sys.path` cannot fake a successful install. As soon as that import + the required snippet pass, **run the allowed package test suite next** (exclude only tests the task marks broken). Once snippet + allowed tests pass, stop — do not start another full-repo inventory.
-- On install-from-source tasks: run `setup.py build_ext --inplace && setup.py install` (or equivalent) **early**, after a small compatibility-fix batch. After any later source edit, **reinstall** before more greps — site-packages does not update itself from the checkout.
-- If allowed tests fail with `KeyError` on graph/node attribute names (or similar third-party API drift), fix with dual-key `.get` fallbacks, reinstall, and re-run the suite. Prefer fixing the reported failure over another alias inventory.
-- For JSON/JSONL deliverables, `cat` the file and parse it (`json.loads`) to assert types and required **task-listed** tokens before finishing. If the task lists CWE candidates, assert every reported ID is in that list (and that listed CRLF IDs like `cwe-93` are present when applicable).
-- Before finishing any task with required output paths, `ls` those paths. A missing required file is an automatic fail — create it.
-- For chess/puzzles: install tools early; in the **same** `python3 <<'PY'` script that finds a non-empty mate set, write the answer file (`open('/app/move.txt','w').write(...)` or `printf`) and print confirmation. If none, run **one** compact hypothesis script that swaps only ambiguous piece types, writes the best mate set when found, and exits — do not dump pixel grids, IoU matrices, or multi-turn silhouette thrash after a mate is already known.
-- For vulnerability fix tasks: run the stated test command early to surface expected `ValueError`/validation failures; fix the helpers; write the required report with **task-listed** IDs; re-run tests."#
+- Prefer compact output: summaries, `head`/`tail`/`wc`; put bulky intermediates in `/tmp`.
+- Non-zero exit is diagnostic signal — read stderr and adapt.
+- Durable services (HTTP, QEMU, anything a later verifier must reach): `nohup <cmd> > log 2>&1 &`, then `curl`/`ss`/`pgrep`. Do **not** use `run_in_background=true` for those — that mode does not outlive the agent.
+- Use `run_in_background=true` only for agent-scoped jobs you will poll or cancel (long builds).
+- After system-installing a package with native extensions, verify from `cd /tmp` so a local checkout cannot mask a bad install; reinstall after later source edits.
+- Before finishing: `ls` required deliverable paths; for JSON/JSONL, parse and assert task-listed tokens/IDs."#
     }
 
     fn parameters(&self) -> Value {

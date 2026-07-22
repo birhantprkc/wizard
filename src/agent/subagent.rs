@@ -773,25 +773,16 @@ impl SpawnSubagentTool {
             })
             .collect::<String>();
         let description = format!(
-            "Delegate a self-contained sub-task to an isolated subagent. It runs its own loop \
-             with a fresh context and scoped tools, then returns one final report — its \
-             intermediate steps never enter your context, so a multi-step sub-task costs you a \
-             single turn.\n\n\
-             Delegate almost always for anything beyond a quick one-off, and set \
-             `background: true` when you do — it returns immediately instead of making the \
-             user wait, so they can keep talking to you while the subagent runs. Its progress \
-             streams in as it works and its report lands in your context automatically once \
-             it's done. Only omit `background` (synchronous) when you need the report to keep \
-             working within this same turn.\n\n\
-             Delegating also pays off when the work would otherwise flood your context with \
-             output you don't need to keep (large greps, reading many files, long logs), or \
-             when a specialist fits better than you do. Don't delegate trivial one-tool \
-             actions, work that needs the user mid-flight (the subagent can't ask questions), \
-             or a task you can't yet describe in full.\n\n\
-             `task` is the ONLY context the subagent gets besides its own prompt — make it \
-             self-contained: state the goal, the relevant paths/context, any constraints, and \
-             exactly what to report back. You can't steer it once it's running, so prefer one \
-             well-scoped task over a chain of follow-ups.\n\n\
+            "Delegate a self-contained sub-task to an isolated subagent. It runs its own \
+             loop with a fresh context and scoped tools, then returns one final report — \
+             intermediate steps never enter your context.\n\n\
+             Default to `background: true` (returns immediately; progress streams; report \
+             lands when done). Use synchronous only when you need the report in this same \
+             turn. Don't delegate trivial one-tool actions, work that needs the user \
+             mid-flight, or a task you can't fully describe.\n\n\
+             `task` is the ONLY context the subagent gets besides its own prompt — goal, \
+             paths, constraints, and exactly what to report back. One well-scoped task \
+             beats a chain of follow-ups.\n\n\
              Available subagents:{roster}"
         );
         Self {
