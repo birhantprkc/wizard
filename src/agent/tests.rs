@@ -693,9 +693,8 @@ async fn double_empty_completion_surfaces_a_notice() {
 
 #[test]
 fn parses_whole_message_protocol_call() {
-    let call =
-        parse_json_tool_call(r#"{"tool":"read_file","arguments":{"path":"src/lib.rs"}}"#)
-            .expect("valid protocol call");
+    let call = parse_json_tool_call(r#"{"tool":"read_file","arguments":{"path":"src/lib.rs"}}"#)
+        .expect("valid protocol call");
     assert_eq!(call.function.name, "read_file");
     assert_eq!(call.function.arguments["path"], "src/lib.rs");
 }
@@ -727,8 +726,7 @@ fn missing_arguments_default_to_empty_object() {
     let call = parse_json_tool_call(r#"{"tool":"git_status"}"#).expect("parses");
     assert_eq!(call.function.arguments, json!({}));
 
-    let call =
-        parse_json_tool_call(r#"{"tool":"git_status","arguments":null}"#).expect("parses");
+    let call = parse_json_tool_call(r#"{"tool":"git_status","arguments":null}"#).expect("parses");
     assert_eq!(call.function.arguments, json!({}));
 }
 
@@ -1091,8 +1089,7 @@ async fn exit_plan_approval_writes_the_plan_and_clears_plan_mode() {
     );
     agent.set_plan_mode(true);
 
-    let (reason, plans) =
-        run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+    let (reason, plans) = run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
     assert_eq!(reason, DoneReason::Completed);
     assert_eq!(plans, ["# Plan\n1. do x"]);
     assert!(!agent.plan_mode(), "approval clears plan mode");
@@ -1187,8 +1184,7 @@ async fn headless_two_phase_turn_blocks_then_plans_then_executes() {
     );
     agent.set_plan_mode(true);
 
-    let (reason, plans) =
-        run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
+    let (reason, plans) = run_turn_with_reviewer(&mut agent, "go", PlanVerdict::approve()).await;
     assert_eq!(reason, DoneReason::Completed);
     assert_eq!(plans, ["# write result.txt"]);
     assert!(!agent.plan_mode());
@@ -1214,8 +1210,7 @@ async fn headless_two_phase_turn_blocks_then_plans_then_executes() {
 #[test]
 fn exit_plan_is_always_registered() {
     let tmp = TempDir::new();
-    let (mut agent, _provider) =
-        test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+    let (mut agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
     let has_exit_plan = |agent: &Agent| {
         agent
             .dispatcher
@@ -1405,11 +1400,9 @@ async fn rollback_failed_cycle_restores_files_and_notes_the_mission() {
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "good");
     assert!(
-        mission
-            .notes
-            .last()
-            .is_some_and(|note| note.contains("rolled back 1 file(s)")
-                && note.contains("circuit breaker")),
+        mission.notes.last().is_some_and(
+            |note| note.contains("rolled back 1 file(s)") && note.contains("circuit breaker")
+        ),
         "rollback noted in the mission: {:?}",
         mission.notes
     );
@@ -1425,8 +1418,7 @@ async fn usage_counts_accumulate_emit_events_and_land_in_the_jsonl_log() {
         vec![usage_chunk("first", 100, 20)],
         vec![usage_chunk("second", 150, 30)],
     ]);
-    let mut agent =
-        test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+    let mut agent = test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
 
     let (tx, mut rx) = mpsc::channel(64);
     agent.run_turn("one", tx).await.expect("turn ok");
@@ -1489,8 +1481,7 @@ async fn prompt_tokens_near_the_context_window_trigger_compaction() {
         ],
         1000,
     );
-    let mut agent =
-        test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+    let mut agent = test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
     for i in 0..14 {
         agent.history.push(ChatMessage::user(format!("filler {i}")));
     }
@@ -1575,8 +1566,7 @@ impl crate::tools::Tool for BigOutputTool {
 #[tokio::test]
 async fn compact_now_force_summarizes_and_keeps_the_recent_tail() {
     // One scripted response: the summarization call.
-    let (mut agent, _provider, _tmp) =
-        test_agent(vec![vec![final_chunk("a terse progress note")]]);
+    let (mut agent, _provider, _tmp) = test_agent(vec![vec![final_chunk("a terse progress note")]]);
     // history[0] is the system prompt; add a middle span + recent tail.
     let extra = KEEP_RECENT + 5;
     for i in 0..extra {
@@ -1719,8 +1709,7 @@ async fn compact_tool_runs_mid_turn_and_feeds_result_back() {
 
 #[tokio::test]
 async fn elevated_pressure_is_injected_into_the_completion_request() {
-    let provider =
-        ScriptedProvider::with_context_window(vec![vec![final_chunk("ok")]], 10_000);
+    let provider = ScriptedProvider::with_context_window(vec![vec![final_chunk("ok")]], 10_000);
     let tmp = TempDir::new();
     let mut agent = test_agent_with(&tmp, provider.clone(), Vec::new(), ToolRegistry::new());
     // 60% fill → elevated signal on the next completion.
@@ -1735,7 +1724,10 @@ async fn elevated_pressure_is_injected_into_the_completion_request() {
         .messages
         .iter()
         .any(|m| m.content.starts_with(CONTEXT_PRESSURE_HEADING));
-    assert!(saw_pressure, "pressure line must ride the completion request");
+    assert!(
+        saw_pressure,
+        "pressure line must ride the completion request"
+    );
     drop(requests);
 
     // Ephemeral: not left in agent history after the step.
@@ -1972,9 +1964,7 @@ async fn background_task_finish_is_injected_into_the_next_step() {
         let note = request
             .messages
             .iter()
-            .find(|m| {
-                m.role == Role::System && m.content.contains("background task #1 finished")
-            })
+            .find(|m| m.role == Role::System && m.content.contains("background task #1 finished"))
             .expect("notification in history");
         assert!(note.content.contains("(exit 0)"), "{}", note.content);
         assert!(
@@ -2370,8 +2360,7 @@ async fn cancel_mid_batch_stops_the_turn_and_answers_skipped_calls() {
 #[tokio::test]
 async fn compaction_never_splits_a_tool_call_group() {
     // One scripted response: the summarization call.
-    let (mut agent, _provider, _tmp) =
-        test_agent(vec![vec![final_chunk("a terse progress note")]]);
+    let (mut agent, _provider, _tmp) = test_agent(vec![vec![final_chunk("a terse progress note")]]);
     // Arrange history so the naive cut (len - KEEP_RECENT) would land on
     // a tool result, splitting it from its assistant tool-call message.
     for i in 0..4 {
@@ -2644,8 +2633,7 @@ async fn streaming_assembles_split_deltas_and_keeps_thinking_out_of_history() {
 async fn a_transient_stream_failure_emits_stream_retrying_then_recovers() {
     let tmp = TempDir::new();
     let provider = ScriptedProvider::flaky(1, vec![vec![final_chunk("second try")]]);
-    let mut agent =
-        test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
+    let mut agent = test_agent_with(&tmp, Arc::clone(&provider), Vec::new(), ToolRegistry::new());
     agent.config.retry_base_secs = 0;
     agent.config.retry_max_secs = 0;
 
@@ -2760,8 +2748,7 @@ async fn rolling_summarization_chains_oversized_spans_through_chunk_summaries() 
 #[test]
 fn leaving_plan_mode_also_leaves_omakase() {
     let tmp = TempDir::new();
-    let (mut agent, _provider) =
-        test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+    let (mut agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
 
     agent.set_omakase(true);
     assert!(agent.plan_mode(), "omakase implies plan mode");
