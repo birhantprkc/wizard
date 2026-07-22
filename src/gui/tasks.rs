@@ -3616,13 +3616,7 @@ mod tests {
         shared.attach(tx);
         let _ = frames(&mut rx);
 
-        for name in [
-            "diff",
-            "todos",
-            "settings",
-            "dashboard",
-            "resume",
-        ] {
+        for name in ["diff", "todos", "settings", "dashboard", "resume"] {
             command(&mut agent, &shared, name, "").await;
             let got = frames(&mut rx);
             assert_eq!(got[0]["type"], "error", "/{name}");
