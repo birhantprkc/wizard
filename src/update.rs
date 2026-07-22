@@ -96,19 +96,20 @@ fn normalize_arch(arch: &str) -> Option<&'static str> {
     }
 }
 
-/// NixOS lacks the FHS dynamic loader the glibc (gnu) binary needs, so it must
-/// prefer the static musl build. Detected the same way `install.sh` does.
-fn is_nixos() -> bool {
-    Path::new("/etc/NIXOS").exists() || Path::new("/run/current-system").exists()
-}
-
 /// Release-asset file names to try, most-preferred first — the pure decision
 /// behind [`asset_candidates`], factored out so it is unit-testable. Mirrors
-/// `install.sh`: macOS → the per-arch Darwin build; NixOS Linux → musl then
-/// gnu (no FHS loader for the gnu build); other Linux → gnu then musl.
-fn asset_candidates_for(os: &str, arch: &str, nixos: bool) -> Vec<String> {
+/// `install.sh`: macOS → the per-arch Darwin build; Termux → empty (no Android
+/// prebuilt; source build only); NixOS Linux → musl then gnu (no FHS loader
+/// for the gnu build); other Linux → gnu then musl.
+fn asset_candidates_for(os: &str, arch: &str, nixos: bool, termux: bool) -> Vec<String> {
     if os == "macos" {
         return vec![format!("wizard-{arch}-apple-darwin.tar.gz")];
+    }
+    // Termux is Android/Bionic: stock gnu/musl release binaries do not run.
+    // Returning no candidates makes `wizard update` fail cleanly with a
+    // source-build hint instead of downloading a binary that cannot start.
+    if termux {
+        return Vec::new();
     }
     let gnu = format!("wizard-{arch}-unknown-linux-gnu.tar.gz");
     let musl = format!("wizard-{arch}-unknown-linux-musl.tar.gz");
@@ -136,7 +137,7 @@ fn desktop_assets(candidates: Vec<String>) -> Vec<String> {
 }
 
 /// The release-asset candidates for this machine, or an error on an
-/// architecture we ship no binary for.
+/// architecture we ship no binary for / a host with no matching prebuilt.
 fn asset_candidates() -> Result<Vec<String>> {
     let arch = normalize_arch(std::env::consts::ARCH).ok_or_else(|| {
         anyhow!(
@@ -144,7 +145,22 @@ fn asset_candidates() -> Result<Vec<String>> {
             std::env::consts::ARCH
         )
     })?;
-    let candidates = asset_candidates_for(std::env::consts::OS, arch, is_nixos());
+    let candidates = asset_candidates_for(
+        std::env::consts::OS,
+        arch,
+        crate::platform::is_nixos(),
+        crate::platform::is_termux(),
+    );
+    if candidates.is_empty() {
+        if let Some(hint) = crate::platform::termux_prebuilt_hint() {
+            bail!("{hint}");
+        }
+        bail!(
+            "no prebuilt wizard release for this platform ({}/{})",
+            std::env::consts::OS,
+            arch
+        );
+    }
     if cfg!(feature = "desktop") {
         return Ok(desktop_assets(candidates));
     }
@@ -490,7 +506,9 @@ async fn download_and_install(repo: &str, tag: &str, dest_exe: &Path) -> Result<
         Err(last_err.context(format!(
             "no prebuilt wizard binary runs on this system (tried {}); the current binary \
              is unchanged. On NixOS, install via the Nix flake (see the README) rather than \
-             `wizard update`.",
+             `wizard update`. On Termux, rebuild from source \
+             (`WIZARD_BUILD_FROM_SOURCE=1` with install.sh, or `cargo build --release` \
+             in ~/.wizard/src).",
             unrunnable.join(", ")
         )))
     }
@@ -760,11 +778,11 @@ mod tests {
     #[test]
     fn asset_candidates_macos_is_single_darwin_build() {
         assert_eq!(
-            asset_candidates_for("macos", "aarch64", false),
+            asset_candidates_for("macos", "aarch64", false, false),
             vec!["wizard-aarch64-apple-darwin.tar.gz".to_string()]
         );
         assert_eq!(
-            asset_candidates_for("macos", "x86_64", true),
+            asset_candidates_for("macos", "x86_64", true, false),
             vec!["wizard-x86_64-apple-darwin.tar.gz".to_string()]
         );
     }
@@ -772,7 +790,7 @@ mod tests {
     #[test]
     fn asset_candidates_nixos_prefers_musl_then_gnu() {
         assert_eq!(
-            asset_candidates_for("linux", "x86_64", true),
+            asset_candidates_for("linux", "x86_64", true, false),
             vec![
                 "wizard-x86_64-unknown-linux-musl.tar.gz".to_string(),
                 "wizard-x86_64-unknown-linux-gnu.tar.gz".to_string(),
@@ -783,7 +801,7 @@ mod tests {
     #[test]
     fn asset_candidates_plain_linux_prefers_gnu_then_musl() {
         assert_eq!(
-            asset_candidates_for("linux", "aarch64", false),
+            asset_candidates_for("linux", "aarch64", false, false),
             vec![
                 "wizard-aarch64-unknown-linux-gnu.tar.gz".to_string(),
                 "wizard-aarch64-unknown-linux-musl.tar.gz".to_string(),
@@ -792,23 +810,32 @@ mod tests {
     }
 
     #[test]
+    fn asset_candidates_termux_is_empty() {
+        // No Android/Bionic release asset: update must not try gnu/musl.
+        assert!(asset_candidates_for("linux", "aarch64", false, true).is_empty());
+        assert!(asset_candidates_for("linux", "x86_64", true, true).is_empty());
+    }
+
+    #[test]
     fn desktop_assets_keep_the_desktop_build_a_desktop_build() {
         // A `--features desktop` binary updates to a desktop asset, never to
         // the plain one: it is what the launcher entry points at.
         assert_eq!(
-            desktop_assets(asset_candidates_for("linux", "x86_64", false)),
+            desktop_assets(asset_candidates_for("linux", "x86_64", false, false)),
             vec!["wizard-desktop-x86_64-unknown-linux-gnu.tar.gz".to_string()]
         );
         assert_eq!(
-            desktop_assets(asset_candidates_for("macos", "aarch64", false)),
+            desktop_assets(asset_candidates_for("macos", "aarch64", false, false)),
             vec!["wizard-desktop-aarch64-apple-darwin.tar.gz".to_string()]
         );
         // musl is dropped rather than rewritten — we publish no static desktop
         // build, so on NixOS this leaves the gnu one and nothing else.
         assert_eq!(
-            desktop_assets(asset_candidates_for("linux", "x86_64", true)),
+            desktop_assets(asset_candidates_for("linux", "x86_64", true, false)),
             vec!["wizard-desktop-x86_64-unknown-linux-gnu.tar.gz".to_string()]
         );
+        // Termux has nothing to rewrite either.
+        assert!(desktop_assets(asset_candidates_for("linux", "aarch64", false, true)).is_empty());
     }
 
     #[test]

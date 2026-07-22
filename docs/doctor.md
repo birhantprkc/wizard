@@ -24,6 +24,7 @@ Checks:
 - **provider \<name\>**: each configured LLM provider answers its health probe; skipped (`–`) when its API key env var is unset
 - **mcp \<name\>**: each `[[server]]` in `~/.wizard/mcp.toml` spawns and completes the MCP handshake (with tool count)
 - **native tools**: the compiled-in tool set is registered
+- **platform**: host notes (Termux source-build expectations, NixOS flake preference, or plain OS/arch)
 - **hooks**: global and project `hooks.toml` parse
 - **writable**: `~/.wizard`, the project's `.wizard/`, and the sessions dir accept writes
 - **checkpoints**: the snapshot index parses; stale snapshot directories are counted

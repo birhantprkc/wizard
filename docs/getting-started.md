@@ -48,9 +48,29 @@ The same script has four mutually exclusive flavors:
 |----------|-------|
 | Linux x86_64 / aarch64 | Prebuilt glibc and static-musl binaries; the installer prefers musl on NixOS |
 | macOS Apple Silicon / Intel | Same `curl … \| bash`; prebuilt binaries for both architectures; Metal-backed `llama-server` for the local stack |
+| Termux (Android) | Supported via on-device **source build** into `$PREFIX/bin`. No matching prebuilt release (Bionic libc). Desktop app, stock llama.cpp Ubuntu assets, and the Ollama curl installer are skipped — use a cloud provider, or put a Termux-built `llama-server` on `PATH` |
 | Windows | Not supported natively; use WSL2 |
 
-The installer downloads the prebuilt binary matching your OS and architecture, verifies its checksum, and falls back to a source build when no prebuilt asset is available.
+The installer downloads the prebuilt binary matching your OS and architecture, verifies its checksum, and falls back to a source build when no prebuilt asset is available. On Termux it always builds from source.
+
+### Termux (Android)
+
+Wizard runs as the TUI inside [Termux](https://termux.dev). There is no Android APK and no published `aarch64-linux-android` release asset in v1 — the phone compiles Wizard itself.
+
+```bash
+pkg install rust git clang make pkg-config openssl curl
+curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
+```
+
+What the installer does on Termux:
+
+1. Detects Termux (`TERMUX_VERSION` / `$PREFIX`) and sets `WIZARD_INSTALL_DIR=$PREFIX/bin` (no `sudo`)
+2. Forces `WIZARD_BUILD_FROM_SOURCE=1` and skips prebuilt download, `WIZARD_APP`, stock llama.cpp assets, and the Ollama curl installer
+3. Clones the repo, runs `cargo build --release`, and installs `wizard` next to your other Termux packages
+
+First run opens onboarding — pick a **cloud** provider (API key or sign-in). On-device GGUF via the one-click Local path is not wired to a Termux-native llama.cpp build yet; if you already have a Termux-built `llama-server` on `PATH` (or set `[server].bin`), Wizard will use it.
+
+Update by re-running the installer (or `cd ~/.wizard/src && git pull && cargo build --release && install -m755 target/release/wizard "$PREFIX/bin/wizard"`). `wizard update` will not swap in a desktop Linux prebuilt on Termux.
 
 ### Nix / NixOS
 
@@ -82,7 +102,7 @@ VRAM detection uses `nvidia-smi` for NVIDIA and `rocm-smi` for AMD, falling back
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WIZARD_INSTALL_DIR` | `/usr/local/bin` (`~/.local/bin` on NixOS) | Where to place the `wizard` binary |
+| `WIZARD_INSTALL_DIR` | `/usr/local/bin` (`~/.local/bin` on NixOS, `$PREFIX/bin` on Termux) | Where to place the `wizard` binary |
 | `WIZARD_VERSION` | latest release | Release tag to install, e.g. `v0.4.0`; pin it for reproducible installs or to roll back to an earlier release |
 | `WIZARD_LOCAL` | `0` | Set to `1` to preinstall the llama.cpp stack and an auto-tiered model (conflicts with `WIZARD_MINIMAL` and `WIZARD_BYOM`) |
 | `WIZARD_MINIMAL` | `0` | Set to `1` for the binary-only install; first run launches onboarding |

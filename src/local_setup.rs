@@ -126,13 +126,27 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: &dyn Progres
 // llama-server install
 // ---------------------------------------------------------------------------
 
-/// Install `llama-server` from the official llama.cpp releases: pick a
-/// release asset for this machine (Vulkan build when a GPU and loader are
-/// present, CPU otherwise), extract the whole release tree to
-/// `~/.wizard/llama.cpp` (the binary resolves its shared libraries via an
-/// `$ORIGIN` runpath, so the `.so` files must stay beside it), and link it
+/// Install `llama-server` from the official llama.cpp releases when it is
+/// missing: pick the newest release asset for this machine (Vulkan build when
+/// a GPU and loader are present, CPU otherwise), extract the whole release
+/// tree to `~/.wizard/llama.cpp` (the binary resolves its shared libraries via
+/// an `$ORIGIN` runpath, so the `.so` files must stay beside it), and link it
 /// from `~/.wizard/bin/llama-server`. Returns the linked path.
+///
+/// Termux has no matching prebuilt (llama.cpp publishes Ubuntu/macOS assets,
+/// not Android/Bionic). Fail with an install hint instead of downloading a
+/// binary that cannot start.
 pub async fn install_llama_server(progress: &dyn Progress) -> Result<PathBuf> {
+    if crate::platform::is_termux() {
+        bail!(
+            "Termux cannot use the prebuilt llama-server releases (they target \
+             Ubuntu glibc, not Android/Bionic). Install a Termux-native build \
+             yourself, e.g. build llama.cpp from source inside Termux and put \
+             `llama-server` on PATH, or point [server].bin at it — then re-run. \
+             Cloud providers work without a local runtime."
+        );
+    }
+
     progress.status("llama-server not found — installing llama.cpp (official releases)…");
 
     let http = reqwest::Client::builder()

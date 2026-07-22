@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 
 One command installs the `wizard` binary. The first run asks which provider you want and sets up the rest. Pick **Local** and Wizard sizes a Qwen 3 GGUF to your hardware and runs [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself, no API key needed. Or sign in with an xAI or ChatGPT account, or bring a key for xAI, OpenAI, Anthropic, Google Gemini, DeepSeek, Groq, Mistral, Moonshot, Z.AI, MiniMax, Together, Fireworks, Cerebras, OpenRouter, Cloudflare Workers AI, or any OpenAI-compatible endpoint, and switch live with `/provider`. It's one fast Rust binary on Linux and macOS; everything it learns is plain TOML under `~/.wizard/` that you can edit or delete.
 
-> **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
+> **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, Termux, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
 
 ---
 
@@ -43,7 +43,7 @@ You thought you needed an interpreter and to write your TUI in bloated TypeScrip
 
 ## Limitations
 
-- **Platforms.** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel). Windows isn't supported; run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet.
+- **Platforms.** Linux (x86_64, aarch64), macOS (Apple Silicon and Intel), and Termux on Android (source build into `$PREFIX/bin`). Windows isn't supported; run it under WSL2. The installer downloads a prebuilt binary for your platform and builds from source when one isn't published yet (always on Termux).
 - **Small local models are worse than frontier models.** A 9B–36B quantized Qwen will misformat tool calls, miss context, and need more steering than Claude- or GPT-class models. Wizard mitigates with native tool-call probing, a JSON fallback, and retry prompts; the 27B+ tiers make much better agents than the 9B tier.
 - **No sandbox.** Tools run with your privileges, with no per-action approval gate in either mode. Read [SECURITY.md](SECURITY.md) before running on anything you don't trust, and prefer a container/VM for autonomous or continuous work.
 - **Context windows are finite.** Wizard searches and reads selectively rather than ingesting the whole repo, auto-compacts older history, and instructs the agent to compact / reset deliberately when the task changes, but long sessions still eventually push out early detail. → [Agent-managed context](docs/usage.md#agent-managed-context)
@@ -52,7 +52,7 @@ You thought you needed an interpreter and to write your TUI in bloated TypeScrip
 
 ## Docs
 
-- [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS), tiers, providers, first run, in-place updates (`wizard update`), troubleshooting
+- [Getting started](docs/getting-started.md): install (all flavors, Nix, macOS, Termux), tiers, providers, first run, in-place updates (`wizard update`), troubleshooting
 - [Usage](docs/usage.md): slash commands, `wizard agents`, the subagent rail, token usage and cost, todos, project instructions
 - [Desktop app](docs/desktop.md): `wizard app`, the GUI in a native window, plus the launcher entry (`WIZARD_APP=1` to install)
 - [Gateway](docs/gateway.md): run Wizard as a Telegram bot

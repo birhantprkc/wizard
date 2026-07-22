@@ -48,7 +48,7 @@
 #
 # Environment variables:
 #   WIZARD_INSTALL_DIR           where to place the binary    (default /usr/local/bin;
-#                                ~/.local/bin on NixOS)
+#                                ~/.local/bin on NixOS; $PREFIX/bin on Termux)
 #   WIZARD_LOCAL                 1 = preinstall the llama.cpp stack and a model
 #                                    (see above)               (default 0)
 #   WIZARD_MINIMAL               1 = minimal install (see above)        (default 0)
@@ -72,7 +72,8 @@
 #                                    desktop), plus a launcher entry, so Wizard
 #                                    opens from the dock like any app. Linux needs
 #                                    WebKitGTK; macOS needs nothing. `wizard`
-#                                    itself is untouched.       (default 0)
+#                                    itself is untouched. Unsupported on Termux.
+#                                    (default 0)
 #   WIZARD_VERSION               release tag to install, e.g. v0.4.0 (default: the
 #                                latest release). Pins the download to
 #                                releases/download/<tag>/ — use it for
@@ -81,27 +82,45 @@
 #   WIZARD_REF                   git ref/tag when building from source
 #                                (default: latest release tag, falling back to
 #                                main only when the repo has no release)
-#   WIZARD_BUILD_FROM_SOURCE     1 = build from source instead of downloading a release (default 0)
+#   WIZARD_BUILD_FROM_SOURCE     1 = build from source instead of downloading a
+#                                    release (default 0; forced on Termux)
+
 
 set -euo pipefail
 
-# --- NixOS detection ----------------------------------------------------
-# Defined early so the install-dir default below can branch on it. NixOS is
+# --- NixOS / Termux detection -------------------------------------------
+# Defined early so the install-dir default below can branch on them. NixOS is
 # not an FHS distro: prebuilt glibc binaries can't find /lib64/ld-linux and
 # /usr/local/bin isn't on PATH, so the installer selects the static musl
-# asset and installs to ~/.local/bin instead.
+# asset and installs to ~/.local/bin instead. Termux is Android/Bionic: no
+# prebuilt gnu/musl asset runs, there is no sudo, and the only writable
+# install location on PATH is $PREFIX/bin — so the installer forces a source
+# build and lands the binary there.
 is_nixos() {
     [ -f /etc/NIXOS ] && return 0
     [ -r /etc/os-release ] && grep -qiE '^ID=nixos' /etc/os-release
 }
 
+is_termux() {
+    # TERMUX_VERSION is set by the app; PREFIX points at the Termux usr tree;
+    # the filesystem path is the last-resort probe for non-interactive shells.
+    [ -n "${TERMUX_VERSION:-}" ] && return 0
+    [ -n "${TERMUX_APP_PID:-}" ] && return 0
+    case "${PREFIX:-}" in
+        *com.termux*) return 0 ;;
+    esac
+    [ -d /data/data/com.termux/files/usr ]
+}
+
 # --- defaults -----------------------------------------------------------
 
 # /usr/local/bin is the right default on FHS distros, but not on NixOS (not on
-# PATH, wrong place for an FHS binary). An explicit WIZARD_INSTALL_DIR override
-# always wins; otherwise pick ~/.local/bin on NixOS, /usr/local/bin elsewhere.
+# PATH, wrong place for an FHS binary) or Termux (no sudo, $PREFIX/bin is the
+# real bin dir). An explicit WIZARD_INSTALL_DIR override always wins.
 if [ -z "${WIZARD_INSTALL_DIR:-}" ]; then
-    if is_nixos; then
+    if is_termux; then
+        WIZARD_INSTALL_DIR="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+    elif is_nixos; then
         WIZARD_INSTALL_DIR="$HOME/.local/bin"
     else
         WIZARD_INSTALL_DIR="/usr/local/bin"
@@ -122,6 +141,18 @@ WIZARD_VERSION="${WIZARD_VERSION:-}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
+
+# Termux cannot run the published gnu/musl release binaries (Android/Bionic).
+# Force a source build unless the user already asked for one; never try the
+# desktop shell (no WebKitGTK / no Android webview integration).
+if is_termux; then
+    if [ "$WIZARD_BUILD_FROM_SOURCE" != "1" ]; then
+        WIZARD_BUILD_FROM_SOURCE=1
+    fi
+    if [ "$WIZARD_APP" = "1" ]; then
+        WIZARD_APP=0
+    fi
+fi
 
 # WIZARD_BESPOKE is the old name for the minimal install; honored as a deprecated alias.
 if [ "${WIZARD_BESPOKE:-0}" = "1" ]; then WIZARD_MINIMAL=1; fi
@@ -208,6 +239,21 @@ nixos_banner() {
     printf '\n' >&2
     warn "Proceeding with a static musl binary instead → ${WIZARD_INSTALL_DIR}"
     warn "Set WIZARD_INSTALL_DIR to override the install location."
+    printf '\n'
+}
+
+termux_banner() {
+    printf '\n'
+    say "Termux detected (Android)."
+    warn "No prebuilt Wizard release runs on Termux (Bionic libc, no FHS loader)."
+    warn "Building from source into ${WIZARD_INSTALL_DIR}."
+    warn "Recommended packages first:"
+    printf '\n' >&2
+    printf '    pkg install rust git clang make pkg-config openssl curl\n' >&2
+    printf '\n' >&2
+    warn "Local GGUF / stock llama-server and Ollama curl installs are not supported here;"
+    warn "use a cloud provider in onboarding, or put a Termux-built llama-server on PATH."
+    warn "Desktop app (WIZARD_APP) is skipped — use the TUI."
     printf '\n'
 }
 
@@ -435,6 +481,23 @@ install_llamacpp() {
         say "Skipping llama.cpp install (WIZARD_SKIP_LLAMACPP_INSTALL=1)"
         return
     fi
+    # On Termux, stock llama.cpp release assets target Ubuntu glibc and will
+    # not run on Bionic. Prefer an existing llama-server; otherwise tell the
+    # user how to build one and skip — cloud providers still work.
+    if is_termux; then
+        if command -v llama-server >/dev/null 2>&1; then
+            say "llama-server already on PATH ($(command -v llama-server)) — wizard will use it"
+        else
+            warn "Termux cannot use the prebuilt llama-server releases (Ubuntu/glibc)."
+            warn "Build llama.cpp inside Termux and put llama-server on PATH, e.g.:"
+            warn "    pkg install clang cmake git"
+            warn "    git clone https://github.com/${LLAMACPP_REPO}.git ~/llama.cpp && cd ~/llama.cpp"
+            warn "    cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF && cmake --build build -j --target llama-server"
+            warn "    ln -sfn \"\$PWD/build/bin/llama-server\" \"\$PREFIX/bin/llama-server\""
+            warn "Skipping automatic llama.cpp install for now."
+        fi
+        return
+    fi
     # On NixOS, never compile from source or drop a prebuilt FHS binary — use an
     # existing llama-server if present, otherwise point the user at Nix.
     if is_nixos; then
@@ -566,6 +629,10 @@ install_ollama() {
     # require a declarative install instead.
     if is_nixos; then
         die "On NixOS, install Ollama declaratively rather than via the curl installer — e.g. 'nix profile install nixpkgs#ollama' (or set services.ollama.enable = true), then re-run."
+    fi
+    # Ollama's official installer targets desktop Linux/macOS, not Termux.
+    if is_termux; then
+        die "Ollama's curl installer is not supported on Termux. Use a cloud provider in onboarding, or install a Termux-native runtime yourself and point Wizard at it."
     fi
     say "Installing Ollama (official install script) ..."
     curl -fsSL https://ollama.com/install.sh | sh \
@@ -881,6 +948,11 @@ verify_checksum() {
 }
 
 download_binary() {
+    # Termux cannot run published gnu/musl assets — never attempt the download.
+    if is_termux; then
+        warn "skipping prebuilt download on Termux (no Android/Bionic release asset)"
+        return
+    fi
     say "Downloading wizard binary from GitHub releases (${REPO}) ..."
     local asset bin assets
     # macOS ships a single per-arch Mach-O asset. On Linux, NixOS can't run the
@@ -1090,6 +1162,12 @@ install_desktop_app() {
 
     printf '\n'
     say "Desktop app (WIZARD_APP=1): the GUI in a native window"
+
+    if is_termux; then
+        warn "the desktop app is not supported on Termux (no system webview integration)"
+        warn "use the TUI ('wizard') — skipping WIZARD_APP"
+        return 0
+    fi
 
     if [ "$OS" = "linux" ] && ! have_webkitgtk; then
         webkitgtk_hint
@@ -1418,8 +1496,27 @@ main() {
     require_curl
     detect_platform
 
-    if is_nixos; then
+    if is_termux; then
+        termux_banner
+    elif is_nixos; then
         nixos_banner
+    fi
+
+    # Soft-skip local-stack flavors on Termux: stock llama/Ollama installers
+    # cannot deliver a working runtime here. Still install the binary so the
+    # user can pick a cloud provider in onboarding.
+    if is_termux; then
+        if [ "$WIZARD_LOCAL" = "1" ] && [ "$WIZARD_USE_OLLAMA" != "1" ]; then
+            warn "WIZARD_LOCAL=1 on Termux: skipping stock llama.cpp preinstall (no matching prebuilt)."
+            warn "Cloud providers work; for on-device models build llama-server yourself (see banner)."
+            WIZARD_LOCAL=0
+        fi
+        if [ "$WIZARD_BYOM" = "1" ] || [ "$WIZARD_USE_OLLAMA" = "1" ]; then
+            warn "Ollama install flavors are not supported on Termux — installing the binary only."
+            WIZARD_BYOM=0
+            WIZARD_USE_OLLAMA=0
+            WIZARD_LOCAL=0
+        fi
     fi
 
     if [ "$WIZARD_MINIMAL" = "1" ]; then
@@ -1472,7 +1569,9 @@ main() {
         say "Desktop app installed. Open Wizard from your launcher, or run: wizard-desktop app"
     fi
     if [ "$BINARY_INSTALLED" = "1" ]; then
-        if [ "$WIZARD_MINIMAL" = "1" ]; then
+        if is_termux; then
+            say "Done. Run 'wizard' from Termux — pick a cloud provider in onboarding (or a Termux-built local runtime)."
+        elif [ "$WIZARD_MINIMAL" = "1" ]; then
             say "Done. Run 'wizard' to start onboarding (pick your model, provider, and gateway)."
         elif [ "$WIZARD_BYOM" = "1" ] && [ -z "$MODEL" ]; then
             say "Done. Run 'wizard' — pick your Ollama model in onboarding; it is pulled on first run."

@@ -35,6 +35,7 @@ pub mod mcp;
 pub mod memory;
 pub mod onboarding;
 pub mod output;
+pub mod platform;
 pub mod progress;
 pub mod schedule;
 pub mod server;

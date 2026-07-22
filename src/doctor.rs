@@ -257,6 +257,32 @@ pub fn check_native_tools() -> Check {
     }
 }
 
+/// Surface host-specific constraints (Termux has no prebuilt asset / no
+/// desktop webview; doctor should say so rather than leaving the user to
+/// discover a broken `wizard update` or Local install).
+pub fn check_platform() -> Check {
+    let label = "platform";
+    if crate::platform::is_termux() {
+        return Check::pass(
+            label,
+            "Termux (Android): source-built binary expected; prebuilt \
+             `wizard update` and stock llama-server assets are unavailable — \
+             use a cloud provider or a Termux-built llama-server",
+        );
+    }
+    if crate::platform::is_nixos() {
+        return Check::pass(
+            label,
+            "NixOS: prefer the flake (`nix profile install github:teddytennant/wizard`); \
+             musl prebuilts are the curl-installer fallback",
+        );
+    }
+    Check::pass(
+        label,
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    )
+}
+
 /// Messaging gateway configuration and token presence. Never prints the
 /// secret. Warns when a telegram token is stored but `gateway.kind` is
 /// still `none`, and when kind is telegram but no process appears to be
@@ -473,6 +499,7 @@ pub async fn run_checks(project_root: &Path) -> Vec<Check> {
     }
 
     checks.push(check_native_tools());
+    checks.push(check_platform());
 
     if let Ok(dir) = Config::wizard_dir() {
         checks.push(check_hooks_file("hooks (global)", &dir.join("hooks.toml")));
@@ -595,6 +622,24 @@ mod tests {
         assert_eq!(check.status, Status::Pass);
         let count = ToolRegistry::with_native_tools().len();
         assert!(check.detail.contains(&count.to_string()));
+    }
+
+    #[test]
+    fn platform_check_always_passes_and_names_the_host() {
+        let check = check_platform();
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.label, "platform");
+        // Off Termux/NixOS the detail is "os/arch"; on those hosts it is a
+        // longer advisory. Either way it must be non-empty.
+        assert!(!check.detail.is_empty());
+        if crate::platform::is_termux() {
+            assert!(check.detail.to_ascii_lowercase().contains("termux"));
+        } else if crate::platform::is_nixos() {
+            assert!(check.detail.to_ascii_lowercase().contains("nixos"));
+        } else {
+            assert!(check.detail.contains(std::env::consts::OS));
+            assert!(check.detail.contains(std::env::consts::ARCH));
+        }
     }
 
     #[test]
