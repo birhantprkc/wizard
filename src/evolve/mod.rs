@@ -756,7 +756,9 @@ impl Evolver {
         // desktop Linux, not Android/Bionic (`pkg install rust` is the path).
         if !is_termux_host() {
             if let Some(ru) = find_rustup() {
-                self.status("Found rustup without a working cargo; running `rustup default stable`…");
+                self.status(
+                    "Found rustup without a working cargo; running `rustup default stable`…",
+                );
                 let status = Command::new(&ru)
                     .args(["default", "stable"])
                     .status()
