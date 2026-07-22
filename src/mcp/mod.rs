@@ -95,6 +95,7 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_status",
     "subagent_kill",
     "run_command",
+    "compact",
     "spawn_subagent",
 ];
 

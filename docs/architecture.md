@@ -144,7 +144,7 @@ When the active provider is llama.cpp and nothing answers at its `base_url`, Wiz
 
 A turn runs until the model stops calling tools. `max_steps = 0` (the default) puts no ceiling on that; a positive `max_steps` caps the round trips. A turn is also bounded by a user interrupt or the sovereign loop-control file, the `--max-hours` limit, and the circuit breaker after repeated identical failures.
 
-Sessions append to `~/.wizard/sessions/<timestamp>.jsonl` after each turn. Auto-compaction and the agent's own `/compact` (via `run_command`) shrink in-memory history while leaving the JSONL intact. See [Agent-managed context](usage.md#agent-managed-context).
+Sessions append to `~/.wizard/sessions/<timestamp>.jsonl` after each turn. Auto-compaction and the agent's native `compact` tool shrink in-memory history while leaving the JSONL intact (the progress note is also appended as a system note). See [Agent-managed context](usage.md#agent-managed-context).
 
 Genie is the interactive TUI personality. Sovereign is headless autonomy for one task. Continuous (`--continuous`) is perpetual sovereign: durable mission under `<project>/.wizard/mission.toml`, sleep-and-wake on provider blips, context compaction, and re-exec after evolve. Details in [modes.md](modes.md).
 
@@ -171,6 +171,7 @@ Base64 stays on the `ChatMessage` in history for vision models. A tool's images 
 | `task_output` / `task_kill` | Background shell task controls |
 | `subagent_status` / `subagent_kill` | Background subagent controls |
 | `run_command` | Queue a Wizard slash command for the attached surface ([usage.md](usage.md#agent-run-slash-commands)) |
+| `compact` | Summarize older history mid-turn on every surface ([usage.md](usage.md#agent-managed-context)) |
 | `spawn_subagent` | Fan out work to a named subagent (agent registry, not mcp-serve) |
 | `exit_plan` / `interview` | Plan-mode completion and clarifying questions |
 | `evolve` / `publish` | Self-extension and fork-and-distribute |

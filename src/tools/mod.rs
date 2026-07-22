@@ -4,6 +4,7 @@
 //! [`registry::ToolRegistry`], so the model calls them identically.
 
 pub mod command;
+pub mod compact;
 pub mod evolve;
 pub mod file;
 pub mod git;

@@ -54,12 +54,12 @@ references.
 
 The agent can run these same commands itself with the native `run_command`
 tool, it passes a command line exactly as you would type it (e.g.
-`/effort high`, `/model claude-sonnet-5`, `/compact`, `/reload`). So the agent
-can raise its own reasoning effort for a hard task, switch models, compact its
-context, or reload skills without you stepping in. Compaction is the main
-lever for agent-managed context: when a thread is bloated or the task changes,
-the agent is instructed to `/compact` (and save durable facts with `memory`)
-rather than wait for the automatic threshold. See
+`/effort high`, `/model claude-sonnet-5`, `/reload`). So the agent can raise
+its own reasoning effort for a hard task, switch models, or reload skills
+without you stepping in. For context pressure, prefer the native **`compact`
+tool** over `run_command` → `/compact`: `compact` runs mid-turn on every
+surface (including headless and the gateway), while a queued `/compact` only
+runs after the current turn finishes and only on interactive surfaces. See
 [Agent-managed context](#agent-managed-context).
 
 Because a turn already in flight can't be reconfigured, a queued command runs
@@ -237,22 +237,24 @@ path (`.wizard/plan.md`).
 ## Agent-managed context
 
 Wizard already persists every turn to `~/.wizard/sessions/<id>.jsonl` and
-auto-compacts as above. The agent is also taught, via a block in its system
-prompt, to steward that window deliberately instead of waiting for the
-threshold:
+auto-compacts as above. Before each model step, when fill is elevated or
+higher, an ephemeral `[context pressure]` line is injected so the agent sees
+live headroom (not persisted to the session file). The agent is also taught,
+via a block in its system prompt, to steward that window deliberately:
 
 | Situation | What the agent should do |
 |-----------|--------------------------|
-| Long investigation, finished sub-goal, or older tool dumps drowning the current task | `run_command` → `/compact` (summarizes older history into a progress note; recent tail stays verbatim) |
-| User pivots to an unrelated task | Save durable facts with `memory`, rewrite the todo list, then `/compact`. Full prior transcript remains on disk as the session JSONL |
+| Long investigation, finished sub-goal, or older tool dumps drowning the current task | Call the native `compact` tool (mid-turn on every surface: TUI, GUI, headless, gateway). Summarizes older history into a progress note; recent tail stays verbatim. The note is also appended to the session JSONL so resume sees the breadcrumb |
+| Pressure signal `elevated` / `high` / `critical` | Compact soon (`elevated`) or before more tool work (`high`/`critical`). Auto-compact still fires at the hard threshold |
+| User pivots to an unrelated task | Save durable facts with `memory`, rewrite the todo list, then `compact`. Full prior transcript remains on disk as the session JSONL |
 | New task must not see the old work at all | Ask the user for `/clear` (agent cannot run it). `/clear` rotates to a fresh session file; the previous JSONL is kept under `~/.wizard/sessions/` |
 | Noisy multi-step work | `spawn_subagent` so intermediate steps never enter the parent context, only the final report does |
-| Need a pressure check | Look at the TUI status bar's token readout (next-call context estimate), or `run_command` → `/status` on the GUI (which prints a `context: N tokens` line). Session lifetime totals stay on `/cost` |
 
-`run_command` is only available on interactive surfaces (TUI / GUI). Headless
-`-p`, the gateway, and continuous mode still auto-compact; there the agent
-leans harder on lean tool output and subagents. Prefer compacting over asking
-the user to clear whenever the prior thread is still useful as a summary.
+`run_command` → `/compact` still works on interactive surfaces but only
+**after** the current turn ends — prefer the `compact` tool for in-turn
+relief. Headless `-p`, the gateway, and continuous mode have the same
+`compact` tool and pressure signal. Prefer compacting over asking the user
+to clear whenever the prior thread is still useful as a summary.
 
 ## Todo list
 

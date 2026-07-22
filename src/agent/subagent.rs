@@ -229,6 +229,8 @@ const FORK_TOOL_DENYLIST: &[&str] = &[
     "run_command",
     "exit_plan",
     "interview",
+    // Compact is parent-loop only; a fork calling it just gets an error.
+    crate::tools::compact::COMPACT_TOOL_NAME,
 ];
 
 /// System reminder appended as the user message that launches a `/fork`

@@ -44,14 +44,17 @@ impl Tool for RunCommandTool {
         "Run one of Wizard's own slash commands — the same ones the user can \
          type at the prompt. Pass the command exactly as typed, including any \
          arguments: e.g. `/effort high`, `/model claude-sonnet-5`, `/mode \
-         sovereign`, `/goal ship the release`, `/compact`, `/reload`, \
-         `/status`, `/diff`, `/settings`. Configuration changes (effort, \
-         model, mode) apply once the current turn finishes — a request already \
-         in flight cannot be reconfigured. Interactive pickers require the \
-         choice as an argument (`/effort` alone is refused; `/effort high` is \
-         fine). Session-ending and external-setup commands (`/quit`, `/clear`, \
-         `/rewind`, `/resume`, `/provider`, `/login`, `/publish`, `/evolve`) \
-         are refused. Run `/help` to list every command."
+         sovereign`, `/goal ship the release`, `/reload`, `/status`, \
+         `/diff`, `/settings`. For mid-turn history summarization prefer the \
+         native `compact` tool (works headless/gateway too); `run_command` \
+         `/compact` only queues until this turn ends and is interactive-only. \
+         Configuration changes (effort, model, mode) apply once the current \
+         turn finishes — a request already in flight cannot be reconfigured. \
+         Interactive pickers require the choice as an argument (`/effort` \
+         alone is refused; `/effort high` is fine). Session-ending and \
+         external-setup commands (`/quit`, `/clear`, `/rewind`, `/resume`, \
+         `/provider`, `/login`, `/publish`, `/evolve`) are refused. Run \
+         `/help` to list every command."
     }
 
     fn parameters(&self) -> Value {

@@ -953,12 +953,87 @@ const KEEP_RECENT: usize = 10;
 /// candidate.
 pub const COMPACT_SUMMARY_HEADING: &str = "[Compacted progress summary]";
 
+/// Prefix of the ephemeral per-step pressure line injected (in memory only)
+/// before each model completion. Surfaces and compaction can recognize it; it
+/// is never persisted to the session file.
+pub const CONTEXT_PRESSURE_HEADING: &str = "[context pressure]";
+
 /// Fraction of the provider's context window the last prompt may fill before
 /// token-aware compaction kicks in.
 const COMPACT_WINDOW_FRACTION: f64 = 0.8;
 
+/// Soft pressure band: the model is nudged to call `compact` once fill crosses
+/// this fraction of the known window (auto-compact still waits for
+/// [`COMPACT_WINDOW_FRACTION`]).
+const PRESSURE_ELEVATED_FRACTION: f64 = 0.5;
+
+/// Strong pressure band: the model is told to compact *before* more tool work.
+const PRESSURE_HIGH_FRACTION: f64 = 0.7;
+
 /// Chunk size (chars) fed to one rolling-summary pass during compaction.
 const COMPACT_CHUNK_CHARS: usize = 20_000;
+
+/// How full the next model call's prompt is, for the live pressure signal and
+/// the `compact` tool's reply. Built from the last reported prompt size (or a
+/// char/4 estimate) plus the provider's known context window when available.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextPressure {
+    /// Tokens that will load into the next model call.
+    pub tokens: u64,
+    /// Provider context window in tokens, when known.
+    pub window: Option<u32>,
+    /// `tokens / window` when the window is known; otherwise a byte-threshold
+    /// proxy so headless runs without a reported window still get a signal.
+    pub fill: f64,
+    pub level: PressureLevel,
+}
+
+/// Coarse pressure band shown to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureLevel {
+    /// Comfortable headroom.
+    Ok,
+    /// Crossing ~50% of the window (or half the byte threshold) — compact when
+    /// convenient.
+    Elevated,
+    /// Crossing ~70% — compact before more tool work.
+    High,
+    /// At or past the auto-compact trigger (~80% / byte threshold).
+    Critical,
+}
+
+impl PressureLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PressureLevel::Ok => "ok",
+            PressureLevel::Elevated => "elevated",
+            PressureLevel::High => "high",
+            PressureLevel::Critical => "critical",
+        }
+    }
+}
+
+impl ContextPressure {
+    /// One-line note the model sees each step (ephemeral, not persisted).
+    pub fn signal_line(&self) -> String {
+        let tokens = crate::usage::format_tokens(self.tokens);
+        let window = match self.window {
+            Some(w) => crate::usage::format_tokens(u64::from(w)),
+            None => "unknown window".to_string(),
+        };
+        let pct = (self.fill * 100.0).round() as i32;
+        let advice = match self.level {
+            PressureLevel::Ok => "headroom ok",
+            PressureLevel::Elevated => "consider calling compact soon",
+            PressureLevel::High => "call compact before more tool work",
+            PressureLevel::Critical => "auto-compact imminent — call compact now",
+        };
+        format!(
+            "{CONTEXT_PRESSURE_HEADING} {} · {tokens} / {window} ({pct}%) — {advice}",
+            self.level.as_str()
+        )
+    }
+}
 
 /// What a compaction pass did, reported back so callers (auto-compaction
 /// notices and the `/compact` command) can describe the outcome.
@@ -1172,6 +1247,53 @@ impl Agent {
         match self.usage.last_prompt_tokens() {
             Some(n) => n,
             None => crate::llm::estimate_history_tokens(&self.history),
+        }
+    }
+
+    /// Live fill of the next model call against the provider window (or a
+    /// byte-threshold proxy when the window is unknown). Powers the per-step
+    /// pressure signal and the `compact` tool's reply.
+    ///
+    /// Soft bands (`elevated` / `high`) may use a char/4 estimate when the
+    /// backend has not reported a prompt size yet. The `critical` band — which
+    /// drives auto-compaction — matches the historical gates exactly: bytes
+    /// over threshold, or a *reported* last prompt over 80% of a known window.
+    /// Estimates never trip auto-compact on their own (they would fire on the
+    /// system prompt alone and steal the first completion of a short turn).
+    pub async fn context_pressure(&self) -> ContextPressure {
+        let tokens = self.context_tokens();
+        let window = self.client.context_window(&self.model).await;
+        let byte_total: usize = self.history.iter().map(|msg| msg.content.len()).sum();
+        let threshold = self.config.compact_threshold_bytes.max(1);
+        let last_prompt = self.usage.last_prompt_tokens();
+
+        let fill = match window {
+            Some(w) if w > 0 => tokens as f64 / f64::from(w),
+            _ => byte_total as f64 / threshold as f64,
+        };
+
+        let auto_critical = byte_total > threshold
+            || match (last_prompt, window) {
+                (Some(prompt), Some(w)) if w > 0 => {
+                    prompt as f64 > f64::from(w) * COMPACT_WINDOW_FRACTION
+                }
+                _ => false,
+            };
+
+        let level = if auto_critical {
+            PressureLevel::Critical
+        } else if fill >= PRESSURE_HIGH_FRACTION {
+            PressureLevel::High
+        } else if fill >= PRESSURE_ELEVATED_FRACTION {
+            PressureLevel::Elevated
+        } else {
+            PressureLevel::Ok
+        };
+        ContextPressure {
+            tokens,
+            window,
+            fill,
+            level,
         }
     }
 
@@ -1676,17 +1798,8 @@ impl Agent {
     /// or the last model call's reported prompt size exceeds
     /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window.
     async fn should_compact(&self) -> bool {
-        let total: usize = self.history.iter().map(|msg| msg.content.len()).sum();
-        if total > self.config.compact_threshold_bytes {
-            return true;
-        }
-        let Some(last_prompt) = self.usage.last_prompt_tokens() else {
-            return false;
-        };
-        let Some(window) = self.client.context_window(&self.model).await else {
-            return false;
-        };
-        last_prompt as f64 > f64::from(window) * COMPACT_WINDOW_FRACTION
+        let pressure = self.context_pressure().await;
+        pressure.level == PressureLevel::Critical
     }
 
     /// Keep history bounded so the agent can run indefinitely. When
@@ -1728,9 +1841,13 @@ impl Agent {
 
     /// Summarize the middle span (everything between the system prompt and the
     /// last [`KEEP_RECENT`] messages) into a single note, unconditionally —
-    /// the `/compact` command's force path, and the shared core of
-    /// [`compact_if_needed`]. A summarization failure falls back to dropping
-    /// the middle span. Never aborts a turn.
+    /// the `/compact` command's force path, the `compact` tool, and the shared
+    /// core of [`compact_if_needed`]. A summarization failure falls back to
+    /// dropping the middle span. Never aborts a turn.
+    ///
+    /// On success the progress note is appended to the session as a system note
+    /// so resume and the model both see that stewardship happened (the full
+    /// pre-compact transcript remains earlier in the JSONL).
     pub async fn compact_now(&mut self) -> CompactOutcome {
         // Need history[0] (system prompt) + a non-empty middle + the recent tail.
         if self.history.len() <= KEEP_RECENT + 1 {
@@ -1753,6 +1870,12 @@ impl Agent {
             Ok(summary) => {
                 let replacement =
                     ChatMessage::system(format!("{COMPACT_SUMMARY_HEADING}\n{summary}"));
+                // Persist the note so resume replays the stewardship breadcrumb;
+                // the in-memory middle span is replaced (full transcript stays
+                // earlier in the append-only JSONL).
+                if let Err(err) = self.session.append_system_note(&replacement) {
+                    tracing::warn!("session append failed for compact note: {err}");
+                }
                 self.history
                     .splice(start..end, std::iter::once(replacement));
                 CompactOutcome::Summarized(count)
@@ -4199,6 +4322,14 @@ mod tests {
             agent.history.last().unwrap().content,
             format!("msg {}", extra - 1)
         );
+        // Progress note is session-persisted so resume / session readers see it.
+        let session = agent.session().load_history().expect("session readable");
+        assert!(
+            session
+                .iter()
+                .any(|m| m.role == Role::System && m.content.contains(COMPACT_SUMMARY_HEADING)),
+            "compact note must land in the session JSONL as a system note"
+        );
     }
 
     #[tokio::test]
@@ -4208,6 +4339,140 @@ mod tests {
         agent.history.push(ChatMessage::user("hi"));
         let outcome = agent.compact_now().await;
         assert_eq!(outcome, CompactOutcome::Nothing);
+    }
+
+    #[tokio::test]
+    async fn context_pressure_bands_follow_window_fill() {
+        let (agent, _provider, _tmp) = test_agent(vec![]);
+        // No window, tiny history → ok via byte proxy.
+        let pressure = agent.context_pressure().await;
+        assert_eq!(pressure.level, PressureLevel::Ok);
+        assert!(pressure.fill < PRESSURE_ELEVATED_FRACTION);
+
+        // Known window + last prompt at 60% → elevated.
+        let provider = ScriptedProvider::with_context_window(vec![], 10_000);
+        let tmp = TempDir::new();
+        let agent = test_agent_with(
+            &tmp,
+            provider,
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        agent.usage.record(Some(6_000), Some(1));
+        let pressure = agent.context_pressure().await;
+        assert_eq!(pressure.level, PressureLevel::Elevated);
+        assert!(pressure.signal_line().contains("elevated"));
+        assert!(pressure.signal_line().starts_with(CONTEXT_PRESSURE_HEADING));
+
+        // 75% → high.
+        agent.usage.record(Some(7_500), Some(1));
+        let pressure = agent.context_pressure().await;
+        assert_eq!(pressure.level, PressureLevel::High);
+
+        // 85% → critical (auto-compact band).
+        agent.usage.record(Some(8_500), Some(1));
+        let pressure = agent.context_pressure().await;
+        assert_eq!(pressure.level, PressureLevel::Critical);
+        assert!(pressure.signal_line().contains("critical"));
+    }
+
+    #[tokio::test]
+    async fn compact_tool_runs_mid_turn_and_feeds_result_back() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::new(vec![
+            vec![tool_call_chunk("compact", json!({}))],
+            vec![final_chunk("a terse progress note")], // summarization
+            vec![final_chunk("done after compact")],
+        ]);
+        let mut agent = test_agent_with(
+            &tmp,
+            provider.clone(),
+            Vec::new(),
+            ToolRegistry::with_native_tools(),
+        );
+        // Enough history that compact has a middle span.
+        for i in 0..(KEEP_RECENT + 5) {
+            agent.history.push(ChatMessage::user(format!("old {i}")));
+        }
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let reason = agent.run_turn("please compact", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::Completed);
+
+        // Tool result reached the model as a tool message.
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("compacted")),
+            "compact tool result missing from history"
+        );
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.contains(COMPACT_SUMMARY_HEADING)),
+            "summary note in history"
+        );
+
+        // Surfaces saw tool start/finish and a context-size refresh.
+        let mut saw_started = false;
+        let mut saw_finished = false;
+        let mut saw_context = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolStarted { name, .. } if name == "compact" => saw_started = true,
+                AgentEvent::ToolFinished { name, output } if name == "compact" => {
+                    saw_finished = true;
+                    assert!(!output.is_error, "{}", output.content);
+                    assert!(output.content.contains("compacted"), "{}", output.content);
+                }
+                AgentEvent::ContextSize { .. } => saw_context = true,
+                _ => {}
+            }
+        }
+        assert!(saw_started, "ToolStarted for compact");
+        assert!(saw_finished, "ToolFinished for compact");
+        assert!(saw_context, "ContextSize after compact");
+    }
+
+    #[tokio::test]
+    async fn elevated_pressure_is_injected_into_the_completion_request() {
+        let provider =
+            ScriptedProvider::with_context_window(vec![vec![final_chunk("ok")]], 10_000);
+        let tmp = TempDir::new();
+        let mut agent = test_agent_with(&tmp, provider.clone(), Vec::new(), ToolRegistry::new());
+        // 60% fill → elevated signal on the next completion.
+        agent.usage.record(Some(6_000), Some(1));
+
+        let (tx, _rx) = mpsc::channel(8);
+        agent.run_turn("hi", tx).await.expect("turn ok");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let saw_pressure = requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.starts_with(CONTEXT_PRESSURE_HEADING));
+        assert!(saw_pressure, "pressure line must ride the completion request");
+        drop(requests);
+
+        // Ephemeral: not left in agent history after the step.
+        assert!(
+            agent
+                .history
+                .iter()
+                .all(|m| !m.content.starts_with(CONTEXT_PRESSURE_HEADING)),
+            "pressure must not linger in history"
+        );
+        // And never session-persisted.
+        let session = agent.session().load_history().expect("session");
+        assert!(
+            session
+                .iter()
+                .all(|m| !m.content.starts_with(CONTEXT_PRESSURE_HEADING)),
+            "pressure must not hit the session file"
+        );
     }
 
     #[tokio::test]
@@ -4365,7 +4630,14 @@ mod tests {
                     .contains("## Context management (you own your window)"),
                 "context block missing from system prompt"
             );
-            assert!(agent.history[0].content.contains("/compact"));
+            assert!(
+                agent.history[0].content.contains("`compact`"),
+                "must teach the compact tool"
+            );
+            assert!(
+                agent.history[0].content.contains("[context pressure]"),
+                "must mention the live pressure signal"
+            );
         }
     }
 

@@ -19,9 +19,9 @@ use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Image, Role, ToolCall};
 use crate::tools::ToolOutput;
 
 use super::{
-    Agent, AgentEvent, DoneReason, EMPTY_COMPLETION_NUDGE, ImageSource, LoopControl, absorb_images,
-    breaker, clear_loop_control, completion_is_empty, emit, error_is_transient,
-    parse_json_tool_call, read_loop_control, ultra,
+    Agent, AgentEvent, CONTEXT_PRESSURE_HEADING, DoneReason, EMPTY_COMPLETION_NUDGE, ImageSource,
+    LoopControl, PressureLevel, absorb_images, breaker, clear_loop_control, completion_is_empty,
+    emit, error_is_transient, parse_json_tool_call, read_loop_control, ultra,
 };
 
 /// One streamed completion, or the turn's cancellation observed mid-stream.
@@ -235,11 +235,19 @@ impl Agent {
             // system prompt's plan-mode block in step with the flag.
             self.sync_plan_prompt();
 
+            // Live pressure: ephemeral system note the model sees on this
+            // completion only (not persisted). High/critical levels tell it
+            // to call `compact` before more tool work.
+            self.inject_pressure_signal().await;
+
             let (mut content, mut tool_calls, mut images) =
                 match self.stream_completion_with_retry(events).await {
                     // Cancelled mid-stream: the partial completion is discarded
                     // (never entered history), so nothing dangles.
-                    Ok(Completion::Cancelled) => return Ok(DoneReason::Stopped),
+                    Ok(Completion::Cancelled) => {
+                        self.drop_pressure_signal();
+                        return Ok(DoneReason::Stopped);
+                    }
                     Ok(Completion::Done {
                         content,
                         tool_calls,
@@ -249,10 +257,16 @@ impl Agent {
                     // (rolled back and clean in sovereign) rather than a hard
                     // error.
                     Err(err) if err.is::<breaker::LlmBreakerOpen>() => {
+                        self.drop_pressure_signal();
                         return Ok(DoneReason::CircuitBreaker);
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        self.drop_pressure_signal();
+                        return Err(err);
+                    }
                 };
+            // Pressure was only for this completion request.
+            self.drop_pressure_signal();
 
             // Some reasoning models (xAI grok-4.3 after tool results) emit
             // only reasoning and stop, leaving the visible message empty.
@@ -261,10 +275,13 @@ impl Agent {
             // text is not empty — it said what it had to say in pixels.
             if images.is_empty() && completion_is_empty(&content, &tool_calls) {
                 // In-memory only (not `push`): the nudge must not pollute the
-                // persisted session history.
+                // persisted session history. Re-attach pressure so the retry
+                // still sees fill.
+                self.inject_pressure_signal().await;
                 self.history.push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
                 let retried = self.stream_completion_with_retry(events).await;
                 self.history.pop();
+                self.drop_pressure_signal();
                 let (retry_content, retry_calls, retry_images) = match retried {
                     Ok(Completion::Cancelled) => return Ok(DoneReason::Stopped),
                     Ok(Completion::Done {
@@ -554,6 +571,14 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Option<DoneReason> {
         let name = call.function.name.clone();
+
+        // `compact` mutates history via Agent::compact_now — intercept here
+        // so it runs mid-turn on every surface (TUI/GUI/headless/gateway).
+        // The tool's own execute path only runs outside this loop.
+        if name == crate::tools::compact::COMPACT_TOOL_NAME {
+            return self.dispatch_compact(events).await;
+        }
+
         let outcome = self.dispatcher.dispatch(call, &self.ctx, events).await;
         let images = match &outcome.output {
             Some(output) => {
@@ -596,6 +621,107 @@ impl Agent {
             self.push(ChatMessage::system(nudge));
         }
         outcome.done
+    }
+
+    /// Run [`Agent::compact_now`] for a `compact` tool call: feed the outcome
+    /// back as the tool result, emit UI notices, and never end the turn.
+    async fn dispatch_compact(&mut self, events: &mpsc::Sender<AgentEvent>) -> Option<DoneReason> {
+        let name = crate::tools::compact::COMPACT_TOOL_NAME;
+        if !emit(
+            events,
+            AgentEvent::ToolStarted {
+                name: name.to_string(),
+                args: serde_json::json!({}),
+            },
+        )
+        .await
+        {
+            self.push(self.tool_feedback(name, &ToolOutput::ok("(not executed — turn ended early)")));
+            return Some(DoneReason::Stopped);
+        }
+
+        let outcome = self.compact_now().await;
+        let pressure = self.context_pressure().await;
+        let body = match &outcome {
+            crate::agent::CompactOutcome::Nothing => {
+                format!(
+                    "{}; {}",
+                    outcome.describe(),
+                    pressure.signal_line().trim_start_matches(CONTEXT_PRESSURE_HEADING).trim()
+                )
+            }
+            crate::agent::CompactOutcome::Summarized(_)
+            | crate::agent::CompactOutcome::Truncated { .. } => {
+                format!(
+                    "{}. Next-call pressure: {}",
+                    outcome.describe(),
+                    pressure.signal_line().trim_start_matches(CONTEXT_PRESSURE_HEADING).trim()
+                )
+            }
+        };
+        let output = match &outcome {
+            crate::agent::CompactOutcome::Truncated { .. } => ToolOutput::error(body),
+            _ => ToolOutput::ok(body),
+        };
+
+        match &outcome {
+            crate::agent::CompactOutcome::Summarized(_) => {
+                let _ = emit(events, AgentEvent::Notice(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
+            }
+            crate::agent::CompactOutcome::Truncated { .. } => {
+                let _ = emit(events, AgentEvent::Error(outcome.describe())).await;
+                let _ = emit(
+                    events,
+                    AgentEvent::ContextSize {
+                        tokens: self.context_tokens(),
+                    },
+                )
+                .await;
+            }
+            crate::agent::CompactOutcome::Nothing => {}
+        }
+
+        if !emit(
+            events,
+            AgentEvent::ToolFinished {
+                name: name.to_string(),
+                output: output.clone(),
+            },
+        )
+        .await
+        {
+            self.push(self.tool_feedback(name, &output));
+            return Some(DoneReason::Stopped);
+        }
+        self.push(self.tool_feedback(name, &output));
+        None
+    }
+
+    /// Push an ephemeral pressure system note for the next completion when
+    /// fill is elevated or higher. In-memory only — never session-persisted.
+    async fn inject_pressure_signal(&mut self) {
+        self.drop_pressure_signal();
+        let pressure = self.context_pressure().await;
+        if pressure.level == PressureLevel::Ok {
+            return;
+        }
+        self.history
+            .push(ChatMessage::system(pressure.signal_line()));
+    }
+
+    /// Drop any ephemeral pressure note left from the last completion.
+    fn drop_pressure_signal(&mut self) {
+        self.history.retain(|message| {
+            !(message.role == Role::System
+                && message.content.starts_with(CONTEXT_PRESSURE_HEADING))
+        });
     }
 
     /// Answer tool calls that will never run (turn ended early, user

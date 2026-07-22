@@ -543,6 +543,10 @@ pub fn candidate_registry(parent: &ToolRegistry) -> ToolRegistry {
     let wasted = [
         crate::tools::interview::INTERVIEW_TOOL_NAME,
         crate::tools::todo::TODO_TOOL_NAME,
+        // Compact mutates the *parent* agent history via the main loop
+        // intercept; a candidate's registry only hits CompactTool::execute,
+        // which errors. Strip it so candidates don't burn a step.
+        crate::tools::compact::COMPACT_TOOL_NAME,
     ];
     let mut registry = ToolRegistry::new();
     for spec in parent.specs() {

@@ -23,12 +23,14 @@ native tools:
 `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `execute`,
 `git_status`, `git_diff`, `memory`, `todo`, `web_fetch`, `web_search`,
 `generate_image`, `task_output`, `task_kill`, `subagent_status`, `subagent_kill`,
-and `run_command`.
+`run_command`, and `compact`.
 
 It is self-contained: no config load, no onboarding, no LLM. It serves until
 stdin closes. Note that `run_command` is only useful inside an interactive
 Wizard surface that drains the slash-command queue; over plain MCP it will
-refuse most calls because there is no TUI/GUI attached.
+refuse most calls because there is no TUI/GUI attached. `compact` likewise only
+runs inside the main agent loop (it needs live conversation history); over plain
+MCP it returns an error explaining that.
 
 Tools run in the directory the server starts in; pass `--cwd <dir>` to serve a
 specific project. Add `--scripted` to also advertise agent-authored scripted
