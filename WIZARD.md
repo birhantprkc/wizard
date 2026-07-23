@@ -114,6 +114,9 @@ report real `gh`/push failures. Details: `publish` tool.
 - **Security is not optional** on trust boundaries (§4.6).
 - **User's machine.** Tools run unsandboxed with their privileges. Prefer
   additive, recoverable steps over destructive ones.
+- **No em dashes.** Never use the em dash character (—) in replies, commits,
+  docs, or other text you write. Use a comma, colon, period, parentheses, or a
+  plain hyphen-minus (-) instead.
 
 ## 7. Amending this charter
 
