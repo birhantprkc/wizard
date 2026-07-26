@@ -1672,16 +1672,25 @@ impl App {
         if self.cursor == 0 {
             return;
         }
+        // A pasted image is one unit in the composer (`[Image #N]`). Backspace
+        // on/inside that token removes the whole attachment, not one glyph.
+        if self.try_delete_image_token_back() {
+            return;
+        }
         self.cursor -= 1;
         let index = self.byte_index();
         self.input.remove(index);
     }
 
     fn delete_forward(&mut self) {
-        if self.cursor < self.input.chars().count() {
-            let index = self.byte_index();
-            self.input.remove(index);
+        if self.cursor >= self.input.chars().count() {
+            return;
         }
+        if self.try_delete_image_token_forward() {
+            return;
+        }
+        let index = self.byte_index();
+        self.input.remove(index);
     }
 
     /// Delete the word before the cursor (Ctrl-W).
@@ -1690,6 +1699,10 @@ impl App {
         while self.cursor > 0 && chars[self.cursor - 1].is_whitespace() {
             self.delete_back();
         }
+        // Image tokens are atomic words: Ctrl-W on one unstages the image.
+        if self.try_delete_image_token_back() {
+            return;
+        }
         let chars: Vec<char> = self.input.chars().collect();
         let mut end = self.cursor;
         while end > 0 && !chars[end - 1].is_whitespace() {
@@ -1697,6 +1710,52 @@ impl App {
         }
         while self.cursor > end {
             self.delete_back();
+        }
+    }
+
+    /// If the character before the cursor sits inside an `[Image #N]` token,
+    /// remove that whole token and unstage the matching attachment.
+    fn try_delete_image_token_back(&mut self) -> bool {
+        let Some((start, end, n)) = image_token_at(&self.input, self.cursor.saturating_sub(1))
+        else {
+            return false;
+        };
+        self.remove_image_token_range(start, end, n);
+        true
+    }
+
+    /// If the character under the cursor sits inside an `[Image #N]` token,
+    /// remove that whole token and unstage the matching attachment.
+    fn try_delete_image_token_forward(&mut self) -> bool {
+        let Some((start, end, n)) = image_token_at(&self.input, self.cursor) else {
+            return false;
+        };
+        self.remove_image_token_range(start, end, n);
+        true
+    }
+
+    /// Drop the `[Image #N]` span `[start, end)` (char indices), unstage image
+    /// `N`, and renumber any higher tokens so the composer stays consistent.
+    fn remove_image_token_range(&mut self, start: usize, end: usize, n: usize) {
+        let byte_start = self.char_byte(start);
+        let byte_end = self.char_byte(end);
+        self.input.replace_range(byte_start..byte_end, "");
+        self.cursor = start;
+
+        if n >= 1 && n <= self.pending_images.len() {
+            self.pending_images.remove(n - 1);
+        }
+        // Keep remaining tokens contiguous: `[Image #k]` for k > n becomes
+        // `[Image #(k-1)]`, matching the new `pending_images` indices.
+        if n >= 1 {
+            renumber_image_tokens_after(&mut self.input, n);
+            // Cursor was left at `start`; renumbering only rewrites tokens to
+            // the right (or same position after a shorter/equal replacement),
+            // so the char index stays valid for digits shrinking by one.
+            let len = self.input.chars().count();
+            if self.cursor > len {
+                self.cursor = len;
+            }
         }
     }
 
@@ -3823,6 +3882,93 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// If `char_pos` lands inside an `[Image #N]` token in `input`, return
+/// `(start, end, n)` as character indices into `input` (`end` exclusive).
+fn image_token_at(input: &str, char_pos: usize) -> Option<(usize, usize, usize)> {
+    let chars: Vec<char> = input.chars().collect();
+    if chars.is_empty() || char_pos >= chars.len() {
+        return None;
+    }
+    // Scan every `[Image #N]` occurrence; return the one covering char_pos.
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        while end < chars.len() && chars[end] != ']' {
+            // Tokens are a single line; a newline means this `[` is not ours.
+            if chars[end] == '\n' {
+                break;
+            }
+            end += 1;
+        }
+        if end >= chars.len() || chars[end] != ']' {
+            i += 1;
+            continue;
+        }
+        end += 1; // exclusive end past `]`
+        let token: String = chars[i..end].iter().collect();
+        if let Some(n) = parse_image_token_number(&token) {
+            if char_pos >= i && char_pos < end {
+                return Some((i, end, n));
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse `N` from a full `[Image #N]` token, or `None` if the shape differs.
+fn parse_image_token_number(token: &str) -> Option<usize> {
+    let rest = token.strip_prefix("[Image #")?.strip_suffix(']')?;
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// After removing image `n`, rewrite every `[Image #k]` with `k > n` down by
+/// one so token numbers stay packed and match `pending_images` indices.
+fn renumber_image_tokens_after(input: &mut String, removed_n: usize) {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut replacements: Vec<(usize, usize, usize)> = Vec::new(); // start, end, new_n
+    while i < chars.len() {
+        if chars[i] == '[' {
+            let mut end = i + 1;
+            while end < chars.len() && chars[end] != ']' {
+                if chars[end] == '\n' {
+                    break;
+                }
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == ']' {
+                end += 1;
+                let token: String = chars[i..end].iter().collect();
+                if let Some(k) = parse_image_token_number(&token) {
+                    if k > removed_n {
+                        replacements.push((i, end, k - 1));
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // Apply from the right so earlier indices stay valid against `chars`.
+    for (start, end, new_n) in replacements.into_iter().rev() {
+        let byte_start: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
+        let byte_end: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
+        let new_token = format!("[Image #{new_n}]");
+        input.replace_range(byte_start..byte_end, &new_token);
     }
 }
 

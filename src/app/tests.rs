@@ -498,6 +498,66 @@ fn clearing_the_composer_drops_staged_images() {
 }
 
 #[test]
+fn backspace_deletes_a_pasted_image_token_in_one_press() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+    let mut app = app();
+    app.project_root = tmp.path().to_path_buf();
+
+    app.handle_paste(&tmp.path().join("a.png").display().to_string());
+    assert_eq!(app.input, "[Image #1]");
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.cursor, app.input.chars().count());
+
+    // One Backspace at the end of the token removes the whole attachment.
+    press(&mut app, KeyCode::Backspace);
+    assert!(app.input.is_empty(), "input: {}", app.input);
+    assert!(app.pending_images.is_empty());
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn delete_removes_image_token_under_the_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+    let mut app = app();
+    app.project_root = tmp.path().to_path_buf();
+
+    type_str(&mut app, "see ");
+    app.handle_paste(&tmp.path().join("a.png").display().to_string());
+    assert!(app.input.ends_with("[Image #1]"), "input: {}", app.input);
+
+    // Park the cursor on the '[' of the token, then Delete.
+    app.cursor = "see ".chars().count();
+    press(&mut app, KeyCode::Delete);
+    assert_eq!(app.input, "see ");
+    assert!(app.pending_images.is_empty());
+    assert_eq!(app.cursor, "see ".chars().count());
+}
+
+#[test]
+fn deleting_one_image_renumbers_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.png"), MINI_PNG).unwrap();
+    std::fs::write(tmp.path().join("b.png"), MINI_PNG).unwrap();
+    let mut app = app();
+    app.project_root = tmp.path().to_path_buf();
+
+    app.handle_paste(&tmp.path().join("a.png").display().to_string());
+    app.handle_paste(&tmp.path().join("b.png").display().to_string());
+    assert_eq!(app.input, "[Image #1] [Image #2]");
+    let first = app.pending_images[0].clone();
+    let second = app.pending_images[1].clone();
+
+    // Cursor after token #1; Backspace drops #1 and renumbers #2 → #1.
+    app.cursor = "[Image #1]".chars().count();
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.input, " [Image #1]");
+    assert_eq!(app.pending_images, vec![second]);
+    assert!(!app.pending_images.contains(&first));
+}
+
+#[test]
 fn sniff_identifies_supported_image_formats() {
     assert_eq!(sniff_image_ext(&MINI_PNG), Some("png"));
     assert_eq!(sniff_image_ext(&[0xff, 0xd8, 0xff, 0xe0]), Some("jpg"));
