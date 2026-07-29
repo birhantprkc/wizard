@@ -1256,8 +1256,11 @@ impl Agent {
     ///
     /// Soft bands (`elevated` / `high`) may use a char/4 estimate when the
     /// backend has not reported a prompt size yet. The `critical` band — which
-    /// drives auto-compaction — matches the historical gates exactly: bytes
-    /// over threshold, or a *reported* last prompt over 80% of a known window.
+    /// drives auto-compaction — needs a *reported* last prompt over 80% of a
+    /// known window; the byte threshold is only the fallback gate when the
+    /// window is unknown. A known window makes tokens the authoritative
+    /// measure — the byte proxy (48 KB default, sized for small local models)
+    /// would otherwise scream "critical" at a few percent of a large window.
     /// Estimates never trip auto-compact on their own (they would fire on the
     /// system prompt alone and steal the first completion of a short turn).
     pub async fn context_pressure(&self) -> ContextPressure {
@@ -1272,13 +1275,13 @@ impl Agent {
             _ => byte_total as f64 / threshold as f64,
         };
 
-        let auto_critical = byte_total > threshold
-            || match (last_prompt, window) {
-                (Some(prompt), Some(w)) if w > 0 => {
-                    prompt as f64 > f64::from(w) * COMPACT_WINDOW_FRACTION
-                }
-                _ => false,
-            };
+        let auto_critical = match window {
+            Some(w) if w > 0 => match last_prompt {
+                Some(prompt) => prompt as f64 > f64::from(w) * COMPACT_WINDOW_FRACTION,
+                None => false,
+            },
+            _ => byte_total > threshold,
+        };
 
         let level = if auto_critical {
             PressureLevel::Critical
@@ -1794,9 +1797,10 @@ impl Agent {
     }
 
     /// Whether the history is close enough to overflowing to warrant
-    /// compaction: either the serialized history exceeds the byte threshold,
-    /// or the last model call's reported prompt size exceeds
-    /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window.
+    /// compaction: the last model call's reported prompt size exceeds
+    /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window,
+    /// or — when no window is known — the serialized history exceeds the
+    /// byte threshold.
     async fn should_compact(&self) -> bool {
         let pressure = self.context_pressure().await;
         pressure.level == PressureLevel::Critical

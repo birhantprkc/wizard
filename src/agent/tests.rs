@@ -1648,6 +1648,37 @@ async fn context_pressure_bands_follow_window_fill() {
 }
 
 #[tokio::test]
+async fn byte_threshold_never_trips_critical_when_window_is_known() {
+    // Regression: with a large known window, the byte proxy (sized for
+    // unknown-window setups) used to force `critical` at a few percent of
+    // real fill — nagging "call compact now" while compact_now had nothing
+    // to fold. A known window makes the reported prompt authoritative.
+    let provider = ScriptedProvider::with_context_window(vec![], 500_000);
+    let tmp = TempDir::new();
+    let mut agent = test_agent_with(
+        &tmp,
+        provider,
+        Vec::new(),
+        ToolRegistry::with_native_tools(),
+    );
+    agent.config.compact_threshold_bytes = 1_000;
+    agent.history.push(ChatMessage::user("x".repeat(10_000)));
+
+    // History bytes far past the threshold, but the reported prompt fills
+    // only 7% of the window: pressure must stay ok.
+    agent.usage.record(Some(36_600), Some(1));
+    let pressure = agent.context_pressure().await;
+    assert_eq!(pressure.level, PressureLevel::Ok);
+    assert!(pressure.fill < PRESSURE_ELEVATED_FRACTION);
+
+    // And without a reported prompt yet, the char/4 estimate alone must not
+    // trip auto-compact either.
+    agent.usage.clear_last_prompt();
+    let pressure = agent.context_pressure().await;
+    assert_ne!(pressure.level, PressureLevel::Critical);
+}
+
+#[tokio::test]
 async fn compact_tool_runs_mid_turn_and_feeds_result_back() {
     let tmp = TempDir::new();
     let provider = ScriptedProvider::new(vec![

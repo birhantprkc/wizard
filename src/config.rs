@@ -749,8 +749,9 @@ pub struct Config {
     pub retry_max_secs: u64,
     /// Pause between continuous cycles (0 = none).
     pub cycle_pause_secs: u64,
-    /// When the serialized chat history exceeds this many bytes, compact older
-    /// messages into a summary.
+    /// When the provider's context window is unknown and the serialized chat
+    /// history exceeds this many bytes, compact older messages into a summary.
+    /// With a known window, the reported prompt size governs instead.
     pub compact_threshold_bytes: usize,
     /// Configured LLM providers. Empty means "use the legacy `model` /
     /// `ollama_host` fields as a single local Ollama provider".
