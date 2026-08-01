@@ -93,7 +93,3 @@ Local inference is powered by [llama.cpp](https://github.com/ggml-org/llama.cpp)
 ## License
 
 MIT; see [LICENSE](LICENSE).
-
-## Author
-
-Teddy Tennant ([github.com/teddytennant](https://github.com/teddytennant))
