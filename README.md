@@ -1,5 +1,10 @@
 # Wizard
 
+<p align="center">
+  <img src="assets/wizard-512.png" alt="Wizard" width="128" height="128" />
+</p>
+
+
 [![CI](https://github.com/teddytennant/wizard/actions/workflows/ci.yml/badge.svg)](https://github.com/teddytennant/wizard/actions/workflows/ci.yml)
 
 **One line. Your sovereign agent. Self-extending. Bring any model.**

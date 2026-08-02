@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The app's mark: the four-point sparkle the GUI already uses as its favicon
+/// The app's mark: the wand the GUI already uses as its favicon
 /// (`gui/assets/index.html`, `FAVICON_SVG` in `src/gui/server.rs`). Embedded,
-/// not read from the source tree — `--install` runs from an installed binary
+/// not read from the source tree - `--install` runs from an installed binary
 /// with no repository anywhere near it.
 const ICON_SVG: &str = include_str!("../assets/wizard.svg");
 const ICON_PNG: &[u8] = include_bytes!("../assets/wizard-512.png");
@@ -1072,10 +1072,14 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_icons_are_the_gui_sparkle() {
+    fn the_embedded_icons_are_the_wand_mark() {
         assert!(
-            ICON_SVG.contains("M8 0C8.6 4.2 11.8 7.4 16 8"),
+            ICON_SVG.contains("wand") || ICON_SVG.contains("four-point spark"),
             "same mark as the favicon"
+        );
+        assert!(
+            ICON_SVG.contains("#0c0c0e") && ICON_SVG.contains("#ececee"),
+            "brand colours present"
         );
         assert_eq!(&ICON_PNG[..4], b"\x89PNG");
         // 512×512, big-endian in the IHDR.

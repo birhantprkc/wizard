@@ -1,7 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-  <!-- Wizard mark: wand + four-point spark. Monochrome on app canvas. -->
-  <rect width="512" height="512" rx="114" fill="#0c0c0e"/>
-  <rect x="0.5" y="0.5" width="511" height="511" rx="113.5" fill="none" stroke="#26262a"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <g fill="#ececee">
     <path d="M 157.07 385.07 L 305.27 236.87 L 291.13 222.73 L 142.93 370.93 Z"/>
     <circle cx="150.00" cy="378.00" r="10.00"/>

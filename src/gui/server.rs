@@ -142,8 +142,8 @@ const ASSETS: [Asset; 15] = [
 ];
 
 /// The favicon, served at `/favicon.ico` for clients that probe the classic
-/// path; `index.html` inlines the same glyph as a data URI.
-const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="#ececee" d="M8 0C8.6 4.2 11.8 7.4 16 8C11.8 8.6 8.6 11.8 8 16C7.4 11.8 4.2 8.6 0 8C4.2 7.4 7.4 4.2 8 0Z"/></svg>"##;
+/// path; `index.html` inlines the same wand mark as a data URI.
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="#ececee"><path d="M 5.00 12.12 L 9.63 7.49 L 9.01 6.87 L 4.38 11.50 Z"/><circle cx="4.688" cy="11.812" r="0.438"/><circle cx="9.319" cy="7.181" r="0.394"/><path d="M 12.40 4.93 L 11.23 6.06 L 11.57 7.65 L 10.44 6.48 L 8.85 6.82 L 10.02 5.69 L 9.68 4.10 L 10.81 5.27 Z"/></g></svg>"##;
 
 /// Build the GUI router over the shared state. Every route — the WebSocket
 /// upgrade included — sits behind [`local_guard`].
@@ -315,7 +315,7 @@ async fn serve_font(
     Ok((headers, font.body).into_response())
 }
 
-/// `GET /favicon.ico`: the embedded SVG sparkle (see [`FAVICON_SVG`]).
+/// `GET /favicon.ico`: the embedded SVG wand mark (see [`FAVICON_SVG`]).
 async fn favicon() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG)
 }

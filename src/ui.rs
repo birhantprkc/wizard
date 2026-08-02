@@ -363,8 +363,6 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
 /// no borders, no banner art.
 fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled("✦", accent())),
-        Line::raw(""),
         Line::from(Span::styled(
             "w i z a r d",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1476,7 +1474,6 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
-            Span::styled(" ✦", accent()),
             Span::styled(picker.title.clone(), Style::default().fg(TEXT_DIM)),
         ]))
         .title_bottom(Line::from(Span::styled(picker.footer_hint(), dim())).centered());
@@ -1522,7 +1519,6 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
-            Span::styled(" ✦ ", accent()),
             Span::styled(
                 "wizard sessions",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -1960,7 +1956,6 @@ fn draw_plan_review(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
-            Span::styled(" ✦", accent()),
             Span::styled(" plan review ", Style::default().fg(TEXT_DIM)),
         ]))
         .title_bottom(Line::from(Span::styled(hints, dim())).centered());
@@ -2052,7 +2047,6 @@ fn draw_interview(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(dim())
         .title(Line::from(vec![
-            Span::styled(" ✦", accent()),
             Span::styled(" interview ", Style::default().fg(TEXT_DIM)),
             Span::styled(title, dim()),
         ]))
