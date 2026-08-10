@@ -11,6 +11,12 @@
 //! band with `wizard sync key`. Pulls are additive/overwrite only — replaced
 //! files are backed up under `~/.wizard/sync/backups/`, nothing is deleted —
 //! and every verification failure aborts before a single byte is written.
+//!
+//! A pull reads the signed manifest and checks its signature *before*
+//! unpacking any payload, and both the compressed bundle and what the gzip
+//! layer may produce are capped ([`MAX_BUNDLE_BYTES`], [`MAX_UNPACKED_BYTES`]).
+//! Trust is first-use, so until the signature holds the bytes came from
+//! nobody.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -26,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::SyncCmd;
 use crate::config::Config;
+use crate::platform::secrets;
 use crate::update::sha256_hex;
 
 /// Bundle format version; bump on incompatible manifest changes.
@@ -33,6 +40,27 @@ const BUNDLE_VERSION: u32 = 1;
 
 /// HTTP connect timeout for a URL pull (mirrors `update::download_and_install`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Cap on the compressed bundle a pull will read at all, mirroring
+/// `update::MAX_DOWNLOAD_BYTES` and for the same reason: everything
+/// that decides whether these bytes are trustworthy happens *after* they have
+/// all arrived, so until then the source — a URL the user was talked into
+/// configuring, quite possibly — can send as much as it likes. Far above any
+/// real bundle (a full `~/.wizard` is single-digit MB), far below anything
+/// that hurts.
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cap on bytes the gzip layer is allowed to *produce*. The compressed cap
+/// above does not bound this at all — gzip reaches a thousand to one, so a
+/// 64 MB upload is 64 GB of `read_to_end` into this process's memory, which
+/// is a hang and an OOM from a bundle nothing has verified yet.
+const MAX_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Cap on the decompressed prefix searched for `manifest.json` and
+/// `manifest.sig`. [`assemble_bundle`] writes both first, so a genuine bundle
+/// needs a few kilobytes here; a bundle that buries them behind a bomb hits
+/// this instead of expanding it.
+const MAX_MANIFEST_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Bundle format
@@ -65,6 +93,11 @@ struct ManifestEntry {
 /// A parsed-but-unverified bundle: the raw manifest bytes (the signature
 /// covers these exactly), the base64 signature line, and the payload files
 /// keyed by their `~/.wizard`-relative path.
+///
+/// Test-only. Production never holds one, because holding one means the
+/// payload of an unverified bundle is already in memory — see [`pull_bundle`],
+/// which reads and checks the signed manifest first and only then unpacks.
+#[cfg(test)]
 struct RawBundle {
     manifest_bytes: Vec<u8>,
     signature: String,
@@ -240,7 +273,9 @@ fn load_or_generate_key(wizard_dir: &Path) -> Result<SigningKey> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).map_err(|err| anyhow!("gathering key randomness: {err}"))?;
-            write_secret_atomic(&path, format!("{}\n", BASE64.encode(seed)).as_bytes())
+            // The one private-write primitive: owner-only file, owner-only
+            // parent, and a rename so a reader never sees half a key.
+            secrets::write_private_atomic(&path, format!("{}\n", BASE64.encode(seed)).as_bytes())
                 .with_context(|| format!("writing {}", path.display()))?;
             Ok(SigningKey::from_bytes(&seed))
         }
@@ -335,18 +370,14 @@ fn check_trust(
     Ok(Trust::Pinned)
 }
 
-/// Create `~/.wizard/sync/` with 0700 permissions (mirrors
-/// `credentials::write_at`).
+/// Create `~/.wizard/sync/` private to this user.
+///
+/// Strict: this directory holds the machine's ed25519 signing key, so a
+/// filesystem that cannot keep it away from other local users must fail the
+/// operation rather than write the key anyway. (Contrast the state tree, where
+/// the same failure is only a warning; see [`crate::platform::secrets`].)
 fn ensure_sync_dir(wizard_dir: &Path) -> Result<()> {
-    let dir = sync_dir(wizard_dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-    }
-    Ok(())
+    secrets::create_private_dir_strict(&sync_dir(wizard_dir))
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +386,15 @@ fn ensure_sync_dir(wizard_dir: &Path) -> Result<()> {
 
 /// Write `data` to `dest` atomically: a temp file in the same directory
 /// (created as needed), then a rename over the target.
+///
+/// `secret` makes the file owner-only from the moment it exists, rather than
+/// writing it at the umask and tightening it afterwards. The *parent* is
+/// deliberately left at whatever mode it has: `dest` here can be a path the
+/// user chose (`wizard sync pack` defaults to a bundle name in the current
+/// directory), and hardening that would chmod their checkout or their home
+/// directory to 0700. Writes into `~/.wizard` itself go through
+/// [`crate::platform::secrets::write_private_atomic`], which owns the parent
+/// as well.
 fn write_file_atomic(dest: &Path, data: &[u8], secret: bool) -> Result<()> {
     let dir = dest
         .parent()
@@ -366,23 +406,15 @@ fn write_file_atomic(dest: &Path, data: &[u8], secret: bool) -> Result<()> {
         .with_context(|| format!("{} has no usable file name", dest.display()))?;
     let tmp = dir.join(format!(".{name}.sync.tmp"));
     {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        if secret {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        // create(true) keeps the mode of a pre-existing file; enforce 0600.
-        #[cfg(unix)]
-        if secret {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
-        }
+        // The private create below is O_EXCL (it refuses to follow a symlink
+        // someone planted at this name), so clear the scratch file an
+        // interrupted earlier write may have left behind.
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = if secret {
+            secrets::create_private_file(&tmp)?
+        } else {
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
+        };
         file.write_all(data)
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.sync_all()
@@ -390,21 +422,6 @@ fn write_file_atomic(dest: &Path, data: &[u8], secret: bool) -> Result<()> {
     }
     std::fs::rename(&tmp, dest).with_context(|| format!("moving {} into place", dest.display()))?;
     Ok(())
-}
-
-/// Atomic write with 0600 perms and a 0700 parent (the key file).
-fn write_secret_atomic(dest: &Path, data: &[u8]) -> Result<()> {
-    let dir = dest
-        .parent()
-        .with_context(|| format!("{} has no parent directory", dest.display()))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-    }
-    write_file_atomic(dest, data, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +519,11 @@ fn append_entry<W: Write>(tar: &mut tar::Builder<W>, path: &str, data: &[u8]) ->
 }
 
 /// Best-effort hostname for the manifest; `unknown` when undeterminable.
-fn host_name() -> String {
+///
+/// `pub(crate)` for the mesh, which names a node after the machine it runs on
+/// for the same reason a sync manifest does: it is the only human-readable
+/// thing about a host that is not a key.
+pub(crate) fn host_name() -> String {
     if let Ok(host) = std::env::var("HOSTNAME")
         && !host.trim().is_empty()
     {
@@ -522,55 +543,187 @@ fn host_name() -> String {
 // Pull: parse and verify
 // ---------------------------------------------------------------------------
 
-/// Split a bundle into manifest bytes, signature, and payload map. Structural
-/// checks only (plus path safety on payload names); cryptographic and hash
-/// verification happen in [`verify_bundle`].
-fn parse_bundle(bytes: &[u8]) -> Result<RawBundle> {
-    let gz = flate2::read::GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(gz);
+/// A reader that refuses to yield more than `remaining` bytes.
+///
+/// Wrapped around the gzip decoder, this is what bounds *decompressed* size.
+/// `Read::take` would do the same but ends the stream silently at the limit,
+/// which a tar reader reports as a truncated archive — the wrong diagnosis for
+/// what is actually a refusal, and one that reads like a corrupt file rather
+/// than a hostile one.
+struct Capped<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+}
+
+impl<R: std::io::Read> Capped<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // One byte past the budget, so a stream that ends exactly at the limit
+        // still reports clean EOF and only an over-long one is refused.
+        let want = buf.len().min((self.remaining + 1) as usize);
+        let read = self.inner.read(&mut buf[..want])?;
+        if read as u64 > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the bundle expands to more than {} MB, which no real bundle does; \
+                     refusing before anything is verified",
+                    self.limit / (1024 * 1024)
+                ),
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+/// A tar reader over the bundle's gzip stream, bounded at `limit`
+/// *decompressed* bytes.
+fn bundle_archive(
+    bytes: &[u8],
+    limit: u64,
+) -> tar::Archive<Capped<flate2::read::GzDecoder<&[u8]>>> {
+    tar::Archive::new(Capped::new(flate2::read::GzDecoder::new(bytes), limit))
+}
+
+/// The name of a bundle entry, or `None` for anything that is not a plain
+/// file.
+fn entry_name<R: std::io::Read>(entry: &tar::Entry<'_, R>) -> Result<Option<String>> {
+    if !entry.header().entry_type().is_file() {
+        return Ok(None);
+    }
+    let raw = entry.path().context("a bundle entry has a bad path")?;
+    Ok(Some(
+        raw.to_str()
+            .context("a bundle entry path is not UTF-8")?
+            .to_string(),
+    ))
+}
+
+/// Read `manifest.json` and `manifest.sig`, check the signature over the exact
+/// manifest bytes, and return the manifest — **before** a single payload byte
+/// is unpacked.
+///
+/// The order is the point. This used to unpack the whole archive into memory
+/// and verify afterwards, so a bundle from any source at all — the pull URL is
+/// TOFU, and the first pull from a new key pins whatever answers — got its
+/// gzip stream fully expanded on the strength of nothing. A signature that
+/// does not check out now costs the attacker a few kilobytes of manifest
+/// instead of the entire archive, and the two caps bound even that.
+fn verify_signed_manifest(bytes: &[u8]) -> Result<Manifest> {
+    let mut archive = bundle_archive(bytes, MAX_MANIFEST_SCAN_BYTES);
     let mut manifest_bytes = None;
     let mut signature = None;
-    let mut payload: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for entry in archive.entries().context("reading the bundle")? {
         let mut entry = entry.context("reading a bundle entry")?;
-        if !entry.header().entry_type().is_file() {
+        let Some(path) = entry_name(&entry)? else {
             continue;
-        }
-        let path = {
-            let raw = entry.path().context("a bundle entry has a bad path")?;
-            raw.to_str()
-                .context("a bundle entry path is not UTF-8")?
-                .to_string()
         };
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut data)
-            .with_context(|| format!("reading {path} from the bundle"))?;
         match path.as_str() {
-            "manifest.json" => manifest_bytes = Some(data),
+            "manifest.json" => {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data)
+                    .context("reading manifest.json from the bundle")?;
+                manifest_bytes = Some(data);
+            }
             "manifest.sig" => {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data)
+                    .context("reading manifest.sig from the bundle")?;
                 signature = Some(
                     String::from_utf8(data)
                         .context("manifest.sig is not UTF-8")?
                         .trim()
                         .to_string(),
-                )
+                );
             }
-            _ => {
-                let Some(rel) = path.strip_prefix("payload/") else {
-                    bail!("unexpected file {path:?} in the bundle");
-                };
-                validate_rel_path(rel)?;
-                if payload.insert(rel.to_string(), data).is_some() {
-                    bail!("duplicate payload entry {rel:?} in the bundle");
-                }
-            }
+            // Everything else is skipped rather than read: the payload has no
+            // business being in memory until the signature holds.
+            _ => {}
+        }
+        if manifest_bytes.is_some() && signature.is_some() {
+            break;
         }
     }
-    Ok(RawBundle {
-        manifest_bytes: manifest_bytes.context("the bundle has no manifest.json")?,
-        signature: signature.context("the bundle has no manifest.sig")?,
-        payload,
-    })
+    let manifest_bytes = manifest_bytes.context("the bundle has no manifest.json")?;
+    let signature = signature.context("the bundle has no manifest.sig")?;
+    verify_manifest(&manifest_bytes, &signature)
+}
+
+/// Parse and check the manifest: format version, signature against the
+/// embedded key, and path safety of everything it lists.
+fn verify_manifest(manifest_bytes: &[u8], signature: &str) -> Result<Manifest> {
+    let manifest: Manifest =
+        serde_json::from_slice(manifest_bytes).context("parsing manifest.json")?;
+    if manifest.version != BUNDLE_VERSION {
+        bail!(
+            "unsupported bundle version {} (this wizard understands version {BUNDLE_VERSION}) \
+             — update wizard on this machine",
+            manifest.version
+        );
+    }
+
+    let key = decode_public_key(&manifest.public_key)?;
+    let sig_bytes = BASE64.decode(signature).context("decoding manifest.sig")?;
+    let signature = Signature::from_slice(&sig_bytes)
+        .map_err(|_| anyhow!("manifest.sig is not a 64-byte ed25519 signature"))?;
+    key.verify_strict(manifest_bytes, &signature).map_err(|_| {
+        anyhow!(
+            "bundle signature verification FAILED — the manifest does not match its \
+             signature; refusing to touch ~/.wizard"
+        )
+    })?;
+
+    let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
+    for entry in &manifest.files {
+        validate_rel_path(&entry.path)?;
+        if seen.insert(entry.path.as_str(), ()).is_some() {
+            bail!("the manifest lists {:?} twice", entry.path);
+        }
+    }
+    Ok(manifest)
+}
+
+/// Unpack the `payload/` entries. Structural checks only (path safety, no
+/// duplicates); correspondence with the manifest and per-file hashes are
+/// [`verify_payload`]'s job, and the signature has already been checked by the
+/// time production calls this.
+fn read_payload(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut archive = bundle_archive(bytes, MAX_UNPACKED_BYTES);
+    let mut payload: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for entry in archive.entries().context("reading the bundle")? {
+        let mut entry = entry.context("reading a bundle entry")?;
+        let Some(path) = entry_name(&entry)? else {
+            continue;
+        };
+        if path == "manifest.json" || path == "manifest.sig" {
+            continue;
+        }
+        let Some(rel) = path.strip_prefix("payload/") else {
+            bail!("unexpected file {path:?} in the bundle");
+        };
+        validate_rel_path(rel)?;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data)
+            .with_context(|| format!("reading {path} from the bundle"))?;
+        if payload.insert(rel.to_string(), data).is_some() {
+            bail!("duplicate payload entry {rel:?} in the bundle");
+        }
+    }
+    Ok(payload)
 }
 
 /// Reject any bundle path that could escape `~/.wizard`: absolute paths,
@@ -597,49 +750,22 @@ fn validate_rel_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Full verification: manifest signature (over the exact manifest bytes,
-/// against the embedded public key), manifest path safety, exact
-/// payload/manifest correspondence, and per-file size + sha256. Any failure
+/// Check the unpacked payload against the already-verified manifest: exact
+/// correspondence in both directions, and per-file size + sha256. Any failure
 /// is a hard error; nothing is written anywhere.
-fn verify_bundle(raw: &RawBundle) -> Result<Manifest> {
-    let manifest: Manifest =
-        serde_json::from_slice(&raw.manifest_bytes).context("parsing manifest.json")?;
-    if manifest.version != BUNDLE_VERSION {
-        bail!(
-            "unsupported bundle version {} (this wizard understands version {BUNDLE_VERSION}) \
-             — update wizard on this machine",
-            manifest.version
-        );
-    }
-
-    let key = decode_public_key(&manifest.public_key)?;
-    let sig_bytes = BASE64
-        .decode(&raw.signature)
-        .context("decoding manifest.sig")?;
-    let signature = Signature::from_slice(&sig_bytes)
-        .map_err(|_| anyhow!("manifest.sig is not a 64-byte ed25519 signature"))?;
-    key.verify_strict(&raw.manifest_bytes, &signature)
-        .map_err(|_| {
-            anyhow!(
-                "bundle signature verification FAILED — the manifest does not match its \
-             signature; refusing to touch ~/.wizard"
-            )
-        })?;
-
-    let mut listed: BTreeMap<&str, &ManifestEntry> = BTreeMap::new();
-    for entry in &manifest.files {
-        validate_rel_path(&entry.path)?;
-        if listed.insert(entry.path.as_str(), entry).is_some() {
-            bail!("the manifest lists {:?} twice", entry.path);
-        }
-    }
-    for path in raw.payload.keys() {
+fn verify_payload(manifest: &Manifest, payload: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    let listed: BTreeMap<&str, &ManifestEntry> = manifest
+        .files
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    for path in payload.keys() {
         if !listed.contains_key(path.as_str()) {
             bail!("payload file {path:?} is not listed in the manifest");
         }
     }
     for (path, entry) in &listed {
-        let Some(data) = raw.payload.get(*path) else {
+        let Some(data) = payload.get(*path) else {
             bail!("the manifest lists {path:?} but the payload does not contain it");
         };
         if data.len() as u64 != entry.size {
@@ -653,7 +779,7 @@ fn verify_bundle(raw: &RawBundle) -> Result<Manifest> {
             bail!("sha256 mismatch for {path:?} — the bundle is corrupt or tampered with");
         }
     }
-    Ok(manifest)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +889,10 @@ fn configured_source() -> Option<String> {
 
 /// Fetch the bundle bytes: http(s) URLs download, everything else is a local
 /// path (`~` expands).
+/// Both arms are bounded at [`MAX_BUNDLE_BYTES`], because nothing that decides
+/// whether these bytes are trustworthy has run yet: `bytes()` read whatever
+/// the server chose to send straight into memory, and a source URL is exactly
+/// the sort of thing a user pastes from a chat message.
 async fn fetch_source(source: &str) -> Result<Vec<u8>> {
     if source.starts_with("http://") || source.starts_with("https://") {
         let client = reqwest::Client::builder()
@@ -770,18 +900,40 @@ async fn fetch_source(source: &str) -> Result<Vec<u8>> {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("building HTTP client")?;
-        let bytes = client
+        let response = client
             .get(source)
             .send()
             .await
             .and_then(|response| response.error_for_status())
-            .with_context(|| format!("downloading {source}"))?
-            .bytes()
-            .await
-            .with_context(|| format!("reading {source}"))?;
-        Ok(bytes.to_vec())
+            .with_context(|| format!("downloading {source}"))?;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt as _;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("reading {source}"))?;
+            if bytes.len() as u64 + chunk.len() as u64 > MAX_BUNDLE_BYTES {
+                bail!(
+                    "{source} sent more than {} MB, which no sync bundle is; refusing before \
+                     anything is verified",
+                    MAX_BUNDLE_BYTES / (1024 * 1024)
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     } else {
         let path = PathBuf::from(shellexpand::tilde(source).into_owned());
+        let len = std::fs::metadata(&path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .len();
+        if len > MAX_BUNDLE_BYTES {
+            bail!(
+                "{} is {} — larger than the {} MB a sync bundle may be",
+                path.display(),
+                format_size(len),
+                MAX_BUNDLE_BYTES / (1024 * 1024)
+            );
+        }
         std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
     }
 }
@@ -847,8 +999,19 @@ async fn pull_cli(source: Option<String>, dry_run: bool) -> Result<i32> {
 /// on `dry_run`). Split from [`pull_cli`] so tests can drive it against a
 /// temp dir.
 fn pull_bundle(wizard_dir: &Path, bytes: &[u8], source: &str, dry_run: bool) -> Result<i32> {
-    let raw = parse_bundle(bytes)?;
-    let manifest = verify_bundle(&raw)?;
+    if bytes.len() as u64 > MAX_BUNDLE_BYTES {
+        bail!(
+            "{source} is {} — larger than the {} MB a sync bundle may be; refusing before \
+             anything is verified",
+            format_size(bytes.len() as u64),
+            MAX_BUNDLE_BYTES / (1024 * 1024)
+        );
+    }
+    // Signature first, payload second. Nothing from this archive is expanded
+    // into memory until the manifest covering it is known to be signed.
+    let manifest = verify_signed_manifest(bytes)?;
+    let payload = read_payload(bytes)?;
+    verify_payload(&manifest, &payload)?;
     let key = decode_public_key(&manifest.public_key)?;
     let fingerprint = fingerprint(&key);
 
@@ -887,7 +1050,7 @@ fn pull_bundle(wizard_dir: &Path, bytes: &[u8], source: &str, dry_run: bool) -> 
         }
     }
 
-    let diff = diff_against(wizard_dir, &raw.payload);
+    let diff = diff_against(wizard_dir, &payload);
     println!();
     for (path, state) in &diff {
         println!("  {:<10} {path}", state.label());
@@ -899,7 +1062,7 @@ fn pull_bundle(wizard_dir: &Path, bytes: &[u8], source: &str, dry_run: bool) -> 
         return Ok(0);
     }
 
-    let outcome = apply(wizard_dir, &raw.payload, &diff)?;
+    let outcome = apply(wizard_dir, &payload, &diff)?;
     println!(
         "applied {} file(s), {} unchanged.",
         outcome.applied, outcome.unchanged
@@ -933,6 +1096,47 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Take a bundle apart without verifying it, so a test can tamper with one
+    /// piece and re-assemble. Production has no such function on purpose:
+    /// [`pull_bundle`] checks the signed manifest before it unpacks anything.
+    fn parse_bundle(bytes: &[u8]) -> Result<RawBundle> {
+        let payload = read_payload(bytes)?;
+        let mut archive = bundle_archive(bytes, MAX_MANIFEST_SCAN_BYTES);
+        let mut manifest_bytes = None;
+        let mut signature = None;
+        for entry in archive.entries().context("reading the bundle")? {
+            let mut entry = entry.context("reading a bundle entry")?;
+            let Some(path) = entry_name(&entry)? else {
+                continue;
+            };
+            let mut data = Vec::new();
+            match path.as_str() {
+                "manifest.json" => {
+                    std::io::Read::read_to_end(&mut entry, &mut data)?;
+                    manifest_bytes = Some(data);
+                }
+                "manifest.sig" => {
+                    std::io::Read::read_to_end(&mut entry, &mut data)?;
+                    signature = Some(String::from_utf8(data)?.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+        Ok(RawBundle {
+            manifest_bytes: manifest_bytes.context("the bundle has no manifest.json")?,
+            signature: signature.context("the bundle has no manifest.sig")?,
+            payload,
+        })
+    }
+
+    /// The old whole-bundle verification, as the two halves production now
+    /// runs in order.
+    fn verify_bundle(raw: &RawBundle) -> Result<Manifest> {
+        let manifest = verify_manifest(&raw.manifest_bytes, &raw.signature)?;
+        verify_payload(&manifest, &raw.payload)?;
+        Ok(manifest)
+    }
 
     /// A `SyncPaths` over a temp `wizard_dir`, with the same relative layout
     /// [`SyncPaths::resolve`] derives from the `Config` helpers.
@@ -1411,6 +1615,103 @@ mod tests {
         pull_bundle(dst.path(), &bundle_c, "test", false).expect("manually trusted pull");
     }
 
+    /// Build a bundle whose payload expands past [`MAX_UNPACKED_BYTES`],
+    /// without ever holding that many bytes in this process.
+    fn bomb_payload_tar(manifest: Option<(&[u8], &str)>) -> Vec<u8> {
+        let size = MAX_UNPACKED_BYTES + 1;
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        if let Some((manifest_bytes, signature)) = manifest {
+            append_entry(&mut tar, "manifest.json", manifest_bytes).expect("append");
+            append_entry(
+                &mut tar,
+                "manifest.sig",
+                format!("{signature}\n").as_bytes(),
+            )
+            .expect("append");
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(
+            &mut header,
+            "payload/bomb",
+            std::io::Read::take(std::io::repeat(0), size),
+        )
+        .expect("append bomb");
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A gzip bomb is refused instead of expanded.
+    ///
+    /// The pull path used to `read_to_end` every entry of an unverified
+    /// archive, with no bound anywhere: not on the download, not on what the
+    /// decompressor produced. Compression reaches a thousand to one, so a
+    /// bundle small enough to send in a chat message was gigabytes of `Vec`
+    /// in a process that had not yet checked a single signature.
+    #[test]
+    fn a_gzip_bomb_is_refused_rather_than_expanded() {
+        let bytes = bomb_payload_tar(None);
+        assert!(
+            bytes.len() as u64 <= MAX_BUNDLE_BYTES,
+            "the bomb is small on the wire — that is the point"
+        );
+        let err = read_payload(&bytes).expect_err("the bomb must be refused");
+        assert!(
+            format!("{err:#}").contains("expands to more than"),
+            "{err:#}"
+        );
+    }
+
+    /// The signature is checked before the payload is unpacked.
+    ///
+    /// Ordering, not just outcome: `parse_bundle` ran first and `verify_bundle`
+    /// second, so an unsigned archive was fully expanded and only then thrown
+    /// away. Here the payload is a bomb and the signature is nonsense; the
+    /// failure has to be the signature, which is only possible if the bomb was
+    /// never read.
+    #[test]
+    fn an_unsigned_bundle_is_rejected_before_its_payload_is_unpacked() {
+        let dst = tempfile::tempdir().expect("tempdir");
+        let keydir = tempfile::tempdir().expect("tempdir");
+        let key = load_or_generate_key(keydir.path()).expect("key");
+        let manifest = Manifest {
+            version: BUNDLE_VERSION,
+            created_at: Utc::now().to_rfc3339(),
+            wizard_version: "2.0.0".to_string(),
+            host: "attacker".to_string(),
+            includes_credentials: false,
+            public_key: BASE64.encode(key.verifying_key().to_bytes()),
+            files: Vec::new(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        // A well-formed 64-byte signature that simply is not the right one, so
+        // the failure is the verification and not the decoding.
+        let signature = BASE64.encode([0u8; 64]);
+        let bytes = bomb_payload_tar(Some((&manifest_bytes, &signature)));
+
+        let err = pull_bundle(dst.path(), &bytes, "test", false).expect_err("unsigned bundle");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("signature verification FAILED"),
+            "the signature must be what stops it, not the size: {message}"
+        );
+    }
+
+    /// A bundle too large to be a bundle is refused before it is opened.
+    #[test]
+    fn an_oversized_bundle_is_refused_before_verification() {
+        let dst = tempfile::tempdir().expect("tempdir");
+        let bytes = vec![0u8; MAX_BUNDLE_BYTES as usize + 1];
+        let err = pull_bundle(dst.path(), &bytes, "test", false).expect_err("oversized");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("refusing before anything is verified"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn credentials_stay_out_unless_asked_for() {
         let src = tempfile::tempdir().expect("tempdir");
@@ -1432,42 +1733,50 @@ mod tests {
         assert!(raw.payload.contains_key("credentials.toml"));
         assert!(raw.payload.contains_key("xai_oauth.json"));
 
-        // Pulled secrets land 0600.
+        // Pulled secrets are owner-only; the rest keep ordinary permissions.
         let dst = tempfile::tempdir().expect("tempdir");
         pull_bundle(dst.path(), &bundle, "test", false).expect("pull");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for rel in ["credentials.toml", "xai_oauth.json"] {
-                let mode = std::fs::metadata(dst.path().join(rel))
-                    .expect("stat")
-                    .permissions()
-                    .mode();
-                assert_eq!(mode & 0o777, 0o600, "{rel} must be 0600");
-            }
-            let mode = std::fs::metadata(dst.path().join("config.toml"))
-                .expect("stat")
-                .permissions()
-                .mode();
-            assert_ne!(mode & 0o777, 0o600, "non-secrets keep normal perms");
+        for rel in ["credentials.toml", "xai_oauth.json"] {
+            assert!(
+                secrets::is_protected(&dst.path().join(rel)).expect("stat"),
+                "{rel} must not be readable by other users"
+            );
         }
+        assert!(
+            !secrets::is_protected(&dst.path().join("config.toml")).expect("stat"),
+            "non-secrets keep normal perms"
+        );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn credential_bundles_are_written_0600() {
-        use std::os::unix::fs::PermissionsExt;
+    fn credential_bundles_are_written_private() {
         let src = tempfile::tempdir().expect("tempdir");
         seed_wizard_dir(src.path());
 
-        let out = src.path().join("secret-bundle.tar.gz");
+        // A directory standing in for wherever the user runs `wizard sync
+        // pack`: their checkout, or their home directory.
+        let outbox = src.path().join("outbox");
+        std::fs::create_dir(&outbox).expect("mkdir");
+        let before = secrets::is_protected(&outbox).expect("stat");
+
+        let out = outbox.join("secret-bundle.tar.gz");
         pack(&test_paths(src.path()), &out, true).expect("pack");
-        let mode = std::fs::metadata(&out).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "a bundle holding keys must be 0600");
+        assert!(
+            secrets::is_protected(&out).expect("stat"),
+            "a bundle holding keys must not be readable by other users"
+        );
+        // …and writing it does not drag the directory the user chose along
+        // with it. Compared rather than asserted outright so the check does
+        // not depend on the ambient umask.
+        assert_eq!(
+            secrets::is_protected(&outbox).expect("stat"),
+            before,
+            "packing must not change the permissions of the output directory"
+        );
     }
 
     #[test]
-    fn key_file_is_0600_and_stable_across_loads() {
+    fn key_file_is_private_and_stable_across_loads() {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = load_or_generate_key(dir.path()).expect("generate");
         let second = load_or_generate_key(dir.path()).expect("reload");
@@ -1476,20 +1785,14 @@ mod tests {
             second.verifying_key().to_bytes(),
             "the key survives reloads"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let key_mode = std::fs::metadata(key_path(dir.path()))
-                .expect("stat key")
-                .permissions()
-                .mode();
-            assert_eq!(key_mode & 0o777, 0o600, "the seed file must be 0600");
-            let dir_mode = std::fs::metadata(sync_dir(dir.path()))
-                .expect("stat sync dir")
-                .permissions()
-                .mode();
-            assert_eq!(dir_mode & 0o777, 0o700, "the sync dir must be 0700");
-        }
+        assert!(
+            secrets::is_protected(&key_path(dir.path())).expect("stat key"),
+            "the seed file must not be readable by other users"
+        );
+        assert!(
+            secrets::is_protected(&sync_dir(dir.path())).expect("stat sync dir"),
+            "the sync dir must not be readable by other users"
+        );
     }
 
     #[test]

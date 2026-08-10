@@ -1,0 +1,17 @@
+: Anthropic Messages API stream with two degenerate tool_use blocks: the first
+: receives input fragments that never assemble into JSON, the second receives
+: no input at all. Both have to reach the agent loop as tool calls with usable
+: arguments, because the alternative is a turn that dies holding a half-parsed
+: block.
+:
+: Transcribed from
+: anthropic::tests::tool_input_that_is_not_json_degrades_to_a_string_argument.
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"execute"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"not json"}}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t2","name":"list"}}
+
+data: {"type":"message_stop"}
+

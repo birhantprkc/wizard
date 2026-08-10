@@ -1,17 +1,17 @@
-//! Subscription sign-in from the browser.
+//! Subscription sign-in from the settings sheet.
 //!
 //! An API key is a string the user can paste; a subscription is not. It is an
-//! OAuth round trip: we hand the browser an authorize URL, the user approves,
+//! OAuth round trip: we open a browser on an authorize URL, the user approves,
 //! and the provider sends them back to a redirect we exchange for tokens that
 //! live in `~/.wizard/`.
 //!
-//! That redirect is never this server's own origin. Both providers only send
-//! the browser to the loopback address registered for their client id —
-//! OpenAI's `localhost:1455/auth/callback`, xAI's `127.0.0.1:56121/callback` —
-//! and ignore anything else, so each flow binds *its* listener itself, exactly
-//! as the terminal flows do ([`crate::llm::xai_oauth::login`]). The GUI hands
-//! out the authorize URL, the flow finishes in a spawned task that outlives the
-//! request, and the tab the user started from watches [`Status`].
+//! Both providers only send the browser to the loopback address registered for
+//! their client id — OpenAI's `localhost:1455/auth/callback`, xAI's
+//! `127.0.0.1:56121/callback` — and ignore anything else, so each flow binds
+//! *its* listener itself, exactly as the terminal flows do
+//! ([`crate::llm::xai_oauth::login`]). The sheet opens the authorize URL, the
+//! flow finishes in a spawned task that outlives the click, and the sheet
+//! polls [`Status`] until it settles.
 //!
 //! One sign-in may be in flight at a time, and a second attempt **replaces**
 //! the first rather than racing it: a person signs in to one account at a time,
@@ -25,7 +25,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
 use tokio::task::JoinHandle;
 
 use crate::config::ProviderConfig;
@@ -40,9 +39,24 @@ use crate::llm::{chatgpt_oauth, xai_oauth};
 /// still an answer, where hanging is not.
 const RELEASE_GRACE: Duration = Duration::from_secs(5);
 
-/// What the frontend polls while the user is off in the provider's tab.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case")]
+/// The subscription sign-ins this build supports: the key a surface passes to
+/// [`SignIn::begin`], what a row calls it, and what the subscription is.
+///
+/// One list, because the sheet offers these rows and `wizard --login` names
+/// them on the command line. The browser GUI that this replaced hard-coded its
+/// copy in `settings.js` and matched on strings server-side; a provider added
+/// to one and not the other was a row that opened nothing.
+pub const SUPPORTED: &[(&str, &str, &str)] = &[
+    (
+        "chatgpt",
+        "Sign in with ChatGPT",
+        "Plus / Pro / Team subscription",
+    ),
+    ("xai", "Sign in with xAI", "SuperGrok subscription"),
+];
+
+/// What the sheet polls while the user is off in the provider's tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Status {
     /// No sign-in has been started.
     #[default]
@@ -92,6 +106,29 @@ impl SignIn {
 
     /// Start an xAI sign-in, replacing any in flight. `store` receives the
     /// provider once the tokens land.
+    /// Start the sign-in named by `provider` and hand back the consent URL.
+    ///
+    /// The one place a provider *name* is turned into a flow, so [`SUPPORTED`]
+    /// is the whole list and a row offered in a picker cannot be a row nothing
+    /// answers to.
+    pub async fn begin(
+        self: &Arc<Self>,
+        provider: &str,
+        store: Arc<ConfigStore>,
+    ) -> anyhow::Result<String> {
+        match provider {
+            "xai" => self.begin_xai(store).await,
+            "chatgpt" => self.begin_chatgpt(store).await,
+            other => {
+                debug_assert!(
+                    !SUPPORTED.iter().any(|(name, _, _)| *name == other),
+                    "{other} is offered in SUPPORTED but has no flow here"
+                );
+                anyhow::bail!("cannot sign in to '{other}'")
+            }
+        }
+    }
+
     pub async fn begin_xai(self: &Arc<Self>, store: Arc<ConfigStore>) -> anyhow::Result<String> {
         let _starting = self.starting.lock().await;
         self.release_in_flight().await;
@@ -278,7 +315,7 @@ mod tests {
 
     #[test]
     fn a_failed_sign_in_is_reported_not_left_pending() {
-        // The frontend polls until it sees done or failed; a flow that died
+        // The sheet polls until it sees done or failed; a flow that died
         // without saying so would keep it waiting forever.
         let sign_in = SignIn::default();
         let generation = sign_in.mark_pending("xai");

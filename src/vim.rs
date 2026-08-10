@@ -1,11 +1,23 @@
 //! Modal (vim-style) editing for the input composer.
 //!
-//! The composer is a single logical line (a `String` with a char-index
-//! cursor), so this is single-line vim: `hjkl`/`w`/`b`/`e`/`0`/`^`/`$`
-//! motions, the `d`/`c`/`y` operators with motions, `x`/`r`/`p` and the
-//! `i`/`a`/`I`/`A` insert transitions. `j`/`k` (no line to move to) recall
-//! input history; `j` outside a history browse drops into the subagent rail,
-//! like plain ↓.
+//! The composer began as a single logical line and this module was written for
+//! that. Alt+Enter now inserts a hard newline, so a draft can have several, and
+//! the split is deliberate rather than accidental:
+//!
+//! - **Line-aware**: `0`, `^`, `$` and `D`/`C`, which have one obvious meaning
+//!   per line. They used to measure the whole buffer, so `0` on line two jumped
+//!   to the start of line one and `D` deleted every line below the caret.
+//! - **Whole-draft**: `dd`/`S`, which take the entire composer. A composer is
+//!   one thing you are about to send, so "the line" for a linewise operator is
+//!   defensibly all of it — and unlike the motions above, taking it is
+//!   recoverable with `u`.
+//! - **Not bound to lines at all**: `j`/`k`, which recall input history, since
+//!   history is what a composer's up and down have always meant here. `j`
+//!   outside a history browse drops into the subagent rail, like plain ↓.
+//!
+//! Otherwise this is vim: `hjkl`/`w`/`b`/`e` motions, the `d`/`c`/`y`
+//! operators with motions and counts, `x`/`r`/`p` and the `i`/`a`/`I`/`A`
+//! insert transitions.
 //!
 //! [`VimState`] holds the mode and the small amount of pending state a modal
 //! editor needs (an operator awaiting its motion, a count prefix, the yank
@@ -56,6 +68,13 @@ pub struct VimState {
     pub pending: Option<Pending>,
     /// Numeric count prefix being typed (`3w`, `d2w`), if any.
     pub count: Option<usize>,
+    /// The count that preceded a pending operator, held while its motion's own
+    /// count is typed.
+    ///
+    /// Vim multiplies the two — `2d3w` deletes six words — and with one field
+    /// the digits simply concatenated: `2` then `3` made 23, so `2d3w` cleared
+    /// a 23-word line. Two fields, multiplied at motion time.
+    pub operator_count: Option<usize>,
     /// The yank/delete register, pasted by `p`/`P`.
     pub register: String,
     /// Undo snapshots `(input, cursor)` captured before each Normal-mode edit;
@@ -88,6 +107,7 @@ impl VimState {
     pub fn clear_pending(&mut self) {
         self.pending = None;
         self.count = None;
+        self.operator_count = None;
     }
 
     /// Push an undo snapshot, trimming the oldest entry past [`UNDO_LIMIT`].
@@ -189,6 +209,32 @@ pub fn first_non_blank(chars: &[char]) -> usize {
     chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0)
 }
 
+/// The bounds of the line `cursor` sits on: `start..end`, where `end` is the
+/// newline (or the buffer end).
+///
+/// The composer used to be a single logical line, and this module's header
+/// said so. Alt+Enter made that untrue, and the line motions kept measuring the
+/// whole buffer: `0` on line two jumped to the start of line *one*, `$` on line
+/// one jumped to the end of the last line, and `D` deleted every line below the
+/// caret. Those three have an unambiguous per-line meaning, so they use this.
+///
+/// `j`/`k` still browse history rather than moving between lines, and `dd`/`S`
+/// still take the whole draft; both are called out in the module header.
+pub fn line_bounds(chars: &[char], cursor: usize) -> (usize, usize) {
+    let at = cursor.min(chars.len());
+    let start = chars[..at]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = chars[at..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map(|i| at + i)
+        .unwrap_or(chars.len());
+    (start, end)
+}
+
 /// Where a motion key lands the cursor, and the character range an operator
 /// applied with that motion would cover. `start..end` is always normalized
 /// (`start <= end`).
@@ -216,12 +262,19 @@ pub fn resolve_motion(key: char, n: usize, chars: &[char], cursor: usize) -> Opt
             let t = (cursor + n).min(len);
             (t, range(cursor, t))
         }
-        '0' => (0, range(0, cursor)),
+        '0' => {
+            let (start, _) = line_bounds(chars, cursor);
+            (start, range(start, cursor))
+        }
         '^' => {
-            let t = first_non_blank(chars);
+            let (start, end) = line_bounds(chars, cursor);
+            let t = start + first_non_blank(&chars[start..end]);
             (t, range(t, cursor))
         }
-        '$' => (len, range(cursor, len)),
+        '$' => {
+            let (_, end) = line_bounds(chars, cursor);
+            (end, range(cursor, end))
+        }
         'w' => {
             let mut t = cursor;
             for _ in 0..n {

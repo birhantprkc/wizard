@@ -28,10 +28,13 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Optional, if you touch the desktop shell (`wizard app`):
+Required if you touch `src/native/` — the native GUI is off by default, so
+nothing above compiles a line of it, and it ships as its own release asset
+(`wizard-native-*`). CI runs both:
 
 ```bash
-cargo check --locked --features desktop
+cargo clippy --all-targets --locked --features native -- -D warnings
+cargo test --locked --features native
 ```
 
 Optional supply-chain check:
@@ -39,6 +42,20 @@ Optional supply-chain check:
 ```bash
 cargo deny --locked --all-features check
 ```
+
+Optional audit, worth a run when you add a `pub fn` that a surface is supposed
+to call:
+
+```bash
+contrib/find-unwired.py
+```
+
+It lists public functions nothing outside a test calls. Most of what it prints
+is fine; it exists because the defect it catches cannot fail a test. A function
+that is written, documented and unit-tested but never wired up reads as
+finished and green while the behaviour its doc describes silently does not
+happen — four of those have been found in this tree, and each one was a bug a
+user could see. The script's header lists them.
 
 Keep `Cargo.lock` in sync (`--locked` fails on drift). Prefer small, focused diffs that match existing style. No `todo!()` / bare `unwrap()` on fallible paths.
 
@@ -58,4 +75,4 @@ Open an issue first for large or architectural changes. Security-sensitive repor
 
 ## License
 
-By contributing, you agree your work is licensed under the MIT license ([LICENSE](LICENSE)).
+By contributing, you agree your work is licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)). That is unchanged by the crate as a whole being `MIT AND Apache-2.0`: the Apache-2.0 half is the ported terminal-UI code listed in [NOTICE](NOTICE), and new contributions are not part of it. If you are porting code from an Apache-2.0 project, say so in the PR and add it to NOTICE rather than relicensing it.

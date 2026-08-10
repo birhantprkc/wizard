@@ -1,13 +1,15 @@
-//! Native web tools: `web_fetch` (URL → markdown/text) and `web_search`
-//! (pluggable search backends).
+//! Native web tools: `web_fetch` (URL → markdown/text), `web_search`
+//! (pluggable search backends), and `x_search` (X/Twitter via xAI).
 //!
-//! Both are [`ToolAccess::ReadOnly`], so they stay available in plan mode.
-//! Settings live in `[web]` in `config.toml` (see
+//! All three are [`ToolAccess::ReadOnly`], so they stay available in plan
+//! mode. Settings live in `[web]` in `config.toml` (see
 //! [`WebConfig`](crate::config::WebConfig)), carried into the tools via
 //! [`ToolContext::web`](super::ToolContext). Fetches are SSRF-guarded:
-//! requests to localhost and private/link-local ranges are rejected unless
+//! requests to anything outside the routable public internet — see
+//! [`ip_is_local`] for the full list — are rejected unless
 //! `allow_local = true`. Search API keys are read from the environment at
-//! call time and never stored.
+//! call time and never stored. `x_search` always uses xAI (OAuth session or
+//! API key) and does not depend on `[web] search_backend`.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -41,22 +43,71 @@ const MAX_SEARCH_COUNT: usize = 10;
 // SSRF guard
 // ---------------------------------------------------------------------------
 
-/// Whether an address is local/private: loopback (127.0.0.0/8, ::1), RFC1918
-/// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), link-local (169.254.0.0/16,
-/// fe80::/10), unique-local (fc00::/7), or unspecified.
+/// Whether an address is one the web tools must not reach: anything that is
+/// not a routable public internet host.
+///
+/// `Ipv4Addr::is_private` alone is not that set. It covers exactly RFC1918 —
+/// 10/8, 172.16/12, 192.168/16 — and the interesting addresses on a real
+/// deployment live outside it. `100.64.0.0/10` (carrier-grade NAT) is the
+/// worst of them: `100.100.100.200` is Alibaba Cloud's instance metadata
+/// endpoint, and Kubernetes and EKS routinely put pod and service CIDRs in
+/// that range, so "private" in the RFC1918 sense let a fetch walk straight
+/// into the cluster.
+///
+/// Blocked, then:
+/// - IPv4: `0.0.0.0/8` (this network), `10.0.0.0/8`, `100.64.0.0/10` (CGNAT),
+///   `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24` (IETF
+///   protocol assignments), `192.168.0.0/16`, `198.18.0.0/15` (benchmarking),
+///   `224.0.0.0/4` (multicast) and `240.0.0.0/4` (reserved, which is where
+///   the `255.255.255.255` broadcast address lives).
+/// - IPv6: `::`, `::1`, `fc00::/7` (unique local), `fe80::/10` (link local),
+///   `ff00::/8` (multicast), the whole NAT64 allocation `64:ff9b::/32` (which
+///   holds the well-known prefix `64:ff9b::/96` and the local-use
+///   `64:ff9b:1::/48`), and any address carrying an IPv4 one — both the mapped
+///   form `::ffff:127.0.0.1` and the deprecated compatible form `::7f00:1` —
+///   which is judged by the IPv4 rules above.
 fn ip_is_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            let [a, b, c, _] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || a == 0 // 0.0.0.0/8, "this network" (0.0.0.0 included)
+                || (a == 100 && (64..128).contains(&b)) // CGNAT 100.64.0.0/10
+                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
+                || v4.is_multicast() // 224.0.0.0/4
+                || a >= 240 // reserved 240.0.0.0/4, incl. 255.255.255.255
         }
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ip_is_local(IpAddr::V4(mapped));
+            // Order matters. `to_ipv4` accepts the whole of `::/96`, so `::1`
+            // converts to `0.0.0.1` and `::` to `0.0.0.0`; settling both as
+            // IPv6 first keeps loopback from being judged as some other host.
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+            // `to_ipv4`, not `to_ipv4_mapped`: the mapped form is only half of
+            // it. `::7f00:1` is IPv4-compatible rather than mapped, so
+            // `to_ipv4_mapped` returned `None` for it and loopback went
+            // through under the IPv6 rules, which say nothing about `::/96`.
+            if let Some(v4) = v6.to_ipv4() {
+                return ip_is_local(IpAddr::V4(v4));
+            }
+            let segments = v6.segments();
+            // The NAT64 allocation, 64:ff9b::/32 — all of it, not only the two
+            // prefixes defined inside it (64:ff9b::/96, the well-known one,
+            // and 64:ff9b:1::/48, for local use). Both embed an IPv4 address
+            // that the translator dials on our behalf, so the v6 literal says
+            // nothing about where the packet lands. The rest of the /32 is
+            // unassigned, so blocking it costs nothing and needs no revisit if
+            // another translation prefix is carved out of it later.
+            if segments[0] == 0x0064 && segments[1] == 0xff9b {
+                return true;
+            }
+            v6.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (segments[0] & 0xffc0) == 0xfe80 // link local fe80::/10
         }
     }
 }
@@ -106,7 +157,11 @@ fn check_url_sync(url: &reqwest::Url, allow_local: bool) -> Result<(), String> {
 
 /// Full SSRF check: the synchronous checks plus DNS resolution of domain
 /// hosts, rejecting any URL whose host resolves to a local/private address.
-async fn check_url(url: &reqwest::Url, allow_local: bool) -> Result<(), String> {
+///
+/// Shared with [`crate::tools::image`], which downloads model-supplied URLs
+/// and needs the same guard; there is one implementation of "is this address
+/// reachable-but-forbidden" so the two cannot drift.
+pub(crate) async fn check_url(url: &reqwest::Url, allow_local: bool) -> Result<(), String> {
     check_url_sync(url, allow_local)?;
     if allow_local {
         return Ok(());
@@ -135,23 +190,114 @@ async fn check_url(url: &reqwest::Url, allow_local: bool) -> Result<(), String> 
     Ok(())
 }
 
-/// HTTP client for the web tools: desktop UA, 30s timeout, and a redirect
-/// policy that re-applies the synchronous SSRF checks on every hop.
-fn web_client(allow_local: bool) -> Result<reqwest::Client, reqwest::Error> {
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 10 {
-            return attempt.error("too many redirects");
+/// Follow redirects by hand, running the **full** SSRF check on every hop.
+///
+/// reqwest's redirect policy is a synchronous callback, so it can only reach
+/// `check_url_sync` — which returns `Ok` for any host that is not a literal IP
+/// or a `localhost`/`*.local` name, without resolving anything. That is the
+/// whole guard bypassed in one hop: fetch `http://blog.attacker.com/post`,
+/// which resolves publicly and passes; it answers `302 Location:
+/// http://meta.attacker.com/…`, whose `A` record is `169.254.169.254`; the sync
+/// check sees a hostname, follows, and the cloud metadata service — instance
+/// credentials and all — lands in the model's context. Public wildcard-DNS
+/// services make the `127.0.0.1` variant a one-liner.
+///
+/// So the client is told not to redirect at all, and this walks the chain
+/// instead, awaiting `check_url` (which resolves) before each hop. There is
+/// still a TOCTOU window between our resolution and reqwest's, which no
+/// userspace check can close without owning the connector; narrowing the hole
+/// from "any hostname" to "a rebinding race" is the part that is achievable
+/// here.
+const MAX_REDIRECTS: usize = 10;
+
+/// Which schemes a redirect chain is allowed to use.
+///
+/// [`check_url_sync`] accepts `http` and `https` both, which is the right rule
+/// for `web_fetch`: the model named a URL and gets whatever that URL leads to,
+/// cleartext included, and the result is text in a transcript.
+///
+/// It is the wrong rule for the image downloader. There the *provider* names
+/// the URL, the bytes are written to the user's disk, and `generate_image`
+/// checked the scheme of the first URL only — so `https://cdn/…` answering
+/// `302 Location: http://host/x.png` was fetched in cleartext, and the
+/// promise in `docs/image.md` that these downloads are "over HTTPS only" was
+/// true of exactly one hop.
+/// This governs the URLs the *chain* names. The starting URL is the caller's
+/// to vet — it came from somewhere this function knows nothing about — and
+/// `download_image` refuses a non-https one before it gets here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HopScheme {
+    /// `http` and `https` are both acceptable, the `web_fetch` rule.
+    Any,
+    /// `https` only; a redirect that downgrades ends the chain with an error.
+    HttpsOnly,
+}
+
+impl HopScheme {
+    fn allows(self, url: &reqwest::Url) -> Result<(), String> {
+        if self == HopScheme::HttpsOnly && url.scheme() != "https" {
+            return Err(format!(
+                "refusing to follow a redirect to '{url}': https is required on every hop"
+            ));
         }
-        match check_url_sync(attempt.url(), allow_local) {
-            Ok(()) => attempt.follow(),
-            Err(reason) => attempt.error(reason),
+        Ok(())
+    }
+}
+
+pub(crate) async fn get_following_redirects(
+    client: &reqwest::Client,
+    start: reqwest::Url,
+    allow_local: bool,
+    scheme: HopScheme,
+) -> Result<reqwest::Response, String> {
+    let mut url = start;
+    for _ in 0..=MAX_REDIRECTS {
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|err| format!("fetch failed: {err}"))?;
+
+        if !response.status().is_redirection() {
+            return Ok(response);
         }
-    });
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            // A 3xx with nowhere to go is the response.
+            return Ok(response);
+        };
+        // Relative locations are legal and common.
+        let next = url
+            .join(location)
+            .map_err(|err| format!("redirect to invalid url '{location}': {err}"))?;
+        scheme.allows(&next)?;
+        check_url(&next, allow_local).await?;
+        url = next;
+    }
+    Err("too many redirects".to_string())
+}
+
+/// Builder for any client whose redirects must be walked by hand rather than
+/// followed by reqwest — see [`get_following_redirects`]. Leaving reqwest's
+/// default follow-10 policy in place is the whole SSRF guard bypassed, because
+/// the policy callback is synchronous and cannot resolve DNS, so every caller
+/// that fetches an untrusted URL starts from here.
+pub(crate) fn no_redirect_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .redirect(policy)
-        .timeout(FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
+}
+
+/// HTTP client for the web tools: desktop UA and a 30s timeout. Redirects are
+/// **not** followed here — see [`get_following_redirects`]. It used to take
+/// `allow_local`, for a redirect policy that no longer lives here.
+fn web_client() -> Result<reqwest::Client, reqwest::Error> {
+    no_redirect_client_builder(FETCH_TIMEOUT)
+        .user_agent(USER_AGENT)
         .build()
 }
 
@@ -396,14 +542,21 @@ impl Tool for WebFetchTool {
             return Ok(ToolOutput::error(reason));
         }
 
-        let client = web_client(allow_local).map_err(|err| ToolError::Execution {
+        let client = web_client().map_err(|err| ToolError::Execution {
             tool: self.name().to_string(),
             source: anyhow::Error::new(err).context("building HTTP client"),
         })?;
 
-        let response = match client.get(url.clone()).send().await {
+        let response = match get_following_redirects(
+            &client,
+            url.clone(),
+            allow_local,
+            HopScheme::Any,
+        )
+        .await
+        {
             Ok(response) => response,
-            Err(err) => return Ok(ToolOutput::error(format!("fetch failed: {err}"))),
+            Err(err) => return Ok(ToolOutput::error(err)),
         };
 
         let status = response.status();
@@ -429,10 +582,13 @@ impl Tool for WebFetchTool {
         };
 
         if !status.is_success() {
+            // Defanged like the success path: an error body is page content
+            // too, authored by the same stranger, and a 404 is the easiest
+            // response in the world to control.
             let snippet = truncate_output(String::from_utf8_lossy(&body).into_owned(), 1_000);
-            return Ok(ToolOutput::error(format!(
+            return Ok(ToolOutput::error(defang(&format!(
                 "fetch of {url} returned HTTP {status}\n{snippet}"
-            )));
+            ))));
         }
 
         let text = String::from_utf8_lossy(&body).into_owned();
@@ -466,8 +622,45 @@ impl Tool for WebFetchTool {
         if capped {
             content.push_str(&format!("\n... [response capped at {cap} bytes]"));
         }
-        Ok(ToolOutput::ok(truncate_output(content, MAX_OUTPUT_BYTES)))
+        Ok(ToolOutput::ok(defang(&truncate_output(
+            content,
+            MAX_OUTPUT_BYTES,
+        ))))
     }
+}
+
+/// Strip what an arbitrary page should not be able to draw with.
+///
+/// A fetched body is the most hostile text this program handles — anyone can
+/// author one — and it went straight into the transcript, the session JSONL and
+/// `--output-format stream-json` as a bare `String`. Peer text, which comes from
+/// somebody the user explicitly trusted, goes through a newtype that cannot be
+/// bypassed; web text had nothing.
+///
+/// Nothing repaints a terminal today, and that is worth stating precisely
+/// rather than leaving as luck: ratatui filters control-containing graphemes
+/// when it fills its buffer, so the TUI is covered by a dependency's
+/// implementation detail with no test in this repo asserting it. Headless
+/// `print!` has no such cover. Either way the escape belongs nowhere
+/// downstream, so it is removed at the boundary it enters through.
+///
+/// Deliberately gentler than the mesh's sanitiser: this keeps newlines and
+/// tabs, because a fetched page is *content* the model is meant to read and
+/// collapsing its layout would damage the thing the tool exists to deliver.
+/// What goes is the set that draws nothing and moves things: C0 and C1 controls
+/// other than `\n`/`\t`, and the invisible/bidi set that
+/// [`crate::mesh::is_invisible`] already defines — reused rather than
+/// re-listed, so there is one audited answer to "what is invisible" instead of
+/// two that can drift.
+fn defang(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !crate::mesh::is_invisible(*ch))
+        .map(|ch| match ch {
+            '\n' | '\t' => ch,
+            ch if ch.is_control() => ' ',
+            ch => ch,
+        })
+        .collect()
 }
 
 /// Whether a content type is textual enough to return verbatim. An absent
@@ -523,6 +716,122 @@ pub trait SearchBackend: Send + Sync {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>>;
 }
 
+/// Send a search-backend request, following redirects by hand.
+///
+/// Every client here comes from [`web_client`], which does not follow
+/// redirects at all — reqwest's policy callback is synchronous and cannot run
+/// the resolving SSRF check, so the chain is always walked in the open. And
+/// `error_for_status` does not consider 3xx an error. Together those meant a
+/// redirected search parsed the *redirect's* body and reported success with
+/// nothing in it: the DuckDuckGo backend, which is the default and the one
+/// that needs no API key, answered a `302` with zero results and no error.
+///
+/// `build` runs again for each hop, so it has to be repeatable — which is why
+/// the backends hand over a closure rather than a built request. The method
+/// and body are replayed as-is (browsers downgrade a POST to GET on 301/302;
+/// an API endpoint that redirects its own POST means the resource moved, not
+/// that it wants a GET).
+///
+/// Only hops that stay on the host we were configured for are followed, so
+/// the request's credentials — an API key in a header or in the JSON body —
+/// are never replayed to a host the operator did not name. A hop off the host
+/// is an error. The point of this function is that it is never silence.
+async fn send_following_redirects<F>(
+    client: &reqwest::Client,
+    start: reqwest::Url,
+    build: F,
+) -> anyhow::Result<reqwest::Response>
+where
+    F: Fn(&reqwest::Client, reqwest::Url) -> reqwest::RequestBuilder + Send,
+{
+    let mut url = start;
+    for _ in 0..=MAX_REDIRECTS {
+        // Built rather than sent directly so the query can be deduplicated
+        // first: `build` calls `.query(…)`, which *appends* through
+        // `query_pairs_mut()`, and a `Location` that carries its own query
+        // string is replayed as the next hop's base. Sending it as built means
+        // `?q=rust&q=rust` — two values for one parameter, resolved by
+        // whichever rule the endpoint happens to use.
+        let mut request = build(client, url.clone()).build()?;
+        drop_duplicate_query_keys(request.url_mut());
+        let response = client.execute(request).await?;
+        let status = response.status();
+        if !status.is_redirection() {
+            return Ok(response.error_for_status()?);
+        }
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            anyhow::bail!("search endpoint returned HTTP {status} with no Location header");
+        };
+        let next = url
+            .join(location)
+            .map_err(|err| anyhow::anyhow!("redirect to invalid url '{location}': {err}"))?;
+        if !hop_stays_home(&url, &next) {
+            anyhow::bail!(
+                "search endpoint redirected from '{url}' to '{next}', off the configured host \
+                 — refusing to replay the request (and its credentials) there"
+            );
+        }
+        url = next;
+    }
+    anyhow::bail!("too many redirects from the search endpoint")
+}
+
+/// Keep the **last** value of every repeated query parameter, dropping the
+/// earlier ones.
+///
+/// Last, not first, because the backend's own `.query(…)` is appended after
+/// whatever the redirect target carried: a `Location` of
+/// `/html/?q=stale&region=us` replayed with `q=rust` must search for `rust`,
+/// while `region=us` — a parameter the endpoint added and the backend knows
+/// nothing about — is kept. A URL with no repeats is left byte-identical
+/// rather than re-encoded, since round-tripping through `query_pairs` rewrites
+/// spaces and percent-escapes and nothing here is worth that risk.
+fn drop_duplicate_query_keys(url: &mut reqwest::Url) {
+    if url.query().is_none() {
+        return;
+    }
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    // Walk backwards so the first sighting of a key is its last occurrence,
+    // then flip back to restore the order the endpoint sent.
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<&(String, String)> = pairs
+        .iter()
+        .rev()
+        .filter(|(key, _)| seen.insert(key.clone()))
+        .collect();
+    if kept.len() == pairs.len() {
+        return;
+    }
+    kept.reverse();
+    let deduped = kept;
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(deduped.iter().map(|(key, value)| (key, value)));
+    // `clear()` on an otherwise empty query leaves a bare `?` behind.
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+}
+
+/// Whether a redirect keeps the request on the host it was addressed to,
+/// without downgrading the transport. A different port on the same host is
+/// still the same machine, so it is allowed; `https` → `http` is not.
+fn hop_stays_home(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    from.host_str().is_some()
+        && from.host_str() == to.host_str()
+        && matches!(
+            (from.scheme(), to.scheme()),
+            ("https", "https") | ("http", "http" | "https")
+        )
+}
+
 /// Default backend: scrape the DuckDuckGo HTML endpoint. No API key.
 pub struct DuckDuckGoHtml {
     base_url: String,
@@ -550,13 +859,12 @@ impl Default for DuckDuckGoHtml {
 #[async_trait]
 impl SearchBackend for DuckDuckGoHtml {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = web_client(true)?;
-        let response = client
-            .get(&self.base_url)
-            .query(&[("q", query)])
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = web_client()?;
+        let url = reqwest::Url::parse(&self.base_url)?;
+        let response = send_following_redirects(&client, url, |client, url| {
+            client.get(url).query(&[("q", query)])
+        })
+        .await?;
         let html = response.text().await?;
         Ok(parse_duckduckgo_html(&html, count))
     }
@@ -638,15 +946,17 @@ impl BraveSearch {
 #[async_trait]
 impl SearchBackend for BraveSearch {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = web_client(true)?;
-        let response = client
-            .get(format!("{}/res/v1/web/search", self.base_url))
-            .header("X-Subscription-Token", &self.api_key)
-            .header("Accept", "application/json")
-            .query(&[("q", query), ("count", &count.to_string())])
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = web_client()?;
+        let url = reqwest::Url::parse(&format!("{}/res/v1/web/search", self.base_url))?;
+        let requested = count.to_string();
+        let response = send_following_redirects(&client, url, |client, url| {
+            client
+                .get(url)
+                .header("X-Subscription-Token", &self.api_key)
+                .header("Accept", "application/json")
+                .query(&[("q", query), ("count", requested.as_str())])
+        })
+        .await?;
         let body: Value = response.json().await?;
         let results = body["web"]["results"]
             .as_array()
@@ -693,17 +1003,16 @@ impl TavilySearch {
 #[async_trait]
 impl SearchBackend for TavilySearch {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = web_client(true)?;
-        let response = client
-            .post(format!("{}/search", self.base_url))
-            .json(&json!({
-                "api_key": self.api_key,
-                "query": query,
-                "max_results": count,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = web_client()?;
+        let url = reqwest::Url::parse(&format!("{}/search", self.base_url))?;
+        let request = json!({
+            "api_key": self.api_key,
+            "query": query,
+            "max_results": count,
+        });
+        let response =
+            send_following_redirects(&client, url, |client, url| client.post(url).json(&request))
+                .await?;
         let body: Value = response.json().await?;
         let results = body["results"]
             .as_array()
@@ -751,19 +1060,21 @@ impl ExaSearch {
 #[async_trait]
 impl SearchBackend for ExaSearch {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = web_client(true)?;
-        let response = client
-            .post(format!("{}/search", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("Accept", "application/json")
-            .json(&json!({
-                "query": query,
-                "numResults": count,
-                "contents": { "text": { "maxCharacters": 300 } },
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = web_client()?;
+        let url = reqwest::Url::parse(&format!("{}/search", self.base_url))?;
+        let request = json!({
+            "query": query,
+            "numResults": count,
+            "contents": { "text": { "maxCharacters": 300 } },
+        });
+        let response = send_following_redirects(&client, url, |client, url| {
+            client
+                .post(url)
+                .header("x-api-key", &self.api_key)
+                .header("Accept", "application/json")
+                .json(&request)
+        })
+        .await?;
         let body: Value = response.json().await?;
         let results = body["results"]
             .as_array()
@@ -810,15 +1121,17 @@ impl SerperSearch {
 #[async_trait]
 impl SearchBackend for SerperSearch {
     async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = web_client(true)?;
-        let response = client
-            .post(format!("{}/search", self.base_url))
-            .header("X-API-KEY", &self.api_key)
-            .header("Accept", "application/json")
-            .json(&json!({ "q": query, "num": count }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let client = web_client()?;
+        let url = reqwest::Url::parse(&format!("{}/search", self.base_url))?;
+        let request = json!({ "q": query, "num": count });
+        let response = send_following_redirects(&client, url, |client, url| {
+            client
+                .post(url)
+                .header("X-API-KEY", &self.api_key)
+                .header("Accept", "application/json")
+                .json(&request)
+        })
+        .await?;
         let body: Value = response.json().await?;
         let results = body["organic"]
             .as_array()
@@ -850,21 +1163,49 @@ enum XaiAuth {
     ApiKey(String),
 }
 
-/// xAI Grok web search via the Responses API server-side `web_search` tool.
+/// Which Responses API server-side tool Grok should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaiServerTool {
+    /// Public web search-and-browse.
+    WebSearch,
+    /// X (Twitter) keyword / semantic / handle search.
+    XSearch,
+}
+
+impl XaiServerTool {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web_search",
+            Self::XSearch => "x_search",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web search",
+            Self::XSearch => "X search",
+        }
+    }
+}
+
+/// xAI Grok search via the Responses API server-side `web_search` or
+/// `x_search` tool.
 ///
 /// Unlike the scraper/keyed backends this is an agentic call: Grok runs its
-/// own search-and-browse loop server-side and returns the synthesized hits.
-/// We ask for a strict JSON envelope and fall back to the response's
-/// `url_citation` annotations / top-level `citations` when the model adds
-/// prose anyway.
+/// own search loop server-side and returns the synthesized hits. We ask for a
+/// strict JSON envelope and fall back to the response's `url_citation`
+/// annotations / top-level `citations` when the model adds prose anyway.
 pub struct XaiSearch {
     base_url: String,
     model: String,
     auth: XaiAuth,
+    server_tool: XaiServerTool,
+    /// Extra fields merged into the `tools[0]` object (handle filters, dates).
+    tool_options: Value,
 }
 
 /// Whole-request timeout for an xAI search. Generous: the server-side
-/// search-and-browse loop is much slower than a single scrape.
+/// search loop is much slower than a single scrape.
 const XAI_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether an xAI OAuth session exists on disk (`wizard --login xai`).
@@ -874,23 +1215,67 @@ fn xai_signed_in() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve xAI auth for search tools: OAuth session if signed in, else a
+/// stored `xai` key, else `search_api_key_env` / `XAI_API_KEY`.
+fn resolve_xai_auth(ctx: &ToolContext) -> Result<XaiSearch, String> {
+    if xai_signed_in() {
+        let source = XaiTokenSource::new()
+            .map_err(|err| format!("opening the xAI OAuth token store: {err:#}"))?;
+        return Ok(XaiSearch::oauth(source));
+    }
+    if let Some(key) = crate::credentials::get("xai")
+        && !key.trim().is_empty()
+    {
+        return Ok(XaiSearch::api_key(key));
+    }
+    let env_name = ctx
+        .web
+        .search_api_key_env
+        .as_deref()
+        .unwrap_or(xai_oauth::DEFAULT_KEY_ENV);
+    match std::env::var(env_name) {
+        Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key)),
+        _ => Err(format!(
+            "xAI search needs auth: run `/login xai` to sign in (or `wizard --login xai`), \
+             or set ${env_name} to an xAI API key"
+        )),
+    }
+}
+
 impl XaiSearch {
-    /// Search using the stored xAI OAuth session.
+    /// Search using the stored xAI OAuth session (web search by default).
     fn oauth(source: XaiTokenSource) -> Self {
         Self {
             base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
             model: xai_oauth::DEFAULT_MODEL.to_string(),
             auth: XaiAuth::Oauth(source),
+            server_tool: XaiServerTool::WebSearch,
+            tool_options: json!({}),
         }
     }
 
-    /// Search using a plain API key.
+    /// Search using a plain API key (web search by default).
     fn api_key(key: impl Into<String>) -> Self {
         Self {
             base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
             model: xai_oauth::DEFAULT_MODEL.to_string(),
             auth: XaiAuth::ApiKey(key.into()),
+            server_tool: XaiServerTool::WebSearch,
+            tool_options: json!({}),
         }
+    }
+
+    /// Switch the server-side tool (`web_search` or `x_search`).
+    fn with_server_tool(mut self, tool: XaiServerTool) -> Self {
+        self.server_tool = tool;
+        self
+    }
+
+    /// Merge extra options into the Responses `tools[0]` object (x_search
+    /// handle filters and date range).
+    fn with_tool_options(mut self, options: Value) -> Self {
+        self.tool_options = options;
+        self
     }
 
     /// Point the backend at a different endpoint (tests use a local server).
@@ -912,12 +1297,21 @@ impl XaiSearch {
     }
 
     /// The Responses API request body: a single user turn that hands Grok the
-    /// `web_search` tool and constrains it to a JSON-only reply.
+    /// chosen server-side tool and constrains it to a JSON-only reply.
     fn request_body(&self, query: &str, count: usize) -> Value {
+        let mut tool = json!({ "type": self.server_tool.as_str() });
+        if let Some(map) = self.tool_options.as_object() {
+            for (key, value) in map {
+                tool[key] = value.clone();
+            }
+        }
         json!({
             "model": self.model,
-            "input": [{ "role": "user", "content": xai_search_prompt(query, count) }],
-            "tools": [{ "type": "web_search" }],
+            "input": [{
+                "role": "user",
+                "content": xai_search_prompt(self.server_tool, query, count)
+            }],
+            "tools": [tool],
             "include": ["no_inline_citations"],
         })
     }
@@ -957,21 +1351,30 @@ impl SearchBackend for XaiSearch {
         let payload: Value = response.json().await?;
         // Some errors arrive as HTTP 200 with an `error` envelope.
         if let Some(message) = payload["error"]["message"].as_str() {
-            anyhow::bail!("xAI web search error: {message}");
+            anyhow::bail!("xAI {} error: {message}", self.server_tool.label());
         }
         Ok(parse_xai_results(&payload, count))
     }
 }
 
-/// Prompt that pins Grok to a JSON-only result envelope.
-fn xai_search_prompt(query: &str, count: usize) -> String {
+/// Prompt that pins Grok to a JSON-only result envelope for a server tool.
+fn xai_search_prompt(tool: XaiServerTool, query: &str, count: usize) -> String {
+    let (use_line, url_hint) = match tool {
+        XaiServerTool::WebSearch => (
+            "Use the web_search tool to find current information for the query below",
+            "with absolute https:// URLs",
+        ),
+        XaiServerTool::XSearch => (
+            "Use the x_search tool to search X (formerly Twitter) for the query below",
+            "with absolute https://x.com/… post or profile URLs when available",
+        ),
+    };
     format!(
-        "Use the web_search tool to find current information for the query below, then \
-         respond with ONLY a single JSON object — no prose, no markdown fences, no inline \
-         citation links — matching this exact schema:\n\n\
+        "{use_line}, then respond with ONLY a single JSON object — no prose, no markdown \
+         fences, no inline citation links — matching this exact schema:\n\n\
          {{\"results\": [{{\"title\": \"string\", \"url\": \"string\", \"description\": \
          \"1-2 sentence summary\"}}]}}\n\n\
-         Return at most {count} results, ordered by relevance, with absolute https:// URLs. \
+         Return at most {count} results, ordered by relevance, {url_hint}. \
          If no usable results exist, return {{\"results\": []}}.\n\n\
          Query: {query}"
     )
@@ -1072,8 +1475,17 @@ fn extract_results_json(text: &str) -> Option<Vec<SearchResult>> {
 }
 
 /// Render results as the numbered markdown list fed back to the model.
+///
+/// [`defang`]ed here rather than at the call sites, because every field in a
+/// [`SearchResult`] is attacker-authored: titles, snippets and URLs come
+/// straight out of a search backend's answer, and getting a chosen string into
+/// one is a matter of publishing a page. `web_search` and `x_search` were
+/// putting them in the transcript, the session JSONL and `stream-json`
+/// verbatim while `web_fetch` — the same text, one hop earlier — was cleaned.
+/// One filter on the one function both tools render through, so a third search
+/// tool cannot forget it.
 fn render_results(results: &[SearchResult]) -> String {
-    results
+    let rendered = results
         .iter()
         .enumerate()
         .map(|(index, result)| {
@@ -1085,7 +1497,8 @@ fn render_results(results: &[SearchResult]) -> String {
             line
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    defang(&rendered)
 }
 
 /// Arguments for [`WebSearchTool`].
@@ -1111,39 +1524,13 @@ impl WebSearchTool {
             "tavily" => Ok(Box::new(TavilySearch::new(Self::api_key(ctx, "tavily")?))),
             "exa" => Ok(Box::new(ExaSearch::new(Self::api_key(ctx, "exa")?))),
             "serper" => Ok(Box::new(SerperSearch::new(Self::api_key(ctx, "serper")?))),
-            "xai" | "grok" => Ok(Box::new(Self::xai_backend(ctx)?)),
+            "xai" | "grok" => Ok(Box::new(
+                resolve_xai_auth(ctx)?.with_server_tool(XaiServerTool::WebSearch),
+            )),
             other => Err(format!(
                 "unknown [web] search_backend '{other}' \
                  (expected duckduckgo, brave, tavily, exa, serper, or xai) — \
                  run /settings to configure web search"
-            )),
-        }
-    }
-
-    /// Build the xAI Grok backend: the OAuth session if the user has signed
-    /// in, else a plain `XAI_API_KEY` (stored key or env var).
-    fn xai_backend(ctx: &ToolContext) -> Result<XaiSearch, String> {
-        if xai_signed_in() {
-            let source = XaiTokenSource::new()
-                .map_err(|err| format!("opening the xAI OAuth token store: {err:#}"))?;
-            return Ok(XaiSearch::oauth(source));
-        }
-        // Not signed in: a stored key, then a configured/default env var.
-        if let Some(key) = crate::credentials::get("xai")
-            && !key.trim().is_empty()
-        {
-            return Ok(XaiSearch::api_key(key));
-        }
-        let env_name = ctx
-            .web
-            .search_api_key_env
-            .as_deref()
-            .unwrap_or(xai_oauth::DEFAULT_KEY_ENV);
-        match std::env::var(env_name) {
-            Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key)),
-            _ => Err(format!(
-                "xAI web search needs auth: run `/login xai` to sign in (or `wizard --login xai`), \
-                 or set ${env_name} to an xAI API key"
             )),
         }
     }
@@ -1231,6 +1618,194 @@ impl Tool for WebSearchTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// x_search
+// ---------------------------------------------------------------------------
+
+/// Arguments for [`XSearchTool`].
+#[derive(Debug, Deserialize)]
+struct XSearchArgs {
+    query: String,
+    /// Number of results (default 5, max 10).
+    #[serde(default)]
+    count: Option<usize>,
+    /// Only include posts from these X handles (max 20).
+    #[serde(default)]
+    allowed_x_handles: Option<Vec<String>>,
+    /// Exclude posts from these X handles (max 20).
+    #[serde(default)]
+    excluded_x_handles: Option<Vec<String>>,
+    /// Inclusive start date (`YYYY-MM-DD`).
+    #[serde(default)]
+    from_date: Option<String>,
+    /// Inclusive end date (`YYYY-MM-DD`).
+    #[serde(default)]
+    to_date: Option<String>,
+}
+
+/// Max handles accepted for allow/exclude lists (matches xAI docs).
+const MAX_X_HANDLES: usize = 20;
+
+/// `x_search` — search X (Twitter) via xAI Grok's server-side `x_search` tool.
+///
+/// Always uses xAI credentials (OAuth from `/login xai` preferred, else a
+/// stored/env API key). Independent of `[web] search_backend`.
+pub struct XSearchTool;
+
+impl XSearchTool {
+    /// Build tool options for the Responses `x_search` object, rejecting
+    /// mutually exclusive handle filters and empty query already handled
+    /// upstream.
+    fn tool_options(args: &XSearchArgs) -> Result<Value, String> {
+        let allowed = normalize_handles(args.allowed_x_handles.as_deref());
+        let excluded = normalize_handles(args.excluded_x_handles.as_deref());
+        if !allowed.is_empty() && !excluded.is_empty() {
+            return Err(
+                "allowed_x_handles and excluded_x_handles cannot be set together".to_string(),
+            );
+        }
+        if allowed.len() > MAX_X_HANDLES {
+            return Err(format!(
+                "allowed_x_handles accepts at most {MAX_X_HANDLES} handles (got {})",
+                allowed.len()
+            ));
+        }
+        if excluded.len() > MAX_X_HANDLES {
+            return Err(format!(
+                "excluded_x_handles accepts at most {MAX_X_HANDLES} handles (got {})",
+                excluded.len()
+            ));
+        }
+        let mut options = serde_json::Map::new();
+        if !allowed.is_empty() {
+            options.insert("allowed_x_handles".to_string(), json!(allowed));
+        }
+        if !excluded.is_empty() {
+            options.insert("excluded_x_handles".to_string(), json!(excluded));
+        }
+        if let Some(from) = args
+            .from_date
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            options.insert("from_date".to_string(), json!(from));
+        }
+        if let Some(to) = args
+            .to_date
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            options.insert("to_date".to_string(), json!(to));
+        }
+        Ok(Value::Object(options))
+    }
+}
+
+/// Strip empty entries and leading `@` from handle lists.
+fn normalize_handles(handles: Option<&[String]>) -> Vec<String> {
+    handles
+        .unwrap_or(&[])
+        .iter()
+        .map(|h| h.trim().trim_start_matches('@').to_string())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+#[async_trait]
+impl Tool for XSearchTool {
+    fn name(&self) -> &str {
+        "x_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search X (formerly Twitter) via xAI Grok and return a numbered list of \
+         posts/profiles (title, url, snippet). Requires `/login xai` or an xAI API key. \
+         Prefer this over web_search for live discussion, posts, and handles on X."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query (keywords, topic, or @handle context)"
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of results (default 5, max 10)"
+                },
+                "allowed_x_handles": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only include posts from these X handles (max 20; no leading @)"
+                },
+                "excluded_x_handles": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exclude posts from these X handles (max 20; cannot combine with allowed_x_handles)"
+                },
+                "from_date": {
+                    "type": "string",
+                    "description": "Inclusive start date (YYYY-MM-DD)"
+                },
+                "to_date": {
+                    "type": "string",
+                    "description": "Inclusive end date (YYYY-MM-DD)"
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn access(&self) -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let args: XSearchArgs = parse_args(self.name(), args)?;
+        if args.query.trim().is_empty() {
+            return Err(ToolError::InvalidArgs {
+                tool: self.name().to_string(),
+                message: "query must not be empty".to_string(),
+            });
+        }
+        let options = match Self::tool_options(&args) {
+            Ok(options) => options,
+            Err(message) => {
+                return Err(ToolError::InvalidArgs {
+                    tool: self.name().to_string(),
+                    message,
+                });
+            }
+        };
+        let count = args
+            .count
+            .unwrap_or(DEFAULT_SEARCH_COUNT)
+            .clamp(1, MAX_SEARCH_COUNT);
+
+        let backend = match resolve_xai_auth(ctx) {
+            Ok(backend) => backend
+                .with_server_tool(XaiServerTool::XSearch)
+                .with_tool_options(options),
+            Err(reason) => return Ok(ToolOutput::error(reason)),
+        };
+        let results = match backend.search(args.query.trim(), count).await {
+            Ok(results) => results,
+            Err(err) => return Ok(ToolOutput::error(format!("X search failed: {err:#}"))),
+        };
+        if results.is_empty() {
+            return Ok(ToolOutput::ok("(no results)"));
+        }
+        Ok(ToolOutput::ok(truncate_output(
+            render_results(&results),
+            MAX_OUTPUT_BYTES,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1287,6 +1862,136 @@ mod tests {
         assert!(!host_is_local_name("notlocal.com"));
     }
 
+    /// A redirect to a private address is refused, not followed.
+    ///
+    /// This is the SSRF hole the manual redirect walk exists to close.
+    /// reqwest's redirect policy is a *synchronous* callback, so it could only
+    /// reach `check_url_sync`, which returns `Ok` for any host that is not a
+    /// literal IP or a `localhost`/`*.local` name — without resolving it. One
+    /// hop through a public hostname that resolves privately was enough to
+    /// reach the cloud metadata service and put its credentials in the model's
+    /// context.
+    ///
+    /// A real listener on loopback stands in for "resolves privately": the
+    /// server is reached only if the redirect is followed, and the assertion is
+    /// that it is not.
+    /// A fetched page cannot carry terminal escapes or invisible text into the
+    /// transcript.
+    ///
+    /// This is the most hostile text the program handles — anyone can author a
+    /// page — and it used to arrive as a bare `String` and go straight into the
+    /// transcript, the session JSONL and `stream-json`. Peer text, which comes
+    /// from somebody the user explicitly trusted, has always gone through a
+    /// newtype that cannot be bypassed.
+    ///
+    /// Newlines and tabs survive on purpose: a page is content the model is
+    /// meant to read, and collapsing its layout would damage the thing the tool
+    /// exists to deliver.
+    #[test]
+    fn a_fetched_page_cannot_carry_escapes_or_invisible_text() {
+        // A cursor-moving CSI, a title-setting OSC, and a C1 introducer.
+        let hostile = "before\u{1b}[2J\u{1b}]0;pwned\u{7}\u{9b}31mafter";
+        let clean = defang(hostile);
+        assert!(
+            !clean
+                .chars()
+                .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'),
+            "a control character survived: {clean:?}"
+        );
+        assert!(
+            clean.contains("before") && clean.contains("after"),
+            "{clean:?}"
+        );
+
+        // Trojan-source bidi and zero-width joiners, which draw nothing and
+        // reorder what is read.
+        let sneaky = "let admin = \u{202e}false\u{202c};\u{200b}\u{2060}";
+        let clean = defang(sneaky);
+        assert!(!clean.contains('\u{202e}'), "{clean:?}");
+        assert!(!clean.contains('\u{200b}'), "{clean:?}");
+        assert!(clean.contains("let admin = false;"), "{clean:?}");
+
+        // Layout the model needs is untouched.
+        let page = "# Title\n\n- one\n- two\n\n\tindented\n";
+        assert_eq!(defang(page), page, "newlines and tabs must survive");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let secret = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let secret_addr = secret.local_addr().expect("addr");
+        let reached = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&reached);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = secret.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nSECRET")
+                    .await;
+            }
+        });
+
+        // The hop that redirects. It is itself on loopback, so the test runs
+        // with `allow_local = true` for the first request and relies on the
+        // *redirect* being checked with the real policy.
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hop_addr = hop.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hop.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{secret_addr}/creds\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let client = web_client().expect("client");
+        let start = reqwest::Url::parse(&format!("http://{hop_addr}/start")).expect("url");
+        let result = get_following_redirects(&client, start, false, HopScheme::Any).await;
+
+        assert!(
+            result.is_err(),
+            "the redirect to a private address must be refused"
+        );
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the private listener was contacted — the redirect was followed"
+        );
+
+        // What the run above does *not* prove, said plainly: its hop target is
+        // a literal IP, which the old synchronous check caught too. The actual
+        // hole was a *hostname* that resolves privately, and reproducing that
+        // needs DNS this suite must not depend on. So the resolving check being
+        // the one on the redirect path is asserted from the source instead —
+        // swapping it back for `check_url_sync` is the regression, and it would
+        // not fail either of the assertions above.
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools/web.rs"))
+                .expect("this file");
+        let walk = source
+            .split_once("async fn get_following_redirects")
+            .expect("the redirect walk exists")
+            .1;
+        let body = walk.split_once("\nfn ").map_or(walk, |(body, _)| body);
+        assert!(
+            body.contains("check_url(&next, allow_local).await"),
+            "the redirect walk must await the resolving check, not the sync one"
+        );
+    }
+
     #[tokio::test]
     async fn check_url_rejects_private_ranges_and_local_names() {
         for url in [
@@ -1304,6 +2009,71 @@ mod tests {
             let parsed = reqwest::Url::parse(url).unwrap();
             let err = check_url(&parsed, false).await.expect_err(url);
             assert!(err.contains("blocked"), "{url}: {err}");
+        }
+    }
+
+    /// The ranges that are not routable public internet, and that
+    /// `Ipv4Addr::is_private` says nothing about.
+    ///
+    /// RFC1918 is three prefixes; "somewhere a fetch must not go" is a great
+    /// many more. The one that mattered was `100.64.0.0/10`: `is_private`
+    /// returned false for `100.100.100.200`, which is Alibaba Cloud's instance
+    /// metadata endpoint, and Kubernetes and EKS habitually allocate pod and
+    /// service CIDRs out of the same block — so a `web_fetch`, or a
+    /// `generate_image` download, could read cluster-internal services. The
+    /// rest are cheap to block and were equally open.
+    #[tokio::test]
+    async fn check_url_rejects_the_ranges_that_are_not_the_public_internet() {
+        for (url, what) in [
+            ("http://100.64.0.1/", "CGNAT 100.64.0.0/10, low end"),
+            ("http://100.100.100.200/", "Alibaba Cloud instance metadata"),
+            ("http://100.127.255.255/", "CGNAT 100.64.0.0/10, high end"),
+            (
+                "http://192.0.0.1/",
+                "IETF protocol assignments 192.0.0.0/24",
+            ),
+            ("http://198.18.0.1/", "benchmarking 198.18.0.0/15"),
+            ("http://198.19.255.255/", "benchmarking 198.18.0.0/15"),
+            ("http://224.0.0.1/", "multicast 224.0.0.0/4"),
+            ("http://239.255.255.250/", "SSDP multicast"),
+            ("http://240.0.0.1/", "reserved 240.0.0.0/4"),
+            ("http://255.255.255.255/", "broadcast"),
+            ("http://0.0.0.0/", "unspecified"),
+            ("http://0.0.0.1/", "this network 0.0.0.0/8"),
+            ("http://[::7f00:1]/", "IPv4-compatible IPv6 loopback"),
+            ("http://[::ffff:7f00:1]/", "IPv4-mapped IPv6 loopback"),
+            ("http://[::ffff:6440:1]/", "IPv4-mapped CGNAT"),
+            ("http://[64:ff9b::7f00:1]/", "NAT64 well-known prefix"),
+            ("http://[64:ff9b:1::1]/", "NAT64 local-use prefix"),
+            (
+                "http://[64:ff9b:beef::1]/",
+                "the rest of the NAT64 allocation 64:ff9b::/32",
+            ),
+            ("http://[ff02::1]/", "IPv6 all-nodes multicast"),
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let err = check_url(&parsed, false).await.expect_err(what);
+            assert!(err.contains("blocked"), "{what} ({url}): {err}");
+        }
+    }
+
+    /// And the neighbours of those ranges are still reachable — a guard that
+    /// blocks the public internet is not a guard, it is an outage.
+    #[tokio::test]
+    async fn check_url_still_allows_the_addresses_next_door() {
+        for (url, what) in [
+            ("http://100.63.255.255/", "just below CGNAT"),
+            ("http://100.128.0.1/", "just above CGNAT"),
+            ("http://192.0.1.1/", "just above 192.0.0.0/24"),
+            ("http://198.17.255.255/", "just below the benchmark range"),
+            ("http://198.20.0.1/", "just above the benchmark range"),
+            ("http://223.255.255.255/", "just below multicast"),
+            ("http://1.1.1.1/", "a public resolver"),
+            ("http://[2606:4700:4700::1111]/", "a public IPv6 resolver"),
+            ("http://[64:ff9a::1]/", "just below the NAT64 prefix"),
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            check_url(&parsed, false).await.expect(what);
         }
     }
 
@@ -1806,6 +2576,171 @@ mod tests {
         assert_eq!(results[0].url, "https://www.rust-lang.org/");
     }
 
+    /// A redirected search follows the hop instead of reporting nothing found.
+    ///
+    /// The search clients stopped following redirects when the SSRF hardening
+    /// gave every web client `Policy::none()`, and nothing was put in their
+    /// place. `error_for_status` does not treat 3xx as an error, so the
+    /// backend went on to parse the redirect's empty body: `web_search`
+    /// answered "no results" — the honest-looking failure, on the backend that
+    /// is the default and the only one that needs no API key.
+    #[tokio::test]
+    async fn a_redirected_search_follows_the_hop_rather_than_finding_nothing() {
+        let addr = serve_redirect_then(DDG_FIXTURE).await;
+        let backend = DuckDuckGoHtml::with_base_url(format!("http://{addr}/html"));
+        let results = backend.search("rust", 5).await.expect("search ok");
+        assert_eq!(
+            results.len(),
+            2,
+            "the redirect was followed, not parsed as an empty page"
+        );
+    }
+
+    /// A search endpoint that redirects off its host is an error, not a
+    /// silently unauthenticated request somewhere else. The keyed backends put
+    /// an API key in a header or a JSON body; replaying that at whatever host
+    /// a `302` names hands the key to that host.
+    #[tokio::test]
+    async fn a_search_redirect_off_the_configured_host_is_refused() {
+        let addr = serve(
+            "HTTP/1.1 302 Found\r\nLocation: http://93.184.216.34/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let backend = DuckDuckGoHtml::with_base_url(format!("http://{addr}/html"));
+        let err = format!(
+            "{:#}",
+            backend.search("rust", 5).await.expect_err("refused")
+        );
+        assert!(
+            err.contains("off the configured host"),
+            "the hop off-host is what must be refused: {err}"
+        );
+    }
+
+    /// A redirect whose `Location` carries its own query string must not make
+    /// the backend send its parameters twice.
+    ///
+    /// `.query(…)` appends through `query_pairs_mut()`, so replaying the
+    /// request against a `Location` of `?q=stale` produced `?q=stale&q=rust`:
+    /// two values for one parameter, and which one wins is the endpoint's
+    /// business, not ours. What the endpoint added for itself has to survive,
+    /// which is why this is a de-duplication and not a `set_query(None)`.
+    #[tokio::test]
+    async fn a_redirect_carrying_a_query_does_not_duplicate_the_search_parameter() {
+        let (addr, seen) =
+            serve_redirect_carrying_a_query("?q=stale&region=us-en", DDG_FIXTURE).await;
+        let backend = DuckDuckGoHtml::with_base_url(format!("http://{addr}/html"));
+        let results = backend.search("rust", 5).await.expect("search ok");
+        assert_eq!(results.len(), 2, "the redirect was followed");
+
+        let targets = seen.lock().expect("recorder").clone();
+        assert_eq!(targets.len(), 2, "one hop, then the replay: {targets:?}");
+        let replayed = &targets[1];
+        assert_eq!(
+            replayed.matches("q=").count(),
+            1,
+            "exactly one q= on the replayed hop: {replayed}"
+        );
+        assert!(replayed.contains("q=rust"), "{replayed}");
+        assert!(
+            !replayed.contains("q=stale"),
+            "the redirect's stale value must lose to the backend's: {replayed}"
+        );
+        assert!(
+            replayed.contains("region=us-en"),
+            "a parameter the endpoint added for itself is kept: {replayed}"
+        );
+    }
+
+    #[test]
+    fn de_duplicating_a_query_leaves_a_url_without_repeats_alone() {
+        for untouched in [
+            "http://example.com/search",
+            "http://example.com/search?q=a%20b&region=us-en",
+            "http://example.com/search#frag",
+        ] {
+            let mut url = reqwest::Url::parse(untouched).expect("parse");
+            drop_duplicate_query_keys(&mut url);
+            assert_eq!(url.as_str(), untouched, "rewritten needlessly");
+        }
+
+        // And a query that is *only* repeats collapses without leaving the
+        // bare `?` that `query_pairs_mut().clear()` writes.
+        let mut url = reqwest::Url::parse("http://example.com/s?q=one&q=two").expect("parse");
+        drop_duplicate_query_keys(&mut url);
+        assert_eq!(url.as_str(), "http://example.com/s?q=two");
+    }
+
+    /// Answer the first request with a same-host `302` whose `Location` also
+    /// carries `location_query`, then serve `body`. Every request target the
+    /// server saw is recorded, so a test can read what the replayed hop asked
+    /// for rather than infer it from the answer.
+    async fn serve_redirect_carrying_a_query(
+        location_query: &'static str,
+        body: &'static str,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let redirect = std::mem::take(&mut first);
+                let recorder = std::sync::Arc::clone(&recorder);
+                let response = if redirect {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/html/{location_query}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    http_response("text/html", body)
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    if let Some(target) = request.split_whitespace().nth(1) {
+                        recorder.lock().expect("recorder").push(target.to_string());
+                    }
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Answer the first request with a same-host `302` and every later one
+    /// with `body` as HTML.
+    async fn serve_redirect_then(body: &'static str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = if std::mem::take(&mut first) {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/html/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    http_response("text/html", body)
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn brave_backend_parses_the_api_shape() {
         let body = json!({
@@ -1976,6 +2911,59 @@ mod tests {
         );
     }
 
+    /// Search results are defanged like fetched pages are.
+    ///
+    /// Titles, snippets and URLs are written by whoever published the page the
+    /// backend indexed, which is anyone. `web_fetch` cleaned its body and these
+    /// two tools — the same text one hop earlier — did not, so a CSI in a
+    /// result title went into the transcript, the session JSONL and
+    /// `stream-json` untouched.
+    #[test]
+    fn rendered_results_cannot_carry_escapes_or_invisible_text() {
+        let rendered = render_results(&[SearchResult {
+            title: "Clean\u{1b}[2J title".to_string(),
+            url: "https://evil.example/\u{202e}gnp.exe".to_string(),
+            snippet: "snippet\u{1b}]0;pwned\u{7} tail\u{200b}".to_string(),
+        }]);
+        assert!(
+            !rendered
+                .chars()
+                .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'),
+            "a control character survived: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{200b}'), "{rendered:?}");
+        assert!(rendered.contains("title"), "{rendered:?}");
+    }
+
+    /// An error body is page content too, and the easiest response to control.
+    #[tokio::test]
+    async fn an_http_error_body_cannot_carry_escapes_either() {
+        let body = "gone\u{1b}[2Jaway\u{202e}";
+        let addr = serve(format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let out = WebFetchTool
+            .execute(
+                json!({ "url": format!("http://{addr}/missing") }),
+                &local_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            !out.content
+                .chars()
+                .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'),
+            "a control character survived: {:?}",
+            out.content
+        );
+        assert!(!out.content.contains('\u{202e}'), "{}", out.content);
+        assert!(out.content.contains("HTTP 404"), "{}", out.content);
+    }
+
     #[tokio::test]
     async fn search_rejects_empty_queries() {
         let err = WebSearchTool
@@ -2039,5 +3027,107 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    // -- x_search -------------------------------------------------------------
+
+    #[test]
+    fn x_search_request_body_uses_x_search_tool_and_options() {
+        let backend = XaiSearch::api_key("test-key")
+            .with_server_tool(XaiServerTool::XSearch)
+            .with_tool_options(json!({
+                "allowed_x_handles": ["xai"],
+                "from_date": "2026-01-01"
+            }));
+        let body = backend.request_body("status of grok", 3);
+        assert_eq!(body["tools"][0]["type"], "x_search");
+        assert_eq!(body["tools"][0]["allowed_x_handles"], json!(["xai"]));
+        assert_eq!(body["tools"][0]["from_date"], "2026-01-01");
+        let prompt = body["input"][0]["content"].as_str().expect("prompt");
+        assert!(prompt.contains("x_search"), "{prompt}");
+        assert!(prompt.contains("status of grok"), "{prompt}");
+        assert!(prompt.contains("at most 3 results"), "{prompt}");
+    }
+
+    #[test]
+    fn web_search_request_body_still_uses_web_search_tool() {
+        let body = XaiSearch::api_key("test-key").request_body("rust", 5);
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        let prompt = body["input"][0]["content"].as_str().expect("prompt");
+        assert!(prompt.contains("web_search"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn x_search_backend_extracts_the_json_envelope() {
+        let envelope = r#"{"results":[{"title":"@xai","url":"https://x.com/xai/status/1","description":"post"}]}"#;
+        let body = json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": envelope, "annotations": [] }]
+            }]
+        })
+        .to_string();
+        let addr = serve(http_response("application/json", &body)).await;
+        let backend = XaiSearch::api_key("test-key")
+            .with_server_tool(XaiServerTool::XSearch)
+            .with_base_url(format!("http://{addr}"));
+        let results = backend.search("status", 5).await.expect("search ok");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "@xai");
+        assert_eq!(results[0].url, "https://x.com/xai/status/1");
+        assert_eq!(results[0].snippet, "post");
+    }
+
+    #[tokio::test]
+    async fn x_search_rejects_empty_queries() {
+        let err = XSearchTool
+            .execute(json!({ "query": "  " }), &local_ctx())
+            .await
+            .expect_err("empty query");
+        assert!(matches!(err, ToolError::InvalidArgs { tool, .. } if tool == "x_search"));
+    }
+
+    #[test]
+    fn x_search_rejects_both_handle_filters() {
+        let err = XSearchTool::tool_options(&XSearchArgs {
+            query: "rust".to_string(),
+            count: None,
+            allowed_x_handles: Some(vec!["a".to_string()]),
+            excluded_x_handles: Some(vec!["b".to_string()]),
+            from_date: None,
+            to_date: None,
+        })
+        .expect_err("mutually exclusive");
+        assert!(err.contains("cannot be set together"), "{err}");
+    }
+
+    #[test]
+    fn x_search_normalizes_handles_and_strips_at() {
+        let options = XSearchTool::tool_options(&XSearchArgs {
+            query: "rust".to_string(),
+            count: None,
+            allowed_x_handles: Some(vec![
+                "@xai".to_string(),
+                "  ".to_string(),
+                "grok".to_string(),
+            ]),
+            excluded_x_handles: None,
+            from_date: Some("2026-06-01".to_string()),
+            to_date: Some("".to_string()),
+        })
+        .expect("ok");
+        assert_eq!(options["allowed_x_handles"], json!(["xai", "grok"]));
+        assert_eq!(options["from_date"], json!("2026-06-01"));
+        assert!(options.get("to_date").is_none());
+        assert!(options.get("excluded_x_handles").is_none());
+    }
+
+    #[test]
+    fn x_search_tool_metadata_is_read_only() {
+        assert_eq!(XSearchTool.name(), "x_search");
+        assert_eq!(XSearchTool.access(), ToolAccess::ReadOnly);
+        assert!(XSearchTool.description().contains("X"));
+        assert_eq!(XSearchTool.parameters()["required"], json!(["query"]));
     }
 }

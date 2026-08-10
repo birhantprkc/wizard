@@ -3,6 +3,16 @@
 //! Thin `reqwest` wrapper — no `ollama-rs` dependency, keeping the binary
 //! small. Provides a startup health probe, a native-tool-support probe, and
 //! NDJSON streaming chat.
+//!
+//! This is the OpenAI-compatible family's odd one out: the native endpoint is
+//! not block-structured and it has no tool-call ids, so
+//! [`build_request_body`] flattens Wizard's blocks into Ollama's own shape and
+//! [`parse_chunk_line`] mints the ids the rest of the tree correlates by.
+//! Prompt caching has no counterpart either, and it degrades to nothing rather
+//! than to a field on the wire: the server keeps the loaded model's KV cache
+//! between requests and reuses the matching prefix on its own, so there is no
+//! `prompt_cache_key` to send. Nothing is lost by leaving it off; sending it
+//! would only put a key on the wire that this API never defined.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,8 +27,6 @@ use super::provider::LlmProvider;
 use super::{ChatChunk, ChatOptions, ChatRequest, ChatStream, ProviderError};
 use crate::server::{ByteProgress, Progress};
 
-/// How long to wait for a TCP/TLS connection before declaring Ollama down.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overall timeout for small control requests (`/api/tags`, `/api/show`).
 /// Chat requests are exempt — generation can legitimately take minutes.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,12 +62,27 @@ pub enum OllamaError {
 impl OllamaError {
     /// Whether this error is transient — a retry after backoff may succeed.
     /// Connection/timeout failures and server-busy/rate-limit/5xx statuses
-    /// are transient; a missing model or a 4xx (other than 429) is not.
+    /// are transient; a missing model or a 4xx (other than 408 and 429) is not.
+    ///
+    /// The status arm is deliberately [`ProviderError::is_transient`] rather
+    /// than a second opinion about the same numbers. Ollama is rarely reached
+    /// directly in a setup that has a status to classify at all: what answers
+    /// is a reverse proxy, a Tailscale front end or a hosted
+    /// Ollama-compatible endpoint, and those are the things that emit the 408
+    /// this used to call permanent — a gateway timing out a long generation,
+    /// which is the single most retryable failure there is. Two predicates
+    /// over one set of statuses is how they came to disagree; there is now
+    /// one, and [`typed`] already guarantees both error types are reachable
+    /// from the same `anyhow` chain.
     pub fn is_transient(&self) -> bool {
         match self {
             OllamaError::Unreachable { .. } => true,
             OllamaError::ModelMissing(_) => false,
-            OllamaError::Api { status, .. } => status.as_u16() == 429 || status.is_server_error(),
+            OllamaError::Api { status, .. } => ProviderError {
+                status: Some(status.as_u16()),
+                message: String::new(),
+            }
+            .is_transient(),
         }
     }
 }
@@ -70,6 +93,21 @@ impl OllamaError {
 /// The two classifications agree: `ModelMissing` maps to its originating
 /// 404 and `Unreachable` to a transport failure.
 fn typed(err: OllamaError) -> anyhow::Error {
+    typed_with_retry_after(err, None)
+}
+
+/// [`typed`], plus the `Retry-After` the response carried.
+///
+/// The hint rides *under* both typed errors on the same `anyhow` chain
+/// instead of becoming a field on either, exactly as
+/// [`crate::llm::http_error_with_retry_after`] arranges it for the
+/// HTTP-status providers: the head of the chain (and so the message the user
+/// sees) is unchanged, and all three of `OllamaError`, `ProviderError` and
+/// `RetryAfter` stay reachable by `downcast_ref`. Ollama itself does not send
+/// the header, but a reverse proxy or a hosted Ollama-compatible endpoint in
+/// front of it does, and a 429 that names its own deadline beats our ladder
+/// guessing at one.
+fn typed_with_retry_after(err: OllamaError, retry_after: Option<Duration>) -> anyhow::Error {
     let status = match &err {
         OllamaError::Unreachable { .. } => None,
         OllamaError::ModelMissing(_) => Some(404),
@@ -79,7 +117,12 @@ fn typed(err: OllamaError) -> anyhow::Error {
         status,
         message: err.to_string(),
     };
-    anyhow::Error::new(err).context(provider)
+    match retry_after {
+        Some(delay) => anyhow::Error::new(crate::llm::RetryAfter(delay))
+            .context(err)
+            .context(provider),
+        None => anyhow::Error::new(err).context(provider),
+    }
 }
 
 /// Client bound to one Ollama host. Cheap to clone.
@@ -97,8 +140,20 @@ impl OllamaClient {
     /// slashes are trimmed.
     pub fn new(host: impl Into<String>) -> Self {
         let host = host.into().trim_end_matches('/').to_string();
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+        // The same builder every other chat backend uses, and for the reason
+        // this one used to be the exception for: Ollama is "the local one", so
+        // it was given a hand-rolled client with a connect timeout and nothing
+        // else. But `WIZARD_OLLAMA_HOST` points at another machine as often as
+        // not — a GPU box on the LAN, a Tailscale address, an SSH tunnel — and
+        // against those a connection that is accepted and then goes silent had
+        // no read timeout at all. `pull_model` and the status probes wait on
+        // that stream, so a half-open NAT binding or a suspended host hung them
+        // with nothing to classify and no retry to make.
+        //
+        // `client_read_timeout_for` is what keeps the local case unchanged: a
+        // loopback or LAN host still gets `None`, because a local model that is
+        // simply thinking slowly must not be killed for it.
+        let http = super::chat_http_builder(super::client_read_timeout_for(&host))
             .build()
             // Builder construction only fails when the TLS backend cannot
             // initialize; fall back to the default client rather than panic.
@@ -143,6 +198,8 @@ impl OllamaClient {
         model: Option<&str>,
     ) -> anyhow::Error {
         let status = response.status();
+        // Before `text()`, which consumes the response along with its headers.
+        let retry_after = crate::llm::retry_after_from_headers(response.headers());
         let body = response.text().await.unwrap_or_default();
         if let Some(model) = model
             && status == reqwest::StatusCode::NOT_FOUND
@@ -150,7 +207,7 @@ impl OllamaClient {
         {
             return typed(OllamaError::ModelMissing(model.to_string()));
         }
-        typed(OllamaError::Api { status, body })
+        typed_with_retry_after(OllamaError::Api { status, body }, retry_after)
     }
 
     /// Startup health probe: `GET /api/tags`. Errors with
@@ -390,40 +447,76 @@ impl LlmProvider for OllamaClient {
 
 /// Translate a native [`ChatRequest`] into Ollama's `/api/chat` body.
 ///
-/// Identical to the request's own serde shape but for `images`: Ollama's native
-/// endpoint takes a sibling array of bare base64 strings on the message (it
-/// sniffs the media type itself), whereas Wizard carries typed
-/// [`Image`](crate::llm::Image)s. Images on an *assistant* message — ones the
-/// model generated — are named in its text instead: an assistant turn is not
-/// image input, and a vision model handed its own output back as input would
-/// only be confused by it.
+/// The top-level shape is the request's own serde shape; the messages are
+/// rebuilt, because Ollama's native endpoint is the one backend that is *not*
+/// block-structured. It wants a flat string `content`, a sibling `tool_calls`
+/// array, and a sibling array of bare base64 image strings (it sniffs the
+/// media type itself), where Wizard carries [`ContentBlock`]s.
+///
+/// Images on an *assistant* message, ones the model generated, are named in
+/// its text instead: an assistant turn is not image input, and a vision model
+/// handed its own output back as input would only be confused by it.
+///
+/// Tool-call ids have nowhere to go here. Ollama correlates results by
+/// position, so a `tool`-role message's blocks are emitted as one message per
+/// result, in order, which is what the model that made the calls expects.
 fn build_request_body(request: &ChatRequest) -> Result<serde_json::Value> {
     use crate::llm::Role;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     let mut body = serde_json::to_value(request).context("serializing chat request")?;
-    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-        return Ok(body);
-    };
-    for (wire, message) in messages.iter_mut().zip(&request.messages) {
-        if message.images.is_empty() {
-            continue;
-        }
-        if message.role == Role::Assistant {
-            wire["content"] = Value::String(crate::llm::assistant_content(message));
-            if let Some(object) = wire.as_object_mut() {
-                object.remove("images");
+    let mut messages: Vec<Value> = Vec::with_capacity(request.messages.len());
+    for message in &request.messages {
+        let role = match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        if message.role == Role::Tool {
+            for result in message.tool_results() {
+                messages.push(json!({
+                    "role": role,
+                    "content": result.content,
+                    "tool_name": result.name,
+                }));
             }
             continue;
         }
-        wire["images"] = Value::Array(
-            message
-                .images
-                .iter()
-                .map(|image| Value::String(image.b64.clone()))
-                .collect(),
-        );
+        let content = if message.role == Role::Assistant {
+            crate::llm::assistant_content(message)
+        } else {
+            message.text()
+        };
+        let mut wire = json!({ "role": role, "content": content });
+        let tool_calls = message.tool_calls();
+        if !tool_calls.is_empty() {
+            wire["tool_calls"] = Value::Array(
+                tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({ "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        }})
+                    })
+                    .collect(),
+            );
+        }
+        // Only *input* images reach the wire; an assistant's own are already
+        // named in `content` above.
+        let images = message.images();
+        if !images.is_empty() && message.role != Role::Assistant {
+            wire["images"] = Value::Array(
+                images
+                    .iter()
+                    .map(|image| Value::String(image.b64.clone()))
+                    .collect(),
+            );
+        }
+        messages.push(wire);
     }
+    body["messages"] = Value::Array(messages);
     Ok(body)
 }
 
@@ -572,9 +665,18 @@ impl<'a> PullRender<'a> {
 }
 
 /// Compact display form of a layer digest: `sha256:ab12cd34…`.
+///
+/// Cut by characters, not bytes. The digest is whatever the server put in the
+/// pull stream — hex in practice, but nothing here verifies that — and
+/// `&hex[..8]` panics outright when byte 8 lands mid-codepoint. A remote
+/// Ollama, or anything answering on its port, could bring the process down
+/// with a nine-character digest containing one accented letter.
 fn short_digest(digest: &str) -> String {
     match digest.split_once(':') {
-        Some((algo, hex)) if hex.len() > 8 => format!("{algo}:{}…", &hex[..8]),
+        Some((algo, hex)) if hex.chars().count() > 8 => {
+            let head: String = hex.chars().take(8).collect();
+            format!("{algo}:{head}…")
+        }
         _ => digest.to_string(),
     }
 }
@@ -608,14 +710,52 @@ struct ErrorLine {
     error: String,
 }
 
+/// Type an in-band `{"error": ...}` line so the retry ladder can classify it.
+///
+/// This used to be a bare `bail!`, which put an untyped `anyhow` on the wire.
+/// [`crate::agent::error_is_transient`] *defaults* an error it does not
+/// recognize to transient — the right default, since ending a run over an
+/// unfamiliar error is worse than retrying one — so every mid-stream Ollama
+/// error was retried regardless of what it said. That was survivable while the
+/// breaker ended a continuous run outright; now that such a run waits an open
+/// breaker out, a permanent one would be waited on for hours before the
+/// patience ceiling stopped it. A missing model is never going to appear by
+/// itself, so it is named as the permanent condition it is.
+///
+/// Anything else stays retryable, but *typed* — a deliberate classification
+/// rather than a fall-through, so the ladder's bound is the one meant for
+/// outages rather than the one meant for the unknown.
+fn classify_stream_error(message: &str) -> anyhow::Error {
+    let lower = message.to_ascii_lowercase();
+    let missing_model =
+        (lower.contains("not found") || lower.contains("no such model")) && lower.contains("model");
+    if missing_model {
+        return typed(OllamaError::ModelMissing(message.to_string()));
+    }
+    anyhow::Error::new(ProviderError::transport(format!("Ollama error: {message}")))
+}
+
 /// Parse one NDJSON line into a [`ChatChunk`], surfacing Ollama's in-band
 /// `{"error": ...}` lines as errors.
 fn parse_chunk_line(line: &str) -> Result<ChatChunk> {
     match serde_json::from_str::<ChatChunk>(line) {
-        Ok(chunk) => Ok(chunk),
+        Ok(mut chunk) => {
+            // Ollama's native `tool_calls` carry no ids at all: it pairs
+            // results by position. Everything downstream correlates by id, so
+            // one is minted here, at the seam, rather than special-cased in
+            // the agent loop.
+            if let Some(message) = chunk.message.as_mut() {
+                let mut calls = message.take_tool_calls();
+                crate::llm::ensure_tool_call_ids(&mut calls);
+                for call in calls {
+                    message.push_tool_call(call);
+                }
+            }
+            Ok(chunk)
+        }
         Err(parse_err) => {
             if let Ok(err) = serde_json::from_str::<ErrorLine>(line) {
-                bail!("Ollama error: {}", err.error);
+                return Err(classify_stream_error(&err.error));
             }
             let preview: String = line.chars().take(200).collect();
             Err(anyhow!(parse_err).context(format!("unparseable line from Ollama: {preview}")))
@@ -628,6 +768,16 @@ struct NdjsonState<S> {
     bytes: S,
     buf: Vec<u8>,
     finished: bool,
+    /// The bytes ran out before any line said `done: true`. Raised on the
+    /// *next* poll rather than immediately, so a trailing line the peer never
+    /// newline-terminated is still delivered first.
+    ///
+    /// This is the state [`NdjsonState::finished`] used to swallow. Both a
+    /// completed generation and a connection cut mid-generation reach EOF; the
+    /// second used to end the stream with `Ok(None)`, handing the agent every
+    /// token that had arrived and no `done` chunk at all, which is
+    /// indistinguishable from a turn that finished normally.
+    cut: bool,
 }
 
 /// Turn a raw byte stream into a [`ChatStream`] by splitting on newlines and
@@ -641,10 +791,14 @@ where
         bytes,
         buf: Vec::new(),
         finished: false,
+        cut: false,
     };
     stream::try_unfold(state, |mut state| async move {
         if state.finished {
             return Ok(None);
+        }
+        if state.cut {
+            return Err(crate::llm::stream_ended_early("the Ollama stream"));
         }
         loop {
             // Drain any complete lines already buffered.
@@ -667,13 +821,20 @@ where
                 None => {
                     // EOF: flush a trailing line without a newline (also the
                     // whole body when the caller requested `stream: false`).
-                    state.finished = true;
-                    let rest = String::from_utf8_lossy(&state.buf);
-                    let rest = rest.trim();
+                    // Whatever that line says decides which of the two endings
+                    // this was; an empty buffer means the peer stopped talking
+                    // without ever saying the reply was over.
+                    let rest = String::from_utf8_lossy(&state.buf).trim().to_string();
+                    state.buf.clear();
                     if rest.is_empty() {
-                        return Ok(None);
+                        return Err(crate::llm::stream_ended_early("the Ollama stream"));
                     }
-                    let chunk = parse_chunk_line(rest)?;
+                    let chunk = parse_chunk_line(&rest)?;
+                    if chunk.done {
+                        state.finished = true;
+                    } else {
+                        state.cut = true;
+                    }
                     return Ok(Some((chunk, state)));
                 }
             }
@@ -694,6 +855,52 @@ mod tests {
         assert_eq!(client.url("/api/tags"), "http://127.0.0.1:11434/api/tags");
     }
 
+    /// A digest from the pull stream cannot panic the process.
+    ///
+    /// The cut was `&hex[..8]`, on a string this program never validates: it
+    /// is whatever the server put in its progress JSON. Byte 8 landing inside
+    /// a multi-byte codepoint is an immediate panic, so any host answering on
+    /// the Ollama port could take Wizard down mid-pull with one accented
+    /// character.
+    #[test]
+    fn a_digest_is_shortened_by_characters_not_bytes() {
+        assert_eq!(short_digest("sha256:ab12cd34ef"), "sha256:ab12cd34…");
+        // Exactly eight characters, and fewer: nothing to cut.
+        assert_eq!(short_digest("sha256:ab12cd34"), "sha256:ab12cd34");
+        assert_eq!(short_digest("sha256:ab"), "sha256:ab");
+        assert_eq!(short_digest("no-colon"), "no-colon");
+        // Nine two-byte characters: byte 8 lands mid-codepoint, which is
+        // where the old cut panicked.
+        assert_eq!(short_digest("sha256:ééééééééé"), "sha256:éééééééé…");
+        // Three four-byte characters: under the limit by count, over it by
+        // bytes, so the old cut panicked here too.
+        assert_eq!(short_digest("sha256:🧙🧙🧙"), "sha256:🧙🧙🧙");
+    }
+
+    /// Ollama's client is built by the shared chat builder, so it carries the
+    /// same read timeout policy as every other backend.
+    ///
+    /// It was the one hand-rolled client in the tree: a connect timeout and
+    /// nothing else. `WIZARD_OLLAMA_HOST` regularly points at another machine,
+    /// and against one of those a connection that is accepted and then goes
+    /// quiet hung `pull_model` and the status probes with no timeout to end it.
+    /// Grep, because a read timeout is not readable back off a `reqwest::Client`.
+    #[test]
+    fn the_ollama_client_uses_the_shared_chat_builder() {
+        let source = include_str!("ollama.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("this module ends with its test module");
+        assert!(
+            production.contains("super::chat_http_builder(super::client_read_timeout_for("),
+            "the client must come from the shared builder with the locality-aware read timeout"
+        );
+        assert!(
+            !production.contains("reqwest::Client::builder()"),
+            "no second, timeout-less client policy in this module"
+        );
+    }
+
     fn request(messages: Vec<crate::llm::ChatMessage>) -> ChatRequest {
         ChatRequest {
             model: "qwen3-vl".to_string(),
@@ -702,6 +909,183 @@ mod tests {
             stream: true,
             options: None,
         }
+    }
+
+    /// Ollama's native `/api/chat` is the one backend that is not
+    /// block-structured: it wants a flat string `content` and a sibling
+    /// `tool_calls` array, so the block list has to be flattened rather than
+    /// serialized straight through.
+    ///
+    /// It also has no place for a tool-call id (it pairs results by
+    /// position), so a batch's one `tool`-role message expands to one wire
+    /// message per result, in call order.
+    #[test]
+    fn blocks_flatten_to_the_native_string_and_sibling_shape() {
+        let mut assistant = crate::llm::ChatMessage::assistant("running both");
+        assistant.push_tool_call(crate::llm::ToolCall::new(
+            "read_file",
+            serde_json::json!({ "path": "a" }),
+        ));
+        assistant.push_tool_call(crate::llm::ToolCall::new(
+            "read_file",
+            serde_json::json!({ "path": "b" }),
+        ));
+        let ids: Vec<String> = assistant
+            .tool_calls()
+            .iter()
+            .map(|call| call.id.clone())
+            .collect();
+        let mut results = crate::llm::ChatMessage::tool_result(&ids[0], "read_file", "a body");
+        results.push_tool_result(&ids[1], "read_file", "b body");
+
+        let body = build_request_body(&request(vec![
+            crate::llm::ChatMessage::user("read both"),
+            assistant,
+            results,
+        ]))
+        .expect("body");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4, "one wire message per result");
+        assert_eq!(messages[0]["content"], "read both");
+        assert_eq!(
+            messages[1]["content"], "running both",
+            "content is a plain string, not a block array"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"]["path"],
+            "a"
+        );
+        assert_eq!(
+            messages[1]["tool_calls"][1]["function"]["arguments"]["path"],
+            "b"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["content"], "a body");
+        assert_eq!(messages[2]["tool_name"], "read_file");
+        assert_eq!(messages[3]["content"], "b body");
+    }
+
+    /// A recorded two-call parallel batch from `/api/chat`, **both calls
+    /// naming the same tool**. Transcribed from a `qwen3` stream: Ollama
+    /// sends a whole batch on one line, with no ids anywhere.
+    const PARALLEL_TOOL_BATCH_NDJSON: &str = concat!(
+        r#"{"model":"qwen3","message":{"role":"assistant","content":"reading both","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"a"}}},{"function":{"name":"read_file","arguments":{"path":"b"}}}]},"done":false}"#,
+        "\n",
+        r#"{"model":"qwen3","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":2048,"eval_count":31}"#,
+        "\n",
+    );
+
+    /// A two-call parallel batch, driven through the real client to a
+    /// recorded Ollama stream.
+    ///
+    /// Ollama is the one backend in this family that cannot carry a
+    /// `tool_call_id`: it pairs a result to a call by the order the `tool`
+    /// messages arrive in. That makes the wire order load-bearing here in a
+    /// way it is nowhere else, and a batch answered out of order is not an
+    /// error the server reports — it is the wrong file's contents handed back
+    /// as the answer to the other read.
+    #[tokio::test]
+    async fn a_parallel_batch_reaches_ollama_in_call_order() {
+        use crate::llm::openai::testing::{Recorded, parallel_batch_request};
+
+        let recorded = Recorded::replay(PARALLEL_TOOL_BATCH_NDJSON).await;
+        let client = OllamaClient::new(recorded.root.as_str());
+
+        // `num_ctx` is set so the request goes straight out: an unset one
+        // sends a `/api/show` probe first, and the recording answers exactly
+        // one connection.
+        let mut request = parallel_batch_request("qwen3");
+        request.options = Some(ChatOptions {
+            temperature: None,
+            num_ctx: Some(16_384),
+            reasoning_effort: None,
+        });
+
+        let mut stream = client.chat_stream(request).await.expect("stream opens");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.expect("chunk decodes"));
+        }
+
+        let sent = recorded.request_body();
+        let messages = sent["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages.len(),
+            5,
+            "system, user, assistant, then one wire message per result: {sent}"
+        );
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(
+            (
+                messages[3]["content"].as_str(),
+                messages[4]["content"].as_str()
+            ),
+            (Some("contents of a"), Some("contents of b")),
+            "the results follow the order of the calls that produced them"
+        );
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"]["path"],
+            "a"
+        );
+        assert_eq!(
+            messages[2]["tool_calls"][1]["function"]["arguments"]["path"],
+            "b"
+        );
+        assert!(
+            !sent.to_string().contains("tool_call_id"),
+            "the native API defines no such field: {sent}"
+        );
+
+        // Coming back, the batch survives as two calls with two distinct ids,
+        // minted at this seam because Ollama sent none. Both name the same
+        // tool, so an id that repeated would leave the second call
+        // unanswerable everywhere downstream.
+        let decoded: Vec<(String, String)> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.message.as_ref())
+            .flat_map(|message| {
+                message
+                    .tool_calls()
+                    .into_iter()
+                    .map(|call| (call.id.clone(), call.function.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(decoded.len(), 2, "the batch is not collapsed: {decoded:?}");
+        assert_eq!(decoded[0].1, "read_file");
+        assert_eq!(decoded[1].1, "read_file");
+        assert!(!decoded[0].0.is_empty(), "an id was minted");
+        assert_ne!(decoded[0].0, decoded[1].0, "and the two differ");
+
+        let last = chunks.last().expect("a final chunk");
+        assert!(last.done);
+        assert_eq!(last.prompt_eval_count, Some(2048));
+        assert_eq!(last.eval_count, Some(31));
+    }
+
+    /// Ollama sends no ids at all, so one is minted at the seam: everything
+    /// downstream correlates a result to its call by id, and an empty one
+    /// would collapse a batch into a single unanswerable call.
+    #[test]
+    fn decoded_tool_calls_get_an_id_ollama_never_sent() {
+        let chunk = parse_chunk_line(
+            r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"a"}}},{"function":{"name":"read_file","arguments":{"path":"b"}}}]},"done":false}"#,
+        )
+        .expect("parses");
+        let message = chunk.message.expect("message");
+        let calls = message.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].id.is_empty(), "an id was minted");
+        assert_ne!(
+            calls[0].id, calls[1].id,
+            "two calls to the same tool must not share an id"
+        );
     }
 
     #[test]
@@ -748,9 +1132,7 @@ mod tests {
     #[test]
     fn assistant_images_are_named_in_the_text_not_sent_back_as_input() {
         let mut assistant = crate::llm::ChatMessage::assistant("here it is");
-        assistant
-            .images
-            .push(crate::llm::Image::new("QUJD", "image/png"));
+        assistant.push_image(crate::llm::Image::new("QUJD", "image/png"));
         let body = build_request_body(&request(vec![assistant])).expect("body");
         let content = body["messages"][0]["content"].as_str().expect("content");
         assert!(content.contains("here it is"));
@@ -770,7 +1152,7 @@ mod tests {
         assert!(!chunk.done);
         let message = chunk.message.expect("message present");
         assert_eq!(message.role, Role::Assistant);
-        assert_eq!(message.content, "hel");
+        assert_eq!(message.text(), "hel");
     }
 
     #[test]
@@ -780,10 +1162,10 @@ mod tests {
         )
         .expect("valid chunk");
         let message = chunk.message.expect("message present");
-        assert_eq!(message.tool_calls.len(), 1);
-        assert_eq!(message.tool_calls[0].function.name, "read_file");
+        assert_eq!(message.tool_calls().len(), 1);
+        assert_eq!(message.tool_calls()[0].function.name, "read_file");
         assert_eq!(
-            message.tool_calls[0].function.arguments["path"],
+            message.tool_calls()[0].function.arguments["path"],
             "src/main.rs"
         );
     }
@@ -793,6 +1175,27 @@ mod tests {
         let err = parse_chunk_line(r#"{"error":"model 'x' not found"}"#)
             .expect_err("error line must fail");
         assert!(err.to_string().contains("model 'x' not found"));
+    }
+
+    #[test]
+    fn an_in_band_error_is_typed_rather_than_left_to_the_transient_default() {
+        // A model that is not installed will not install itself, and a
+        // continuous run now *waits out* anything it is told is transient.
+        let missing = classify_stream_error("model 'qwen3.6:27b' not found, try pulling it first");
+        assert!(
+            !crate::agent::error_is_transient(&missing),
+            "a missing model must not be waited on: {missing:#}"
+        );
+        assert!(missing.downcast_ref::<OllamaError>().is_some());
+
+        // Anything else stays retryable, but as a typed transport failure
+        // rather than an unrecognized error that merely defaults that way.
+        let busy = classify_stream_error("server busy, try again");
+        assert!(crate::agent::error_is_transient(&busy), "{busy:#}");
+        assert!(
+            busy.downcast_ref::<ProviderError>().is_some(),
+            "the classification must be deliberate, not a fall-through: {busy:#}"
+        );
     }
 
     #[test]
@@ -820,6 +1223,37 @@ mod tests {
             .is_transient()
         );
         assert!(!OllamaError::ModelMissing("m".to_string()).is_transient());
+
+        // The two classifications are one table, not two opinions of it. A
+        // gateway in front of Ollama — a reverse proxy, a Tailscale front end,
+        // a hosted Ollama-compatible endpoint — answers a long generation with
+        // a 408, and this predicate used to call that permanent while
+        // `ProviderError` called it transient, so which one ran decided
+        // whether the run continued.
+        for code in [408, 429, 500, 502, 503, 504, 529] {
+            let api = OllamaError::Api {
+                status: status(code),
+                body: String::new(),
+            };
+            assert!(api.is_transient(), "HTTP {code} must be transient");
+            assert_eq!(
+                api.is_transient(),
+                ProviderError::http(code, "x").is_transient(),
+                "the two classifications must agree on HTTP {code}"
+            );
+        }
+        for code in [400, 401, 403, 404, 413, 422] {
+            let api = OllamaError::Api {
+                status: status(code),
+                body: String::new(),
+            };
+            assert!(!api.is_transient(), "HTTP {code} must not be transient");
+            assert_eq!(
+                api.is_transient(),
+                ProviderError::http(code, "x").is_transient(),
+                "the two classifications must agree on HTTP {code}"
+            );
+        }
     }
 
     #[test]
@@ -1041,7 +1475,7 @@ mod tests {
             .await
             .expect("first chunk")
             .expect("first chunk ok");
-        assert_eq!(first.message.expect("message").content, "hi");
+        assert_eq!(first.message.expect("message").text(), "hi");
         assert!(!first.done);
         let last = chunks
             .next()
@@ -1073,7 +1507,72 @@ mod tests {
         let mut chunks = decode_ndjson(stream::iter(parts));
         let only = chunks.next().await.expect("chunk").expect("ok");
         assert!(only.done);
-        assert_eq!(only.message.expect("message").content, "all");
+        assert_eq!(only.message.expect("message").text(), "all");
+        assert!(chunks.next().await.is_none());
+    }
+
+    /// A stream that stops before any line said `done: true` is a failure,
+    /// not a shorter reply.
+    ///
+    /// This used to end with `Ok(None)`: the agent got every token that had
+    /// arrived and no final chunk at all, which is what a turn that finished
+    /// normally also looks like from there. `ollama serve` being OOM-killed
+    /// mid-generation, or a tunnel to a remote box dropping, both land here,
+    /// and both are worth another attempt.
+    #[tokio::test]
+    async fn a_stream_that_stops_before_done_is_a_transient_failure() {
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"half a sen\"},\"done\":false}\n"
+                .to_vec(),
+        )];
+        let mut chunks = decode_ndjson(stream::iter(parts));
+
+        let first = chunks.next().await.expect("chunk").expect("ok");
+        assert_eq!(first.message.expect("message").text(), "half a sen");
+
+        let err = chunks
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("a cut stream is not a completed reply");
+        let provider = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed, or the ladder cannot classify it");
+        assert_eq!(provider.status, None);
+        assert!(provider.is_transient());
+
+        // The same for a stream that produced nothing at all: a 200 whose body
+        // never arrived is a failure, not an empty answer.
+        let empty: Vec<Result<Vec<u8>>> = vec![Ok(Vec::new())];
+        let err = decode_ndjson(stream::iter(empty))
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("an empty body is not an empty reply");
+        assert!(
+            err.downcast_ref::<ProviderError>()
+                .expect("typed")
+                .is_transient()
+        );
+    }
+
+    /// The trailing-line case must still be able to *end* the stream: a
+    /// `done: true` that arrived without its newline is a complete reply, and
+    /// refusing it would turn every such response into an endless retry.
+    #[tokio::test]
+    async fn a_done_line_without_its_newline_still_ends_the_stream_cleanly() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":false}\n"
+                    .to_vec(),
+            ),
+            Ok(br#"{"done":true,"done_reason":"stop"}"#.to_vec()),
+        ];
+        let mut chunks = decode_ndjson(stream::iter(parts));
+        assert!(!chunks.next().await.expect("text").expect("ok").done);
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("stop"));
         assert!(chunks.next().await.is_none());
     }
 
@@ -1087,5 +1586,40 @@ mod tests {
         assert!(chunks.next().await.expect("chunk").is_ok());
         let err = chunks.next().await.expect("item").expect_err("error");
         assert!(err.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_response_carries_the_retry_after_under_both_typed_errors() {
+        // Ollama itself does not rate-limit, but a reverse proxy or a hosted
+        // Ollama-compatible endpoint in front of it does, and the header is
+        // the only thing that stops the agent's ladder from guessing. All
+        // three classifications have to survive on the one chain: the legacy
+        // `OllamaError` path, the shared `ProviderError` contract, and the
+        // wait itself.
+        let host = crate::llm::testing::one_shot_http_server(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 12\r\nContent-Length: \
+             9\r\nConnection: close\r\n\r\nslow down",
+        )
+        .await;
+        let client = OllamaClient::new(host);
+        let err = client.health().await.expect_err("429 is not healthy");
+
+        let provider = err
+            .downcast_ref::<ProviderError>()
+            .expect("the shared provider classification");
+        assert_eq!(provider.status, Some(429));
+        assert!(provider.is_transient());
+        let ollama = err
+            .downcast_ref::<OllamaError>()
+            .expect("the Ollama-specific classification is still reachable");
+        assert!(ollama.is_transient());
+        assert_eq!(
+            err.downcast_ref::<crate::llm::RetryAfter>()
+                .map(|hint| hint.0),
+            Some(Duration::from_secs(12)),
+            "the proxy's own deadline reaches the retry loop"
+        );
+        // The message users see is still the provider's, not the hint's.
+        assert!(err.to_string().contains("HTTP 429"), "{err}");
     }
 }

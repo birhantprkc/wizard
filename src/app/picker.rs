@@ -64,6 +64,11 @@ pub enum PickerKind {
     Rewind,
     /// A past session to resume (item values are session ids).
     Resume,
+    /// A Claude Code conversation to import and continue (item values are
+    /// Claude Code session ids). Opening one writes a *new* Wizard session and
+    /// resumes that; `~/.claude` is only read. See
+    /// [`crate::claude_resume`].
+    ResumeClaude,
     /// A subagent to delegate to (item values are subagent names). Selecting
     /// one pre-fills the input with a delegation request rather than running a
     /// command, since subagents are invoked by the model, not directly.

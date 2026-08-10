@@ -1,10 +1,46 @@
 //! Subagents: isolated sub-contexts for parallel or decomposed work.
 //!
-//! Each subagent gets its own message history and tool scope. By default a
-//! sub-loop has no step ceiling (same as the parent turn); an optional
-//! `max_steps` on the definition can still cap a specialist. The result
+//! Each subagent gets its own message history and tool scope. The result
 //! returns to the parent as a single tool result, so a multi-step sub-task
 //! costs the parent one turn of context.
+//!
+//! # What ends a run
+//!
+//! Three things, and until recently there were none of them. A sub-loop used
+//! to default to *no* step ceiling, carry no deadline, and observe no
+//! cancellation, which meant nothing in the process could end one: a subagent
+//! that talked itself into re-reading the same file forever spent the API
+//! budget until the operator killed Wizard, and a foreground one could not be
+//! interrupted at all: Esc reached the parent's turn and stopped nothing.
+//!
+//! So a run now ends on whichever of these comes first:
+//!
+//! - the model stops calling tools (the ordinary end),
+//! - [`SubagentConfig::max_steps`], which defaults to [`DEFAULT_MAX_STEPS`]
+//!   rather than to unlimited,
+//! - [`SpawnOptions::deadline`], defaulting to [`DEFAULT_DEADLINE`],
+//! - [`SpawnOptions::cancel`], the turn's [`CancelHandle`], when the caller is
+//!   a foreground run that the user can interrupt,
+//! - [`SpawnOptions::breaker`], the endpoint's circuit breaker, when the
+//!   provider is down.
+//!
+//! The last three are enforced by [`spawn`] itself and not by its callers.
+//! That is deliberate: `/ultra` used to wrap every candidate in its own biased
+//! `select!` because `spawn` had neither of the first two, which put the
+//! knowledge of how to abort a run and how to close out its pane in the one
+//! caller that happened to need it. A caller that forgot is a run nothing can
+//! stop.
+//!
+//! # What it shares with the parent turn
+//!
+//! Everything that is not sub-loop-specific, and by construction rather than
+//! by resemblance. A sub-run climbs the parent's retry ladder over the
+//! parent's breaker ([`crate::agent::retry`]) and steers by the same context
+//! reading and the same compactor ([`crate::agent::context`]); what differs is
+//! passed *in* — a scoped registry, a step budget, no user to interview, no
+//! slash commands, no session file — rather than reimplemented here. Each
+//! capability this loop lacked used to be one bug; `/ultra` and `/fusion` fan
+//! N of these out per turn, which made each one N.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,29 +48,48 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Mode, StepBudget};
-use crate::hooks::{HookEngine, PreToolUse};
+use crate::config::{Config, StepBudget};
+use crate::dispatch::{DispatchOutcome, Dispatcher};
+use crate::hooks::HookEngine;
 use crate::llm::provider::LlmProvider;
-use crate::llm::{ChatMessage, ChatOptions, ChatRequest, Image, Role, ToolCall};
+use crate::llm::{ChatMessage, Role, ToolCall, ToolSpec};
 use crate::tools::subagent_tasks::SubagentRunResult;
 use crate::tools::{
     CommandDispatch, Tool, ToolAccess, ToolContext, ToolError, ToolOutput, registry::ToolRegistry,
 };
 
-use super::prompts;
-use super::{error_is_transient, normalize_args, parse_json_tool_call};
+use super::turn::{self, CallOutcome, Host, Policy, Sink, StepUsage};
+use super::{CancelHandle, breaker, cancelled, context, prompts};
 
 /// Advertised name of the spawn tool, referenced by the dispatcher's
 /// plan-mode gate.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 
-/// Retry budget for one subagent model call (mirrors the parent loop's
-/// non-continuous budget).
-const RETRY_ATTEMPTS: u32 = 6;
+/// Step ceiling a definition gets when it does not set one.
+///
+/// Deliberately finite, where this used to be [`StepBudget::UNLIMITED`]. The
+/// parent turn is unlimited for a reason (a human is at the prompt and can
+/// interrupt it), and a subagent inherited that reason without inheriting the
+/// human: nobody is watching a background run, and a foreground one reports
+/// nothing until it is done, so a sub-loop that stops making progress is
+/// invisible until the bill arrives.
+///
+/// Fifty round trips is far past where a self-contained sub-task is still
+/// converging and far short of a budget worth reaching for on purpose. A
+/// specialist that genuinely needs more says so in its TOML.
+pub const DEFAULT_MAX_STEPS: u32 = 50;
+
+/// Wall-clock cap on one run when the caller names none.
+///
+/// A step budget alone does not bound a run in *time*: a throttled provider
+/// parks each step inside the retry ladder below (six attempts, `retry_base`
+/// doubling to `retry_max`, over five minutes of sleeping at the shipped
+/// defaults), so fifty steps against a rate-limited endpoint is hours during
+/// which the run has produced nothing and will keep producing nothing.
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// What a subagent reports when its loop ended without any final text — it
 /// only ever called tools, or the model returned nothing. Not an error, but
@@ -51,10 +106,75 @@ pub fn next_run_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The parent agent's active model, shared with [`SpawnSubagentTool`] so
-/// mid-session `/model` switches reach subagents. `None` falls back to the
-/// configured model.
-pub type SharedActiveModel = Arc<std::sync::RwLock<Option<String>>>;
+/// The parent agent's live state that a `spawn_subagent` call has to read when
+/// it *runs* rather than when the tool was built: the model `/model` last
+/// switched to, the [`CancelHandle`] of the turn the call is happening inside,
+/// and the circuit breaker over the endpoint the parent is dialing.
+///
+/// One slot holding all three, rather than three slots, because they are bound
+/// by the same call at the same moment
+/// ([`crate::agent::Agent::bind_subagent_model`]) and a tool holding one but
+/// not another is a specific bug each time: without the model, subagents
+/// answer from the model the session started on however many times `/model`
+/// has been used since; without the handle, an interrupted turn leaves its
+/// foreground subagent running; without the breaker, a delegated run keeps
+/// dialing a provider the parent has already given up on.
+///
+/// All three are `Option` because the tool is built before the agent that
+/// binds it exists. Unbound, a run falls back to the configured model, cannot
+/// be interrupted, and carries a breaker of its own, which is what every
+/// surface that never binds already gets.
+#[derive(Debug, Default)]
+pub struct SubagentBinding {
+    model: std::sync::RwLock<Option<String>>,
+    cancel: std::sync::RwLock<Option<CancelHandle>>,
+    breaker: std::sync::RwLock<Option<breaker::LlmBreaker>>,
+}
+
+impl SubagentBinding {
+    /// Point this slot at a parent agent: the model it is live on, the handle
+    /// its surface raises on Esc, and the breaker over its endpoint.
+    pub fn bind(&self, model: String, cancel: CancelHandle, breaker: breaker::LlmBreaker) {
+        self.set_model(model);
+        if let Ok(mut slot) = self.cancel.write() {
+            *slot = Some(cancel);
+        }
+        if let Ok(mut slot) = self.breaker.write() {
+            *slot = Some(breaker);
+        }
+    }
+
+    /// Write a mid-session `/model` switch through, so the next subagent runs
+    /// on the model the user just chose.
+    pub fn set_model(&self, model: String) {
+        if let Ok(mut slot) = self.model.write() {
+            *slot = Some(model);
+        }
+    }
+
+    /// The parent's active model; `None` until bound.
+    pub fn model(&self) -> Option<String> {
+        self.model.read().ok().and_then(|model| model.clone())
+    }
+
+    /// The running turn's cancel handle; `None` until bound.
+    pub fn cancel(&self) -> Option<CancelHandle> {
+        self.cancel.read().ok().and_then(|cancel| cancel.clone())
+    }
+
+    /// The parent's endpoint breaker; `None` until bound.
+    pub fn breaker(&self) -> Option<breaker::LlmBreaker> {
+        self.breaker.read().ok().and_then(|breaker| breaker.clone())
+    }
+}
+
+/// The shared [`SubagentBinding`] a surface hands from
+/// [`SpawnSubagentTool::model_handle`] to
+/// [`crate::agent::Agent::bind_subagent_model`].
+///
+/// The name is older than the contents (it held only the model once) and is
+/// kept because it is what every surface's registry builder returns.
+pub type SharedActiveModel = Arc<SubagentBinding>;
 
 /// A named, reusable subagent definition. Built-in defaults exist
 /// (a general-purpose worker); `/evolve` can add more as TOML files under
@@ -70,19 +190,51 @@ pub struct SubagentConfig {
     /// Tool names this subagent may call. `None` = the parent's full set.
     #[serde(default)]
     pub tool_scope: Option<Vec<String>>,
-    /// Optional step ceiling for the sub-loop. Defaults to unlimited (`0`) —
-    /// the subagent runs until it finishes, the parent kills it, or a hard
-    /// error stops it. Set a positive number only when a specialist should
-    /// be hard-capped.
+    /// Step ceiling for the sub-loop, defaulting to [`DEFAULT_MAX_STEPS`]. Set
+    /// `0` for [`StepBudget::UNLIMITED`] only when a specialist genuinely runs
+    /// until it is done and something else is going to end it.
     #[serde(default = "SubagentConfig::default_max_steps")]
     pub max_steps: StepBudget,
 }
 
 impl SubagentConfig {
     fn default_max_steps() -> StepBudget {
-        StepBudget::UNLIMITED
+        StepBudget::new(DEFAULT_MAX_STEPS)
     }
 }
+
+/// Why a run ended before its loop did.
+///
+/// Returned as [`spawn`]'s error rather than folded into its `Ok` value, so a
+/// caller that must tell an *interrupted* run from a *broken* one (the
+/// council fans several out and one Ctrl-C has to end the whole sitting, not
+/// contribute one dead candidate to it) can ask, in the same way the turn
+/// loop already asks about [`crate::llm::TruncatedToolCall`]:
+///
+/// ```ignore
+/// match err.downcast_ref::<SubagentStop>() {
+///     Some(SubagentStop::Cancelled) => …,
+///     _ => …,
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentStop {
+    /// The user interrupted: [`SpawnOptions::cancel`] was raised.
+    Cancelled,
+    /// The run outlived [`SpawnOptions::deadline`].
+    DeadlineExceeded(Duration),
+}
+
+impl std::fmt::Display for SubagentStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::DeadlineExceeded(after) => write!(f, "timed out after {after:?}"),
+        }
+    }
+}
+
+impl std::error::Error for SubagentStop {}
 
 /// Outcome of a subagent run, summarized for the parent.
 #[derive(Debug, Clone)]
@@ -204,7 +356,7 @@ pub fn read_only_registry(parent: &ToolRegistry) -> ToolRegistry {
 }
 
 /// Per-run overrides for [`spawn`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SpawnOptions {
     /// Model to run the subagent on; `None` falls back to the configured
     /// active model. The parent passes its live model so `/model` switches
@@ -216,6 +368,46 @@ pub struct SpawnOptions {
     /// system prompt + bare task. Used by [`spawn_fork`] (`/fork`): the side
     /// quest inherits history, tools, and prompt, then appends its brief.
     pub inherited_history: Option<Vec<ChatMessage>>,
+    /// The turn this run belongs to, so a user interrupt ends it.
+    ///
+    /// `None`, the default, is an *uninterruptible* run, and that is the
+    /// right answer for exactly one caller: a backgrounded subagent outlives
+    /// the turn that spawned it by design, so wiring the turn's handle into it
+    /// would kill the user's detached work the moment they pressed Esc on
+    /// something unrelated. Background runs are ended through
+    /// [`crate::tools::subagent_tasks::SubagentTaskRegistry::kill`] instead.
+    /// Every foreground caller passes a handle.
+    pub cancel: Option<CancelHandle>,
+    /// Wall-clock cap on the whole run, defaulting to [`DEFAULT_DEADLINE`].
+    /// `None` removes the cap, which only a caller enforcing its own should
+    /// do.
+    pub deadline: Option<Duration>,
+    /// Circuit breaker over the endpoint this run will dial.
+    ///
+    /// Not `Option`, unlike everything above it: a run without a breaker is
+    /// the defect this field closes, so the question a caller answers is
+    /// *whose* breaker, never whether. A caller that has the parent's passes
+    /// it, and then an outage the parent already hit is one its N delegated
+    /// runs do not each have to prove; a caller that has none gets a fresh
+    /// one, which still bounds that run on its own.
+    pub breaker: breaker::LlmBreaker,
+}
+
+impl Default for SpawnOptions {
+    /// Note that this is *not* `#[derive]`-shaped: `deadline` defaults to
+    /// [`DEFAULT_DEADLINE`] and not to `None`. A derived default would make
+    /// "the caller said nothing" mean "no deadline", which is the exact
+    /// failure this field exists to close.
+    fn default() -> Self {
+        Self {
+            model: None,
+            read_only: false,
+            inherited_history: None,
+            cancel: None,
+            deadline: Some(DEFAULT_DEADLINE),
+            breaker: breaker::LlmBreaker::new(),
+        }
+    }
 }
 
 /// Built-in name for a `/fork` side-quest run (shown on the subagent rail and
@@ -298,7 +490,7 @@ pub async fn spawn_fork(
     options: &SpawnOptions,
     client: &Arc<dyn LlmProvider>,
     registry: &ToolRegistry,
-    hooks: &HookEngine,
+    hooks: &Arc<HookEngine>,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
     let config = fork_config();
@@ -310,98 +502,36 @@ pub async fn spawn_fork(
     spawn(run, &config, task, &options, client, &scoped, hooks, ctx).await
 }
 
-/// One model round-trip: stream a completion, skipping reasoning
-/// ("thinking") chunks so they never leak into subagent history or reports.
-/// Any images the model generated come back alongside the text (see
-/// [`ChatChunk::images`](crate::llm::ChatChunk::images)).
-async fn stream_step(client: &Arc<dyn LlmProvider>, request: ChatRequest) -> Result<Step> {
-    let mut stream = client.chat_stream(request).await?;
-    let mut step = Step::default();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        step.images.extend(chunk.images);
-        if let Some(message) = chunk.message {
-            if !chunk.thinking {
-                step.content.push_str(&message.content);
-            }
-            step.images.extend(message.images);
-            step.tool_calls.extend(message.tool_calls);
-        }
-        if chunk.prompt_eval_count.is_some() {
-            step.prompt_tokens = chunk.prompt_eval_count;
-        }
-        if chunk.eval_count.is_some() {
-            step.completion_tokens = chunk.eval_count;
-        }
-        if chunk.done {
-            break;
-        }
-    }
-    Ok(step)
-}
-
-/// One completed model call inside a subagent's loop: what the model said,
-/// what it asked to run, and what it cost (when the backend reported counts).
-#[derive(Debug, Default)]
-struct Step {
-    content: String,
-    tool_calls: Vec<ToolCall>,
-    /// Images the model generated during the call (see
-    /// [`ChatChunk::images`](crate::llm::ChatChunk::images)).
-    images: Vec<Image>,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-}
-
-/// Account for one subagent model call, on both of the surfaces that report
-/// spend: the parent's counters (`/cost`, the usage log) through the shared
-/// [`ToolContext::usage`] tracker, and the live status bar through the run's
-/// event channel.
-///
-/// Without this a subagent's tokens are spent and then reported nowhere. That
-/// was survivable while `spawn_subagent` was an occasional tool call; `/ultra`
-/// makes N candidate runs plus a judge the price of *every* turn, so a status
-/// bar that counted the main loop alone would understate an ultra turn several
-/// times over — under a chip that advertises exactly that multiplier.
-///
-/// It is [`crate::usage::UsageTracker::record_delegated`], not `record`: these
-/// tokens belong on the totals but must not become the parent's `last_prompt`,
-/// which is what decides when to compact.
-async fn record_usage(ctx: &ToolContext, progress: Option<&Progress>, step: &Step) {
-    if step.prompt_tokens.is_none() && step.completion_tokens.is_none() {
-        return;
-    }
-    let prompt_tokens = step.prompt_tokens.unwrap_or(0);
-    let completion_tokens = step.completion_tokens.unwrap_or(0);
-    if let Some(usage) = &ctx.usage {
-        usage.record_delegated(prompt_tokens, completion_tokens);
-    }
-    if let Some(events) = progress {
-        super::emit(
-            events,
-            crate::agent::AgentEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-            },
-        )
-        .await;
-    }
-}
-
 /// The run's event channel: where a subagent's progress (and its spend) is
 /// streamed for the surface to render as its pane.
 type Progress = tokio::sync::mpsc::Sender<crate::agent::AgentEvent>;
 
 /// Run `task` in an isolated context defined by `config`: fresh history,
-/// scoped registry, optional step budget. The parent's lifecycle `hooks` apply to
-/// the subagent's tool calls too.
+/// scoped registry, step budget, deadline, and the caller's cancellation.
+/// The parent's lifecycle `hooks` apply to the subagent's tool calls too.
 ///
 /// The subagent reports back to the parent model as one tool result, but its
 /// step-by-step activity streams to the surface as `AgentEvent::SubagentRun*`
 /// events scoped to `run` (see [`next_run_id`]), which the TUI renders as that
 /// subagent's own pane. The caller emits `SubagentRunStarted` (it knows the
 /// background id); this function emits everything after it, including the
-/// terminal `SubagentRunDone`.
+/// terminal `SubagentRunDone`, **on every path**, including the two where the
+/// loop never gets to finish, so no pane is ever left sitting at "running".
+///
+/// # Why the interrupt is here and not around the call
+///
+/// `biased` checks cancellation before anything else on every poll, so a
+/// Ctrl-C is honored mid-stream (the TUI raises the parent's [`CancelHandle`]
+/// before it resorts to aborting the turn's task) rather than at the next step
+/// boundary. Dropping [`run_loop`]'s future is a clean abort: it holds its own
+/// history and nothing else.
+///
+/// A caller cannot do this for itself correctly. Wrapping the whole thing in
+/// its own `select!` was what `/ultra` did, and it left that caller unable to
+/// know whether this function had already closed the pane out before its
+/// future was dropped, so it guessed, and a second `SubagentRunDone` flips a
+/// pane from `Done` to `Failed`. Inside, the question does not arise: the same
+/// function that emits the terminal event decides the run is over.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn(
     run: u64,
@@ -410,7 +540,207 @@ pub async fn spawn(
     options: &SpawnOptions,
     client: &Arc<dyn LlmProvider>,
     registry: &ToolRegistry,
-    hooks: &HookEngine,
+    hooks: &Arc<HookEngine>,
+    ctx: &ToolContext,
+) -> Result<SubagentResult> {
+    let stop = tokio::select! {
+        biased;
+        () = cancelled(options.cancel.as_ref()) => SubagentStop::Cancelled,
+        () = elapsed(options.deadline) => {
+            // `elapsed` only resolves when there *is* a deadline.
+            SubagentStop::DeadlineExceeded(options.deadline.unwrap_or_default())
+        }
+        result = run_loop(run, config, task, options, client, registry, hooks, ctx) => return result,
+    };
+
+    // The loop's future has just been dropped mid-run, so it never reached its
+    // own terminal event. Close the pane out here or it sits at "running" for
+    // the rest of the session. The pane's step count already arrived on
+    // `SubagentRunStep`; the loop's own counter went with its dropped future.
+    close_pane(&ctx.events, run, 0, &stop.to_string()).await;
+    Err(anyhow::Error::new(stop))
+}
+
+/// Emit the terminal `SubagentRunDone` for a run that ended badly.
+///
+/// One function because there are five ways for a run to end early — the
+/// interrupt, the deadline, a permanent provider error, an exhausted retry
+/// ladder, an open breaker — and a pane left at "running" is indistinguishable
+/// from a run still working, so the failure mode of forgetting one is a rail
+/// that never empties.
+async fn close_pane(events: &Option<Progress>, run: u64, steps_used: u32, error: &str) {
+    if let Some(events) = events {
+        super::emit(
+            events,
+            crate::agent::AgentEvent::SubagentRunDone {
+                run,
+                completed: false,
+                output: String::new(),
+                steps_used,
+                error: Some(error.to_string()),
+            },
+        )
+        .await;
+    }
+}
+
+/// Resolves when `deadline` elapses, and never when there is none. See
+/// [`cancelled`](super::cancelled).
+async fn elapsed(deadline: Option<Duration>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// One delegated run, as the step loop sees it.
+///
+/// Everything here that differs from a turn's [`TurnHost`](super::turn) is a
+/// thing that genuinely needs the owner of the history: there is no session to
+/// persist to, the compactor cuts under a different anchor, and the tokens are
+/// billed as delegated. What the run merely *chooses* — what bounds it, which
+/// of the turn's gates it keeps — is [`Policy::sub_run`], not code in here.
+struct SubRun<'a> {
+    client: &'a Arc<dyn LlmProvider>,
+    /// The context nested tools run in: the parent's registries, checkpoint
+    /// store and image store, with the surface deliberately unwired (see the
+    /// construction in [`run_loop`]).
+    ctx: ToolContext,
+    /// This run's tool pipeline, over its scoped registry. The same
+    /// [`Dispatcher`] a turn uses, built for a sub-run.
+    dispatcher: Dispatcher,
+    history: Vec<ChatMessage>,
+    model: String,
+    /// The sub-loop's own last reported prompt size, which is what decides
+    /// when it compacts.
+    ///
+    /// It cannot come from `ctx.usage`: a subagent's tokens are recorded there
+    /// as *delegated* precisely so they never become the parent's
+    /// `last_prompt` (see [`Host::record_usage`]), and the parent's window has
+    /// nothing to do with how full this run's context is. Behind a lock
+    /// because the retry ladder bills an attempt through `&self`.
+    last_prompt: std::sync::Mutex<Option<u64>>,
+}
+
+impl SubRun<'_> {
+    /// Read the reading, tolerating a poisoned lock: a number describing how
+    /// full a prompt was is not worth failing a run over.
+    fn reading(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        self.last_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl Host for SubRun<'_> {
+    fn client(&self) -> &Arc<dyn LlmProvider> {
+        self.client
+    }
+
+    fn ctx(&self) -> &ToolContext {
+        &self.ctx
+    }
+
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.dispatcher.registry().specs()
+    }
+
+    fn history(&self) -> &[ChatMessage] {
+        &self.history
+    }
+
+    fn history_mut(&mut self) -> &mut Vec<ChatMessage> {
+        &mut self.history
+    }
+
+    /// In memory and nowhere else: a sub-run has no session file, and its
+    /// record is the one report it hands back. That is the whole economy of
+    /// delegation — a multi-step sub-task costs the parent one turn of context.
+    fn push(&mut self, message: ChatMessage) {
+        self.history.push(message);
+    }
+
+    fn last_prompt(&self) -> Option<u64> {
+        *self.reading()
+    }
+
+    /// A sub-run's tokens are the parent's — one bill, one status bar, and a
+    /// council makes N candidate runs the price of every turn — but they are
+    /// recorded as *delegated*: they belong on the totals and must never
+    /// become the parent's `last_prompt`, which is what decides when the
+    /// parent compacts. This run's own reading is kept here instead.
+    async fn record_usage(&self, usage: &StepUsage, sink: &Sink) {
+        if !usage.reported() {
+            return;
+        }
+        let prompt = usage.prompt.unwrap_or(0);
+        let completion = usage.completion.unwrap_or(0);
+        if let Some(tracker) = &self.ctx.usage {
+            tracker.record_delegated(prompt, completion);
+            tracker.record_cache(usage.cache.read, usage.cache.write);
+        }
+        if usage.prompt.is_some() {
+            *self.reading() = usage.prompt;
+        }
+        sink.usage(prompt, completion).await;
+    }
+
+    /// The same cut a turn makes, under [`context::Anchor::SubLoop`] — a
+    /// sub-loop's history has exactly one user message, so the conversation
+    /// anchor would walk the boundary all the way back onto it and find
+    /// nothing it was allowed to cut, and a run that outgrew its window simply
+    /// failed.
+    ///
+    /// The pass is logged rather than announced. There is no run-scoped event
+    /// for "the context was managed", and borrowing one that renders as the
+    /// subagent's own words would put a sentence it never said into the
+    /// transcript the council reads back — which is exactly what [`Sink`] does
+    /// with a notice on this arm.
+    async fn compact(&mut self, sink: &Sink) {
+        let compacted = context::compact(
+            &mut self.history,
+            context::Anchor::SubLoop,
+            self.client,
+            &self.model,
+        )
+        .await;
+        if compacted.outcome == context::CompactOutcome::Nothing {
+            return;
+        }
+        // The history just shrank: the last reported prompt size describes a
+        // prompt that no longer exists and must not re-trigger a pass with
+        // nothing left to cut.
+        *self.reading() = None;
+        sink.notice(compacted.outcome.describe()).await;
+    }
+
+    async fn dispatch(&mut self, call: &ToolCall, sink: &Sink) -> DispatchOutcome {
+        self.dispatcher.dispatch(call, &self.ctx, sink).await
+    }
+
+    /// Nothing. The one tool a turn answers itself is `compact`, which is
+    /// parent-loop only: it is not in a sub-run's scope, and a fork's denylist
+    /// strips it outright.
+    async fn intercept(&mut self, _call: &ToolCall, _sink: &Sink) -> Option<CallOutcome> {
+        None
+    }
+}
+
+/// The sub-loop proper: everything [`spawn`] does once it is running, minus
+/// the interrupt and the deadline that can end it early.
+///
+/// Which is to say: the setup, [`turn::run`], and the report. The loop itself
+/// is the parent's, and has been since criterion 6 — see [`super::turn`].
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    run: u64,
+    config: &SubagentConfig,
+    task: &str,
+    options: &SpawnOptions,
+    client: &Arc<dyn LlmProvider>,
+    registry: &ToolRegistry,
+    hooks: &Arc<HookEngine>,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
     let loaded = Config::load().unwrap_or_default();
@@ -418,14 +748,13 @@ pub async fn spawn(
         .model
         .clone()
         .unwrap_or_else(|| loaded.active().model);
-    let (retry_base, retry_max) = (loaded.retry_base_secs, loaded.retry_max_secs);
     let mut scoped = scoped_registry(registry, config.tool_scope.as_deref());
     if options.read_only {
         scoped = read_only_registry(&scoped);
     }
     let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
 
-    let mut history = match &options.inherited_history {
+    let history = match &options.inherited_history {
         // `/fork`: seed from the parent's conversation, then append the
         // side-quest brief. The parent's system prompt (and any mid-session
         // notes) stay at the front; we only add the fork instruction + task.
@@ -438,10 +767,10 @@ pub async fn spawn(
                 && let Some(system) = history.first_mut()
                 && system.role == Role::System
             {
-                system.content.push_str("\n\n");
+                let protocol = prompts::render_tool_protocol(&scoped.specs());
                 system
                     .content
-                    .push_str(&prompts::render_tool_protocol(&scoped.specs()));
+                    .push(crate::llm::ContentBlock::text(format!("\n\n{protocol}")));
             }
             history.push(ChatMessage::user(format!("{FORK_BRIEF}\n\n{task}")));
             history
@@ -459,11 +788,12 @@ pub async fn spawn(
         }
     };
 
-    // The subagent reports back to the model as one tool result, but its
+    // The subagent reports back to the parent model as one tool result, but its
     // step-by-step activity streams to the surface as run-scoped events so the
     // user can open its pane and watch it work. Nested tools run with
     // `events: None` so they don't double-emit (todos, background tasks) or
-    // leak into the parent's transcript; we emit our own run-scoped pair.
+    // leak into the parent's transcript; the run's own pair goes out on the
+    // [`Sink`] below.
     let progress = ctx.events.clone();
     // Forks keep the parent's todo list (shared work, shared status bar);
     // ordinary subagents get a fresh one so their scratch todos never leak.
@@ -478,241 +808,74 @@ pub async fn spawn(
         // A subagent has no surface to drive; it must never dispatch the
         // parent's slash commands even if the parent's ctx enabled it.
         command_dispatch: CommandDispatch::None,
+        // Nor does it have a human. A subagent's `execute` must keep
+        // `/dev/null` on fd 0: its prompt would be announced on a stream the
+        // parent's composer is not bound to, and the only party in a position
+        // to answer it would be the model that asked. `events: None` above
+        // already means nothing is announced; this says why, and holds even if
+        // a later change starts forwarding a subagent's raw events.
+        console: crate::tools::ConsoleAccess::None,
         ..ctx.clone()
     };
 
-    let mut steps_used = 0;
-    let mut completed = false;
-    let mut last_text = String::new();
-    let max_steps = config.max_steps.last_step();
+    let sink = Sink::Run {
+        run,
+        name: config.name.clone(),
+        events: progress.clone(),
+    };
+    let policy = Policy::sub_run(
+        config.max_steps.last_step(),
+        model.clone(),
+        native_tools,
+        loaded
+            .reasoning_effort
+            .map(|effort| effort.as_str().to_string()),
+        // The parent's breaker when it shared one: an outage it already hit is
+        // one this run does not have to prove again.
+        options.breaker.clone(),
+        loaded.retry_base_secs,
+        loaded.retry_max_secs,
+        loaded.compact_threshold_bytes,
+    );
+    let mut host = SubRun {
+        client,
+        dispatcher: Dispatcher::sub_run(scoped, Arc::clone(hooks)),
+        ctx,
+        history,
+        model,
+        last_prompt: std::sync::Mutex::new(None),
+    };
 
-    for step in 1..=max_steps {
-        steps_used = step;
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: history.clone(),
-            tools: if native_tools {
-                scoped.specs()
-            } else {
-                Vec::new()
-            },
-            stream: true,
-            options: Some(ChatOptions {
-                temperature: Some(Mode::Sovereign.temperature()),
-                num_ctx: None,
-                reasoning_effort: loaded
-                    .reasoning_effort
-                    .map(|effort| effort.as_str().to_string()),
-            }),
-        };
-
-        // Same retry policy as the parent loop: transient provider failures
-        // (transport drops, 429/5xx) back off and retry instead of killing a
-        // deep run; permanent errors (auth, bad request) fail immediately.
-        let mut attempt: u32 = 0;
-        let step_result = loop {
-            match stream_step(client, request.clone()).await {
-                Ok(completion) => break completion,
-                Err(err) => {
-                    if !error_is_transient(&err) || attempt >= RETRY_ATTEMPTS {
-                        let err = err.context(format!("subagent '{}' chat failed", config.name));
-                        // Close the pane out, or it sits at "running" forever.
-                        if let Some(events) = &progress {
-                            super::emit(
-                                events,
-                                crate::agent::AgentEvent::SubagentRunDone {
-                                    run,
-                                    completed: false,
-                                    output: String::new(),
-                                    steps_used,
-                                    error: Some(format!("{err:#}")),
-                                },
-                            )
-                            .await;
-                        }
-                        return Err(err);
-                    }
-                    let secs =
-                        retry_max.min(retry_base.saturating_mul(2u64.saturating_pow(attempt)));
-                    tracing::warn!(
-                        "subagent '{}': LLM unavailable ({err:#}); retrying in {secs}s",
-                        config.name
-                    );
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
-                    attempt += 1;
-                }
-            }
-        };
-        record_usage(&ctx, progress.as_ref(), &step_result).await;
-        let Step {
-            content,
-            mut tool_calls,
-            images,
-            ..
-        } = step_result;
-
-        // Images the subagent's model generated: persisted to the session's
-        // image store (shared with the parent through the context) and
-        // announced on this run's pane before they land in its history.
-        let images =
-            crate::agent::absorb_images(images, ctx.images.as_ref(), progress.as_ref(), |images| {
-                crate::agent::AgentEvent::SubagentRunImages {
-                    run,
-                    source: crate::agent::ImageSource::Assistant,
-                    images,
-                }
-            })
-            .await;
-
-        history.push(ChatMessage {
-            role: Role::Assistant,
-            content: content.clone(),
-            tool_calls: tool_calls.clone(),
-            tool_name: None,
-            images,
-        });
-
-        if !native_tools
-            && tool_calls.is_empty()
-            && let Some(call) = parse_json_tool_call(&content)
-        {
-            tool_calls.push(call);
+    let ran = match turn::run(&mut host, &policy, &sink).await {
+        Ok(ran) => ran,
+        Err(err) => {
+            let err = err.context(format!("subagent '{}' chat failed", config.name));
+            // Close the pane out, or it sits at "running" forever. The step
+            // count the pane shows already arrived on `SubagentRunStep`; the
+            // loop's own counter went with the error.
+            close_pane(&progress, run, 0, &format!("{err:#}")).await;
+            return Err(err);
         }
-
-        if tool_calls.is_empty() {
-            last_text = content;
-            completed = true;
-            break;
-        }
-        if !content.trim().is_empty() {
-            last_text = content.clone();
-        }
-
-        // The subagent's own message for this step, into its pane.
-        if let Some(events) = &progress
-            && !content.trim().is_empty()
-        {
-            super::emit(
-                events,
-                crate::agent::AgentEvent::SubagentRunText {
-                    run,
-                    text: content.clone(),
-                },
-            )
-            .await;
-        }
-
-        for call in tool_calls {
-            let name = call.function.name.clone();
-            let mut args = normalize_args(&call.function.arguments);
-            if let Some(events) = &progress {
-                super::emit(
-                    events,
-                    crate::agent::AgentEvent::SubagentRunToolStarted {
-                        run,
-                        name: name.clone(),
-                        args: args.clone(),
-                    },
-                )
-                .await;
-            }
-            // Same hook pipeline as the parent's dispatcher: pre-hooks may
-            // rewrite the arguments or veto, post-hooks may append context.
-            let output = match hooks
-                .pre_tool_use(&name, &args, Mode::Sovereign, None)
-                .await
-            {
-                PreToolUse::Block(reason) => {
-                    ToolOutput::error(format!("blocked by pre_tool_use hook: {reason}"))
-                }
-                PreToolUse::Continue(updated) => {
-                    if let Some(updated) = updated {
-                        args = updated;
-                    }
-                    // Same checkpoint seam as the parent's dispatcher: the
-                    // subagent's edits are snapshotted under the parent's
-                    // current turn (the context carries the parent's store).
-                    crate::checkpoint::snapshot_edit_target(&scoped, &name, &args, &ctx);
-                    let mut output = match scoped.execute(&name, args.clone(), &ctx).await {
-                        Ok(output) => output,
-                        Err(err) => ToolOutput::error(err.to_string()),
-                    };
-                    if let Some(extra) = hooks
-                        .post_tool_use_with_output(
-                            &name,
-                            &args,
-                            &output.content,
-                            output.is_error,
-                            Mode::Sovereign,
-                            None,
-                        )
-                        .await
-                    {
-                        crate::hooks::append_context(&mut output.content, &extra);
-                    }
-                    output
-                }
-            };
-            if let Some(events) = &progress {
-                super::emit(
-                    events,
-                    crate::agent::AgentEvent::SubagentRunToolFinished {
-                        run,
-                        name: name.clone(),
-                        output: output.clone(),
-                    },
-                )
-                .await;
-            }
-            let body = if output.is_error {
-                format!("Error: {}", output.content)
-            } else {
-                output.content
-            };
-            history.push(if native_tools {
-                ChatMessage::tool_result(name.clone(), body)
-            } else {
-                ChatMessage::user(format!("Tool result for `{name}`:\n{body}"))
-            });
-
-            // Same convention as the parent loop: a tool's images ride back to
-            // the model on a following user message (a `tool` result cannot
-            // carry them on OpenAI), after being persisted and announced.
-            if !output.images.is_empty() {
-                let tool = name.clone();
-                let images = crate::agent::absorb_images(
-                    output.images,
-                    ctx.images.as_ref(),
-                    progress.as_ref(),
-                    |images| crate::agent::AgentEvent::SubagentRunImages {
-                        run,
-                        source: crate::agent::ImageSource::Tool(tool),
-                        images,
-                    },
-                )
-                .await;
-                if !images.is_empty() {
-                    history.push(ChatMessage::user_with_images(
-                        format!("Image(s) returned by `{name}`:"),
-                        images,
-                    ));
-                }
-            }
-        }
-
-        if let Some(events) = &progress {
-            super::emit(
-                events,
-                crate::agent::AgentEvent::SubagentRunStep { run, step },
-            )
-            .await;
-        }
+    };
+    // Unreachable in practice — this run's policy carries no interrupt, because
+    // `spawn` races the whole loop against one — but a `spawn` that grows a
+    // per-step interrupt later must not silently turn it into a completed run.
+    if ran.reason == crate::agent::DoneReason::Stopped {
+        close_pane(
+            &progress,
+            run,
+            ran.steps_used,
+            &SubagentStop::Cancelled.to_string(),
+        )
+        .await;
+        return Err(anyhow::Error::new(SubagentStop::Cancelled));
     }
 
-    let output = if last_text.trim().is_empty() {
+    let completed = ran.reason == crate::agent::DoneReason::Completed;
+    let output = if ran.last_text.trim().is_empty() {
         NO_FINAL_TEXT.to_string()
     } else {
-        last_text
+        ran.last_text
     };
     if let Some(events) = &progress {
         super::emit(
@@ -721,7 +884,7 @@ pub async fn spawn(
                 run,
                 completed,
                 output: output.clone(),
-                steps_used,
+                steps_used: ran.steps_used,
                 error: None,
             },
         )
@@ -731,7 +894,7 @@ pub async fn spawn(
     Ok(SubagentResult {
         name: config.name.clone(),
         output,
-        steps_used,
+        steps_used: ran.steps_used,
         completed,
     })
 }
@@ -749,9 +912,10 @@ pub struct SpawnSubagentTool {
     hooks: Arc<HookEngine>,
     /// Tool description, including the roster of available subagents.
     description: String,
-    /// The parent's active model (bound via [`Self::model_handle`] +
-    /// `Agent::bind_subagent_model`); `None` reads the configured model.
-    model: SharedActiveModel,
+    /// The parent's live model and cancel handle (bound via
+    /// [`Self::model_handle`] + `Agent::bind_subagent_model`). Unbound, runs
+    /// read the configured model and cannot be interrupted.
+    binding: SharedActiveModel,
 }
 
 impl SpawnSubagentTool {
@@ -793,19 +957,20 @@ impl SpawnSubagentTool {
             registry,
             hooks,
             description,
-            model: Arc::new(std::sync::RwLock::new(None)),
+            binding: Arc::new(SubagentBinding::default()),
         }
     }
 
     /// Handle the parent agent binds (see `Agent::bind_subagent_model`) so
-    /// mid-session `/model` switches reach subagent runs. Unbound, runs fall
-    /// back to the configured active model.
+    /// mid-session `/model` switches and user interrupts reach subagent runs.
+    /// Unbound, runs fall back to the configured active model and cannot be
+    /// cancelled.
     pub fn model_handle(&self) -> SharedActiveModel {
-        Arc::clone(&self.model)
+        Arc::clone(&self.binding)
     }
 
     fn active_model(&self) -> Option<String> {
-        self.model.read().ok().and_then(|model| model.clone())
+        self.binding.model()
     }
 }
 
@@ -852,9 +1017,23 @@ impl Tool for SpawnSubagentTool {
             tool: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
             message: err.to_string(),
         })?;
+        // A foreground run happens *inside* the parent's turn, so Esc must end
+        // it; a background one outlives that turn on purpose and is killed
+        // through the subagent registry instead. Deciding here rather than in
+        // `spawn` is what keeps that distinction visible at the place it is
+        // actually made.
         let options = SpawnOptions {
             model: self.active_model(),
             read_only: args.plan_mode,
+            cancel: if args.background {
+                None
+            } else {
+                self.binding.cancel()
+            },
+            // The breaker, unlike the cancel handle, is shared by background
+            // runs too: detaching a run from the *turn* is not detaching it
+            // from the endpoint, and an outage is an outage whoever noticed.
+            breaker: self.binding.breaker().unwrap_or_default(),
             ..Default::default()
         };
 
@@ -1004,7 +1183,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
-    use crate::llm::{ChatChunk, ChatStream, FunctionCall};
+    use crate::llm::{CacheTokens, ChatChunk, ChatRequest, ChatStream, Image};
 
     /// Temp project dir removed on drop.
     struct TempDir(PathBuf);
@@ -1032,8 +1211,18 @@ mod tests {
         /// scripted responses resume; `u32::MAX` fails every call.
         fail: Mutex<u32>,
         fail_status: u16,
+        /// `Retry-After` the scripted failures carry, as a real provider
+        /// attaches it (under the `ProviderError`, not on it).
+        fail_retry_after: Option<std::time::Duration>,
         /// What `supports_native_tools` reports.
         native_tools: bool,
+        /// What `context_window` reports, which is what the pressure bands —
+        /// and therefore compaction — are measured against.
+        window: Option<u32>,
+        /// Leading calls that hang forever before the scripted responses
+        /// start, so a test can interrupt a run mid-call and still have the
+        /// provider answer the *next* one.
+        stall: Mutex<u32>,
     }
 
     impl ScriptedProvider {
@@ -1064,7 +1253,44 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 fail: Mutex::new(fail),
                 fail_status,
+                fail_retry_after: None,
                 native_tools,
+                window: None,
+                stall: Mutex::new(0),
+            })
+        }
+
+        /// Serves `responses` under a provider that reports `window` tokens of
+        /// context, which is the only way a sub-run can know it is too full.
+        fn windowed(window: u32, responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            let mut built = Self::build(responses, 0, 0, true);
+            Arc::get_mut(&mut built).expect("sole owner").window = Some(window);
+            built
+        }
+
+        /// Hangs on the first `calls` requests, then serves `responses`.
+        fn stalling(calls: u32, responses: Vec<Vec<ChatChunk>>) -> Arc<Self> {
+            let built = Self::build(responses, 0, 0, true);
+            *built.stall.lock().unwrap() = calls;
+            built
+        }
+
+        /// Fails `failures` times with `status` **and** a server-stated
+        /// `Retry-After`, then serves `responses`.
+        fn rate_limited(
+            failures: u32,
+            retry_after: std::time::Duration,
+            responses: Vec<Vec<ChatChunk>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+                fail: Mutex::new(failures),
+                fail_status: 429,
+                fail_retry_after: Some(retry_after),
+                native_tools: true,
+                window: None,
+                stall: Mutex::new(0),
             })
         }
     }
@@ -1086,16 +1312,30 @@ mod tests {
         async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
             self.requests.lock().unwrap().push(request);
             {
+                let stall = {
+                    let mut stall = self.stall.lock().unwrap();
+                    let hang = *stall > 0;
+                    *stall = stall.saturating_sub(1);
+                    hang
+                };
+                if stall {
+                    // Longer than any test's patience: a stalled run must end
+                    // on its own terms, never on the provider relenting.
+                    tokio::time::sleep(Duration::from_secs(3_600)).await;
+                    unreachable!("the stall outlasts the test");
+                }
+            }
+            {
                 let mut fail = self.fail.lock().unwrap();
                 if *fail > 0 {
                     if *fail != u32::MAX {
                         *fail -= 1;
                     }
-                    return Err(crate::llm::ProviderError::http(
+                    return Err(crate::llm::http_error_with_retry_after(
                         self.fail_status,
                         "scripted failure",
-                    )
-                    .into());
+                        self.fail_retry_after,
+                    ));
                 }
             }
             let chunks = self
@@ -1107,6 +1347,10 @@ mod tests {
             Ok(futures_util::StreamExt::boxed(stream::iter(
                 chunks.into_iter().map(Ok),
             )))
+        }
+
+        async fn context_window(&self, _model: &str) -> Option<u32> {
+            self.window
         }
 
         fn label(&self) -> String {
@@ -1123,6 +1367,7 @@ mod tests {
             done_reason: None,
             eval_count: None,
             prompt_eval_count: None,
+            cache: CacheTokens::NONE,
         }
     }
 
@@ -1241,7 +1486,7 @@ mod tests {
 
         // Bound, then written through by a `/model` switch.
         let handle = tool.model_handle();
-        *handle.write().unwrap() = Some("switched-model".to_string());
+        handle.set_model("switched-model".to_string());
 
         tool.execute(
             serde_json::json!({ "subagent": worker().name, "task": "report" }),
@@ -1264,7 +1509,11 @@ mod tests {
             chunk("secret reasoning", true, false),
             chunk("the actual report", false, true),
         ]]);
-        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "test".to_string(),
+        ));
         let ctx = ToolContext::new(&tmp.0);
         let client: Arc<dyn LlmProvider> = provider.clone();
 
@@ -1325,12 +1574,7 @@ mod tests {
 
         let tmp = TempDir::new();
         let mut call = ChatMessage::assistant("");
-        call.tool_calls.push(ToolCall {
-            function: FunctionCall {
-                name: "generate_image".to_string(),
-                arguments: json!({}),
-            },
-        });
+        call.push_tool_call(ToolCall::new("generate_image".to_string(), json!({})));
         let provider = ScriptedProvider::new(vec![
             vec![ChatChunk {
                 message: Some(call),
@@ -1340,10 +1584,15 @@ mod tests {
                 done_reason: None,
                 eval_count: None,
                 prompt_eval_count: None,
+                cache: CacheTokens::NONE,
             }],
             vec![chunk("done", false, true)],
         ]);
-        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "test".to_string(),
+        ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let ctx = ToolContext::new(&tmp.0)
             .with_images(Arc::new(crate::images::ImageStore::in_dir(
@@ -1373,10 +1622,10 @@ mod tests {
         let second = provider.requests.lock().unwrap()[1].messages.clone();
         let carried = second
             .iter()
-            .find(|message| !message.images.is_empty())
+            .find(|message| !message.images().is_empty())
             .expect("a message carrying the image");
         assert_eq!(carried.role, crate::llm::Role::User);
-        assert_eq!(carried.images[0].mime, "image/png");
+        assert_eq!(carried.images()[0].mime, "image/png");
 
         // And it was announced on this run, with a path on disk.
         let mut announced = Vec::new();
@@ -1405,31 +1654,40 @@ mod tests {
         // Two model calls: one that asks for a tool, then the report. Both
         // report counts, and both have to be accounted for — an ultra turn is
         // N of these runs, and the status bar shows one number.
+        //
+        // Both also report a cache split, which is the shape that actually
+        // occurs: the second call re-sends the first one's prefix, so a
+        // subagent's steps are cache hits almost by construction, and `/ultra`
+        // multiplies that by the size of its roster. A run whose split never
+        // reaches the parent bills that prefix at the full input rate every
+        // time.
         let provider = ScriptedProvider::new(vec![
             vec![ChatChunk {
-                message: Some(ChatMessage {
-                    role: Role::Assistant,
-                    content: String::new(),
-                    tool_calls: vec![ToolCall {
-                        function: FunctionCall {
-                            name: "probe".to_string(),
-                            arguments: json!({}),
-                        },
-                    }],
-                    tool_name: None,
-                    images: Vec::new(),
-                }),
+                message: Some(ChatMessage::assistant_turn(
+                    "",
+                    Vec::new(),
+                    vec![ToolCall::new("probe".to_string(), json!({}))],
+                )),
                 prompt_eval_count: Some(100),
+                cache: CacheTokens { read: 0, write: 80 },
                 eval_count: Some(20),
                 ..chunk("", false, true)
             }],
             vec![ChatChunk {
                 prompt_eval_count: Some(300),
+                cache: CacheTokens {
+                    read: 240,
+                    write: 0,
+                },
                 eval_count: Some(40),
                 ..chunk("the report", false, true)
             }],
         ]);
-        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "test".to_string(),
+        ));
         let usage = Arc::new(crate::usage::UsageTracker::new());
         let (events, mut drain) = tokio::sync::mpsc::channel(64);
         let ctx = ToolContext::new(&tmp.0)
@@ -1468,6 +1726,48 @@ mod tests {
             "but never on last_prompt: that is the parent's own prompt size, and it decides when \
              to compact"
         );
+        assert_eq!(
+            usage.session_cache_totals(),
+            (240, 80),
+            "the cache split is delegated the same way the counts are: it lands on the parent's \
+             record, which is where the turn is priced. Without it the 240 cached tokens bill at \
+             the full input rate and the saving disappears from the cost column"
+        );
+
+        // What that is worth. The second figure is the same turn with the
+        // split dropped, which is what this priced before the threading.
+        let (prompt, completion) = usage.session_totals();
+        let (cache_read, cache_write) = usage.session_cache_totals();
+        let inputs = crate::usage::PriceInputs {
+            model: "claude-opus-5",
+            endpoint: "https://api.anthropic.com",
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+            self_hosted: false,
+        };
+        let billed = crate::usage::estimate_cost(
+            crate::usage::TurnTokens {
+                prompt,
+                completion,
+                cache_read,
+                cache_write,
+            },
+            &inputs,
+        );
+        let as_all_fresh = crate::usage::estimate_cost(
+            crate::usage::TurnTokens {
+                prompt,
+                completion,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            &inputs,
+        );
+        assert!(
+            billed.usd < as_all_fresh.usd,
+            "a delegated cache hit has to move the number it is supposed to move: \
+             {billed:?} vs {as_all_fresh:?}"
+        );
 
         let mut reported = Vec::new();
         while let Ok(event) = drain.try_recv() {
@@ -1486,11 +1786,121 @@ mod tests {
         );
     }
 
+    /// A subagent runs the same models through the same providers as its
+    /// parent, so it cannot answer a parallel batch in a shape Anthropic
+    /// rejects either: all of a turn's results go back on ONE message, and
+    /// the images a tool returned ride after the whole batch rather than
+    /// between two results.
+    #[tokio::test]
+    async fn a_subagent_answers_a_parallel_batch_on_one_message() {
+        /// First call of the batch, so a per-call image push would land its
+        /// user message in the middle of the results.
+        struct ShotTool;
+        #[async_trait]
+        impl Tool for ShotTool {
+            fn name(&self) -> &str {
+                "generate_image"
+            }
+            fn description(&self) -> &str {
+                "Generate an image."
+            }
+            fn parameters(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+            async fn execute(
+                &self,
+                _args: Value,
+                _ctx: &ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+                bytes.extend_from_slice(b"pixels");
+                Ok(ToolOutput::ok_with_images(
+                    "rendered",
+                    vec![Image::from_bytes(&bytes).expect("a PNG")],
+                ))
+            }
+        }
+
+        let tmp = TempDir::new();
+        let mut batch = ChatMessage::assistant("");
+        batch.push_tool_call(ToolCall::new("generate_image", json!({})));
+        batch.push_tool_call(ToolCall::new("probe", json!({ "n": 2 })));
+        let ids: Vec<String> = batch
+            .tool_calls()
+            .iter()
+            .map(|call| call.id.clone())
+            .collect();
+        let provider = ScriptedProvider::new(vec![
+            vec![ChatChunk {
+                message: Some(batch),
+                ..chunk("", false, true)
+            }],
+            vec![chunk("the report", false, true)],
+        ]);
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "test".to_string(),
+        ));
+        let ctx = ToolContext::new(&tmp.0).with_images(Arc::new(
+            crate::images::ImageStore::in_dir(tmp.0.join("images")),
+        ));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ShotTool));
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+
+        spawn(
+            next_run_id(),
+            &worker(),
+            "draw and probe",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("spawn ok");
+
+        // The second request carries the answered batch.
+        let second = provider.requests.lock().unwrap()[1].messages.clone();
+        let answered = second
+            .iter()
+            .position(|message| message.role == Role::Tool)
+            .expect("the batch was answered");
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.role == Role::Tool)
+                .count(),
+            1,
+            "one message answers the whole batch"
+        );
+        let blocks = second[answered].tool_results();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].tool_use_id, ids[0]);
+        assert_eq!(blocks[1].tool_use_id, ids[1]);
+
+        // The images payload follows the batch, never splits it.
+        let follow_up = &second[answered + 1];
+        assert_eq!(follow_up.role, Role::User);
+        assert!(follow_up.text().contains("generate_image"));
+        assert_eq!(follow_up.images().len(), 1);
+    }
+
     #[tokio::test]
     async fn spawn_fails_fast_on_permanent_provider_errors() {
         let tmp = TempDir::new();
         let provider = ScriptedProvider::failing(401);
-        let hooks = HookEngine::new(Vec::new(), tmp.0.clone(), "test".to_string());
+        let hooks = Arc::new(HookEngine::new(
+            Vec::new(),
+            tmp.0.clone(),
+            "test".to_string(),
+        ));
         let ctx = ToolContext::new(&tmp.0);
         let client: Arc<dyn LlmProvider> = provider.clone();
 
@@ -1518,15 +1928,156 @@ mod tests {
         Arc::new(HookEngine::new(Vec::new(), tmp.0.clone(), "test".into()))
     }
 
+    /// A tool that counts how often it was actually dispatched.
+    struct CountingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn description(&self) -> &str {
+            "counts its dispatches"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } })
+        }
+
+        fn access(&self) -> ToolAccess {
+            ToolAccess::ReadOnly
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tool_call_is_refused_by_a_subagent_too() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // What a provider emits when the output-token ceiling lands in the
+        // middle of the *second* call's arguments: both names made it out,
+        // the truncated arguments decoded to `{}`, and the finish reason says
+        // why. The parent turn refuses this batch whole; a subagent running
+        // the same dispatcher and the same hook pipeline must too, and it
+        // must refuse the complete first call along with it, or the model's
+        // own message is left half-answered.
+        let mut message = ChatMessage::assistant("");
+        for _ in 0..2 {
+            message.push_tool_call(ToolCall::new("probe".to_string(), json!({})));
+        }
+        let provider = ScriptedProvider::new(vec![vec![ChatChunk {
+            message: Some(message),
+            images: Vec::new(),
+            thinking: false,
+            done: true,
+            done_reason: Some("length".to_string()),
+            eval_count: None,
+            prompt_eval_count: None,
+            cache: CacheTokens::NONE,
+        }]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+
+        let tmp = TempDir::new();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CountingTool(Arc::clone(&dispatches))));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+        let run = next_run_id();
+
+        let err = spawn(
+            run,
+            &worker(),
+            "delete the temp files",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &test_hooks(&tmp),
+            &ctx,
+        )
+        .await
+        .expect_err("a truncated tool call fails the run");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("output-token limit"), "got: {chain}");
+        assert!(chain.contains("probe"), "got: {chain}");
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            0,
+            "neither call in the batch runs with the arguments that survived truncation"
+        );
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            1,
+            "a truncated reply is not an outage: retrying re-bills the prompt for the same cut"
+        );
+
+        // The pane is closed out rather than left at "running" forever.
+        let mut done = None;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::SubagentRunDone { run: id, error, .. } = event {
+                done = Some((id, error));
+            }
+        }
+        let (id, error) = done.expect("the pane is closed out");
+        assert_eq!(id, run);
+        assert!(
+            error
+                .expect("error carried on the terminal event")
+                .contains("output-token limit")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subagent_waits_the_server_stated_retry_after() {
+        // `/ultra` fans N candidates at one endpoint; on a shared 429 they
+        // used to sleep an identical `retry_base * 2^attempt` and re-storm it
+        // in lockstep, ignoring the deadline the endpoint had just named. The
+        // shipped ladder's first rung is 5s, so a wait past 30s can only have
+        // come from the header.
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::rate_limited(
+            1,
+            std::time::Duration::from_secs(30),
+            vec![vec![chunk("recovered", false, true)]],
+        );
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let ctx = ToolContext::new(&tmp.0);
+
+        let started = tokio::time::Instant::now();
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "report",
+            &SpawnOptions::default(),
+            &client,
+            &ToolRegistry::new(),
+            &hooks,
+            &ctx,
+        )
+        .await
+        .expect("the run recovers after honouring the wait");
+        let waited = started.elapsed();
+
+        assert!(result.completed);
+        assert_eq!(result.output, "recovered");
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert!(
+            waited >= std::time::Duration::from_secs(30),
+            "the subagent retried before the server's own deadline: {waited:?}"
+        );
+    }
+
     /// `done: true` chunk carrying one tool call alongside `content`.
     fn tool_call_chunk(name: &str, content: &str) -> ChatChunk {
         let mut message = ChatMessage::assistant(content);
-        message.tool_calls.push(ToolCall {
-            function: FunctionCall {
-                name: name.to_string(),
-                arguments: json!({}),
-            },
-        });
+        message.push_tool_call(ToolCall::new(name.to_string(), json!({})));
         ChatChunk {
             message: Some(message),
             images: Vec::new(),
@@ -1535,6 +2086,7 @@ mod tests {
             done_reason: None,
             eval_count: None,
             prompt_eval_count: None,
+            cache: CacheTokens::NONE,
         }
     }
 
@@ -1554,8 +2106,9 @@ mod tests {
         assert_eq!(configs[0].name, "helper");
         assert_eq!(
             configs[0].max_steps,
-            crate::config::StepBudget::UNLIMITED,
-            "an omitted budget is unlimited"
+            crate::config::StepBudget::new(DEFAULT_MAX_STEPS),
+            "an omitted budget is the finite default, never unlimited: a manifest that says \
+             nothing must not produce a run nothing can end"
         );
     }
 
@@ -1685,7 +2238,7 @@ mod tests {
         assert!(format!("{err:#}").contains("chat failed"), "{err:#}");
         assert_eq!(
             provider.requests.lock().unwrap().len(),
-            (RETRY_ATTEMPTS + 1) as usize,
+            (turn::RETRY_ATTEMPTS + 1) as usize,
             "initial attempt plus the retry budget"
         );
 
@@ -1754,9 +2307,9 @@ mod tests {
             .find(|m| m.role == Role::Tool)
             .expect("tool feedback");
         assert!(
-            feedback.content.contains("unknown tool: mutate"),
+            feedback.text().contains("unknown tool: mutate"),
             "the write tool does not exist inside the run: {}",
-            feedback.content
+            feedback.text()
         );
     }
 
@@ -1794,7 +2347,7 @@ mod tests {
 
         let requests = provider.requests.lock().unwrap();
         assert!(requests[0].tools.is_empty(), "no native tool specs sent");
-        let system = &requests[0].messages[0].content;
+        let system = requests[0].messages[0].text();
         assert!(
             system.contains("do not have native function calling"),
             "the JSON protocol is taught: {system}"
@@ -1809,9 +2362,9 @@ mod tests {
             .expect("second request has messages");
         assert_eq!(feedback.role, Role::User, "results ride user messages");
         assert!(
-            feedback.content.contains("Tool result for `probe`"),
+            feedback.text().contains("Tool result for `probe`"),
             "{}",
-            feedback.content
+            feedback.text()
         );
     }
 
@@ -1929,18 +2482,16 @@ mod tests {
         let messages = &requests[0].messages;
         // Parent system + user + assistant + fork brief.
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].content, "you are the parent");
+        assert_eq!(messages[0].text(), "you are the parent");
         assert!(
-            messages[3]
-                .content
-                .contains("summarize the auth discussion"),
+            messages[3].text().contains("summarize the auth discussion"),
             "fork brief carries the task: {}",
-            messages[3].content
+            messages[3].text()
         );
         assert!(
-            messages[3].content.contains("/fork"),
+            messages[3].text().contains("/fork"),
             "fork brief identifies itself: {}",
-            messages[3].content
+            messages[3].text()
         );
         // Tools advertised to the fork must exclude spawn_subagent.
         let tool_names: Vec<_> = requests[0]
@@ -1989,5 +2540,427 @@ mod tests {
             .map(|s| s.function.name)
             .collect();
         assert_eq!(names, vec!["probe".to_string()]);
+    }
+
+    /// A provider that never answers, so the only thing that can end a run
+    /// against it is the run's own interrupt or its deadline.
+    struct StallingProvider;
+
+    #[async_trait]
+    impl LlmProvider for StallingProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<ChatStream> {
+            // Longer than any test's patience: a stalled run must die on its
+            // own terms, never on the provider relenting.
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            unreachable!("the stall outlasts the test")
+        }
+
+        fn label(&self) -> String {
+            "stalling:test".to_string()
+        }
+    }
+
+    /// Every `SubagentRunDone` on `events`, drained without waiting for the
+    /// channel to close (the sender is still alive).
+    fn done_events(rx: &mut tokio::sync::mpsc::Receiver<crate::agent::AgentEvent>) -> Vec<String> {
+        let mut closed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::SubagentRunDone { error, .. } = event {
+                closed.push(error.unwrap_or_default());
+            }
+        }
+        closed
+    }
+
+    /// An interrupt ends a foreground run *while it is inside a model call*,
+    /// not at the next step boundary, and closes its pane on the way out.
+    /// Before the interrupt lived in `spawn`, Esc reached the parent's turn and
+    /// left the subagent it was blocked on running.
+    #[tokio::test]
+    async fn a_cancelled_run_ends_at_once_and_closes_its_pane() {
+        let tmp = TempDir::new();
+        let client: Arc<dyn LlmProvider> = Arc::new(StallingProvider);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+        let cancel = CancelHandle::default();
+
+        let options = SpawnOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let raised = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            raised.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = spawn(
+            next_run_id(),
+            &worker(),
+            "stall forever",
+            &options,
+            &client,
+            &ToolRegistry::new(),
+            &test_hooks(&tmp),
+            &ctx,
+        )
+        .await
+        .expect_err("a cancelled run is not a result");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the interrupt ends the run, not the provider"
+        );
+        assert_eq!(
+            err.downcast_ref::<SubagentStop>(),
+            Some(&SubagentStop::Cancelled),
+            "and says so in a way a fan-out can tell from a dead candidate: {err:#}"
+        );
+        assert_eq!(
+            done_events(&mut rx),
+            vec!["cancelled".to_string()],
+            "exactly one terminal event, or the pane is left running"
+        );
+    }
+
+    /// The deadline is `spawn`'s own, so a caller that passed one does not have
+    /// to wrap the call to get it, and the pane is closed out by the same
+    /// function that opened everything else on it.
+    #[tokio::test]
+    async fn a_run_past_its_deadline_is_ended_and_named() {
+        let tmp = TempDir::new();
+        let client: Arc<dyn LlmProvider> = Arc::new(StallingProvider);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+
+        let options = SpawnOptions {
+            deadline: Some(Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let err = spawn(
+            next_run_id(),
+            &worker(),
+            "stall forever",
+            &options,
+            &client,
+            &ToolRegistry::new(),
+            &test_hooks(&tmp),
+            &ctx,
+        )
+        .await
+        .expect_err("a run past its deadline is not a result");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(
+                err.downcast_ref::<SubagentStop>(),
+                Some(SubagentStop::DeadlineExceeded(_))
+            ),
+            "{err:#}"
+        );
+        let closed = done_events(&mut rx);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].contains("timed out"), "{}", closed[0]);
+    }
+
+    /// A run that outgrows its window compacts, exactly as the parent turn
+    /// does, rather than climbing until the provider refuses the prompt.
+    ///
+    /// This is the case a fifty-step budget makes *likelier*, not rarer:
+    /// fifty round trips of tool output is precisely what fills a window, and
+    /// before the sub-loop shared the parent's compactor there was nothing in
+    /// it that could give any of that back.
+    #[tokio::test]
+    async fn a_sub_run_that_outgrows_its_window_compacts_instead_of_failing() {
+        let tmp = TempDir::new();
+        // Twenty messages of inherited conversation (`/fork`'s shape), which
+        // is a history whose only user message is at index 1 — the shape the
+        // conversation anchor could never find a cut in.
+        let mut inherited = vec![
+            ChatMessage::system("you are the parent"),
+            ChatMessage::user("the original request"),
+        ];
+        for step in 0..9 {
+            let mut assistant = ChatMessage::assistant(format!("parent step {step}"));
+            assistant.push_tool_call(ToolCall::new("probe", json!({})));
+            inherited.push(assistant);
+            inherited.push(ChatMessage::tool_result("id", "probe", "some tool output"));
+        }
+
+        // Step one reports a prompt filling 90% of a 1,000-token window, which
+        // is past the auto-compact trigger; the summary lands next; then the
+        // report.
+        let provider = ScriptedProvider::windowed(
+            1_000,
+            vec![
+                vec![ChatChunk {
+                    prompt_eval_count: Some(900),
+                    cache: CacheTokens::NONE,
+                    ..tool_call_chunk("probe", "still working")
+                }],
+                vec![chunk("a terse progress note", false, true)],
+                vec![chunk("the report", false, true)],
+            ],
+        );
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        let options = SpawnOptions {
+            inherited_history: Some(inherited),
+            ..Default::default()
+        };
+
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "carry on",
+            &options,
+            &client,
+            &registry,
+            &test_hooks(&tmp),
+            &ToolContext::new(&tmp.0),
+        )
+        .await
+        .expect("the run survives its own context");
+        assert!(result.completed);
+        assert_eq!(result.output, "the report");
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "the step, the summary, the step");
+        assert!(
+            requests[1].tools.is_empty(),
+            "the summarization pass is a bare completion"
+        );
+        assert!(
+            requests[1].messages[1].text().contains("parent step 0"),
+            "the span handed to the summarizer is the middle of the history"
+        );
+
+        let (before, after) = (&requests[0].messages, &requests[2].messages);
+        assert!(
+            after.len() < before.len(),
+            "the history shrank: {} -> {}",
+            before.len(),
+            after.len()
+        );
+        let note = after
+            .iter()
+            .find(|message| {
+                message
+                    .text()
+                    .starts_with(crate::agent::COMPACT_SUMMARY_HEADING)
+            })
+            .expect("the summary replaced the span");
+        assert!(note.text().contains("a terse progress note"));
+        assert_eq!(
+            note.role,
+            Role::User,
+            "a sub-loop's tail starts on an assistant turn, so a system note would leave the \
+             request opening on one — which Anthropic rejects outright"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .find(|message| message.role != Role::System)
+                .map(|message| message.role),
+            Some(Role::User),
+            "and the request still opens on a user message"
+        );
+    }
+
+    /// The breaker a parent shares is the breaker its delegated runs answer
+    /// to, so an outage is proved once rather than N times — which is the
+    /// difference between a council noticing a dead endpoint and a council
+    /// spending N × 7 requests on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_breaker_ends_a_subagents_run_and_refuses_the_next_one() {
+        let tmp = TempDir::new();
+        let provider = ScriptedProvider::failing(503);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let hooks = test_hooks(&tmp);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ctx = ToolContext::new(&tmp.0).with_events(tx);
+        let shared = breaker::LlmBreaker::new();
+        let options = SpawnOptions {
+            breaker: shared.clone(),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::new();
+        // An `async fn` rather than a closure: the future borrows `options`,
+        // and a closure has no way to say its return type outlives its own
+        // parameter.
+        async fn run(
+            options: &SpawnOptions,
+            client: &Arc<dyn LlmProvider>,
+            registry: &ToolRegistry,
+            hooks: &Arc<HookEngine>,
+            ctx: &ToolContext,
+        ) -> Result<SubagentResult> {
+            spawn(
+                next_run_id(),
+                &worker(),
+                "report",
+                options,
+                client,
+                registry,
+                hooks,
+                ctx,
+            )
+            .await
+        }
+
+        // One run's retry budget is seven attempts, which is under the trip
+        // threshold: it ends on the provider's own error, as it always did.
+        let err = run(&options, &client, &registry, &hooks, &ctx)
+            .await
+            .expect_err("the outage fails the run");
+        assert!(
+            !err.is::<breaker::LlmBreakerOpen>(),
+            "one run's worth of failures is not yet an outage: {err:#}"
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 7);
+        assert!(!shared.is_open());
+
+        // The next run inherits that streak instead of starting a fresh one,
+        // so its very first attempt trips the breaker and ends it.
+        let err = run(&options, &client, &registry, &hooks, &ctx)
+            .await
+            .expect_err("the breaker ends the run");
+        assert!(err.is::<breaker::LlmBreakerOpen>(), "{err:#}");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            8,
+            "one more attempt, then the trip"
+        );
+
+        // And once open it refuses without dialing at all.
+        let err = run(&options, &client, &registry, &hooks, &ctx)
+            .await
+            .expect_err("an open breaker refuses");
+        assert!(err.is::<breaker::LlmBreakerOpen>(), "{err:#}");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            8,
+            "a run against an open breaker costs the endpoint nothing"
+        );
+
+        // A run without the shared breaker is unaffected: the field is about
+        // *whose* breaker, never whether there is one.
+        let err = run(&SpawnOptions::default(), &client, &registry, &hooks, &ctx)
+            .await
+            .expect_err("a fresh breaker still lets the run try");
+        assert!(!err.is::<breaker::LlmBreakerOpen>(), "{err:#}");
+        assert_eq!(provider.requests.lock().unwrap().len(), 15);
+
+        assert_eq!(
+            done_events(&mut rx).len(),
+            4,
+            "every one of those runs closed its pane, including the two that never dialed"
+        );
+    }
+
+    /// Interrupting a foreground run ends that run and nothing else: the
+    /// parent is free to delegate again on the same tool and the same context,
+    /// and the endpoint's breaker has not been told an outage happened.
+    ///
+    /// The second half is the part worth stating. An interrupt that counted as
+    /// a provider failure would mean a user who presses Esc eight times has
+    /// taken their own endpoint offline for thirty seconds.
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_the_parent_free_to_delegate_again() {
+        let tmp = TempDir::new();
+        // The first call hangs; the second answers. So only the interrupt can
+        // end run one, and only a genuinely unwedged parent gets run two.
+        let provider = ScriptedProvider::stalling(1, vec![vec![chunk("the report", false, true)]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let tool = SpawnSubagentTool::new(
+            vec![worker()],
+            client,
+            Arc::new(ToolRegistry::new()),
+            test_hooks(&tmp),
+        );
+        let ctx = ToolContext::new(&tmp.0);
+        let shared = breaker::LlmBreaker::new();
+
+        let cancel = CancelHandle::default();
+        let handle = tool.model_handle();
+        handle.bind("a-model".to_string(), cancel.clone(), shared.clone());
+        let raised = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            raised.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = tool
+            .execute(
+                json!({ "subagent": "worker", "task": "stall forever" }),
+                &ctx,
+            )
+            .await
+            .expect_err("a cancelled run is not a tool result");
+        let ToolError::Execution { source, .. } = &err else {
+            panic!("a cancelled run is an execution failure, not bad arguments: {err}");
+        };
+        assert_eq!(
+            source.downcast_ref::<SubagentStop>(),
+            Some(&SubagentStop::Cancelled),
+            "and the parent can tell an interrupt from a broken run: {source:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the interrupt ends the run, not the provider"
+        );
+        assert_eq!(
+            shared.state(),
+            breaker::BreakerState::Closed,
+            "an interrupt is the user's decision, not the provider's"
+        );
+
+        // A new turn arms a fresh handle, exactly as `run_turn` does, and the
+        // very next delegation runs to completion through the same tool.
+        handle.bind(
+            "a-model".to_string(),
+            CancelHandle::default(),
+            shared.clone(),
+        );
+        let output = tool
+            .execute(json!({ "subagent": "worker", "task": "carry on" }), &ctx)
+            .await
+            .expect("the parent delegates again");
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("the report"), "{}", output.content);
+    }
+
+    /// The default is a run that *can* be ended: unlimited steps plus no
+    /// deadline was a run nothing in the process could stop.
+    #[test]
+    fn the_default_run_is_bounded_in_steps_and_in_time() {
+        assert_eq!(
+            SubagentConfig::default_max_steps(),
+            crate::config::StepBudget::new(DEFAULT_MAX_STEPS)
+        );
+        assert_eq!(SpawnOptions::default().deadline, Some(DEFAULT_DEADLINE));
+        assert!(
+            SpawnOptions::default().cancel.is_none(),
+            "cancellation is opt-in: a backgrounded run outlives the turn that spawned it"
+        );
     }
 }

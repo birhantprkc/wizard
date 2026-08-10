@@ -1,0 +1,57 @@
+# grok: the palette that goes with the `grok` UI skin.
+#
+# Companion to `[ui] skin = "grok"` (see `src/skin.rs`), picked by it only when
+# the user has named no theme of their own.
+#
+# The idea: neutral gray base, cool accents. Grok Build's look is a colored bar
+# down the side of every block, so the palette's job is to keep those bars
+# apart at a glance — violet for the agent, plain gray for the user, dim for a
+# tool — while the prose between them stays neutral.
+#
+# Values are xterm-256 indices approximating the accents Grok Build ships
+# (violet, steel blue, sky, sage, rose, amber) on a neutral rather than
+# blue-tinted gray, which is the pairing that survives quantization: a
+# blue-tinted base loses its character below truecolor, a neutral one does not.
+
+name = "grok"
+description = "violet and steel on neutral gray — pairs with the grok skin"
+
+border = "rounded"
+
+[tokens]
+text = "reset"
+
+# Neutral grays, three levels.
+muted = 250
+faint = 242
+quote = 245
+
+# The accents. Violet is the agent's voice (it is the bar beside every reply);
+# steel blue structures; sky is code.
+accent = 141
+heading = 111
+code = 117
+
+link = 117
+border = 238
+
+error = 210
+warning = 179
+success = 149
+
+# Tool lifecycle.
+"tool.running" = 117
+"tool.done" = 149
+"tool.failed" = 210
+
+# The `/diff` sidebar.
+"diff.add" = 149
+"diff.del" = 210
+"diff.meta" = 242
+"diff.hunk" = 111
+
+# GrokNight’s `bg_light` (the prompt band) and `bg_dark` (tool-output panels),
+# approximated on the 24-step grey ramp. `blend.rs` recomputes both against the
+# terminal’s real background when that is knowable.
+"bg.raised" = 236
+"bg.sunken" = 234

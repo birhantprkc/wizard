@@ -146,12 +146,6 @@ impl CheckpointStore {
         Ok(true)
     }
 
-    /// Restore the before-states of one turn and prune its records.
-    /// Returns the restored file paths.
-    pub fn restore_turn(&self, turn: u64) -> Result<Vec<PathBuf>> {
-        self.restore_where(|t| t == turn)
-    }
-
     /// Restore the before-states of `turn` and every later turn (the
     /// `/rewind` and cycle-rollback operation): the earliest snapshot of
     /// each path wins, so files return to their state just before `turn`
@@ -170,6 +164,38 @@ impl CheckpointStore {
         let mut chosen: HashMap<&Path, &SnapshotRecord> = HashMap::new();
         for record in records.iter().filter(|record| matches(record.turn)) {
             chosen.entry(record.path.as_path()).or_insert(record);
+        }
+
+        // Check every blob before touching a single file.
+        //
+        // This loop copies as it goes and `?`s out on the first failure, which
+        // for a *destructive* operation is the wrong shape: a rewind that
+        // reverts three files, finds the fourth snapshot missing and aborts
+        // leaves the tree in a state that is neither before nor after, prunes
+        // nothing (the pruning is below this loop), and does exactly the same
+        // partial thing on a retry.
+        //
+        // A record without its blob needs outside interference — `snapshot`
+        // copies the blob before it appends the record, and `gc` rewrites the
+        // index before it removes the directory, so neither can produce one.
+        // But checkpoints live under a `.wizard/` directory that people clean,
+        // back up and restore, and "somebody deleted a cache directory" should
+        // cost you the ability to rewind, not the contents of your files.
+        let missing: Vec<String> = chosen
+            .values()
+            .filter(|record| record.existed_before)
+            .filter(|record| !self.root.join(&record.snap).exists())
+            .map(|record| format!("{} (turn {})", record.path.display(), record.turn))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "cannot rewind: {} snapshot(s) are missing from {}, so the restore would be \
+                 partial and would leave your files in a state that is neither before nor \
+                 after. Nothing has been changed. Missing: {}",
+                missing.len(),
+                self.root.display(),
+                missing.join(", ")
+            );
         }
 
         let mut restored: Vec<PathBuf> = Vec::new();
@@ -382,7 +408,7 @@ mod tests {
         assert!(store.snapshot(turn, "write_file", &file).unwrap());
         write(&file, "after");
 
-        let restored = store.restore_turn(turn).unwrap();
+        let restored = store.restore_turns_from(turn).unwrap();
         assert_eq!(restored, vec![file.clone()]);
         assert_eq!(read(&file), "before");
     }
@@ -397,7 +423,7 @@ mod tests {
         assert!(store.snapshot(turn, "write_file", &file).unwrap());
         write(&file, "fresh content");
 
-        store.restore_turn(turn).unwrap();
+        store.restore_turns_from(turn).unwrap();
         assert!(!file.exists(), "rewind deletes a file that did not exist");
     }
 
@@ -415,12 +441,61 @@ mod tests {
         assert!(!store.snapshot(turn, "edit_file", &file).unwrap());
         write(&file, "v3");
 
-        store.restore_turn(turn).unwrap();
+        store.restore_turns_from(turn).unwrap();
         assert_eq!(
             read(&file),
             "v1",
             "the turn's before-state is the first snapshot"
         );
+    }
+
+    /// A missing snapshot blob aborts the rewind before anything is written.
+    ///
+    /// The shape this guards: `restore_where` copies file by file and returns
+    /// on the first error, so without a pre-flight check a rewind could revert
+    /// some files, fail on the next, and leave the tree in a state that is
+    /// neither before nor after — with the index unpruned, so a retry repeats
+    /// the same partial write. For the one operation in this program that
+    /// overwrites the user's working files, all-or-nothing is worth a stat per
+    /// snapshot.
+    #[test]
+    fn a_missing_snapshot_aborts_the_rewind_without_touching_anything() {
+        let tmp = TempDir::new();
+        let store = CheckpointStore::open(&tmp.0, 50);
+        let kept = tmp.0.join("kept.txt");
+        let orphan = tmp.0.join("orphan.txt");
+        write(&kept, "before");
+        write(&orphan, "before");
+
+        let turn = store.begin_turn();
+        store.snapshot(turn, "write_file", &kept).unwrap();
+        store.snapshot(turn, "write_file", &orphan).unwrap();
+        write(&kept, "after");
+        write(&orphan, "after");
+
+        // Something outside Wizard removed the checkpoint blobs — a cleaned
+        // cache directory, a restore from backup, a full disk.
+        std::fs::remove_dir_all(
+            tmp.0
+                .join(".wizard")
+                .join("checkpoints")
+                .join(turn.to_string()),
+        )
+        .expect("remove the turn's snapshots");
+
+        let err = store
+            .restore_turns_from(turn)
+            .expect_err("a rewind with no snapshots to restore from must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("Nothing has been changed"), "{text}");
+        assert!(
+            text.contains("orphan.txt") || text.contains("kept.txt"),
+            "{text}"
+        );
+
+        // The point of the check: neither file moved.
+        assert_eq!(read(&kept), "after", "no file may be touched: {text}");
+        assert_eq!(read(&orphan), "after", "no file may be touched: {text}");
     }
 
     #[test]
@@ -485,6 +560,32 @@ mod tests {
         // The same path can be snapshotted again in the same turn after a
         // rewind (the dedup entry was pruned with the records).
         assert!(store.snapshot(turn, "write_file", &file).unwrap());
+    }
+
+    /// `keep_turns = 0` collects everything, and that is on purpose.
+    ///
+    /// Pinned because it is the one value a reader is likely to take for
+    /// "unlimited", and because `gc` reaches it through a `saturating_sub` and
+    /// a `filter` rather than an explicit branch — an easy thing to "tidy" into
+    /// keeping one turn, or into keeping all of them. Both config and
+    /// `docs/checkpoints.md` say what it means; this makes the code agree.
+    #[test]
+    fn keeping_zero_turns_collects_every_snapshot() {
+        let tmp = TempDir::new();
+        let store = CheckpointStore::open(&tmp.0, 0);
+        let file = tmp.0.join("notes.txt");
+        write(&file, "A");
+
+        let turn = store.begin_turn();
+        store.snapshot(turn, "write_file", &file).unwrap();
+        write(&file, "B");
+
+        assert_eq!(store.gc().unwrap(), 1, "the only turn is collected");
+        assert_eq!(
+            store.recent_turns(10).len(),
+            0,
+            "nothing is left to rewind to"
+        );
     }
 
     #[test]

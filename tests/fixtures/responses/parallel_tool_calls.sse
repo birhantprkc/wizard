@@ -1,0 +1,39 @@
+: OpenAI Responses API stream (POST /responses, store=false,
+: include=["reasoning.encrypted_content"]) as the ChatGPT subscription
+: endpoint at chatgpt.com/backend-api/codex serves it.
+:
+: A two-call PARALLEL BATCH, both calls naming the SAME tool. The reasoning
+: item leads, because that is the order the endpoint emits in and the order
+: build_input has to replay in; its encrypted_content is opaque and is the
+: only thing that stops a store=false reasoning model deriving its whole
+: chain of thought again on the next step, and being billed for it again.
+:
+: Same-tool is the case the whole call_id change exists for. Correlating a
+: result back to its call by tool name has two answers here and picks one,
+: which feeds the model file a.rs's contents as the answer to the read of
+: b.rs. Only call_a and call_b tell the two apart, and the ids in this fixture
+: are the only place a test can get them without inventing them.
+:
+: usage.input_tokens_details.cached_tokens is a subset of input_tokens, the
+: way OpenAI counts everywhere, and is never added to it.
+:
+: Lines starting with a colon are SSE comments. The adapter skips every line
+: that does not begin with "data" plus a colon, so this header and the event:
+: lines travel with the bytes without changing what is parsed.
+:
+: Transcribed from the shape chatgpt::tests::
+: a_two_call_batch_from_the_wire_keeps_both_ids_apart asserts. See the header
+: of tests/recorded_provider.rs for how to re-record it from a live stream
+: once the adapter's dump hook exists.
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"gAAAAAB-opaque","summary":[{"type":"summary_text","text":"read both"}]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"a.rs\"}","call_id":"call_a"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"b.rs\"}","call_id":"call_b"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":48000,"output_tokens":120,"input_tokens_details":{"cached_tokens":46080}}}}

@@ -1,17 +1,22 @@
 //! Plaintext API keys for cloud providers, stored in
 //! `~/.wizard/credentials.toml` (0600) keyed by provider name. Unlike
-//! `config.toml` — which only ever names the env var holding a key — this file
+//! `config.toml`, which only ever names the env var holding a key, this file
 //! holds the secret itself, so it is written atomically with tight
-//! permissions (mirroring `xai_oauth::save_tokens`) and reads never hard-fail.
+//! permissions and reads never hard-fail.
+//!
+//! "Tight permissions" is the platform's business, not this module's: the
+//! write goes through [`crate::platform::secrets`], which owns the 0600/0700
+//! mode bits today and the Windows ACL later. This file used to carry its own
+//! copy of that sequence, one of three in the tree.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::platform::secrets;
 
 /// On-disk shape of `credentials.toml`: a `[keys]` table mapping provider name
 /// to its API key.
@@ -57,9 +62,9 @@ fn get_at(path: &Path, name: &str) -> Option<String> {
         .cloned()
 }
 
-/// Insert `key` for `name` and persist atomically (0600). Mirrors
-/// `xai_oauth::save_tokens`: the parent dir is created and tightened to 0700,
-/// then a 0600 temp file is written and renamed over the target.
+/// Insert `key` for `name` and persist atomically, owner-only: the parent dir
+/// is created and tightened, then a private temp file is written and renamed
+/// over the target.
 fn store_at(path: &Path, name: &str, key: &str) -> Result<()> {
     let mut store = load_at(path);
     store.keys.insert(name.to_string(), key.to_string());
@@ -73,49 +78,17 @@ fn remove_at(path: &Path, name: &str) -> Result<()> {
     write_at(path, &store)
 }
 
-/// Serialize `store` to `path` atomically with 0600 permissions.
+/// Serialize `store` to `path` as a private file, atomically.
+///
+/// A failure to make the file (or its directory) private aborts the write.
+/// That is the strict half of [`secrets`]' two policies, and the right one
+/// here: the state tree degrades to a warning on a filesystem with no mode
+/// bits so Wizard still starts, but a plaintext API key that cannot be kept
+/// from other local users is better not written at all.
 fn write_at(path: &Path, store: &Store) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        anyhow!(
-            "credentials path {} has no parent directory",
-            path.display()
-        )
-    })?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-    }
-
     let raw = toml::to_string_pretty(store).context("serializing credentials")?;
-    let tmp = dir.join(".credentials.toml.tmp");
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        // create(true) keeps the mode of a pre-existing file; enforce 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
-        }
-        file.write_all(raw.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
-    Ok(())
+    secrets::write_private_atomic(path, raw.as_bytes())
+        .with_context(|| format!("storing credentials in {}", path.display()))
 }
 
 /// The stored API key for provider `name`, or `None` when none is set.
@@ -203,14 +176,57 @@ mod tests {
         assert!(format!("{err:#}").contains("parsing"), "got: {err:#}");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn stored_file_is_0600() {
-        use std::os::unix::fs::PermissionsExt;
+    fn stored_file_is_private() {
+        // The exact protection, not merely "no wider than": `wizard doctor`
+        // and every reader here assume the file is still writable by its
+        // owner, and an unpinned create under a hostile umask produces one
+        // that is not.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("credentials.toml");
         store_at(&path, "openai", "sk-test").expect("store");
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "credentials file must be 0600");
+        assert!(
+            secrets::is_private_file(&path).expect("stat"),
+            "the credentials file is {}",
+            secrets::protection_summary(&path)
+        );
+    }
+
+    #[test]
+    fn a_store_hardens_its_directory_and_leaves_no_readable_copy() {
+        // Routing the write through the platform layer must not lose any of
+        // the three properties the hand-rolled version had: a private parent
+        // (created if missing), a private file, and no leftover temp file
+        // holding the same key at whatever mode it was created with.
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("fresh-home");
+        let path = dir.join("credentials.toml");
+        store_at(&path, "openai", "sk-secret").expect("store");
+
+        assert!(
+            secrets::is_private_dir(&dir).expect("stat"),
+            "the credentials directory is {}",
+            secrets::protection_summary(&dir)
+        );
+        assert!(secrets::is_protected(&path).expect("stat"));
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "credentials.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+
+        // A directory an older release left world-readable is tightened by the
+        // next write rather than trusted.
+        secrets::expose_to_other_users(&dir).expect("loosen");
+        store_at(&path, "claude", "sk-ant").expect("store again");
+        assert!(
+            secrets::is_private_dir(&dir).expect("stat"),
+            "a loose directory stayed {}",
+            secrets::protection_summary(&dir)
+        );
+        assert_eq!(get_at(&path, "openai"), Some("sk-secret".to_string()));
     }
 }

@@ -42,16 +42,21 @@ impl Tool for EvolveTool {
 
     fn description(&self) -> &str {
         "Add a NEW capability to yourself when the current task needs one you \
-         lack. By default (deep=false) this performs a fast runtime extension — \
+         lack. By default (deep=false) this performs a fast runtime extension: \
          it adds a skill, MCP server, scripted tool (LuaJIT by default), or \
          subagent under ~/.wizard/ with no recompile. Scripted tools run through \
          the embedded LuaJIT just-in-time compiler unless an external interpreter \
          is required. Set deep=true ONLY when the capability genuinely requires \
-         changing Wizard's own Rust source: this rebuilds and replaces the \
-         running binary, is much slower, and is gated by a build plus smoke test \
-         (falling back to a runtime extension if no toolchain or source is \
-         available). The `description` argument is a precise natural-language \
-         specification of the capability you want."
+         changing Wizard's own Rust source. Deep evolve rebuilds and replaces the \
+         running binary behind a three-rung gate: a release build \
+         (`cargo build --release --locked`), the WHOLE test suite \
+         (`cargo test --release --locked`), then a smoke test. Budget for it \
+         accordingly: on a cold cache that is tens of minutes of wall clock, and \
+         it is bounded at 45 minutes, so do not start one when the user is \
+         waiting on a quick answer. A patch that fails any rung is reverted and \
+         the current binary is kept. Falls back to a runtime extension if no \
+         toolchain or source is available. The `description` argument is a \
+         precise natural-language specification of the capability you want."
     }
 
     fn parameters(&self) -> Value {
@@ -65,7 +70,7 @@ impl Tool for EvolveTool {
                 "deep": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Change Wizard's own Rust source and rebuild the binary (slow). Default false uses a fast runtime extension."
+                    "description": "Change Wizard's own Rust source and rebuild the binary. Gated by a release build, the full test suite, and a smoke test, so it can take tens of minutes. Default false uses a fast runtime extension."
                 }
             },
             "required": ["description"]
@@ -224,6 +229,26 @@ mod tests {
         std::fs::write(tmp.0.join(".wizard"), b"not a dir").unwrap();
         let note = write_marker(&tmp.ctx(), "evolve-reexec");
         assert!(note.starts_with("(could not create"), "{note}");
+    }
+
+    #[test]
+    fn the_description_states_the_whole_deep_gate() {
+        let tool = EvolveTool::new(Config::default());
+        let description = tool.description();
+        // This is the only account of the gate the model ever sees, and it is
+        // what it budgets a turn against. While it said "a build plus smoke
+        // test" an agent could reasonably start a deep evolve expecting a
+        // compile and block on a full release test suite instead.
+        assert!(
+            description.contains("cargo test --release --locked"),
+            "{description}"
+        );
+        assert!(description.contains("smoke test"), "{description}");
+        let minutes = crate::evolve::DEFAULT_TEST_TIMEOUT.as_secs() / 60;
+        assert!(
+            description.contains(&format!("{minutes} minutes")),
+            "the bound the model is told must be the bound that is enforced: {description}"
+        );
     }
 
     #[test]

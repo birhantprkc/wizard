@@ -3,13 +3,15 @@
 //! perpetual continuous, gateway). See `docs/hooks.md`.
 //!
 //! Hooks are declared in `~/.wizard/hooks.toml` and
-//! `<project>/.wizard/hooks.toml` (project hooks run after global ones) and
+//! `<project>/.wizard/hooks.toml` (project hooks run after global ones, and
+//! only once the project is trusted, see [`crate::trust`]) and
 //! receive a JSON payload on stdin. Exit 0 continues — depending on the
 //! event, stdout may rewrite tool arguments or append extra context. Exit 2
 //! blocks, with stderr as the reason. Any other exit code, a timeout, or a
 //! spawn failure is a logged warning and the pipeline continues: a broken
 //! hook can never wedge the agent.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -86,7 +88,8 @@ pub struct HookDef {
     /// meaningful for the tool events; other events fire regardless.
     #[serde(default)]
     pub matcher: Option<String>,
-    /// Shell command, run via `sh -c` in the project root.
+    /// Shell command, run in the project root through the platform shell
+    /// ([`crate::platform::shell`]: `sh -c` on Unix).
     pub command: String,
     /// Wall-clock budget; the hook is killed and ignored past it
     /// (default 60).
@@ -107,15 +110,101 @@ pub fn parse(raw: &str) -> Result<Vec<HookDef>, toml::de::Error> {
 }
 
 /// Load hook definitions for a project: global `~/.wizard/hooks.toml` first,
-/// then `<project>/.wizard/hooks.toml` appended after it.
+/// then `<project>/.wizard/hooks.toml` appended after it, the latter only
+/// when the project is trusted ([`crate::trust`]).
+///
+/// This is the single funnel every surface goes through (TUI, sovereign,
+/// gateway, GUI, fleet), so the trust gate lives here rather than at the four
+/// call sites: a hook that is never loaded can never fire, on any surface,
+/// for any event.
+///
+/// Never prompts, on any surface, ever. This runs again on every agent rebuild
+/// (`/model`, a provider switch, `/fusion`, crash recovery), by which time the
+/// TUI owns the terminal in raw mode behind the alternate screen and a blocking
+/// stdin read would freeze the whole app, so an undecided project is refused
+/// rather than asked about. The question is settled once, earlier, by the
+/// surface that still owns its terminal (`crate::trust::preflight`); by the
+/// time anything gets here the answer is on record and this only reads it.
 pub fn load(project_root: &Path) -> Vec<HookDef> {
     let mut paths = Vec::new();
     match Config::wizard_dir() {
         Ok(dir) => paths.push(dir.join("hooks.toml")),
         Err(err) => tracing::warn!("could not resolve ~/.wizard for hooks: {err}"),
     }
-    paths.push(project_root.join(".wizard").join("hooks.toml"));
-    load_files(&paths)
+    // The global file lives in the user's own ~/.wizard and is theirs by
+    // construction; only the project file arrives with a `git clone`, so only
+    // the project file is gated.
+    let mut defs = load_files(&paths);
+    defs.extend(load_project(
+        project_root,
+        crate::trust::env_trust(),
+        &log_refusal,
+    ));
+    defs
+}
+
+/// Where a trust refusal goes from *here*. One seam, one destination: the log.
+///
+/// The refusal used to be written to stderr as well, on the theory that a log
+/// file is nobody's idea of a notification. But [`load_project`] runs again on
+/// every agent rebuild (`/model`, a provider switch, `/fusion`, crash
+/// recovery), and under the TUI that put a multi-line message straight onto
+/// the alternate screen with the terminal in raw mode, where a bare `\n`
+/// staircases the text across the frame. `crate::logging` is the sink that
+/// exists precisely because nothing in this process may write to the terminal
+/// behind the TUI's back.
+///
+/// A log line is not a notification, so it is not the only thing that happens:
+/// each surface says it once, itself, where its user is actually looking. The
+/// TUI settles the question before it takes the terminal
+/// (`crate::trust::preflight`) and puts any refusal in the transcript; the
+/// headless runner prints it before the spinner starts; the gateway and the
+/// GUI call `crate::trust::unattended_refusal` and put it in the operator's
+/// journal and the task's own stream. This is the per-rebuild trace underneath
+/// all of that.
+fn log_refusal(why: &str) {
+    tracing::warn!("{why}");
+}
+
+/// How a refusal is surfaced, injected so a test can count the reports without
+/// depending on a global tracing subscriber.
+type Report<'a> = &'a dyn Fn(&str);
+
+/// `<project>/.wizard/hooks.toml`, behind the per-project trust gate.
+///
+/// Cloning a repository must not be enough to run its shell commands, and
+/// `session_start` fires before the model has said a word, so an untrusted
+/// project contributes no hooks at all.
+///
+/// The approved bytes come back from the gate and are parsed here rather than
+/// read again: between the read the trust decision was made on and a second
+/// read at load time sits a `git pull`, a branch switch, or Wizard's own edit
+/// of the project it is working in, and what runs must be what was approved.
+///
+/// The console declaration is hard-coded to
+/// [`crate::trust::Console::Unavailable`] and not a parameter, because there is
+/// no caller for which it could be anything else: this is the funnel every
+/// surface shares, including the mid-turn rebuilds that run underneath a live
+/// TUI. `env_trusted` *is* a parameter so a test can say which side of the
+/// opt-in it is testing instead of inheriting the shell's.
+fn load_project(project_root: &Path, env_trusted: bool, report: Report<'_>) -> Vec<HookDef> {
+    match crate::trust::gate_with_console_env(
+        project_root,
+        crate::trust::Console::Unavailable,
+        env_trusted,
+    ) {
+        crate::trust::Gate::Allowed(surface) => {
+            match surface.contents_of(crate::trust::PROJECT_HOOKS_FILE) {
+                Some(raw) => parse_bytes(&project_root.join(crate::trust::PROJECT_HOOKS_FILE), raw),
+                // No project hooks file at all: the common case.
+                None => Vec::new(),
+            }
+        }
+        crate::trust::Gate::Refused(why) => {
+            report(&why);
+            Vec::new()
+        }
+    }
 }
 
 /// Read and parse each path in order, concatenating the results. Missing
@@ -124,7 +213,7 @@ pub fn load(project_root: &Path) -> Vec<HookDef> {
 fn load_files(paths: &[PathBuf]) -> Vec<HookDef> {
     let mut defs = Vec::new();
     for path in paths {
-        let raw = match std::fs::read_to_string(path) {
+        let raw = match std::fs::read(path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -132,16 +221,33 @@ fn load_files(paths: &[PathBuf]) -> Vec<HookDef> {
                 continue;
             }
         };
-        match parse(&raw) {
-            Ok(mut hooks) => defs.append(&mut hooks),
-            Err(err) => tracing::warn!("skipping invalid {}: {err}", path.display()),
-        }
+        defs.append(&mut parse_bytes(path, &raw));
     }
     defs
 }
 
+/// Parse one hooks file's bytes. Invalid UTF-8 or invalid TOML costs that
+/// file's hooks and nothing else: a bad hook file can never prevent startup.
+fn parse_bytes(path: &Path, raw: &[u8]) -> Vec<HookDef> {
+    let raw = match std::str::from_utf8(raw) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::warn!("skipping {}: not valid UTF-8: {err}", path.display());
+            return Vec::new();
+        }
+    };
+    match parse(raw) {
+        Ok(hooks) => hooks,
+        Err(err) => {
+            tracing::warn!("skipping invalid {}: {err}", path.display());
+            Vec::new()
+        }
+    }
+}
+
 /// What one hook execution did, surfaced via [`AgentEvent::HookFired`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HookOutcome {
     /// `pre_tool_use` rewrote the tool arguments.
     UpdatedArgs,
@@ -227,6 +333,21 @@ pub struct HookEngine {
     /// Current session id for payloads; swapped when `/clear` starts a new
     /// session.
     session_id: Mutex<String>,
+    /// Which hooks have already had an [`HookOutcome::AppendedContext`]
+    /// reported, keyed by lifecycle event and command.
+    ///
+    /// A hook that appends context does so every single time it matches —
+    /// that is what a context-injection hook *is* — so reporting each one
+    /// turns a `post_tool_use` hook into a line per tool call. The first
+    /// append is worth surfacing, because text entering the model's context
+    /// from outside the conversation is not otherwise visible anywhere; the
+    /// hundredth is not. Repeats are dropped to the log instead.
+    ///
+    /// Only [`HookOutcome::AppendedContext`] is deduplicated. A warning, a
+    /// block and a rewrite are reported every time: those describe something
+    /// that varies per call, and swallowing the second one would hide the
+    /// event that mattered.
+    appended: Mutex<HashSet<(&'static str, String)>>,
 }
 
 impl HookEngine {
@@ -256,6 +377,7 @@ impl HookEngine {
             hooks,
             cwd,
             session_id: Mutex::new(session_id),
+            appended: Mutex::new(HashSet::new()),
         }
     }
 
@@ -265,8 +387,16 @@ impl HookEngine {
     }
 
     /// Swap the payload session id (after `/clear` starts a new session).
+    ///
+    /// The append-notice filter is emptied with it: "once per session" is
+    /// measured in sessions, and `/clear` gives the user a transcript with
+    /// nothing in it, where the note that a hook is feeding the model text is
+    /// worth making again.
     pub fn set_session_id(&self, id: String) {
         *self.session_id.lock().unwrap() = id;
+        if let Ok(mut seen) = self.appended.lock() {
+            seen.clear();
+        }
     }
 
     /// `pre_tool_use`: run the matching hooks before `tool` executes. Exit 2
@@ -548,9 +678,13 @@ impl HookEngine {
                 .extend(fields.clone());
         }
 
-        let mut child = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&hook.def.command)
+        // Through the platform shell, not a hand-written `sh -c`: hooks are
+        // command *lines* (`cargo fmt && git add -u`), and which interpreter
+        // reads them is a platform decision that has to match the one
+        // `crate::agent::prompts` tells the model about. A second spelling here
+        // is how a Windows leg ends up running every hook through `sh` while
+        // the rest of the process has moved to `cmd`.
+        let mut child = match crate::platform::shell::tokio_command(&hook.def.command)
             .current_dir(&self.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -562,14 +696,36 @@ impl HookEngine {
             Err(err) => return RunResult::Failed(format!("spawn failed: {err}")),
         };
 
-        if let Some(mut stdin) = child.stdin.take() {
-            // A hook that never reads stdin may close the pipe early; that is
-            // its prerogative, not an error.
-            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-        }
+        let stdin = child.stdin.take();
+        let bytes = payload.to_string().into_bytes();
+        // The write goes *inside* the timeout, and runs concurrently with the
+        // wait rather than before it. Both matter, and neither used to hold.
+        //
+        // A pipe buffers 64 KiB on Linux; a `pre_tool_use` payload carries the
+        // tool's arguments, so a `write_file` of any real size exceeds that on
+        // the first hook that fires. Past the buffer the write blocks until the
+        // hook reads — and a hook that never reads stdin, which the comment
+        // below correctly calls its prerogative, never does. That is an
+        // unbounded block before `timeout_secs` has started, which is exactly
+        // the wedge this module's contract promises cannot happen.
+        //
+        // Joining the write with the wait closes the other half: a hook that
+        // reads stdin but prints more than a pipe's worth first would otherwise
+        // deadlock against a writer that is not draining its stdout.
+        let run = async {
+            let write = async {
+                if let Some(mut stdin) = stdin {
+                    // A hook that never reads stdin may close the pipe early;
+                    // that is its prerogative, not an error.
+                    let _ = stdin.write_all(&bytes).await;
+                    // Dropped here, so a hook that reads to EOF sees one.
+                }
+            };
+            tokio::join!(write, child.wait_with_output()).1
+        };
 
         let timeout = Duration::from_secs(hook.def.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        match tokio::time::timeout(timeout, run).await {
             Ok(Ok(output)) => RunResult::Exited {
                 code: output.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -582,6 +738,9 @@ impl HookEngine {
 
     /// Surface one hook's outcome. Warnings also land in the log; callers
     /// skip this for plain successes, so default behavior is unchanged.
+    ///
+    /// A repeated [`HookOutcome::AppendedContext`] from the same hook is
+    /// logged rather than surfaced — see [`HookEngine::appended`].
     async fn report(
         &self,
         events: Option<&mpsc::Sender<AgentEvent>>,
@@ -592,15 +751,40 @@ impl HookEngine {
         if let HookOutcome::Warning(why) = &outcome {
             tracing::warn!("hook {} ({}): {why}", event.name(), hook.def.command);
         }
+        if outcome == HookOutcome::AppendedContext && !self.first_append(event, hook) {
+            tracing::debug!(
+                "hook {} ({}): appended context (already reported this session)",
+                event.name(),
+                hook.def.command
+            );
+            return;
+        }
         if let Some(events) = events {
             let _ = events
                 .send(AgentEvent::HookFired {
-                    event: event.name(),
+                    event: event.name().to_string(),
                     command: hook.def.command.clone(),
                     outcome,
                 })
                 .await;
         }
+    }
+
+    /// Claim the one reportable append for this hook: `true` the first time
+    /// `event`/`hook` appends context, `false` for every append after it.
+    ///
+    /// Claiming and testing are the same operation on purpose. Two tool calls
+    /// can dispatch concurrently (a subagent's and the main loop's share this
+    /// engine through an `Arc`), and a check followed by a separate insert
+    /// would let both see an empty set and both report.
+    ///
+    /// A poisoned lock is treated as "already reported". The set is a noise
+    /// filter, and a panic somewhere else in the process is not a reason to
+    /// start printing a line this exists to suppress.
+    fn first_append(&self, event: HookEvent, hook: &CompiledHook) -> bool {
+        self.appended
+            .lock()
+            .is_ok_and(|mut seen| seen.insert((event.name(), hook.def.command.clone())))
     }
 
     /// Commands of the hooks that would fire for `event`/`tool` (tests).
@@ -817,8 +1001,386 @@ mod tests {
         assert!(capped.ends_with("[tool output truncated]"));
     }
 
+    /// A hook that never reads its stdin cannot outlive its `timeout_secs`.
+    ///
+    /// The payload here is bigger than a pipe buffer (64 KiB on Linux), which
+    /// a `pre_tool_use` payload reaches the first time a `write_file` of any
+    /// real size is hooked, because the tool's arguments travel in it. The
+    /// write used to sit *before* the timeout, so past the buffer it blocked
+    /// until the hook read — and this one never does. `timeout_secs` had not
+    /// started, so nothing bounded it: the module contract says a broken hook
+    /// can never wedge the agent, and a hook that just ignores stdin did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_that_never_reads_a_large_payload_still_hits_its_timeout() {
+        let engine = HookEngine::new(
+            vec![HookDef {
+                event: HookEvent::PreToolUse,
+                matcher: None,
+                command: "sleep 30".to_string(),
+                timeout_secs: Some(1),
+            }],
+            std::env::temp_dir(),
+            "test-session".to_string(),
+        );
+        let args = json!({ "content": "x".repeat(512 * 1024) });
+
+        let started = std::time::Instant::now();
+        let result = engine
+            .run(
+                &engine.hooks[0],
+                HookEvent::PreToolUse,
+                Some(("write_file", &args)),
+                None,
+                Mode::default(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        match result {
+            RunResult::Failed(why) => assert!(why.contains("timed out"), "{why}"),
+            RunResult::Exited { code, .. } => panic!("expected a timeout, got exit {code}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the timeout did not bound the run: {elapsed:?}"
+        );
+    }
+
     // A `cat` hook echoes the stdin payload back as appended context, so
     // these tests observe exactly what a hook receives.
+
+    /// A project root with a `session_start` hook that would `touch` the
+    /// returned sentinel path. Whether the sentinel exists afterwards is the
+    /// only honest test of "did the hook execute".
+    fn project_with_session_start_hook() -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("wizard-hooks-trust-{}", uuid::Uuid::new_v4()));
+        let sentinel = root.join("fired");
+        let hooks = root.join(".wizard").join("hooks.toml");
+        std::fs::create_dir_all(hooks.parent().expect("has parent")).unwrap();
+        std::fs::write(
+            &hooks,
+            format!(
+                "[[hooks]]\nevent = \"session_start\"\ncommand = \"touch {}\"\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        (root, sentinel)
+    }
+
+    /// [`load`] with the environment opt-in pinned off, which is what every
+    /// surface sees on a machine that has not exported `WIZARD_TRUST_PROJECT`.
+    /// `cargo test` inherits the developer's (or the CI runner's) environment,
+    /// and `docs/hooks.md` recommends exporting the variable on unattended
+    /// machines, so a test about an *undecided* project has to say which
+    /// answer it is testing rather than inherit one.
+    fn load_undecided(root: &Path) -> Vec<HookDef> {
+        load_project(root, false, &log_refusal)
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_projects_session_start_hook_never_runs() {
+        let (root, sentinel) = project_with_session_start_hook();
+        crate::trust::record(&root, crate::trust::Decision::Deny).expect("record the refusal");
+
+        // `load`, the production entry point: a recorded refusal outranks the
+        // environment opt-in, so this holds whatever the suite was started
+        // with.
+        let defs = load(&root);
+        assert!(
+            defs.is_empty(),
+            "an untrusted project contributes no hooks: {defs:?}"
+        );
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(
+            !sentinel.exists(),
+            "the hook of an untrusted project must not execute"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_projects_session_start_hook_still_runs() {
+        let (root, sentinel) = project_with_session_start_hook();
+        crate::trust::record(&root, crate::trust::Decision::Trust).expect("record the approval");
+
+        let defs = load(&root);
+        assert_eq!(defs.len(), 1, "the project hook is loaded: {defs:?}");
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(
+            sentinel.exists(),
+            "a trusted project's hook fires as before"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn approving_a_project_at_the_prompt_lets_its_session_start_hook_run() {
+        // The other half of the gate, and the one that was unreachable while
+        // no caller declared a console: a project the user says yes to runs its
+        // hooks. The answer travels the real path: the gate reads the surface,
+        // records the decision, and writes the store that `load` reads back
+        // through `status`, with only the human scripted.
+        let (root, sentinel) = project_with_session_start_hook();
+        assert!(
+            matches!(
+                crate::trust::answer_for_test(&root, true),
+                crate::trust::Gate::Allowed(_)
+            ),
+            "answering yes allows"
+        );
+        assert_eq!(crate::trust::status(&root), crate::trust::Status::Trusted);
+
+        let defs = load(&root);
+        assert_eq!(defs.len(), 1, "the approved project's hook loads: {defs:?}");
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(
+            sentinel.exists(),
+            "an approved project's session_start hook actually executes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn refusing_a_project_at_the_prompt_keeps_its_session_start_hook_off() {
+        // The mirror of the test above, through the same path: a no is
+        // recorded, and it is a decision rather than a re-ask.
+        let (root, sentinel) = project_with_session_start_hook();
+        assert!(matches!(
+            crate::trust::answer_for_test(&root, false),
+            crate::trust::Gate::Refused(_)
+        ));
+        assert_eq!(crate::trust::status(&root), crate::trust::Status::Denied);
+
+        let defs = load(&root);
+        assert!(defs.is_empty(), "a refused project loads nothing: {defs:?}");
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(!sentinel.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_project_contributes_no_hooks_on_any_rebuild() {
+        let (root, sentinel) = project_with_session_start_hook();
+        crate::trust::record(&root, crate::trust::Decision::Deny).expect("record the refusal");
+
+        // `load` runs again on every agent rebuild (`/model`, a provider
+        // switch, `/fusion`, crash recovery), and each of those must be silent
+        // about everything except the one report. Reaching the end of this
+        // loop at all is half the assertion: a gate that prompted here would
+        // sit on stdin forever.
+        let reported = std::cell::RefCell::new(Vec::new());
+        let report = |why: &str| reported.borrow_mut().push(why.to_string());
+        for _ in 0..3 {
+            let defs = load_project(&root, false, &report);
+            assert!(
+                defs.is_empty(),
+                "a refused project contributes no hooks, ever: {defs:?}"
+            );
+        }
+
+        let reported = reported.into_inner();
+        assert_eq!(reported.len(), 3, "reported once per load: {reported:?}");
+        assert!(
+            reported
+                .iter()
+                .all(|why| why.contains("not running project hooks")),
+            "{reported:?}"
+        );
+        assert!(!sentinel.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_refusal_never_reaches_the_terminal() {
+        // Structural, deliberately. The defect this guards against is a print
+        // that staircases across the TUI's alternate screen on every agent
+        // rebuild, and nothing a unit test can observe in-process tells "wrote
+        // to fd 2" from "wrote to the log" without hijacking fd 2 for every
+        // other test in the binary. So assert on this module's own source: it
+        // prints nowhere, and the reporter it hands `load_project` is the log.
+        let source = include_str!("mod.rs");
+        // Everything above this module's own tests. Tests may print; the
+        // module may not, and this assertion has to be able to name what it
+        // is looking for without becoming the match itself.
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("this module ends with its test module");
+        // The needles are assembled rather than written out for the same
+        // reason. The two cover all four print macros: the `e`-prefixed
+        // spellings end in the same characters as the plain ones.
+        for needle in [concat!("print", "ln!"), concat!("print", "!")] {
+            assert!(
+                !production.contains(needle),
+                "a hook refusal must never go to the terminal: found {needle}"
+            );
+        }
+        assert_eq!(
+            production.matches("&log_refusal").count(),
+            1,
+            "one reporter, wired at one call site"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecided_project_is_refused_when_there_is_nobody_to_ask() {
+        // No console declared, which is the position of a sovereign run, the
+        // gateway, the GUI server, CI, and every agent rebuild: default
+        // untrusted, and nothing asked.
+        let (root, sentinel) = project_with_session_start_hook();
+        let defs = load_undecided(&root);
+        assert!(defs.is_empty(), "no decision on record means no hooks");
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(!sentinel.exists());
+        assert_eq!(
+            crate::trust::status(&root),
+            crate::trust::Status::Unknown,
+            "the unattended refusal is not recorded as the user's answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn editing_the_hooks_file_revokes_the_old_approval() {
+        let (root, sentinel) = project_with_session_start_hook();
+        crate::trust::record(&root, crate::trust::Decision::Trust).expect("record the approval");
+        assert_eq!(load(&root).len(), 1, "approved as it stands");
+
+        // Same path, edited command: the approval covered the old content
+        // only. It still touches the sentinel, so a gate that let the edit
+        // through would be caught below rather than merely unproven.
+        std::fs::write(
+            root.join(".wizard").join("hooks.toml"),
+            format!(
+                "[[hooks]]\nevent = \"session_start\"\ncommand = \"touch {} && echo pwned\"\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        let defs = load_undecided(&root);
+        assert!(
+            defs.is_empty(),
+            "the edited file is a new question: {defs:?}"
+        );
+        let engine = HookEngine::new(defs, root.clone(), "test-session".to_string());
+        engine.session_start(Mode::default(), None).await;
+        assert!(!sentinel.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every append still reaches the model; only the *notice* is deduplicated.
+    /// A `post_tool_use` hook fires on every tool call, so reporting each one
+    /// puts a line in the transcript per tool call for a hook doing exactly
+    /// what it was configured to do.
+    #[tokio::test]
+    async fn a_repeated_append_is_reported_once_per_session() {
+        let engine = engine(vec![def(HookEvent::PostToolUse, None, "echo extra")]);
+        let (tx, mut rx) = mpsc::channel(16);
+
+        for _ in 0..3 {
+            let extra = engine
+                .post_tool_use_with_output(
+                    "read_file",
+                    &json!({}),
+                    "",
+                    false,
+                    Mode::default(),
+                    Some(&tx),
+                )
+                .await;
+            assert_eq!(
+                extra.as_deref(),
+                Some("extra"),
+                "the context itself is never suppressed"
+            );
+        }
+        drop(tx);
+
+        let mut fired = Vec::new();
+        while let Some(event) = rx.recv().await {
+            fired.push(event);
+        }
+        assert_eq!(fired.len(), 1, "three appends, one notice: {fired:?}");
+        assert!(matches!(
+            &fired[0],
+            AgentEvent::HookFired { outcome, .. } if *outcome == HookOutcome::AppendedContext
+        ));
+    }
+
+    /// `/clear` hands the user an empty transcript, so the note that a hook is
+    /// feeding the model text is worth making again in the session after it.
+    #[tokio::test]
+    async fn clearing_the_session_lets_the_append_be_reported_again() {
+        let engine = engine(vec![def(HookEvent::PostToolUse, None, "echo extra")]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let fire = async |tx: &mpsc::Sender<AgentEvent>| {
+            engine
+                .post_tool_use_with_output(
+                    "read_file",
+                    &json!({}),
+                    "",
+                    false,
+                    Mode::default(),
+                    Some(tx),
+                )
+                .await;
+        };
+
+        fire(&tx).await;
+        fire(&tx).await;
+        engine.set_session_id("a-new-session".to_string());
+        fire(&tx).await;
+        drop(tx);
+
+        let mut fired = 0;
+        while rx.recv().await.is_some() {
+            fired += 1;
+        }
+        assert_eq!(fired, 2, "one notice per session, not one in total");
+    }
+
+    /// A warning describes something that varies per call — a different exit
+    /// code, a different reason — so suppressing the repeat would hide the
+    /// occurrence that mattered. Only the append is filtered.
+    #[tokio::test]
+    async fn a_repeated_warning_is_reported_every_time() {
+        let engine = engine(vec![def(HookEvent::PostToolUse, None, "exit 3")]);
+        let (tx, mut rx) = mpsc::channel(16);
+
+        for _ in 0..3 {
+            engine
+                .post_tool_use_with_output(
+                    "read_file",
+                    &json!({}),
+                    "",
+                    false,
+                    Mode::default(),
+                    Some(&tx),
+                )
+                .await;
+        }
+        drop(tx);
+
+        let mut fired = 0;
+        while rx.recv().await.is_some() {
+            fired += 1;
+        }
+        assert_eq!(fired, 3);
+    }
 
     #[tokio::test]
     async fn user_prompt_submit_with_prompt_puts_the_prompt_in_the_payload() {
@@ -861,5 +1423,47 @@ mod tests {
         );
         assert!(payload.contains(r#""is_error":true"#), "{payload}");
         assert!(payload.contains(r#""tool_name":"execute""#), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn a_hook_runs_under_the_shell_the_model_is_told_about() {
+        // `$0` is the name the running shell was invoked with, so this is the
+        // hook executor reporting which interpreter it actually landed in.
+        // `crate::agent::prompts` tells the model the same answer through
+        // `platform::shell::name()`; a hook that runs under a different shell
+        // than the one the prompt names is a command line written for the
+        // wrong language.
+        let engine = engine(vec![def(HookEvent::SessionStart, None, "printf %s \"$0\"")]);
+        let context = engine
+            .session_start(Mode::default(), None)
+            .await
+            .expect("the hook prints its shell's name");
+        assert_eq!(context.trim(), crate::platform::shell::name());
+    }
+
+    #[test]
+    fn the_hook_executor_spawns_through_the_platform_shell() {
+        // Structural, like `the_refusal_never_reaches_the_terminal` above, and
+        // for the same class of reason: on Unix a hand-written `sh -c` and
+        // `platform::shell::tokio_command` are the same two strings, so no
+        // in-process observation can tell them apart today. What they are not
+        // is the same *decision*: the second one changes with the platform and
+        // with what the system prompt claims, and the first one silently does
+        // not. This module was the last hand-written `sh -c` in the tree.
+        let source = include_str!("mod.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("this module ends with its test module");
+        assert!(
+            !production.contains(concat!("Command::new(", "\"sh\")")),
+            "hooks must not hand-write the shell; use platform::shell"
+        );
+        assert_eq!(
+            production
+                .matches("crate::platform::shell::tokio_command(")
+                .count(),
+            1,
+            "one spawn site, through the platform shell"
+        );
     }
 }

@@ -6,6 +6,15 @@
 //! lives here: the health probe hits llama-server's native `GET /health`
 //! (which distinguishes "still loading the model" from "down"), and
 //! connection failures tell the user how to start the server.
+//!
+//! Requests are therefore built entirely by the inner client, tool-call ids
+//! and parallel batches included. Prompt caching is the one hosted feature
+//! that has no counterpart here, and it degrades to nothing rather than to a
+//! field on the wire: llama-server keeps a KV cache per slot and reuses the
+//! longest matching prefix of the next request on its own, with no API to
+//! address it by, so there is no `prompt_cache_key` to send and sending one
+//! would only add a key this server never asked for. See
+//! `openai::is_openai_api`, which is what leaves it off.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +28,11 @@ use super::provider::LlmProvider;
 use super::{ChatRequest, ChatStream, ProviderError};
 
 /// How long to wait for a TCP connection before declaring llama-server down.
+/// Shorter than the shared chat budget because this client only ever makes
+/// the two tiny local probes below: a loopback connect either lands at once
+/// or the server is not there. There is deliberately no read timeout:
+/// `/health` answers immediately even while the model is still loading, and
+/// nothing here streams.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Client bound to one llama-server instance. Cheap to clone.
@@ -45,7 +59,15 @@ impl LlamaCppProvider {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let model = model.into();
-        let inner = OpenAiProvider::new(format!("{base_url}/v1"), model.clone(), "");
+        // The inner client speaks to a process on this machine, so it must not
+        // inherit the cloud read timeout: a large GGUF prefilling a long
+        // prompt on weak hardware is silent for as long as it takes, and five
+        // minutes of that is a slow model, not a stalled connection. Killing
+        // it would surface as a transient error and send the agent's retry
+        // loop round again on a request that was working.
+        let inner = crate::llm::with_local_inference_timeouts(|| {
+            OpenAiProvider::new(format!("{base_url}/v1"), model.clone(), "")
+        });
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -129,23 +151,29 @@ impl LlmProvider for LlamaCppProvider {
         if status.is_success() {
             return Ok(());
         }
+        // Read the header before the body: `text()` consumes the response.
+        // llama-server itself sends no `Retry-After`, but a reverse proxy in
+        // front of it may, and honoring it beats guessing at a backoff.
+        let retry_after = crate::llm::retry_after_from_headers(response.headers());
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(anyhow::Error::new(ProviderError::http(
+            return Err(crate::llm::http_error_with_retry_after(
                 503,
                 format!(
                     "llama-server at {} is still loading its model (HTTP 503) — try again shortly",
                     self.base_url
                 ),
-            )));
+                retry_after,
+            ));
         }
         let body = response.text().await.unwrap_or_default();
-        Err(anyhow::Error::new(ProviderError::http(
+        Err(crate::llm::http_error_with_retry_after(
             status.as_u16(),
             format!(
                 "llama-server at {} returned HTTP {status}: {body}",
                 self.base_url
             ),
-        )))
+            retry_after,
+        ))
     }
 
     async fn supports_native_tools(&self, model: &str) -> Result<bool> {
@@ -227,6 +255,111 @@ mod tests {
         let chain = format!("{err:#}");
         assert!(chain.contains("llama-server -m"), "got: {chain}");
         assert!(chain.contains("http://127.0.0.1:1"), "got: {chain}");
+    }
+
+    #[test]
+    fn the_inner_client_is_built_for_local_inference() {
+        // The inner client records the read-timeout policy it was actually
+        // constructed with, so this asserts the constructor's own behaviour
+        // rather than restating `with_local_inference_timeouts`: no read
+        // timeout, so a multi-minute GGUF prefill is never mistaken for a
+        // stalled connection and retried on top of itself.
+        let provider = LlamaCppProvider::new("http://127.0.0.1:11435", "m");
+        assert_eq!(provider.inner.read_timeout(), None);
+
+        // The same holds for a llama-server reached over a public name (an
+        // SSH tunnel, a Tailscale hostname), where the address cannot say it
+        // is local inference but the provider kind can. Drop the
+        // `with_local_inference_timeouts` scope from `new` and this is the
+        // assertion that fails.
+        let tunnelled = LlamaCppProvider::new("https://gpu.example.com", "m");
+        assert_eq!(tunnelled.inner.read_timeout(), None);
+
+        // Building a provider leaves the thread back on the cloud policy, so
+        // the next hosted client constructed on it still gets the stall
+        // detector.
+        assert!(crate::llm::client_read_timeout().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_loading_server_hands_its_retry_after_to_the_backoff() {
+        // llama-server itself sends no `Retry-After`, but a reverse proxy in
+        // front of it does, and the 503-while-loading answer is exactly when
+        // waiting the stated time beats guessing. Driven through a real
+        // socket because the header is only readable from a real response.
+        let root = crate::llm::testing::one_shot_http_server(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: \
+             7\r\nConnection: close\r\n\r\nloading",
+        )
+        .await;
+        let provider = LlamaCppProvider::new(root, "m");
+        let err = provider.health().await.expect_err("503 is not healthy");
+        assert!(err.to_string().contains("still loading"), "{err}");
+        assert_eq!(
+            err.downcast_ref::<ProviderError>()
+                .expect("typed provider error")
+                .status,
+            Some(503)
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::llm::RetryAfter>()
+                .map(|hint| hint.0),
+            Some(Duration::from_secs(5)),
+            "the proxy's own deadline reaches the retry loop"
+        );
+    }
+
+    /// A two-call parallel batch, driven through the real client to a
+    /// recorded llama-server stream.
+    ///
+    /// llama-server's tool-calling support is a grammar-constrained
+    /// re-implementation of OpenAI's shape rather than the same code, and a
+    /// batch is where the two most easily diverge, so the body this provider
+    /// sends is asserted rather than assumed. The same test pins the prompt
+    /// cache degrading to *nothing*: a local server has no key to route on.
+    #[tokio::test]
+    async fn a_parallel_batch_reaches_llama_server_in_the_shared_shape() {
+        use futures_util::StreamExt as _;
+
+        use crate::llm::openai::testing::{
+            PARALLEL_TOOL_BATCH_SSE, Recorded, assert_batch_is_answerable, parallel_batch_request,
+        };
+
+        let recorded = Recorded::replay(PARALLEL_TOOL_BATCH_SSE).await;
+        let provider = LlamaCppProvider::new(recorded.root.as_str(), "qwen3-8b");
+
+        let mut stream = provider
+            .chat_stream(parallel_batch_request("qwen3-8b"))
+            .await
+            .expect("stream opens");
+        let mut last = None;
+        while let Some(chunk) = stream.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+
+        let sent = recorded.request_body();
+        assert_batch_is_answerable(sent["messages"].as_array().expect("messages"), 2);
+        assert!(
+            sent.get("prompt_cache_key").is_none(),
+            "llama-server reuses its own KV cache and has no key to route on: {sent}"
+        );
+
+        let calls = last
+            .expect("a final chunk")
+            .message
+            .expect("tool call message")
+            .tool_calls()
+            .iter()
+            .map(|call| (call.id.clone(), call.function.name.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            vec![
+                ("call_aaa".to_string(), "read_file".to_string()),
+                ("call_bbb".to_string(), "read_file".to_string()),
+            ],
+            "two calls to one tool, told apart by id"
+        );
     }
 
     #[tokio::test]

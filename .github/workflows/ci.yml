@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # For the `coverage` job, which is the only thing here that is manual, and
+  # only until its floor is seeded. See that job.
+  workflow_dispatch:
+
+# Nothing here writes to the repository: no releases, no commits, no packages.
+# Stated rather than inherited — the repo default happens to be `read` today,
+# and a workflow whose safety depends on a setting in another system is one
+# settings change away from being wrong.
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same ref (frequent pushes to main).
 concurrency:
@@ -24,13 +34,100 @@ jobs:
       - name: File-size ratchet
         run: contrib/check-file-size.sh
 
+      # Two properties of this file that no run of it can report on, because
+      # both failure modes look green: a required check that stops being
+      # reported (every pull request then sits forever at "Expected - Waiting
+      # for status to be reported", with no failing job to point at), and a
+      # compile step that stops being able to fail (a broken build reports
+      # success). The second is not hypothetical: the macOS leg shipped with
+      # `continue-on-error` on both of its `cargo check` steps and reported
+      # green with no blocking compile left, which is why it is asserted here
+      # now rather than left to whoever reads the diff.
+      #
+      # Deliberately narrow. It checks those two invariants and holds no opinion
+      # about anything else in the file, so ordinary edits (a new job, a renamed
+      # step, a matrix entry) do not have to come here first.
+      #
+      # PyYAML is on the hosted images, and the install is the fallback for the
+      # day it is not: a guard that goes red on its own dependency teaches
+      # people to skip past red, which is the failure this file argues about
+      # elsewhere.
+      - name: Workflow invariants
+        run: |
+          set -eu
+          # --break-system-packages because Ubuntu images are PEP 668
+          # "externally managed": a bare `pip install` there fails with
+          # externally-managed-environment, which would make this guard go red
+          # on its own dependency — the exact thing the note above says not to
+          # do. The runner image ships PyYAML, so this fallback has never
+          # fired; it is here for an image that stops shipping it.
+          python3 -c 'import yaml' 2>/dev/null \
+            || python3 -m pip install --quiet --disable-pip-version-check \
+                 --break-system-packages pyyaml
+          python3 - <<'PY'
+          import sys
+          import yaml
+
+          jobs = yaml.safe_load(open(".github/workflows/ci.yml"))["jobs"]
+          problems = []
+
+          # 1. Branch protection matches required checks by NAME, and a renamed
+          # check is never reported again. These three are the names it holds.
+          # The matrix placeholder is assembled rather than written out:
+          # GitHub expands every `${`+`{ ... }}` in a `run:` block before the
+          # shell ever sees it, and this job has no matrix to expand against.
+          def placeholder(key):
+              return "$" + "{{ matrix." + key + " }}"
+
+          produced = set()
+          for job in jobs.values():
+              include = (job.get("strategy") or {}).get("matrix", {}).get("include") or [{}]
+              for entry in include:
+                  name = job.get("name", "")
+                  for key, value in entry.items():
+                      name = name.replace(placeholder(key), str(value))
+                  produced.add(name)
+          for required in ("Rust checks", "macOS check", "Shellcheck scripts"):
+              if required not in produced:
+                  problems.append(f"required check {required!r} is no longer reported by any job")
+
+          # 2. The macOS leg's suite may be non-blocking while it is unproven.
+          # Its COMPILE may not: release.yml runs the same compile on macos-15
+          # blocking, and every asset needs it, so a Darwin-only break that
+          # merged here surfaces as a tag publishing zero of ten assets.
+          suite = jobs.get("suite")
+          if suite is None:
+              problems.append("there is no suite job left to carry the macOS compile gate")
+          else:
+              if "continue-on-error" in suite:
+                  problems.append(
+                      "the suite job has a job-level continue-on-error; it promises nothing "
+                      "about this job's own check run, so put it on the step that may fail"
+                  )
+              compiles = [
+                  step for step in suite["steps"]
+                  if str(step.get("run", "")).startswith("cargo check")
+              ]
+              if not compiles:
+                  problems.append("the suite job has no blocking cargo check step left")
+              for step in compiles:
+                  if "continue-on-error" in step:
+                      problems.append(
+                          f"suite step {step.get('name')!r} is a compile and must be able to fail the job"
+                      )
+
+          for problem in problems:
+              print(f"::error::{problem}")
+          sys.exit(1 if problems else 0)
+          PY
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      # Prebuilt binary — no cargo-install-from-source in CI.
+      # Prebuilt binary, no cargo-install-from-source in CI.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-machete
@@ -54,23 +151,115 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
-      # The desktop shell (`wizard app`) is off by default — nothing above
-      # compiles a line of it — so without this it would rot unnoticed. Only a
-      # check: the release workflow does the real builds.
-      - name: Install WebKitGTK (desktop feature)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+      # The native GUI (`wizard gui`) is off by default, so nothing
+      # above compiles a line of it — and it is now a *published release asset*
+      # (`wizard-native-*`, the `native` job in release.yml), so letting it rot
+      # unnoticed would mean shipping four binaries no gate ever looked at.
+      #
+      # Lint and suite, not a bare `cargo check`, and that is the difference
+      # from the webview shell this replaced: `--features native` adds real
+      # logic (the widget trees, the selection layer, the console gate) with
+      # real tests behind `#[cfg(feature = "native")]`, and a `cargo check`
+      # compiles none of them. It needs no system packages — winit reaches X11
+      # and Wayland through `dlopen`, and `tiny-skia` means no wgpu — so there
+      # is nothing to `apt-get` first.
+      #
+      # No compositor here, and there never will be one: everything in
+      # `src/native/tests.rs` drives `iced_test`'s headless `Simulator` or a
+      # software-rasterized frame in memory. See "Testing, and what a headless
+      # machine cannot prove" in docs/native-gui.md for what that leaves
+      # unproven.
+      - name: Clippy (--features native)
+        run: cargo clippy --all-targets --locked --features native -- -D warnings
 
-      - name: Check (--features desktop)
-        run: cargo check --locked --features desktop
+      - name: Test (--features native)
+        run: cargo test --locked --features native
 
-  # Cheap macOS canary: `cargo check` only, so Darwin-specific breakage
-  # (cfg blocks, linker, dependencies) surfaces before a tagged release
-  # instead of during it.
-  macos:
-    name: macOS check
-    runs-on: macos-14
+  # The second platform, running the same suite the Linux job above runs.
+  # macOS used to be a `cargo check` canary, which meant every Darwin-specific
+  # runtime behaviour (paths, process handling, terminal detection) shipped
+  # untested; a suite that only ever runs on one OS is a suite that only
+  # documents one OS.
+  #
+  # The two halves of this job are deliberately not the same shape:
+  #
+  #   - The `cargo check` steps BLOCK, exactly as they did when this leg was
+  #     only a canary. A Darwin-only compile break (a dependency that does not
+  #     build there, a `#[cfg(target_os = "macos")]` arm naming a symbol that
+  #     does not exist) is a code defect, and this is the only check that sees
+  #     it before a tag: release.yml's `test` job runs the same compile on
+  #     macos-15 blocking, and every build and the release itself `needs` it,
+  #     so a break that merged here would surface as a tag publishing zero of
+  #     ten assets.
+  #   - `cargo test` does NOT block, and only until it has been observed green
+  #     (see the matrix entry below).
+  #
+  # The lint/ratchet/release-build steps stay on the Linux job: they are
+  # platform-independent and there is no reason to pay for them twice.
+  #
+  # There is no Windows leg. Windows is deferred to a release of its own, and
+  # until then a leg that is red on every single run is not a scoreboard, it is
+  # training to skip past red. Be honest about the size of that port when it
+  # comes back, because the `include:` entry is the last line of it, not the
+  # first: `src/platform/` is where the OS decisions are meant to live, but the
+  # tree today still carries roughly 75 `cfg(unix)` / `cfg(windows)` sites
+  # across two dozen files outside it, only about ten of which have a
+  # `#[cfg(not(unix))]` arm beside them (src/server.rs's process group,
+  # src/trust.rs, src/logging.rs, src/credentials.rs and src/config.rs are
+  # unpaired), plus a live `#[cfg(target_os = "windows")]` clipboard path in
+  # src/app/paste.rs that the platform layer does not know about at all.
+  # Finishing F4 (extract the platform layer) is what makes the port one entry
+  # here; budget for that first, not for one `include:`.
+  #
+  # The reported check-run name comes from the matrix rather than from the job,
+  # because that name is an identifier, not a label: branch protection matches
+  # required checks by it, and a renamed check is never reported again, so
+  # every pull request sits at "Expected - Waiting for status to be reported"
+  # with no failing job to point at. macOS keeps the exact name it has always
+  # had ("macOS check") even though the job now runs the whole suite alongside
+  # the `cargo check` it used to be. Rename it only in a change that also
+  # updates the branch protection rules, the way `rust` above has never been
+  # renamed. It is also why the matrix stays a matrix with one entry: `check-name` and
+  # `experimental` are the two things a second platform needs, and rebuilding
+  # them later is how the name gets fumbled.
+  suite:
+    name: ${{ matrix.check-name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `experimental` marks the SUITE as unproven. It does not reach the
+          # compile: the two `cargo check` steps below block whatever it says.
+          #
+          # Non-blocking as of 2026-08-01, and only until it is observed green.
+          # This leg ran `cargo check` until today, so the suite has never once
+          # been executed on Darwin: "the tests pass on macOS" is a hope, not a
+          # measurement. Making a never-executed leg blocking is how a repo
+          # goes red on a commit that changed nothing, and this check run's
+          # name is in branch protection, so that red would be unmergeable
+          # rather than merely loud.
+          #
+          # FLIP `experimental` TO false ONCE `cargo test` HAS BEEN SEEN GREEN
+          # on main. The `Report unproven-leg outcome` step below prints which
+          # way each run went, into the run summary, so nobody has to go
+          # looking.
+          #
+          # `macos-15`, not `macos-14`, since 2026-08-08. macos-14 is deprecated
+          # on both architectures (actions/runner-images#13518): brownouts that
+          # *deliberately* fail jobs run through October on eight dated windows,
+          # and the image retires on 2026-11-02. A release cut in either period
+          # would publish nothing, because release.yml's blocking test gate and
+          # both Darwin build legs all sat on it.
+          #
+          # Like for like: macos-14 resolved to Apple Silicon and so does
+          # macos-15, which is what release.yml depends on when it
+          # cross-compiles the x86_64 asset on an arm64 runner. Not `macos-26`
+          # or `macos-latest` — a floating label moves under you, and this is
+          # the gate that decides whether a tag publishes.
+          - runner: macos-15
+            check-name: macOS check
+            experimental: true
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
 
@@ -78,13 +267,345 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Blocking, and the whole reason this job can still go red on a code
+      # defect. It is the gate this leg carried before it grew a suite, kept
+      # exactly as it was: no `continue-on-error`, no matrix input, nothing
+      # that can turn it off without editing this line.
       - name: Check
         run: cargo check --locked
 
-      # WKWebView ships with macOS, so the desktop feature needs no extra
-      # packages here — only the check that it still compiles.
-      - name: Check (--features desktop)
-        run: cargo check --locked --features desktop
+      # The native GUI compiles a Darwin-specific windowing path (winit's
+      # AppKit backend) that the Linux leg above never touches, and it ships as
+      # two of the four `wizard-native-*` assets. A check rather than the
+      # Linux leg's full clippy-and-suite, matching the `Check` step above:
+      # this leg's suite is still the unproven half below. Blocking for the
+      # same reason as that check — it is a compile.
+      - name: Check (--features native)
+        run: cargo check --all-targets --locked --features native
+
+      # The unproven half, and the only step here that may fail without
+      # failing the job.
+      #
+      # `continue-on-error` sits on the step, not on the job, and that is not a
+      # stylistic choice. Job-level `continue-on-error` is documented as
+      # keeping the *workflow run* from failing; it does not promise anything
+      # about this job's own check run, and that check run is "macOS check",
+      # the name branch protection matches on. A red required check blocks
+      # every pull request just as thoroughly as a renamed one does. Failing
+      # the step and passing the job is the one shape that is unambiguously
+      # non-blocking, and the summary step below is what stops it from being
+      # invisible.
+      - name: Test
+        id: test
+        continue-on-error: ${{ matrix.experimental }}
+        run: cargo test --locked
+
+      # The half that keeps an unproven leg from being a hole: whichever way it
+      # went is in the run summary along with the exact edit that promotes it
+      # to blocking. Without this, "flip it once it is green" is a thing nobody
+      # ever does, because nobody opens a green job to read its log.
+      #
+      # A failed compile never reaches here (the steps above block, so the job
+      # has already stopped), which is the intended reading: this step reports
+      # on the suite and on nothing else.
+      - name: Report unproven-leg outcome
+        if: matrix.experimental
+        env:
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          set -eu
+          echo "### macOS suite (non-blocking)" >>"$GITHUB_STEP_SUMMARY"
+          if [ "$TEST_OUTCOME" = success ]; then
+            echo "::notice::macOS suite green. Set experimental: false on the macos-15 leg in .github/workflows/ci.yml to make it blocking."
+            echo "Green. Set \`experimental: false\` on the macos-15 leg in .github/workflows/ci.yml to make this blocking." >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::macOS suite failed (cargo test: ${TEST_OUTCOME}). This leg is non-blocking, so it did not fail the run. The compile steps in the same job are blocking."
+            echo "FAILED, and did not fail the run (cargo test: ${TEST_OUTCOME})." >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  # contrib/check-coverage.sh's own regression test, and the reason "it cannot
+  # fail" is not a fair description of the script: a fixture summary below the
+  # floor has to exit 1, the same fixture at the floor has to pass, an unseeded
+  # floor has to exit 1 rather than wave everything through, and no environment
+  # variable may talk it out of either failure. Hermetic, needs no toolchain,
+  # and runs in about a second, which is why it is its own job on every event
+  # instead of a step inside the measurement job below: the test for the
+  # failing path is worthless if it only runs after the merge.
+  #
+  # Each case runs a *copy* of the script with the floor seeded to a known
+  # number, because the floor is a line in the file now and the environment can
+  # only raise it. Seeding the copy is what lets these cases keep testing the
+  # logic after somebody puts a real number on that line; the alternative is a
+  # self-check that quietly stops exercising the unseeded path the day the
+  # floor is set, which is the day it starts mattering.
+  #
+  # jq is preinstalled on the hosted ubuntu images; the script checks for it
+  # and says so if that ever stops being true.
+  coverage-selfcheck:
+    name: Coverage ratchet self-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # GITHUB_STEP_SUMMARY is blanked so the fixture's invented numbers cannot
+      # land in the run summary and be mistaken for a measurement.
+      - name: Ratchet self-check
+        env:
+          GITHUB_STEP_SUMMARY: ''
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          COVERAGE_REPORT="$work/summary.json"
+          export COVERAGE_REPORT
+          printf '%s\n' '{"data":[{"totals":{"lines":{"count":1000,"covered":623,"percent":62.3}}}]}' >"$COVERAGE_REPORT"
+
+          # seed <percent> <destination>: the shipped script with its one
+          # marked floor line replaced. The grep is not paranoia, it is the
+          # test's own assertion: if that line is ever renamed or reshaped, sed
+          # silently produces an unchanged copy and every case below starts
+          # measuring the shipped floor instead of the seeded one.
+          seed() {
+            sed "s/^DEFAULT_MIN_LINE_PERCENT=.*/DEFAULT_MIN_LINE_PERCENT=$1/" \
+              contrib/check-coverage.sh >"$2"
+            if ! grep -q "^DEFAULT_MIN_LINE_PERCENT=$1\$" "$2"; then
+              echo "::error::contrib/check-coverage.sh has no DEFAULT_MIN_LINE_PERCENT line for the self-check to seed"
+              exit 1
+            fi
+          }
+          seed 63 "$work/at63.sh"
+          seed 62 "$work/at62.sh"
+          seed 0 "$work/at0.sh"
+          seed 80 "$work/at80.sh"
+
+          if sh "$work/at63.sh"; then
+            echo "::error::the coverage check accepted 62.3% against a floor of 63%"
+            exit 1
+          fi
+          if sh "$work/at0.sh"; then
+            echo "::error::the coverage check passed with an unseeded floor of 0; it is a reporter, not a gate"
+            exit 1
+          fi
+          # The environment must not be able to disarm either failure. A floor
+          # of 1% is a legal *raise* from an unseeded 0, so the unseeded test
+          # has to read the file rather than the raised value, and a floor of
+          # 1% against a seeded 80% has to be refused outright.
+          if MIN_LINE_PERCENT=1 sh "$work/at0.sh"; then
+            echo "::error::MIN_LINE_PERCENT=1 walked past the unseeded-floor failure"
+            exit 1
+          fi
+          if MIN_LINE_PERCENT=1 sh "$work/at80.sh"; then
+            echo "::error::MIN_LINE_PERCENT=1 lowered a seeded floor of 80% from the environment"
+            exit 1
+          fi
+          # Raising is the one thing it may do.
+          if MIN_LINE_PERCENT=63 sh "$work/at62.sh"; then
+            echo "::error::MIN_LINE_PERCENT=63 did not raise a seeded floor of 62%"
+            exit 1
+          fi
+          sh "$work/at62.sh"
+
+  # Coverage. The floor lives on one marked line in contrib/check-coverage.sh
+  # and was seeded on 2026-08-02 at 78%, from a measured 79.60%. Until then
+  # this job was `workflow_dispatch` only, because the script treats an
+  # unseeded floor as an error and a job that is red on every commit by
+  # construction teaches everyone to ignore it.
+  #
+  # It now runs on push and on pull_request, which the seeding commit was
+  # always supposed to turn on: an instrumented build plus a second run of the
+  # suite is not cheap, but a floor that never runs on a pull request is a
+  # floor pull requests fall straight through, and that is the only place it
+  # could have stopped the regression.
+  #
+  # Deliberately not `continue-on-error`: a check that reports a number it can
+  # never fail on is the thing this job exists not to be.
+  coverage:
+    name: Coverage report
+    # Nothing above needs it, but paying for an instrumented build to exercise
+    # a script that just failed its own test is a waste of ten minutes.
+    needs: [coverage-selfcheck]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov reads the instrumentation with llvm-profdata/llvm-cov
+          # from this component rather than a system LLVM.
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage
+        id: coverage
+        env:
+          COVERAGE_SUMMARY_OUT: coverage-summary.json
+        run: contrib/check-coverage.sh
+
+      # "Coverage is measured, published and ratcheted" wants the measurement
+      # to outlive the run that produced it. The step summary and the `::notice`
+      # annotation are prose on one run page; this is the numbers, in
+      # cargo-llvm-cov's own JSON, downloadable and diffable against the next
+      # run. `always()` so a run that went red *below the floor* still publishes
+      # the figure that failed it — that is exactly the run someone needs it on.
+      - name: Publish the coverage summary
+        if: always() && hashFiles('coverage-summary.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-summary
+          path: coverage-summary.json
+          retention-days: 90
+
+  # 560+ transitive packages behind a binary that stores API keys and OAuth
+  # refresh tokens. `cargo deny check` covers all four of the questions nobody
+  # was asking: published advisories, yanked versions, licenses the project
+  # cannot ship under, and dependencies arriving from an unexpected source.
+  # Policy, and every exception with its reason, lives in deny.toml.
+  #
+  # `--all-features` because the release workflow publishes four
+  # `wizard-native-*` assets built with `--features native`, which drags in
+  # iced and several hundred crates of winit, cosmic-text and tiny-skia.
+  # Without it those crates would ship to users having never been looked at.
+  #
+  # Note for whoever finds this job red on a commit that changed nothing: the
+  # advisory database is fetched live, so a newly published advisory can turn
+  # it red on its own. That is the job working. Fix it by updating the
+  # offending dependency, or by adding a dated, reasoned entry to the ignore
+  # list in deny.toml. Never by deleting the job or widening a lint level.
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny
+        run: cargo deny --locked --all-features check
+
+  # install.sh is the documented way to get Wizard, it is 1,900+ lines of
+  # branching, and the only other things that look at it are shellcheck and the
+  # installer tests in `src/update.rs` (which source it with WIZARD_SELFTEST=1
+  # and drive its download path against a stub curl). This runs it, for real,
+  # against the published release, on the distros whose differences it actually
+  # branches on, and then runs the binary it installed.
+  # contrib/install-in-container.sh is the in-container half.
+  #
+  # No leg sets WIZARD_MIRROR: the mirror is off by default, and what this job
+  # exists to prove is that the default path works. The mirror's own behaviour
+  # (try it first, fall back to GitHub, refuse anything that does not verify)
+  # is covered by those installer tests, which need no network.
+  #
+  # "Against the published release" is the catch, and it is why no leg of this
+  # job blocks a pull request (see `continue-on-error` below). install.sh
+  # downloads from releases/latest, so what this job measures is the last
+  # release plus the checked-out install.sh, not the commit under test: a
+  # withdrawn or mid-publish asset would redden every open pull request in the
+  # repo, and a pull request that changes install.sh alongside a new asset name
+  # could not go green until after the release that would make it green. On
+  # push it still blocks, because there the red is a report worth acting on
+  # (either install.sh regressed on main or the published release is broken)
+  # and it is holding nobody's work up.
+  #
+  # It earns the right to block pull requests again the day
+  # contrib/install-in-container.sh can be pointed at an artifact this commit
+  # built rather than at releases/latest.
+  install-script:
+    name: install.sh on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The mainstream FHS path: /usr/local/bin, the gnu asset.
+          #
+          # These two legs are the ones that normally block on push, and they
+          # are non-blocking for exactly as long as the newest published
+          # release predates release signing. install.sh now refuses a release
+          # whose checksums.txt carries no valid minisign signature, with no
+          # flag to skip it, and every release published so far carries none:
+          # the leg reports an accurate refusal against an asset set that
+          # cannot satisfy it. Nothing in the script can fix that, only cutting
+          # a signed release can.
+          #
+          # Remove `experimental: true` from both entries (and this paragraph)
+          # in the change that follows the first signed tag.
+          - image: ubuntu:22.04
+            flavor: default
+            experimental: true
+          # Oldest glibc the release binaries claim to support, and the leg
+          # that covers WIZARD_MINIMAL (binary, no loadout).
+          - image: debian:oldstable
+            flavor: minimal
+            experimental: true
+          # musl. Marked non-blocking because it fails on a defect outside
+          # this workflow, not on a flake: the published
+          # wizard-x86_64-unknown-linux-musl asset is not static (it requests
+          # the interpreter /lib/ld-musl-x86_64.so.1) and it segfaults under
+          # Alpine's loader. install.sh behaves correctly (its post-download
+          # sanity check rejects the binary and falls through), so the red leg
+          # is an accurate report of a broken release artifact.
+          #
+          # Remove `experimental: true` once the musl asset is genuinely
+          # statically linked and starts on Alpine.
+          - image: alpine:3.20
+            flavor: default
+            experimental: true
+          # NixOS: no FHS loader, so install.sh must prefer the static musl
+          # asset and install to ~/.local/bin. Blocked by the same musl defect
+          # as the Alpine leg: with the gnu asset unusable here by design,
+          # the musl asset is the only one that can work, so it is
+          # non-blocking for now and goes green the moment that is fixed.
+          - image: nixos/nix:latest
+            flavor: default
+            nixos: true
+            experimental: true
+    steps:
+      - uses: actions/checkout@v6
+
+      # Read-only mount: install.sh writes to its own mktemp dir, to $HOME and
+      # to the install dir, never into the checkout, and this proves it.
+      #
+      # `continue-on-error` is on this step rather than on the job for the
+      # reason `suite` spells out above: job-level `continue-on-error` keeps
+      # the *workflow run* from failing and promises nothing about this job's
+      # own check run, and it is the check run ("install.sh on ubuntu:22.04")
+      # that a required-checks rule matches and a pull request waits on.
+      # `matrix.experimental` is the per-image escape hatch (the two musl
+      # legs); the event check is the non-hermetic one explained above, and it
+      # is why `false || false` has to stay a real boolean expression rather
+      # than a bare `matrix.experimental`.
+      - name: Run install.sh in ${{ matrix.image }}
+        id: install
+        continue-on-error: ${{ matrix.experimental || github.event_name == 'pull_request' }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          FLAVOR: ${{ matrix.flavor }}
+          SIMULATE_NIXOS: ${{ matrix.nixos && '1' || '0' }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -e "SIMULATE_NIXOS=${SIMULATE_NIXOS}" \
+            "$IMAGE" \
+            sh /src/contrib/install-in-container.sh "$FLAVOR"
+
+      # Non-blocking and silent is how a leg rots unnoticed. This only runs
+      # when the step above failed and was swallowed, and it puts that in the
+      # run summary where a reader who never opens a green job still sees it.
+      - name: Report swallowed failure
+        if: steps.install.outcome == 'failure'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -eu
+          echo "::warning::install.sh failed on ${IMAGE} and did not fail the run (non-blocking leg); open this job's log."
+          echo "### install.sh on ${IMAGE}: FAILED, non-blocking" >>"$GITHUB_STEP_SUMMARY"
 
   shellcheck:
     name: Shellcheck scripts
@@ -93,4 +614,26 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: shellcheck
-        run: shellcheck install.sh install-byom.sh contrib/check-file-size.sh
+        run: |
+          shellcheck install.sh install-byom.sh \
+            contrib/check-file-size.sh \
+            contrib/check-coverage.sh \
+            contrib/install-in-container.sh
+
+  # Evaluation only, and that is the point. `nix build` here would compile the
+  # whole crate a second time for no new information, but nothing evaluated
+  # flake.nix at all, so an attribute that is unavailable on a platform — the
+  # Wayland and Xorg libraries the dev shell lists, which nixpkgs marks
+  # Linux-only — broke `nix develop` and `nix flake check` on macOS and no
+  # check here noticed. `--all-systems` is what makes this leg see the macOS
+  # shell from a Linux runner.
+  flake:
+    name: Nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: nix flake check
+        run: nix flake check --all-systems --no-update-lock-file

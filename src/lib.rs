@@ -9,11 +9,12 @@ pub mod acp;
 pub mod agent;
 pub mod app;
 pub mod checkpoint;
+pub mod claude_resume;
+pub mod claude_session;
 pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod credentials;
-pub mod desktop;
 pub mod dispatch;
 pub mod doctor;
 pub mod event;
@@ -21,9 +22,17 @@ pub mod evolve;
 pub mod fleet;
 pub mod gateway;
 pub mod git_util;
+pub mod graph;
+// The agent core the native window is built on (sessions, config store, git,
+// OAuth). It used to carry a browser GUI too — an axum server and a JavaScript
+// page — and was compiled into every build for it. That surface is gone, and
+// with it the reason: the window is now the only caller, so the module follows
+// it behind the same feature. See `docs/native-gui.md`.
+#[cfg(feature = "native")]
 pub mod gui;
 pub mod hardware;
 pub mod harness;
+pub mod headless;
 pub mod hooks;
 pub mod image_view;
 pub mod images;
@@ -31,18 +40,27 @@ pub mod import_claude;
 pub mod instructions;
 pub mod llm;
 pub mod local_setup;
+pub mod logging;
 pub mod mcp;
 pub mod memory;
+pub mod mesh;
+#[cfg(feature = "native")]
+pub mod native;
 pub mod onboarding;
 pub mod output;
 pub mod platform;
 pub mod progress;
+pub mod registry_client;
 pub mod schedule;
 pub mod server;
 pub mod session_registry;
 pub mod skills;
+pub mod skin;
 pub mod sync;
+pub mod theme;
 pub mod tools;
+pub mod transcript;
+pub mod trust;
 pub mod ui;
 pub mod update;
 pub mod usage;
@@ -61,20 +79,27 @@ use crate::config::Mode;
 /// [`output::exit_code`] (0 completed, 2 max-steps, 3 circuit breaker, 4 time
 /// limit); every other mode exits 0 on success. Hard errors surface as `Err`
 /// and exit 1 from `main`.
-pub async fn run(cli: cli::Cli) -> Result<i32> {
+pub async fn run(mut cli: cli::Cli) -> Result<i32> {
     // Top-level flags are not global: the self-contained subcommands below
     // read none of them (only --cwd). Reject the combination loudly instead
     // of silently dropping the flags (`wizard --plan fleet run` must not run
     // an un-planned fleet). `wizard agents` is exempt: it goes through the
     // normal config path, where the flags do apply.
+    //
+    // Every subcommand reaches this check, `resume` included. That is the
+    // reason it has to run before the dispatch chain rather than inside it:
+    // `resume` clears its own subcommand on the way past (it rewrites the
+    // invocation into the `--resume` one it is equivalent to), so a check
+    // placed after the chain would see no subcommand and let
+    // `wizard --plan resume` through with the flag silently dropped.
     if let Some(command) = &cli.command
         && !matches!(command, cli::Command::Agents)
     {
         let ignored = cli.ignored_top_level_flags();
         if !ignored.is_empty() {
             anyhow::bail!(
-                "{} cannot be combined with a `wizard` subcommand — \
-                 these top-level flags would be ignored; drop them (only --cwd applies)",
+                "{} cannot be combined with a `wizard` subcommand; these top-level flags \
+                 would be ignored, so drop them (only --cwd applies)",
                 ignored.join(", ")
             );
         }
@@ -88,6 +113,13 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             std::env::set_current_dir(dir)?;
         }
         return harness::run(cmd.clone()).map(|()| 0);
+    }
+
+    // `desktop-setup` is system provisioning for the `computer` tool: it
+    // installs OS packages and reports permissions, so it wants no config, no
+    // onboarding and no LLM.
+    if let Some(cli::Command::DesktopSetup) = &cli.command {
+        return tools::computer::setup::run().map(|()| 0);
     }
 
     // MCP server: expose Wizard's native tools over stdio to another MCP
@@ -105,54 +137,56 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return usage::run_cli(since.as_deref());
     }
 
-    // The browser GUI serves existing sessions and builds agents lazily per
-    // task, so it loads config directly (defaults on a fresh install) and
-    // never onboards — startup must not depend on a reachable provider.
-    if let Some(cli::Command::Gui {
-        port,
-        no_open,
-        assets,
-    }) = &cli.command
-    {
+    // The window opens existing sessions and builds agents lazily per chat, so
+    // it loads config directly (defaults on a fresh install) and never
+    // onboards — startup must not depend on a reachable provider.
+    if let Some(cli::Command::Gui { native: _ }) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        let config = config::Config::load()?;
-        return gui::run(config, *port, *no_open, assets.clone())
-            .await
-            .map(|()| 0);
+        #[cfg(feature = "native")]
+        {
+            let config = config::Config::load()?;
+            return native::run(config).await.map(|()| 0);
+        }
+        // Two routes, and naming both matters: `wizard app` shipped for a
+        // year telling people to rebuild, while the release page carried a
+        // binary that already worked. Whoever reads this has a terminal in
+        // front of them, so give them the line to paste.
+        //
+        // The list of what to do instead is not a consolation prize: it is
+        // what replaced the browser GUI, which used to be the answer here and
+        // was deleted. A headless box is reached by running the TUI over SSH,
+        // by `wizard -p`, by an ACP editor, or through the Telegram gateway —
+        // none of which need a window or a port.
+        #[cfg(not(feature = "native"))]
+        anyhow::bail!(
+            "this build has no native GUI — it was built without the `native` feature.\n\
+             \n\
+             The window is a separate build because it links iced, several hundred crates\n\
+             that a headless `wizard -p` or `wizard acp` never executes a line of, and that\n\
+             cannot go into the static musl binary.\n\
+             \n\
+             To get one:\n\
+             \x20 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \\\n\
+             \x20   | WIZARD_NATIVE=1 bash        # installs `wizard-native` beside `wizard`\n\
+             \x20 cargo build --release --features native   # from a checkout\n\
+             \n\
+             To drive this machine without one: `wizard` over SSH, `wizard -p '<prompt>'`,\n\
+             `wizard acp` from an ACP editor, or `wizard gateway` for Telegram.\n\
+             See docs/native-gui.md."
+        );
     }
 
     // ACP server: an editor drives Wizard over stdin/stdout, so it must not
     // onboard or open a TUI. Loads config directly (defaults on a fresh
-    // install) like the GUI, then serves until the client closes the pipe.
+    // install) like the window, then serves until the client closes the pipe.
     if let Some(cli::Command::Acp) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
         let config = config::Config::load()?;
         return acp::run(config).await.map(|()| 0);
-    }
-
-    // The desktop shell is the same GUI server in a webview window, so it
-    // dispatches the same way. `--install` / `--uninstall` only write launcher
-    // files, and a build without the `desktop` feature only prints how to get
-    // one — neither needs a config, so the load happens inside.
-    if let Some(cli::Command::App {
-        devtools,
-        install,
-        uninstall,
-    }) = &cli.command
-    {
-        if let Some(dir) = &cli.cwd {
-            std::env::set_current_dir(dir)?;
-        }
-        return desktop::run(desktop::AppArgs {
-            devtools: *devtools,
-            install: *install,
-            uninstall: *uninstall,
-        })
-        .await;
     }
 
     // Evolution history: reads ~/.wizard/evolution.jsonl and touches the
@@ -188,14 +222,15 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return sync::run(cmd.clone()).await;
     }
 
-    // Doctor diagnoses the environment — starting with "does the config
-    // parse?" — so it too dispatches before the config load and can never
-    // trigger onboarding. Exits 0 when no check failed, 1 otherwise.
-    if let Some(cli::Command::Doctor) = &cli.command {
+    // Doctor diagnoses the environment, starting with "does the config
+    // parse?", so it too dispatches before the config load and can never
+    // trigger onboarding. Exits 0 when no check failed, 1 otherwise; with
+    // `--bundle` it also writes the redacted bug-report bundle.
+    if let Some(bundle) = doctor_request(&cli) {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        return doctor::run().await;
+        return doctor::run(bundle).await;
     }
 
     // Schedule CRUD and the scheduler daemon are config-independent too:
@@ -208,11 +243,37 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         }
         return schedule::run(cmd.clone()).await;
     }
-    if let Some(cli::Command::Scheduler) = &cli.command {
+    // `wizard scheduler` bare is still the foreground daemon; with a
+    // subcommand it manages that daemon as a background service. Both are
+    // config-independent, so both dispatch here.
+    if let Some(cli::Command::Scheduler { cmd }) = &cli.command {
         if let Some(dir) = &cli.cwd {
             std::env::set_current_dir(dir)?;
         }
-        return schedule::run_daemon().await;
+        return match cmd {
+            Some(cmd) => schedule::run_service(*cmd),
+            None => schedule::run_daemon().await,
+        };
+    }
+
+    // Gateway service management writes a unit under ~/.config/systemd/user
+    // (or ~/Library/LaunchAgents) and talks to the supervisor. The chdir
+    // above is load-bearing here: `install` captures the current directory as
+    // the gateway's project root, and a gateway turn runs in a project.
+    //
+    // `setup` dispatches from the same arm but *not* through
+    // `gateway::service`: it writes no unit and asks the supervisor nothing,
+    // so it has to keep working on the hosts where `service::dispatch` refuses
+    // outright (Termux, a Linux without systemd). Getting a bot configured is
+    // exactly as useful there — you just supervise it yourself.
+    if let Some(cli::Command::Gateway { cmd }) = &cli.command {
+        if let Some(dir) = &cli.cwd {
+            std::env::set_current_dir(dir)?;
+        }
+        return match cmd {
+            cli::GatewayCmd::Setup => gateway::setup::run().await,
+            cli::GatewayCmd::Service(cmd) => gateway::service::run(*cmd),
+        };
     }
 
     // Fleet dispatches before the normal flow too, but `fleet run` loads
@@ -226,14 +287,58 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
         return fleet::run(cmd.clone()).await;
     }
 
+    // The registry client and the mesh peer store are self-contained in the
+    // way `sync` is: no config, no onboarding, no LLM. Neither one reads the
+    // working directory (both work entirely under ~/.wizard), which is why
+    // they are the only arms in this chain without a chdir.
+    if let Some(cli::Command::Skills { cmd }) = &cli.command {
+        return registry_client::run_cli(cmd.clone()).await;
+    }
+    if let Some(cli::Command::Peers { cmd }) = &cli.command {
+        return mesh::cli::run(cmd.clone()).await;
+    }
+
+    // `wizard resume` is the subcommand spelling of `--resume`, so unlike
+    // every arm above it does not return: it rewrites this invocation into the
+    // equivalent `--resume` one and falls through into the normal flow below.
+    // With `--claude` the rewrite converts a Claude Code conversation into a
+    // Wizard session first (see [`claude_resume`]), which is why it runs ahead
+    // of the config load rather than inside the resume path proper: it decides
+    // *which* session the `--resume` below will then find. It also applies
+    // `--cwd` itself, before the chdir further down, because Claude Code files
+    // its sessions under a slug of the working directory and a listing taken
+    // from the wrong directory is a different project's.
+    if let Some(request) = claude_resume::Request::from_cli(&cli) {
+        // Detached before the rewrite: what comes back is a plain `--resume`
+        // invocation, and leaving the subcommand attached would send it
+        // straight back into this arm.
+        cli.command = None;
+        match claude_resume::prepare(cli, request)? {
+            Some(rewritten) => cli = rewritten,
+            // `--list` printed what it was asked for, or the picker was
+            // cancelled. Either way there is nothing left to resume, and
+            // neither is an error.
+            None => return Ok(0),
+        }
+    }
+
     // `--login` is a one-shot credential flow: no config, no onboarding,
     // no TUI. Tokens land in a dedicated file under ~/.wizard/.
     if let Some(provider) = &cli.login {
+        // This flow owns the terminal, so a session whose browser cannot reach
+        // our loopback listener — an SSH login without a forwarded port — can
+        // still carry the redirect back by hand. Piped stdin has no human to
+        // prompt, and its EOF would only close the channel again.
+        let paste = if std::io::stdin().is_terminal() {
+            llm::oauth_callback::PasteChannel::Stdin
+        } else {
+            llm::oauth_callback::PasteChannel::Disabled
+        };
         return match provider.as_str() {
-            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"))
+            "xai" => llm::xai_oauth::login(|line: &str| println!("{line}"), paste)
                 .await
                 .map(|()| 0),
-            "chatgpt" => llm::chatgpt_oauth::login(|line: &str| println!("{line}"))
+            "chatgpt" => llm::chatgpt_oauth::login(|line: &str| println!("{line}"), paste)
                 .await
                 .map(|()| 0),
             other => {
@@ -307,7 +412,23 @@ pub async fn run(cli: cli::Cli) -> Result<i32> {
             update::maybe_check_on_startup(&config.update).await;
             app::run_tui(config, cli).await
         }
-        Mode::Sovereign => agent::run_headless(config, cli).await,
+        Mode::Sovereign => headless::run(config, cli).await,
+    }
+}
+
+/// `Some(bundle)` when this invocation is a doctor run, where `bundle` is the
+/// `--bundle` flag; `None` otherwise.
+///
+/// Split out of [`run`] so the wiring from the parsed flag to
+/// [`doctor::run_bundle`] is unit-testable: [`run`] itself probes every
+/// configured provider over the network and writes under `~/.wizard`, so no
+/// test can call it. `wizard doctor --bundle` shipped dead once already
+/// (the subcommand was a unit variant and clap rejected the flag), and the
+/// only reason nothing caught it was that this decision had no name.
+fn doctor_request(cli: &cli::Cli) -> Option<bool> {
+    match &cli.command {
+        Some(cli::Command::Doctor { bundle }) => Some(*bundle),
+        _ => None,
     }
 }
 
@@ -387,6 +508,22 @@ mod tests {
                 "{args:?} must not onboard"
             );
         }
+    }
+
+    #[test]
+    fn doctor_subcommand_routes_bundle_to_the_bundle_run() {
+        // `wizard doctor` prints the report; `wizard doctor --bundle` must
+        // reach doctor::run_bundle. The flag used to be invisible to clap, so
+        // the bundle was only reachable through an undocumented env var.
+        assert_eq!(doctor_request(&parse(&["wizard", "doctor"])), Some(false));
+        assert_eq!(
+            doctor_request(&parse(&["wizard", "doctor", "--bundle"])),
+            Some(true)
+        );
+        assert!(doctor::bundle_requested(true));
+        // Any other invocation is not a doctor run at all.
+        assert_eq!(doctor_request(&parse(&["wizard", "agents"])), None);
+        assert_eq!(doctor_request(&parse(&["wizard"])), None);
     }
 
     #[test]

@@ -35,16 +35,20 @@ pub(super) fn setup_terminal() -> Result<Tui> {
     .context("entering alternate screen")?;
     // Kitty keyboard protocol (best-effort): with disambiguation on, terminals
     // report Shift+Enter as Enter+SHIFT instead of a bare Enter, which lets the
-    // composer bind it to a newline. Terminals that don't support it are left
-    // untouched (Alt+Enter is the fallback there). Popped in `restore_terminal`.
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        let _ = crossterm::execute!(
-            stdout,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            ),
-        );
-    }
+    // composer bind it to a newline. Push unconditionally — unsupported
+    // terminals ignore the CSI, and Pop in `restore_terminal` is also a no-op
+    // there. Do **not** call `supports_keyboard_enhancement()` here: that
+    // probe writes a CSI query and blocks on the reply (up to 2s, or forever
+    // if another reader is draining stdin), and we already entered the
+    // alternate screen above, so a hang looks like a blank Wizard that only
+    // Ctrl-C can leave. Alt+Enter remains the fallback where the push is a
+    // no-op.
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ),
+    );
     Terminal::new(CrosstermBackend::new(stdout)).context("creating terminal")
 }
 
@@ -63,6 +67,17 @@ fn resolve_editor() -> Option<String> {
     nvim_on_path.then(|| "nvim".to_string())
 }
 
+/// The command that opens `editor` on `path`.
+///
+/// Through the platform shell so editors configured with flags ("code --wait",
+/// "emacsclient -t") work: the setting is a command *line*, not a program
+/// name, so `Command::new(editor)` would look for a binary called
+/// "code --wait". Its own function so that property is testable without
+/// suspending a terminal.
+fn editor_command(editor: &str, path: &std::path::Path) -> std::process::Command {
+    crate::platform::shell::command(&format!("{editor} \"{}\"", path.display()))
+}
+
 /// Suspend the TUI, run `editor` on `path`, then restore the TUI. Returns the
 /// editor's exit status, or `None` when the TUI could not be suspended or
 /// restored (a notice is posted either way; an unrestored terminal is fatal
@@ -78,11 +93,7 @@ fn run_editor_suspended(
         app.notice(format!("could not suspend the TUI: {err:#}"));
         return None;
     }
-    // `sh -c` so editors with flags ("code --wait", "emacsclient -t") work.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"{}\"", path.display()))
-        .status();
+    let status = editor_command(editor, path).status();
 
     // Re-enter the TUI regardless of how the editor exited.
     match setup_terminal() {
@@ -127,7 +138,6 @@ pub(super) fn edit_config_file(app: &mut App, terminal: &mut Tui) {
         Ok(status) if status.success() => match Config::load() {
             Ok(config) => {
                 app.config = config;
-                app.mode = app.config.mode;
                 app.status.mode = app.config.mode;
                 app.status.model = app.config.active().model;
                 app.notice("config reloaded — restart for provider/model changes to take effect");
@@ -137,6 +147,98 @@ pub(super) fn edit_config_file(app: &mut App, terminal: &mut Tui) {
         Ok(_) => app.notice("editor exited without success — config not reloaded"),
         Err(err) => app.notice(format!("could not launch editor: {err:#}")),
     }
+}
+
+/// The name every composer draft starts with. The pid keeps two live sessions
+/// off each other's file; the prefix is what the sweep matches on.
+const DRAFT_PREFIX: &str = "wizard-prompt-";
+
+/// How long an abandoned draft survives before the next Ctrl-G removes it.
+///
+/// The editor is modal (it owns the terminal while it runs), so a draft this
+/// old belongs to a session that died between staging the file and reading it
+/// back, and nothing is going to come for it. Generous anyway, because the
+/// cost of sweeping too eagerly is deleting text a user still wants and the
+/// cost of sweeping too late is a few kilobytes.
+const DRAFT_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Where the composer draft is staged for the external editor.
+///
+/// Wizard's own private scratch directory rather than the shared temp dir: the
+/// draft is an unsent prompt (often the most sensitive text in the session, and
+/// frequently pasted credentials or logs), the name is predictable from the
+/// pid, and `/tmp` is world-writable, so another local user could read it or
+/// pre-plant the name and have the editor follow their symlink.
+///
+/// Hardened best-effort, not strictly, which is why this does not go through
+/// [`crate::platform::paths::staging_dir`]: that helper's policy is set by its
+/// other caller, where the staged file becomes the argument to `sudo install`
+/// and a loose mode is worse than no directory at all. Here a `chmod` that the
+/// filesystem cannot express (exFAT, WSL DrvFs, a CIFS mount with `WIZARD_HOME`
+/// on it) would take Ctrl-G away entirely, in exchange for a protection that
+/// filesystem was never going to provide. That is the same trade, and the same
+/// reasoning, as the state tree's own directories.
+fn prompt_scratch_path() -> Result<std::path::PathBuf> {
+    let dir = crate::platform::paths::state_dir()?.join("scratch");
+    crate::platform::secrets::create_private_dir(&dir)?;
+    // The draft outlives the process whenever the TUI could not be restored
+    // around the editor, and `/tmp`'s reaper is not here to collect it any
+    // more. Sweeping on the way in keeps that from accumulating unsent prompts
+    // for the life of the install.
+    sweep_stale_drafts(&dir, DRAFT_TTL);
+    Ok(dir.join(format!("{DRAFT_PREFIX}{}.md", std::process::id())))
+}
+
+/// Remove drafts in `dir` that have not been touched for `ttl`. Best effort
+/// throughout: a scratch sweep must never be the reason the editor does not
+/// open.
+fn sweep_stale_drafts(dir: &std::path::Path, ttl: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_draft = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(DRAFT_PREFIX));
+        if !is_draft {
+            continue;
+        }
+        // An unreadable mtime (or one in the future, which a clock change or a
+        // restored backup can produce) reads as "young": the sweep's job is to
+        // stop unbounded growth, not to guess at a file it cannot date.
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= ttl);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Write the draft the editor is about to open.
+///
+/// Owner-only where the filesystem can express it, and best effort where it
+/// cannot, for the same reason [`prompt_scratch_path`] hardens its directory
+/// that way. Deliberately not [`crate::platform::secrets::write_private_atomic`]:
+/// that primitive hardens the parent strictly, which would put the hard
+/// failure straight back. The 0700 directory is the lock that actually holds
+/// here; the file mode is a second one on the same door.
+fn stage_draft(path: &std::path::Path, text: &str) -> Result<()> {
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    if let Err(err) = crate::platform::secrets::harden_file(path) {
+        tracing::warn!(
+            "could not restrict permissions on {} ({err:#}); \
+             the draft is readable by other users on this filesystem",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Suspend the TUI and open the composer draft in the external editor
@@ -149,13 +251,23 @@ pub(super) fn edit_prompt_in_editor(app: &mut App, terminal: &mut Tui) {
         return;
     };
 
-    let path = std::env::temp_dir().join(format!("wizard-prompt-{}.md", std::process::id()));
-    if let Err(err) = std::fs::write(&path, &app.input) {
+    let path = match prompt_scratch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            app.notice(format!("could not stage the prompt: {err:#}"));
+            return;
+        }
+    };
+    if let Err(err) = stage_draft(&path, &app.input) {
         app.notice(format!("could not stage the prompt: {err:#}"));
         return;
     }
 
     let Some(status) = run_editor_suspended(app, terminal, &editor, &path) else {
+        // The draft stays behind here on purpose: the editor may already have
+        // run, in which case this file holds the only copy of what the user
+        // just wrote, and the session is over either way. `sweep_stale_drafts`
+        // is what keeps it from outliving its usefulness.
         return;
     };
     match status {
@@ -294,9 +406,22 @@ fn restore_terminal() -> Result<()> {
 /// from a panic hook or after a headless run — it does nothing when the TUI
 /// never started.
 pub fn restore_terminal_best_effort() {
-    if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+    if is_terminal_armed() {
         let _ = restore_terminal();
     }
+}
+
+/// Whether the terminal is still in the state [`setup_terminal`] put it in.
+///
+/// Raw mode is the marker for the whole arrangement: it goes on first and
+/// comes off last, and every teardown path in this module (and the panic hook
+/// in `main`) moves it in lockstep with the alternate screen, mouse capture,
+/// and bracketed paste. The event loop polls this every frame because the
+/// panic hook can strip all of it while the process keeps running — see
+/// [`crate::app::recover::TerminalWatchdog`] for why that happens and what the
+/// loop does about it.
+pub(super) fn is_terminal_armed() -> bool {
+    crossterm::terminal::is_raw_mode_enabled().unwrap_or(false)
 }
 
 /// Restores the terminal when the main loop unwinds or errors out.
@@ -305,5 +430,115 @@ pub(super) struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal_best_effort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prompt_scratch_file_is_private_and_not_in_the_shared_temp_dir() {
+        // The draft is unsent user text and the file name is derivable from the
+        // pid, so a world-writable directory is both a disclosure and a
+        // symlink-planting opportunity. Pin the directory, not just the name.
+        let path = prompt_scratch_path().expect("scratch path");
+        let dir = path.parent().expect("scratch parent");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("scratch"));
+        assert_eq!(
+            dir.parent(),
+            Some(
+                crate::platform::paths::state_dir()
+                    .expect("state dir")
+                    .as_path()
+            ),
+            "the scratch file must live under Wizard's own state tree"
+        );
+        assert_ne!(
+            dir,
+            crate::platform::paths::temp_dir(),
+            "the shared temp dir is world-writable"
+        );
+        assert!(
+            crate::platform::secrets::is_protected(dir).expect("stat the scratch dir"),
+            "{} must be owner-only",
+            dir.display()
+        );
+
+        // And the file itself, which is what actually holds the text: a 0700
+        // parent is the lock that matters, but a draft written at the process
+        // umask is one `chmod` on the directory away from being world-readable.
+        stage_draft(&path, "an unsent prompt with a pasted key in it").expect("stage the draft");
+        assert!(
+            crate::platform::secrets::is_protected(&path).expect("stat the draft"),
+            "{} must be owner-only",
+            path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the draft"),
+            "an unsent prompt with a pasted key in it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn abandoned_drafts_are_swept_and_live_ones_are_not() {
+        // `/tmp` had a reaper; `~/.wizard/scratch` does not, so a session that
+        // died between staging the draft and reading it back used to leave an
+        // unsent prompt on disk for the life of the install, one file per pid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join(format!("{DRAFT_PREFIX}101.md"));
+        let fresh = dir.path().join(format!("{DRAFT_PREFIX}102.md"));
+        let unrelated = dir.path().join("notes.md");
+        for path in [&old, &fresh, &unrelated] {
+            std::fs::write(path, "draft").expect("write");
+        }
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        for path in [&old, &unrelated] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_modified(ancient)
+                .expect("backdate");
+        }
+
+        sweep_stale_drafts(dir.path(), DRAFT_TTL);
+
+        assert!(!old.exists(), "an abandoned draft must be swept");
+        assert!(fresh.exists(), "a draft in use must survive");
+        assert!(
+            unrelated.exists(),
+            "the sweep must only touch its own file names"
+        );
+
+        // A sweep that ran with the shipped TTL against files this new would
+        // delete a draft the user is editing right now.
+        sweep_stale_drafts(dir.path(), std::time::Duration::from_secs(0));
+        assert!(!fresh.exists(), "the age threshold is what decides");
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn the_editor_runs_as_a_command_line_not_a_program_name() {
+        // `$EDITOR` is routinely "code --wait" or "emacsclient -t", so the
+        // whole string has to reach a shell as one argument; splitting it (or
+        // passing it to `Command::new`) would look for a binary with a space in
+        // its name. Built through the same function `run_editor_suspended`
+        // calls, so reverting that call to `Command::new(editor).arg(path)`
+        // fails here.
+        let command = editor_command("code --wait", std::path::Path::new("/some/draft.md"));
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_ne!(
+            program, "code --wait",
+            "the editor setting is not a program name"
+        );
+        assert_eq!(program, crate::platform::shell::name());
+        assert_eq!(args.len(), 2, "expected <flag> <line>, got {args:?}");
+        assert_eq!(args[1], "code --wait \"/some/draft.md\"");
     }
 }

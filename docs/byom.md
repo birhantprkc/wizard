@@ -2,7 +2,7 @@
 
 Wizard runs on whatever model you point it at. For hosted models, `/provider add` registers any OpenAI-compatible endpoint or Anthropic (see [getting started](getting-started.md#using-a-cloud-or-remote-provider)); this page covers bringing your own *local* model weights.
 
-The primary BYOM path is onboarding: run `wizard --onboard` (or just `wizard` with no config) and pick one of the two BYOM providers — llama.cpp for any GGUF, Ollama for any model tag. Onboarding records the choice; the first run materializes it: a missing known-tier GGUF is downloaded, and a missing Ollama tag is pulled through Ollama's API, both with visible progress. Custom weights are always your call, and Wizard's managed local option (onboarding's Local pick, or `WIZARD_LOCAL=1` at install) downloads only official Qwen GGUF quants.
+The primary BYOM path is onboarding: run `wizard --onboard` (or just `wizard` with no config) and pick one of the two BYOM providers — llama.cpp for any GGUF, Ollama for any model tag. Onboarding records the choice; the first run materializes it: a missing known-tier GGUF is downloaded, and a missing Ollama tag is pulled through Ollama's API, both with visible progress. Custom weights are always your call, and Wizard's managed local option (onboarding's Local pick, or `WIZARD_LOCAL=1` at install) downloads only its own hardware-matched tier list — currently the [unsloth](https://huggingface.co/unsloth) GGUF requants of Qwen 3.5/3.6.
 
 ## Any GGUF with llama.cpp (the default local backend)
 
@@ -81,6 +81,19 @@ wizard -p "list files in the current directory"
 
 ## The installer's BYOM flavor
 
+> **This does not work yet.** `install.sh` verifies every release asset against a
+> minisign key baked into the script, and that key is still the placeholder
+> `RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md`. The installer refuses
+> up front rather than fetch anything it cannot verify. Until a signed release
+> exists, the only path through is building from source:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
+>   | WIZARD_BYOM=1 WIZARD_BUILD_FROM_SOURCE=1 bash
+> ```
+>
+> Everything below describes what the flavor does once it can run.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
 ```
@@ -93,7 +106,7 @@ With `WIZARD_BYOM=1`, the installer:
 
 No model is chosen at install time: the first `wizard` run opens onboarding, and the tag you pick there is pulled on first run. For headless/non-interactive installs, set `WIZARD_MODEL=<tag>`: the installer pulls that tag and writes the config itself (a fresh config gets a full `[[providers]]` Ollama entry; an existing config keeps everything else and only has its `model =` line(s) updated), so no onboarding is needed.
 
-The old `install-byom.sh` URL still works: it is a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`).
+The old `install-byom.sh` URL is still wired up: it is a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`). It hits the same unsigned-release refusal, so it needs `WIZARD_BUILD_FROM_SOURCE=1` too.
 
 ## Model requirements
 
@@ -103,10 +116,10 @@ Wizard expects models that support:
 |------------|----------|-------|
 | Tool calling | Recommended | Native preferred; Wizard falls back to a prompt-based JSON tool protocol when a model lacks native support |
 | Streaming chat | Yes | llama-server's `/v1/chat/completions` or Ollama's `/api/chat` |
-| Context ≥ 32K | Recommended | 128K+ preferred for large codebases |
+| Context ≥ 32K | Recommended | 128K+ preferred for large codebases. Note that a `llama-server` Wizard spawns itself is started with `--ctx-size 16384` regardless; a server you run yourself, or Ollama, is not capped by Wizard |
 | Code quality | Recommended | Coding-oriented models perform best |
 
-Native tool calling varies by model, so Wizard probes for it at startup: models that advertise tools support get native function calling, others fall back to a prompt-based JSON tool protocol. The JSON path is less reliable on weaker models, so prefer one with solid native tool calling.
+Native tool calling varies by model, so Wizard probes for it at startup: models that advertise tools support get native function calling, others fall back to a prompt-based JSON tool protocol. A probe that fails outright (server not up yet, a proxy that answers oddly) also falls back, so a native-capable model behind a flaky endpoint can end up on the weaker path for the session. The JSON path is less reliable on weaker models, so prefer one with solid native tool calling.
 
 ### Remote servers
 
@@ -134,13 +147,13 @@ The automatic first-run pull applies only to loopback URLs — Wizard never down
 
 ## Disclaimer
 
-BYOM lets you choose any GGUF or Ollama-compatible model. Wizard does not ship, endorse, or maintain third-party model weights. You are responsible for compliance with the model's license and acceptable use terms.
+BYOM lets you choose any GGUF or Ollama-compatible model. Wizard does not ship or maintain model weights, including the ones its own tier list points at — those are third-party requants hosted on Hugging Face. You are responsible for compliance with the model's license and acceptable use terms.
 
-The default `install.sh` one-liner downloads no model weights; Wizard's managed local setup downloads only official Qwen quants.
+The default `install.sh` one-liner downloads no model weights; Wizard's managed local setup downloads only the tiers listed in `src/hardware.rs`.
 
-## Switching back to official models
+## Switching back to the managed tiers
 
-Run `wizard --onboard` and pick the recommended tier — it is downloaded (llama.cpp) or pulled (Ollama) on the next run. Or re-run the installer with the local flavor: it downloads the VRAM-matched official Qwen GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards:
+Run `wizard --onboard` and pick the recommended tier — it is downloaded (llama.cpp) or pulled (Ollama) on the next run. Or re-run the installer with the local flavor: it downloads the VRAM-matched GGUF and leaves an existing config untouched, so update `model` / `gguf_path` in the provider entry afterwards (this needs `WIZARD_BUILD_FROM_SOURCE=1` today, per the note above):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_LOCAL=1 bash

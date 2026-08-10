@@ -19,7 +19,12 @@
 
 set -euo pipefail
 
-WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
+# Exported, not just assigned: install.sh reads WIZARD_REPO from the
+# environment, and a plain assignment here is invisible to it. A value the
+# caller exported reaches install.sh either way, but the *default* set on this
+# line did not — so if the two scripts' defaults ever diverged, this shim would
+# fetch install.sh from one repo and install from another without saying so.
+export WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_INSTALLER_REF="${WIZARD_INSTALLER_REF:-main}"
 
 INSTALL_URL="https://raw.githubusercontent.com/${WIZARD_REPO}/${WIZARD_INSTALLER_REF}/install.sh"

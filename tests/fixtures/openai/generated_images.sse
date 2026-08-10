@@ -1,0 +1,19 @@
+: OpenRouter's shape for image-output models on the OpenAI-compatible
+: endpoint: delta.images, each entry a data URI, arriving in the same delta as
+: the text. Text and image both have to survive, and the image is streamed
+: live rather than held for the final chunk.
+:
+: A keep-alive comment leads the stream, because that is what a real
+: connection sends while the model is still thinking and it must not be
+: mistaken for a payload.
+:
+: Transcribed from
+: openai::tests::decodes_generated_images_from_the_delta_images_array and
+: openai::tests::malformed_lines_and_comments_are_skipped.
+
+: keep-alive
+
+data: {"choices":[{"delta":{"content":"here you go","images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+

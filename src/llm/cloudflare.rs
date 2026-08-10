@@ -7,6 +7,15 @@
 //! Workers AI's OpenAI-compatible surface exposes only `/v1/chat/completions`
 //! (there is no `/v1/models`), so reachability/auth and model discovery instead
 //! use Cloudflare's native account-scoped catalog (`/ai/models/search`).
+//!
+//! Everything else about the request is deliberately *not* re-implemented
+//! here. Tool calls carry the ids Workers AI issued, a parallel batch's
+//! results go back as one `tool` message each, bound by `tool_call_id`, and
+//! the usage block is read the same way, all because the inner client builds
+//! the body. The one OpenAI feature that does not survive the trip is prompt
+//! caching: it is keyed by a `prompt_cache_key` request field that Workers AI
+//! does not implement (it has no prompt cache to key into), so the field is
+//! not sent. `openai::is_openai_api` is what decides that.
 
 use std::sync::Arc;
 
@@ -85,9 +94,12 @@ impl CloudflareProvider {
             .unwrap_or(&base_url)
             .trim_end_matches('/')
             .to_string();
+        let http = crate::llm::chat_http_builder(crate::llm::client_read_timeout_for(&base_url))
+            .build()
+            .unwrap_or_default();
         Self {
             inner,
-            http: crate::llm::cloud_http_builder().build().unwrap_or_default(),
+            http,
             account_base,
             api_key,
             model,
@@ -118,14 +130,18 @@ impl CloudflareProvider {
         })?;
         let status = response.status();
         if !status.is_success() {
+            // Header before body: `text()` consumes the response, and
+            // Cloudflare rate-limits the catalog endpoint per account.
+            let retry_after = crate::llm::retry_after_from_headers(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(ProviderError::http(
+            return Err(crate::llm::http_error_with_retry_after(
                 status.as_u16(),
                 format!(
                     "{} returned HTTP {status}: {body}",
                     self.models_search_url()
                 ),
-            )));
+                retry_after,
+            ));
         }
         let parsed: ModelSearch = response
             .json()
@@ -326,5 +342,63 @@ mod tests {
     #[test]
     fn fallback_list_leads_with_glm_5_2() {
         assert_eq!(fallback_models()[0], DEFAULT_MODEL);
+    }
+
+    /// A two-call parallel batch, driven through the real client to a
+    /// recorded Workers AI stream.
+    ///
+    /// This module owns no request building at all, which is exactly why the
+    /// test exists: the way that claim stops being true is somebody adding a
+    /// body tweak here, and a batch is the shape that breaks first, because
+    /// the API rejects a `tool` message whose id does not belong to the
+    /// assistant turn before it.
+    #[tokio::test]
+    async fn a_parallel_batch_reaches_workers_ai_in_the_shared_shape() {
+        use futures_util::StreamExt as _;
+
+        use crate::llm::openai::testing::{
+            PARALLEL_TOOL_BATCH_SSE, Recorded, assert_batch_is_answerable, parallel_batch_request,
+        };
+
+        let recorded = Recorded::replay(PARALLEL_TOOL_BATCH_SSE).await;
+        let provider = CloudflareProvider::new(
+            format!("{}/client/v4/accounts/acc/ai/v1", recorded.root),
+            DEFAULT_MODEL,
+            "token",
+        );
+
+        let mut stream = provider
+            .chat_stream(parallel_batch_request(DEFAULT_MODEL))
+            .await
+            .expect("stream opens");
+        let mut last = None;
+        while let Some(chunk) = stream.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+
+        let sent = recorded.request_body();
+        assert_eq!(sent["model"], DEFAULT_MODEL);
+        assert_batch_is_answerable(sent["messages"].as_array().expect("messages"), 2);
+        assert!(
+            sent.get("prompt_cache_key").is_none(),
+            "Workers AI has no prompt cache to key into: {sent}"
+        );
+
+        // Both calls name the same tool; only the ids tell them apart.
+        let calls = last
+            .expect("a final chunk")
+            .message
+            .expect("tool call message")
+            .tool_calls()
+            .iter()
+            .map(|call| (call.id.clone(), call.function.name.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            vec![
+                ("call_aaa".to_string(), "read_file".to_string()),
+                ("call_bbb".to_string(), "read_file".to_string()),
+            ]
+        );
     }
 }

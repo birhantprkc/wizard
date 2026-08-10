@@ -21,14 +21,27 @@ enabled = true                  # optional, default true
 ```
 
 Cron expressions are strict 5-field (`minute hour day month weekday`),
-no seconds or year fields, and are validated on `add` and on every load.
-Aliases like `MON-FRI` and `@daily` work.
+no seconds or year fields. Aliases like `MON-FRI` and `@daily` work.
+
+They are validated on `wizard schedule add` and on `wizard schedule run`,
+and **not** on load. An entry you hand-edit into an invalid cron is not an
+error. The daemon reloads the file, logs one warning naming the entry, the
+expression and the parse error, and then never fires it. `wizard schedule
+list` is the other place it shows up — the `next` column reads `invalid
+cron`.
+
+`max_hours` is treated the same way: it must be a positive, finite number of
+hours no greater than 8760 (a year), and an entry whose value is not is warned
+about on load and never fired. `--max-hours` on the command line is checked
+against the same rule, and a value that fails it is refused before the run
+starts.
 
 ## CLI
 
 ```bash
 # Add an entry (validates the cron, the mode, and that --cwd exists;
-# prints the next fire time):
+# prints the next fire time). --mode defaults to sovereign; pass
+# --mode continuous for a perpetual run:
 wizard schedule add nightly-cleanup \
     --cron "0 3 * * *" \
     --prompt "tidy the repo, run tests, commit" \
@@ -75,7 +88,7 @@ stale). Each pass (at least once a minute) it:
    `wizard --mode sovereign -p "<prompt>" --cwd <cwd> [--max-hours H]`
    (`--continuous` for `mode = "continuous"`). Entries due at the same time
    all spawn concurrently; runs are never serialized.
-4. Sleeps until the next fire, capped at 60 s.
+4. Sleeps until the next fire, floored at 1 s and capped at 60 s.
 
 Semantics worth knowing:
 
@@ -92,10 +105,33 @@ Semantics worth knowing:
   pruned automatically.
 - **Shutdown.** Ctrl-C (SIGINT) kills running jobs and exits 0.
 
-## Running under systemd
+## Running it in the background
 
-The daemon stays in the foreground on purpose; let your init system own it.
-A user unit (`~/.config/systemd/user/wizard-scheduler.service`):
+`wizard scheduler` stays in the foreground on purpose. To have it supervised
+instead — surviving logout and starting at boot — install it:
+
+```bash
+wizard scheduler install     # systemd user unit, or a launchd agent on macOS
+wizard scheduler status
+wizard scheduler logs -f     # same lines as scheduler.log
+wizard scheduler start       # stop / start / restart an installed service
+wizard scheduler stop
+wizard scheduler restart     # after replacing the binary
+wizard scheduler uninstall
+```
+
+`install` on an empty `schedule.toml` says so rather than leaving you with a
+daemon that looks broken but is only idle.
+
+The unit points at the absolute path of the running binary and runs the daemon
+from your home directory: every entry carries its own `cwd` and each child is
+started there, so the daemon's own directory is never a project. On Linux,
+`install` also tells you whether lingering is on — without it a user service
+stops when you log out. On Termux or a Linux without systemd it refuses and
+names the alternative rather than writing a unit nothing will read.
+
+See [Services](services.md) for the unit it writes and what environment it
+carries. To write one yourself instead:
 
 ```ini
 [Unit]
@@ -107,9 +143,4 @@ Restart=on-failure
 
 [Install]
 WantedBy=default.target
-```
-
-```bash
-systemctl --user enable --now wizard-scheduler
-journalctl --user -u wizard-scheduler -f   # same lines as scheduler.log
 ```

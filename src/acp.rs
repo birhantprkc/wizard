@@ -2,7 +2,7 @@
 //! Neovim (CodeCompanion/avante), Emacs — embed Wizard as their agent over
 //! stdio. `wizard acp` runs the server; the editor drives it with JSON-RPC.
 //!
-//! This is the inverse of the TUI and browser GUI: the same agent core
+//! This is the inverse of the TUI and the window: the same agent core
 //! ([`crate::agent`]), but the surface is an editor on the other end of a pipe
 //! instead of a terminal. Each ACP `session/new` builds a headless agent for
 //! the requested cwd; each `session/prompt` runs one turn and streams the
@@ -340,20 +340,65 @@ impl Translator {
                 ))
                 .await;
             }
+            // A dead stream is re-generated from scratch, and the deltas above
+            // have already left the building: an ACP client paints each chunk
+            // as it arrives, so there is no partial buffer here to discard.
+            // Saying so is the only honest move left: staying quiet welds the
+            // abandoned attempt onto the front of its replacement, and the
+            // editor shows the answer twice.
+            AgentEvent::StreamRetrying => {
+                self.send(acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new(acp::ContentBlock::from(
+                        "\n[wizard] the response stream dropped; it restarts below\n".to_string(),
+                    )),
+                ))
+                .await;
+            }
             // Wizard runs in the default non-plan mode over ACP, so these should
             // not fire — but the exit_plan/interview tools are always
-            // registered, and a dropped responder hangs the turn. Auto-approve a
-            // plan and decline an interview so a turn can never wedge.
-            AgentEvent::PlanReady { respond, .. } => {
-                let _ = respond.send(PlanVerdict::approve());
+            // registered, and an unanswered gate parks the turn inside the tool.
+            // Auto-approve a plan and decline an interview so a turn can never
+            // wedge.
+            AgentEvent::PlanReady { gate, .. } => {
+                gate.answer(PlanVerdict::approve());
             }
-            AgentEvent::Interview { respond, .. } => {
-                let _ = respond.send(None);
+            AgentEvent::Interview { gate, .. } => {
+                gate.decline();
             }
             // v1 does not surface usage, context, images, background tasks, or
             // subagent runs to the editor; the core text/thinking/tool stream is
-            // what an ACP client renders.
-            _ => {}
+            // what an ACP client renders. Spelled out rather than caught by a
+            // wildcard: a new event must break this match, so somebody decides
+            // what an editor does with it instead of it vanishing here.
+            AgentEvent::Images { .. }
+            | AgentEvent::StepCompleted { .. }
+            | AgentEvent::HookFired { .. }
+            | AgentEvent::OmakaseProceeding { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::ContextSize { .. }
+            | AgentEvent::UltraGuidance { .. }
+            | AgentEvent::TodoUpdated(_)
+            | AgentEvent::TaskStarted { .. }
+            | AgentEvent::TaskFinished { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::SubagentRunStarted { .. }
+            | AgentEvent::SubagentRunText { .. }
+            | AgentEvent::SubagentRunToolStarted { .. }
+            | AgentEvent::SubagentRunToolFinished { .. }
+            | AgentEvent::SubagentRunImages { .. }
+            | AgentEvent::SubagentRunStep { .. }
+            | AgentEvent::SubagentRunDone { .. }
+            | AgentEvent::CommandRequested(_)
+            | AgentEvent::Done { .. } => {}
+            // A shell command's console. ACP drives an editor, not a
+            // terminal with a person typing into it, so this run's tool context
+            // never declares `ConsoleAccess::Interactive` and no command ever
+            // opens one. Named rather than wildcarded so that the day ACP grows
+            // a place to type, somebody has to decide here.
+            AgentEvent::ConsoleOpened { .. }
+            | AgentEvent::ConsoleOutput { .. }
+            | AgentEvent::ConsoleClosed { .. } => {}
         }
     }
 }
@@ -364,7 +409,7 @@ fn tool_kind(name: &str) -> acp::ToolKind {
     match name {
         "read_file" | "list_files" | "git_status" | "git_diff" => acp::ToolKind::Read,
         "write_file" | "edit_file" => acp::ToolKind::Edit,
-        "search_files" | "web_search" => acp::ToolKind::Search,
+        "search_files" | "web_search" | "x_search" => acp::ToolKind::Search,
         "execute" => acp::ToolKind::Execute,
         "web_fetch" => acp::ToolKind::Fetch,
         _ => acp::ToolKind::Other,
@@ -459,6 +504,40 @@ mod tests {
             stop_reason(DoneReason::MaxSteps, false),
             acp::StopReason::MaxTurnRequests
         );
+    }
+
+    /// The editor paints every delta the moment it arrives, so a retried
+    /// stream cannot be un-rendered: the translator has to say the response
+    /// restarts, or the abandoned attempt reads as the first half of the
+    /// answer.
+    #[tokio::test]
+    async fn stream_retrying_tells_the_editor_the_response_restarts() {
+        let (updates, mut rx) = mpsc::unbounded_channel();
+        let mut translator = Translator {
+            session_id: acp::SessionId::new("session-1"),
+            updates,
+            next_call_id: Rc::new(Cell::new(1)),
+            open_calls: HashMap::new(),
+        };
+        // `send` waits for the pump to acknowledge the update, so the drain has
+        // to run alongside it: dropping the ack is what a flushed update looks
+        // like from here.
+        let (notification, ()) = tokio::join!(
+            async {
+                let (notification, ack) = rx.recv().await.expect("one update");
+                drop(ack);
+                notification
+            },
+            translator.handle(AgentEvent::StreamRetrying),
+        );
+
+        let acp::SessionUpdate::AgentMessageChunk(chunk) = notification.update else {
+            panic!("expected an assistant message chunk");
+        };
+        let acp::ContentBlock::Text(text) = chunk.content else {
+            panic!("expected text content");
+        };
+        assert!(text.text.contains("restarts below"), "{}", text.text);
     }
 
     #[test]

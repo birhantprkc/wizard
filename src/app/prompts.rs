@@ -1,7 +1,7 @@
 //! Inline composer prompts and paused-turn modals: provider setup, the
-//! plan-review modal, and the interview modal.
+//! plan-review modal, the interview modal, and a running command's console.
 
-use crate::agent::{InterviewQuestion, PlanVerdict, ultra};
+use crate::agent::{ConsoleGate, ConsoleWriter, InterviewQuestion, PlanVerdict, ultra};
 use crate::config::ProviderKind;
 
 /// A field being collected in the inline provider-setup prompt.
@@ -171,4 +171,27 @@ impl Interview {
     pub fn current_question(&self) -> Option<&InterviewQuestion> {
         self.questions.get(self.current)
     }
+}
+
+/// A running foreground shell command whose stdin this composer is driving
+/// ([`AgentEvent::ConsoleOpened`](crate::agent::AgentEvent::ConsoleOpened)).
+///
+/// This is not a modal. The transcript keeps scrolling, the agent keeps
+/// working, and the only thing that changes is where Enter goes — which is
+/// exactly why the composer has to *say* it changed, and why
+/// [`crate::ui::draw`] repaints the prompt glyph, the rule above it and the
+/// status hints for as long as this is `Some`. A composer that quietly meant
+/// something else would be a worse bug than the one consoles fix.
+#[derive(Debug)]
+pub struct Console {
+    /// The command line, so the banner can name what is being typed at.
+    pub command: String,
+    /// The ticket this console arrived on. Kept so a `ConsoleClosed` for some
+    /// *other* command cannot close this one — two `execute` calls in one turn
+    /// are sequential today, but "today" is not a thing to key correctness on.
+    pub gate: ConsoleGate,
+    /// Writer into the child's stdin. Dropping it detaches: the command keeps
+    /// running, and its timeout clock — stopped while somebody was there to
+    /// answer it — starts again.
+    pub(super) writer: ConsoleWriter,
 }

@@ -4,42 +4,43 @@ on:
   push:
     tags: ['v*']
 
+# Read at the top, write on exactly one job. Ten of the twelve jobs here only
+# compile and upload build artifacts — artifact storage is a separate scope and
+# needs nothing from `contents` — so the only step that writes to the
+# repository is the one that creates the release. A token that can write
+# releases is handed to every `cargo build` in the matrix otherwise, including
+# the ones that run third-party build scripts from the dependency tree.
 permissions:
-  contents: write
+  contents: read
+
+# One release at a time. Two tags pushed close together otherwise race on the
+# mirror's `latest/` prefix, which is a shared mutable location: the loser
+# finishes second and leaves `latest/` describing the older release. NOT
+# `cancel-in-progress` — a half-cancelled release is worse than a queued one,
+# because the GitHub release is already public by the time the mirror step
+# runs.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    strategy:
-      # Don't cancel sibling targets when one fails: their artifacts still
-      # upload, so re-running only the broken job completes the release
-      # instead of rebuilding every target.
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-22.04-arm
-          # Both macOS targets build on Apple Silicon runners (macos-14): the macOS
-          # SDK is universal, so x86_64 cross-compiles fine, and we avoid the scarce
-          # Intel `macos-13` runners that leave the job stuck in queue for hours.
-          - target: x86_64-apple-darwin
-            runner: macos-14
-          - target: aarch64-apple-darwin
-            runner: macos-14
-    runs-on: ${{ matrix.runner }}
+  # A tag that disagrees with Cargo.toml is cheap to catch and expensive to
+  # discover after ten uploads. Its own job, on one runner, needing nothing but
+  # a checkout: as a step inside the `test` matrix it ran once per runner, so a
+  # mismatched tag failed twice with the same annotation and the second failure
+  # waited on whatever queue that runner was in. Everything below checks out
+  # the same tag, so checking it once here covers them all.
+  version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Verify tag matches Cargo.toml version
+        shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
@@ -49,15 +50,142 @@ jobs:
           fi
           echo "Releasing version ${cargo_version}"
 
+      # The same refusal the `release` job makes before publishing, made here
+      # first because of what it costs there. Down at the signing step this
+      # fires only after the full matrix — ten builds across four macOS and
+      # four ARM legs — has already been paid for. The answer cannot change
+      # in between: both read the committed wizard-release.pub at the same
+      # tag. So a tag pushed with the placeholder still in the repo fails in
+      # about a runner-minute instead of an hour.
+      #
+      # This does NOT replace the check at signing time, which stays the
+      # authoritative one: it guards the step that actually produces the
+      # signature, and a guard that lives only at the front of a pipeline is
+      # one refactor away from being skipped.
+      - name: Refuse a placeholder signing key early
+        run: |
+          set -eu
+          key="$(grep -v '^untrusted comment:' wizard-release.pub | tr -d '[:space:]')"
+          case "$key" in
+            RELEASE-SIGNING-KEY-NOT-YET-GENERATED*)
+              echo "::error::wizard-release.pub is still the placeholder; generate the release keypair and update install.sh's inlined copy before tagging (see SECURITY.md)" >&2
+              exit 1
+              ;;
+          esac
+          echo "A real release signing key is committed."
+
+  # The gate. A tag push used to go straight to `cargo build` and then to a
+  # published, non-draft release: nothing between `git tag` and ten binaries on
+  # the download page ever ran a test or started the binary. Everything below
+  # needs this job, so a red suite means no artifacts and no release.
+  #
+  # Two runners, exactly the platforms that get an asset: this is the shipping
+  # gate, not a portability survey. Windows ships nothing, and its port is
+  # deferred to a release of its own, which is also why CI no longer carries a
+  # Windows leg (see the `suite` job in ci.yml).
+  #
+  # This runs `cargo test --locked` on macos-15 and blocks, while the identical
+  # command in CI's `suite` job is non-blocking until it has been observed
+  # green. That is not an inconsistency, it is the two failure modes being
+  # different: a red macOS leg here means a tag publishes nothing, which is a
+  # deliberate act by one person who can look at it and retag, and shipping
+  # Darwin binaries whose suite has never passed is the thing a release gate
+  # exists to stop. A red macOS leg on a pull request means nobody can merge
+  # anything. Both flip to the same state once the suite is known green there.
+  #
+  # Only the *suite* is split that way. CI's macOS leg still blocks on
+  # `cargo check --locked` (and on the `--features native` check), so a
+  # Darwin-only compile break is refused at the pull request rather than
+  # discovered here, where it would cost a tag that publishes zero of ten
+  # assets.
+  test:
+    name: Test suite (${{ matrix.runner }})
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [test]
+    strategy:
+      # Don't cancel sibling targets when one fails: their artifacts still
+      # upload, so re-running only the broken job completes the release
+      # instead of rebuilding every target.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            native: true
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            native: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            native: true
+          # Both macOS targets build on Apple Silicon runners (macos-15): the macOS
+          # SDK is universal, so x86_64 cross-compiles fine, and we avoid the scarce
+          # Intel `macos-13` runners that leave the job stuck in queue for hours.
+          # The consequence is that the x86_64 asset cannot be started here
+          # (an arm64 runner needs Rosetta 2 for that, and the hosted images do
+          # not ship it), so it is the one asset the smoke test below skips.
+          - target: x86_64-apple-darwin
+            runner: macos-15
+            native: false
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            native: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
+      # musl-tools ships exactly two binaries, musl-gcc and musl-ldd. That was
+      # enough until this tree grew a vendored LuaJIT (mlua's `luajit` +
+      # `vendored` features): luajit-src searches PATH for `musl-ar` and
+      # `musl-strip` by name and panics with "cannot find musl-ar" when either
+      # is absent. That panic happens in `Build (release)` below, which has no
+      # continue-on-error, so the whole `build` job goes red and `release`
+      # (needs: [build, native]) never runs — a tag push would publish nothing
+      # at all rather than a bad musl asset.
+      #
+      # ar and strip are binutils, not libc: the host's operate on musl objects
+      # for the runner's own architecture perfectly well, so aliasing them under
+      # the names luajit-src looks for is the whole fix. Verified by
+      # reproducing both panics in order against this exact dependency, and by
+      # confirming `dpkg -L musl-tools` lists only musl-gcc and musl-ldd.
       - name: Install musl tooling
         if: contains(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          set -eu
+          sudo apt-get update && sudo apt-get install -y musl-tools binutils
+          for tool in ar strip ranlib; do
+            if ! command -v "musl-$tool" >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v "$tool")" "/usr/local/bin/musl-$tool"
+            fi
+          done
+          musl-gcc --version >/dev/null
+          command -v musl-ar musl-strip
 
       - name: Build (release)
         env:
@@ -80,34 +208,142 @@ jobs:
           strip "target/${{ matrix.target }}/release/wizard"
           tar -C "target/${{ matrix.target }}/release" -czf "wizard-${{ matrix.target }}.tar.gz" wizard
 
+      # Start what we are about to ship. Deliberately the unpacked tarball and
+      # not target/release/wizard: strip and tar are the last two things that
+      # touch the artifact, and a release that uploads a binary nobody ever ran
+      # is how a broken asset reaches users through install.sh instead of here.
+      # `--version` is enough: it links, loads, and reaches main.
+      #
+      # Non-blocking on the two musl targets, and only there. They fail today
+      # on a defect this gate did not cause and cannot fix: the published
+      # wizard-x86_64-unknown-linux-musl asset is not statically linked (it
+      # requests the interpreter /lib/ld-musl-x86_64.so.1) and segfaults under
+      # Alpine's loader, which is also why the Alpine and NixOS legs of CI's
+      # install-script job are marked experimental. Blocking here would take
+      # `build` red, and `release` needs `build`, so the next tag push would
+      # publish nothing at all rather than the eight assets that do work plus
+      # the two that are already broken on the download page. The step still
+      # runs and still reports.
+      #
+      # Remove this `continue-on-error` (and this paragraph) on the first real
+      # CI run that reports "genuinely static", so the asset can never regress
+      # silently again. That is now the only thing standing in the way, and it
+      # is worth knowing why:
+      #
+      # **The tree is not the problem.** Built locally on 2026-08-08 at
+      # `75d8b45` for x86_64-unknown-linux-musl with these exact RUSTFLAGS, the
+      # binary has no PT_INTERP, `file` calls it "static-pie linked", `ldd`
+      # says "statically linked", and the packaged tarball's binary runs
+      # `--version` successfully under Alpine 3.20 (musl), busybox:uclibc (not
+      # musl at all) and debian:12 (glibc). So the source and the flags produce
+      # exactly the portable static binary this asset is supposed to be.
+      #
+      # What is still unverified is *this runner's* toolchain: that build used
+      # nixpkgs' `pkgsCross.musl64` cross toolchain, not Ubuntu's `musl-tools`,
+      # and musl-tools plus the host GCC is the combination that has never been
+      # observed producing a static binary here. A plain `musl-gcc` on a GCC-15
+      # host cannot even link LuaJIT — it pulls the host `libgcc_eh.a`, which
+      # needs glibc's `_dl_find_object`.
+      #
+      # So: this step is the measurement, and one green run retires the marker.
+      # Name the musl defect precisely instead of leaving it to present as a
+      # segfault in the smoke test below. A genuinely static binary has no
+      # PT_INTERP program header at all; the published
+      # wizard-x86_64-unknown-linux-musl asset requests
+      # /lib/ld-musl-x86_64.so.1, which is what makes it die under Alpine's
+      # loader. Non-blocking on the same reasoning as the smoke test, and for
+      # the same limited time: this reports, so that whoever removes the
+      # continue-on-error has a log line saying whether it is safe to.
+      - name: Check the musl binary is actually static
+        id: static
+        if: contains(matrix.target, '-musl')
+        continue-on-error: true
+        run: |
+          set -eu
+          bin="target/${{ matrix.target }}/release/wizard"
+          if readelf -l "$bin" | grep -q INTERP; then
+            interp="$(readelf -l "$bin" | grep -i 'Requesting program interpreter' | sed 's/.*: //; s/\]//')"
+            echo "::warning::${{ matrix.target }} is NOT static — it requests ${interp}. It will segfault on Alpine and will not run on any host without that loader."
+            exit 1
+          fi
+          echo "${{ matrix.target }} has no PT_INTERP: genuinely static."
+
+      - name: Smoke test the packaged binary
+        id: smoke
+        if: matrix.native
+        continue-on-error: ${{ contains(matrix.target, '-musl') }}
+        run: |
+          set -eu
+          rm -rf smoke && mkdir smoke
+          tar -xzf "wizard-${{ matrix.target }}.tar.gz" -C smoke
+          ./smoke/wizard --version
+          rm -rf smoke
+
+      # A `continue-on-error` step reports `conclusion: success` to the jobs
+      # API no matter what happened — only `outcome` carries the truth, and
+      # `outcome` is not exposed per-step to anyone reading run status. So the
+      # two swallowed steps above are, without this, indistinguishable from
+      # passing. That is exactly how the musl asset stayed broken across
+      # releases. ci.yml carries the same reporter for the same reason.
+      - name: Report swallowed musl failures
+        if: always() && (steps.static.outcome == 'failure' || steps.smoke.outcome == 'failure')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          if [ "${{ steps.static.outcome }}" = "failure" ]; then
+            echo "::warning::${TARGET} is not statically linked and did not fail the run (non-blocking); open this job's log."
+            echo "### ${TARGET}: NOT STATIC, non-blocking" >>"$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${{ steps.smoke.outcome }}" = "failure" ]; then
+            echo "::warning::${TARGET} did not start and did not fail the run (non-blocking); this asset is being published broken."
+            echo "### ${TARGET}: SMOKE TEST FAILED, non-blocking — asset published anyway" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
       - uses: actions/upload-artifact@v7
         with:
           name: wizard-${{ matrix.target }}
           path: wizard-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  # The desktop shell (`wizard app`): the same binary built with
-  # `--features desktop`, which links the system webview. A separate job and a
-  # separate asset, never a replacement for the six above — a webview build
-  # cannot start on a Linux box without libwebkit2gtk, and the plain binary must
-  # keep working everywhere.
+  # The native GUI (`wizard gui`): the same binary built with
+  # `--features native`, which links iced. A separate job and a separate asset,
+  # never a replacement for the six above.
   #
-  # No musl target: a static binary and a dynamically linked system webview are
-  # a contradiction. No Windows target: the shell is Linux and macOS only.
-  desktop:
-    name: Build desktop (${{ matrix.target }})
+  # It is a second asset rather than the default build for the reason written
+  # out in `Cargo.toml`'s `[features]`: iced is several hundred crates of winit,
+  # cosmic-text and tiny-skia that a `wizard -p`, a `wizard acp` or a CI
+  # container never executes a line of, and putting them in the default build
+  # would tax every headless user for a window they will never open. This job
+  # is what keeps that choice from meaning "source-only" — `curl | bash` with
+  # `WIZARD_NATIVE=1` installs one of these, and `wizard update` on a binary
+  # built this way stays on this asset line (`native_assets` in
+  # `src/update.rs`).
+  #
+  # No musl target: winit reaches X11 and Wayland through `dlopen`, which a
+  # fully static musl binary cannot do. No Windows target: the port is deferred
+  # to a release of its own, same as for the plain assets.
+  native:
+    name: Build native GUI (${{ matrix.target }})
+    needs: [test]
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            runnable: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+            runnable: true
+          # Cross-compiled on an arm64 runner, same as in the `build` job: no
+          # Rosetta 2, so it cannot be started here.
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
+            runnable: false
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
+            runnable: true
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -118,37 +354,64 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # WebKitGTK (wry) and GTK 3 (tao). macOS needs nothing: WKWebView is part
-      # of the OS.
-      - name: Install WebKitGTK
-        if: contains(matrix.target, '-linux-')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
+      # No `apt-get` step, and that is the point of the toolkit choice rather
+      # than an omission. `default-features = false` + `tiny-skia` links no
+      # wgpu, so there is no Vulkan or Mesa development package to install, and
+      # winit opens X11 and Wayland with `dlopen` at run time rather than
+      # linking them, so there is no `-dev` package at build time either. The
+      # webview shell this job replaced needed `libwebkit2gtk-4.1-dev` and
+      # `libgtk-3-dev` on every Linux leg.
 
-      - name: Build (release, desktop)
-        run: cargo build --release --locked --features desktop --target ${{ matrix.target }}
+      - name: Build (release, native GUI)
+        run: cargo build --release --locked --features native --target ${{ matrix.target }}
 
-      # The binary inside keeps the name `wizard` — same as every other asset,
+      # The binary inside keeps the name `wizard`, same as every other asset,
       # so `wizard update` unpacks it with the same code path. The *asset* name
       # is what distinguishes the build.
       - name: Package
         run: |
           strip "target/${{ matrix.target }}/release/wizard"
           tar -C "target/${{ matrix.target }}/release" \
-            -czf "wizard-desktop-${{ matrix.target }}.tar.gz" wizard
+            -czf "wizard-native-${{ matrix.target }}.tar.gz" wizard
+
+      # Same purpose as the smoke test in `build`: prove that strip and tar
+      # produced a binary that links, loads and reaches main. `--version`
+      # returns before any window is opened, so no display is needed — which is
+      # also all this can prove. There is no compositor on a runner, so that
+      # `wizard gui` opens a window is not tested here and is not
+      # tested anywhere (see "Testing, and what a headless machine cannot
+      # prove" in docs/native-gui.md).
+      - name: Smoke test the packaged binary
+        if: matrix.runnable
+        run: |
+          set -eu
+          rm -rf smoke && mkdir smoke
+          tar -xzf "wizard-native-${{ matrix.target }}.tar.gz" -C smoke
+          ./smoke/wizard --version
+          rm -rf smoke
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wizard-desktop-${{ matrix.target }}
-          path: wizard-desktop-${{ matrix.target }}.tar.gz
+          name: wizard-native-${{ matrix.target }}
+          path: wizard-native-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   release:
     name: Create GitHub release
-    needs: [build, desktop]
+    needs: [build, native]
     runs-on: ubuntu-latest
+    # The only job in this workflow that writes anything. See the workflow-level
+    # `permissions` above.
+    permissions:
+      contents: write
     steps:
+      # The checkout is here for one file: wizard-release.pub, the public half
+      # of the signing key. The signature below is verified against it before
+      # anything is published, so a secret that has drifted from the key users
+      # actually carry fails the release instead of shipping ten assets nobody
+      # can install.
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
@@ -156,10 +419,124 @@ jobs:
       - name: Generate checksums
         run: sha256sum -- *.tar.gz > checksums.txt
 
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      # checksums.txt is the only file that has to be *authentic*: every
+      # tarball is verified against it, so signing it signs the release.
+      # `install.sh` and `wizard update` both refuse a release whose
+      # checksums.txt has no valid signature under the key in
+      # wizard-release.pub, with no flag to skip the check, so a tag that
+      # reaches this step without a working secret must fail here rather than
+      # publish assets that cannot be installed.
+      #
+      # The secret is the whole `minisign -G` secret key file, verbatim
+      # (including its `untrusted comment:` line). Generate it with `-W` so it
+      # carries no password: a password on a key whose only user is this
+      # runner protects nothing and cannot be typed here anyway.
+      - name: Sign checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -eu
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set; releases must be signed (see SECURITY.md)" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -S -s minisign.key -m checksums.txt \
+            -c "wizard ${GITHUB_REF_NAME} release checksums" \
+            -t "wizard ${GITHUB_REF_NAME} checksums, signed by the wizard release key" \
+            </dev/null
+          rm -f minisign.key
+
+      # Verify with the *published* key, not with the secret that just signed:
+      # this is the step that proves what ships can be checked by what users
+      # already have.
+      - name: Verify the signature against the published public key
+        run: |
+          set -eu
+          key="$(grep -v '^untrusted comment:' wizard-release.pub | tr -d '[:space:]')"
+          case "$key" in
+            RELEASE-SIGNING-KEY-NOT-YET-GENERATED*)
+              echo "::error::wizard-release.pub is still the placeholder; generate the release keypair before tagging (see SECURITY.md)" >&2
+              exit 1
+              ;;
+          esac
+          minisign -Vm checksums.txt -x checksums.txt.minisig -P "$key"
+
+      # `draft: false` publishes the moment this job runs, which is only
+      # defensible because of what has to be green first: the tag matching
+      # Cargo.toml, the suite on both shipping platforms, then ten builds,
+      # then every asset that can run on its build runner actually starting,
+      # and finally a checksums.txt signature that verifies against the public
+      # key in the repository.
+      # The two musl assets are the exception, and the only one: their smoke
+      # test reports but does not block, for the reason spelled out on that
+      # step. Do not add an asset that skips or downgrades the smoke test
+      # without saying why there, and do not remove `needs` from the jobs
+      # above.
+      #
+      # `fail_on_unmatched_files: true` because the action's own default is
+      # false: an asset named below that does not exist is otherwise skipped
+      # and the job still goes green, which would publish a release quietly
+      # missing a platform. `if-no-files-found: error` on the uploads makes
+      # that unlikely, and unlikely-and-silent is the combination this release
+      # can least afford.
+      #
+      # `preserve_order: true` uploads in the order listed, and checksums.txt
+      # and its signature are listed last on purpose. The release is public
+      # from the moment this step starts, so during the upload `install.sh`
+      # can fetch checksums.txt from releases/latest and then 404 on a tarball
+      # it names. Ordering does not close that window — only a draft would —
+      # but it means the file that advertises the others arrives after them.
+      #
+      # `generate_release_notes: true` because without it the body is empty:
+      # the ten assets appear on the release page with nothing above them, no
+      # changelog and no statement about what they are. GitHub builds the
+      # changelog from the commits since the previous tag; `body` below is
+      # prepended to it.
+      #
+      # The prepended part is the verification instructions, and they lead
+      # rather than trail. Every asset here is covered by a signature over
+      # checksums.txt, `install.sh` and `wizard update` both refuse a release
+      # whose signature does not check, and somebody who downloads a tarball
+      # from this page by hand gets none of that enforcement — they are the one
+      # reader who has to run the check themselves, and this is the page they
+      # are standing on when they need it.
       - uses: softprops/action-gh-release@v2
         with:
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
+          preserve_order: true
+          generate_release_notes: true
+          body: |
+            ## Verifying this download
+
+            Every asset below is covered by `checksums.txt`, which is signed
+            with the Wizard release key. `install.sh` and `wizard update` check
+            that signature and refuse anything that fails it, with no flag to
+            skip the check. If you download a tarball from this page by hand,
+            that check is yours to run:
+
+            ```sh
+            # 1. the signature over checksums.txt, against the key in the repo
+            curl -fsSLO https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/wizard-release.pub
+            minisign -Vm checksums.txt -x checksums.txt.minisig \
+              -P "$(grep -v '^untrusted comment:' wizard-release.pub)"
+
+            # 2. then the tarball you actually downloaded, against checksums.txt
+            sha256sum --ignore-missing -c checksums.txt
+            ```
+
+            Both must pass. The first proves the checksum list is ours; the
+            second proves your download matches it. Checking only the second
+            proves nothing, because an attacker who can replace the tarball can
+            replace the checksum beside it.
+
+            ---
           files: |
             wizard-x86_64-unknown-linux-gnu.tar.gz
             wizard-x86_64-unknown-linux-musl.tar.gz
@@ -167,8 +544,111 @@ jobs:
             wizard-aarch64-unknown-linux-musl.tar.gz
             wizard-x86_64-apple-darwin.tar.gz
             wizard-aarch64-apple-darwin.tar.gz
-            wizard-desktop-x86_64-unknown-linux-gnu.tar.gz
-            wizard-desktop-aarch64-unknown-linux-gnu.tar.gz
-            wizard-desktop-x86_64-apple-darwin.tar.gz
-            wizard-desktop-aarch64-apple-darwin.tar.gz
+            wizard-native-x86_64-unknown-linux-gnu.tar.gz
+            wizard-native-aarch64-unknown-linux-gnu.tar.gz
+            wizard-native-x86_64-apple-darwin.tar.gz
+            wizard-native-aarch64-apple-darwin.tar.gz
             checksums.txt
+            checksums.txt.minisig
+
+      # ---------------------------------------------------------------------
+      # The download mirror (D1.2)
+      # ---------------------------------------------------------------------
+      #
+      # The same artifacts, plus checksums.txt and its signature, copied to
+      # Cloudflare R2 so downloads have stable URLs that are not version-shaped
+      # the way GitHub's asset URLs are. GitHub stays the source of truth: this
+      # runs *after* the release is published, and both `install.sh` and
+      # `wizard update` fall back to GitHub on any mirror failure.
+      #
+      # Secrets, all four required together:
+      #   R2_ACCOUNT_ID         Cloudflare account id (the R2 S3 endpoint host)
+      #   R2_BUCKET             bucket name, e.g. wizard-dl
+      #   R2_ACCESS_KEY_ID      R2 API token, "Object Read & Write" on that bucket
+      #   R2_SECRET_ACCESS_KEY  its secret
+      #
+      # With any of them absent the upload is skipped and the release stands.
+      # A release that fails because an *optional* mirror is not configured
+      # would make the mirror a single point of failure for the thing it exists
+      # to take load off.
+      - name: Is the R2 mirror configured?
+        id: mirror
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -eu
+          if [ -n "${R2_ACCOUNT_ID:-}" ] && [ -n "${R2_BUCKET:-}" ] \
+             && [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ]; then
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >>"$GITHUB_OUTPUT"
+            echo "R2 mirror not configured; skipping the upload. GitHub Releases is unaffected." \
+              >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Upload order matters, and it is: every tarball first, then
+      # checksums.txt.minisig, then checksums.txt last. A client that finds a
+      # checksums.txt has therefore already been able to find everything it
+      # names, so an interrupted upload leaves the prefix incomplete rather
+      # than internally inconsistent — which matters because a digest that does
+      # not match is a *refusal*, not a fallback.
+      #
+      # That reasoning holds for `<tag>/`, which is empty before this runs. It
+      # does NOT hold for `latest/`, which already contains the previous
+      # release: there, an interrupted upload leaves the new tarballs beside
+      # the *old* checksums.txt, which is exactly the internally-inconsistent
+      # state the paragraph above says cannot happen. The blast radius is
+      # humans and scripts reading `latest/` by hand — the clients read the
+      # tag-pinned prefix and never this one — but do not extend the first
+      # paragraph's guarantee to `latest/`, because it is not true there.
+      # Re-running an *old* tag's workflow also overwrites `latest/` with the
+      # older release, and nothing here prevents that.
+      #
+      # Two prefixes per release, both with the release's own asset names plus a
+      # bare `<target>` alias of each tarball:
+      #   /<tag>/wizard-<target>.tar.gz  /<tag>/<target>       what the clients read
+      #   /latest/wizard-<target>.tar.gz /latest/<target>      for humans and scripts
+      # The clients only ever read the version-pinned prefix (the tag comes from
+      # GitHub), so the mutable `latest/` prefix cannot pin anyone to an old
+      # release. Budget: roughly 2x the release's asset size per tag, against
+      # R2's 10 GB free tier — prune old tags with a lifecycle rule rather than
+      # discovering the ceiling.
+      - name: Upload the release to the R2 mirror
+        if: steps.mirror.outputs.configured == 'true'
+        # The GitHub release is already published at this point, so a mirror
+        # that refuses the upload must not retroactively fail the release. It
+        # still reports: a mirror silently a version behind is worse than one
+        # that is visibly missing a release.
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 rejects the streaming checksum trailers the AWS CLI has sent by
+          # default since v2.23, so ask for them only where the S3 API requires
+          # them. Without this every upload fails with a 501.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -eu
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          put() {
+            aws s3 cp --only-show-errors --endpoint-url "$endpoint" "$1" "s3://${R2_BUCKET}/$2"
+          }
+          for prefix in "${GITHUB_REF_NAME}" latest; do
+            for tarball in wizard-*.tar.gz; do
+              target="${tarball#wizard-}"
+              target="${target%.tar.gz}"
+              put "$tarball" "${prefix}/${tarball}"
+              put "$tarball" "${prefix}/${target}"
+            done
+            put checksums.txt.minisig "${prefix}/checksums.txt.minisig"
+            put checksums.txt "${prefix}/checksums.txt"
+          done
+          echo "Mirrored ${GITHUB_REF_NAME} to R2 (${R2_BUCKET}): /${GITHUB_REF_NAME}/ and /latest/" \
+            >>"$GITHUB_STEP_SUMMARY"

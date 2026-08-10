@@ -1,0 +1,10 @@
+size=14   indent=18   gap=14   fill=- rule=y spans=1  | the build hangs on a stale lock — fix it
+size=14   indent=0    gap=10   fill=- rule=- spans=1  | Found a stale lock file and removed it. Here is the guard that replaces it:
+size=13   indent=10   gap=12   fill=y rule=- spans=32 | fn main() {\n    let lock = Lock::acquire()?;\n\n    println!("held");\n}
+size=14   indent=0    gap=10   fill=- rule=- spans=1  | Notes:
+size=14   indent=0    gap=2    fill=- rule=- spans=2  | • the lock is released on drop
+size=14   indent=0    gap=2    fill=- rule=- spans=3  | • no timeout is applied
+size=14   indent=0    gap=10   fill=- rule=y spans=1  | A crash still leaves the file, which is why the guard checks the pid.
+size=13   indent=0    gap=4    fill=- rule=- spans=3  | ✓ execute  rm -f .lock
+size=13   indent=18   gap=12   fill=y rule=- spans=1  | removed 1 file\nexit status 0
+size=13   indent=18   gap=10   fill=- rule=- spans=1  | [note] background task #1 finished

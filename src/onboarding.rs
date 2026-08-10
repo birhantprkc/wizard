@@ -21,20 +21,39 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::config::{Config, GatewayConfig, GatewayKind, Mode, ProviderConfig, ProviderKind};
 use crate::hardware::{self, GgufModel};
 use crate::import_claude::{self, ImportSelection};
+use crate::skin::Skin;
+use crate::theme::{self, Token};
 
-/// White accent, matching [`crate::ui`].
-const ACCENT: Color = Color::White;
-/// Dim chrome (borders, hints).
-const DIM: Color = Color::DarkGray;
-/// Secondary text.
-const TEXT_DIM: Color = Color::Gray;
+// The wizard paints with the same semantic tokens as the main TUI, so
+// `NO_COLOR`, `WIZARD_COLOR` and `WIZARD_THEME` mean here what they mean
+// everywhere else. It used to carry its own white/gray/darkgray constants,
+// which made first-run setup the one screen that ignored all three: a machine
+// with no config is exactly where a user who sets `NO_COLOR=1` meets Wizard
+// first, and the wizard painted colors at them anyway. Under the default
+// theme the three tokens below are the same white/gray/darkgray, so nothing
+// looks different unless the user asked for it.
+
+/// The one accent: titles, the selection marker, the input caret.
+fn accent() -> Style {
+    theme::style(Token::Accent)
+}
+
+/// Dim chrome: borders, hints, footers.
+fn dim() -> Style {
+    theme::style(Token::Faint)
+}
+
+/// Secondary text: subtitles and option details.
+fn text_dim() -> Style {
+    theme::style(Token::Muted)
+}
 
 // ---------------------------------------------------------------------------
 // Pure logic (unit-tested)
@@ -52,8 +71,13 @@ pub struct Answers {
     pub base_url: String,
     /// Model tag.
     pub model: String,
-    /// Env var holding the API key (cloud providers only).
+    /// Env var that overrides the stored API key (cloud providers only).
     pub api_key_env: Option<String>,
+    /// A pasted provider API key, stored under [`Self::provider_name`] in
+    /// `~/.wizard/credentials.toml` (0600) by [`run_blocking`] after the pure
+    /// config mapping, exactly like [`Self::web_search_api_key`]. It never
+    /// reaches `config.toml`.
+    pub provider_api_key: Option<String>,
     /// Path to the GGUF model file (llama.cpp only) — lets Wizard spawn
     /// `llama-server` itself.
     pub gguf_path: Option<String>,
@@ -61,10 +85,16 @@ pub struct Answers {
     pub gateway_kind: GatewayKind,
     /// Env var holding the gateway bot token (Telegram only).
     pub gateway_token_env: Option<String>,
-    /// Allowed inbound chat IDs (Telegram only; empty = allow all).
+    /// Allowed inbound chat IDs (Telegram only). The list is closed: an empty
+    /// list allows **nobody**, which is the shipped default (see
+    /// [`crate::gateway::is_authorized`]). Leaving this empty ships a gateway
+    /// that refuses every message, not one that answers everyone.
     pub gateway_allowed_chat_ids: Vec<i64>,
     /// Personality mode.
     pub mode: Mode,
+    /// Which coding agent's terminal chrome the TUI wears. Cosmetic: it
+    /// changes glyphs, framing and wording, never the commands or the model.
+    pub skin: Skin,
     /// `web_search` backend id (`"duckduckgo"`, `"brave"`, `"tavily"`,
     /// `"exa"`, `"serper"`, or `"xai"`).
     pub web_search_backend: String,
@@ -120,6 +150,10 @@ impl Answers {
         config.providers = vec![provider];
         config.active_provider = Some(self.provider_name);
         config.mode = self.mode;
+        // Written even when it is the default, because it was answered: a key
+        // that is present means "this was chosen", and `/ui` rewrites the same
+        // key when it is chosen again.
+        config.ui.skin = Some(self.skin.key().to_string());
         config.web.search_backend = self.web_search_backend;
         config.gateway = GatewayConfig {
             kind: self.gateway_kind,
@@ -130,9 +164,56 @@ impl Answers {
     }
 }
 
+/// Persist the secrets [`Answers`] carries and [`Answers::into_config`]
+/// deliberately drops. `store` is the credential writer
+/// ([`crate::credentials::store`] in production, which writes 0600).
+///
+/// The *names* it is called with are the contract, because each secret is read
+/// back from somewhere else entirely: the provider key under
+/// `provider_name`, which is what [`crate::config::ProviderConfig`] resolves
+/// against; the web-search key under the backend name the `web_search` tool
+/// resolves at call time; the bot token under
+/// [`crate::gateway::telegram::TOKEN_CREDENTIAL`], which is what the gateway
+/// reads. A typo in any of those stores the secret where nothing looks for it
+/// and leaves a setup that looks finished and 401s on the first turn, which is
+/// exactly the failure asking for the key was meant to remove. Injecting the
+/// writer is what lets a test pin the names without touching the shared
+/// credentials file.
+///
+/// A write failure is reported and does not abort onboarding: the config is
+/// still worth saving, and the summary then reports the key as missing.
+fn store_pasted_secrets(answers: &Answers, mut store: impl FnMut(&str, &str) -> Result<()>) {
+    let mut persist = |name: &str, secret: Option<&str>, label: &str| {
+        let Some(secret) = secret.map(str::trim).filter(|secret| !secret.is_empty()) else {
+            return;
+        };
+        if let Err(err) = store(name, secret) {
+            eprintln!("warning: could not save the {label}: {err:#}");
+        }
+    };
+
+    persist(
+        &answers.provider_name,
+        answers.provider_api_key.as_deref(),
+        &format!("{} API key", answers.provider_name),
+    );
+    persist(
+        &answers.web_search_backend,
+        answers.web_search_api_key.as_deref(),
+        &format!("{} API key", answers.web_search_backend),
+    );
+    persist(
+        crate::gateway::telegram::TOKEN_CREDENTIAL,
+        answers.gateway_bot_token.as_deref(),
+        "Telegram bot token",
+    );
+}
+
 /// Parse a comma-separated list of numeric chat IDs. Whitespace and empty
-/// entries are ignored; an empty input yields an empty list ("allow all").
-/// A non-numeric entry is an error naming the offending token.
+/// entries are ignored; an empty input yields an empty list, which the gateway
+/// reads as "allow nobody" (see [`crate::gateway::is_authorized`]) and warns
+/// about in the summary. A non-numeric entry is an error naming the offending
+/// token.
 pub fn parse_chat_ids(input: &str) -> Result<Vec<i64>, String> {
     let mut ids = Vec::new();
     for token in input.split(',') {
@@ -170,8 +251,13 @@ const XAI_MODELS: &[&str] = &[
     "grok-4.20-0309-reasoning",
     "grok-build-0.1",
 ];
-/// Ollama tier options offered alongside the hardware-suggested default.
-const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b"];
+/// Ollama tier options offered alongside the hardware-suggested default. Must
+/// list every tag [`hardware::suggest_ollama_model`] can return, including the
+/// 4B tier: a machine below 8 GB is suggested `qwen3.5:4b`, and leaving it out
+/// of the picker meant the one model such a machine can actually load was
+/// unreachable the moment the user changed the default (the GGUF picker offers
+/// its whole tier table, so the two pickers disagreed).
+const OLLAMA_TIERS: &[&str] = &["qwen3.6:35b", "qwen3.6:27b", "qwen3.5:9b", "qwen3.5:4b"];
 
 /// Default base URL for a local llama.cpp `llama-server`.
 const LLAMACPP_BASE_URL: &str = crate::config::DEFAULT_LLAMACPP_HOST;
@@ -220,9 +306,24 @@ pub async fn run() -> Result<Option<Config>> {
 
 /// Synchronous core of [`run`].
 fn run_blocking() -> Result<Option<Config>> {
+    // Install the skin and theme before anything is drawn: there is no config
+    // yet on a first run, so this is `WIZARD_SKIN` / `WIZARD_THEME` plus the
+    // terminal's colour depth (`NO_COLOR`, `WIZARD_COLOR`, `TERM`). A name
+    // that will not load is reported after the terminal is restored, not
+    // swallowed.
+    //
+    // Onboarding itself always draws in its own plain style rather than the
+    // chosen skin's: the interface question is one of the questions it asks,
+    // and a wizard that restyled itself halfway through would make the answer
+    // look like it had already taken effect for the whole session.
+    let skin_warning = crate::skin::init(None);
+    let theme_warning = theme::init(crate::skin::active().companion_theme());
     let mut terminal = setup_terminal()?;
     let outcome = collect_answers(&mut terminal);
     restore_terminal_best_effort();
+    for warning in [skin_warning, theme_warning].into_iter().flatten() {
+        eprintln!("warning: {warning}");
+    }
 
     let answers = match outcome {
         Ok(Some(answers)) => answers,
@@ -231,30 +332,9 @@ fn run_blocking() -> Result<Option<Config>> {
     };
 
     let import = answers.claude_import;
-    // The pasted web-search key (if any) is stored separately from config.
-    let web_search_backend = answers.web_search_backend.clone();
-    let web_search_api_key = answers.web_search_api_key.clone();
-    let gateway_bot_token = answers.gateway_bot_token.clone();
+    // The pasted secrets go to credentials.toml (0600), never into config.
+    store_pasted_secrets(&answers, crate::credentials::store);
     let mut config = answers.into_config();
-
-    // Persist a pasted web-search API key under the backend name (0600),
-    // matching how the `web_search` tool resolves it at call time.
-    if let Some(key) = web_search_api_key
-        && !key.trim().is_empty()
-        && let Err(err) = crate::credentials::store(&web_search_backend, key.trim())
-    {
-        eprintln!("warning: could not save the {web_search_backend} API key: {err:#}");
-    }
-
-    // Persist the Telegram bot token under the fixed key "telegram" (0600).
-    // The gateway reads credentials first, then the env var named in
-    // `token_env` — so a token pasted here is enough to start `wizard --gateway`.
-    if let Some(token) = gateway_bot_token
-        && !token.trim().is_empty()
-        && let Err(err) = crate::credentials::store("telegram", token.trim())
-    {
-        eprintln!("warning: could not save the Telegram bot token: {err:#}");
-    }
 
     // Perform the Claude Code import (MCP/commands file writes + spinner verbs)
     // before saving, so the verbs land in the same config write.
@@ -346,7 +426,10 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             Some(c) => c,
             None => return Ok(None),
         },
-        2 => collect_local_auto(),
+        2 => match collect_local_auto(terminal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
         3 => match collect_openrouter(terminal)? {
             Some(c) => c,
             None => return Ok(None),
@@ -425,19 +508,33 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
             None => return Ok(None),
         };
         // Allowed chat IDs: re-prompt on a parse error rather than discarding
-        // the answer.
+        // the answer. The list is a closed allow-list (see
+        // `gateway::is_authorized`), so an empty answer is not "allow all",
+        // it is "allow nobody". Say so before and after the prompt, because
+        // from the outside the bot then looks broken rather than locked.
         let allowed = loop {
             let raw = match text_input(
                 terminal,
-                "Allowed chat IDs (optional)",
-                "Comma-separated numeric chat IDs. Leave empty to allow all.",
+                "Allowed chat IDs",
+                "Comma-separated numeric chat IDs. Only these chats can drive the agent; \
+                 an empty list refuses every message.",
                 "",
             )? {
                 Some(value) => value,
                 None => return Ok(None),
             };
             match parse_chat_ids(&raw) {
-                Ok(ids) => break ids,
+                Ok(ids) => {
+                    if ids.is_empty() {
+                        notice(
+                            terminal,
+                            "No chat IDs entered: the gateway will refuse every message. \
+                             Run `wizard gateway setup` afterwards — it has you message the \
+                             bot, reports your chat id, and adds it for you.",
+                        )?;
+                    }
+                    break ids;
+                }
                 Err(message) => {
                     notice(terminal, &message)?;
                 }
@@ -473,7 +570,27 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    // Step 5 — web search backend (used by the `web_search` tool). DuckDuckGo
+    // Step 5 — the interface. Purely how the terminal looks: the same Wizard
+    // commands, onboarding, providers and keys under every one of them, which
+    // is what the detail line has to say, because "Claude Code" in a list of
+    // options otherwise reads as a choice of *agent*.
+    let skin_options: Vec<Opt> = Skin::ALL
+        .iter()
+        .map(|skin| Opt::new(skin.label(), skin.description()))
+        .collect();
+    let skin = match select(
+        terminal,
+        "Interface",
+        "Which terminal UI should Wizard wear? (looks only — same commands either way; \
+         change it any time with /ui)",
+        &skin_options,
+        0,
+    )? {
+        Some(index) => Skin::ALL[index],
+        None => return Ok(None),
+    };
+
+    // Step 6 — web search backend (used by the `web_search` tool). DuckDuckGo
     // needs no key; the keyed backends prompt for one; xAI reuses an existing
     // sign-in when present so the user is not asked to authenticate twice.
     let (web_search_backend, web_search_api_key) = match collect_web_search(terminal)? {
@@ -481,7 +598,7 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         None => return Ok(None),
     };
 
-    // Step 6 — optional: import artifacts from an existing Claude Code install.
+    // Step 7 — optional: import artifacts from an existing Claude Code install.
     // Only shown when `~/.claude` exists. Esc here skips the import (the rest of
     // the config is already complete) rather than aborting onboarding.
     let claude_import = if import_claude::claude_home().is_some() {
@@ -496,11 +613,13 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
         base_url: collected.base_url,
         model: collected.model,
         api_key_env: collected.api_key_env,
+        provider_api_key: collected.api_key,
         gguf_path: collected.gguf_path,
         gateway_kind,
         gateway_token_env,
         gateway_allowed_chat_ids,
         mode,
+        skin,
         web_search_backend,
         web_search_api_key,
         gateway_bot_token,
@@ -636,7 +755,59 @@ struct ProviderAnswers {
     base_url: String,
     model: String,
     api_key_env: Option<String>,
+    /// The key the user pasted, if any. Stored in credentials.toml (0600) by
+    /// [`run_blocking`], never written to config.toml.
+    api_key: Option<String>,
     gguf_path: Option<String>,
+}
+
+/// Ask for a cloud provider's key the way the Telegram step asks for a bot
+/// token: paste the secret first, then name the env var that overrides it.
+/// Returns `(pasted_key, env_var_name)`, or `None` if the user cancels.
+///
+/// Asking only for the *name of an environment variable* is what this step
+/// used to do, and it is why onboarding could print "Wizard is configured"
+/// over a setup that 401s on the first turn: the user had exported nothing,
+/// and the only complaint was a `tracing::warn!` nobody sees. The paste is the
+/// primary answer now; the variable is the documented override.
+fn collect_api_key(
+    terminal: &mut Tui,
+    label: &str,
+    noun: &str,
+    default_env: &str,
+) -> Result<Option<(Option<String>, String)>> {
+    let key = match text_input(
+        terminal,
+        &format!("{label} {noun}"),
+        &format!(
+            "Paste your {noun} here. Stored locally in ~/.wizard/credentials.toml \
+             (mode 0600), never in config.toml. Leave empty to use an env var instead."
+        ),
+        "",
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let key = key.trim().to_string();
+    let key = (!key.is_empty()).then_some(key);
+
+    let env = match text_input(
+        terminal,
+        &format!("{noun} env var (override)"),
+        if key.is_some() {
+            "Exporting this variable overrides the key you just pasted."
+        } else {
+            "Nothing pasted, so Wizard reads this variable; export it before the first turn."
+        },
+        default_env,
+    )? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    // Whether the pair actually adds up to a usable key is reported by
+    // `print_summary`, which sees the environment too and can say so without
+    // costing the user another keypress here.
+    Ok(Some((key, env)))
 }
 
 /// Pick a model from `models` plus a "type a custom tag" row; on the custom
@@ -781,12 +952,26 @@ fn installed_ollama_models() -> Vec<String> {
 
 /// The one-click "Local" pick: no questions. Resolve the plan from what is
 /// already on this machine and the hardware suggestion.
-fn collect_local_auto() -> ProviderAnswers {
-    let (suggested, _) = hardware::suggest_gguf();
+///
+/// The pick asks nothing, which is the point, but it must not therefore *say*
+/// nothing: on a machine below the smallest tier's requirement the hardware
+/// suggestion carries a warning that local inference will not work here, and
+/// this path used to throw the explanation away. The user then paid for a
+/// multi-GB download and met the same verdict from the preflight afterwards.
+/// The other local paths show the explanation as the picker subtitle; this one
+/// shows it as a notice, and only when it is a warning, so the one-click pick
+/// stays one click on every machine that can actually run a model.
+///
+/// `Ok(None)` when the notice is cancelled (Esc), like every other step.
+fn collect_local_auto(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
+    let (suggested, explanation) = hardware::suggest_gguf();
     let (suggested_tag, _) = hardware::suggest_model();
+    if hardware::suggestion_is_a_warning(&explanation) {
+        notice(terminal, &explanation)?;
+    }
     let dir = models_dir();
     let existing = existing_ggufs(&dir);
-    match plan_local_auto(
+    let answers = match plan_local_auto(
         &existing,
         &dir,
         &installed_ollama_models(),
@@ -799,6 +984,7 @@ fn collect_local_auto() -> ProviderAnswers {
             base_url: LLAMACPP_BASE_URL.to_string(),
             model: gguf_model_tag(&gguf_path),
             api_key_env: None,
+            api_key: None,
             gguf_path: Some(gguf_path),
         },
         LocalPlan::Ollama { model } => ProviderAnswers {
@@ -807,9 +993,11 @@ fn collect_local_auto() -> ProviderAnswers {
             base_url: OLLAMA_BASE_URL.to_string(),
             model,
             api_key_env: None,
+            api_key: None,
             gguf_path: None,
         },
-    }
+    };
+    Ok(Some(answers))
 }
 
 fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
@@ -903,6 +1091,7 @@ fn collect_llamacpp(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url,
         model: gguf_model_tag(&gguf_path),
         api_key_env: None,
+        api_key: None,
         gguf_path: Some(gguf_path),
     }))
 }
@@ -948,6 +1137,7 @@ fn collect_ollama(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: OLLAMA_BASE_URL.to_string(),
         model,
         api_key_env: None,
+        api_key: None,
         gguf_path: None,
     }))
 }
@@ -976,21 +1166,18 @@ fn collect_openai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        OPENAI_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, "OpenAI", "API key", OPENAI_KEY_ENV)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     Ok(Some(ProviderAnswers {
         provider_name: "openai".to_string(),
         kind: ProviderKind::Openai,
         base_url: OPENAI_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1019,21 +1206,18 @@ fn collect_anthropic(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        ANTHROPIC_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, "Anthropic", "API key", ANTHROPIC_KEY_ENV)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     Ok(Some(ProviderAnswers {
         provider_name: "claude".to_string(),
         kind: ProviderKind::Anthropic,
         base_url: ANTHROPIC_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1052,21 +1236,18 @@ fn collect_openrouter(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        OPENROUTER_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, "OpenRouter", "API key", OPENROUTER_KEY_ENV)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     Ok(Some(ProviderAnswers {
         provider_name: "openrouter".to_string(),
         kind: ProviderKind::OpenRouter,
         base_url: OPENROUTER_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1102,21 +1283,18 @@ fn collect_cloudflare(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API token env var",
-        "Wizard reads your Cloudflare API token from this env var (never stored on disk).",
-        CLOUDFLARE_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, "Cloudflare", "API token", CLOUDFLARE_KEY_ENV)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     Ok(Some(ProviderAnswers {
         provider_name: "cloudflare".to_string(),
         kind: ProviderKind::Cloudflare,
         base_url: crate::llm::cloudflare::base_url(&account_id),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1140,13 +1318,8 @@ fn collect_xai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        XAI_KEY_ENV,
-    )? {
-        Some(value) => value,
+    let (api_key, api_key_env) = match collect_api_key(terminal, "xAI", "API key", XAI_KEY_ENV)? {
+        Some(pair) => pair,
         None => return Ok(None),
     };
     Ok(Some(ProviderAnswers {
@@ -1155,6 +1328,7 @@ fn collect_xai(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: XAI_BASE_URL.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1189,6 +1363,7 @@ fn collect_xai_oauth(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url: XAI_BASE_URL.to_string(),
         model,
         api_key_env: None,
+        api_key: None,
         gguf_path: None,
     }))
 }
@@ -1242,21 +1417,18 @@ fn collect_compat(
         Some(model) => model,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Wizard reads your key from this env var (never stored on disk).",
-        preset.key_env,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, preset.label, "API key", preset.key_env)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     Ok(Some(ProviderAnswers {
         provider_name: preset.name.to_string(),
         kind: ProviderKind::Openai,
         base_url: preset.base_url.to_string(),
         model,
         api_key_env: Some(api_key_env),
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1275,15 +1447,13 @@ fn collect_custom(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         Some(value) => value,
         None => return Ok(None),
     };
-    let api_key_env = match text_input(
-        terminal,
-        "API key env var",
-        "Env var holding the key (leave empty if the endpoint needs none).",
-        OPENAI_KEY_ENV,
-    )? {
-        Some(value) => value,
-        None => return Ok(None),
-    };
+    // A custom endpoint may need no key at all (a local vLLM, say), so both
+    // answers are allowed to be empty here.
+    let (api_key, api_key_env) =
+        match collect_api_key(terminal, "Custom endpoint", "API key", OPENAI_KEY_ENV)? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
     let api_key_env = if api_key_env.trim().is_empty() {
         None
     } else {
@@ -1295,6 +1465,7 @@ fn collect_custom(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
         base_url,
         model,
         api_key_env,
+        api_key,
         gguf_path: None,
     }))
 }
@@ -1302,6 +1473,43 @@ fn collect_custom(terminal: &mut Tui) -> Result<Option<ProviderAnswers>> {
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
+
+/// The API-key lines of the summary, given what is on disk (`stored`), which
+/// env var the provider reads (`env`), and whether that variable currently
+/// holds a non-blank value (`exported`).
+///
+/// Pure, because the thing it has to get right is a precedence rule that lives
+/// somewhere else: [`crate::config::ProviderConfig::resolved_key`] reads the
+/// **env var first** and only then the stored key. The (stored, exported) case
+/// is the one this creates and the one that used to be reported backwards: a
+/// user who exported `OPENAI_API_KEY` months ago (which is what onboarding
+/// itself used to tell everyone to do), then re-ran `wizard --onboard` and
+/// pasted a fresh key, was told the pasted key was in use while the first turn
+/// went out with the stale export and 401'd. The summary has to name the key
+/// that will actually be sent.
+fn api_key_summary(stored: bool, env: Option<&str>, exported: bool) -> Vec<String> {
+    const STORED: &str = "  • API key: stored in ~/.wizard/credentials.toml (mode 0600)";
+    match (stored, env) {
+        (true, Some(env)) if exported => vec![
+            format!("  ⚠  API key: ${env} is exported, and it wins over the stored key."),
+            format!("     Wizard will send ${env}. Run `unset {env}` (or re-export it)"),
+            "     to use the key just stored in ~/.wizard/credentials.toml.".to_string(),
+        ],
+        (true, Some(env)) => vec![
+            STORED.to_string(),
+            format!("    (export {env}=... to override it for a run)"),
+        ],
+        (true, None) => vec![STORED.to_string()],
+        (false, Some(env)) if exported => vec![format!("  • API key: read from ${env}")],
+        (false, Some(env)) => vec![
+            "  ⚠  no API key yet: requests will fail with 401.".to_string(),
+            format!("     export {env}=...   (or paste one: /provider inside Wizard)"),
+        ],
+        (false, None) => {
+            vec!["  • no API key configured (fine if the endpoint needs none)".to_string()]
+        }
+    }
+}
 
 /// Print a clean plaintext summary plus concrete next steps to stdout, after
 /// the alternate screen has been left.
@@ -1364,8 +1572,17 @@ fn print_summary(config: &Config) {
         | ProviderKind::OpenRouter
         | ProviderKind::Xai
         | ProviderKind::Cloudflare => {
-            if let Some(env) = provider.api_key_env.as_deref() {
-                println!("  • export your key: export {env}=...");
+            // Report the actual state rather than a generic instruction: a
+            // summary that says "Wizard is configured" over a setup with no
+            // key anywhere is how the first turn came to 401 in silence.
+            let stored =
+                crate::credentials::get(&provider.name).is_some_and(|key| !key.trim().is_empty());
+            let env = provider.api_key_env.as_deref();
+            let exported = env.is_some_and(|name| {
+                std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+            });
+            for line in api_key_summary(stored, env, exported) {
+                println!("{line}");
             }
         }
         ProviderKind::XaiOauth => {
@@ -1378,8 +1595,8 @@ fn print_summary(config: &Config) {
 
     if config.gateway.kind == GatewayKind::Telegram {
         let env = config.gateway.token_env();
-        let token_stored =
-            crate::credentials::get("telegram").is_some_and(|t| !t.trim().is_empty());
+        let token_stored = crate::credentials::get(crate::gateway::telegram::TOKEN_CREDENTIAL)
+            .is_some_and(|t| !t.trim().is_empty());
         if token_stored {
             println!("  • Telegram bot token: stored in ~/.wizard/credentials.toml");
         } else {
@@ -1388,6 +1605,21 @@ fn print_summary(config: &Config) {
             println!("        [keys]");
             println!("        telegram = \"<token from @BotFather>\"");
             println!("    or: export {env}=...");
+        }
+        // The allow-list is closed: empty refuses everyone, which otherwise
+        // presents as a bot that never answers.
+        if config.gateway.allowed_chat_ids.is_empty() {
+            println!("  ⚠  no allowed chat IDs: the gateway will refuse every message.");
+            println!("     Run `wizard gateway setup` — it has you message the bot, reports");
+            println!("     your chat id, and (with your say-so) writes it here:");
+            println!();
+            println!("        [gateway]");
+            println!("        allowed_chat_ids = [<your chat id>]");
+        } else {
+            println!(
+                "  • allowed chat IDs: {:?} (every other chat is refused)",
+                config.gateway.allowed_chat_ids
+            );
         }
         println!();
         println!("  ⚠  The gateway is a long-running process — messages get no reply");
@@ -1622,28 +1854,22 @@ fn frame_body(frame: &mut ratatui::Frame, title: &str, subtitle: &str, footer: &
     let header_lines = Text::from(vec![
         Line::from(Span::styled(
             format!("  {title}"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            accent().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            format!("  {subtitle}"),
-            Style::default().fg(TEXT_DIM),
-        )),
+        Line::from(Span::styled(format!("  {subtitle}"), text_dim())),
     ]);
     frame.render_widget(Paragraph::new(header_lines), header);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(DIM))
-        .title(Span::styled(" wizard setup ", Style::default().fg(DIM)));
+        .border_type(theme::border_type())
+        .border_style(dim())
+        .title(Span::styled(" wizard setup ", dim()));
     let inner = block.inner(body);
     frame.render_widget(block, body);
 
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            format!("  {footer}"),
-            Style::default().fg(DIM),
-        )),
+        Paragraph::new(Span::styled(format!("  {footer}"), dim())),
         foot,
     );
     inner
@@ -1667,19 +1893,16 @@ fn draw_select(
         let active = index == selected;
         let marker = if active { "▸ " } else { "  " };
         let label_style = if active {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            accent().add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT_DIM)
+            text_dim()
         };
         let mut spans = vec![
-            Span::styled(format!(" {marker}"), Style::default().fg(ACCENT)),
+            Span::styled(format!(" {marker}"), accent()),
             Span::styled(option.label.clone(), label_style),
         ];
         if !option.detail.is_empty() {
-            spans.push(Span::styled(
-                format!("   {}", option.detail),
-                Style::default().fg(DIM),
-            ));
+            spans.push(Span::styled(format!("   {}", option.detail), dim()));
         }
         lines.push(Line::from(spans));
     }
@@ -1710,20 +1933,17 @@ fn draw_multi_select(
             "[ ]"
         };
         let label_style = if active {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            accent().add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT_DIM)
+            text_dim()
         };
         let mut spans = vec![
-            Span::styled(format!(" {marker}"), Style::default().fg(ACCENT)),
-            Span::styled(format!("{box_} "), Style::default().fg(ACCENT)),
+            Span::styled(format!(" {marker}"), accent()),
+            Span::styled(format!("{box_} "), accent()),
             Span::styled(option.label.clone(), label_style),
         ];
         if !option.detail.is_empty() {
-            spans.push(Span::styled(
-                format!("   {}", option.detail),
-                Style::default().fg(DIM),
-            ));
+            spans.push(Span::styled(format!("   {}", option.detail), dim()));
         }
         lines.push(Line::from(spans));
     }
@@ -1745,20 +1965,20 @@ fn draw_input(
             } else {
                 format!("  {default}")
             },
-            Style::default().fg(DIM),
+            dim(),
         )
     } else {
-        Span::styled(format!("  {buffer}"), Style::default().fg(ACCENT))
+        Span::styled(format!("  {buffer}"), accent())
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(" ▸ ", Style::default().fg(ACCENT)),
+        Span::styled(" ▸ ", accent()),
         shown,
-        Span::styled("▏", Style::default().fg(ACCENT)),
+        Span::styled("▏", accent()),
     ])];
     if !default.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("   default: {default}"),
-            Style::default().fg(DIM),
+            dim(),
         )));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -1769,27 +1989,19 @@ fn draw_notice(frame: &mut ratatui::Frame, message: &str) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::White))
+        .border_type(theme::border_type())
+        .border_style(theme::style(Token::Warning))
         .title(Span::styled(
             " notice ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            theme::style(Token::Warning).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("  {message}"),
-                Style::default().fg(TEXT_DIM),
-            )),
+            Line::from(Span::styled(format!("  {message}"), text_dim())),
             Line::from(""),
-            Line::from(Span::styled(
-                "  press any key to continue",
-                Style::default().fg(DIM),
-            )),
+            Line::from(Span::styled("  press any key to continue", dim())),
         ])
         .alignment(Alignment::Left),
         inner,
@@ -1807,11 +2019,13 @@ mod tests {
             base_url: OLLAMA_BASE_URL.to_string(),
             model: "qwen3.6:27b".to_string(),
             api_key_env: None,
+            provider_api_key: None,
             gguf_path: None,
             gateway_kind: GatewayKind::None,
             gateway_token_env: None,
             gateway_allowed_chat_ids: Vec::new(),
             mode: Mode::Genie,
+            skin: Skin::Wizard,
             web_search_backend: "duckduckgo".to_string(),
             web_search_api_key: None,
             gateway_bot_token: None,
@@ -1836,6 +2050,41 @@ mod tests {
         assert_eq!(config.ollama_host, "http://10.0.0.5:11434");
         assert_eq!(config.gateway.kind, GatewayKind::None);
         assert_eq!(config.mode, Mode::Genie);
+    }
+
+    /// Adversarial: first-run setup is where a user who exports `NO_COLOR=1`
+    /// meets Wizard, and it is the one screen that used to ignore it. The
+    /// wizard carried its own white/gray/darkgray constants, so neither
+    /// `NO_COLOR`, `WIZARD_COLOR` nor `WIZARD_THEME` reached it while the TUI
+    /// it hands off to honoured all three.
+    #[test]
+    fn the_wizard_paints_with_the_active_theme_not_a_palette_of_its_own() {
+        use ratatui::style::Color;
+        use std::sync::Arc;
+
+        use crate::theme::ColorDepth;
+
+        // A terminal that wants no color at all: every one of the wizard's
+        // three styles has to come back uncolored.
+        {
+            let _pin = theme::pin(Arc::new(theme::minimal().with_depth(ColorDepth::Mono)));
+            for (name, style) in [
+                ("accent", accent()),
+                ("dim", dim()),
+                ("text_dim", text_dim()),
+            ] {
+                assert_eq!(style.fg, Some(Color::Reset), "{name} kept a color");
+            }
+            assert_eq!(theme::style(Token::Warning).fg, Some(Color::Reset));
+        }
+
+        // And under the default theme they are the palette the wizard used to
+        // hard-code, so honouring the theme changed nothing for the user who
+        // set none of those variables.
+        let _pin = theme::pin(theme::minimal());
+        assert_eq!(accent().fg, Some(Color::White));
+        assert_eq!(dim().fg, Some(Color::DarkGray));
+        assert_eq!(text_dim().fg, Some(Color::Gray));
     }
 
     #[test]
@@ -2022,6 +2271,216 @@ mod tests {
         );
     }
 
+    /// Record every `(name, secret)` [`store_pasted_secrets`] writes, instead
+    /// of the real credential store: the property under test is *which name*
+    /// each secret lands under, and asserting it against a recorder keeps the
+    /// test off the process-wide `credentials.toml` that the rest of the suite
+    /// writes concurrently.
+    fn recording_store(
+        recorded: &mut Vec<(String, String)>,
+    ) -> impl FnMut(&str, &str) -> Result<()> {
+        move |name: &str, secret: &str| {
+            recorded.push((name.to_string(), secret.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Adversarial: the provider key onboarding now asks for is a secret, and
+    /// `config.toml` is a plain 0644-ish file people paste into issues. The
+    /// key belongs in credentials.toml (0600) and nowhere else; only the name
+    /// of the overriding env var is config.
+    ///
+    /// Both halves are asserted here on purpose. `into_config` has no path by
+    /// which the key could reach `ProviderConfig`, so the "not in config" half
+    /// alone cannot fail however the storage code behaves; the half that can
+    /// fail is that the key is handed to the credential store under the same
+    /// name `ProviderConfig::resolved_key` reads back.
+    #[test]
+    fn pasted_provider_key_never_reaches_config() {
+        let answers = Answers {
+            provider_name: "openai".to_string(),
+            kind: ProviderKind::Openai,
+            base_url: OPENAI_BASE_URL.to_string(),
+            model: OPENAI_MODELS[0].to_string(),
+            api_key_env: Some(OPENAI_KEY_ENV.to_string()),
+            provider_api_key: Some("  sk-pasted-during-onboarding\n".to_string()),
+            ..base_answers()
+        };
+
+        // The storage step run_blocking performs, with the writer captured.
+        let mut recorded: Vec<(String, String)> = Vec::new();
+        store_pasted_secrets(&answers, recording_store(&mut recorded));
+        assert_eq!(
+            recorded,
+            vec![(
+                "openai".to_string(),
+                // Trimmed: a key pasted with surrounding whitespace still works.
+                "sk-pasted-during-onboarding".to_string()
+            )],
+            "the key must be stored under the provider's own name"
+        );
+
+        let config = answers.into_config();
+        // The name it was stored under is the name the provider resolves by.
+        assert_eq!(config.active().name, recorded[0].0);
+        assert_eq!(config.active().api_key_env.as_deref(), Some(OPENAI_KEY_ENV));
+        let toml = toml::to_string(&config).expect("serialize");
+        assert!(
+            !toml.contains("sk-pasted-during-onboarding"),
+            "a pasted provider key must not appear in config: {toml}"
+        );
+    }
+
+    /// The web-search key goes under the backend name the `web_search` tool
+    /// resolves at call time, and the bot token under the exact key the
+    /// gateway reads. A typo in either name stores a live secret where nothing
+    /// looks for it, and the failure only shows up as a 401 (or a gateway that
+    /// says the token is not set) much later.
+    #[test]
+    fn pasted_secrets_are_stored_under_the_names_that_read_them_back() {
+        let answers = Answers {
+            provider_name: "openai".to_string(),
+            provider_api_key: Some("sk-provider".to_string()),
+            web_search_backend: "brave".to_string(),
+            web_search_api_key: Some("brv-secret-key".to_string()),
+            gateway_kind: GatewayKind::Telegram,
+            gateway_bot_token: Some("123456:ABC-test-token".to_string()),
+            ..base_answers()
+        };
+
+        let mut recorded: Vec<(String, String)> = Vec::new();
+        store_pasted_secrets(&answers, recording_store(&mut recorded));
+        assert_eq!(
+            recorded,
+            vec![
+                ("openai".to_string(), "sk-provider".to_string()),
+                ("brave".to_string(), "brv-secret-key".to_string()),
+                (
+                    crate::gateway::telegram::TOKEN_CREDENTIAL.to_string(),
+                    "123456:ABC-test-token".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// Nothing is written for an answer that was left blank: a store call with
+    /// an empty value would shadow a key stored by an earlier run.
+    #[test]
+    fn blank_answers_store_nothing() {
+        let answers = Answers {
+            provider_api_key: Some("   ".to_string()),
+            web_search_api_key: None,
+            gateway_bot_token: Some(String::new()),
+            ..base_answers()
+        };
+        let mut recorded: Vec<(String, String)> = Vec::new();
+        store_pasted_secrets(&answers, recording_store(&mut recorded));
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+
+    /// A credential-store failure is reported, not fatal: the config is still
+    /// worth saving, and every secret is still attempted.
+    #[test]
+    fn a_failing_credential_store_does_not_abort_onboarding() {
+        let answers = Answers {
+            provider_name: "openai".to_string(),
+            provider_api_key: Some("sk-provider".to_string()),
+            web_search_api_key: Some("brv-secret-key".to_string()),
+            gateway_bot_token: Some("123456:ABC".to_string()),
+            ..base_answers()
+        };
+        let mut attempts = 0;
+        store_pasted_secrets(&answers, |_, _| {
+            attempts += 1;
+            Err(anyhow::anyhow!("read-only filesystem"))
+        });
+        assert_eq!(attempts, 3, "one attempt per pasted secret");
+    }
+
+    /// The Ollama picker must offer every tag the hardware suggestion can
+    /// produce. The 4B tier was missing, so an 8 GB laptop was suggested
+    /// `qwen3.5:4b` and then could not pick it back after moving the cursor,
+    /// while the GGUF picker (which lists `hardware::GGUF_TIERS` in full) had
+    /// no such gap.
+    #[test]
+    fn ollama_tiers_offer_every_suggested_tag() {
+        // Boundaries either side of every tier in `suggest_ollama_model`.
+        for gb in [0, 1, 7, 8, 17, 18, 23, 24, 64, 512] {
+            let suggested = hardware::suggest_ollama_model(gb);
+            assert!(
+                OLLAMA_TIERS.contains(&suggested),
+                "{gb} GB suggests {suggested}, which the picker does not offer: {OLLAMA_TIERS:?}"
+            );
+        }
+        assert!(OLLAMA_TIERS.contains(&"qwen3.5:4b"), "{OLLAMA_TIERS:?}");
+    }
+
+    /// Every tier stays offered even when the suggestion is one of them (no
+    /// duplicate row), and the suggested tag is always present.
+    #[test]
+    fn ollama_model_options_list_each_tier_once() {
+        let rows = ollama_model_options(&[], "qwen3.5:4b");
+        let tags: Vec<&str> = rows.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert!(tags.contains(&"qwen3.5:4b"), "{tags:?}");
+        for tier in OLLAMA_TIERS {
+            assert_eq!(
+                tags.iter().filter(|tag| *tag == tier).count(),
+                1,
+                "{tier} should appear exactly once: {tags:?}"
+            );
+        }
+    }
+
+    /// Adversarial: the summary must name the key the *next turn* will send,
+    /// not the one most recently written. `ProviderConfig::resolved_key` reads
+    /// the env var first, so a user who has `export OPENAI_API_KEY=<revoked>`
+    /// in their shell rc (what onboarding used to tell everyone to do) and
+    /// then pastes a fresh key was being told the pasted key was in use while
+    /// the first request went out with the stale export and 401'd.
+    #[test]
+    fn the_summary_names_the_key_that_actually_wins() {
+        let overridden = api_key_summary(true, Some("OPENAI_API_KEY"), true).join("\n");
+        assert!(
+            overridden.contains("OPENAI_API_KEY") && overridden.contains("wins"),
+            "an exported key overrides the stored one and the summary must say so: {overridden}"
+        );
+        assert!(
+            !overridden.contains("(export OPENAI_API_KEY=... to override it for a run)"),
+            "must not offer to export what is already exported: {overridden}"
+        );
+        assert!(
+            overridden.contains("unset OPENAI_API_KEY"),
+            "the summary has to say how to get the pasted key back: {overridden}"
+        );
+
+        // Stored with the variable unset: the stored key is what is sent, and
+        // exporting is the documented one-run override.
+        let stored = api_key_summary(true, Some("OPENAI_API_KEY"), false).join("\n");
+        assert!(stored.contains("credentials.toml"), "{stored}");
+        assert!(stored.contains("export OPENAI_API_KEY=..."), "{stored}");
+        assert!(!stored.contains("wins"), "{stored}");
+
+        // Nothing stored, nothing exported: the state that 401s, called out.
+        let neither = api_key_summary(false, Some("OPENAI_API_KEY"), false).join("\n");
+        assert!(neither.contains("401"), "{neither}");
+
+        // Nothing stored but exported: the env var is the key, no warning.
+        let exported = api_key_summary(false, Some("OPENAI_API_KEY"), true).join("\n");
+        assert_eq!(exported, "  • API key: read from $OPENAI_API_KEY");
+
+        // No env var configured at all (a custom endpoint).
+        assert!(
+            api_key_summary(true, None, false)
+                .join("\n")
+                .contains("credentials.toml")
+        );
+        assert!(
+            api_key_summary(false, None, false)
+                .join("\n")
+                .contains("no API key configured")
+        );
+    }
+
     #[test]
     fn web_search_choice_lands_in_config_but_the_key_does_not() {
         let answers = Answers {
@@ -2203,13 +2662,17 @@ mod tests {
                 "my-coder:latest",
                 "qwen3.5:9b",
                 "qwen3.6:27b",
-                "qwen3.6:35b"
+                "qwen3.6:35b",
+                "qwen3.5:4b"
             ]
         );
         assert_eq!(rows[0].1, "already pulled");
         assert!(rows[2].1.contains("recommended"));
         assert!(rows[2].1.contains("pulled on first run"));
         assert_eq!(rows[3].1, "pulled on first run");
+        // The 4B tier is offered even on a machine that was suggested a
+        // bigger one: a user who knows their box is busy can pick down.
+        assert_eq!(rows[4].1, "pulled on first run");
     }
 
     #[test]
@@ -2231,8 +2694,12 @@ mod tests {
         assert_eq!(rows[0].0, "qwen3.5:9b");
         assert!(rows[0].1.contains("recommended"));
         assert!(rows.iter().all(|(_, detail)| detail.contains("first run")));
-        // Every known tier is offered exactly once.
+        // Every known tier is offered exactly once, including the 4B one an
+        // 8 GB machine needs.
         let tags: Vec<&str> = rows.iter().map(|(tag, _)| tag.as_str()).collect();
-        assert_eq!(tags, vec!["qwen3.5:9b", "qwen3.6:35b", "qwen3.6:27b"]);
+        assert_eq!(
+            tags,
+            vec!["qwen3.5:9b", "qwen3.6:35b", "qwen3.6:27b", "qwen3.5:4b"]
+        );
     }
 }

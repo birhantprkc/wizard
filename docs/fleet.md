@@ -31,8 +31,9 @@ planning and synthesis turns drive a real in-process agent); `status` and
      renaming `queue/<id>.json` into `claimed/` and spawns
      `wizard --mode sovereign -p "<task>" --cwd <worktree> --output-format json`
      with `WIZARD_FLEET=1`, at most N
-     children at a time. Worker prompts end with: commit your changes with a
-     descriptive message; do not push.
+     children at a time. Worker prompts end with three standing instructions:
+     commit your changes with a descriptive message, do not push, and never
+     commit anything under `.wizard/`.
    - **reaping**: when a child exits, its exit code, branch, and parsed JSON
      summary (the `--output-format json` object from stdout) are written to
      `results/<id>.json`, and the slot's worktree is reused for the next
@@ -82,27 +83,34 @@ and `logs/` from the previous run.
 pids, and a per-task table:
 
 ```
-task        state    exit  branch            title
-add-tests   done     0     fleet/0-raise-te  Add parser tests
-write-docs  running  -     -                 Document the API
-fix-lints   queued   -     -                 Fix clippy lints
+task        state    exit  branch                          title
+add-tests   done     0     fleet/0-raise-test-coverage-of  Add parser tests
+write-docs  running  -     -                               Document the API
+fix-lints   queued   -     -                               Fix clippy lints
 ```
 
+Columns are sized to their contents; nothing is truncated. The branch slug is
+the mission kebab-cased and cut to 24 characters, which is why the branch for
+the mission above is `fleet/0-raise-test-coverage-of`.
+
 `exit` is the child's exit code (the headless map: 0 completed/stopped,
-2 max-steps, 3 circuit breaker, 4 time limit), `timeout` for a watchdog
-kill, or `killed` for signal death / shutdown.
+1 hard error, 2 max-steps, 3 circuit breaker, 4 time limit), `timeout` for a
+watchdog kill, or `killed` for signal death / shutdown.
 
 While the fleet is `running`, `status` also reports the coordinator's
 heartbeat age. The heartbeat is touched every supervision tick, so an age
 past ~30 s means the coordinator was killed without cleaning up
-(`stale (42s old, coordinator likely dead)`); the `running` status in
+(`stale (42s old — coordinator likely dead)`); the `running` status in
 `fleet.toml` can then no longer be trusted.
 
 `wizard fleet stop` writes the stop sentinel and returns immediately; the
 coordinator winds down on its next tick. Ctrl-c on the coordinator behaves
-the same way. When no fleet is live (none ever ran, the last one already
-finished, or the heartbeat shows the coordinator is dead), `stop` prints
-"no fleet is running", writes nothing, and exits 1.
+the same way. When no fleet is live, `stop` prints "no fleet is running",
+writes no sentinel, and exits 1. It also clears a stale sentinel a previous
+no-op stop left behind — on that path only (none ever ran, or the last one
+already finished). The other one, where `fleet.toml` still says "running"
+but the coordinator's heartbeat has gone stale, refuses without touching the
+sentinel.
 
 ## Config
 
@@ -122,5 +130,9 @@ synthesize = true  # false: skip the merge turn, just print branches + table
   so partial work is always recoverable with a manual `git merge`.
 - A worker slot reuses its worktree (and branch) for consecutive tasks, so
   one `fleet/<i>-<slug>` branch can carry commits from several tasks.
-- The coordinator claims tasks; workers never touch the queue. Killing the
-  coordinator also kills the workers (`kill_on_drop`).
+- The coordinator claims tasks; workers never touch the queue. Ending the
+  coordinator *gracefully* — ctrl-c, `wizard fleet stop`, a normal exit —
+  also kills its workers, because the child handles are `kill_on_drop`. A
+  `SIGKILL`ed or OOM-killed coordinator never runs that drop, so its workers
+  are orphaned and keep going; the stale heartbeat is the only signal, and
+  the pids in `fleet.toml` are how you find them.

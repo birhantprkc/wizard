@@ -87,8 +87,10 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "git_diff",
     "memory",
     "todo",
+    "manual",
     "web_fetch",
     "web_search",
+    "x_search",
     "generate_image",
     "task_output",
     "task_kill",
@@ -96,6 +98,7 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_kill",
     "run_command",
     "compact",
+    "computer",
     "spawn_subagent",
 ];
 

@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, ProviderConfig};
+// RAM headroom beyond the raw weights (KV cache, compute buffers) demanded by
+// the preflight fit check in [`ensure_running`]. It lives with the tier table
+// because the two have to be sized against the same number.
+use crate::hardware::FIT_HEADROOM_GB;
 
 /// Context window passed to a spawned server (`--ctx-size`). Sized so the
 /// agent's compaction threshold (48 kB of history ≈ 12k tokens) plus the
@@ -32,10 +36,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long to wait for a TCP connection on a single health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// RAM headroom beyond the raw weights (KV cache, compute buffers) demanded
-/// by the preflight fit check in [`ensure_running`].
-const FIT_HEADROOM_GB: u64 = 2;
 
 /// How many log lines a startup-failure error quotes.
 const LOG_TAIL_LINES: usize = 20;
@@ -104,13 +104,20 @@ pub async fn probe(base_url: &str) -> Health {
 /// how to start the server themselves.
 pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) -> Result<()> {
     let base_url = provider.base_url.trim_end_matches('/');
+    // The model this provider names, when it names one. Carried into every
+    // wait so a startup failure can be diagnosed against the model that was
+    // actually loading rather than against the tier table alone.
+    let configured_gguf = provider
+        .gguf_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty());
     match probe(base_url).await {
         Health::Ready => return Ok(()),
         Health::Loading => {
             progress.status(&format!(
                 "llama-server at {base_url} is loading its model — waiting…"
             ));
-            return wait_ready(base_url, None, progress).await;
+            return wait_ready(base_url, configured_gguf, None, progress).await;
         }
         Health::Down => {}
     }
@@ -134,11 +141,7 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) 
              port in ~/.wizard/config.toml"
         );
     }
-    let Some(gguf) = provider
-        .gguf_path
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-    else {
+    let Some(gguf) = configured_gguf else {
         bail!(
             "cannot reach llama-server at {base_url} and the provider has no `gguf_path`, so \
              Wizard cannot start it for you — start it with {START_HINT}, or set `gguf_path` \
@@ -153,14 +156,9 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) 
     // unknown model size skips the check.
     if let Some(ram_gb) = crate::hardware::usable_ram_gb()
         && let Some(model_gb) = model_size_gb(Path::new(gguf))
-        && model_gb + FIT_HEADROOM_GB > ram_gb
+        && !model_fits(model_gb, ram_gb)
     {
-        bail!(
-            "the model {gguf} is ~{model_gb} GB but this machine has only {ram_gb} GB of usable \
-             RAM, so llama-server would be killed loading it — run `wizard --onboard` to pick a \
-             smaller model (the 9B tier), or point `gguf_path` in ~/.wizard/config.toml at one \
-             that fits"
-        );
+        bail!("{}", fit_failure_message(gguf, model_gb, ram_gb));
     }
     // A missing GGUF that names a known tier is downloaded into place (the
     // one-click local onboarding writes exactly such a path); anything else
@@ -204,14 +202,23 @@ pub async fn ensure_running(provider: &ProviderConfig, progress: &dyn Progress) 
         "waiting for the model to load (up to {}s)…",
         READY_TIMEOUT.as_secs()
     ));
-    wait_ready(base_url, Some(pid), progress).await
+    wait_ready(base_url, Some(gguf), Some(pid), progress).await
 }
 
 /// Poll `{base_url}/health` until the server reports ready, up to
 /// [`READY_TIMEOUT`] (GGUF loads are slow). When `pid` names a server Wizard
 /// just spawned, its early death short-circuits the wait. Both failure paths
 /// quote the tail of the server log ([`diagnose`]) so the cause is visible.
-pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: &dyn Progress) -> Result<()> {
+///
+/// `gguf` is the model being loaded, when the caller knows which one it is.
+/// Without it a memory-exhaustion diagnosis can only reason from the tier
+/// table, and the tier table is what said the model would fit.
+pub async fn wait_ready(
+    base_url: &str,
+    gguf: Option<&str>,
+    pid: Option<u32>,
+    progress: &dyn Progress,
+) -> Result<()> {
     let started = Instant::now();
     let mut reported_loading = false;
     while started.elapsed() < READY_TIMEOUT {
@@ -228,7 +235,7 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: &dyn Progres
         {
             bail!(
                 "llama-server (PID {pid}) exited during startup — {}",
-                diagnose(&log_path()?)
+                diagnose(&log_path()?, gguf)
             );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -236,7 +243,7 @@ pub async fn wait_ready(base_url: &str, pid: Option<u32>, progress: &dyn Progres
     bail!(
         "llama-server at {base_url} did not become ready within {}s — {}",
         READY_TIMEOUT.as_secs(),
-        diagnose(&log_path()?)
+        diagnose(&log_path()?, gguf)
     )
 }
 
@@ -266,6 +273,46 @@ fn server_args(gguf_path: &str, port: u16, gpu: bool) -> Vec<String> {
     args
 }
 
+/// Whether a `model_gb` model can be loaded on a machine with `ram_gb` of
+/// usable RAM, leaving [`FIT_HEADROOM_GB`] for the KV cache and compute
+/// buffers llama-server allocates on top of the weights.
+fn model_fits(model_gb: u64, ram_gb: u64) -> bool {
+    model_gb + FIT_HEADROOM_GB <= ram_gb
+}
+
+/// The error for a model that cannot fit in this machine's RAM.
+///
+/// It names a way out that exists. When a smaller tier still fits, it names
+/// that tier; when nothing does, saying "pick a smaller model" would send the
+/// user looking for something Wizard does not have, so the message says local
+/// inference will not work here and points at the cloud providers onboarding
+/// offers instead.
+fn fit_failure_message(gguf: &str, model_gb: u64, ram_gb: u64) -> String {
+    let head = format!(
+        "the model {gguf} is ~{model_gb} GB but this machine has only {ram_gb} GB of usable \
+         RAM, so llama-server would be killed loading it"
+    );
+    match crate::hardware::largest_tier_fitting(ram_gb, FIT_HEADROOM_GB) {
+        Some(tier) => format!(
+            "{head}; run `wizard --onboard` and pick {} (~{} GB, the largest tier that fits), \
+             or point `gguf_path` in ~/.wizard/config.toml at a model that does",
+            tier.name, tier.approx_gb
+        ),
+        None => {
+            let smallest = crate::hardware::smallest_gguf_tier();
+            format!(
+                "{head}. Even the smallest local tier ({}, ~{} GB) needs about {} GB free, so \
+                 local inference will not work on this machine: run `wizard --onboard` and pick \
+                 a cloud provider (xAI sign-in, Anthropic, OpenAI, OpenRouter), which needs no \
+                 local RAM. Nothing smaller to download exists",
+                smallest.name,
+                smallest.approx_gb,
+                smallest.approx_gb + FIT_HEADROOM_GB
+            )
+        }
+    }
+}
+
 /// Approximate size of the model at `path` in GB: the file's real size when
 /// it exists, else the known tier's [`crate::hardware::GgufModel::approx_gb`]
 /// when the file name matches one. `None` for unknown missing files.
@@ -283,18 +330,129 @@ fn model_size_gb(path: &Path) -> Option<u64> {
 /// The tail of the llama-server log plus, when it smells like memory
 /// exhaustion, a pointer at onboarding. Shared by both startup-failure bails
 /// in [`wait_ready`] so the user sees the actual failure, not just a path.
-fn diagnose(log: &Path) -> String {
+/// `gguf` is the model that was loading, when the caller knows it.
+fn diagnose(log: &Path, gguf: Option<&str>) -> String {
+    diagnose_with(log, gguf, crate::hardware::usable_ram_gb())
+}
+
+/// Testable core of [`diagnose`]: `ram_gb` is this machine's usable RAM.
+///
+/// It is a parameter for the same reason [`oom_hint`]'s inputs are. Reading it
+/// inside meant the one test covering the model → hint wiring could only fail
+/// on a host with enough RAM for the largest tier to be a candidate: on a
+/// 14 GB dev box or a 16 GB CI runner the advice was the same whether or not
+/// the failing model was threaded through, so deleting the wiring left the
+/// suite green.
+fn diagnose_with(log: &Path, gguf: Option<&str>, ram_gb: Option<u64>) -> String {
     let tail = match std::fs::read_to_string(log) {
         Ok(contents) if !contents.trim().is_empty() => tail_lines(&contents),
         _ => "  (log is empty or unreadable)".to_string(),
     };
     let hint = if looks_like_oom(&tail) {
-        "\nthe log suggests the model did not fit in memory — run `wizard --onboard` to pick a \
-         smaller model"
+        format!(
+            "\n{}",
+            oom_hint(
+                gguf.and_then(|path| failing_model_gb(Path::new(path))),
+                ram_gb
+            )
+        )
     } else {
-        ""
+        String::new()
     };
     format!("tail of {}:\n{tail}{hint}", log.display())
+}
+
+/// Size of the model that just died, on the scale [`oom_hint`] compares
+/// against: a known tier's own `approx_gb` first, then the file on disk.
+///
+/// [`model_size_gb`] answers the preflight's question ("will this file fit?"),
+/// where the real byte count is the honest input. The OOM ceiling is a
+/// different question, and mixing the scales made it wrong in the direction
+/// that matters: `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` is 21.4 GiB on disk against
+/// an `approx_gb` of 20, so "recommend a tier strictly smaller than 21" let
+/// the 35B through and named the model the user had just watched die. Comparing
+/// a tier against tiers keeps both sides on the table's own scale; a model that
+/// is not in the table has only its file size, and that is fine, because the
+/// tiers it is being compared against are then somebody else's numbers anyway.
+fn failing_model_gb(path: &Path) -> Option<u64> {
+    let tier = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::hardware::gguf_tier_for_file);
+    match tier {
+        Some(tier) => Some(tier.approx_gb),
+        None => model_size_gb(path),
+    }
+}
+
+/// The advice appended to a log tail that smells of memory exhaustion.
+///
+/// `failing_gb` is the size of the model that just died, `ram_gb` this
+/// machine's usable RAM; both are `None` when unknown. Taking them as
+/// parameters is what makes the advice honest *and* testable: asking only
+/// "what is the largest tier that fits this much RAM?" answers with the model
+/// that was just OOM-killed, because it is the tier the fit table picked for
+/// this machine in the first place. Knowing what died lets the recommendation
+/// be strictly smaller, and lets the message admit it when nothing smaller
+/// exists rather than pointing at a model the user has already watched fail.
+/// Same honesty rule as [`fit_failure_message`].
+fn oom_hint(failing_gb: Option<u64>, ram_gb: Option<u64>) -> String {
+    const LEAD: &str = "the log suggests the model did not fit in memory";
+    let Some(ram_gb) = ram_gb else {
+        // RAM unknown, so which tiers fit is unknown too; the picker is
+        // still the right place to look.
+        return format!("{LEAD}; run `wizard --onboard` to pick a smaller model");
+    };
+    match crate::hardware::largest_tier_fitting_below(ram_gb, FIT_HEADROOM_GB, failing_gb) {
+        Some(tier) => {
+            let why = match failing_gb {
+                Some(gb) => format!("the largest tier smaller than the ~{gb} GB model that failed"),
+                None => format!("the largest tier that fits {ram_gb} GB of RAM"),
+            };
+            format!(
+                "{LEAD}; run `wizard --onboard` and pick {} (~{} GB, {why})",
+                tier.name, tier.approx_gb
+            )
+        }
+        // Nothing *smaller* fits, which hides two very different machines.
+        None => {
+            let fits_anything =
+                crate::hardware::largest_tier_fitting(ram_gb, FIT_HEADROOM_GB).is_some();
+            match failing_gb {
+                // Tiers do fit this machine; the model that died was simply at
+                // or below the smallest one. Saying "local inference will not
+                // work here" would be false (this is reachable on a 64 GB
+                // workstation running someone's own 2 GB fine-tune), and
+                // naming a tier would mean recommending something *larger*
+                // than what already failed. What is left is the honest answer:
+                // nothing smaller exists, so the memory has to come from
+                // somewhere else.
+                Some(gb) if fits_anything => format!(
+                    "{LEAD}, and Wizard has no local tier smaller than the ~{gb} GB model that \
+                     failed, so there is nothing smaller to fall back to; free memory on this \
+                     machine (llama-server needs room for its KV cache and compute buffers on \
+                     top of the weights) and try again, or run `wizard --onboard` and pick a \
+                     cloud provider (xAI sign-in, Anthropic, OpenAI, OpenRouter), which needs \
+                     no local RAM"
+                ),
+                // Nothing in the table fits this machine at all: the one case
+                // where "local inference will not work here" is the truth.
+                failing => {
+                    let nothing = match failing {
+                        Some(gb) => format!(
+                            "no local tier fits {ram_gb} GB of RAM, and none is smaller than \
+                             the ~{gb} GB model that failed"
+                        ),
+                        None => format!("no local tier fits {ram_gb} GB of RAM"),
+                    };
+                    format!(
+                        "{LEAD}, and {nothing}; run `wizard --onboard` and pick a cloud provider \
+                         (xAI sign-in, Anthropic, OpenAI, OpenRouter) instead"
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Last [`LOG_TAIL_LINES`] lines of `contents`, indented two spaces, with
@@ -677,15 +835,175 @@ mod tests {
     fn every_suggested_tier_passes_the_fit_check_at_its_boundary() {
         // The tier table and the preflight check must agree: a machine with
         // exactly the RAM that selects a tier must also be allowed to run it.
-        for gb in [8, 18, 24, 48] {
+        // Swept from zero rather than from the first tier's boundary, because
+        // the disagreement can only live below it: under 5 GB nothing in the
+        // table fits, and there the contract is not "the suggestion runs" but
+        // "the suggestion is the floor and nothing is claimed to fit".
+        let floor = crate::hardware::smallest_gguf_tier();
+        for gb in 0..=64 {
             let tier = crate::hardware::suggest_gguf_model(gb);
+            let anything_fits = crate::hardware::largest_tier_fitting(gb, FIT_HEADROOM_GB);
+            if anything_fits.is_none() {
+                assert!(
+                    gb < floor.approx_gb + FIT_HEADROOM_GB,
+                    "{gb} GB fits nothing but is not below the floor's requirement"
+                );
+                assert_eq!(tier.file, floor.file, "{gb} GB must get the floor");
+                continue;
+            }
             assert!(
-                tier.approx_gb + FIT_HEADROOM_GB <= gb,
+                model_fits(tier.approx_gb, gb),
                 "{} (~{} GB) does not fit the {gb} GB budget that selects it",
                 tier.name,
                 tier.approx_gb
             );
         }
+    }
+
+    #[test]
+    fn an_8gb_machine_starts_the_tier_it_is_given() {
+        // An "8 GB" laptop reports ~7 GB of usable RAM. Before the 4B tier
+        // existed the smallest model was 6 GB, so 6 + 2 > 7 refused the only
+        // thing on offer and told the user to pick something smaller than the
+        // smallest thing. It now resolves to a model it can actually load.
+        let tier = crate::hardware::suggest_gguf_model(7);
+        assert!(
+            model_fits(tier.approx_gb, 7),
+            "{} (~{} GB) still does not fit an 8 GB laptop",
+            tier.name,
+            tier.approx_gb
+        );
+        // And the file it names is one Wizard knows how to download.
+        assert!(crate::hardware::gguf_tier_for_file(tier.file).is_some());
+    }
+
+    #[test]
+    fn a_model_that_does_not_fit_names_a_tier_that_does() {
+        let message = fit_failure_message("/m/Qwen3.6-27B-Q4_K_M.gguf", 16, 8);
+        assert!(
+            message.contains("16 GB"),
+            "states the model size: {message}"
+        );
+        assert!(
+            message.contains("8 GB of usable"),
+            "states the RAM: {message}"
+        );
+        assert!(
+            message.contains("Qwen3.5 9B"),
+            "names the tier that fits: {message}"
+        );
+        assert!(message.contains("wizard --onboard"));
+    }
+
+    #[test]
+    fn a_machine_below_every_tier_is_pointed_at_the_cloud() {
+        // 2 GB fits nothing, not even the smallest tier, so the message must
+        // not send the user hunting for a smaller model that does not exist.
+        let message = fit_failure_message("/m/Qwen3.5-4B-Q4_K_M.gguf", 3, 2);
+        assert!(
+            message.contains("local inference will not work"),
+            "says so plainly: {message}"
+        );
+        assert!(
+            message.contains("cloud provider") && message.contains("Anthropic"),
+            "names the cloud path: {message}"
+        );
+        assert!(
+            !message.contains("the largest tier that fits"),
+            "no tier can be recommended here: {message}"
+        );
+        assert!(
+            message.contains("Qwen3.5 4B"),
+            "names the smallest tier it already ruled out: {message}"
+        );
+    }
+
+    #[test]
+    fn oom_hint_never_recommends_the_model_that_just_died() {
+        // An 18 GB machine loading the 27B (~16 GB): the fit table admits it
+        // (16 + 2 <= 18), which is why it was downloaded and started, and why
+        // llama-server being OOM-killed at ctx 16384 must not be answered with
+        // "pick Qwen3.6 27B, the largest tier that fits 18 GB of RAM".
+        let hint = oom_hint(Some(16), Some(18));
+        assert!(
+            !hint.contains("Qwen3.6 27B"),
+            "recommends the model that just died: {hint}"
+        );
+        assert!(
+            hint.contains("Qwen3.5 9B"),
+            "must name the next tier down: {hint}"
+        );
+        assert!(hint.contains("wizard --onboard"));
+
+        // Same shape one tier lower: an 8 GB laptop that OOMs on the 9B is
+        // sent to the 4B, not back to the 9B.
+        let hint = oom_hint(Some(6), Some(8));
+        assert!(!hint.contains("Qwen3.5 9B"), "{hint}");
+        assert!(hint.contains("Qwen3.5 4B"), "{hint}");
+    }
+
+    #[test]
+    fn oom_hint_admits_when_nothing_smaller_exists() {
+        // The floor itself died on an 8 GB machine: by fit alone the 4B still
+        // "fits" (3 + 2 <= 8), but recommending it again is recommending the
+        // failure. There is nothing smaller to download, so say so and name
+        // the cloud, the same way `fit_failure_message` does.
+        let hint = oom_hint(Some(3), Some(8));
+        assert!(
+            !hint.contains("Qwen3.5 4B (~3 GB"),
+            "the model that died is not the advice: {hint}"
+        );
+        assert!(
+            hint.contains("no local tier smaller than"),
+            "says nothing smaller exists: {hint}"
+        );
+        assert!(
+            hint.contains("cloud provider") && hint.contains("Anthropic"),
+            "names the way out: {hint}"
+        );
+
+        // A machine under every tier, with no idea what was loading: still the
+        // cloud, and no tier named.
+        let hint = oom_hint(None, Some(2));
+        assert!(hint.contains("no local tier fits 2 GB"), "{hint}");
+        assert!(hint.contains("cloud provider"), "{hint}");
+
+        // Adversarial: "nothing smaller fits" is not "nothing fits". A 64 GB
+        // workstation whose own 2 GB fine-tune died has every tier available
+        // to it, so telling that user local inference cannot work here (and
+        // sending them to a paid API) is simply false. It used to say exactly
+        // that, because the branch conflated the two questions.
+        let hint = oom_hint(Some(2), Some(64));
+        assert!(
+            !hint.contains("no local tier fits"),
+            "every tier fits 64 GB: {hint}"
+        );
+        assert!(
+            hint.contains("nothing smaller to fall back to"),
+            "the true statement is that nothing *smaller* exists: {hint}"
+        );
+        assert!(
+            hint.contains("free memory"),
+            "and the way out is memory, not a smaller model: {hint}"
+        );
+
+        // RAM unknown: which tiers fit is unknown too, so the hint stays
+        // vague on purpose rather than inventing a recommendation.
+        let hint = oom_hint(Some(16), None);
+        assert_eq!(
+            hint,
+            "the log suggests the model did not fit in memory; run `wizard --onboard` to pick a \
+             smaller model"
+        );
+    }
+
+    #[test]
+    fn oom_hint_without_a_model_falls_back_to_the_fit_table() {
+        // Nothing knows which model a foreign llama-server was loading, so the
+        // best available answer is the largest tier this machine can hold.
+        let hint = oom_hint(None, Some(18));
+        assert!(hint.contains("Qwen3.6 27B"), "{hint}");
+        assert!(hint.contains("fits 18 GB of RAM"), "{hint}");
     }
 
     #[test]
@@ -734,17 +1052,84 @@ mod tests {
         let log = dir.path().join("llama-server.log");
 
         // Missing log: still a readable message, never an error.
-        assert!(diagnose(&log).contains("(log is empty or unreadable)"));
+        assert!(diagnose(&log, None).contains("(log is empty or unreadable)"));
 
         std::fs::write(&log, "loading model\nfailed to allocate 20 GiB\n").expect("write log");
-        let message = diagnose(&log);
+        let message = diagnose(&log, None);
         assert!(message.contains("failed to allocate 20 GiB"));
         assert!(message.contains("wizard --onboard"), "OOM hint present");
 
         std::fs::write(&log, "wrong chat template\n").expect("write log");
-        let message = diagnose(&log);
+        let message = diagnose(&log, None);
         assert!(message.contains("wrong chat template"));
         assert!(!message.contains("wizard --onboard"), "no hint without OOM");
+    }
+
+    /// Adversarial: the model → hint wiring, on a *stated* machine.
+    ///
+    /// This used to read the host's own RAM, so it could only fail where the
+    /// largest tier was a candidate at all: on the 14 GB box this was written
+    /// on (and on 16 GB CI runners) the advice was identical whether or not
+    /// the failing model was passed, and deleting the whole threading left the
+    /// suite green. With the reading as a parameter the two answers differ on
+    /// every host, and the control below is what proves it.
+    #[test]
+    fn the_model_that_died_is_excluded_from_the_advice_on_any_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("llama-server.log");
+        std::fs::write(&log, "loading model\nfailed to allocate 20 GiB\n").expect("write log");
+
+        // A 24 GB machine that was loading the largest tier. The fit table
+        // admits that tier here (20 + 2 <= 24), which is exactly why it was
+        // downloaded and started and exactly why it must not be the advice.
+        let biggest = crate::hardware::GGUF_TIERS[0];
+        let path = dir.path().join(biggest.file);
+        // Deliberately a stub: the real file is ~21 GiB and the ceiling must
+        // not depend on the bytes being there. It also pins the scale fix:
+        // by file size this stub is 0 GB, which would exclude every tier.
+        std::fs::write(&path, b"stub").expect("write stub");
+        let message = diagnose_with(&log, Some(&path.display().to_string()), Some(24));
+        assert!(
+            !message.contains(biggest.name),
+            "recommends the model that just died: {message}"
+        );
+        assert!(
+            message.contains("Qwen3.6 27B"),
+            "must name the next tier down: {message}"
+        );
+
+        // The control that makes the assertion above mean something: without
+        // the model, the fit table alone names the largest tier on this same
+        // machine. If the threading is deleted, this is what the first
+        // assertion gets, and it fails.
+        let blind = diagnose_with(&log, None, Some(24));
+        assert!(
+            blind.contains(biggest.name),
+            "control: the fit table alone recommends the largest tier: {blind}"
+        );
+    }
+
+    #[test]
+    fn the_oom_ceiling_is_measured_on_the_tier_tables_own_scale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A known tier answers with the table's `approx_gb`, whatever the file
+        // on disk says. The 35B's real download is ~21.4 GiB against an
+        // `approx_gb` of 20, and comparing a measured 21 against the table's
+        // 20 let the tier that just died back into the recommendation.
+        let biggest = crate::hardware::GGUF_TIERS[0];
+        let known = dir.path().join(biggest.file);
+        std::fs::write(&known, b"stub").expect("write stub");
+        assert_eq!(failing_model_gb(&known), Some(biggest.approx_gb));
+        // Missing, but a known tier: same answer.
+        assert_eq!(
+            failing_model_gb(&dir.path().join("Qwen3.5-9B-Q4_K_M.gguf")),
+            Some(6)
+        );
+        // A model Wizard does not ship has only its own size to go on.
+        let foreign = dir.path().join("my-tune-3b-q4.gguf");
+        std::fs::write(&foreign, b"stub").expect("write stub");
+        assert_eq!(failing_model_gb(&foreign), Some(0));
+        assert_eq!(failing_model_gb(&dir.path().join("gone.gguf")), None);
     }
 
     #[tokio::test]

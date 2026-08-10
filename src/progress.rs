@@ -1,6 +1,6 @@
 //! Progress reporting for Wizard's plain-terminal surfaces.
 //!
-//! The interactive genie TUI draws its own spinner (`src/ui.rs`); everything
+//! The interactive genie TUI draws its own spinner (`src/ui/mod.rs`); everything
 //! here covers the paths that print to a normal terminal instead — headless
 //! sovereign turns, fleet workers, and llama-server startup waits — with
 //! one shared look: the TUI's braille frames, white accent, dim text.
@@ -18,7 +18,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::server::{ByteProgress, Progress};
 
-/// Braille frames matching the TUI spinner in `src/ui.rs`, plus a final
+/// Braille frames matching the TUI spinner of the house skin (`WIZARD` in
+/// `src/skin/mod.rs`; the TUI reads whichever skin is active), plus a final
 /// check mark shown when a spinner finishes with a message.
 const TICK_CHARS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓";
 
@@ -130,11 +131,18 @@ impl TurnSpinner {
     }
 
     /// Print a full line to stdout without tearing a visible spinner.
+    ///
+    /// Through [`crate::output::print_line`] rather than `println!` because
+    /// this is the one call every headless narration line goes through, and it
+    /// runs on the printer task. A `println!` here panics the moment the
+    /// reader hangs up — `wizard -p "…" | head` — which kills the printer,
+    /// drops the event receiver, and turns a perfectly ordinary shell pipeline
+    /// into a run that stopped for no visible reason.
     pub fn println(&self, line: &str) {
         if self.visible.load(Ordering::SeqCst) {
-            self.bar.suspend(|| println!("{line}"));
+            self.bar.suspend(|| crate::output::print_line(line));
         } else {
-            println!("{line}");
+            crate::output::print_line(line);
         }
     }
 
@@ -153,7 +161,13 @@ impl Default for TurnSpinner {
 
 /// Progress reporter for slow setup waits — llama-server startup (spawn +
 /// model load) and Ollama model pulls: a spinner whose message tracks the
-/// latest status on a terminal, plain stdout lines otherwise.
+/// latest status on a terminal, plain stderr lines otherwise.
+///
+/// The off-terminal fallback goes to stderr, the same stream the spinner
+/// itself draws on, and never to stdout. This reporter is built inside
+/// [`crate::agent::build_headless_agent`], which every surface calls,
+/// including the two that own stdout as a protocol transport: the ACP server
+/// frames JSON-RPC there and `--output-format json` frames the run there.
 pub struct ServerSpinner {
     bar: ProgressBar,
     /// Closing message shown when the wait succeeded and actually waited.
@@ -162,7 +176,7 @@ pub struct ServerSpinner {
     /// spawned or waited on rather than already answering.
     waited: AtomicBool,
     /// Whether stderr is a terminal. When false the spinner draws nothing
-    /// and status falls back to plain `println!` lines.
+    /// and status falls back to plain `eprintln!` lines.
     enabled: bool,
 }
 
@@ -189,8 +203,8 @@ impl ServerSpinner {
     }
 
     /// Finish the wait. A successful wait that actually had to spawn or
-    /// poll leaves the closing status (plain println on non-terminals); the
-    /// fast path and failures clear silently — errors are reported by the
+    /// poll leaves the closing status (a plain stderr line on non-terminals);
+    /// the fast path and failures clear silently — errors are reported by the
     /// caller.
     pub fn finish(&self, ok: bool) {
         if ok && self.waited.load(Ordering::SeqCst) {
@@ -198,7 +212,7 @@ impl ServerSpinner {
                 self.bar.finish_with_message(self.ready.clone());
             } else {
                 self.bar.finish_and_clear();
-                println!("{}", self.ready);
+                crate::output::eprint_line(&self.ready);
             }
         } else {
             self.bar.finish_and_clear();
@@ -213,7 +227,7 @@ impl Progress for ServerSpinner {
         if self.enabled {
             self.bar.set_message(line.to_string());
         } else {
-            println!("{line}");
+            crate::output::eprint_line(line);
         }
     }
 
@@ -269,11 +283,12 @@ impl ServerByteProgress {
                 self.spinner.set_draw_target(ProgressDrawTarget::stderr());
                 self.spinner.enable_steady_tick(TICK_INTERVAL);
             }
-            // Off-terminal: surface a closing message as a plain line, the
-            // way status lines fall back when there is no spinner to update.
+            // Off-terminal: surface a closing message as a plain stderr line,
+            // the way status lines fall back when there is no spinner to
+            // update.
             None => {
                 if let Some(msg) = msg.filter(|msg| !msg.is_empty()) {
-                    println!("{msg}");
+                    crate::output::eprint_line(msg);
                 }
             }
         }

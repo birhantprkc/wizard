@@ -53,7 +53,7 @@ The installer clones your fork at `WIZARD_REF`, ensures a Rust toolchain (instal
 Running your one-liner installs:
 
 - **Your source code**: the Rust that came out of your deep evolve, committed at `~/.wizard/src`.
-- **Your WIZARD.md charter**: the behavioral charter ([WIZARD.md](../WIZARD.md) at the repo root) that governs how Wizard behaves. It is compiled into the binary and injected into every system prompt, so your fork ships your copy of it.
+- **Your WIZARD.md charter**: the behavioral charter ([WIZARD.md](../WIZARD.md) at the repo root) that governs how Wizard behaves. It is compiled into the binary, and a generated digest of it (the ladder's rung names, an index of section topic ids, and the rules that must hold on every reply) goes into every system prompt, with the full text of each section served on demand by the `manual` tool. Edit it and your fork ships your copy: the digest and the manual pages are both generated from whatever your `WIZARD.md` says, including sections you add or renumber.
 - **Your defaults**: any configuration baked into the source.
 
 Tier-1 evolutions (skills, MCP server registrations, scripted tools, subagents) live under `~/.wizard/` on your machine and are not pushed by `/publish`. Publish is for source changes only.
@@ -90,6 +90,80 @@ See [WIZARD.md](../WIZARD.md) for the current charter.
 
 ## When to publish
 
-Skills, MCP servers, scripted tools, and subagents are runtime additions that do not touch Wizard's source, so `/publish` will not do anything useful with them alone. To share a skill or MCP setup, document the configuration instead.
+Skills, MCP servers, scripted tools, and subagents are runtime additions that do not touch Wizard's source, so `/publish` will not do anything useful with them alone. To share a single skill or tool, use the registry below instead.
 
 Reach for `/publish` when the change is in `~/.wizard/src`: a new built-in tool, a protocol change, a TUI feature, an amended charter.
+
+---
+
+# The skills and tools registry
+
+`/publish` shares a whole Wizard. `wizard skills` shares one piece of one: a skill (markdown injected into the system prompt) or a tool (a LuaJIT script the model can call).
+
+The registry is a git-backed static site. One public repo holds `registry.json` plus a directory per entry, and nothing else: no backend, no database, no accounts. Submitting is a pull request; CI validates the manifest, smoke-tests the entry, and regenerates the index on merge.
+
+**The client ships before the registry does.** `teddytennant/wizard-registry` is not published yet, so `wizard skills search` against the default URL reports that it could not fetch the index, and there is nothing to install by name. Everything below describes the client that is in this binary today; point `WIZARD_REGISTRY_URL` at your own `registry.json` (any URL that serves the index, a fork's raw URL included) and all of it works now.
+
+```bash
+wizard skills search todo list        # every term has to match; extra terms narrow
+wizard skills search todo --tools     # or --skills, to resolve one kind only
+wizard skills install slugify
+wizard skills list                    # what is installed, and what each one was granted
+wizard skills update                  # or `wizard skills update <name>`
+```
+
+Installs land beside the skills that ship inside the binary:
+
+| Kind | Where it lands | Receipt |
+|------|----------------|---------|
+| skill | `~/.wizard/skills/<name>/SKILL.md` | `~/.wizard/skills/<name>/.registry.json` (hidden, so the skills loader never sees it) |
+| tool | `~/.wizard/tools/<name>.lua` + `<name>.toml` | `~/.wizard/tools/<name>.registry.json` |
+
+The receipt records the author, version, checksum, source URL and what the install was granted. It is the "where did this come from" listing, and for a tool it is also what the runtime reads on every call. There is no central list: deleting an install deletes its record with it.
+
+The index is cached under `~/.wizard/registry`, so `search` keeps working offline once you have fetched it once. Set `WIZARD_REGISTRY_URL` to point at a different registry.
+
+## Installing a tool is running its author's code
+
+This is the part worth reading twice.
+
+`mlua`'s `StdLib::ALL_SAFE`, which every scripted tool ran under before the registry existed, excludes `debug` and `ffi` but keeps `os` and `io`. `os.execute` is a shell. "Safe" there means "cannot corrupt the VM", never "cannot run commands". So Wizard splits the difference rather than picking a side:
+
+1. **Sandboxed by default.** A registry-installed tool gets `table`, `string`, `math`, `bit` and `jit`, and nothing else: no `os`, no `io`, no `package`, no `dofile`/`loadfile`, and the host file helpers confined to the project directory. Fewer tools are expressible. That is the price.
+
+2. **The full stdlib only by informed opt-in.** A manifest may declare capabilities (`process`, `filesystem`). Installing such a tool **refuses by default**. It succeeds only after Wizard prints the author, the version, the source URL, the sha256 and what is being handed over, and a human answers yes:
+
+```
+Installing the tool 'deploy' version 1.2.0
+  author:   alice
+  source:   https://.../tools/alice/deploy/tool.lua
+  sha256:   9f2c…
+  asks to:
+    - run commands with your privileges (os.execute, io.popen, os.getenv)
+
+Granting this runs the author's code on your machine with your privileges, under the
+full LuaJIT standard library.
+Wizard cannot narrow it to the list above: `os` and `io` arrive as whole tables, so the
+grant is all or nothing.
+Without the grant this tool installs sandboxed and its declared capabilities will not work.
+Read the source at the URL above first.
+
+Install and grant the full standard library? [y/N]
+```
+
+Anything but an explicit `y` is a no, end of input included. Piped into a script or run under CI there is no terminal to ask on, and the install refuses rather than guessing.
+
+`--grant-full-stdlib` gives that answer up front. It is spelled out rather than called `--yes` on purpose: a flag read back out of a shell history a month later has to say what it accepted. It still prints the grant, so what was handed over is on the screen and not only in the flag.
+
+Refusing beats installing sandboxed anyway. A tool that declared it needs `os.execute` and got a VM without it fails somewhere in the middle of a task with a Lua error, and the user learns nothing about why.
+
+Locally authored tools, everything `/evolve` writes and everything you drop in `~/.wizard/tools/` yourself, are untouched by all of this and keep the full stdlib. Their author is you.
+
+## What the registry may not do
+
+- **Take a built-in's name.** `ToolRegistry::register` replaces by name and scripted tools register last, so a registry tool called `execute` or `manual` would become the thing the model reaches when it means the built-in. Those names are refused, read from the native registry itself so the list cannot drift. The two bundled skills (`coding`, `evolve`) are reserved the same way.
+- **Overwrite something you wrote.** A local skill or tool of the same name stops the install. Rename or remove yours first.
+- **Change hands quietly.** An entry installed from one author and published by another is never updated automatically: `wizard skills update` reports it and leaves the old version alone. A name changing hands is how a supply chain gets taken over.
+- **Get a new version on an old grant.** An install holding the full stdlib is not silently replaced either. The grant covered the code the user read, not whatever the author has pushed since, so `update` reports it and waits to be asked again.
+
+`wizard skills update` exits non-zero only when an update genuinely failed. "Up to date", "no longer published", "author changed" and "needs consent" are decisions it made on purpose and reported; an exit code that cries wolf at those teaches people to ignore it.

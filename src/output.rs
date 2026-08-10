@@ -1,6 +1,7 @@
 //! Headless output sinks: how a sovereign (`-p`) run reports its events.
 //!
-//! The agent loop emits [`AgentEvent`]s; `run_headless` forwards them to one
+//! The agent loop emits [`AgentEvent`]s; [`crate::headless::run`] forwards
+//! them to one
 //! [`EventSink`] selected by `--output-format`:
 //!
 //! - `text` (default) — the human-readable stream: deltas as they arrive,
@@ -33,6 +34,56 @@ pub enum OutputFormat {
     Json,
     /// One JSON object per line as events arrive (JSONL).
     StreamJson,
+}
+
+/// Write `text` to stdout, and keep going when nobody is reading it.
+///
+/// `print!` and `println!` panic when the write fails, and the write fails as
+/// soon as the reader hangs up: `wizard -p "…" | head -20` closes the pipe the
+/// moment `head` has its twenty lines. Rust ignores `SIGPIPE`, so instead of
+/// the usual quiet death the process takes a panic — inside the printer task,
+/// which is where the run's whole output goes — and what the user sees is the
+/// run stopping partway through with a panic message stapled to it. Every
+/// other tool in the pipeline just ends.
+///
+/// A closed stdout is not a reason to abandon the work. The agent is editing
+/// files and running commands; those effects are the point, and the run has to
+/// reach its end (and its exit code) whether or not anyone is still reading
+/// the commentary. So a broken pipe is swallowed here and the run carries on
+/// writing into a stream that discards it.
+///
+/// Every other kind of write error is swallowed too, for the same reason and
+/// with less ceremony: there has never been a useful response to "the terminal
+/// would not take this line" beyond not dying of it.
+pub fn print_str(text: &str) {
+    write_chunk(&mut std::io::stdout().lock(), text, false);
+}
+
+/// [`print_str`] with a trailing newline — the non-panicking `println!`.
+pub fn print_line(line: &str) {
+    write_chunk(&mut std::io::stdout().lock(), line, true);
+}
+
+/// [`print_line`] for stderr — the non-panicking `eprintln!`.
+///
+/// stderr gets the same treatment because it is redirected as readily as
+/// stdout (`2>&1 | head`, a log collector that restarts, a supervisor closing
+/// the pipe on shutdown), and a headless run dying on the way to reporting an
+/// error is the worst possible moment to lose it.
+pub fn eprint_line(line: &str) {
+    write_chunk(&mut std::io::stderr().lock(), line, true);
+}
+
+/// The shared body of the three helpers above, generic over the destination so
+/// the "a failed write is not fatal" contract can be tested against a stream
+/// that always fails — which is exactly what stdout becomes the moment the
+/// process on the other side of the pipe exits.
+fn write_chunk(out: &mut impl Write, text: &str, newline: bool) {
+    let _ = out.write_all(text.as_bytes());
+    if newline {
+        let _ = out.write_all(b"\n");
+    }
+    let _ = out.flush();
 }
 
 /// One line per image announced by [`AgentEvent::Images`]: what produced it and
@@ -144,14 +195,12 @@ impl EventSink for TextSink {
         match event {
             AgentEvent::TextDelta(delta) => {
                 self.spinner.hide();
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
+                print_str(&delta);
             }
             AgentEvent::ThinkingDelta(delta) => {
                 // ANSI faint so reasoning reads as background noise.
                 self.spinner.hide();
-                print!("\x1b[2m{delta}\x1b[0m");
-                let _ = std::io::stdout().flush();
+                print_str(&format!("\x1b[2m{delta}\x1b[0m"));
             }
             AgentEvent::ToolStarted { name, args } => {
                 self.spinner.println(&format!("\n→ {name} {args}"));
@@ -207,11 +256,11 @@ impl EventSink for TextSink {
                 // Text already printed can't be unprinted; mark the cut so
                 // the re-generated response below isn't read as a duplicate.
                 self.spinner.hide();
-                println!("\x1b[2m\n… stream interrupted — the response restarts below …\x1b[0m");
+                print_line("\x1b[2m\n… stream interrupted — the response restarts below …\x1b[0m");
             }
             AgentEvent::Error(message) => {
                 self.spinner.hide();
-                eprintln!("\nwizard error: {message}");
+                eprint_line(&format!("\nwizard error: {message}"));
             }
             AgentEvent::Notice(message) => {
                 self.spinner.println(&format!("~ {message}"));
@@ -224,18 +273,18 @@ impl EventSink for TextSink {
                 self.spinner
                     .println(&format!("~ hook {event}: {outcome} ({command})"));
             }
-            AgentEvent::PlanReady { plan, respond } => {
+            AgentEvent::PlanReady { plan, gate } => {
                 // Headless: print the plan and approve it, so the turn moves
                 // from planning to execution on its own.
                 self.spinner
                     .println(&format!("\n=== plan ===\n{plan}\n=== plan approved ==="));
-                let _ = respond.send(PlanVerdict::approve());
+                gate.answer(PlanVerdict::approve());
                 self.spinner.show();
             }
-            AgentEvent::Interview { respond, .. } => {
+            AgentEvent::Interview { gate, .. } => {
                 // Headless: no interactive user — decline so the model
                 // proceeds with its best judgment.
-                let _ = respond.send(None);
+                gate.decline();
             }
             AgentEvent::OmakaseProceeding { plan } => {
                 self.spinner.println(&format!(
@@ -304,23 +353,31 @@ impl EventSink for TextSink {
                     "~ agent requested {line} (slash commands apply only in the interactive TUI)"
                 ));
             }
+            // A shell command's console. A headless run has nobody at the
+            // keyboard, so it leaves `ConsoleAccess` at `None` and every
+            // command keeps `/dev/null` on fd 0 — it reads EOF and moves on
+            // rather than parking on a question this printer could show but
+            // nobody could answer. Named rather than wildcarded so that the day
+            // headless grows an answerer, somebody has to decide here.
+            AgentEvent::ConsoleOpened { .. }
+            | AgentEvent::ConsoleOutput { .. }
+            | AgentEvent::ConsoleClosed { .. } => {}
             AgentEvent::Done { reason } => {
                 self.spinner.hide();
-                println!("\n[turn done: {reason:?}]");
+                print_line(&format!("\n[turn done: {reason:?}]"));
             }
         }
     }
 
     fn finish(&mut self, reason: DoneReason) {
         if self.prompt_tokens > 0 || self.completion_tokens > 0 {
-            println!(
+            print_line(&format!(
                 "[run finished: {reason:?} — {} prompt + {} completion tokens]",
                 self.prompt_tokens, self.completion_tokens
-            );
+            ));
         } else {
-            println!("[run finished: {reason:?}]");
+            print_line(&format!("[run finished: {reason:?}]"));
         }
-        let _ = std::io::stdout().flush();
     }
 }
 
@@ -453,13 +510,13 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
                 // re-streams it, so keeping it would double the text.
                 self.result.truncate(self.committed);
             }
-            AgentEvent::PlanReady { respond, .. } => {
+            AgentEvent::PlanReady { gate, .. } => {
                 // No human in the loop: approve so the turn executes.
-                let _ = respond.send(PlanVerdict::approve());
+                gate.answer(PlanVerdict::approve());
             }
-            AgentEvent::Interview { respond, .. } => {
+            AgentEvent::Interview { gate, .. } => {
                 // No interactive user: decline so the model uses its judgment.
-                let _ = respond.send(None);
+                gate.decline();
             }
             AgentEvent::Usage {
                 prompt_tokens,
@@ -485,7 +542,14 @@ impl<W: Write + Send> EventSink for JsonSink<W> {
             | AgentEvent::TaskFinished { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentFinished { .. }
-            | AgentEvent::CommandRequested(_) => {}
+            | AgentEvent::CommandRequested(_)
+            // A command's console: never opened in a headless run (see the
+            // text sink above), and a live byte stream is not a thing a
+            // one-object summary has a field for anyway. The final tool result
+            // carries the same output.
+            | AgentEvent::ConsoleOpened { .. }
+            | AgentEvent::ConsoleOutput { .. }
+            | AgentEvent::ConsoleClosed { .. } => {}
         }
     }
 
@@ -632,17 +696,17 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "outcome": outcome.to_string(),
                 }));
             }
-            AgentEvent::PlanReady { plan, respond } => {
+            AgentEvent::PlanReady { plan, gate } => {
                 // No human in the loop: report the plan and approve it.
                 self.emit(json!({"type": "plan", "plan": plan, "approved": true}));
-                let _ = respond.send(PlanVerdict::approve());
+                gate.answer(PlanVerdict::approve());
             }
-            AgentEvent::Interview { questions, respond } => {
+            AgentEvent::Interview { questions, gate } => {
                 // No interactive user: report the questions, then decline so
                 // the model proceeds with its best judgment.
                 let asked: Vec<&str> = questions.iter().map(|q| q.question.as_str()).collect();
                 self.emit(json!({"type": "interview", "questions": asked, "answered": false}));
-                let _ = respond.send(None);
+                gate.decline();
             }
             AgentEvent::OmakaseProceeding { plan } => {
                 self.emit(json!({"type": "plan", "plan": plan, "omakase": true, "approved": true}));
@@ -720,6 +784,20 @@ impl<W: Write + Send> EventSink for StreamJsonSink<W> {
                     "guidance": guidance,
                 }));
             }
+            // This sink's contract is one frame per event, so a console gets
+            // frames like everything else — even though a headless run never
+            // opens one today. The gate rides as its bare ticket number, which
+            // is all it can honestly be off-process: a reader of this stream
+            // cannot claim it, and is not meant to.
+            AgentEvent::ConsoleOpened { command, gate } => {
+                self.emit(json!({"type": "console_opened", "command": command, "gate": gate}));
+            }
+            AgentEvent::ConsoleOutput { gate, chunk } => {
+                self.emit(json!({"type": "console_output", "gate": gate, "chunk": chunk}));
+            }
+            AgentEvent::ConsoleClosed { gate } => {
+                self.emit(json!({"type": "console_closed", "gate": gate}));
+            }
             AgentEvent::Done { reason } => {
                 self.emit(json!({"type": "turn_done", "reason": reason_str(reason)}));
             }
@@ -766,6 +844,46 @@ pub(crate) mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A destination that has hung up — what stdout becomes the instant the
+    /// next process in the pipeline exits (`wizard -p … | head`).
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_reader_that_hung_up_does_not_take_the_run_with_it() {
+        // `println!` panics on this error, and the panic lands inside the
+        // headless printer task — which drops the event receiver and stops the
+        // run partway through. Reaching the end of this test is the assertion:
+        // the writes are dropped, nothing unwinds.
+        write_chunk(&mut BrokenPipe, "a streamed delta", false);
+        write_chunk(&mut BrokenPipe, "[run finished: Completed]", true);
+
+        // The structured sinks write through the same kind of destination, and
+        // must survive it far enough to run their own `finish`.
+        let mut sink = JsonSink::new(BrokenPipe);
+        sink.event(AgentEvent::TextDelta("answer".to_string()));
+        sink.finish(DoneReason::Completed);
+
+        let mut sink = StreamJsonSink::new(BrokenPipe);
+        sink.event(AgentEvent::TextDelta("answer".to_string()));
+        sink.finish(DoneReason::Completed);
     }
 
     fn synthetic_events() -> Vec<AgentEvent> {
@@ -928,12 +1046,12 @@ pub(crate) mod tests {
     fn stream_json_plan_is_reported_and_auto_approved() {
         let buf = SharedBuf::default();
         let mut sink = StreamJsonSink::new(buf.clone());
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let (gate, mut verdict) = crate::agent::PlanGate::open();
         sink.event(AgentEvent::PlanReady {
             plan: "1. do it".to_string(),
-            respond: tx,
+            gate,
         });
-        let verdict = rx.try_recv().expect("verdict sent synchronously");
+        let verdict = verdict.try_recv().expect("verdict sent synchronously");
         assert!(verdict.approved);
         let value: serde_json::Value =
             serde_json::from_str(buf.contents().trim()).expect("valid JSON");
@@ -959,12 +1077,12 @@ pub(crate) mod tests {
         assert_eq!(sink.prompt_tokens, 12);
         assert_eq!(sink.completion_tokens, 4);
 
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let (gate, mut verdict) = crate::agent::PlanGate::open();
         sink.event(AgentEvent::PlanReady {
             plan: "plan".to_string(),
-            respond: tx,
+            gate,
         });
-        assert!(rx.try_recv().expect("verdict sent").approved);
+        assert!(verdict.try_recv().expect("verdict sent").approved);
         sink.finish(DoneReason::Completed);
     }
 }

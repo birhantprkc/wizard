@@ -48,6 +48,31 @@ pub struct Mission {
     /// Rolling progress log (most recent last), capped at [`MAX_NOTES`].
     #[serde(default)]
     pub notes: Vec<String>,
+    /// What the loop was doing when it last stamped itself — "cycle 12:
+    /// running turn", "cycle 12: waiting out circuit breaker", "held by
+    /// operator pause".
+    ///
+    /// An operator watching a perpetual run from outside cannot tell "thinking
+    /// hard about a big refactor" from "wedged on a request that will never
+    /// answer": both look like a process using no CPU and writing no output.
+    /// This field plus [`Mission::heartbeat`] make the difference legible —
+    /// the phase says what it *believed* it was doing and the heartbeat says
+    /// how long ago it believed it. Deliberately stamped only at phase
+    /// boundaries by the loop itself, never by a background timer: a timer
+    /// keeps ticking merrily while the agent hangs on a socket, which is
+    /// precisely the state worth detecting.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// When [`Mission::phase`] was last stamped. `None` on a mission written
+    /// by a build that predates the field.
+    #[serde(default)]
+    pub heartbeat: Option<DateTime<Utc>>,
+    /// Cycles that ended in a hard error or a tripped breaker since the last
+    /// one that landed. Mirrors the loop's live counter so an operator reading
+    /// `mission.toml` can see a run that is thrashing rather than progressing,
+    /// and how close it is to `max_consecutive_failures`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 impl Mission {
@@ -60,6 +85,9 @@ impl Mission {
             updated: now,
             cycles: 0,
             notes: Vec::new(),
+            phase: None,
+            heartbeat: None,
+            consecutive_failures: 0,
         }
     }
 
@@ -92,12 +120,47 @@ impl Mission {
     ///
     /// The note is appended to [`Mission::notes`]; once the log exceeds
     /// [`MAX_NOTES`], the oldest entries are dropped from the front.
+    /// A cycle that reaches here landed, so it also clears the consecutive
+    /// failure streak: the bound that ends a thrashing perpetual run counts
+    /// *consecutive* bad cycles, and one good cycle proves the run is not
+    /// stuck.
     pub fn record_cycle(&mut self, note: Option<String>) {
         self.cycles += 1;
         self.updated = Utc::now();
+        self.consecutive_failures = 0;
         if let Some(n) = note {
             self.note(n);
         }
+    }
+
+    /// Record a cycle that ended badly — a hard error or a tripped circuit
+    /// breaker — and return the new consecutive streak.
+    ///
+    /// Deliberately not a cycle: `cycles` is the count of work the mission
+    /// actually advanced by, and inflating it with failures would make the
+    /// number the continuation prompt quotes back to the model a lie.
+    pub fn record_failure(&mut self, note: impl Into<String>) -> u32 {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.note(note);
+        self.consecutive_failures
+    }
+
+    /// Forget the failure streak without recording a cycle — for a turn that
+    /// ran out of steps rather than finishing. It did real work, so the run is
+    /// demonstrably not wedged, but it has not completed anything to count.
+    pub fn clear_failures(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Stamp what the loop is doing now and when, so an outside observer can
+    /// tell a long turn from a hung one. Called at phase boundaries — cycle
+    /// start, turn end, before every wait — and nowhere else; see
+    /// [`Mission::phase`] for why there is no timer behind it.
+    pub fn stamp(&mut self, phase: impl Into<String>) {
+        let now = Utc::now();
+        self.phase = Some(phase.into());
+        self.heartbeat = Some(now);
+        self.updated = now;
     }
 
     /// Append a progress note (bumping `updated`) without counting a cycle —
@@ -180,6 +243,75 @@ mod tests {
         );
         // The oldest survivor is the expected front entry.
         assert_eq!(mission.notes.first().expect("non-empty notes"), "note-10");
+    }
+
+    #[test]
+    fn failure_streak_counts_consecutively_and_any_landed_cycle_clears_it() {
+        let mut mission = Mission::new("endure");
+        assert_eq!(mission.record_failure("hard error: disk full"), 1);
+        assert_eq!(mission.record_failure("circuit breaker"), 2);
+        assert_eq!(mission.consecutive_failures, 2);
+        // A failure is not progress: the cycle count must not move.
+        assert_eq!(mission.cycles, 0);
+
+        mission.record_cycle(Some("landed".to_string()));
+        assert_eq!(
+            mission.consecutive_failures, 0,
+            "one good cycle proves the run is not stuck"
+        );
+        assert_eq!(mission.cycles, 1);
+
+        assert_eq!(mission.record_failure("another"), 1);
+        mission.clear_failures();
+        assert_eq!(mission.consecutive_failures, 0);
+        assert_eq!(mission.cycles, 1, "clear_failures is not a cycle");
+    }
+
+    #[test]
+    fn stamp_records_phase_and_heartbeat_and_survives_a_round_trip() {
+        let tmp = TempDir::new();
+        let mut mission = Mission::new("endure");
+        assert!(mission.phase.is_none());
+        assert!(mission.heartbeat.is_none());
+
+        mission.stamp("cycle 3: waiting out circuit breaker");
+        mission.consecutive_failures = 2;
+        let stamped = mission.heartbeat.expect("heartbeat set");
+        assert_eq!(mission.updated, stamped, "a stamp is an update");
+        mission.save(&tmp.0).expect("save mission");
+
+        let loaded = Mission::load(&tmp.0)
+            .expect("load mission")
+            .expect("mission present");
+        assert_eq!(
+            loaded.phase.as_deref(),
+            Some("cycle 3: waiting out circuit breaker")
+        );
+        assert_eq!(loaded.heartbeat, Some(stamped));
+        assert_eq!(loaded.consecutive_failures, 2);
+    }
+
+    /// A mission written by a build that predates the liveness fields must
+    /// still load. Losing it would restart a long-running mission from zero,
+    /// which is the failure the corruption test below also guards.
+    #[test]
+    fn mission_without_liveness_fields_still_loads() {
+        let tmp = TempDir::new();
+        std::fs::create_dir_all(control_dir(&tmp.0)).unwrap();
+        let legacy = "goal = \"endure\"\n\
+                      created = \"2024-01-01T00:00:00Z\"\n\
+                      updated = \"2024-01-02T00:00:00Z\"\n\
+                      cycles = 7\n\
+                      notes = [\"a note\"]\n";
+        std::fs::write(mission_path(&tmp.0), legacy).unwrap();
+
+        let loaded = Mission::load(&tmp.0)
+            .expect("legacy mission loads")
+            .expect("mission present");
+        assert_eq!(loaded.cycles, 7);
+        assert!(loaded.phase.is_none());
+        assert!(loaded.heartbeat.is_none());
+        assert_eq!(loaded.consecutive_failures, 0);
     }
 
     #[test]

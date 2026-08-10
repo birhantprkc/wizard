@@ -1,0 +1,35 @@
+: OpenAI chat-completions SSE stream (POST /v1/chat/completions with
+: stream_options.include_usage). A two-call PARALLEL BATCH, both calls naming
+: the SAME tool: each opens on its own tool_calls index carrying its own
+: call_ id, and the argument fragments arrive afterwards interleaved between
+: the two indices.
+:
+: Same-tool is the case the whole tool-call-id change exists for. Correlating
+: a result back to its call by tool name has two answers here and picks one,
+: which feeds the model file a's contents as the answer to the read of b. Only
+: call_aaa and call_bbb tell the two apart, and the ids in this fixture are
+: the only place a test can get them without inventing them.
+:
+: The usage block also carries a cache hit (1,920 of 2,048 prompt tokens
+: served from the prefix cache); unlike Anthropic's, this one is a subset of
+: prompt_tokens and is never added to it.
+:
+: Lines starting with a colon are SSE comments. Both adapters skip every line
+: that does not begin with "data" plus a colon, so this header travels with
+: the bytes without changing what is parsed.
+:
+: This file is also compiled into the adapter's own tests as
+: openai::testing::PARALLEL_TOOL_BATCH_SSE, so the in-process decoder tests
+: and the over-a-socket ones read the same bytes. See the header of
+: tests/recorded_provider.rs for how to re-record it from a live stream once
+: the adapter's dump hook exists.
+
+data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_aaa","type":"function","function":{"name":"read_file","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_bbb","type":"function","function":{"name":"read_file","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a\"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\"b\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2048,"completion_tokens":31,"prompt_tokens_details":{"cached_tokens":1920}}}
+
+data: [DONE]

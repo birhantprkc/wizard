@@ -67,18 +67,32 @@
 #                                    (implies WIZARD_LOCAL)    (default 0)
 #   WIZARD_SKIP_OLLAMA_INSTALL   1 = Ollama managed elsewhere (default 0)
 #   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
-#   WIZARD_APP                   1 = also install the native desktop app: a second
-#                                    binary, `wizard-desktop` (built --features
-#                                    desktop), plus a launcher entry, so Wizard
-#                                    opens from the dock like any app. Linux needs
-#                                    WebKitGTK; macOS needs nothing. `wizard`
-#                                    itself is untouched. Unsupported on Termux.
+#   WIZARD_NATIVE                1 = also install the native GUI: a second binary,
+#                                    `wizard-native` (built --features native),
+#                                    which is the only build that can open the
+#                                    window with `wizard gui`. Needs no
+#                                    system packages on either OS. `wizard` itself
+#                                    is untouched. Unsupported on Termux, and
+#                                    there is no static musl build of it.
+#                                    (WIZARD_APP is the old name, still honored.)
 #                                    (default 0)
 #   WIZARD_VERSION               release tag to install, e.g. v0.4.0 (default: the
 #                                latest release). Pins the download to
 #                                releases/download/<tag>/ — use it for
 #                                reproducible installs or to roll back
 #   WIZARD_REPO                  owner/repo to install from   (default teddytennant/wizard)
+#   WIZARD_MIRROR                download mirror to try before GitHub Releases,
+#                                e.g. https://dl.example.com. Empty (the
+#                                default) means no mirror: GitHub is used
+#                                directly. "off", "none" or "0" also disable it.
+#                                Assets are read from <mirror>/<tag>/<asset>;
+#                                the tag always comes from GitHub, so a stale
+#                                mirror cannot pin you to an old release. Any
+#                                mirror failure falls back to GitHub, and the
+#                                script says which one served the download.
+#                                A mirror-served file is verified exactly like a
+#                                GitHub-served one — same signature, same digest,
+#                                same refusals                          (default "")
 #   WIZARD_REF                   git ref/tag when building from source
 #                                (default: latest release tag, falling back to
 #                                main only when the repo has no release)
@@ -136,21 +150,34 @@ WIZARD_LLAMACPP_NO_CUDA="${WIZARD_LLAMACPP_NO_CUDA:-0}"
 WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
-WIZARD_APP="${WIZARD_APP:-0}"
+WIZARD_NATIVE="${WIZARD_NATIVE:-0}"
 WIZARD_VERSION="${WIZARD_VERSION:-}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
+# Off unless you set it. The mirror is a bandwidth optimisation in front of
+# GitHub Releases, and a default pointing at a host that does not answer would
+# make every install pay a failed request and a fallback warning to gain
+# nothing. Ship a default here only once the host is real; until then the
+# people who have one set WIZARD_MIRROR.
+WIZARD_MIRROR="${WIZARD_MIRROR:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
+
+# WIZARD_APP is the old name for the graphical install. It installed
+# `wizard-desktop`, a webview window over the loopback GUI server, which this
+# release deleted; WIZARD_NATIVE installs the iced window that replaced it.
+# Honored as a deprecated alias so an existing provisioning script still gets a
+# window rather than silently getting nothing.
+if [ "${WIZARD_APP:-0}" = "1" ]; then WIZARD_NATIVE=1; fi
 
 # Termux cannot run the published gnu/musl release binaries (Android/Bionic).
 # Force a source build unless the user already asked for one; never try the
-# desktop shell (no WebKitGTK / no Android webview integration).
+# native GUI (no display server, and no prebuilt asset for Bionic).
 if is_termux; then
     if [ "$WIZARD_BUILD_FROM_SOURCE" != "1" ]; then
         WIZARD_BUILD_FROM_SOURCE=1
     fi
-    if [ "$WIZARD_APP" = "1" ]; then
-        WIZARD_APP=0
+    if [ "$WIZARD_NATIVE" = "1" ]; then
+        WIZARD_NATIVE=0
     fi
 fi
 
@@ -169,6 +196,33 @@ if [ -n "$WIZARD_VERSION" ]; then
 else
     RELEASE_BASE="https://github.com/${WIZARD_REPO}/releases/latest/download"
 fi
+# The minisign public key wizard releases are signed with. It is the exact key
+# line published at the repository root as wizard-release.pub, and the exact key
+# compiled into the binary (src/update.rs), so the installer and `wizard update`
+# trust one key and a test asserts the two copies have not drifted. Editing this
+# line is editing what this script will install.
+WIZARD_RELEASE_PUBKEY="RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md"
+# Set once `checksums.txt` in $TMP_DIR has been fetched *and* its signature has
+# verified, so a second asset does not re-verify the same file.
+CHECKSUMS_VERIFIED=0
+
+# The release tag this run is installing, resolved once (see
+# resolve_release_tag) and empty when it could not be determined at all. Two
+# things read it: the mirror, which is addressed per release, and the signature
+# check, which requires the signed trusted comment to name this tag.
+RESOLVED_TAG=""
+TAG_RESOLVED=0
+
+# Download-mirror state, all resolved once on the first asset fetch.
+# MIRROR_BASE is the full per-release base URL (<mirror>/<tag>) or empty when
+# there is no mirror to try; MIRROR_RESOLVED guards the one-time resolution;
+# MIRROR_WARNED keeps the fallback notice to one line per run; DOWNLOAD_SOURCE
+# names whoever served the last asset, so the install can say which one it used.
+MIRROR_BASE=""
+MIRROR_RESOLVED=0
+MIRROR_WARNED=0
+DOWNLOAD_SOURCE=""
+
 LLAMACPP_REPO="ggml-org/llama.cpp"
 LLAMACPP_URL="http://127.0.0.1:11435"
 LLAMA_BIN_DIR="$HOME/.wizard/bin"
@@ -186,8 +240,9 @@ MEM_SOURCE=""
 BINARY_INSTALLED=0
 INSTALLED_PATH=""
 PLACED_PATH=""
-DESKTOP_INSTALLED=0
-DESKTOP_PATH=""
+NATIVE_INSTALLED=0
+NATIVE_PATH=""
+NATIVE_BIN=""
 
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
@@ -198,6 +253,23 @@ trap cleanup EXIT
 say()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# --- input validation ---------------------------------------------------
+
+# WIZARD_MODEL becomes a model tag on an `ollama pull` command line, a lookup
+# key for a GGUF download, and a TOML string in ~/.wizard/config.toml. Refuse
+# anything that is not tag-shaped, here, before a single byte is installed —
+# a value that only blows up in write_config blows up *after* the binary is in
+# place, which is the worst moment to abort. Real tags look like `qwen3.5:9b`
+# or `vendor/model-name@v2`; a quote, a backslash or a shell metacharacter
+# does not belong in one.
+if [ -n "${WIZARD_MODEL:-}" ]; then
+    case "$WIZARD_MODEL" in
+        *[!A-Za-z0-9._:/@+-]*)
+            die "WIZARD_MODEL='${WIZARD_MODEL}' contains characters a model tag cannot have (allowed: letters, digits, . _ : / @ + -)"
+            ;;
+    esac
+fi
 
 # --- platform detection -------------------------------------------------
 
@@ -258,7 +330,7 @@ termux_banner() {
     printf '\n' >&2
     warn "Local GGUF / stock llama-server and Ollama curl installs are not supported here;"
     warn "use a cloud provider in onboarding, or put a Termux-built llama-server on PATH."
-    warn "Desktop app (WIZARD_APP) is skipped — use the TUI."
+    warn "The native GUI (WIZARD_NATIVE) is skipped — use the TUI."
     printf '\n'
 }
 
@@ -382,6 +454,43 @@ ensure_build_tools() {
     fi
     command -v cmake >/dev/null 2>&1 && command -v git >/dev/null 2>&1 \
         && { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }
+}
+
+# Best-effort install of a C linker, which `cargo build` needs even though no
+# C is being written: rustc shells out to `cc` to link, so a machine with a
+# Rust toolchain and no compiler gets several minutes into the build and then
+# fails on `linker \`cc\` not found`.
+#
+# Separate from ensure_build_tools() rather than reusing it, because that one
+# also demands cmake for llama.cpp and would refuse a machine that has a
+# perfectly good compiler but no cmake. Alpine is handled here and not there
+# because the source build is the only path a musl host has (see the asset
+# sanity check in download_binary), so apk is on the critical path.
+#
+# Returns non-zero if a linker is still missing afterwards, and names the
+# package to install rather than leaving the caller to read cargo's output.
+ensure_c_linker() {
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+        return 0
+    fi
+    local sudo=""
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        sudo="sudo"
+    fi
+    say "No C linker found; installing one (cargo needs it to link) ..."
+    if command -v apt-get >/dev/null 2>&1; then
+        $sudo apt-get update -qq >/dev/null 2>&1 || true
+        $sudo apt-get install -y -qq build-essential >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        $sudo dnf install -y gcc >/dev/null 2>&1 || true
+    elif command -v pacman >/dev/null 2>&1; then
+        $sudo pacman -Sy --noconfirm base-devel >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        $sudo apk add --no-cache build-base >/dev/null 2>&1 || true
+    elif command -v zypper >/dev/null 2>&1; then
+        $sudo zypper install -y gcc >/dev/null 2>&1 || true
+    fi
+    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1
 }
 
 # Build llama-server from source with CUDA and install it under
@@ -743,11 +852,21 @@ detect_memory() {
     # macOS: Apple Silicon shares unified memory between CPU and the Metal GPU,
     # so total RAM is the right tiering signal (and the Metal-backed llama-server
     # can address most of it). sysctl reports it in bytes.
+    #
+    # hw.memsize is the exact physical byte count, unlike /proc/meminfo's
+    # MemTotal below, which already excludes what the kernel keeps for itself:
+    # an "8 GB" Linux laptop reads 7 GB there while an 8 GB Mac would read a
+    # flat 8 here, clear the 8 GB tier boundary and be handed a model macOS
+    # will not let it load. Net off the same 6% (src/hardware.rs's
+    # OS_RESERVED_PERCENT) so both readings mean the same thing, and MEM_GB is
+    # usable memory rather than the machine's nameplate figure.
     if [ "$OS" = "macos" ]; then
         local mem_b
         mem_b="$(sysctl -n hw.memsize 2>/dev/null || true)"
         if is_uint "$mem_b" && [ "$mem_b" -gt 0 ]; then
-            MEM_GB=$((mem_b / 1024 / 1024 / 1024))
+            # Multiply before dividing: `mem_b / 100` first would throw away
+            # the remainder of a byte count, and shellcheck flags it (SC2017).
+            MEM_GB=$((mem_b * 94 / 100 / 1024 / 1024 / 1024))
             MEM_SOURCE="unified memory (Apple Silicon)"
             return
         fi
@@ -789,13 +908,17 @@ select_model() {
 
     detect_memory
     if [ -z "$MEM_SOURCE" ]; then
-        MODEL="qwen3.5:9b"
+        MODEL="qwen3.5:4b"
         warn "could not detect GPU VRAM or system RAM — falling back to the smallest model tier"
         say "Selected model tier: ${MODEL} (override with WIZARD_MODEL=<tag>)"
         return
     fi
-    say "Detected ${MEM_GB} GB of ${MEM_SOURCE}"
+    say "Detected ${MEM_GB} GB of ${MEM_SOURCE} usable by models"
 
+    # These boundaries are the shell copy of src/hardware.rs's tier table
+    # (suggest_ollama_model / suggest_gguf_model); the two are pinned together
+    # by install_sh_tier_table_matches_the_rust_tier_table. When they drift the
+    # installer downloads one model and wizard's preflight refuses it.
     if [ "$MEM_GB" -ge 24 ]; then
         MODEL="qwen3.6:35b"
     elif [ "$MEM_GB" -ge 18 ]; then
@@ -803,8 +926,11 @@ select_model() {
     elif [ "$MEM_GB" -ge 8 ]; then
         MODEL="qwen3.5:9b"
     else
-        MODEL="qwen3.5:9b"
-        warn "less than 8 GB available — ${MODEL} will run on CPU / partial offload and may be slow"
+        # Under 8 GB the 9B does not fit: ~6 GB of weights plus the KV cache
+        # and compute buffers llama-server allocates on top leaves nothing for
+        # the OS, so it is OOM-killed while loading rather than merely slow.
+        MODEL="qwen3.5:4b"
+        warn "less than 8 GB usable, using the smallest tier (${MODEL}); it will run on CPU / partial offload and may be slow"
     fi
     say "Selected model tier: ${MODEL}"
 }
@@ -826,6 +952,10 @@ gguf_for_model() {
         qwen3.5:9b)
             GGUF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
             GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/${GGUF_FILE}"
+            ;;
+        qwen3.5:4b)
+            GGUF_FILE="Qwen3.5-4B-Q4_K_M.gguf"
+            GGUF_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/${GGUF_FILE}"
             ;;
     esac
 }
@@ -873,7 +1003,7 @@ pull_model() {
 
 place_binary() {
     # $1 = path to the extracted binary, $2 = name to install it as (default
-    # "wizard"; the desktop shell goes in beside it as "wizard-desktop").
+    # "wizard"; the native GUI build goes in beside it as "wizard-native").
     # Sets PLACED_PATH to where it landed.
     local src="$1" name="${2:-wizard}"
     chmod 755 "$src"
@@ -901,13 +1031,115 @@ place_binary() {
     PLACED_PATH="${WIZARD_INSTALL_DIR}/${name}"
 }
 
+# The newest published release tag for $REPO, or empty if it cannot be
+# determined. The releases API first; on a rate limit or a proxy that eats it,
+# the /releases/latest redirect, which needs no API budget.
+latest_release_tag() {
+    local tag
+    tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 \
+        | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+    if [ -z "$tag" ]; then
+        tag="$(curl -fsI -o /dev/null -w '%{redirect_url}' \
+            "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
+        tag="${tag##*/}"
+        [ "$tag" = "latest" ] && tag=""
+    fi
+    printf '%s' "$tag"
+}
+
+# Resolve the release tag this run is installing into RESOLVED_TAG: the pinned
+# WIZARD_VERSION if there is one, otherwise whatever GitHub calls the latest
+# release. Once per run, because two callers need the same answer and
+# disagreeing about which release is being installed is exactly the confusion
+# the signature check below exists to catch — and because otherwise every
+# caller pays another API request.
+#
+# Sets a variable rather than printing one: `$(release_tag)` would run the body
+# in a subshell, where the cache it just filled dies with it and the caller sees
+# an empty RESOLVED_TAG.
+#
+# RESOLVED_TAG is left empty when neither source could name a tag, which also
+# means resolve_mirror_base skipped the mirror.
+resolve_release_tag() {
+    [ "$TAG_RESOLVED" = "1" ] && return 0
+    TAG_RESOLVED=1
+    if [ -n "$WIZARD_VERSION" ]; then
+        RESOLVED_TAG="$WIZARD_VERSION"
+    else
+        RESOLVED_TAG="$(latest_release_tag)"
+    fi
+}
+
+# Resolve WIZARD_MIRROR into MIRROR_BASE, once. Empty MIRROR_BASE means "no
+# mirror", which is both the default and what every unusable setting degrades
+# to: a mirror is an optimisation, so a bad one must cost a warning, never an
+# install.
+#
+# The release tag comes from GitHub even when the mirror is on, and the mirror
+# is then read at <mirror>/<tag>/. That is deliberate: it keeps GitHub the
+# authority on *which* version you get, so a mirror that stopped updating can
+# only fail to answer (and be fallen back from), never quietly hold you on an
+# old release. It also means the client never reads the mutable /latest/ prefix,
+# which exists on the mirror for humans and scripts that want a URL that does
+# not change.
+resolve_mirror_base() {
+    [ "$MIRROR_RESOLVED" = "1" ] && return 0
+    MIRROR_RESOLVED=1
+
+    local host="$WIZARD_MIRROR" tag
+    # Case-insensitively, and with `tr` rather than bash 4's ${x,,}: macOS still
+    # ships bash 3.2 and this script runs there. Same off-switches as
+    # `mirror_root` in src/update.rs, so one documented spelling works on both.
+    case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
+        "" | 0 | off | none | false) return 0 ;;
+    esac
+    case "$host" in
+        *://*) ;;
+        *) host="https://${host}" ;;
+    esac
+    host="${host%/}"
+
+    resolve_release_tag
+    tag="$RESOLVED_TAG"
+    if [ -z "$tag" ]; then
+        warn "could not determine the latest release tag, so the download mirror (${host}) is skipped — using GitHub releases"
+        return 0
+    fi
+    MIRROR_BASE="${host}/${tag}"
+    say "Download mirror: ${MIRROR_BASE} (GitHub releases remain the fallback)"
+}
+
 download_release_asset() {
-    # $1 = release asset name, $2 = output path.
-    # Plain curl covers public releases; on a private repo the unauthenticated
-    # asset URL returns plain 404, so fall back to an authenticated
-    # `gh release download` when the gh CLI is available.
+    # $1 = release asset name, $2 = output path. Sets DOWNLOAD_SOURCE to
+    # whoever served it.
+    #
+    # The mirror is tried first and *any* failure falls back to GitHub, which
+    # stays the source of truth. Nothing about verification changes with the
+    # source: this is the only function that fetches a release file, so the
+    # signature check on checksums.txt and the sha256 check on every tarball
+    # are the same checks on the same bytes whichever host answered.
+    #
+    # On the GitHub leg, plain curl covers public releases; on a private repo
+    # the unauthenticated asset URL returns plain 404, so fall back to an
+    # authenticated `gh release download` when the gh CLI is available.
     local asset="$1" out="$2"
+
+    resolve_mirror_base
+    if [ -n "$MIRROR_BASE" ]; then
+        if curl -fsSL -o "$out" "${MIRROR_BASE}/${asset}" 2>/dev/null; then
+            DOWNLOAD_SOURCE="the mirror at ${MIRROR_BASE}"
+            return 0
+        fi
+        rm -f "$out"
+        if [ "$MIRROR_WARNED" = "0" ]; then
+            MIRROR_WARNED=1
+            warn "the download mirror did not serve ${asset} (${MIRROR_BASE}) — falling back to GitHub releases"
+        fi
+    fi
+
     if curl -fsSL -o "$out" "${RELEASE_BASE}/${asset}" 2>/dev/null; then
+        DOWNLOAD_SOURCE="GitHub releases (${REPO})"
         return 0
     fi
     rm -f "$out"
@@ -916,6 +1148,7 @@ download_release_asset() {
         if gh release download ${WIZARD_VERSION:+"$WIZARD_VERSION"} \
             --repo "$REPO" --pattern "$asset" \
             --output "$out" 2>/dev/null; then
+            DOWNLOAD_SOURCE="GitHub releases (${REPO}, authenticated via gh)"
             return 0
         fi
         rm -f "$out"
@@ -923,19 +1156,200 @@ download_release_asset() {
     return 1
 }
 
-verify_checksum() {
-    # $1 = path to the downloaded tarball, $2 = asset name.
-    # Missing checksums.txt (older release) is a warning; a mismatch is fatal.
-    local tarball="$1" asset="$2" sums="${TMP_DIR}/checksums.txt" expected actual
-    if [ ! -f "$sums" ] \
-        && ! download_release_asset "checksums.txt" "$sums"; then
-        warn "release has no checksums.txt — skipping checksum verification"
-        return
+# --- release verification -----------------------------------------------
+#
+# Every downloaded tarball is checked against the release's checksums.txt, and
+# checksums.txt is itself checked against its detached minisign signature
+# (checksums.txt.minisig) under the key above. Both are mandatory: this script
+# has no flag, variable or fallback that installs a binary it could not verify,
+# because it is run as `curl | bash` and the binary it places is then run as
+# you. The way out of a failure is never to skip a check, it is to build from
+# source (WIZARD_BUILD_FROM_SOURCE=1), which trusts the git history instead.
+
+# The tail of every refusal, so the message ends in something to do.
+verify_hint() {
+    printf 'install minisign (Debian/Ubuntu: sudo apt install minisign; macOS: brew install minisign; Alpine: apk add minisign; Nix: nix-shell -p minisign) and re-run, or build from source with WIZARD_BUILD_FROM_SOURCE=1'
+}
+
+# True when this openssl can check an ed25519 signature over raw bytes and hash
+# with blake2b-512, which is what minisign's two algorithms need. Probed rather
+# than assumed: macOS ships LibreSSL as `openssl`, and it has neither, so
+# without this a missing feature would be reported as a bad signature.
+openssl_can_verify() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl pkeyutl -help 2>&1 | grep -q -- '-rawin' || return 1
+    openssl dgst -blake2b512 </dev/null >/dev/null 2>&1
+}
+
+# minisign verification with openssl, for hosts that have no minisign. A
+# .minisig is four lines: an untrusted comment, base64(algorithm, key id and a
+# 64-byte ed25519 signature), a trusted comment, and base64 of a second
+# signature over (signature followed by trusted comment). "ED" signs a blake2b-512
+# prehash of the file, the legacy "Ed" signs the file itself.
+verify_signature_openssl() {
+    local file="$1" sig="$2" work="${TMP_DIR}/minisig" algorithm pub_id sig_id
+    rm -rf "$work"
+    mkdir -p "$work" || return 1
+
+    printf '%s\n' "$WIZARD_RELEASE_PUBKEY" | openssl base64 -d -A >"${work}/pub.bin" 2>/dev/null || return 1
+    [ "$(wc -c <"${work}/pub.bin")" -eq 42 ] || return 1
+    sed -n 2p "$sig" | openssl base64 -d -A >"${work}/sig.bin" 2>/dev/null || return 1
+    [ "$(wc -c <"${work}/sig.bin")" -eq 74 ] || return 1
+
+    # The key id is a hint about which key to reach for, never the check.
+    pub_id="$(dd if="${work}/pub.bin" bs=1 skip=2 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    sig_id="$(dd if="${work}/sig.bin" bs=1 skip=2 count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "$pub_id" = "$sig_id" ] || return 1
+
+    # An ed25519 SubjectPublicKeyInfo is a fixed 12-byte header plus the raw
+    # key, which is how openssl is handed a key minisign stored bare.
+    printf '\060\052\060\005\006\003\053\145\160\003\041\000' >"${work}/key.der" || return 1
+    tail -c 32 "${work}/pub.bin" >>"${work}/key.der" || return 1
+    tail -c 64 "${work}/sig.bin" >"${work}/sig.raw" || return 1
+
+    algorithm="$(dd if="${work}/sig.bin" bs=1 count=2 2>/dev/null)"
+    case "$algorithm" in
+        ED) openssl dgst -blake2b512 -binary "$file" >"${work}/message.bin" 2>/dev/null || return 1 ;;
+        Ed) cp "$file" "${work}/message.bin" || return 1 ;;
+        *)  return 1 ;;
+    esac
+    openssl pkeyutl -verify -pubin -inkey "${work}/key.der" -keyform DER \
+        -rawin -sigfile "${work}/sig.raw" -in "${work}/message.bin" >/dev/null 2>&1 || return 1
+
+    # The trusted comment is inside the signed envelope; verifying it is what
+    # keeps it from being an unauthenticated field riding along in a signed file.
+    {
+        cat "${work}/sig.raw"
+        sed -n 3p "$sig" | sed 's/^trusted comment: //' | tr -d '\n'
+    } >"${work}/global.bin"
+    sed -n 4p "$sig" | openssl base64 -d -A >"${work}/global.sig" 2>/dev/null || return 1
+    openssl pkeyutl -verify -pubin -inkey "${work}/key.der" -keyform DER \
+        -rawin -sigfile "${work}/global.sig" -in "${work}/global.bin" >/dev/null 2>&1
+}
+
+# Check $1 against the detached signature $2. Three outcomes, because the fixes
+# differ: 0 verified, 1 the signature is wrong, 2 this host has nothing that
+# can check one. Two and one are both fatal to the caller.
+verify_signature() {
+    if command -v minisign >/dev/null 2>&1; then
+        minisign -Vqm "$1" -x "$2" -P "$WIZARD_RELEASE_PUBKEY" >/dev/null 2>&1 || return 1
+        return 0
     fi
-    expected="$(awk -v a="$asset" '$2 == a {print $1; exit}' "$sums" || true)"
+    if openssl_can_verify; then
+        verify_signature_openssl "$1" "$2" || return 1
+        return 0
+    fi
+    return 2
+}
+
+# True when the trusted comment $1 names the release tag $2.
+#
+# A whole-word match rather than a fixed wording, mirroring binds_to_tag() in
+# src/update.rs so the installer and `wizard update` agree: the release workflow
+# signs `-t "wizard <tag> checksums, signed by the wizard release key"`, and that
+# sentence must be free to change without breaking verification. What it cannot
+# do is match a *different* release's comment, which is the whole point.
+comment_names_tag() {
+    local comment="$1" tag="$2" words
+    [ -n "$tag" ] || return 1
+    # Everything that is not part of a tag becomes a separator, so the tag has
+    # to sit between two of them: v1.0 must not match "v1.0.0".
+    words=" $(printf '%s' "$comment" | sed 's/[^A-Za-z0-9._-]/ /g') "
+    case "$words" in
+        *" $tag "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Require the signature just verified over $1 (a .minisig) to have been made for
+# the release being installed. Fatal on a mismatch: nothing is installed.
+#
+# Without this, a signature only proves that *some* release was signed by the
+# release key, never which one. Asset names carry no version, so a host serving
+# <mirror>/v2.0.0/ can answer with v1.0.0's genuine, key-signed checksums.txt,
+# signature and tarball: the key id matches, both signatures verify, and every
+# digest matches its own checksums.txt. The user is moved to whichever earlier
+# release the attacker prefers — one with a known hole, say — which is a signed
+# downgrade, and it is what would make SECURITY.md's "a mirror cannot hold you on
+# an old release" false. The mirror is tried before GitHub, so this is the
+# installer's exposure, not a theoretical one.
+#
+# Line 3 of a .minisig is the trusted comment, and it is signed data by the time
+# this runs: minisign -V checks the global signature over it, and
+# verify_signature_openssl checks the same signature itself, so both verification
+# paths have already authenticated the bytes being read here.
+require_signature_names_tag() {
+    local sig="$1" tag comment
+    resolve_release_tag
+    tag="$RESOLVED_TAG"
+    if [ -z "$tag" ]; then
+        # No tag could be resolved, so there is nothing to compare against —
+        # and, because resolve_mirror_base reads the same cached answer, no
+        # mirror was consulted either: these bytes came from GitHub's own
+        # /releases/latest/download. Say so rather than implying a check ran.
+        warn "could not determine the release tag, so the signature was not checked against a specific release (GitHub's latest release served these files; set WIZARD_VERSION=<tag> to pin one)"
+        return 0
+    fi
+    comment="$(sed -n 3p "$sig" | sed 's/^trusted comment: //')"
+    if ! comment_names_tag "$comment" "$tag"; then
+        die "this signature was made for a different release: its signed comment reads \"${comment}\", not ${tag} (served by ${DOWNLOAD_SOURCE:-the release host}). A host that answers a request for one release with another release's genuinely signed files is trying to move you off the version you asked for; nothing was installed. If a new release published seconds ago, retry; otherwise pin one with WIZARD_VERSION=<tag>, or build from source with WIZARD_BUILD_FROM_SOURCE=1"
+    fi
+}
+
+# Die if this script carries the placeholder instead of a real signing key.
+#
+# Called from two places on purpose. verify_release_checksums() is the
+# authoritative gate — it sits ahead of every download that must be verified,
+# including the mirror path, and it is what makes the refusal unbypassable.
+# main() calls it too, before any asset is fetched, so a user on an unsigned
+# release learns that in a second rather than after an 8 MB download. One
+# function rather than two copies of the message, because a security refusal
+# whose two wordings drift apart teaches the reader to trust neither.
+refuse_placeholder_key() {
+    case "$WIZARD_RELEASE_PUBKEY" in
+        RELEASE-SIGNING-KEY-NOT-YET-GENERATED*)
+            die "this install.sh carries no release signing key, so it cannot verify any release; build from source with WIZARD_BUILD_FROM_SOURCE=1, or use an install.sh from a release that has one"
+            ;;
+    esac
+}
+
+# Fetch the release's checksums.txt and verify its signature, once per run.
+# Leaves the verified file at ${TMP_DIR}/checksums.txt. Every failure is fatal:
+# an unverified checksums.txt is not a checksums.txt.
+verify_release_checksums() {
+    local sums="${TMP_DIR}/checksums.txt" sig="${TMP_DIR}/checksums.txt.minisig" rc=0
+    if [ "$CHECKSUMS_VERIFIED" = "1" ]; then
+        return 0
+    fi
+
+    refuse_placeholder_key
+    [ -f "$sums" ] || download_release_asset "checksums.txt" "$sums" \
+        || die "the release published no checksums.txt (or it could not be downloaded), so its binaries cannot be verified; retry, pin a different release with WIZARD_VERSION=<tag>, or build from source with WIZARD_BUILD_FROM_SOURCE=1"
+    download_release_asset "checksums.txt.minisig" "$sig" \
+        || die "the release published no checksums.txt.minisig, so its checksums cannot be authenticated; retry, pin a different release with WIZARD_VERSION=<tag>, or build from source with WIZARD_BUILD_FROM_SOURCE=1"
+
+    verify_signature "$sums" "$sig" || rc=$?
+    case "$rc" in
+        0) ;;
+        2) die "no way to check the release signature on this host: neither minisign nor an openssl with ed25519 and blake2b (macOS ships LibreSSL, which has neither); $(verify_hint)" ;;
+        *) die "release signature verification FAILED: checksums.txt does not match its signature under the wizard release key; the download is corrupted or tampered with, and nothing was installed" ;;
+    esac
+    # Signed by the release key *and* signed for this release; announced only
+    # once both hold, so the line never claims more than was checked.
+    require_signature_names_tag "$sig"
+    say "Release checksums.txt signature verified (minisign${RESOLVED_TAG:+, signed for ${RESOLVED_TAG}})"
+    CHECKSUMS_VERIFIED=1
+}
+
+verify_checksum() {
+    # $1 = path to the downloaded tarball, $2 = asset name. Fatal on anything
+    # that leaves the tarball unverified, including a host with no sha256 tool.
+    local tarball="$1" asset="$2" sums="${TMP_DIR}/checksums.txt" expected actual
+    verify_release_checksums
+    # `sha256sum` writes `<hex>  <name>`, or `<hex> *<name>` in binary mode.
+    expected="$(awk -v a="$asset" '$2 == a || $2 == "*" a {print $1; exit}' "$sums" || true)"
     if [ -z "$expected" ]; then
-        warn "checksums.txt has no entry for ${asset} — skipping checksum verification"
-        return
+        die "the release's signed checksums.txt has no entry for ${asset}, so it cannot be verified; pin a different release with WIZARD_VERSION=<tag>, or build from source with WIZARD_BUILD_FROM_SOURCE=1"
     fi
     # sha256sum on Linux; macOS ships `shasum -a 256` instead.
     if command -v sha256sum >/dev/null 2>&1; then
@@ -943,13 +1357,12 @@ verify_checksum() {
     elif command -v shasum >/dev/null 2>&1; then
         actual="$(shasum -a 256 "$tarball" | awk '{print $1}')"
     else
-        warn "no sha256 tool (sha256sum/shasum) found on PATH — skipping checksum verification"
-        return
+        die "no sha256 tool on PATH, so ${asset} cannot be verified; install coreutils (Debian/Ubuntu: sudo apt install coreutils; Alpine: apk add coreutils) or perl's shasum, or build from source with WIZARD_BUILD_FROM_SOURCE=1"
     fi
     if [ "$actual" != "$expected" ]; then
         die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}) — the download may be corrupted or tampered with; aborting"
     fi
-    say "Checksum verified for ${asset}"
+    say "Checksum and signature verified for ${asset}"
 }
 
 download_binary() {
@@ -958,7 +1371,7 @@ download_binary() {
         warn "skipping prebuilt download on Termux (no Android/Bionic release asset)"
         return
     fi
-    say "Downloading wizard binary from GitHub releases (${REPO}) ..."
+    say "Downloading wizard binary (${REPO}) ..."
     local asset bin assets
     # macOS ships a single per-arch Mach-O asset. On Linux, NixOS can't run the
     # glibc (gnu) binary — no dynamic loader at the FHS path — so prefer the
@@ -975,8 +1388,18 @@ download_binary() {
     for asset in $assets; do
         if download_release_asset "$asset" "${TMP_DIR}/${asset}"; then
             verify_checksum "${TMP_DIR}/${asset}" "${asset}"
-            tar -xzf "${TMP_DIR}/${asset}" -C "$TMP_DIR" || continue
-            bin="$(find "$TMP_DIR" -type f -name wizard | head -n1 || true)"
+            # Unpack each asset into its own directory and search only that.
+            # Extracting them all into a shared TMP_DIR and taking the first
+            # `find` hit lets a rejected binary answer for the asset tried
+            # after it, in whatever order the directory happens to walk —
+            # which would install the very binary the sanity check below
+            # just refused. `fetch_native_binary` unpacks per-asset for the
+            # same reason.
+            local unpack="${TMP_DIR}/unpack-${asset}"
+            rm -rf "$unpack"
+            mkdir -p "$unpack" || continue
+            tar -xzf "${TMP_DIR}/${asset}" -C "$unpack" || continue
+            bin="$(find "$unpack" -type f -name wizard | head -n1 || true)"
             if [ -z "$bin" ]; then
                 warn "no wizard binary inside ${asset}"
                 continue
@@ -991,7 +1414,7 @@ download_binary() {
             place_binary "$bin"
             INSTALLED_PATH="$PLACED_PATH"
             BINARY_INSTALLED=1
-            say "Installed wizard to ${INSTALLED_PATH}"
+            say "Installed wizard to ${INSTALLED_PATH} (from ${DOWNLOAD_SOURCE})"
             return
         fi
     done
@@ -1151,17 +1574,7 @@ resolve_source_ref() {
         printf '%s' "$WIZARD_VERSION"
         return
     fi
-    tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 \
-        | sed -E 's/.*"([^"]+)"$/\1/' || true)"
-    if [ -z "$tag" ]; then
-        # API unavailable (rate limit, proxy): derive the tag from the
-        # /releases/latest redirect instead.
-        tag="$(curl -fsI -o /dev/null -w '%{redirect_url}' \
-            "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)"
-        tag="${tag##*/}"
-        [ "$tag" = "latest" ] && tag=""
-    fi
+    tag="$(latest_release_tag)"
     if [ -n "$tag" ]; then
         printf '%s' "$tag"
     else
@@ -1180,6 +1593,8 @@ build_from_source() {
     git clone --depth 1 --branch "$ref" \
         "https://github.com/${WIZARD_REPO}" "$src_dir" \
         || die "git clone failed — check WIZARD_REPO (${WIZARD_REPO}) and the ref (${ref})"
+    ensure_c_linker \
+        || die "a C linker (cc) is required to build from source and none could be installed — install your distro's compiler package (build-essential on Debian/Ubuntu, gcc on Fedora, base-devel on Arch, build-base on Alpine) and re-run"
     ensure_rust_toolchain
     say "Running cargo build --release (this may take several minutes) ..."
     ( cd "$src_dir" && cargo build --release ) \
@@ -1195,113 +1610,131 @@ build_from_source() {
     say "Installed wizard (built from source) to ${INSTALLED_PATH}"
 }
 
-# --- desktop app (WIZARD_APP=1) -----------------------------------------
+# --- native GUI (WIZARD_NATIVE=1) ---------------------------------------
 
-# The desktop shell (`wizard app`, a webview window over the same GUI) ships as
-# a *separate* binary, `wizard-desktop`, and never replaces `wizard`.
+# `wizard gui` opens an iced window in the agent's own process. iced
+# is behind an off-by-default cargo feature (`Cargo.toml` `[features]` says
+# why), so it needs its own build — and that build ships as a *separate*
+# binary, `wizard-native`, which never replaces `wizard`.
 #
-# It is built with --features desktop, which links the system webview
-# (WebKitGTK on Linux). A binary linked against a library the machine does not
-# have cannot start at all — not the TUI, not the CLI, not `--version`. Keeping
-# the two apart means a desktop app that cannot launch never takes Wizard down
-# with it, and the plain binary keeps its "runs anywhere" promise.
+# Two binaries rather than one, for the same reason the webview shell this
+# replaced had two, minus the webview's reason. There is no shared library to
+# be missing here: the asset links only libc, libm and libgcc_s, because
+# `tiny-skia` means no wgpu and winit reaches X11 and Wayland through `dlopen`
+# at the moment a window opens. What is still true is that the native asset
+# exists only for the gnu and darwin targets — `dlopen` from a fully static
+# musl binary does not work — so on a host where `wizard` itself is the musl
+# build, replacing it with this one would trade a binary that runs anywhere for
+# a binary that runs here. Keeping them apart means the graphical build is
+# strictly additive.
 
-have_webkitgtk() {
-    # Look for the runtime library the binary loads, not the -dev package.
-    ldconfig -p 2>/dev/null | grep -q 'libwebkit2gtk-4\.1\.so' && return 0
-    local dir
-    for dir in /usr/lib /usr/lib64 /lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
-        [ -e "${dir}/libwebkit2gtk-4.1.so.0" ] && return 0
-    done
-    return 1
-}
-
-webkitgtk_hint() {
-    warn "the desktop app needs the system webview (WebKitGTK 4.1), which is not installed:"
-    printf '    Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0\n' >&2
-    printf '    Fedora:        sudo dnf install webkit2gtk4.1\n' >&2
-    printf '    Arch:          sudo pacman -S webkit2gtk-4.1\n' >&2
-    printf '    NixOS:         nix run github:%s -- app   (the flake carries it)\n' "$WIZARD_REPO" >&2
-    printf '\n' >&2
-}
-
-desktop_asset_name() {
+native_asset_name() {
     case "$OS" in
-        macos) printf 'wizard-desktop-%s-apple-darwin.tar.gz' "$ARCH" ;;
-        # No musl desktop asset: a static binary cannot load a system webview.
-        *)     printf 'wizard-desktop-%s-unknown-linux-gnu.tar.gz' "$ARCH" ;;
+        macos) printf 'wizard-native-%s-apple-darwin.tar.gz' "$ARCH" ;;
+        # No musl native asset: see above.
+        *)     printf 'wizard-native-%s-unknown-linux-gnu.tar.gz' "$ARCH" ;;
     esac
 }
 
-fetch_desktop_binary() {
-    # Prints the path to a runnable desktop binary on success; returns nonzero
-    # if it could not be obtained. Mirrors download_binary / build_from_source.
+# Sets NATIVE_BIN to a runnable native-GUI binary; returns nonzero if one
+# could not be obtained. Mirrors download_binary / build_from_source.
+#
+# The path comes back in a global, and the caller must never wrap this in
+# `$(…)`. verify_checksum below reaches die() on a digest mismatch, an
+# unsignable release or a signature that does not verify, and inside a command
+# substitution that `exit 1` ends only the subshell: the install would carry on,
+# report "no runnable native build", and finish 0 after refusing a tampered
+# asset. Nothing unverified would be installed either way, but "every failure
+# aborts" (SECURITY.md) would be false and the user would be told the wrong
+# reason. This is the only place in the script where a die() sits under a
+# function that a caller could capture, so it is kept uncapturable instead.
+fetch_native_binary() {
     local asset bin src_dir
+    NATIVE_BIN=""
     if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
         src_dir="${TMP_DIR}/wizard-src"
         [ -d "$src_dir" ] || return 1
-        say "Building the desktop shell from source (--features desktop) ..." >&2
-        ( cd "$src_dir" && cargo build --release --features desktop >&2 ) || return 1
+        say "Building the native GUI from source (--features native) ..."
+        ( cd "$src_dir" && cargo build --release --features native ) || return 1
         bin="${src_dir}/target/release/wizard"
     else
-        asset="$(desktop_asset_name)"
+        asset="$(native_asset_name)"
         download_release_asset "$asset" "${TMP_DIR}/${asset}" || return 1
-        verify_checksum "${TMP_DIR}/${asset}" "$asset" >&2
-        local unpack="${TMP_DIR}/desktop"
+        verify_checksum "${TMP_DIR}/${asset}" "$asset"
+        local unpack="${TMP_DIR}/native"
         mkdir -p "$unpack"
         tar -xzf "${TMP_DIR}/${asset}" -C "$unpack" || return 1
         bin="$(find "$unpack" -type f -name wizard | head -n1 || true)"
     fi
     [ -n "$bin" ] && [ -f "$bin" ] || return 1
     chmod 755 "$bin"
-    # The sanity check also catches a missing WebKitGTK: the dynamic loader
-    # fails before main, so even `--version` exits nonzero.
+    # `--version` returns before any window is opened, so this proves the
+    # binary links and reaches main without needing a display.
     "$bin" --version >/dev/null 2>&1 || return 1
-    printf '%s' "$bin"
+    NATIVE_BIN="$bin"
 }
 
-install_desktop_app() {
-    [ "$WIZARD_APP" = "1" ] || return 0
+install_native_gui() {
+    [ "$WIZARD_NATIVE" = "1" ] || return 0
 
     printf '\n'
-    say "Desktop app (WIZARD_APP=1): the GUI in a native window"
+    say "Native GUI (WIZARD_NATIVE=1): the agent in its own window"
 
     if is_termux; then
-        warn "the desktop app is not supported on Termux (no system webview integration)"
-        warn "use the TUI ('wizard') — skipping WIZARD_APP"
+        warn "the native GUI is not supported on Termux (no display server, no Bionic asset)"
+        warn "use the TUI ('wizard') — skipping WIZARD_NATIVE"
         return 0
     fi
 
-    if [ "$OS" = "linux" ] && ! have_webkitgtk; then
-        webkitgtk_hint
-        warn "skipping the desktop app — install WebKitGTK, then re-run with WIZARD_APP=1"
-        warn "('wizard gui' works today: the same interface, in your browser)"
+    # A verification failure never lands here: verify_checksum aborts the whole
+    # install rather than returning, so reaching this branch means the asset
+    # could not be fetched, held no wizard binary, or does not run on this host.
+    if ! fetch_native_binary; then
+        warn "could not install the native GUI for ${OS}/${ARCH} (no native asset could be fetched, or the build inside it does not run here)"
+        warn "use the TUI ('wizard') — 'wizard gui' needs this build, and the browser GUI is gone"
         return 0
     fi
 
-    local bin
-    if ! bin="$(fetch_desktop_binary)"; then
-        warn "could not install the desktop app for ${OS}/${ARCH} (no runnable desktop build)"
-        warn "'wizard gui' still serves the same interface in your browser"
-        return 0
-    fi
-
-    place_binary "$bin" "wizard-desktop"
-    DESKTOP_PATH="$PLACED_PATH"
-    DESKTOP_INSTALLED=1
-    say "Installed wizard-desktop to ${DESKTOP_PATH}"
-
-    # Put it in the launcher (Linux: ~/.local/share/applications; macOS:
-    # ~/Applications/Wizard.app). Idempotent, and never fatal — a failure here
-    # leaves a working `wizard-desktop app` on the command line.
-    if "$DESKTOP_PATH" app --install; then
-        say "Wizard is in your launcher — search for it, or run 'wizard-desktop app'"
-    else
-        warn "could not add Wizard to the launcher — run '${DESKTOP_PATH} app --install' by hand"
-    fi
+    place_binary "$NATIVE_BIN" "wizard-native"
+    NATIVE_PATH="$PLACED_PATH"
+    NATIVE_INSTALLED=1
+    say "Installed wizard-native to ${NATIVE_PATH}"
 }
 
 # --- config -------------------------------------------------------------
+
+# Rewrite the first `model = …` line of $1 to name the model $2, in place.
+#
+# awk reading the tag out of the environment, rather than sed with it spliced
+# into the script: the tag is user input (WIZARD_MODEL), `|` was this sed's own
+# delimiter — so WIZARD_MODEL='a|b' made sed exit non-zero and, under `set -e`,
+# aborted the installer *after* the binary was already in place — and `&` and
+# `\1` are replacement syntax in every sed there is. Nothing is interpolated
+# here, so the tag is used literally whatever it contains.
+#
+# The first line only. `s|…|…|` with no address rewrites every match, so a
+# config with two `[[providers]]` blocks had *both* models replaced while the
+# caller said "other settings preserved". The caller has already established
+# there is exactly one.
+rewrite_model_line() {
+    local cfg="$1" tmp
+    tmp="${cfg}.wizard-new.$$"
+    if ! WIZARD_NEW_MODEL="$2" awk '
+        BEGIN { done = 0 }
+        done == 0 && /^[[:space:]]*model[[:space:]]*=/ {
+            printf "model = \"%s\"\n", ENVIRON["WIZARD_NEW_MODEL"]
+            done = 1
+            next
+        }
+        { print }
+    ' "$cfg" >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    # Truncate and rewrite rather than `mv`, so the file keeps its own mode.
+    cat "$tmp" >"$cfg"
+    rm -f "$tmp"
+}
 
 write_config() {
     local cfg="$HOME/.wizard/config.toml"
@@ -1323,13 +1756,25 @@ write_config() {
     if [ -f "$cfg" ]; then
         if [ "$WIZARD_BYOM" = "1" ]; then
             # Don't clobber an existing config — only record the chosen model.
-            if grep -qE '^[[:space:]]*model[[:space:]]*=' "$cfg"; then
-                sed -i.wizard-bak -E "s|^[[:space:]]*model[[:space:]]*=.*|model = \"${MODEL}\"|" "$cfg"
-                rm -f "${cfg}.wizard-bak"
-            else
+            #
+            # A `model =` line belongs to a provider block, and a config can
+            # declare several. Rewriting all of them would repoint providers
+            # the user never mentioned at a model they may not serve, so more
+            # than one is a case this script refuses to guess at rather than
+            # get wrong quietly.
+            local model_lines
+            model_lines="$(grep -cE '^[[:space:]]*model[[:space:]]*=' "$cfg" || true)"
+            if [ "$model_lines" -eq 0 ]; then
                 printf 'model = "%s"\n' "$MODEL" >>"$cfg"
+                say "Added model = \"${MODEL}\" to the existing config (other settings preserved)"
+            elif [ "$model_lines" -eq 1 ]; then
+                rewrite_model_line "$cfg" "$MODEL" \
+                    || die "could not update the model in ${cfg}"
+                say "Updated model = \"${MODEL}\" in the existing config (other settings preserved)"
+            else
+                say "Existing config at ${cfg} declares ${model_lines} models, one per provider — leaving it untouched"
+                say "Set the model with /provider inside wizard, or edit ${cfg}"
             fi
-            say "Updated model = \"${MODEL}\" in existing config (other settings preserved)"
             return
         fi
         say "Existing config found at ${cfg} — leaving it untouched"
@@ -1551,8 +1996,17 @@ tool_scope = ["read_file", "write_file", "edit_file", "list_files", "search_file
 
 system_prompt = """
 You are the documenter subagent of Wizard, a local agent. Your job is to
-produce documentation that is accurate, clear, and matched to the actual code —
+produce documentation that is accurate, clear, and matched to the actual code:
 READMEs, docs pages, usage examples, and doc comments.
+
+Voice:
+- Sound human-written. Short sentences. Plain words. No filler.
+- No slop: skip hype, throat-clearing, and vague claims ("powerful", "seamless",
+  "robust", "in today's world", "it's worth noting"). Cut anything that does not
+  help the reader do or understand something.
+- Be concise. Prefer one clear paragraph or a tight list over a long essay.
+- Do not use em dashes (—) unless the user explicitly asks for them. Use commas,
+  periods, colons, or parentheses instead.
 
 Method:
 1. Read the relevant code and any existing docs before writing a word. Your
@@ -1560,7 +2014,8 @@ Method:
    to do. Trace function signatures, public APIs, config keys, CLI flags, and
    defaults to their source.
 2. Match the existing documentation's voice, structure, and formatting. Reuse
-   established headings and conventions; do not invent a new style.
+   established headings and conventions; do not invent a new style. Still apply
+   the Voice rules above unless the surrounding docs clearly require otherwise.
 3. Write for the reader: lead with what the thing is and how to use it, then
    details. Prefer concrete, runnable examples over abstract description.
 
@@ -1568,7 +2023,7 @@ Rules:
 - Never document behavior you have not verified in the source. Do not invent
   flags, options, return values, or benchmarks. If something is ambiguous, note
   the ambiguity rather than guessing.
-- Keep examples correct and minimal — every command or snippet you show should
+- Keep examples correct and minimal. Every command or snippet you show should
   actually work as written.
 - Edit only documentation and comments. Do not change application logic; if you
   notice a code bug while documenting, report it rather than fixing it.
@@ -1622,6 +2077,22 @@ main() {
         fi
     fi
 
+    # Refuse an unsignable release *before* any of the flavors below, not just
+    # before the binary download further down.
+    #
+    # The flavors are where the bytes are: WIZARD_LOCAL installs llama.cpp and
+    # pulls a hardware-tiered GGUF, which is several gigabytes and can be
+    # twenty; WIZARD_USE_OLLAMA installs Ollama and pulls a model. Refusing
+    # after that is refusing after the expensive part, and the first version of
+    # this guard did exactly that — it sat below the flavor block, so
+    # `WIZARD_LOCAL=1` downloaded a model and then declined to install the
+    # binary that would have used it.
+    #
+    # Skipped when building from source, which needs no signature at all.
+    if [ "$WIZARD_BUILD_FROM_SOURCE" != "1" ]; then
+        refuse_placeholder_key
+    fi
+
     if [ "$WIZARD_MINIMAL" = "1" ]; then
         say "Minimal install (WIZARD_MINIMAL=1): binary only — no model runtime, model, config, or loadout"
     elif [ "$WIZARD_BYOM" = "1" ]; then
@@ -1655,6 +2126,9 @@ main() {
     if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
         build_from_source
     else
+        # The early refusal above has already run for this path;
+        # verify_release_checksums() refuses again on the way past, and that
+        # one is the authoritative gate.
         download_binary
         if [ "$BINARY_INSTALLED" != "1" ]; then
             say "No prebuilt binary found; falling back to building from source ..."
@@ -1665,11 +2139,11 @@ main() {
     install_toolchain
     write_config
     install_loadout
-    install_desktop_app
+    install_native_gui
 
     printf '\n'
-    if [ "$DESKTOP_INSTALLED" = "1" ]; then
-        say "Desktop app installed. Open Wizard from your launcher, or run: wizard-desktop app"
+    if [ "$NATIVE_INSTALLED" = "1" ]; then
+        say "Native GUI installed. Open the window with: wizard-native gui"
     fi
     if [ "$BINARY_INSTALLED" = "1" ]; then
         if is_termux; then
@@ -1690,4 +2164,11 @@ main() {
     fi
 }
 
-main "$@"
+# Sourced with WIZARD_SELFTEST=1, the script stops here: every function above is
+# defined and nothing is installed, so the suite can drive the download and
+# verification helpers directly against a stub `curl` (see the installer tests in
+# `src/update.rs`). Any other invocation runs the installer, which is what the
+# `curl | bash` one-liner does.
+if [ "${WIZARD_SELFTEST:-0}" != "1" ]; then
+    main "$@"
+fi

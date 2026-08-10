@@ -1,13 +1,13 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui TUI, a headless/sovereign loop, a browser GUI, and several other surfaces (ACP, MCP server, gateway, fleet, scheduler) on top of one provider-agnostic agent loop. The tool set is native tools plus MCP servers plus scripted tools, with tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, xAI (key or OAuth), ChatGPT OAuth, OpenRouter, Cloudflare Workers AI, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
+Wizard is a single-binary Rust application: a Ratatui TUI, a headless/sovereign loop, an iced window (`--features native`), and several other surfaces (ACP, MCP server, gateway, fleet, scheduler) on top of one provider-agnostic agent loop. The tool set is native tools plus MCP servers plus scripted tools, with tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, xAI (key or OAuth), ChatGPT OAuth, OpenRouter, Cloudflare Workers AI, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
 
 ## High-level overview
 
 ```mermaid
 flowchart TB
     subgraph install [install.sh]
-        A[detect OS + arch] --> D[download wizard binary]
+        A[detect OS + arch] --> D["obtain wizard binary (download, or cargo build)"]
         D --> E["lay down ~/.wizard/ loadout"]
     end
 
@@ -15,7 +15,7 @@ flowchart TB
         CLI[clap CLI] --> Mode{surface}
         Mode -->|genie| TUI[ratatui TUI]
         Mode -->|sovereign / continuous| Headless[autonomous loop]
-        Mode -->|gui / app| GUI[browser GUI]
+        Mode -->|gui| GUI["iced window (native)"]
         Mode -->|acp / mcp-serve / gateway| Other[other surfaces]
         TUI --> Agent[agent loop]
         Headless --> Agent
@@ -29,7 +29,7 @@ flowchart TB
         Agent --> Skills[skills loader]
         TUI --> Evolve["/evolve"]
         Evolve -->|tier 1| Live[register skill / MCP / scripted tool + reload]
-        Evolve -->|tier 2 --deep| Build[fetch source + cargo build + install + restart]
+        Evolve -->|tier 2 --deep| Build[fetch source + cargo build + cargo test + install + restart]
     end
 
     install --> runtime
@@ -43,21 +43,28 @@ wizard/
 │   ├── main.rs / lib.rs     # entry, surface dispatch
 │   ├── cli.rs               # clap argument parsing
 │   ├── config.rs            # ~/.wizard/config.toml
-│   ├── app/ / ui.rs / event.rs / vim.rs
+│   ├── app/ / ui/ / event.rs / vim.rs
 │   ├── agent/               # tool-calling loop, prompts, subagents, mission, ultra
 │   ├── server.rs            # llama-server lifecycle
 │   ├── llm/                 # LlmProvider + per-vendor clients (incl. fusion, oauth)
 │   ├── mcp/                 # MCP client and mcp-serve server
 │   ├── tools/               # native tools + registry + scripted
 │   ├── evolve/              # tiered self-extension + publish
-│   ├── gui/                 # browser GUI HTTP/WS server
+│   ├── gui/                 # the window's agent half: tasks, config store, git, OAuth (`native`)
 │   ├── gateway/             # messaging bot (Telegram)
 │   ├── fleet/               # parallel worktree workers
+│   ├── mesh/                # peer discovery, QUIC transport, `wizard peers`
+│   ├── graph/               # mesh graph model for the explorer
+│   ├── commands/            # slash-command registry, shared by every surface
+│   ├── platform/            # OS seams: paths, service units, secrets, locks
 │   ├── schedule.rs          # cron-scheduled headless runs
 │   ├── git_util.rs          # shared async git / worktree helpers
 │   ├── hooks/               # pre/post tool hooks
+│   ├── trust.rs             # per-project trust gate for project-shipped hooks
+│   ├── logging.rs           # JSONL session log under ~/.wizard/logs (never stdio)
+│   ├── doctor.rs            # environment checks + redacted bug-report bundles
 │   ├── acp.rs               # Agent Client Protocol surface
-│   ├── desktop.rs           # wizard app (system webview)
+│   ├── native/              # wizard gui (iced window, `native` feature)
 │   ├── sync.rs              # signed config bundles
 │   ├── memory.rs / checkpoint.rs / usage.rs / update.rs / …
 │   └── skills/              # bundled skill loader
@@ -84,12 +91,12 @@ Parses arguments and selects the surface:
 | `--publish` | Fork-and-distribute |
 | `--max-hours` / `--loop` | Sovereign run limits |
 | `--cwd` | Project root override |
-| `--bg` | Detached background session (dashboard) |
+| `--bg` | Internal (hidden): marks a headless run dispatched from `/dashboard` |
 | `--output-format text\|json\|stream-json` | Headless output |
-| `wizard gui` / `wizard app` | Browser GUI / desktop webview |
+| `wizard gui` | The iced window (needs `--features native`; `--native` is still accepted and ignored) |
 | `wizard acp` | Agent Client Protocol over stdio |
 | `wizard mcp-serve` | Expose native tools as an MCP server |
-| `wizard agents` / `doctor` / `usage` / `update` / `sync` / `fleet` / `schedule` / … | Utility subcommands |
+| `wizard agents` / `doctor` / `usage` / `sync` / `fleet` / `schedule` / `scheduler` / `gateway` / `peers` / `skills` / `harness` / `evolve` / `resume` / `update` / … | Utility subcommands (`update` exists but refuses every download today — see [Install scripts](#install-scripts)) |
 
 ### Config (`config.rs`)
 
@@ -165,9 +172,10 @@ Base64 stays on the `ChatMessage` in history for vision models. A tool's images 
 | `search_files` | Ripgrep/grep content search |
 | `execute` | Run shell command with timeout; `run_in_background` detaches ([tasks.md](tasks.md)) |
 | `git_status` / `git_diff` | Working tree status and diffs |
-| `web_fetch` / `web_search` | HTTP fetch and search ([web.md](web.md)) |
+| `web_fetch` / `web_search` / `x_search` | HTTP fetch, web search, and X/Twitter search ([web.md](web.md)) |
 | `generate_image` | Image generation ([image.md](image.md)) |
 | `memory` / `todo` | Durable project memory and working todo list |
+| `manual` | Read one section of the charter (`WIZARD.md`) in full; the system prompt carries only its index |
 | `task_output` / `task_kill` | Background shell task controls |
 | `subagent_status` / `subagent_kill` | Background subagent controls |
 | `run_command` | Queue a Wizard slash command for the attached surface ([usage.md](usage.md#agent-run-slash-commands)) |
@@ -184,14 +192,18 @@ Beyond the built-ins, the registry also serves scripted tools (`~/.wizard/tools/
 
 Wizard is both an MCP client and an MCP server:
 
-- **Client:** servers in `~/.wizard/mcp.toml` (stdio or HTTP). On startup and `/reload`, tools are listed and merged into the registry. This is the path for browser control, computer use, databases, and similar.
+- **Client:** servers in `~/.wizard/mcp.toml` (stdio or HTTP). On startup and `/reload`, tools are listed and merged into the registry. This is the path for browser control, databases, search, and similar. (Computer use is not one of them: `computer` is a native tool.)
 - **Server:** `wizard mcp-serve` exposes the native tool set over stdio. See [mcp.md](mcp.md).
+
+### Mesh (`mesh/`, `graph/`)
+
+Peer-to-peer visibility between your own machines: discovery, a QUIC transport with per-peer trust, and `wizard peers` to list, trust, and watch them. It is an **observation** layer — a peer's turn arrives as an event you can watch. (The graph explorer that draws it is deferred and unreachable in 2.0; see [graph-explorer.md](graph-explorer.md).) It does not distribute work: there is no task frame on the wire and nothing in a shipping path hands a peer a job. See [mesh.md](mesh.md). Nothing accepts a connection until `[mesh] listen` is configured.
 
 ### Subagents (`agent/subagent.rs`)
 
 Isolated workers for parallel or decomposed work:
 
-- Each subagent gets its own history and tool scope (no step ceiling by default)
+- Each subagent gets its own history and tool scope, and a 50-step ceiling unless its file sets `max_steps` (`0` = no ceiling)
 - Results return to the parent as one tool result
 - `spawn_subagent` can detach (`background: true`); the report lands when finished
 - Runs emit `SubagentRun*` events; the TUI demuxes them onto the [subagent rail](usage.md#the-subagent-rail)
@@ -212,18 +224,18 @@ Triggered by `/evolve`, the `evolve` tool, or `--evolve` on the CLI. Two tiers; 
 1. Locate source at `~/.wizard/src` (clone on first use; `WIZARD_SOURCE_REPO` overrides the URL)
 2. Ensure a Rust toolchain (`rustup --profile minimal` if needed)
 3. Propose a unified diff (file-selection turn, then diff-authoring turn)
-4. `cargo build --release` and a `--version` smoke test
-5. Install over the running binary (keep `<name>.prev`); fall back to the build tree if the install path is not writable
+4. Clear the gate: `cargo build --release --locked`, then `cargo test --release --locked` (bounded by `WIZARD_EVOLVE_TEST_TIMEOUT_SECS`, 45 min default), then a `--version` smoke test. `--locked` is on the build because that is the first cargo invocation to touch `Cargo.lock`. Any rung failing reverts the diff and logs the failure
+5. Install over the running binary (keep `<name>.prev`). No `sudo` escalation here: an unwritable install path fails the evolve after the source commit, naming the built binary and the `sudo install` command to finish by hand
 6. Restart into the new binary when the surface supports it (CLI `exec`-replace, continuous re-exec marker; interactive sessions report and expect a restart)
 
 Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard/src` to a GitHub fork ([market.md](market.md)).
 
 ### Surfaces
 
-- **TUI** (`app/`, `ui.rs`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
+- **TUI** (`app/`, `ui/`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
 - **Headless** (`agent` + `output.rs`): text / JSON / stream-json ([headless.md](headless.md))
-- **GUI / app** (`gui/`, `desktop.rs`): same agent core over HTTP/WS; system webview for `wizard app` ([desktop.md](desktop.md))
-- **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md))
+- **Window** (`src/native/` drawing, `src/gui/` holding the agent; both `--features native`): the same agent core in-process, in an iced window — no HTTP, no webview, no port ([native-gui.md](native-gui.md)). There is no browser GUI: the loopback HTTP server and JavaScript page that used to be the second surface are deleted. A headless box is reached by running the TUI over SSH, by `wizard -p`, by `wizard acp`, or through the gateway
+- **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md)); also the surface Buzz and other ACP harnesses drive ([buzz.md](buzz.md))
 - **Gateway** (`gateway/`): Telegram bot turns ([gateway.md](gateway.md))
 - **Fleet / schedule / sync / doctor / update**: see the matching docs pages
 
@@ -233,11 +245,12 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 |------|----------|
 | `~/.wizard/config.toml` | User configuration |
 | `~/.wizard/credentials.toml` | API keys (mode 0600) |
-| `~/.wizard/xai_oauth.json` / `chatgpt_oauth.json` | OAuth sessions (mode 0600) |
+| `~/.wizard/xai_oauth.json` / `chatgpt_oauth.json` | OAuth sessions (created mode 0600; `wizard doctor`'s secret-storage check reports one that is loose anyway) |
 | `~/.wizard/models/*.gguf` | Downloaded GGUF model files |
 | `~/.wizard/llama.cpp/` | llama.cpp release tree from the installer |
 | `~/.wizard/llama-server.log` / `.pid` | Managed llama-server |
 | `~/.wizard/mcp.toml` | MCP server declarations |
+| `~/.wizard/schedule.toml` / `scheduler.lock` | Cron entries, and the daemon's single-instance lock |
 | `~/.wizard/subagents/*.toml` | Subagent definitions |
 | `~/.wizard/tools/` | Agent-authored scripted tools (LuaJIT by default) |
 | `~/.wizard/src/` | Source checkout for deep evolve |
@@ -248,11 +261,14 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 | `~/.wizard/usage.jsonl` | Token usage log |
 | `~/.wizard/running/` | Live session heartbeats for `wizard agents` |
 | `~/.wizard/sync/` | Sync key, trusted keys, pull backups |
-| `~/.wizard/logs/` | Debug traces |
+| `~/.wizard/trusted_projects` | Per-project trust decisions for project hooks (mode 0600) |
+| `~/.wizard/logs/` | Per-process JSONL diagnostic logs, filtered by `WIZARD_LOG` ([logging.md](logging.md)) |
+| `~/.wizard/bundles/` | `wizard doctor --bundle` bug-report bundles (mode 0700) |
 | `<project>/.wizard/loop-control` | Sovereign/continuous run control |
 | `<project>/.wizard/mission.toml` | Continuous-mode durable mission |
 | `<project>/.wizard/plan.md` | Last plan-mode plan |
 | `<project>/.wizard/checkpoints/` | Per-file edit snapshots for `/rewind` |
+| `<project>/.wizard/fleet/` | Fleet queue, results, worktrees, logs ([fleet.md](fleet.md)) |
 
 ## Install scripts
 
@@ -260,7 +276,9 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 
 By default: binary + [default loadout](loadout.md) (browser MCP + subagents). No model, no config, no Rust toolchain. First `wizard` run opens onboarding.
 
-Flavors: `WIZARD_LOCAL=1` preinstalls the local stack; `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor; `WIZARD_BYOM=1` sets up Ollama and defers the model choice; `WIZARD_MINIMAL=1` is binary only (`WIZARD_BESPOKE=1` is a deprecated alias). Deep-evolve toolchain installs on first `/evolve --deep`, or eagerly with `WIZARD_WITH_TOOLCHAIN=1`.
+**In v2.0.0 the download path refuses.** `wizard-release.pub` is a placeholder rather than a real minisign public key, so `install.sh` aborts before fetching anything and `wizard update` does the same; no published release carries a signature to check either. `WIZARD_BUILD_FROM_SOURCE=1` (implied on Termux) is the path that works, along with Nix and a plain checkout. The refusal comes first, before any flavor does its work, so `WIZARD_LOCAL=1` declines in about a second rather than after a multi-gigabyte GGUF. Details in [Getting started](getting-started.md#install).
+
+Flavors: `WIZARD_LOCAL=1` preinstalls the local stack; `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor; `WIZARD_BYOM=1` sets up Ollama and defers the model choice; `WIZARD_MINIMAL=1` is binary only (`WIZARD_BESPOKE=1` is a deprecated alias). `WIZARD_NATIVE=1` additionally installs `wizard-native`, the build with the iced window. Deep-evolve toolchain installs on first `/evolve --deep`, or eagerly with `WIZARD_WITH_TOOLCHAIN=1`.
 
 ### `install-byom.sh`
 
@@ -273,7 +291,6 @@ Back-compat shim: downloads `install.sh` and runs it with `WIZARD_BYOM=1`.
 | `ratatui` + `crossterm` | Terminal UI |
 | `tokio` | Async runtime |
 | `reqwest` | Provider HTTP |
-| `axum` | GUI HTTP/WS |
 | `clap` | CLI parsing |
 | `serde` / `serde_json` | Serialization |
 | `toml` + `dirs` | Config |
@@ -284,9 +301,10 @@ Target release binary: well under 60 MB stripped (current builds are much smalle
 ## Security model
 
 - Inference goes to the active provider and nowhere else
-- Beyond the active provider, the core makes outbound calls only for things you invoke: native web tools, the messaging gateway, model download at install, deep evolve's source clone. MCP servers and scripted tools you add can make their own calls; they run with your privileges
+- Beyond the active provider, the core makes outbound calls only for things you invoke or configure: native web tools, the messaging gateway, model download at install, deep evolve's source clone, the skills registry (`wizard skills`), `wizard sync pull` from a URL, `wizard update`'s release check, and the mesh's QUIC dials to peers you gave routes for. MCP servers and scripted tools you add can make their own calls; they run with your privileges
 - The `execute` tool runs real shell commands and cannot be confined to the working directory. Treat tool execution as full local access
 - There is no per-action y/n gate outside plan mode and hooks. Genie is interactive; sovereign runs one task unattended; continuous is perpetual. Prefer a container or VM for untrusted work. Full threat model in [SECURITY.md](../SECURITY.md)
+- A project's own `.wizard/hooks.toml` loads only after a recorded per-project trust decision (`~/.wizard/trusted_projects`); with no terminal to ask on, it is refused unless `WIZARD_TRUST_PROJECT=1` opts that one process in, and a recorded refusal outranks even that. See [hooks.md](hooks.md#project-trust)
 
 ## Roadmap-shaped ideas
 
@@ -294,4 +312,4 @@ Not commitments, just directions that have come up:
 
 - Plugin marketplace (dynamic `.so` / WASM)
 - Richer ACP surface (images, todos, subagent events)
-- Deeper GUI parity with every TUI command
+- Deeper window parity with every TUI command

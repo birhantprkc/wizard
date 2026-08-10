@@ -5,12 +5,14 @@
 
 pub mod command;
 pub mod compact;
+pub mod computer;
 pub mod evolve;
 pub mod file;
 pub mod git;
 pub mod image;
 pub mod interview;
 pub mod lua;
+pub mod manual;
 pub mod memory;
 pub mod plan;
 pub mod publish;
@@ -91,10 +93,10 @@ impl CommandDispatch {
             // page, and the model deserves the real reason rather than a shrug
             // it will read as a bug and retry around.
             CommandDispatch::Only(names) => Err(match crate::commands::spec(name).map(|s| s.gui) {
-                Some(crate::commands::Execution::Client) => format!(
+                Some(crate::commands::Execution::Ui) => format!(
                     "'/{name}' belongs to the user's window, not the agent — they open it, you cannot"
                 ),
-                Some(crate::commands::Execution::Terminal) => {
+                Some(crate::commands::Execution::Unavailable) => {
                     format!("'/{name}' runs only in a terminal session, and this one is not")
                 }
                 _ => {
@@ -127,11 +129,18 @@ pub struct ToolContext {
     /// approval round-trip) can reach it. `None` outside the dispatch
     /// pipeline (subagents, direct registry execution).
     pub events: Option<tokio::sync::mpsc::Sender<crate::agent::AgentEvent>>,
-    /// Cooperative "background the current foreground command" handle. The
-    /// TUI keeps a clone (see [`crate::agent::Agent::background_gate`]) and
-    /// fires it on Ctrl-B; a running `execute` selects on it and promotes the
-    /// child into the background task registry. `None` outside an agent.
-    pub background: Option<crate::agent::BackgroundGate>,
+    /// The running turn's cancel handle, set by the agent at construction. A
+    /// tool that can park for as long as a human takes to answer has to observe
+    /// this itself: the agent loop only checks cancellation *between* tool
+    /// calls, so Ctrl-C during a two-minute install would otherwise do nothing
+    /// until the turn task was aborted out from under the child. `None` outside
+    /// an agent.
+    pub cancel: Option<crate::agent::CancelHandle>,
+    /// Whether a human is attached to this run and can answer a command that
+    /// prompts on stdin. Set by the surface's agent builder;
+    /// [`ConsoleAccess::None`] everywhere else, which is the behaviour every
+    /// command had before consoles existed.
+    pub console: ConsoleAccess,
     /// Settings for the native web tools (`[web]` in `config.toml`), set by
     /// the agent at construction; defaults elsewhere.
     pub web: Arc<crate::config::WebConfig>,
@@ -167,7 +176,8 @@ impl ToolContext {
             subagents: Arc::new(subagent_tasks::SubagentTaskRegistry::new()),
             todos: Arc::new(Mutex::new(todo::TodoList::new())),
             events: None,
-            background: None,
+            cancel: None,
+            console: ConsoleAccess::None,
             web: Arc::new(crate::config::WebConfig::default()),
             checkpoints: None,
             images: None,
@@ -178,6 +188,13 @@ impl ToolContext {
 
     /// Declare which queued slash commands the attached surface will run
     /// (see [`CommandDispatch`]). Anything but `None` enables `run_command`.
+    ///
+    /// Nothing calls this. Every surface declares it after the agent exists,
+    /// through [`crate::agent::Agent::set_command_dispatch`] — the TUI, ACP
+    /// and the browser GUI all do. Kept as the builder-time spelling of the
+    /// same field for a caller assembling a registry by hand, and named here
+    /// so the next reader does not go looking for the builder call that wires
+    /// the real surfaces.
     pub fn with_command_dispatch(mut self, dispatch: CommandDispatch) -> Self {
         self.command_dispatch = dispatch;
         self
@@ -217,17 +234,61 @@ impl ToolContext {
         }
     }
 
-    /// This context with the session's background-promote gate attached
-    /// (agent construction).
-    pub fn with_background(mut self, gate: crate::agent::BackgroundGate) -> Self {
-        self.background = Some(gate);
+    /// This context with the turn's cancel handle attached (agent
+    /// construction), so a tool that can block for a long time observes Ctrl-C
+    /// rather than being torn down under it.
+    pub fn with_cancel(mut self, cancel: crate::agent::CancelHandle) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Declare whether a human can answer a command that prompts (see
+    /// [`ConsoleAccess`]).
+    ///
+    /// Not "set by the surface's agent builder", which is what this said: the
+    /// surfaces call [`crate::agent::Agent::set_console_access`] instead, and
+    /// nothing calls this. Same standing as
+    /// [`Self::with_command_dispatch`] above.
+    pub fn with_console(mut self, console: ConsoleAccess) -> Self {
+        self.console = console;
         self
     }
 }
 
+/// Whether a human is attached to this run and could answer a shell command
+/// that asks a question on stdin.
+///
+/// This is a declaration by the surface, exactly like [`CommandDispatch`], and
+/// for the same reason: only the surface knows whether there is a person in
+/// front of it, and a tool that guessed would guess wrong in the two directions
+/// that matter. Guessing *yes* in a headless run leaves a child blocked on a
+/// pipe nobody will ever write to, until the timeout kills it — which is worse
+/// than today's behaviour, not better. Guessing *no* in the TUI is the bug this
+/// exists to fix.
+///
+/// It is deliberately **not** derived from `ctx.events.is_some()`. A headless
+/// run has an event channel too; what it does not have is somebody reading it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConsoleAccess {
+    /// No human: a foreground command gets `/dev/null` on fd 0 and reads EOF
+    /// immediately, which is how every command in this codebase has always
+    /// run. Headless, the gateway, ACP, fleet runs, the browser GUI, and every
+    /// subagent under any of them.
+    #[default]
+    None,
+    /// A surface will claim the [`ConsoleGate`](crate::agent::ConsoleGate) on
+    /// [`AgentEvent::ConsoleOpened`](crate::agent::AgentEvent::ConsoleOpened)
+    /// and relay what the user types. The interactive TUI.
+    Interactive,
+}
+
 /// Result of a tool execution, fed back to the model as a `role: tool`
 /// message.
-#[derive(Debug, Clone)]
+///
+/// Serializable because it rides
+/// [`AgentEvent::ToolFinished`](crate::agent::AgentEvent::ToolFinished), and
+/// that event has to survive being recorded and read back.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {
     /// Text returned to the model (stdout, file contents, diff, ...).
     pub content: String,

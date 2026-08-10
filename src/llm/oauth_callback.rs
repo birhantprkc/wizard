@@ -13,17 +13,23 @@
 //! a cancelled flow drops the listener at once, leaving the port free for the
 //! sign-in that replaced it.
 //!
+//! Loopback also means *the browser's* loopback, which is only this machine
+//! when the browser runs here. Over SSH it is not, so a terminal sign-in can
+//! take the redirect off stdin instead — see [`PasteChannel`] — and says how
+//! to bridge the gap properly — see [`remote_hint`].
+//!
 //! The two providers differ only in how they classify a request target (their
 //! paths and error shapes differ); everything else — accepting, reading,
 //! answering the human's browser with a page — is here, once.
 
+use std::io::{BufRead, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// How long the listener waits for the browser before giving the port back.
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
@@ -136,6 +142,267 @@ where
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The paste fallback, for sign-ins with no browser on this machine
+// ---------------------------------------------------------------------------
+
+/// Whether a sign-in may take its redirect from stdin as well as from the
+/// loopback listener.
+///
+/// The listener is not enough on a remote session. Both providers redirect to
+/// a loopback address, and loopback is resolved by *the machine running the
+/// browser* — so over SSH the redirect lands on the laptop's `127.0.0.1` while
+/// the listener sits on the server's, and the flow can only time out. The URL
+/// the browser ends up on still carries the authorization code in its address
+/// bar, though, so a human who can read that bar can carry the code across the
+/// gap by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteChannel {
+    /// The sign-in owns the terminal (`wizard --login …`): prompt on stderr and
+    /// read pasted redirects from stdin.
+    Stdin,
+    /// Something else owns stdin — the TUI is reading keystrokes, the GUI has
+    /// no terminal at all — so there is nothing to prompt on and nothing to
+    /// read. The loopback listener is the only channel.
+    Disabled,
+}
+
+/// What a provider must supply to accept a pasted redirect: the callback path
+/// its `classify` expects, and the `state` it minted.
+///
+/// The state is here for the one paste that carries no query at all — a bare
+/// code, copied out of a URL by hand. Rebuilding the target around the expected
+/// state is not a weakened check: `state` exists so that a *request arriving on
+/// the listener* has to prove it belongs to this flow, and a human typing into
+/// this process's own stdin has already proved more than that.
+pub struct PasteSpec {
+    pub callback_path: &'static str,
+    pub state: String,
+}
+
+/// [`serve_redirect`], plus a second way in: whatever the human pastes on
+/// stdin. First channel to produce a code wins, and the listener is dropped
+/// either way.
+///
+/// `paste` of `None` is exactly [`serve_redirect`].
+pub async fn serve_redirect_or_paste<F>(
+    listener: StdTcpListener,
+    cancel: Cancel,
+    classify: F,
+    paste: Option<PasteSpec>,
+) -> Result<String>
+where
+    F: Fn(&str) -> Callback,
+{
+    let Some(spec) = paste else {
+        return serve_redirect(listener, cancel, classify).await;
+    };
+
+    // `&F` is `Fn` too, so the listener and the paste loop can share one
+    // classifier without cloning it or boxing it.
+    let served = serve_redirect(listener, cancel, &classify);
+    tokio::pin!(served);
+    let mut pasted = stdin_lines();
+    prompt_for_paste();
+
+    loop {
+        tokio::select! {
+            outcome = &mut served => return outcome,
+            line = pasted.recv() => {
+                // stdin closed (piped input, ^D): the listener is all that is
+                // left, and it still has its own timeout.
+                let Some(line) = line else { return served.await };
+                if line.is_empty() {
+                    prompt_for_paste();
+                    continue;
+                }
+                match spec.classify(&line, &classify) {
+                    Callback::Code(code) => return Ok(code),
+                    Callback::Failed(message) => bail!(message),
+                    // Not a redirect at all — a stray keystroke, a half-copied
+                    // line. Say so and keep both channels open.
+                    Callback::Ignored => {
+                        eprintln!(
+                            "that does not look like the redirect URL — it should contain \
+                             `?code=…&state=…`"
+                        );
+                        prompt_for_paste();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PasteSpec {
+    /// Classify one pasted line by normalizing it into a callback target the
+    /// provider's own `classify` can read.
+    fn classify<F>(&self, line: &str, classify: &F) -> Callback
+    where
+        F: Fn(&str) -> Callback,
+    {
+        match self.target(line) {
+            Some(target) => classify(&target),
+            None => Callback::Ignored,
+        }
+    }
+
+    /// Normalize a pasted line into a `/path?query` target.
+    ///
+    /// The host and port that come back are the browser machine's, not ours,
+    /// and the path is whatever that machine was redirected to — none of it
+    /// tells us anything we do not already know. Only the query matters, so
+    /// the target is rebuilt around [`Self::callback_path`] and the accepted
+    /// shapes are as loose as a real paste is:
+    ///
+    /// - a full URL, `http://127.0.0.1:56121/callback?code=…&state=…`
+    /// - a scheme-less address bar copy, `127.0.0.1:56121/callback?code=…`
+    /// - the query alone, with or without its `?`
+    /// - a bare code, picked out of the URL by hand
+    fn target(&self, line: &str) -> Option<String> {
+        let line = line.trim().trim_matches(['"', '\'']);
+        if line.is_empty() {
+            return None;
+        }
+        // A fragment is never part of an OAuth redirect's query, and a paste
+        // can pick one up from the address bar.
+        let line = line.split('#').next().unwrap_or(line);
+
+        let query = match line.split_once('?') {
+            Some((_, query)) => query,
+            // `code=…&state=…` on its own: the query, minus its punctuation.
+            None if line.contains("code=") => line,
+            // A bare code. Loose, but it only has to exclude prose and paths:
+            // anything that gets through still faces the token exchange.
+            None if is_bare_code(line) => return Some(self.target_for_code(line)),
+            None => return None,
+        };
+        if query.is_empty() {
+            return None;
+        }
+        Some(format!("{}?{query}", self.callback_path))
+    }
+
+    /// A target for a code the human copied on its own, carrying the state
+    /// this flow minted.
+    fn target_for_code(&self, code: &str) -> String {
+        let mut url = reqwest::Url::parse("http://127.0.0.1/").expect("a literal loopback URL");
+        url.set_path(self.callback_path);
+        url.query_pairs_mut()
+            .append_pair("code", code)
+            .append_pair("state", &self.state);
+        format!(
+            "{}?{}",
+            url.path(),
+            url.query().expect("two pairs were just appended")
+        )
+    }
+}
+
+/// Whether a line could be an authorization code lifted out of a redirect URL
+/// on its own: one token, long enough to be a credential, drawn from the
+/// unreserved URL characters codes are issued in.
+fn is_bare_code(line: &str) -> bool {
+    line.len() >= 8
+        && line
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+}
+
+/// Ask for the paste. Goes to stderr so that a caller redirecting stdout still
+/// sees it, and so it never lands in whatever stdout is being parsed as.
+fn prompt_for_paste() {
+    eprint!("or paste the redirect URL here: ");
+    let _ = std::io::stderr().flush();
+}
+
+/// Trimmed lines from stdin, on a detached OS thread.
+///
+/// Not a `spawn_blocking` task: the browser usually wins this race, leaving the
+/// read blocked forever on a human who will never type. Tokio's runtime waits
+/// for its blocking pool at shutdown, so that parked read would hang the
+/// process *after* a successful sign-in. A plain thread has no such claim on
+/// the process — `main` returning ends it, parked reader and all.
+fn stdin_lines() -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel(1);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdin.lock().read_line(&mut line) {
+                // EOF, or a stdin that cannot be read at all.
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if tx.blocking_send(line.trim().to_string()).is_err() {
+                        // The sign-in finished without us.
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+// ---------------------------------------------------------------------------
+// Remote-session guidance
+// ---------------------------------------------------------------------------
+
+/// Guidance for a session whose browser, if it has one at all, is on another
+/// machine — or `None` when the browser is reachable and the flow needs no
+/// explaining.
+///
+/// This is advice, not a gate: nothing downstream branches on it, and a wrong
+/// guess costs a paragraph of text rather than a sign-in.
+pub fn remote_hint(port: u16) -> Option<String> {
+    remote_hint_from(port, |key| std::env::var(key).ok())
+}
+
+/// [`remote_hint`] against an injected environment, so the wording and the
+/// detection can be tested without mutating this process's own env — which is
+/// `unsafe` under edition 2024 and racy besides, with the suite on threads.
+fn remote_hint_from<E>(port: u16, env: E) -> Option<String>
+where
+    E: Fn(&str) -> Option<String>,
+{
+    let get = |key: &str| env(key).filter(|value| !value.is_empty());
+
+    let ssh = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .iter()
+        .any(|key| get(key).is_some());
+    // On a desktop OS the browser is always local. On Linux and the BSDs, a
+    // session with neither display server is a console or a service, and
+    // `xdg-open` has nothing to open.
+    let headless = cfg!(not(any(target_os = "macos", target_os = "windows")))
+        && get("DISPLAY").is_none()
+        && get("WAYLAND_DISPLAY").is_none();
+    if !ssh && !headless {
+        return None;
+    }
+
+    // `SSH_CONNECTION` is `client-ip client-port server-ip server-port`, so
+    // its third field is this machine as the client can already reach it —
+    // better than a hostname that may not resolve from over there.
+    let destination = get("SSH_CONNECTION")
+        .and_then(|conn| conn.split_whitespace().nth(2).map(str::to_string))
+        .map(|host| match get("USER").or_else(|| get("LOGNAME")) {
+            Some(user) => format!("{user}@{host}"),
+            None => host,
+        })
+        .unwrap_or_else(|| "<you>@<this-machine>".to_string());
+
+    Some(format!(
+        "this session has no browser of its own, and the sign-in redirects to \
+         127.0.0.1:{port} — which, opened from another machine, is that machine's \
+         loopback and not this one's. Either:\n\
+         \x20 1. forward the port, then open the URL above in your local browser:\n\
+         \x20      ssh -N -L {port}:127.0.0.1:{port} {destination}\n\
+         \x20 2. or open the URL above anyway, let the final redirect fail to \
+         connect, and paste that failed page's address back here."
+    ))
 }
 
 /// Serve one connection. `Some(result)` ends the wait; `None` keeps waiting.
@@ -407,5 +674,209 @@ mod tests {
     fn provider_text_is_escaped_into_the_page() {
         assert_eq!(html_escape("a<b>&\"c"), "a&lt;b&gt;&amp;&quot;c");
         assert!(html_escape("<script>alert(1)</script>").contains("&lt;script&gt;"));
+    }
+
+    fn spec() -> PasteSpec {
+        PasteSpec {
+            callback_path: "/callback",
+            state: "s7".to_string(),
+        }
+    }
+
+    /// What a human actually pastes varies by browser and by how much of the
+    /// address bar they caught. Every shape has to land on the same target,
+    /// because a paste that is silently ignored looks exactly like a hang.
+    #[test]
+    fn every_shape_of_pasted_redirect_reaches_the_same_target() {
+        let want = "/callback?code=abc&state=s7";
+        for pasted in [
+            "http://127.0.0.1:56121/callback?code=abc&state=s7",
+            // Chrome hides the scheme when you copy from the address bar.
+            "127.0.0.1:56121/callback?code=abc&state=s7",
+            // A tunnel makes it `localhost`, and https if the human retyped it.
+            "https://localhost:56121/callback?code=abc&state=s7",
+            // Trailing fragment, surrounding quotes, stray whitespace.
+            "  \"http://127.0.0.1:56121/callback?code=abc&state=s7#\"  ",
+            // The query on its own, with and without its punctuation.
+            "?code=abc&state=s7",
+            "code=abc&state=s7",
+        ] {
+            assert_eq!(spec().target(pasted).as_deref(), Some(want), "{pasted}");
+        }
+    }
+
+    /// The path a paste carries is the *browser machine's* — a tunnel rewrites
+    /// nothing, but a human retyping might. Only the query is load-bearing, so
+    /// the target is rebuilt around the path the provider expects.
+    #[test]
+    fn a_pasted_path_is_replaced_by_the_providers_own() {
+        let spec = PasteSpec {
+            callback_path: "/auth/callback",
+            state: "s7".to_string(),
+        };
+        assert_eq!(
+            spec.target("http://localhost:1455/callback?code=abc&state=s7")
+                .as_deref(),
+            Some("/auth/callback?code=abc&state=s7"),
+        );
+    }
+
+    /// A code copied out of the URL by hand carries no state, so the flow's own
+    /// is supplied. The reconstruction has to survive the provider's parser.
+    #[test]
+    fn a_bare_code_is_rebuilt_around_the_flows_state() {
+        let target = spec().target("ac_01HQZ-x.y_z~").expect("a bare code");
+        let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).expect("parses");
+        assert_eq!(url.path(), "/callback");
+        let pairs: Vec<_> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("code".to_string(), "ac_01HQZ-x.y_z~".to_string()),
+                ("state".to_string(), "s7".to_string()),
+            ],
+        );
+    }
+
+    /// Anything that is not a redirect must leave both channels open rather
+    /// than fail the sign-in: the browser may still be on its way.
+    #[test]
+    fn prose_and_fragments_are_not_mistaken_for_a_redirect() {
+        for pasted in [
+            "",
+            "   ",
+            "y",
+            "no idea what goes here",
+            "http://127.0.0.1:56121/callback",
+            "/callback?",
+        ] {
+            assert_eq!(spec().target(pasted), None, "{pasted:?}");
+        }
+    }
+
+    /// The paste goes through the provider's own classifier, so a forged or
+    /// stale `state` is refused exactly as it would be on the listener.
+    #[test]
+    fn a_pasted_redirect_is_classified_by_the_provider() {
+        let classify = |target: &str| {
+            let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).expect("parses");
+            let mut code = None;
+            let mut state = None;
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "code" => code = Some(value.into_owned()),
+                    "state" => state = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+            match (code, state.as_deref() == Some("s7")) {
+                (Some(code), true) => Callback::Code(code),
+                _ => Callback::Failed("state mismatch".to_string()),
+            }
+        };
+
+        let spec = spec();
+        assert_eq!(
+            spec.classify(
+                "http://127.0.0.1:56121/callback?code=abc&state=s7",
+                &classify
+            ),
+            Callback::Code("abc".to_string()),
+        );
+        assert!(matches!(
+            spec.classify(
+                "http://127.0.0.1:56121/callback?code=abc&state=nope",
+                &classify
+            ),
+            Callback::Failed(_),
+        ));
+        // Unparseable input never reaches the classifier at all.
+        assert_eq!(spec.classify("what?", &classify), Callback::Ignored);
+    }
+
+    /// With no paste channel the wait is [`serve_redirect`], unchanged.
+    #[tokio::test]
+    async fn without_a_paste_channel_the_listener_is_the_only_way_in() {
+        let (listener, port) = bind_private();
+        let served = tokio::spawn(serve_redirect_or_paste(
+            listener,
+            Cancel::never(),
+            |target| match target.split_once("code=") {
+                Some((_, code)) => Callback::Code(code.to_string()),
+                None => Callback::Ignored,
+            },
+            None,
+        ));
+
+        request(port, "/callback?code=abc").await;
+
+        assert_eq!(served.await.expect("join").expect("code"), "abc");
+    }
+
+    /// The whole point of the hint: a command the user can paste back, naming
+    /// this machine as their own client already reaches it.
+    #[test]
+    fn an_ssh_session_is_told_how_to_forward_the_port() {
+        let hint = remote_hint_from(56121, |key| {
+            match key {
+                "SSH_CONNECTION" => Some("198.51.100.23 38008 203.0.113.10 22"),
+                "USER" => Some("ada"),
+                _ => None,
+            }
+            .map(str::to_string)
+        })
+        .expect("an SSH session has no browser of its own");
+        assert!(
+            hint.contains("ssh -N -L 56121:127.0.0.1:56121 ada@203.0.113.10"),
+            "{hint}"
+        );
+    }
+
+    /// X11 forwarding gives the session a `DISPLAY`, and a browser — on the
+    /// *other* machine, whose loopback is not ours. Still a remote session.
+    #[test]
+    fn a_forwarded_display_does_not_make_the_session_local() {
+        let hint = remote_hint_from(1455, |key| {
+            match key {
+                "SSH_TTY" => Some("/dev/pts/3"),
+                "DISPLAY" => Some("localhost:10.0"),
+                _ => None,
+            }
+            .map(str::to_string)
+        });
+        assert!(hint.is_some());
+    }
+
+    /// A session with a browser of its own needs none of this said to it.
+    #[test]
+    fn a_local_desktop_session_gets_no_hint() {
+        let hint = remote_hint_from(56121, |key| match key {
+            "DISPLAY" => Some(":0".to_string()),
+            // An empty SSH var is as good as unset — a login shell can export
+            // one without a connection behind it.
+            "SSH_CLIENT" => Some(String::new()),
+            _ => None,
+        });
+        assert_eq!(hint, None);
+    }
+
+    /// Without a `SSH_CONNECTION` to read this machine's address out of, the
+    /// command still has to be recognisable — a placeholder, not a broken line.
+    #[test]
+    fn a_headless_session_still_gets_a_usable_command() {
+        let hint = remote_hint_from(56121, |_| None);
+        // A desktop OS always has a local browser; there is nothing to explain.
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(hint, None);
+            return;
+        }
+        let hint = hint.expect("no display server and no SSH: a console or a service");
+        assert!(
+            hint.contains("ssh -N -L 56121:127.0.0.1:56121 <you>@<this-machine>"),
+            "{hint}"
+        );
     }
 }

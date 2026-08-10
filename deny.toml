@@ -1,0 +1,248 @@
+# cargo-deny configuration.
+#
+# Wizard is a single binary that holds API keys and OAuth refresh tokens on
+# disk and speaks to five clouds, and it pulls in 560+ transitive packages to
+# do it. Nothing checked those packages for published advisories, for a
+# license the project cannot ship under, or for a supply chain that quietly
+# grew a second source. `cargo deny check` in CI is that gate; this file is
+# its policy.
+#
+# Run it locally exactly as CI does:
+#
+#     cargo deny --locked --all-features check
+#
+# `--all-features` is load-bearing, not decoration. The `native` feature pulls
+# in iced and several hundred crates of winit, cosmic-text and tiny-skia behind
+# it, and the release workflow publishes four `wizard-native-*` assets built
+# from exactly that graph. Checking only the default features would leave those
+# crates shipping to users without one advisory or license ever having been
+# looked at, which is the failure mode this file exists to prevent.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate is a maintainer saying "do not use this version". Cargo will
+# happily keep resolving to it from an existing lockfile, so it has to fail
+# here or it never surfaces.
+yanked = "deny"
+# Every entry needs the advisory id (or a crate spec, for a yanked version),
+# the date it was reviewed, why it is acceptable *today*, and the concrete
+# thing that removes it. An empty list is the goal state; everything below is
+# a debt with a name, not a setting.
+#
+# These are load-bearing rules for whoever edits this list next:
+#
+#   - An entry whose advisory no longer matches anything in the graph is
+#     reported by cargo-deny as `unmatched ignore configuration`, so a stale
+#     exception announces itself on the next run instead of rotting quietly.
+#     Delete it when you see it.
+#   - Widening a lint level (`unmaintained = "none"`, `yanked = "warn"`) to
+#     make this list shorter is not allowed. The value of the gate is that
+#     every muted advisory is written down here with a reason.
+#   - "Not reachable from any input we control" is a reason. "It is only a
+#     warning in practice" is not.
+#   - A reason names the version that was reviewed, and Cargo.lock moves
+#     without this file. If a bump takes the crate off the advisory, the entry
+#     stops matching and cargo-deny says so (see above); if the entry still
+#     matches at a new version, the version in the reason is stale and the
+#     reasoning behind it is what has to be re-read, not just the number.
+ignore = [
+    # Reviewed 2026-08-01. Unsound `Error::downcast_mut` after `Error::context`
+    # (undefined behaviour, not a vulnerability). Wizard never calls
+    # `downcast_mut`: the whole tree downcasts by value or by shared reference
+    # (`downcast_ref`, e.g. the `RetryAfter` lookup in src/agent/turn.rs).
+    # Fixed in anyhow 1.0.103 and the manifest already allows it (`anyhow =
+    # "1"`), so this is a lockfile-only bump: run `cargo update -p anyhow`,
+    # then delete this entry. It is here rather than done because the lockfile
+    # is not this change's to move.
+    { id = "RUSTSEC-2026-0190", reason = "anyhow 1.0.102 unsound downcast_mut; wizard never calls it; fixed by `cargo update -p anyhow` (>= 1.0.103), which is a lockfile change" },
+
+    # Reviewed 2026-08-01. Unmaintained, no patched release exists for any of
+    # these four, so the only way off them is dropping the crate that pulls
+    # them in.
+    #
+    # bincode 1.3.3 <- syntect: syntect decodes its compiled-in syntax and
+    # theme dumps with it (`SyntaxSet::load_defaults_newlines`,
+    # `ThemeSet::load_defaults`, src/ui/mod.rs). The bytes are `include_bytes!` of
+    # assets built into the binary, never anything a user or a model supplies,
+    # so an unmaintained decoder here has no untrusted input to be wrong about.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 unmaintained, no patch; reached only through syntect, which decodes assets compiled into the binary, never untrusted input" },
+    # number_prefix 0.4.0 <- indicatif: formats "1.2 MiB" in the download
+    # progress bar. Unmaintained only, no known defect.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix 0.4.0 unmaintained, no patch; reached only through indicatif's progress-bar byte formatting" },
+    # paste 1.0.15 <- ratatui 0.29: a proc macro, so it runs in the compiler
+    # and contributes no code to the shipped binary. Cargo.toml explains why
+    # the tree is held at ratatui 0.29 (ratatui-image would otherwise link a
+    # second copy); moving off it is that bump, not this file.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained, no patch; a build-time proc macro reached through ratatui 0.29, contributing no code to the binary" },
+    # yaml-rust 0.4.5 <- syntect: only syntect's `.sublime-syntax` YAML loader
+    # uses it, and wizard loads its syntaxes from the compiled dump instead
+    # (src/ui/mod.rs `syntect_assets`). No YAML from any source reaches it.
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust 0.4.5 unmaintained, no patch; syntect's YAML syntax loader is never called, wizard uses the compiled dump" },
+
+    # Reviewed 2026-08-01. Two real vulnerabilities (quadratic attribute
+    # scanning, unbounded namespace allocation), both patched in quick-xml
+    # 0.41. Unreachable in this tree and unreachable by `cargo update`:
+    # quick-xml is reached only through plist <- syntect, plist 1.9 requires
+    # `quick-xml = "0.39.2"`, and 0.41 is a semver-incompatible bump only a
+    # plist release can make. Nothing in wizard calls the plist path at all:
+    # themes come from `ThemeSet::load_defaults`, never
+    # `ThemeSet::add_from_folder` or `Theme::parse_settings`, so no XML from
+    # any origin (let alone an attacker's) is parsed by this binary. Remove
+    # both entries when plist ships against quick-xml >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 DoS; no XML is ever parsed (plist's loaders are never called), and plist 1.9 pins quick-xml 0.39 so no lockfile bump reaches the fix" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 DoS; no XML is ever parsed (plist's loaders are never called), and plist 1.9 pins quick-xml 0.39 so no lockfile bump reaches the fix" },
+
+    # Reviewed 2026-08-07, with the native GUI (`--features native`). Same
+    # shape as the gtk-rs block above and scoped the same way, to one advisory
+    # id, so a *new* advisory against ttf-parser still fails the build.
+    #
+    # ttf-parser is reached through fontdb <- cosmic-text <- iced_graphics: it
+    # is the font-file parser behind text shaping. Two paths bring it into the
+    # lockfile, and neither is in the shipped default binary — `iced` is
+    # optional and off by default, and `iced_test` is a dev-dependency, so a
+    # release build links no copy of it at all. (`cargo deny` reads the
+    # lockfile, which is feature- and target-agnostic, which is why it is
+    # visible here.)
+    #
+    # The advisory is "the author will not fix further bugs", not a
+    # vulnerability: no CVE, no exploit, and the alternative it names (skrifa)
+    # is already in this tree beside it, because cosmic-text uses skrifa for
+    # rasterization and fontdb uses ttf-parser only to read a face's metadata
+    # when building the font database. The fix is upstream — fontdb dropping
+    # ttf-parser, or cosmic-text dropping fontdb — and neither has landed.
+    # Delete this the moment it does.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25: unmaintained (author-declared, no CVE); reached only through cosmic-text under the optional `native` feature and the iced_test dev-dependency, so no shipped binary links it" },
+]
+
+[licenses]
+# The set the tree actually resolves to, no wider. A dependency arriving under
+# something not listed is a decision for a human, which is the point: a strong
+# copyleft license on a statically linked single binary would change what
+# Wizard can be distributed as, and that must not slip in as a transitive bump.
+#
+# Deliberately only the licenses some package in the tree resolves to on its
+# own. Every other license that appears in the graph does so as one branch of
+# an OR that MIT or Apache-2.0 already satisfies, so allowing those too would
+# widen the policy without covering a single package.
+#
+# `wizard` itself is one of the packages this list is checked against, and its
+# expression is `MIT AND Apache-2.0` (see Cargo.toml, and NOTICE for the ported
+# files that make the Apache half true). An `AND` needs *both* halves allowed to
+# pass, not either one, so removing `Apache-2.0` below would fail the crate's own
+# license check before it failed a dependency's.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    # Unicode-3.0 covers the ICU-derived tables (unicode-ident and friends).
+    "Unicode-3.0",
+    # File-level copyleft, and only ever reached through leaf crates
+    # (option-ext, cssparser, selectors, dtoa-short). It obliges publishing
+    # modifications to *those files*, which the project does not make; it puts
+    # no condition on the binary they link into.
+    "MPL-2.0",
+    # webpki-roots ships Mozilla's CA bundle under this.
+    "CDLA-Permissive-2.0",
+    # unicodeit is "MIT AND LPPL-1.3c": the LaTeX Project Public License
+    # covers the symbol tables it derives from TeX, so both halves have to be
+    # allowed for the crate to pass.
+    "LPPL-1.3c",
+    # target-lexicon, and the wasm/unicode crates under iced. The LLVM
+    # exception only *removes* an obligation from Apache-2.0, which is already
+    # allowed, so this widens nothing in substance; SPDX simply does not let a
+    # bare `Apache-2.0` allow-entry satisfy an expression that carries a WITH
+    # clause, so it has to be spelled out.
+    "Apache-2.0 WITH LLVM-exception",
+    # Reviewed 2026-08-07, arriving with the native GUI. Four crates under iced
+    # resolve to BSD-2-Clause on their own rather than as one branch of an OR:
+    # `arrayref` (through tiny-skia, the rasterizer), and `kamadak-exif` with
+    # its `mutate_once` (through iced_graphics, which reads image orientation).
+    # It is the 3-clause license already allowed above with the
+    # no-endorsement clause struck out — strictly weaker, same permissive
+    # shape, no condition on the binary they link into.
+    "BSD-2-Clause",
+    # Same review. `clipboard-win` and its `error-code`, reached through
+    # `window_clipboard` <- iced_winit, and *Windows-only* — they are in the
+    # lockfile because it is target-agnostic, and no asset this project
+    # publishes links either one. The Boost license is permissive with no
+    # attribution requirement at all for a binary distribution, which is
+    # weaker than the MIT terms the tree is already full of.
+    "BSL-1.0",
+]
+exceptions = []
+# icy_sixel (through ratatui-image) publishes no SPDX `license` field at all,
+# only `license-file = "LICENSE"`. cargo-deny identifies that file's text,
+# which is verbatim MIT. If a future version changes the file this check fails
+# loudly instead of quietly accepting whatever replaced it, which is what we
+# want from the one package in the graph that does not name its license.
+
+[bans]
+# There are real duplicates in the tree today (two `windows-sys` majors, two
+# `rand`, two `thiserror`), almost all of them held there by transitive deps
+# the project does not pick. Denying would be a permanently red build over
+# something not actionable here; warning keeps the count visible so it can be
+# driven down deliberately.
+multiple-versions = "warn"
+# `foo = "*"` in a manifest means the next major release lands unannounced,
+# with no review and no lockfile line to notice it by, so this is a hard deny.
+# Confirmed against this tree with `cargo deny --locked --all-features check
+# bans`, which reports no wildcard findings.
+#
+# It can be a hard deny only because every dependency in Cargo.toml comes from
+# crates.io carrying a real version requirement. The shape that would push back
+# on this line is a `{ git = "..." }` dependency with no `version` key: cargo
+# metadata reports such a dependency's requirement as `*`, and cargo-deny has
+# no per-crate exemption for it (`allow-wildcard-paths` covers path
+# dependencies only), so one of those turns this into a permanently red
+# supply-chain job over a wildcard somebody chose on purpose. The debate engine
+# was the tree's one candidate for that and is vendored at src/llm/fusion.rs
+# instead; Cargo.toml now forbids git dependencies outright, for the separate
+# reason that `cargo publish` refuses a crate carrying one.
+#
+# If a git dependency is ever proposed anyway, give it a `version` key rather
+# than relaxing this line. "warn" does not scope the hole to that one entry: it
+# means ANY crate added as `foo = "*"` is reported and the job still exits 0.
+wildcards = "deny"
+
+# reqwest is pinned to rustls precisely so the binary has no OpenSSL link
+# dependency: that is what lets it be built static against musl and installed
+# on a box with no libssl. A transitive dep flipping on a `native-tls` feature
+# would undo that silently, and the failure would show up as a link error on a
+# user's machine rather than here. Neither crate is in the graph today; this
+# keeps it that way.
+deny = [
+    { crate = "openssl-sys", reason = "the binary is rustls-only and must not gain an OpenSSL link dependency" },
+    { crate = "native-tls", reason = "the binary is rustls-only and must not gain an OpenSSL link dependency" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+# Empty, and it has to stay empty: `unknown-git = "deny"` above plus no allowed
+# org means every git dependency fails this check, from any owner, including
+# this project's own.
+#
+# It used to read `github = ["teddytennant"]`, on the reasoning that a second
+# repo from the project's own owner is a deliberate choice someone can weigh.
+# That was a hole rather than a policy. Cargo.toml requires every dependency to
+# come from crates.io for a reason that has nothing to do with who wrote it:
+# `cargo publish` refuses a crate carrying a `{ git = ... }` dependency at all,
+# so `cargo install wizard`, Homebrew and everything else downstream of crates.io
+# go away the moment one lands. An allow-org entry meant such a dependency would
+# sail through `cargo deny` in CI and only fail at the release, which is the
+# worst place to find out. It also names a GitHub org, and `[bans] wildcards =
+# "deny"` above explains the second trap waiting there: a git dependency with no
+# `version` key reports its requirement as `*` and turns the bans check
+# permanently red.
+#
+# cargo-deny reports a listed org that matches nothing as
+# `unmatched-organization`, so the old entry was also warning on every run about
+# being unused. If a git dependency is ever genuinely needed, vendor it (the
+# /fusion debate engine is the precedent — it lives at `src/llm/fusion.rs`) or
+# publish it to crates.io; do not reopen this list.
+github = []

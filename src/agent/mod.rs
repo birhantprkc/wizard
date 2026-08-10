@@ -6,23 +6,26 @@
 //! Ratatui TUI (genie) or the headless runner (sovereign) consumes.
 
 pub mod breaker;
+pub mod context;
+mod event;
 pub mod mission;
 pub mod prompts;
+mod retry;
 pub mod session;
 pub mod subagent;
-mod turn;
+pub(crate) mod turn;
 pub mod ultra;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::cli::Cli;
 use crate::config::{Config, Mode, ProviderKind};
 use crate::dispatch::Dispatcher;
 use crate::hooks::HookEngine;
@@ -31,8 +34,17 @@ use crate::llm::provider::LlmProvider;
 use crate::llm::{ChatMessage, ChatOptions, ChatRequest, FunctionCall, Image, Role, ToolCall};
 use crate::mcp::{McpConfig, McpManager};
 use crate::skills::Skill;
-use crate::tools::{CommandDispatch, ToolContext, ToolOutput, registry::ToolRegistry};
+use crate::tools::{CommandDispatch, ToolContext, registry::ToolRegistry};
 
+pub use context::{
+    COMPACT_SUMMARY_HEADING, CONTEXT_PRESSURE_HEADING, CompactOutcome, ContextPressure,
+    PressureLevel,
+};
+#[cfg(test)]
+pub(crate) use context::{KEEP_RECENT, PRESSURE_ELEVATED_FRACTION};
+pub use event::{
+    AgentEvent, ConsoleGate, ConsoleHost, ConsoleInput, ConsoleWriter, InterviewGate, PlanGate,
+};
 use session::Session;
 
 /// Everything a `/btw` side question needs, owned so it can run without
@@ -125,7 +137,7 @@ impl SideQuestionContext {
             if let Some(message) = chunk.message
                 && !chunk.thinking
             {
-                answer.push_str(&message.content);
+                answer.push_str(&message.text());
             }
             if chunk.done {
                 break;
@@ -158,6 +170,12 @@ impl ForkContext {
             model: Some(self.model.clone()),
             read_only: self.read_only,
             inherited_history: None, // spawn_fork sets this itself
+            // A fork is detached by definition: it runs alongside the main
+            // conversation and reports back whenever it is done, so the turn
+            // the user pressed Esc on is not the turn the fork belongs to.
+            // `/kill` through the subagent registry is how a fork is ended.
+            cancel: None,
+            ..Default::default()
         };
 
         let name = subagent::FORK_NAME.to_string();
@@ -228,7 +246,8 @@ impl ForkContext {
 }
 
 /// Why an agent turn (or sovereign run) ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DoneReason {
     /// Model finished without requesting more tools.
     Completed,
@@ -275,7 +294,7 @@ impl PlanVerdict {
 /// One clarifying question asked via the `interview` tool (plan mode). The
 /// surface collects an answer for each; an empty option list means a
 /// free-text answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterviewQuestion {
     /// The question text shown to the user.
     pub question: String,
@@ -285,12 +304,14 @@ pub struct InterviewQuestion {
 }
 
 /// Where an image came from, on an [`AgentEvent::Images`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ImageSource {
     /// The model produced it inline in its reply
     /// ([`ChatChunk::images`](crate::llm::ChatChunk::images)).
     Assistant,
-    /// A tool returned it ([`ToolOutput::images`]); the name of the tool.
+    /// A tool returned it ([`ToolOutput::images`](crate::tools::ToolOutput::images));
+    /// the name of the tool.
     Tool(String),
 }
 
@@ -311,202 +332,6 @@ impl ImageSource {
             ImageSource::Tool(name) => Some(name),
         }
     }
-}
-
-/// Events emitted by the agent loop. The TUI renders them; the headless
-/// runner logs them.
-#[derive(Debug)]
-pub enum AgentEvent {
-    /// Streaming assistant text delta.
-    TextDelta(String),
-    /// Streaming model reasoning ("thinking") delta. Rendered dimmed by the
-    /// TUI; never part of the assistant message or the session history.
-    ThinkingDelta(String),
-    /// A tool call is being executed.
-    ToolStarted { name: String, args: Value },
-    /// A tool call finished. `output.images` carries any images the tool
-    /// produced, as base64; the [`AgentEvent::Images`] that follows says where
-    /// they landed on disk, which is what a renderer wants.
-    ToolFinished { name: String, output: ToolOutput },
-    /// Images produced during this turn — by a tool, or by the model itself —
-    /// and written to the session's image directory
-    /// (`~/.wizard/images/<session>/`).
-    ///
-    /// This is the event the surfaces render off. Each [`ImageRef`] names a
-    /// file on disk plus its media type and size: the TUI prints the path when
-    /// the terminal cannot draw the image, the GUI links to it for "open full
-    /// size". No base64 rides on this event — the payload the model needs stays
-    /// in history, and a transcript frame references the image rather than
-    /// embedding it.
-    ///
-    /// Ordering: for a tool's images this arrives immediately after that tool's
-    /// [`AgentEvent::ToolFinished`]; for the model's own images, immediately
-    /// after the last [`AgentEvent::TextDelta`] of the reply that produced them.
-    Images {
-        source: ImageSource,
-        images: Vec<ImageRef>,
-    },
-    /// One agent step (model round-trip) completed. 1-based.
-    StepCompleted { step: u32 },
-    /// Non-fatal error surfaced to the user; the loop may continue.
-    Error(String),
-    /// Informational progress notice (e.g. history compaction); never an
-    /// error.
-    Notice(String),
-    /// A completion stream died mid-response and is about to be retried from
-    /// scratch. Whatever partial text was streamed so far never entered
-    /// history and will be re-generated — consumers rendering deltas must
-    /// discard their partial buffer or the retry duplicates it.
-    StreamRetrying,
-    /// A lifecycle hook did something worth surfacing (rewrote arguments,
-    /// appended context, blocked, or failed). Plain successes are silent.
-    /// Rendered as a dim log line.
-    HookFired {
-        /// Lifecycle event name (e.g. `"pre_tool_use"`).
-        event: &'static str,
-        /// The hook's shell command.
-        command: String,
-        /// What the hook did.
-        outcome: crate::hooks::HookOutcome,
-    },
-    /// Plan mode: the model presented a plan via `exit_plan` and the turn is
-    /// paused awaiting a verdict. The consumer must send exactly one
-    /// [`PlanVerdict`] on `respond` (the TUI renders a review; headless and
-    /// gateway auto-approve). Dropping the sender counts as no verdict and
-    /// keeps plan mode on.
-    PlanReady {
-        /// The plan markdown (also persisted to `.wizard/plan.md`).
-        plan: String,
-        respond: tokio::sync::oneshot::Sender<PlanVerdict>,
-    },
-    /// Plan mode: the model asked clarifying questions via the `interview`
-    /// tool and the turn is paused awaiting answers. The consumer must send
-    /// exactly one response on `respond`: `Some(answers)` aligned with
-    /// `questions` (empty string = the user skipped that one), or `None` to
-    /// decline the interview entirely (no interactive user, or the user
-    /// dismissed it). Dropping the sender counts as `None`. Read-only, so it
-    /// is allowed mid-plan.
-    Interview {
-        /// The questions to put to the user, in order.
-        questions: Vec<InterviewQuestion>,
-        respond: tokio::sync::oneshot::Sender<Option<Vec<String>>>,
-    },
-    /// Omakase (chef's-choice) mode: the model finished planning and, because
-    /// there is no human review gate, is proceeding to execute. Informational
-    /// only — the plan markdown for the surface to display. The plan is also
-    /// persisted to `.wizard/plan.md`.
-    OmakaseProceeding {
-        /// The plan markdown the chef chose.
-        plan: String,
-    },
-    /// Token usage of one completed model call, when the backend reported
-    /// counts. Surfaces accumulate these (status bar lifetime totals via
-    /// `/cost`, headless summary). The TUI context meter uses
-    /// `prompt_tokens` as the size of the next call until compaction or
-    /// `/clear` replaces it with an estimate via [`AgentEvent::ContextSize`].
-    /// Emitted for the parent's own calls and for every subagent call made
-    /// under it (`spawn_subagent`, `/ultra`'s candidates and judges), so the
-    /// counter reflects what the turn actually spent.
-    Usage {
-        prompt_tokens: u64,
-        completion_tokens: u64,
-    },
-    /// Tokens that will load into the next model call after history shrank
-    /// (`/compact`, auto-compaction). Replaces the context meter without
-    /// touching session lifetime totals.
-    ContextSize { tokens: u64 },
-    /// The `/ultra` pre-phase produced its guidance: `label` is the roster that
-    /// ran (`"ultra ×3 · implementer+skeptic+minimalist · 1 judge"`), `guidance`
-    /// the candidate drafts and the judge's verdict exactly as they were
-    /// injected into the turn.
-    ///
-    /// The TUI folds it into a collapsed transcript card, which is the durable
-    /// record of a fan-out the user paid several× a normal turn for: the
-    /// candidates' panes retire off the rail within seconds of finishing, while
-    /// the main agent is still working. Surfaces that only print the turn's
-    /// answer ignore it — the drafts are advice, not the answer.
-    UltraGuidance { label: String, guidance: String },
-    /// The todo list was replaced via the `todo` tool. Carries the full new
-    /// list; the TUI mirrors it in a compact overlay above the composer,
-    /// headless prints a one-line summary, the gateway ignores it.
-    TodoUpdated(Vec<crate::tools::todo::TodoItem>),
-    /// A background task (`execute` with `run_in_background`) was just
-    /// spawned. The TUI mirrors it into the dashboard's task list; other
-    /// surfaces ignore it.
-    TaskStarted { id: u32, command: String },
-    /// A background task (`execute` with `run_in_background`) finished; its
-    /// output tail was injected into history. The TUI and headless surfaces
-    /// print a one-liner, the gateway ignores it.
-    TaskFinished {
-        id: u32,
-        command: String,
-        status: crate::tools::tasks::TaskStatus,
-    },
-    /// `spawn_subagent` was called with `background: true` and just detached.
-    /// The TUI mirrors it into the dashboard's subagent list; other surfaces
-    /// ignore it.
-    SubagentStarted { id: u32, name: String, task: String },
-    /// A backgrounded subagent finished; its report was injected into
-    /// history. The TUI and headless surfaces print a one-liner, the gateway
-    /// ignores it.
-    SubagentFinished {
-        id: u32,
-        name: String,
-        task: String,
-        completed: bool,
-        output: String,
-    },
-    /// A subagent run started, foreground or background. `run` scopes every
-    /// later `SubagentRun*` event below to this run, so a surface can demux
-    /// concurrent runs of the same subagent into separate panes. `bg` carries
-    /// the background-registry id when the run was detached, so the surface
-    /// can kill it.
-    SubagentRunStarted {
-        run: u64,
-        bg: Option<u32>,
-        name: String,
-        task: String,
-    },
-    /// A subagent produced assistant text (its own message, between tool
-    /// calls). Scoped to a run.
-    SubagentRunText { run: u64, text: String },
-    /// A subagent started a tool call. Scoped to a run; the tool name is bare
-    /// (the pane supplies the subagent's name).
-    SubagentRunToolStarted { run: u64, name: String, args: Value },
-    /// A subagent's tool call finished. Scoped to a run.
-    SubagentRunToolFinished {
-        run: u64,
-        name: String,
-        output: ToolOutput,
-    },
-    /// [`AgentEvent::Images`], scoped to a subagent run — images produced
-    /// inside a run land in the same session directory and are announced the
-    /// same way, so a run's pane can render them instead of losing them.
-    SubagentRunImages {
-        run: u64,
-        source: ImageSource,
-        images: Vec<ImageRef>,
-    },
-    /// A subagent completed one step (model round-trip). 1-based, scoped to a
-    /// run.
-    SubagentRunStep { run: u64, step: u32 },
-    /// A subagent run ended. Scoped to a run. `error` is set when it died on a
-    /// hard error; `completed` is false when it hit its step budget.
-    SubagentRunDone {
-        run: u64,
-        completed: bool,
-        output: String,
-        steps_used: u32,
-        error: Option<String>,
-    },
-    /// The agent asked to run one of Wizard's own slash commands via the
-    /// `run_command` tool. Carries the raw command line (e.g. `/effort high`).
-    /// The interactive surface validates and dispatches it once the turn ends
-    /// and the agent is back in its slot; other surfaces ignore it (there is
-    /// no menu to drive).
-    CommandRequested(String),
-    /// The turn is over.
-    Done { reason: DoneReason },
 }
 
 /// Sovereign-mode run control, read from `.wizard/loop-control` in the
@@ -541,7 +366,7 @@ fn loop_control_path(project_root: &Path) -> PathBuf {
 
 /// Remove the loop-control file after consuming a one-shot command
 /// (`stop`/`skip`), so it does not re-trigger on the next run.
-fn clear_loop_control(project_root: &Path) {
+pub(crate) fn clear_loop_control(project_root: &Path) {
     let path = loop_control_path(project_root);
     if let Err(err) = std::fs::remove_file(&path)
         && err.kind() != std::io::ErrorKind::NotFound
@@ -569,7 +394,11 @@ pub(crate) fn parse_json_tool_call(text: &str) -> Option<ToolCall> {
         } else {
             call.arguments
         };
+        // A JSON-in-text call has no provider id: it never went through a
+        // native tool-calling API. One is minted here so the result that
+        // answers it can be correlated the same way every other call's is.
         Some(ToolCall {
+            id: crate::llm::synthetic_tool_call_id(),
             function: FunctionCall {
                 name: call.tool,
                 arguments,
@@ -619,8 +448,9 @@ pub(crate) async fn emit(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) -
 }
 
 /// Take custody of images produced during a turn — the one seam every image
-/// passes through, from either direction: a tool's [`ToolOutput::images`] or
-/// the model's own [`ChatChunk::images`](crate::llm::ChatChunk::images).
+/// passes through, from either direction: a tool's
+/// [`ToolOutput::images`](crate::tools::ToolOutput::images) or the model's own
+/// [`ChatChunk::images`](crate::llm::ChatChunk::images).
 ///
 /// Images over [`crate::llm::MAX_IMAGE_BYTES`] are dropped here with a notice:
 /// an absurd image must not reach history, where it would melt the context
@@ -685,6 +515,15 @@ pub(crate) fn error_is_transient(err: &anyhow::Error) -> bool {
 #[derive(Clone, Default)]
 pub struct CancelHandle(Arc<CancelState>);
 
+impl std::fmt::Debug for CancelHandle {
+    /// A handle is a flag and a notify list; neither is worth printing, and
+    /// the flag would be stale by the time anyone read it. What a `{:?}` of a
+    /// struct holding one needs is that the field is there at all.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CancelHandle")
+    }
+}
+
 #[derive(Default)]
 struct CancelState {
     flag: std::sync::atomic::AtomicBool,
@@ -727,64 +566,16 @@ impl CancelHandle {
     }
 }
 
-/// Cooperative "background the foreground command" handle. Cloneable and
-/// thread-safe: the TUI keeps a clone (see [`Agent::background_gate`]) and
-/// calls [`BackgroundGate::request`] on Ctrl-B; a running `execute` selects
-/// on it and promotes the child into the background task registry without
-/// interrupting the turn. One-shot per arming — after a promote (or a
-/// clear at the next tool call) the gate is inert until the next request.
+/// Resolves when the turn is cancelled, and never when there is no handle.
 ///
-/// Unlike [`CancelHandle`], firing this does **not** end the turn: the tool
-/// returns immediately with a background-task notice and the agent keeps
-/// working (or finishes its step) while the command keeps running.
-#[derive(Clone, Default)]
-pub struct BackgroundGate(Arc<BackgroundGateState>);
-
-impl std::fmt::Debug for BackgroundGate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("BackgroundGate")
-    }
-}
-
-#[derive(Default)]
-struct BackgroundGateState {
-    flag: std::sync::atomic::AtomicBool,
-    notify: tokio::sync::Notify,
-}
-
-impl BackgroundGate {
-    /// Ask the in-flight foreground `execute` (if any) to promote itself to
-    /// a background task. No-op when nothing is listening.
-    pub fn request(&self) {
-        self.0.flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.0.notify.notify_waiters();
-    }
-
-    /// Whether a promote has been requested since the last clear.
-    pub fn is_requested(&self) -> bool {
-        self.0.flag.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Resolves once a promote is requested (immediately if it already was).
-    pub async fn requested(&self) {
-        loop {
-            let notified = self.0.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_requested() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Clear a stale request so the next tool call starts clean. Called at
-    /// the start of every foreground `execute` and at the start of every
-    /// turn (alongside [`CancelHandle::clear`]).
-    pub fn clear(&self) {
-        self.0
-            .flag
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+/// A future that never resolves rather than a second copy of every `select!`
+/// for each combination of "has a handle" and "has whatever else": an arm that
+/// is always pending is exactly what "this cannot be cancelled" means, and it
+/// costs one poll.
+pub(crate) async fn cancelled(handle: Option<&CancelHandle>) {
+    match handle {
+        Some(handle) => handle.cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -904,10 +695,6 @@ pub struct Agent {
     /// Cooperative cancellation of the running turn (see
     /// [`Agent::cancel_handle`]). Cleared at the start of every turn.
     cancel: CancelHandle,
-    /// Cooperative "background the foreground command" gate (see
-    /// [`Agent::background_gate`]). Cleared at the start of every turn; the
-    /// TUI fires it on Ctrl-B while an `execute` is in flight.
-    background: BackgroundGate,
     /// The spawn tool's shared model slot, when bound
     /// ([`Agent::bind_subagent_model`]): `/model` switches write through so
     /// subagents run on the parent's active model.
@@ -942,138 +729,45 @@ pub struct RewindCandidate {
 /// are still reported, as one-line [`AgentEvent::HookFired`] notices.
 pub const SESSION_START_HOOK_NOTE: &str = "[session_start hook]";
 
-/// Number of most-recent messages preserved verbatim when compacting history.
-const KEEP_RECENT: usize = 10;
-
-/// Heading of the note [`Agent::compact_now`] leaves in place of the span it
-/// summarized. Public because it is the only handle anything downstream has on
-/// that note: it is a `Role::System` message like any other, and
-/// [`ultra::render_context`] has to be able to tell "everything older than the
-/// tail, summarized" apart from an ordinary injected note when it briefs a
-/// candidate.
-pub const COMPACT_SUMMARY_HEADING: &str = "[Compacted progress summary]";
-
-/// Prefix of the ephemeral per-step pressure line injected (in memory only)
-/// before each model completion. Surfaces and compaction can recognize it; it
-/// is never persisted to the session file.
-pub const CONTEXT_PRESSURE_HEADING: &str = "[context pressure]";
-
-/// Fraction of the provider's context window the last prompt may fill before
-/// token-aware compaction kicks in.
-const COMPACT_WINDOW_FRACTION: f64 = 0.8;
-
-/// Soft pressure band: the model is nudged to call `compact` once fill crosses
-/// this fraction of the known window (auto-compact still waits for
-/// [`COMPACT_WINDOW_FRACTION`]).
-const PRESSURE_ELEVATED_FRACTION: f64 = 0.5;
-
-/// Strong pressure band: the model is told to compact *before* more tool work.
-const PRESSURE_HIGH_FRACTION: f64 = 0.7;
-
-/// Chunk size (chars) fed to one rolling-summary pass during compaction.
-const COMPACT_CHUNK_CHARS: usize = 20_000;
-
-/// How full the next model call's prompt is, for the live pressure signal and
-/// the `compact` tool's reply. Built from the last reported prompt size (or a
-/// char/4 estimate) plus the provider's known context window when available.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ContextPressure {
-    /// Tokens that will load into the next model call.
-    pub tokens: u64,
-    /// Provider context window in tokens, when known.
-    pub window: Option<u32>,
-    /// `tokens / window` when the window is known; otherwise a byte-threshold
-    /// proxy so headless runs without a reported window still get a signal.
-    pub fill: f64,
-    pub level: PressureLevel,
-}
-
-/// Coarse pressure band shown to the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PressureLevel {
-    /// Comfortable headroom.
-    Ok,
-    /// Crossing ~50% of the window (or half the byte threshold) — compact when
-    /// convenient.
-    Elevated,
-    /// Crossing ~70% — compact before more tool work.
-    High,
-    /// At or past the auto-compact trigger (~80% / byte threshold).
-    Critical,
-}
-
-impl PressureLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PressureLevel::Ok => "ok",
-            PressureLevel::Elevated => "elevated",
-            PressureLevel::High => "high",
-            PressureLevel::Critical => "critical",
-        }
-    }
-}
-
-impl ContextPressure {
-    /// One-line note the model sees each step (ephemeral, not persisted).
-    pub fn signal_line(&self) -> String {
-        let tokens = crate::usage::format_tokens(self.tokens);
-        let window = match self.window {
-            Some(w) => crate::usage::format_tokens(u64::from(w)),
-            None => "unknown window".to_string(),
-        };
-        let pct = (self.fill * 100.0).round() as i32;
-        let advice = match self.level {
-            PressureLevel::Ok => "headroom ok",
-            PressureLevel::Elevated => "consider calling compact soon",
-            PressureLevel::High => "call compact before more tool work",
-            PressureLevel::Critical => "auto-compact imminent — call compact now",
-        };
-        format!(
-            "{CONTEXT_PRESSURE_HEADING} {} · {tokens} / {window} ({pct}%) — {advice}",
-            self.level.as_str()
-        )
-    }
-}
-
-/// What a compaction pass did, reported back so callers (auto-compaction
-/// notices and the `/compact` command) can describe the outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompactOutcome {
-    /// Too little history between the system prompt and the recent tail.
-    Nothing,
-    /// Summarized `count` middle messages into one progress note.
-    Summarized(usize),
-    /// The summary LLM failed, so `count` middle messages were dropped.
-    Truncated { count: usize, error: String },
-}
-
-impl CompactOutcome {
-    /// One-line notice describing what the pass did, shared by the
-    /// auto-compaction events and the `/compact` command.
-    pub fn describe(&self) -> String {
-        fn messages(count: usize) -> String {
-            if count == 1 {
-                "1 message".to_string()
-            } else {
-                format!("{count} messages")
-            }
-        }
-        match self {
-            CompactOutcome::Nothing => "nothing to compact yet".to_string(),
-            CompactOutcome::Summarized(count) => {
-                format!("compacted {} into a summary", messages(*count))
-            }
-            CompactOutcome::Truncated { count, error } => format!(
-                "compacted {} by truncation (summary failed: {error})",
-                messages(*count)
-            ),
-        }
-    }
-}
-
 /// User-role nudge injected (in memory only) when a completion comes back
 /// with no visible text and no tool calls.
 const EMPTY_COMPLETION_NUDGE: &str = "(continue: reply to the user with your findings)";
+
+/// User-role nudge injected (in memory only) after the provider cut a reply off
+/// at its output-token ceiling while the model was still writing a tool call.
+///
+/// The `{tool}` placeholder is filled with the name of the call that was cut
+/// off, because that is the only part of it that survived decoding and it is
+/// usually enough for the model to recognize what it was in the middle of.
+///
+/// Naming a concrete way to be smaller matters more than it looks. Told only
+/// "that was too long", a model tends to re-emit the same call with the same
+/// arguments and get cut off at the same byte; told to split the write or
+/// narrow the hunk, it produces something that fits.
+const TRUNCATED_TOOL_CALL_NUDGE: &str = "\
+(your previous reply hit the output-token limit while you were still writing the arguments for \
+`{tool}`, so it was discarded and never ran — nothing you asked for has happened)\n\
+Send that step again, smaller: one tool call, with the least argument text that still does the \
+job. Write a long file in successive appends rather than one call; edit a narrow hunk rather than \
+a whole file; run a short command rather than a long script. Do not repeat the explanation you \
+already gave.";
+
+/// User-role nudge injected (in memory only) after a reply was cut off because
+/// the *conversation* no longer fit the context window, rather than because the
+/// reply hit its own output ceiling.
+///
+/// Deliberately says nothing about writing smaller tool calls, which is the
+/// advice the other cutoff wants and is actively misleading here: the reply's
+/// length was never the problem, and a model that acts on it spends the next
+/// request being wrong in a smaller way. By the time this is sent the history
+/// has already been compacted, so what the model needs is to know its last step
+/// did not happen and that the transcript behind it has changed shape.
+const CONTEXT_OVERFLOW_NUDGE: &str = "\
+(your previous reply was cut off because the conversation had outgrown the model's context \
+window, so it was discarded and the tool call in it never ran — nothing you asked for has \
+happened)\n\
+The history above has just been compacted, so older detail is now a summary. Re-read what is \
+there, then carry on from where you were.";
 
 /// True when a completed assistant message has neither visible content nor
 /// tool calls (e.g. a reasoning model that thought and then just stopped).
@@ -1151,12 +845,17 @@ impl Agent {
         // Images produced this session (by a tool or by the model) land under
         // `~/.wizard/images/<session>/`, so every surface has a real file to
         // render or link to.
-        let background = BackgroundGate::default();
+        // One cancel handle, shared between the run loop and the tool context.
+        // The loop checks it between calls; a tool that can park on a human
+        // (`execute` with a claimed console) checks it while it is parked, so
+        // Ctrl-C reaches the child's process group instead of waiting for the
+        // turn task to be aborted around it.
+        let cancel = CancelHandle::default();
         let mut ctx = ToolContext::new(project_root)
             .with_web(web)
             .with_checkpoints(Arc::clone(&checkpoints))
             .with_usage(Arc::clone(&usage))
-            .with_background(background.clone());
+            .with_cancel(cancel.clone());
         if let Some(images) = open_image_store(&session.id) {
             ctx = ctx.with_images(images);
         }
@@ -1190,8 +889,7 @@ impl Agent {
             usage,
             usage_log: crate::usage::default_log_path(),
             checkpoints,
-            cancel: CancelHandle::default(),
-            background,
+            cancel,
             subagent_model: None,
             ultra: None,
         };
@@ -1233,6 +931,19 @@ impl Agent {
         self.ctx.command_dispatch = dispatch;
     }
 
+    /// Declare whether a human is watching this agent and can answer a shell
+    /// command that prompts on stdin (see
+    /// [`ConsoleAccess`](crate::tools::ConsoleAccess)).
+    ///
+    /// Only the interactive TUI says yes. Everything else leaves it at
+    /// `None`, which keeps `/dev/null` on every child's fd 0 — the behaviour
+    /// every surface had before consoles existed, and the only honest one when
+    /// there is nobody to type an answer. Preserved across per-turn context
+    /// clones (`ToolContext::with_events`).
+    pub fn set_console_access(&mut self, console: crate::tools::ConsoleAccess) {
+        self.ctx.console = console;
+    }
+
     /// Conversation history (system prompt included).
     pub fn history(&self) -> &[ChatMessage] {
         &self.history
@@ -1250,54 +961,17 @@ impl Agent {
         }
     }
 
-    /// Live fill of the next model call against the provider window (or a
-    /// byte-threshold proxy when the window is unknown). Powers the per-step
-    /// pressure signal and the `compact` tool's reply.
-    ///
-    /// Soft bands (`elevated` / `high`) may use a char/4 estimate when the
-    /// backend has not reported a prompt size yet. The `critical` band — which
-    /// drives auto-compaction — needs a *reported* last prompt over 80% of a
-    /// known window; the byte threshold is only the fallback gate when the
-    /// window is unknown. A known window makes tokens the authoritative
-    /// measure — the byte proxy (48 KB default, sized for small local models)
-    /// would otherwise scream "critical" at a few percent of a large window.
-    /// Estimates never trip auto-compact on their own (they would fire on the
-    /// system prompt alone and steal the first completion of a short turn).
+    /// Live fill of the next model call against the provider window, measured
+    /// by [`context::pressure`] — the same reading a subagent takes of its own
+    /// history, from the same numbers.
     pub async fn context_pressure(&self) -> ContextPressure {
-        let tokens = self.context_tokens();
-        let window = self.client.context_window(&self.model).await;
-        let byte_total: usize = self.history.iter().map(|msg| msg.content.len()).sum();
-        let threshold = self.config.compact_threshold_bytes.max(1);
-        let last_prompt = self.usage.last_prompt_tokens();
-
-        let fill = match window {
-            Some(w) if w > 0 => tokens as f64 / f64::from(w),
-            _ => byte_total as f64 / threshold as f64,
-        };
-
-        let auto_critical = match window {
-            Some(w) if w > 0 => match last_prompt {
-                Some(prompt) => prompt as f64 > f64::from(w) * COMPACT_WINDOW_FRACTION,
-                None => false,
-            },
-            _ => byte_total > threshold,
-        };
-
-        let level = if auto_critical {
-            PressureLevel::Critical
-        } else if fill >= PRESSURE_HIGH_FRACTION {
-            PressureLevel::High
-        } else if fill >= PRESSURE_ELEVATED_FRACTION {
-            PressureLevel::Elevated
-        } else {
-            PressureLevel::Ok
-        };
-        ContextPressure {
-            tokens,
-            window,
-            fill,
-            level,
-        }
+        context::pressure(context::Measured {
+            tokens: self.context_tokens(),
+            window: self.client.context_window(&self.model).await,
+            bytes: self.history.iter().map(|msg| msg.text().len()).sum(),
+            byte_threshold: self.config.compact_threshold_bytes,
+            last_prompt: self.usage.last_prompt_tokens(),
+        })
     }
 
     /// Session this agent persists to.
@@ -1408,29 +1082,35 @@ impl Agent {
         self.cancel.clone()
     }
 
-    /// Handle for backgrounding a foreground `execute` mid-flight (Ctrl-B).
-    /// The surface clones it before spawning `run_turn` and calls
-    /// [`BackgroundGate::request`]; the running command promotes itself into
-    /// the background task registry and returns immediately so the turn can
-    /// keep going. No-op when nothing is listening.
-    pub fn background_gate(&self) -> BackgroundGate {
-        self.background.clone()
-    }
-
     /// Shared handle on the background-shell-task registry, so a surface can
-    /// kill a task or open its live output while a turn holds the agent —
-    /// same pattern as [`Self::subagent_registry`].
+    /// read it while a turn holds the agent — same pattern as
+    /// [`Self::subagent_registry`], and taken by `App::tasks` so `/bashes`
+    /// answers mid-turn, which is the only time there is anything to list.
+    ///
+    /// Read, specifically. The registry can also kill (`TaskRegistry::kill`),
+    /// and this accessor claimed a surface used it for that; none does. The
+    /// only kill paths today are the model's own `kill_task` tool and
+    /// `kill_all` on teardown, so a human cannot stop a backgrounded command
+    /// from any surface. That gap is real and is not closed here.
     pub fn task_registry(&self) -> Arc<crate::tools::tasks::TaskRegistry> {
         Arc::clone(&self.ctx.tasks)
     }
 
-    /// Bind the spawn tool's shared model slot (see
-    /// [`subagent::SpawnSubagentTool::model_handle`]) so subagents run on
-    /// this agent's active model, including after `/model` switches.
+    /// Bind the spawn tool's shared slot (see
+    /// [`subagent::SpawnSubagentTool::model_handle`]) to this agent: subagents
+    /// run on its active model, including after `/model` switches, and a
+    /// foreground subagent ends when the user interrupts the turn it is
+    /// running inside.
+    ///
+    /// The name is older than what it binds. It stayed because every surface's
+    /// registry builder hands the slot back through it, and renaming the entry
+    /// point would touch each of them for nothing.
     pub fn bind_subagent_model(&mut self, handle: subagent::SharedActiveModel) {
-        if let Ok(mut slot) = handle.write() {
-            *slot = Some(self.model.clone());
-        }
+        handle.bind(
+            self.model.clone(),
+            self.cancel.clone(),
+            self.llm_breaker.clone(),
+        );
         self.subagent_model = Some(handle);
     }
 
@@ -1497,11 +1177,18 @@ impl Agent {
     /// The agent's working todo list, for `/status` on a surface that does not
     /// mirror the `TodoUpdated` events itself.
     pub fn todos(&self) -> Vec<crate::tools::todo::TodoItem> {
+        // Poison is recovered, not propagated, for the same reason
+        // `GateDesk::lock` recovers it: the list is owned data that nothing
+        // reads while the lock is held, so a panic elsewhere cannot have left
+        // it half-written. `map(...).unwrap_or_default()` used to swallow a
+        // poisoned lock as an *empty* todo list, which reads on the status bar
+        // as "the agent has no work left", a wrong answer where the honest
+        // one was available all along.
         self.ctx
             .todos
             .lock()
-            .map(|list| list.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The model client this agent talks to. A surface rebuilding the tool
@@ -1670,10 +1357,8 @@ impl Agent {
     /// prompt is recomposed so the JSON tool protocol section matches.
     pub fn set_model(&mut self, model: String, native_tools: bool) {
         self.config.model = model.clone();
-        if let Some(handle) = &self.subagent_model
-            && let Ok(mut slot) = handle.write()
-        {
-            *slot = Some(model.clone());
+        if let Some(handle) = &self.subagent_model {
+            handle.set_model(model.clone());
         }
         self.model = model;
         self.native_tools = native_tools;
@@ -1729,7 +1414,7 @@ impl Agent {
         self.memory_index = read_memory_index(&self.ctx.cwd);
         let prompt = self.compose_system_prompt();
         match self.history.first_mut() {
-            Some(first) if first.role == Role::System => first.content = prompt,
+            Some(first) if first.role == Role::System => *first = ChatMessage::system(prompt),
             _ => self.history.insert(0, ChatMessage::system(prompt)),
         }
     }
@@ -1782,13 +1467,43 @@ impl Agent {
         let Some(path) = &self.usage_log else {
             return;
         };
+        let (cache_read_tokens, cache_write_tokens) = self.usage.turn_cache_totals();
+        let provider = self.config.active();
+        // Cost is settled here, at write time, because this is the only place
+        // that holds all three inputs at once: the counts, the model that
+        // produced them, and the provider's configured rates. Whoever reads
+        // usage.jsonl months from now has the counts and neither of the
+        // others, and by then the config may name a different model entirely.
+        let priced = crate::usage::estimate_cost(
+            crate::usage::TurnTokens {
+                prompt: prompt_tokens,
+                completion: completion_tokens,
+                cache_read: cache_read_tokens,
+                cache_write: cache_write_tokens,
+            },
+            &crate::usage::PriceInputs {
+                model: &self.model,
+                // The seller, for the open-weight ids several hosts serve at
+                // different prices: `gpt-oss-120b` costs one thing on Groq
+                // and more than twice that on Cerebras, and the model id
+                // alone cannot tell them apart.
+                endpoint: &provider.base_url,
+                usd_per_mtok_in: provider.usd_per_mtok_in,
+                usd_per_mtok_out: provider.usd_per_mtok_out,
+                self_hosted: crate::usage::self_hosted(provider.kind),
+            },
+        );
         let record = crate::usage::UsageRecord {
             ts: crate::usage::unix_now(),
             project: self.ctx.cwd.display().to_string(),
             model: self.model.clone(),
-            provider: self.config.active().name,
+            provider: provider.name,
             prompt_tokens,
             completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cost_usd: Some(priced.usd),
+            price_source: priced.source,
             mode: self.mode.to_string(),
         };
         if let Err(err) = crate::usage::append(path, &record) {
@@ -1796,256 +1511,54 @@ impl Agent {
         }
     }
 
-    /// Whether the history is close enough to overflowing to warrant
-    /// compaction: the last model call's reported prompt size exceeds
-    /// [`COMPACT_WINDOW_FRACTION`] of the provider's known context window,
-    /// or — when no window is known — the serialized history exceeds the
-    /// byte threshold.
-    async fn should_compact(&self) -> bool {
-        let pressure = self.context_pressure().await;
-        pressure.level == PressureLevel::Critical
-    }
-
-    /// Keep history bounded so the agent can run indefinitely. When
-    /// [`Self::should_compact`] fires (byte threshold, or the last prompt
-    /// nearing the provider's context window), summarize the middle span
-    /// (everything between the system prompt and the last [`KEEP_RECENT`]
-    /// messages) into a single progress note. Best-effort: a summarization
-    /// failure falls back to dropping the middle span. Never aborts the turn.
-    async fn compact_if_needed(&mut self, events: &mpsc::Sender<AgentEvent>) {
-        if !self.should_compact().await {
-            return;
-        }
-        match self.compact_now().await {
-            CompactOutcome::Nothing => {}
-            // Success is informational; only a truncation (the summary LLM
-            // genuinely failed) is an error.
-            outcome @ CompactOutcome::Summarized(_) => {
-                let _ = emit(events, AgentEvent::Notice(outcome.describe())).await;
-                let _ = emit(
-                    events,
-                    AgentEvent::ContextSize {
-                        tokens: self.context_tokens(),
-                    },
-                )
-                .await;
-            }
-            outcome @ CompactOutcome::Truncated { .. } => {
-                let _ = emit(events, AgentEvent::Error(outcome.describe())).await;
-                let _ = emit(
-                    events,
-                    AgentEvent::ContextSize {
-                        tokens: self.context_tokens(),
-                    },
-                )
-                .await;
-            }
-        }
-    }
-
-    /// Summarize the middle span (everything between the system prompt and the
-    /// last [`KEEP_RECENT`] messages) into a single note, unconditionally —
-    /// the `/compact` command's force path, the `compact` tool, and the shared
-    /// core of [`compact_if_needed`]. A summarization failure falls back to
-    /// dropping the middle span. Never aborts a turn.
+    /// Compact the conversation unconditionally — the `/compact` command's
+    /// force path, the `compact` tool, and the shared core of
+    /// the step loop's own pass. The cut itself is [`context::compact`]'s, under
+    /// [`context::Anchor::Conversation`]; what is added here is the part that
+    /// needs an [`Agent`]: persisting the note, and invalidating the reading
+    /// that triggered the pass.
     ///
     /// On success the progress note is appended to the session as a system note
     /// so resume and the model both see that stewardship happened (the full
     /// pre-compact transcript remains earlier in the JSONL).
     pub async fn compact_now(&mut self) -> CompactOutcome {
-        // Need history[0] (system prompt) + a non-empty middle + the recent tail.
-        if self.history.len() <= KEEP_RECENT + 1 {
-            return CompactOutcome::Nothing;
+        let compacted = context::compact(
+            &mut self.history,
+            context::Anchor::Conversation,
+            &self.client,
+            &self.model,
+        )
+        .await;
+        // Persist the note so resume replays the stewardship breadcrumb; the
+        // in-memory middle span is already replaced (the full transcript stays
+        // earlier in the append-only JSONL).
+        if let Some(note) = &compacted.note
+            && let Err(err) = self.session.append_system_note(note)
+        {
+            tracing::warn!("session append failed for compact note: {err}");
         }
-        let start = 1;
-        let mut end = self.history.len() - KEEP_RECENT;
-        // Never cut between an assistant tool-call message and its results:
-        // snap the boundary back so the kept tail starts at a user message
-        // (every tool-call group is preceded by one).
-        while end > start && self.history[end].role != Role::User {
-            end -= 1;
+        if compacted.outcome != CompactOutcome::Nothing {
+            // The history just shrank: the last reported prompt size is stale
+            // and must not re-trigger compaction on the next step. A pass that
+            // cut nothing leaves it alone — the reading is still true, and
+            // dropping it would put the status bar back on an estimate.
+            self.usage.clear_last_prompt();
         }
-        if start >= end {
-            return CompactOutcome::Nothing;
-        }
-        let count = end - start;
-
-        let outcome = match self.summarize_span(start, end).await {
-            Ok(summary) => {
-                let replacement =
-                    ChatMessage::system(format!("{COMPACT_SUMMARY_HEADING}\n{summary}"));
-                // Persist the note so resume replays the stewardship breadcrumb;
-                // the in-memory middle span is replaced (full transcript stays
-                // earlier in the append-only JSONL).
-                if let Err(err) = self.session.append_system_note(&replacement) {
-                    tracing::warn!("session append failed for compact note: {err}");
-                }
-                self.history
-                    .splice(start..end, std::iter::once(replacement));
-                CompactOutcome::Summarized(count)
-            }
-            Err(err) => {
-                // Fall back to truncation: drop the middle span outright.
-                self.history.drain(start..end);
-                CompactOutcome::Truncated {
-                    count,
-                    error: format!("{err:#}"),
-                }
-            }
-        };
-        // The history just shrank: the last reported prompt size is stale
-        // and must not re-trigger compaction on the next step.
-        self.usage.clear_last_prompt();
-        outcome
+        compacted.outcome
     }
 
-    /// Summarize `history[start..end]` with a rolling per-chunk pass, so an
-    /// arbitrarily large span is fully represented instead of hard-truncated:
-    /// each chunk is summarized together with the summary of everything
-    /// before it.
-    async fn summarize_span(&self, start: usize, end: usize) -> Result<String> {
-        // Render each message and pack into ~20k-char chunks, splitting
-        // oversized messages at char boundaries.
-        let mut chunks: Vec<String> = vec![String::new()];
-        for msg in &self.history[start..end] {
-            let role = match msg.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
-            let rendered = format!("{role}: {}\n", msg.content);
-            let mut rest = rendered.as_str();
-            while !rest.is_empty() {
-                let chunk = chunks.last_mut().expect("at least one chunk");
-                let room = COMPACT_CHUNK_CHARS.saturating_sub(chunk.len());
-                if rest.len() <= room {
-                    chunk.push_str(rest);
-                    break;
-                }
-                if room == 0 {
-                    chunks.push(String::new());
-                    continue;
-                }
-                let mut cut = room;
-                while cut > 0 && !rest.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                if cut == 0 {
-                    chunks.push(String::new());
-                    continue;
-                }
-                chunk.push_str(&rest[..cut]);
-                rest = &rest[cut..];
-                chunks.push(String::new());
-            }
-        }
-
-        let mut summary: Option<String> = None;
-        for chunk in &chunks {
-            let blob = match &summary {
-                None => chunk.clone(),
-                Some(prev) => format!(
-                    "[Progress summary of the transcript so far]\n{prev}\n\n\
-                     [Transcript continues]\n{chunk}"
-                ),
-            };
-            summary = Some(self.summarize_transcript(&blob).await?);
-        }
-        summary.ok_or_else(|| anyhow::anyhow!("nothing to summarize"))
-    }
-
-    /// Summarize a transcript blob into a terse progress note via the model.
-    /// Used by [`compact_if_needed`]; deltas are not forwarded to the UI.
-    async fn summarize_transcript(&self, blob: &str) -> Result<String> {
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ChatMessage::system(
-                    "Summarize the following Wizard agent transcript into a compact progress \
-                     note. Preserve: the mission/goal, decisions made, files changed, commands \
-                     run, what worked/failed, and open next steps. Preserve the current todo \
-                     list state verbatim (every item and its status) if one was maintained, \
-                     and mention the plan file path (.wizard/plan.md) if a plan was written. \
-                     Be terse and factual.",
-                ),
-                ChatMessage::user(blob.to_string()),
-            ],
-            tools: Vec::new(),
-            stream: true,
-            options: Some(ChatOptions {
-                temperature: Some(0.2),
-                num_ctx: None,
-                // Internal summarization stays at the provider default; the
-                // user's `/effort` applies to real turns, not compaction.
-                reasoning_effort: None,
-            }),
-        };
-
-        let mut stream = self
-            .client
-            .chat_stream(request)
-            .await
-            .context("starting compaction summary")?;
-        let mut summary = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading compaction stream")?;
-            if let Some(message) = chunk.message
-                && !chunk.thinking
-            {
-                summary.push_str(&message.content);
-            }
-            if chunk.done {
-                break;
-            }
-        }
-        if summary.trim().is_empty() {
-            anyhow::bail!("empty summary");
-        }
-        Ok(summary)
-    }
-
-    /// Drain background tasks that finished since the last check (each
-    /// reported exactly once): inject a notification with the output tail
-    /// into history so the model sees it on its next completion, and emit
-    /// [`AgentEvent::TaskFinished`] for the surfaces. Called at the top of
-    /// every agent step and every perpetual cycle.
-    async fn drain_background_tasks(&mut self, events: &mpsc::Sender<AgentEvent>) {
-        for task in self.ctx.tasks.drain_completed() {
-            self.push(ChatMessage::system(task_note(&task)));
-            let _ = emit(
-                events,
-                AgentEvent::TaskFinished {
-                    id: task.id,
-                    command: task.command,
-                    status: task.status,
-                },
-            )
-            .await;
-        }
-    }
-
-    /// Drain backgrounded subagents (`spawn_subagent` with `background: true`)
-    /// that finished since the last check (each reported exactly once):
-    /// inject the report into history so the model sees it on its next
-    /// completion, and emit [`AgentEvent::SubagentFinished`] for the
-    /// surfaces. Called at the top of every agent step, alongside
-    /// [`Self::drain_background_tasks`].
-    async fn drain_background_subagents(&mut self, events: &mpsc::Sender<AgentEvent>) {
-        for task in self.ctx.subagents.drain_completed() {
-            self.push(ChatMessage::system(subagent_note(&task)));
-            let _ = emit(
-                events,
-                AgentEvent::SubagentFinished {
-                    id: task.id,
-                    name: task.name,
-                    task: task.task,
-                    completed: task.completed,
-                    output: task.output,
-                },
-            )
-            .await;
-        }
+    /// Drain background tasks and subagents that finished since the last check
+    /// (each reported exactly once): inject a notification into history so the
+    /// model sees it on its next completion, and emit the matching event for
+    /// the surfaces.
+    ///
+    /// The same drain the loop runs at the top of every step (it *is* that
+    /// drain — see [`turn::drain_background`]), exposed for the perpetual
+    /// runner, which has to surface finished work between cycles too.
+    pub(crate) async fn drain_background(&mut self, events: &mpsc::Sender<AgentEvent>) {
+        let sink = turn::Sink::Turn(events.clone());
+        let mut host = turn::TurnHost { agent: self };
+        turn::drain_background(&mut host, &sink).await;
     }
 
     /// Collect background tasks and subagents that finished since the last
@@ -2069,10 +1582,21 @@ impl Agent {
 }
 
 impl Drop for Agent {
-    /// Kill any still-running background tasks. Their children also carry
-    /// `kill_on_drop`; this makes the teardown explicit and immediate.
+    /// Kill everything this agent detached: background shell tasks, and
+    /// background subagent runs.
+    ///
+    /// Both, and the second one was missing. A shell task's child carries
+    /// `kill_on_drop`, so killing the registry is mostly making the teardown
+    /// explicit and immediate. A background subagent has no such backstop: its
+    /// driver is a detached `tokio::spawn` holding its own `Arc` clones of the
+    /// client, the registry and the tool context, so dropping the agent freed
+    /// none of it. The run kept calling the provider, kept billing the user's
+    /// key, and kept writing into a registry nothing would ever drain, once for
+    /// every rebuild of the agent, which is every `/model`, every provider
+    /// switch, every `/fusion` toggle and every `/reload`.
     fn drop(&mut self) {
         self.ctx.tasks.kill_all();
+        self.ctx.subagents.kill_all();
     }
 }
 
@@ -2115,11 +1639,11 @@ fn read_memory_index(project_root: &Path) -> Option<String> {
 /// registry (native + scripted + MCP + subagent spawner + evolve + publish),
 /// load skills, and open/create the session.
 ///
-/// This is the shared agent-construction path used by both the sovereign
-/// headless runner ([`run_headless`]) and the messaging gateway
-/// ([`crate::gateway`]). `resume` reopens the latest session instead of
-/// starting a new one. Each builds exactly one agent, so each lets this path
-/// connect the MCP servers for it.
+/// This is the shared agent-construction path used by the sovereign headless
+/// runner ([`crate::headless::run`]), the ACP server ([`crate::acp`]) and the
+/// messaging gateway ([`crate::gateway`]). `resume` reopens the latest session
+/// instead of starting a new one. Each builds exactly one agent, so each lets
+/// this path connect the MCP servers for it.
 pub async fn build_headless_agent(
     config: &Config,
     project_root: &Path,
@@ -2242,7 +1766,7 @@ async fn build_headless_agent_inner(
         .with_context(|| format!("building provider '{}'", active.name))?;
     // llama.cpp gets a lifecycle hand: when nothing answers, Wizard starts
     // the server itself, showing spawn/load progress on a spinner (plain
-    // stdout lines when stderr is not a terminal).
+    // stderr lines when stderr is not a terminal).
     if active.kind == ProviderKind::LlamaCpp {
         let wait = crate::progress::ServerSpinner::start();
         let outcome = crate::server::ensure_running(&active, &wait).await;
@@ -2268,7 +1792,12 @@ async fn build_headless_agent_inner(
 
     let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     if !native_tools {
-        println!("using the JSON tool protocol for '{model}'");
+        // Never `println!`. Every surface reaches this path, and two of them
+        // own stdout as a protocol transport: the ACP server frames JSON-RPC
+        // on it (`crate::acp`) and `--output-format json` frames the run
+        // there. A bare line on stdout corrupts both, so the notice goes to
+        // stderr, which no surface parses.
+        eprintln!("using the JSON tool protocol for '{model}'");
     }
 
     // Session first: the hook engine carries its id in every payload. An
@@ -2323,401 +1852,108 @@ async fn build_headless_agent_inner(
     Ok(agent)
 }
 
-/// `rollback_failed_cycles`: restore every checkpoint from the failed
-/// cycle's first turn onward and note the rollback in the persisted mission.
-/// Best-effort — failures are logged and the run proceeds to its normal end.
-fn rollback_failed_cycle(
-    config: &Config,
-    agent: &Agent,
-    mission: Option<&mut mission::Mission>,
-    project_root: &Path,
-    first_turn: u64,
-    why: &str,
-    // `None` in the structured output formats, where stdout is JSON-only.
-    spinner: Option<&crate::progress::TurnSpinner>,
-) {
-    if !config.rollback_failed_cycles {
-        return;
-    }
-    match agent.checkpoints().restore_turns_from(first_turn) {
-        Ok(restored) => {
-            if restored.is_empty() {
-                return;
-            }
-            if let Some(spinner) = spinner {
-                spinner.println(&format!(
-                    "[rolled back {} file(s) after {why}]",
-                    restored.len()
-                ));
-            }
-            if let Some(mission) = mission {
-                mission.note(format!(
-                    "rolled back {} file(s) after {why} (cycle starting at turn {first_turn})",
-                    restored.len()
-                ));
-                if let Err(err) = mission.save(project_root) {
-                    tracing::warn!("could not record rollback in mission.toml: {err:#}");
-                }
-            }
-        }
-        Err(err) => tracing::warn!("cycle rollback failed: {err:#}"),
-    }
-}
-
-/// Sovereign-mode headless runner: builds an [`Agent`] and drives it in an
-/// outer loop. The goal comes from `cli.prompt`, or (on a self-evolve
-/// re-exec) from the persisted [`mission::Mission`]. With `--continuous` it
-/// runs perpetually — persisting a mission, self-directing the next action
-/// after each completed cycle, sleeping-and-waking through transient LLM
-/// outages, compacting context, and re-exec'ing itself after a self-evolve —
-/// until stopped via `.wizard/loop-control`, `--max-hours`, or the circuit
-/// breaker. Otherwise it honors the `--loop N` bound. Prints progress to
-/// stdout instead of the TUI (`--output-format` selects the
-/// [`crate::output::EventSink`]); the returned exit code encodes the
-/// outcome (see [`crate::output::exit_code`]).
-pub async fn run_headless(config: Config, cli: Cli) -> Result<i32> {
-    let project_root = std::env::current_dir().context("determining project root")?;
-
-    // Goal resolution: an explicit `-p` wins; otherwise resume the standing
-    // mission (this is the path taken after a self-evolve re-exec, which
-    // relaunches without `-p`); otherwise there is nothing to do.
-    let goal = if let Some(prompt) = cli.prompt.clone() {
-        prompt
-    } else if let Some(existing) = mission::Mission::load(&project_root)? {
-        existing.goal
-    } else {
-        return Err(anyhow::anyhow!(
-            "headless mode needs a task: pass -p \"<task>\""
-        ));
-    };
-    // The same preprocessing the TUI applies on submit: custom `/command`
-    // expansion and `@file` references (including image attachments).
-    let custom_commands = crate::commands::load(&project_root);
-    let prepared = crate::commands::preprocess(&goal, &custom_commands, &project_root);
-    let goal = prepared.text;
-    let goal_images = prepared.images;
-
-    let active = config.active();
-    let model = active.model.clone();
-    let endpoint = active.base_url.clone();
-
-    let mut agent = build_headless_agent(&config, &project_root, cli.resume).await?;
-    agent.set_deadline(
-        cli.max_hours
-            .map(|hours| Instant::now() + Duration::from_secs_f64(hours * 3600.0)),
-    );
-    // `--plan` / `plan_first = true`: the first turn starts in plan mode.
-    // The model investigates read-only, presents a plan via exit_plan, the
-    // printer below auto-approves it, and the same turn proceeds to execute
-    // — a natural two-phase turn with no human in the loop.
-    if config.plan_first {
-        agent.set_plan_mode(true);
-    }
-
-    // Dashboard-dispatched background session (`--bg`): register in the session
-    // registry and keep a heartbeat ticking so `/dashboard` shows it as a live
-    // "Working" row. The terminal state is written once the run ends, below.
-    let bg_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut bg_record: Option<crate::session_registry::SessionRecord> = None;
-    let mut bg_ticker: Option<tokio::task::JoinHandle<()>> = None;
-    if cli.bg {
-        let headline = goal
-            .lines()
-            .next()
-            .unwrap_or("background run")
-            .chars()
-            .take(48)
-            .collect::<String>();
-        let record = crate::session_registry::SessionRecord {
-            id: agent.session().id.clone(),
-            name: if headline.is_empty() {
-                "background run".to_string()
-            } else {
-                headline.clone()
-            },
-            cwd: project_root.display().to_string(),
-            model: model.clone(),
-            mode: "sovereign".to_string(),
-            state: crate::session_registry::SessionState::Working,
-            activity: format!("working: {headline}"),
-            pid: std::process::id(),
-            started_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            updated_unix: 0,
-        };
-        crate::session_registry::write(&record);
-        let stop = Arc::clone(&bg_stop);
-        let ticker_record = record.clone();
-        bg_ticker = Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                crate::session_registry::write(&ticker_record);
-            }
-        }));
-        bg_record = Some(record);
-    }
-
-    // Busy spinner ("Conjuring…") shown while the model thinks or a tool
-    // runs, hidden while output streams. Shared with the text sink; a
-    // no-op when stderr is not a terminal. The structured formats never
-    // show it and keep stdout pure JSON (`text_mode` gates every plain
-    // stdout line below).
-    let spinner = Arc::new(crate::progress::TurnSpinner::new());
-    let text_mode = cli.output_format == crate::output::OutputFormat::Text;
-
-    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-    // The sink consumes every agent event off the run loop; it is returned
-    // so `finish` can emit the run summary once the outcome is known.
-    let mut sink: Box<dyn crate::output::EventSink> = match cli.output_format {
-        crate::output::OutputFormat::Text => {
-            Box::new(crate::output::TextSink::new(Arc::clone(&spinner)))
-        }
-        crate::output::OutputFormat::Json => Box::new(crate::output::JsonSink::stdout()),
-        crate::output::OutputFormat::StreamJson => {
-            Box::new(crate::output::StreamJsonSink::stdout())
-        }
-    };
-    let printer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            sink.event(event);
-        }
-        sink
-    });
-
-    if text_mode {
-        println!(
-            "wizard {} — model {model} @ {endpoint} — task: {goal}",
-            config.mode
-        );
-    }
-
-    // session_start hooks fire once for the whole run.
-    agent.fire_session_start(&tx).await;
-
-    // Continuous mode persists a long-lived mission so the loop survives
-    // restarts and binary self-replacement (deep evolve re-exec).
-    let mut mission_state = if config.continuous {
-        let mission = match mission::Mission::load(&project_root)? {
-            Some(existing) => existing,
-            None => {
-                let fresh = mission::Mission::new(goal.clone());
-                fresh.save(&project_root)?;
-                fresh
-            }
-        };
-        Some(mission)
-    } else {
-        None
-    };
-
-    let max_iterations = cli.loop_limit.unwrap_or(1).max(1);
-    let mut input = goal.clone();
-    let mut final_reason = DoneReason::Completed;
-    let mut run_error: Option<anyhow::Error> = None;
-    // Set when a self-evolve marker is consumed: after draining the printer we
-    // re-exec into the freshly built/extended binary.
-    let mut reexec_after = false;
-    let mut iteration: u32 = 0;
-
-    loop {
-        iteration += 1;
-        if !config.continuous && iteration > max_iterations {
-            break;
-        }
-
-        // Honor a graceful stop at the top of every cycle.
-        if read_loop_control(&project_root) == Some(LoopControl::Stop) {
-            clear_loop_control(&project_root);
-            final_reason = DoneReason::Stopped;
-            break;
-        }
-        if config.continuous {
-            if text_mode {
-                spinner.println(&format!("\n=== cycle {iteration} ==="));
-            }
-            // `plan_each_cycle = true`: every cycle starts by planning again
-            // (the previous cycle's exit_plan approval cleared the flag).
-            if config.plan_each_cycle {
-                agent.set_plan_mode(true);
-            }
-        } else if max_iterations > 1 && text_mode {
-            spinner.println(&format!("\n=== iteration {iteration}/{max_iterations} ==="));
-        }
-
-        // Fresh verb per turn (same mechanism as the TUI's busy spinner), so
-        // one turn reads as one activity. Structured formats never spin.
-        if text_mode {
-            let verb_seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos() as u64)
-                .wrapping_add(u64::from(iteration));
-            spinner.set_verb(config.ui.spinner_verb(verb_seed));
-            spinner.show();
-        }
-
-        // Surface background tasks that finished between cycles (the turn
-        // loop also drains at the top of every step).
-        agent.drain_background_tasks(&tx).await;
-
-        // First checkpoint turn of this cycle, for rollback_failed_cycles
-        // (run_turn assigns the next id via begin_turn).
-        let cycle_first_turn = agent.checkpoints().current_turn() + 1;
-        // Images only ride on the first cycle's initial user prompt; later
-        // continuation prompts are pure text.
-        let turn_images = if iteration == 1 {
-            goal_images.clone()
-        } else {
-            Vec::new()
-        };
-        match agent
-            .run_turn_with_images(&input, turn_images, tx.clone())
-            .await
-        {
-            Ok(reason) => {
-                final_reason = reason;
-                match reason {
-                    DoneReason::MaxSteps => {
-                        input = "Continue the task from where you left off. If it is already \
-                                 complete, summarize what was done."
-                            .to_string();
-                    }
-                    DoneReason::Completed => {
-                        if config.continuous {
-                            // Never idle: record the cycle and self-direct the
-                            // next most valuable action toward the mission.
-                            if let Some(mission) = mission_state.as_mut() {
-                                mission.record_cycle(Some(format!("cycle done: {reason:?}")));
-                                mission.save(&project_root)?;
-                                input = format!(
-                                    "You are operating CONTINUOUSLY and autonomously toward this \
-                                     standing mission:\n\n{goal}\n\nYou just reported the current \
-                                     sub-task complete (cycle {}). Re-examine the project state, \
-                                     then choose and carry out the single most valuable next \
-                                     action that advances the mission. If the mission itself is \
-                                     genuinely and fully complete, instead pick a high-value \
-                                     improvement to the project — better tests, docs, \
-                                     performance, robustness — or improve your OWN capabilities \
-                                     using the `evolve` tool. Never idle; always advance.",
-                                    mission.cycles
-                                );
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    DoneReason::Stopped | DoneReason::TimeLimit => {
-                        break;
-                    }
-                    DoneReason::CircuitBreaker => {
-                        rollback_failed_cycle(
-                            &config,
-                            &agent,
-                            mission_state.as_mut(),
-                            &project_root,
-                            cycle_first_turn,
-                            "circuit breaker",
-                            text_mode.then_some(&*spinner),
-                        );
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                rollback_failed_cycle(
-                    &config,
-                    &agent,
-                    mission_state.as_mut(),
-                    &project_root,
-                    cycle_first_turn,
-                    "hard error",
-                    text_mode.then_some(&*spinner),
-                );
-                run_error = Some(err);
-                break;
-            }
-        }
-
-        // After the turn, react to self-evolution markers: a deep rebuild
-        // (`evolve-reexec`) or a tier-1 extension (`evolve-reload`) both mean
-        // the running image is stale, so we re-exec to reload everything.
-        // Only meaningful in continuous mode, where the persisted mission lets
-        // the relaunched process resume without a `-p` goal; a one-shot run
-        // just finishes and the next launch picks up the new binary.
-        let reexec = mission::reexec_marker(&project_root);
-        let reload = mission::reload_marker(&project_root);
-        if config.continuous && (reexec.exists() || reload.exists()) {
-            if let Some(mission) = mission_state.as_ref() {
-                mission.save(&project_root)?;
-            }
-            let _ = std::fs::remove_file(&reexec);
-            let _ = std::fs::remove_file(&reload);
-            reexec_after = true;
-            break;
-        }
-
-        if config.cycle_pause_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(config.cycle_pause_secs)).await;
-        }
-    }
-
-    // session_end hooks fire however the run ended (including just before a
-    // self-evolve re-exec replaces the process).
-    agent.fire_session_end(Some(&tx)).await;
-
-    drop(tx);
-    let mut sink = match printer.await {
-        Ok(sink) => sink,
-        Err(err) => return Err(anyhow::anyhow!("output task panicked: {err}")),
-    };
-    spinner.finish();
-
-    // Background session: stop the heartbeat and record the terminal state so
-    // the dashboard shows the result (completed/failed) rather than the row
-    // vanishing. The terminal record is retained (not removed) by the registry.
-    if let Some(mut record) = bg_record.take() {
-        bg_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(ticker) = bg_ticker.take() {
-            ticker.abort();
-        }
-        if run_error.is_some() {
-            record.state = crate::session_registry::SessionState::Failed;
-            record.activity = "failed".to_string();
-        } else {
-            record.state = crate::session_registry::SessionState::Completed;
-            record.activity = "completed".to_string();
-        }
-        crate::session_registry::write(&record);
-    }
-
-    if reexec_after {
-        use std::os::unix::process::CommandExt;
-        let exe = std::env::current_exe().context("locating current executable for re-exec")?;
-        if text_mode {
-            println!("[re-exec into evolved binary {}]", exe.display());
-        }
-        let err = std::process::Command::new(exe)
-            .arg("--mode")
-            .arg("sovereign")
-            .arg("--continuous")
-            .arg("--cwd")
-            .arg(&project_root)
-            .exec(); // never returns on success
-        return Err(anyhow::anyhow!("re-exec after evolve failed: {err}"));
-    }
-
-    if let Some(err) = run_error {
-        return Err(err);
-    }
-    // The sink emits the run summary (the text trailer line, or the final
-    // JSON object / `done` JSONL line) and leaves stdout flushed.
-    sink.finish(final_reason);
-    Ok(crate::output::exit_code(final_reason))
-}
-
 #[cfg(test)]
 mod tests;
+
+/// Teardown: what a dropped [`Agent`] takes with it.
+///
+/// Its own module rather than a case in [`tests`], because the thing under
+/// test is a `Drop` impl and every assertion has to happen *after* the value
+/// is gone, which means the harness is a scope and not a fixture.
+#[cfg(test)]
+mod teardown_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::llm::ChatStream;
+
+    /// A provider that is never called; the agent under test only has to
+    /// exist.
+    struct IdleProvider;
+
+    #[async_trait]
+    impl LlmProvider for IdleProvider {
+        async fn health(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn supports_native_tools(&self, _model: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> Result<ChatStream> {
+            anyhow::bail!("the teardown tests never talk to a model")
+        }
+
+        fn label(&self) -> String {
+            "idle:test".to_string()
+        }
+    }
+
+    /// A background subagent must not outlive the agent that spawned it.
+    ///
+    /// It used to. `Drop` killed the shell-task registry and not the subagent
+    /// one, so every rebuild of the agent (`/model`, a provider switch, a
+    /// `/fusion` toggle, `/reload`) left the previous agent's detached runs
+    /// calling the provider on a key nobody was watching, writing into a
+    /// registry nothing would ever drain.
+    #[tokio::test]
+    async fn dropping_the_agent_kills_its_background_subagents() {
+        let dir = std::env::temp_dir().join(format!("wizard-teardown-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let session = Session::create(&dir).expect("create session");
+        let hooks = Arc::new(HookEngine::new(Vec::new(), dir.clone(), session.id.clone()));
+
+        // Set by the detached run if it is ever allowed to finish.
+        let survived = Arc::new(AtomicBool::new(false));
+        let registry = {
+            let agent = Agent::new(
+                Arc::new(IdleProvider),
+                ToolRegistry::new(),
+                Config::default(),
+                Vec::new(),
+                dir.clone(),
+                session,
+                true,
+                hooks,
+            )
+            .expect("build agent");
+
+            let registry = agent.subagent_registry();
+            let flag = Arc::clone(&survived);
+            registry.spawn("worker", "outlive my parent", async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                flag.store(true, Ordering::SeqCst);
+                crate::tools::subagent_tasks::SubagentRunResult {
+                    completed: true,
+                    output: "still here".to_string(),
+                    steps_used: 1,
+                    error: None,
+                }
+            });
+            assert_eq!(registry.pending_count(), 1, "the run is detached and live");
+            registry
+        };
+
+        // Give the aborted driver a chance to be scheduled, so a failure here
+        // is "it kept running", not "it had not started yet".
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.pending_count(),
+            0,
+            "the agent went away and its detached runs went with it"
+        );
+        assert!(
+            !survived.load(Ordering::SeqCst),
+            "the run was aborted, not merely marked as finished"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

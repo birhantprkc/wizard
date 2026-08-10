@@ -1,0 +1,42 @@
+Wizard
+Copyright (c) 2026 Teddy Tennant
+
+Wizard's own code is licensed under the MIT License (see LICENSE-MIT). The product
+as a whole is therefore `MIT AND Apache-2.0`, because of the ports below.
+
+It contains terminal-UI code ported from the following Apache-2.0 projects.
+Every ported function and constant names the upstream file it came from at the
+site it appears; docs/ui-skins.md holds the file-by-file table.
+
+--------------------------------------------------------------------------------
+
+OpenAI Codex
+https://github.com/openai/codex
+Copyright (c) OpenAI
+Licensed under the Apache License, Version 2.0.
+
+Ported from codex-rs/tui/src/ into src/ui/codex.rs, src/ui/mod.rs,
+src/skin/blend.rs, src/skin/motion.rs and src/skin/layout.rs.
+
+--------------------------------------------------------------------------------
+
+xAI Grok Build
+https://github.com/xai-org/grok-build
+Copyright (c) X.AI Corp.
+Licensed under the Apache License, Version 2.0.
+
+Ported from crates/codegen/xai-grok-pager/ and
+crates/codegen/xai-grok-pager-render/ into src/ui/grok.rs, src/skin/layout.rs
+and src/skin/motion.rs.
+
+--------------------------------------------------------------------------------
+
+A verbatim copy of the Apache License, Version 2.0 ships with this project as
+LICENSE-APACHE, next to this file. Section 4(a) of that license requires that
+whoever receives a derivative work receives the license text with it, so it is a
+file in the tree rather than only the canonical URL,
+http://www.apache.org/licenses/LICENSE-2.0
+
+The crate's SPDX expression is therefore `MIT AND Apache-2.0`, not `OR`: this is
+one work carrying both sets of terms at once, not a choice offered to the
+recipient.

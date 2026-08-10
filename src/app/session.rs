@@ -148,6 +148,11 @@ pub(super) async fn build_agent(
     // all of them (the GUI runs the subset its executor implements; headless and
     // gateway runs, none).
     agent.set_command_dispatch(CommandDispatch::All);
+    // The TUI is the one surface with a person at a keyboard, so it is the one
+    // surface where a shell command that asks a question can be answered: its
+    // composer claims the console gate and relays what is typed. Everywhere
+    // else leaves this at `None` and keeps `/dev/null` on fd 0.
+    agent.set_console_access(crate::tools::ConsoleAccess::Interactive);
     agent.bind_subagent_model(subagent_model);
     Ok(agent)
 }
@@ -173,23 +178,52 @@ pub(super) fn spawn_session_rebuild(
     let manager = Arc::clone(manager);
     let session = SessionTarget::Id(app.session_id.clone());
     let success_notice = success_notice.to_string();
-    tokio::spawn(async move {
-        let manager = manager.lock().await;
-        let rebuild =
-            match build_agent(&client, &config, &skills, &project_root, &manager, session).await {
-                Ok(agent) => AgentRebuild {
+    // `App::rebuilding` is cleared only by the `AgentRebuilt` below, and while
+    // it is set the main loop refuses to start any turn. A panic in here
+    // (session decode, a provider client's model probe) therefore did not just
+    // lose the rebuild — it made every later message queue silently, forever.
+    // See [`crate::app::recover::spawn_answering`].
+    super::recover::spawn_answering(
+        notify,
+        Event::AgentRebuilt(Box::new(AgentRebuild {
+            agent: None,
+            model: None,
+            notice: "the agent rebuild crashed".to_string(),
+        })),
+        async move {
+            // Bounded, because the `McpManager` lock below is shared with the
+            // startup connect: a stdio server that never answers its handshake
+            // would otherwise park this rebuild forever, and a rebuild that
+            // never lands is a session that never runs another turn.
+            let built = super::recover::within(
+                "restarting the agent",
+                super::recover::AGENT_REBUILD_DEADLINE,
+                async {
+                    let manager = manager.lock().await;
+                    build_agent(&client, &config, &skills, &project_root, &manager, session).await
+                },
+            )
+            .await;
+            let rebuild = match built {
+                Ok(Ok(agent)) => AgentRebuild {
                     agent: Some(agent),
                     model: None,
                     notice: success_notice,
                 },
-                Err(err) => AgentRebuild {
+                Ok(Err(err)) => AgentRebuild {
                     agent: None,
                     model: None,
-                    notice: format!("could not restart the agent: {err:#} — /quit and relaunch"),
+                    notice: format!("could not restart the agent: {err:#}"),
+                },
+                Err(timed_out) => AgentRebuild {
+                    agent: None,
+                    model: None,
+                    notice: timed_out,
                 },
             };
-        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-    });
+            Some(Event::AgentRebuilt(Box::new(rebuild)))
+        },
+    );
 }
 
 /// Re-arm `/ultra` on a freshly built agent, and a no-op when ultra is off.

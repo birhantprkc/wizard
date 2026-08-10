@@ -1,6 +1,11 @@
 /target/
-/target-glibc/
+# Alternate CARGO_TARGET_DIRs (glibc builds, sandboxed or parallel agent runs).
+# One pattern rather than one line per directory: these get created ad hoc, and
+# an unignored one is several GB of build artifacts staged into a commit.
+/target-*/
 **/*.rs.bk
+# Bytecode from the repo's python helpers (`contrib/find-unwired.py`).
+__pycache__/
 *.pdb
 .DS_Store
 .idea/
@@ -15,3 +20,27 @@ demo/demo.mp4
 .wizard/
 # generate_image tool output
 /generated/
+# working notes and plans, not part of the shipped repo
+/internal/
+
+# Scratch git worktrees created for background agents.
+.claude/worktrees/
+
+# Secrets, in the one place nothing else stops them. Runtime credentials live
+# under $HOME/.wizard/ and never come near a checkout, so this is not about
+# them; it is about the keys that get written here by hand. The concrete one:
+# `contrib/seed-release-key.sh` takes the keyfile as an optional argument, so
+# `contrib/seed-release-key.sh ./release.key` puts the *release signing private
+# key* in the repository root, and from there a `git add -A` is the whole
+# accident. That key signs every release `wizard update` will ever accept, and a
+# commit is not a place it can be taken back from.
+#
+# Patterns, not filenames, because the argument is whatever the caller typed.
+# Nothing tracked today matches any of them (checked with `git ls-files`); if a
+# fixture ever needs to, negate it on its own line rather than dropping a
+# pattern — `git check-ignore -v <path>` names the line that caught a file.
+*.pem
+*.key
+id_rsa*
+credentials.toml
+*_oauth.json

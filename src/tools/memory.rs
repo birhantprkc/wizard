@@ -69,13 +69,19 @@ impl Tool for MemoryTool {
         "memory"
     }
 
+    /// The pointer to the memory rules is load-bearing and has already dangled
+    /// once: it named a system-prompt section after that section's rules had
+    /// moved behind the `manual` lookup, so the rules were reachable from
+    /// nowhere. `the_description_sends_the_model_somewhere_that_exists` now
+    /// follows it. Point it at a real destination or inline the rule, never at
+    /// a place that "should" carry it.
     fn description(&self) -> &str {
         "Persist a fact about this project or its user across sessions. Actions: \
-         'save' (record or update a durable fact — needs type, description, content), \
+         'save' (record or update a durable fact: needs type, description, content), \
          'read' (full body plus linked memories), 'delete' (drop a wrong/obsolete one). \
-         Types: user, feedback, project, reference. Rules for what belongs in memory \
-         are in the system prompt Memory section — follow those; do not restate them \
-         here. Names are kebab-case; descriptions are one line."
+         Types: user, feedback, project, reference. Before you save or delete, read \
+         `manual` topic `memory`: it says what earns a place and what must never be \
+         written down. Names are kebab-case; descriptions are one line."
     }
 
     fn parameters(&self) -> Value {
@@ -187,6 +193,41 @@ mod tests {
             let _ = std::fs::remove_dir_all(self.store().dir());
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Follow the pointer the description hands the model.
+    ///
+    /// This description used to delegate the memory rules to "the system prompt
+    /// Memory section" after those rules had moved behind the `manual` lookup,
+    /// so the chain ran description -> prompt -> nothing and the rules that keep
+    /// the store from becoming a junk drawer were unreachable. A pointer nobody
+    /// walks is a pointer that rots.
+    #[test]
+    fn the_description_sends_the_model_somewhere_that_exists() {
+        let description = MemoryTool.description();
+        assert!(
+            !description.contains("system prompt Memory section"),
+            "the rules do not live in the prompt any more"
+        );
+
+        const LEAD: &str = "`manual` topic `";
+        let start = description
+            .find(LEAD)
+            .expect("the description must say where the memory rules are")
+            + LEAD.len();
+        let tail = &description[start..];
+        let topic = &tail[..tail.find('`').expect("the topic id is closed")];
+
+        let page = crate::agent::prompts::manual_page(topic).unwrap_or_else(|| {
+            panic!(
+                "the memory tool sends the model to `manual` topic {topic:?}, which no page serves"
+            )
+        });
+        assert!(
+            page.body.contains("A memory has to earn its place"),
+            "topic {topic:?} resolves, but not to the rules: {}",
+            page.title
+        );
     }
 
     #[tokio::test]

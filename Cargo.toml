@@ -1,26 +1,104 @@
 [package]
 name = "wizard"
-version = "1.8.0"
+version = "2.0.0"
 edition = "2024"
-license = "MIT"
+# `AND`, not `OR`. This is not a dual-licensed crate offering the recipient a
+# choice: Wizard's own code is MIT, and the terminal-UI ports listed in NOTICE
+# (`src/ui/codex.rs`, `src/ui/grok.rs`, `src/ui/mod.rs`, `src/skin/blend.rs`,
+# `src/skin/motion.rs`, `src/skin/layout.rs`) came from Apache-2.0 upstreams and
+# stay under Apache-2.0 wherever they go. A binary built from this tree
+# therefore carries both sets of terms at once, and both license files ship
+# beside it: LICENSE-MIT and LICENSE-APACHE.
+# Apache-2.0 section 4(a) requires that the recipient of a
+# derivative work be *given* a copy of the license, which is why LICENSE-APACHE
+# is a file in the tree rather than a URL in NOTICE.
+license = "MIT AND Apache-2.0"
 description = "One line. Your sovereign agent. Self-extending. Bring any model."
 repository = "https://github.com/teddytennant/wizard"
+# There is no separate project website — the README, the docs/ directory and the
+# release assets all live in the repository — so this points at the same place
+# rather than inventing a domain that would 404 from the crates.io sidebar.
+homepage = "https://github.com/teddytennant/wizard"
+# Edition 2024 needs 1.85, but that is not the binding constraint: the tree uses
+# `if let` chains (for example `RegistryClient::index` in
+# `src/registry_client.rs`, which reads the cache age and the cache itself in one
+# condition), and those stabilized in 1.88. CI does not pin a toolchain — both
+# jobs use `dtolnay/rust-toolchain@stable` — so nothing there would catch a
+# feature from a newer release sneaking in; this line is the only floor a
+# downstream `cargo install` on an older toolchain gets told about, and it fails
+# with "requires rustc 1.88" instead of a page of parse errors.
+rust-version = "1.88"
+keywords = ["agent", "llm", "cli", "tui", "ai"]
+# crates.io rejects a category slug it does not know, so these are four from its
+# published list rather than descriptions: the binary is a terminal program
+# (`command-line-utilities`) that edits code and drives git (`development-tools`),
+# renders and rewrites markdown, diffs and syntax (`text-processing`), and speaks
+# to a dozen model providers' HTTP APIs (`api-bindings`).
+categories = [
+  "command-line-utilities",
+  "development-tools",
+  "text-processing",
+  "api-bindings",
+]
+# What a `cargo package` tarball does not need. Everything here is media that
+# exists for the README and the GitHub social preview, led by `demo/demo.gif` at
+# 1.2 MB — over half the crate on its own, downloaded by every `cargo install`
+# and never opened by one.
+#
+# Deliberately narrow, because two things under `assets/` are compiled *into*
+# the binary and excluding either breaks the build rather than slimming it:
+# `assets/fonts/*.ttf` is `include_bytes!`d by `src/native/font.rs`, and
+# `assets/themes/*.toml` is `include_str!`d by `src/theme.rs`. `build.rs`,
+# `WIZARD.md` (`include_str!` in `src/agent/prompts.rs` and `src/tools/manual.rs`)
+# and `wizard-release.pub` (`include_str!` in `src/update.rs`) are all load-bearing
+# too and stay in. Check for a new `include_bytes!`/`include_str!` before adding a
+# line here.
+exclude = [
+  "demo/",
+  "assets/favicon.svg",
+  "assets/favicon-*.png",
+  "assets/favicon-*.svg",
+  "assets/github-social.png",
+  "assets/og.png",
+  "assets/wizard.svg",
+  "assets/wizard-512.png",
+  "assets/wizard-mark.png",
+]
 build = "build.rs"
 
 [features]
 default = []
 
-# Native desktop shell (`wizard app`): a tao window with a wry webview over the
-# in-process GUI server. OFF by default and it must stay that way — wry links
-# the system webview (WebKitGTK on Linux), so a default-featured build would
-# gain a hard runtime dependency on libwebkit2gtk that every TUI and CLI user
-# would have to satisfy just to start the binary, and it could no longer be
-# linked statically against musl.
-desktop = ["dep:tao", "dep:wry"]
+# The GUI (`wizard gui`): an iced window over the agent core, with no webview,
+# no loopback HTTP and no JSON round-trip per streaming token. It is the only
+# GUI — the browser one it replaced (axum, a WebSocket and `gui/assets/`) is
+# deleted; see `docs/native-gui.md`.
+#
+# OFF by default: iced is a windowing toolkit, so a default-featured build
+# would link winit, a font stack and a rasterizer into every headless
+# `wizard -p`, every `wizard acp` and every CI container — several hundred
+# crates that a terminal user never executes a line of. It would also break the
+# static musl build, because winit reaches X11 and Wayland through `dlopen`,
+# and it would put the whole UI layer inside the coverage ratchet
+# (`contrib/check-coverage.sh` measures default features), where a widget tree
+# that can only be exercised with a compositor would drag the floor down for
+# everyone.
+#
+# So `cargo build` with no features must keep linking no iced at all, and the
+# window ships as its *own* release asset: the `native` job in
+# `.github/workflows/release.yml` publishes `wizard-native-<target>.tar.gz` for
+# the four gnu/darwin targets, and `install.sh WIZARD_NATIVE=1` installs one.
+# See `docs/native-gui.md`.
+# `src/gui/` — sessions, config store, git, OAuth — is behind this flag too:
+# the window is now the only thing that reaches it.
+native = ["dep:iced", "dep:iced_highlighter", "dep:iced_test"]
 
 [dependencies]
-# FUSION debate engine (provider-agnostic core; drives /fusion mode)
-fusion-core = { git = "https://github.com/teddytennant/FUSION.git" }
+# NOTE: every dependency here must be a crates.io dependency. `cargo publish`
+# refuses any crate that carries a `{ git = ... }` one, so a single such line
+# takes `cargo install wizard` (and everything downstream of crates.io, Homebrew
+# included) off the table. The /fusion debate engine used to be one; it now
+# lives in `src/llm/fusion.rs`.
 
 # Errors
 anyhow = "1"
@@ -39,10 +117,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 
 # Ollama HTTP (rustls so the binary has no OpenSSL link dependency)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-
-# Browser GUI (`wizard gui`): local HTTP server + WebSocket event stream +
-# multipart uploads (attachments)
-axum = { version = "0.8", features = ["ws", "multipart"] }
 
 # OAuth sign-in (xAI): PKCE hashing, base64url tokens, randomness
 sha2 = "0.10"
@@ -99,9 +173,20 @@ globset = "0.4"
 # falls back to a plain byte copy when the filesystem lacks FICLONE/clonefile.
 reflink-copy = "0.1"
 
-# Tracing facade for internal diagnostics. No subscriber is installed, so
-# events are dropped at runtime; kept for the call sites across src/.
+# Internal diagnostics. `tracing` is the facade every call site in src/ emits
+# through; `tracing-subscriber` is what actually records them, as JSONL under
+# ~/.wizard/logs/ (see `crate::logging`). Default features are off on purpose:
+# `ansi` and `tracing-log` are dead weight for a sink that must never touch a
+# terminal, and dropping `ansi` keeps nu-ansi-term out of the tree entirely.
+# What is left is the minimum that sink needs: `fmt` for the layer and the
+# registry behind it, `json` for the JSONL formatter, `env-filter` for the
+# `WIZARD_LOG` directive syntax.
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "env-filter",
+  "fmt",
+  "json",
+] }
 
 # Web tools: HTML → markdown for web_fetch, result scraping for web_search
 htmd = "0.5"
@@ -112,27 +197,105 @@ scraper = "0.27"
 flate2 = "1"
 tar = "0.4"
 semver = "1"
+# Release signatures are minisign, which is ed25519 over a blake2b-512 prehash
+# of the file rather than a new algorithm: the signature itself is verified by
+# the ed25519-dalek below, and this is the one primitive that pulls in. Same
+# RustCrypto `digest` traits sha2 already brings, so it adds one crate.
+blake2 = "0.10"
 
 # Config/skills sync (`wizard sync`): ed25519 signatures over the bundle
 # manifest. Keys are seeded from getrandom — no rand/rand_core dependency.
 ed25519-dalek = "2"
 
-# Desktop shell (`--features desktop` only): window + system webview, the two
-# libraries Tauri itself is built on. No Electron, no bundled Chromium — wry
-# drives WebKitGTK on Linux and WKWebView on macOS. Optional, so a default
-# build links neither.
-# `default-features = false` drops tao's `dbus` feature, which exists for the
-# tray and global shortcuts this shell does not use. Keeping it would make
-# libdbus-1-dev a build dependency of every Linux desktop build for nothing.
-# `x11` and `rwh_06` are the rest of tao's default set and are load-bearing.
-tao = { version = "0.35", optional = true, default-features = false, features = [
-  "x11",
-  "rwh_06",
+# The P2P mesh transport (`src/mesh/quic.rs`): QUIC with mutual TLS, where the
+# certificate's key IS the node's ed25519 identity, so the handshake proves the
+# peer id rather than a signature check bolted onto a plaintext socket.
+#
+# quinn's default feature set is deliberately off. `platform-verifier` drags in
+# rustls-platform-verifier and a whole OS trust-store integration for a mesh
+# that has no CAs in it at all — every certificate here is self-signed by the
+# node it names, and `src/mesh/tls.rs` is the only verifier. `rustls-ring`
+# rather than `rustls-aws-lc-rs` because aws-lc-rs is a C library and this
+# project ships static musl builds; ring is already in the tree under reqwest.
+quinn = { version = "0.11", default-features = false, features = [
+  "log",
+  "ring",
+  "runtime-tokio",
+  "rustls-ring",
 ] }
-# `devtools`: wry compiles the inspector out of release builds unless it is
-# asked for (it is `cfg(any(debug_assertions, feature = "devtools"))`), and
-# `wizard app --devtools` has to work in the binary people actually install.
-wry = { version = "0.55", optional = true, features = ["devtools"] }
+# Same rustls the reqwest client already links, reached directly for the two
+# certificate verifiers the mesh installs in place of a CA chain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Zero-config LAN discovery for the mesh, and the second mechanism rather than
+# the first: a pasted address is still how a peer is added, and mDNS grants no
+# trust to anything it finds (see src/mesh/discovery.rs). `default-features =
+# false` drops `logging`, which installs an env_logger the crate would then own;
+# wizard logs through `tracing` and nothing else. `async` is kept because the
+# browse channel is drained from a tokio task that has to be cancellable, which
+# a blocking `recv()` is not.
+mdns-sd = { version = "0.20", default-features = false, features = ["log", "async"] }
+
+# The native GUI (`--features native` only). Every feature here is chosen
+# against a dependency that is already in the tree, because the whole point of
+# an in-process GUI is that it does not bring a second copy of anything:
+#
+# `default-features = false` + `tiny-skia` is the load-bearing one. It links no
+# wgpu at all — not a runtime fallback, an absent dependency — which is what
+# keeps `curl | bash` honest on a box with no Vulkan driver, and what keeps the
+# build off the shader toolchain. `cargo tree -i wgpu --features native` must
+# stay empty.
+#
+# `image-without-codecs` rather than `image`: the latter turns on `image`'s
+# default feature set, which would undo the four-format selection above
+# (`png, jpeg, gif, webp`) that keeps the TIFF/DDS/EXR/AVIF decoders out.
+#
+# `linux-theme-detection` is deliberately OFF. It is in iced's default set and
+# it pulls `mundy`, which runs its D-Bus query on `async-io` — a second,
+# smol-flavoured reactor thread alongside the tokio runtime the agent core
+# already owns. The theme comes from `crate::theme` anyway (see
+# `src/native/theme.rs`), so the detection would be ignored even if it worked.
+#
+# `highlighter` reaches syntect through `two-face` with `syntect-default-fancy`,
+# which is byte-identical to the selection above: one syntect, fancy-regex, no
+# oniguruma and so no C dependency.
+#
+# `markdown` is deliberately OFF: it pins `pulldown-cmark ^0.12` against the
+# 0.13 above, so enabling it links two copies of the parser. Wizard's own
+# markdown pipeline feeds `text::Rich` spans instead.
+iced = { version = "0.14", optional = true, default-features = false, features = [
+  "tiny-skia",
+  "x11",
+  "wayland",
+  "canvas",
+  "tokio",
+  "image-without-codecs",
+  "highlighter",
+  "lazy",
+  "advanced",
+] }
+# Reached directly for `Highlighter::new`, which the transcript's code blocks
+# drive per-line. Re-exported by iced under the `highlighter` feature, but
+# naming it here is what pins the version alongside iced's.
+iced_highlighter = { version = "0.14", optional = true }
+
+# Headless UI testing for the window: `Simulator` drives a widget tree with no
+# compositor and snapshots it to PNG, and `iced_test::runtime` re-exports the
+# `UserInterface` the selection tests drive directly, because
+# `Simulator::simulate` hardcodes `clipboard::Null` and so cannot observe a
+# copy. Only `src/native/**` names it, always under `#[cfg(test)]`.
+#
+# Here rather than in `[dev-dependencies]`, which is where it belongs and where
+# it cannot go. Cargo compiles a dev-dependency for every `cargo test` whether
+# or not any code under `#[cfg]` names it, so an unconditional entry drags
+# `iced_renderer` into a default-feature test build, where it gets no renderer
+# backend and hits iced's own `compile_error!`. That breaks `cargo test
+# --release` specifically, which is the command deep evolve gates a
+# self-authored patch on (`src/evolve/mod.rs`, `TEST_ARGS`) — so every
+# self-rebuild would fail on an error that has nothing to do with the patch.
+# `optional` is the fix and `[dev-dependencies]` forbids it ("dev-dependencies
+# are not allowed to be optional"), so it moves up here and `native` turns it
+# on. A `native` release build compiles the crate and links none of it.
+iced_test = { version = "0.14", optional = true }
 
 # Embedded LuaJIT for self-extension: scripted tools and evolve glue run through
 # the just-in-time compiler in-process. Vendored so the binary has no system
@@ -143,9 +306,33 @@ mlua = { version = "0.11", default-features = false, features = ["luajit", "vend
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# macOS desktop control for the `computer` tool: CoreGraphics is how you
+# synthesise mouse and keyboard events and read the display, behind the
+# Accessibility and Screen Recording permissions (`src/tools/computer/macos.rs`).
+#
+# Target-gated because it must not reach the Linux or Windows builds at all:
+# the Linux backend shells out to X11/Wayland helpers instead, and an
+# unconditional dependency would put a macOS-only system framework in the
+# static musl link. `src/tools/computer/macos.rs` is `cfg(target_os = "macos")`
+# on the Rust side, so a Linux build compiles clean whether or not this line is
+# here — which is exactly why it is easy to forget and why macOS is the only
+# target that would notice.
+#
+# `highsierra` is not optional here despite the name: `CGEvent::new_scroll_event`
+# — the whole of the scroll action — sits behind that feature, and nothing else
+# in the graph turns it on, so a default-featured build fails to compile
+# `macos.rs` rather than merely losing scrolling. The feature gates the
+# non-variadic `CGEventCreateScrollWheelEvent2`, which has been present since
+# macOS 10.13; the deployment target is well past that.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.24", features = ["highsierra"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+# `iced_test` is not here: it is optional and lives under `[dependencies]`,
+# because a dev-dependency cannot be optional and an unconditional one breaks
+# `cargo test --release` without `native`. See the note at its entry.
 
 [profile.release]
 strip = true

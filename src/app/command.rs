@@ -1,16 +1,24 @@
-//! Slash-command dispatch: [`CommandContext`] borrows the main loop's
-//! stack for the duration of one command.
+//! The terminal UI's half of the one slash-command dispatcher.
+//!
+//! [`CommandContext`] borrows the main loop's stack for the duration of one
+//! command and implements [`CommandSurface`]: the verbs a command needs, and
+//! nothing about what a command *means*. That lives in
+//! [`crate::commands::surface`], which every surface runs the same command
+//! through, so the terminal and the window cannot answer `/goal` differently
+//! again.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::agent::Agent;
-use crate::commands::{
-    FusionAction, MemoryAction, ProviderAction, ServerAction, SlashCommand, UltraAction,
+use crate::agent::{Agent, RewindCandidate};
+use crate::commands::surface::{
+    Chooser, CommandSurface, Panel, PlanState, SessionSnapshot, Surface, dispatch,
 };
+use crate::commands::{ProviderAction, ServerAction, SlashCommand};
 use crate::config::{
     Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget, UltraConfig,
 };
@@ -21,11 +29,14 @@ use crate::llm::provider::LlmProvider;
 use crate::mcp::{McpConfig, McpManager};
 use crate::server;
 use crate::skills::Skill;
+use crate::skin;
+use crate::theme;
+use crate::tools::tasks::Task;
 
 use super::session::{
     SessionTarget, build_agent, build_registry, load_skill_roots, restore_ultra, switch_model_task,
 };
-use crate::agent::subagent;
+use crate::agent::{subagent, ultra};
 
 use super::{App, Picker, PickerItem, PickerKind};
 
@@ -115,53 +126,68 @@ async fn git_diff_untracked(root: &Path, file: &str) -> String {
     }
 }
 
-const HELP_TEXT: &str = "available commands:\n  \
-/help                       show this help\n  \
-/clear                      clear the conversation\n  \
-/model [tag]                pick a model interactively, or switch directly\n  \
-/mode [genie|sovereign]     pick or switch personality mode\n  \
-/genie · /sovereign         switch mode directly\n  \
-/effort [low|med|high]      set reasoning effort (Grok 4.x, OpenAI o-series/gpt-5)\n  \
-/plan                       toggle plan mode (read-only until a plan is approved)\n  \
-/omakase                    toggle omakase: chef's-choice plan mode, the agent decides\n  \
-/rewind [turn]              rewind files and conversation to before a turn\n  \
-/resume                     reopen and continue a past session\n  \
-/compact                    summarize older history into a progress note now\n  \
-/btw <question>             ask a side question without adding it to the conversation\n  \
-/fork <task>                spawn a background side quest that inherits full context\n  \
-/agents                     browse subagents and delegate to one\n  \
-/evolve [--deep] <desc>     self-extension (skill / MCP / scripted tool)\n  \
-/publish [branch]           fork Wizard to your GitHub, get a one-line installer\n  \
-/provider                   add or switch LLM providers (interactive picker)\n  \
-/fusion [config]            toggle model fusion (panel debate → synthesis), or configure the panel\n  \
-/ultra [config]             toggle mixture of agents (candidates draft → judge rules → agent acts)\n  \
-/server [status|start|stop] manage the local llama-server\n  \
-/login xai                  sign in with your xAI account (OAuth, no API key)\n  \
-/reload                     reload skills, scripted tools, and MCP servers\n  \
-/diff                       toggle the git diff sidebar\n  \
-/todos                      toggle the todo list above the input\n  \
-/dashboard                  session manager: all live wizard sessions on this machine\n  \
-/cost                       show session token usage and cost\n  \
-/memory [read|forget <name>] list, show, or forget saved project memories\n  \
-/status                     show session status (model, usage, todos, tasks)\n  \
-/bashes                     list background tasks (id, status, command)\n  \
-/goal [text]                show the standing goal, or set one and start working on it\n  \
-/settings                   open the settings menu (change config anytime)\n  \
-/vim                        toggle vim-style modal editing of the input line\n  \
-/doctor                     diagnose config, providers, MCP, hooks, state dirs\n  \
-/quit                       exit\n\
-keys:\n  \
-Tab / →                     accept command completion\n  \
+/// `/ui [name]`: wear another agent's terminal chrome, or list what is
+/// available.
+///
+/// Unlike [`theme_command`] this one *persists*: `[ui] skin` exists, so a
+/// switch that only lasted until the next launch would be a worse answer than
+/// writing the file. A failed write is reported and the switch still stands
+/// for this session — the user asked to see it, and they can see it.
+///
+/// Switching brings the new skin's palette with it, unconditionally. It used
+/// to do so only for a user who had never set `[ui] theme` or `WIZARD_THEME`,
+/// which meant `/ui codex` drew Codex's frame in the old colors for exactly
+/// the people most likely to notice. Those settings are gone and a skin now
+/// owns its colors outright, so there is nothing left to defer to.
+pub(super) fn ui_command(app: &mut App, name: Option<&str>) -> String {
+    let Some(name) = name else {
+        let active = skin::active();
+        let mut text = format!("ui: {} — {}\n", active.label(), active.description());
+        for candidate in skin::Skin::ALL {
+            let marker = if candidate == active { "●" } else { "·" };
+            text.push_str(&format!(
+                "  {marker} {}  {}\n",
+                candidate.key(),
+                candidate.description()
+            ));
+        }
+        text.push_str("switch with /ui <name> — the commands and keys stay Wizard's");
+        return text;
+    };
+
+    let switched = match skin::set_active_by_name(name) {
+        Ok(switched) => switched,
+        Err(err) => return format!("error: {err:#}"),
+    };
+
+    let mut text = format!("ui: {} — {}", switched.label(), switched.description());
+    if let Ok(theme) = theme::set_active_by_name(switched.companion_theme()) {
+        text.push_str(&format!("\npalette: {} (came with the skin)", theme.name));
+    }
+
+    app.config.ui.skin = Some(switched.key().to_string());
+    if let Err(err) = app.config.save() {
+        text.push_str(&format!("\ncould not save config: {err:#}"));
+    }
+    text
+}
+
+/// The key bindings appended to `/help` here. The *commands* half of that
+/// answer is derived from [`crate::commands::COMMANDS`] on every surface:
+/// there used to be a hand-written list in this file, and it had already lost
+/// `/exit`. Keys are the terminal's own, and have no table to come from.
+const HELP_KEYS: &str = "keys:\n  \
+Tab / \u{2192}                     accept command completion\n  \
 Shift+Tab                   toggle plan mode\n  \
-↑ / ↓                       select suggestion · browse input history\n  \
-PgUp/PgDn · wheel           scroll the transcript (stays put while streaming)\n  \
-Esc · Ctrl-End              jump back to the live tail\n  \
-drag                        select text — copied to the clipboard on release\n  \
+\u{2191} / \u{2193}                       select suggestion \u{b7} browse input history\n  \
+PgUp/PgDn \u{b7} wheel           scroll the transcript (stays put while streaming)\n  \
+Esc \u{b7} Ctrl-End              jump back to the live tail\n  \
+drag                        select text \u{2014} copied to the clipboard on release\n  \
 click a tool card           expand / collapse its output\n  \
-Ctrl-P                      model picker  ·  Ctrl-T toggle last tool card\n  \
-Ctrl-A/E Home/End ←/→       move cursor   ·  Ctrl-W/U/K kill word/to start/to end\n  \
+Ctrl-P                      model picker  \u{b7}  Ctrl-T toggle last tool card\n  \
+Ctrl-A/E Home/End \u{2190}/\u{2192}       move cursor   \u{b7} Ctrl-W/U/K kill word/to start/to end\n  \
 Ctrl-G                      edit the prompt in $EDITOR\n  \
-Ctrl-C                      interrupt · press twice to quit";
+Ctrl-C                      interrupt \u{b7} press twice to quit";
 
 /// Everything a slash command may touch, borrowed from the main loop for
 /// the duration of one dispatch.
@@ -179,62 +205,11 @@ pub(super) struct CommandContext<'a> {
 
 impl CommandContext<'_> {
     /// Execute one slash command against the running stack.
+    ///
+    /// Straight through the one dispatcher, so what a command means here is
+    /// what it means everywhere. This surface supplies the verbs below.
     pub(super) async fn run(mut self, command: SlashCommand) {
-        match command {
-            SlashCommand::Help => self.app.notice(HELP_TEXT),
-            SlashCommand::Quit => self.app.should_quit = true,
-            SlashCommand::Diff => self.toggle_diff().await,
-            SlashCommand::Todos => self.toggle_todos(),
-            SlashCommand::Dashboard => self.toggle_dashboard(),
-            SlashCommand::Cost => self.cost(),
-            SlashCommand::Memory(action) => self.memory(action),
-            SlashCommand::Doctor => self.doctor().await,
-            SlashCommand::Status => self.status(),
-            SlashCommand::Bashes => self.bashes(),
-            SlashCommand::Goal(None) => self.show_goal(),
-            SlashCommand::Goal(Some(text)) => self.set_goal(text),
-            SlashCommand::Clear => self.clear(),
-            SlashCommand::Model(None) => self.open_model_picker().await,
-            SlashCommand::Model(Some(tag)) => self.switch_model(tag),
-            SlashCommand::Mode(None) => self.open_mode_picker(),
-            SlashCommand::Mode(Some(mode)) => self.switch_mode(mode),
-            SlashCommand::Effort(None) => self.open_effort_picker(),
-            SlashCommand::Effort(Some(effort)) => self.set_effort(effort),
-            SlashCommand::Plan => self.toggle_plan(),
-            SlashCommand::Omakase => self.toggle_omakase(),
-            SlashCommand::Rewind(None) => self.open_rewind_picker(),
-            SlashCommand::Rewind(Some(turn)) => self.rewind(turn),
-            SlashCommand::Resume(None) => self.app.open_resume_picker(),
-            SlashCommand::Resume(Some(id)) => self.resume_session(id).await,
-            SlashCommand::Compact => self.request_compact(),
-            SlashCommand::Btw(question) => self.btw(question),
-            SlashCommand::Fork(task) => self.fork(task),
-            SlashCommand::Agents => self.open_agents_picker(),
-            SlashCommand::Reload => self.reload().await,
-            SlashCommand::Evolve { deep, description } => self.evolve(deep, description),
-            SlashCommand::Publish { branch } => self.publish(branch),
-            SlashCommand::Fusion(FusionAction::Toggle) => self.toggle_fusion().await,
-            SlashCommand::Fusion(FusionAction::Config) => self.open_fusion_picker(),
-            SlashCommand::Ultra(UltraAction::Toggle) => self.toggle_ultra(),
-            SlashCommand::Ultra(UltraAction::Config) => self.open_ultra_picker(),
-            SlashCommand::Ultra(UltraAction::Apply(ultra)) => self.apply_ultra(ultra),
-            SlashCommand::Provider(action) => self.provider(action).await,
-            SlashCommand::ProviderSetup {
-                name,
-                kind,
-                base_url,
-                model,
-                api_key,
-            } => {
-                self.provider_setup(name, kind, base_url, model, api_key)
-                    .await
-            }
-            SlashCommand::Server(action) => self.server(action).await,
-            SlashCommand::Login(provider) => self.login(provider),
-            SlashCommand::Settings => self.app.open_settings_picker(),
-            SlashCommand::Vim => self.app.toggle_vim(),
-            SlashCommand::ImportClaude(selection) => self.import_claude(selection).await,
-        }
+        dispatch(command, &mut self).await;
     }
 
     /// True (with a notice) when the agent cannot be touched right now —
@@ -254,14 +229,16 @@ impl CommandContext<'_> {
     }
 
     async fn toggle_diff(&mut self) {
-        self.app.show_diff = !self.app.show_diff;
-        if self.app.show_diff {
-            self.app.diff_scroll = 0;
-            self.app.diff_text = match git_diff_text(self.project_root).await {
+        if self.app.diff.take().is_some() {
+            return;
+        }
+        self.app.diff = Some(crate::app::DiffPane {
+            text: match git_diff_text(self.project_root).await {
                 Ok(text) => text,
                 Err(err) => format!("could not read git diff: {err:#}"),
-            };
-        }
+            },
+            scroll: 0,
+        });
     }
 
     /// `/todos`: toggle the compact todo band above the composer.
@@ -284,194 +261,8 @@ impl CommandContext<'_> {
         }
     }
 
-    /// `/cost`: session token totals, plus an estimate when the active
-    /// provider has `usd_per_mtok_in` / `usd_per_mtok_out` configured.
-    fn cost(&mut self) {
-        let prompt = self.app.status.prompt_tokens;
-        let completion = self.app.status.completion_tokens;
-        let mut text = format!("session usage: {prompt} prompt + {completion} completion tokens");
-        let provider = self.app.config.active();
-        match crate::usage::cost_usd(
-            prompt,
-            completion,
-            provider.usd_per_mtok_in,
-            provider.usd_per_mtok_out,
-        ) {
-            Some(cost) => text.push_str(&format!(" · est. ${cost:.4}")),
-            None => text.push_str(&format!(
-                "\nset usd_per_mtok_in / usd_per_mtok_out on provider '{}' in \
-                 ~/.wizard/config.toml for cost estimates",
-                provider.name
-            )),
-        }
-        self.app.notice(text);
-    }
-
-    /// `/memory`: the user's window onto the memories the agent writes with
-    /// the `memory` tool — list them, read one, or forget one. Rendered by
-    /// [`crate::memory::report`], the same renderer the GUI answers with.
-    fn memory(&mut self, action: MemoryAction) {
-        self.app
-            .notice(crate::memory::report(self.project_root, &action));
-    }
-
-    /// `/doctor`: the same diagnostics as `wizard doctor`, in the
-    /// transcript. Network probes are capped at 5s each, but a slow
-    /// provider or MCP server still blocks the UI for that long.
-    async fn doctor(&mut self) {
-        let checks = crate::doctor::run_checks(self.project_root).await;
-        self.app
-            .notice(format!("doctor:\n{}", crate::doctor::render(&checks)));
-    }
-
-    /// `/status`: one snapshot of the session — model, provider, mode,
-    /// session id, usage, todo progress, background tasks, plan mode.
-    fn status(&mut self) {
-        let provider = self.app.config.active();
-        let effort = self
-            .app
-            .config
-            .reasoning_effort
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "default".to_string());
-        let mut text = format!(
-            "model: {}\nprovider: {} ({:?} @ {})\nmode: {}\neffort: {effort}",
-            self.app.status.model, provider.name, provider.kind, provider.base_url, self.app.mode,
-        );
-        match self.agent_slot.as_ref() {
-            Some(agent) => {
-                let (prompt, completion) = agent.usage().session_totals();
-                text.push_str(&format!(
-                    "\nsession: {}\nusage: {prompt} prompt + {completion} completion tokens",
-                    agent.session().id,
-                ));
-                text.push_str(&format!(
-                    "\nbackground tasks: {} running",
-                    agent.running_tasks()
-                ));
-            }
-            None => {
-                // Mid-turn (or rebuilding): the status bar mirror is the
-                // best available source.
-                let (prompt, completion) = (
-                    self.app.status.prompt_tokens,
-                    self.app.status.completion_tokens,
-                );
-                text.push_str(&format!(
-                    "\nsession: (turn running)\nusage: {prompt} prompt + {completion} completion tokens",
-                ));
-            }
-        }
-        let (done, total) = crate::tools::todo::progress(&self.app.todos);
-        if total > 0 {
-            text.push_str(&format!("\ntodos: {done}/{total} done"));
-        } else {
-            text.push_str("\ntodos: none");
-        }
-        text.push_str(&format!(
-            "\nplan mode: {}",
-            if self.app.omakase {
-                "on (omakase — chef's choice)"
-            } else if self.app.plan_mode {
-                "on"
-            } else {
-                "off"
-            }
-        ));
-        text.push_str(&format!(
-            "\nultra: {}",
-            match &self.app.ultra {
-                Some(ultra) => ultra.label(),
-                None => "off".to_string(),
-            }
-        ));
-        self.app.notice(text);
-    }
-
-    /// `/bashes`: list every background task this session has spawned
-    /// (`execute` with `run_in_background`), running and finished, newest
-    /// last — id, status, and the command line.
-    fn bashes(&mut self) {
-        let Some(agent) = self.agent_slot.as_ref() else {
-            self.app
-                .notice("background tasks: unavailable while a turn is running");
-            return;
-        };
-        let tasks = agent.tasks();
-        if tasks.is_empty() {
-            self.app.notice("background tasks: none");
-            return;
-        }
-        let mut text = String::from("background tasks:\n");
-        for task in &tasks {
-            text.push_str(&format!(
-                "  #{} [{}] {}\n",
-                task.id,
-                task.status.describe(),
-                task.command
-            ));
-        }
-        self.app.notice(text.trim_end().to_string());
-    }
-
-    /// `/goal`: show the standing mission goal that drives sovereign /
-    /// continuous mode, with its cycle count and a few recent progress notes.
-    fn show_goal(&mut self) {
-        match crate::agent::mission::Mission::load(self.project_root) {
-            Err(err) => self.app.notice(format!("could not read mission: {err:#}")),
-            Ok(None) => self.app.notice(
-                "no standing goal set — use `/goal <text>` to set one \
-                 (drives sovereign/continuous mode)",
-            ),
-            Ok(Some(m)) => {
-                let mut text = format!(
-                    "goal: {}\ncycles: {}  ·  updated {}",
-                    m.goal,
-                    m.cycles,
-                    m.updated.format("%Y-%m-%d %H:%M UTC"),
-                );
-                if !m.notes.is_empty() {
-                    text.push_str("\nrecent:");
-                    let skip = m.notes.len().saturating_sub(5);
-                    for note in &m.notes[skip..] {
-                        text.push_str(&format!("\n  - {note}"));
-                    }
-                }
-                self.app.notice(text);
-            }
-        }
-    }
-
-    /// `/goal <text>`: set (or replace) the standing mission goal,
-    /// non-destructively preserving cycles and existing progress notes, then
-    /// immediately start working toward it (queued behind any running turn).
-    fn set_goal(&mut self, text: String) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            self.app.notice("usage: /goal <text>");
-            return;
-        }
-        let m = match crate::agent::mission::Mission::load(self.project_root) {
-            Err(err) => {
-                self.app.notice(format!("could not read mission: {err:#}"));
-                return;
-            }
-            Ok(Some(mut m)) => {
-                m.goal = text.clone();
-                m.note(format!("goal changed to: {text}"));
-                m
-            }
-            Ok(None) => crate::agent::mission::Mission::new(text.clone()),
-        };
-        if let Err(err) = m.save(self.project_root) {
-            self.app.notice(format!("could not save mission: {err:#}"));
-            return;
-        }
-        self.app.notice(format!("standing goal set:\n{text}"));
-        self.app.queue_goal_kickoff(&text);
-    }
-
-    fn clear(&mut self) {
+    /// `/clear`: rotate the session and empty the transcript view.
+    fn clear_conversation(&mut self) {
         if self.agent_unavailable("clear") {
             return;
         }
@@ -483,8 +274,6 @@ impl CommandContext<'_> {
             return;
         }
         self.app.transcript.clear();
-        self.app.streaming.clear();
-        self.app.streaming_thinking.clear();
         // Drop any prompts queued behind a previous turn — a cleared
         // conversation shouldn't auto-fire messages the user typed mid-turn.
         self.app.message_queue.clear();
@@ -548,11 +337,40 @@ impl CommandContext<'_> {
         let project_root = self.project_root.to_path_buf();
         let manager = Arc::clone(self.manager);
         let notify = self.events.sender();
-        tokio::spawn(async move {
-            let rebuild =
-                switch_model_task(agent, tag, &client, config, skills, project_root, manager).await;
-            let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-        });
+        // The agent has left its slot for the duration. A panic in the switch
+        // (a provider's `list_models`, the native-tool probe) would strand it
+        // there with `rebuilding` lit and the session unable to run another
+        // turn; the fallback lets the main loop rebuild from the session file
+        // instead. See [`crate::app::recover::spawn_answering`].
+        crate::app::recover::spawn_answering(
+            notify,
+            Event::AgentRebuilt(Box::new(crate::app::AgentRebuild {
+                agent: None,
+                model: None,
+                notice: "the model switch crashed — restarting the agent".to_string(),
+            })),
+            async move {
+                // Bounded like every other task that holds the agent: a
+                // `list_models` or tool-support probe against an endpoint that
+                // accepts the connection and then says nothing would otherwise
+                // end the session without ending the process.
+                let rebuild = match crate::app::recover::within(
+                    "switching model",
+                    crate::app::recover::AGENT_REBUILD_DEADLINE,
+                    switch_model_task(agent, tag, &client, config, skills, project_root, manager),
+                )
+                .await
+                {
+                    Ok(rebuild) => rebuild,
+                    Err(timed_out) => crate::app::AgentRebuild {
+                        agent: None,
+                        model: None,
+                        notice: timed_out,
+                    },
+                };
+                Some(Event::AgentRebuilt(Box::new(rebuild)))
+            },
+        );
     }
 
     /// Open the interactive mode picker.
@@ -564,12 +382,12 @@ impl CommandContext<'_> {
             PickerItem {
                 value: "genie".to_string(),
                 detail: "interactive — bypass permissions; acts without asking".to_string(),
-                current: self.app.mode == Mode::Genie,
+                current: self.app.mode() == Mode::Genie,
             },
             PickerItem {
                 value: "sovereign".to_string(),
                 detail: "autonomous — works continuously; self-directing".to_string(),
-                current: self.app.mode == Mode::Sovereign,
+                current: self.app.mode() == Mode::Sovereign,
             },
         ];
         let selected = items.iter().position(|item| item.current).unwrap_or(0);
@@ -614,53 +432,21 @@ impl CommandContext<'_> {
         });
     }
 
-    /// `/plan` (and Shift+Tab): toggle plan mode on the live agent.
-    fn toggle_plan(&mut self) {
-        if self.agent_unavailable("toggle plan mode") {
-            return;
+    /// `/plan` (and Shift+Tab) and `/omakase`, which are one state: omakase is
+    /// plan mode with the review gate removed, so the two flags move together
+    /// and [`PlanState`] is what decides how. Mirrored onto the live agent and
+    /// onto the badge, which must not disagree.
+    fn apply_plan(&mut self, plan: PlanState) -> bool {
+        if self.agent_unavailable("change plan mode") {
+            return false;
         }
-        let on = !self.app.plan_mode;
         if let Some(agent) = self.agent_slot.as_mut() {
-            agent.set_plan_mode(on);
+            agent.set_plan_mode(plan.plan);
+            agent.set_omakase(plan.omakase);
         }
-        self.app.plan_mode = on;
-        // Plain plan mode and omakase are mutually exclusive flavors; turning
-        // plan mode off leaves omakase too (mirrors the agent).
-        if !on {
-            self.app.omakase = false;
-        }
-        self.app.notice(if on {
-            "plan mode on — the agent investigates read-only and presents a plan via \
-             exit_plan for approval (/plan or Shift+Tab to leave)"
-        } else {
-            "plan mode off"
-        });
-    }
-
-    /// `/omakase`: toggle chef's-choice mode on the live agent. Omakase is a
-    /// flavor of plan mode — the agent explores read-only, then decides the
-    /// approach itself and auto-approves its own plan (no interview, no review
-    /// gate). Enabling it enables plan mode; disabling it drops back to plain
-    /// plan mode.
-    fn toggle_omakase(&mut self) {
-        if self.agent_unavailable("toggle omakase") {
-            return;
-        }
-        let on = !self.app.omakase;
-        if let Some(agent) = self.agent_slot.as_mut() {
-            agent.set_omakase(on);
-        }
-        self.app.omakase = on;
-        if on {
-            self.app.plan_mode = true;
-            self.app.notice(
-                "omakase on — chef's choice: the agent explores read-only, decides the \
-                 approach itself, and executes its own plan (/omakase to leave)",
-            );
-        } else {
-            self.app
-                .notice("omakase off — back to plan mode (you review the plan)");
-        }
+        self.app.plan_mode = plan.plan;
+        self.app.omakase = plan.omakase;
+        true
     }
 
     /// `/rewind`: open the turn picker (newest first). Each row shows the
@@ -715,7 +501,7 @@ impl CommandContext<'_> {
 
     /// `/rewind <turn>` (or a picker selection): restore the files and drop
     /// the rewound turns from the session and the transcript.
-    fn rewind(&mut self, turn: u64) {
+    fn rewind_to_turn(&mut self, turn: u64) {
         if self.agent_unavailable("rewind") {
             return;
         }
@@ -727,11 +513,8 @@ impl CommandContext<'_> {
             Ok(restored) => {
                 // The rewound turns no longer exist: replay the truncated
                 // conversation into the transcript view (same as `/resume`).
-                let messages = agent.session().load_messages().unwrap_or_default();
-                self.app.load_transcript(messages);
-                self.app.streaming.clear();
-                self.app.streaming_thinking.clear();
-                self.app.scroll_to_bottom();
+                let entries = agent.session().entries().unwrap_or_default();
+                self.app.load_transcript(&entries);
                 let files = if restored.is_empty() {
                     "no files needed restoring".to_string()
                 } else {
@@ -791,20 +574,29 @@ impl CommandContext<'_> {
         }
         restore_ultra(self.app, &mut agent);
         // Replay the reopened conversation into the transcript view.
-        let messages = agent.session().load_messages().unwrap_or_default();
+        let entries = agent.session().entries().unwrap_or_default();
         let resumed_id = agent.session().id.clone();
-        let turns = messages
+        self.app.load_transcript(&entries);
+        // Named and counted off the replayed conversation rather than off the
+        // raw messages: the model already knows which user-role records were
+        // things a person said and which were an agent carrying a tool's
+        // images back, and only the first kind is a prompt.
+        let prompts: Vec<&str> = self
+            .app
+            .transcript
             .iter()
-            .filter(|m| m.role == crate::llm::Role::User)
-            .count();
-        let name = messages
-            .iter()
-            .find(|m| m.role == crate::llm::Role::User)
-            .and_then(|m| m.content.lines().next())
+            .filter_map(|item| match item {
+                crate::transcript::TranscriptItem::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let turns = prompts.len();
+        let name = prompts
+            .first()
+            .and_then(|text| text.lines().next())
             .map(|line| line.trim().chars().take(48).collect::<String>())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| resumed_id.clone());
-        self.app.load_transcript(messages);
         *self.agent_slot = Some(agent);
 
         // Hand this session's identity over to the new one: drop the old
@@ -815,6 +607,84 @@ impl CommandContext<'_> {
         crate::session_registry::write(&self.app.session_record());
         self.app
             .notice(format!("resumed session {resumed_id} · {turns} turns"));
+    }
+
+    /// `/resume-claude <id>`: copy a Claude Code conversation into a new
+    /// Wizard session and continue it, where `id` is a Claude Code session id
+    /// or a unique prefix of one.
+    ///
+    /// The import is the only new part; everything after it is
+    /// [`Self::resume_session`] on the session it produced, so a conversation
+    /// that came from Claude Code behaves from here on exactly like one that
+    /// did not.
+    ///
+    /// `~/.claude` is read and never written — the guard that keeps that true
+    /// is a source-level one in [`crate::claude_session`].
+    pub(crate) async fn resume_claude(&mut self, id: String) {
+        // Refused before the import rather than after, because importing
+        // writes a session file: failing afterwards would leave one behind for
+        // a resume that was never going to happen.
+        if self.agent_unavailable("resume a Claude Code session") {
+            return;
+        }
+        if self.agent_slot.is_none() {
+            self.app.notice("the agent is busy — try again in a moment");
+            return;
+        }
+        let cwd = self.app.project_root.display().to_string();
+        let matches: Vec<_> = crate::session_registry::claude_chats(&cwd)
+            .into_iter()
+            .filter(|row| row.id.starts_with(&id))
+            .collect();
+        let row = match matches.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                self.app.notice(format!(
+                    "no Claude Code session here has an id starting with {id:?}"
+                ));
+                return;
+            }
+            many => {
+                self.app.notice(format!(
+                    "{id:?} matches {} Claude Code sessions; give more of the id",
+                    many.len()
+                ));
+                return;
+            }
+        };
+        let crate::session_registry::Origin::Claude { path, leaf, .. } = row.origin else {
+            // `claude_chats` produces nothing else. Reported rather than
+            // asserted: the wrong row is a reason to say so, not to abort a
+            // session the user is working in.
+            self.app.notice("that row did not come from Claude Code");
+            return;
+        };
+
+        // Off the UI thread: this parses a whole transcript, and a large one
+        // is thousands of lines with base64 images in it. On the reactor it
+        // freezes the frame loop, which reads as the TUI having hung at
+        // exactly the moment the user is waiting to see a conversation.
+        let root = self.app.project_root.clone();
+        let imported = tokio::task::spawn_blocking(move || {
+            crate::claude_resume::import(&path, leaf.as_deref(), &root)
+        })
+        .await;
+        let imported = match imported {
+            Ok(Ok(imported)) => imported,
+            Ok(Err(err)) => {
+                self.app.notice(format!("could not import: {err:#}"));
+                return;
+            }
+            Err(err) => {
+                self.app.notice(format!("the import task failed: {err}"));
+                return;
+            }
+        };
+
+        // Said before the resume, so a truncated chain is explained *above*
+        // the conversation it truncated rather than under it.
+        self.app.notice(imported.summary());
+        self.resume_session(imported.id).await;
     }
 
     /// `/compact`: ask the main loop to run compaction in the background (it
@@ -839,7 +709,7 @@ impl CommandContext<'_> {
     /// allowed *while a turn is running* — that is the point — so it does not
     /// go through [`Self::agent_unavailable`]. The main loop owns the client
     /// and either the live agent or a mid-turn snapshot of its history.
-    fn btw(&mut self, question: String) {
+    fn ask_aside(&mut self, question: String) {
         if self.app.rebuilding.is_some() {
             self.app
                 .notice("cannot ask a side question while the agent is rebuilding");
@@ -859,7 +729,7 @@ impl CommandContext<'_> {
     /// Allowed mid-turn (same as `/btw`); the main loop snapshots a
     /// [`crate::agent::ForkContext`] and detaches the run into the parent's
     /// background-subagent registry so the report lands in history when done.
-    fn fork(&mut self, task: String) {
+    fn start_side_quest(&mut self, task: String) {
         if self.app.rebuilding.is_some() {
             self.app.notice("cannot fork while the agent is rebuilding");
             return;
@@ -872,14 +742,13 @@ impl CommandContext<'_> {
         self.app.pending_fork = Some(task);
     }
 
-    fn switch_mode(&mut self, mode: Mode) {
+    fn switch_mode(&mut self, mode: Mode) -> bool {
         if self.agent_unavailable("switch modes") {
-            return;
+            return false;
         }
         if let Some(agent) = self.agent_slot.as_mut() {
             agent.set_mode(mode);
         }
-        self.app.mode = mode;
         self.app.config.mode = mode;
         self.app.status.mode = mode;
         match mode {
@@ -893,7 +762,7 @@ impl CommandContext<'_> {
         self.app.status.max_steps = self.app.config.max_steps;
         // Persist so the mode survives a restart (consistent with /provider).
         self.persist_config();
-        self.app.notice(format!("switched to {mode} mode"));
+        true
     }
 
     /// Open the interactive reasoning-effort picker (`/effort`).
@@ -944,24 +813,19 @@ impl CommandContext<'_> {
     /// Set the reasoning effort (`/effort <level>`): applies to the live agent
     /// and persists so it survives a restart. Only reaches providers whose
     /// models accept a `reasoning_effort` field; others ignore it.
-    fn set_effort(&mut self, effort: Option<ReasoningEffort>) {
+    fn apply_effort(&mut self, effort: Option<ReasoningEffort>) -> bool {
         if self.agent_unavailable("change effort") {
-            return;
+            return false;
         }
         if let Some(agent) = self.agent_slot.as_mut() {
             agent.set_reasoning_effort(effort);
         }
         self.app.config.reasoning_effort = effort;
         self.persist_config();
-        match effort {
-            Some(effort) => self.app.notice(format!("reasoning effort: {effort}")),
-            None => self
-                .app
-                .notice("reasoning effort: provider default".to_string()),
-        }
+        true
     }
 
-    async fn reload(&mut self) {
+    async fn reload_extensions(&mut self) {
         if self.agent_unavailable("reload") {
             return;
         }
@@ -1037,7 +901,7 @@ impl CommandContext<'_> {
     /// Run a Claude Code import (dispatched from the `/settings` import
     /// picker), then reload custom commands + MCP servers live so the imported
     /// artifacts take effect without a restart.
-    async fn import_claude(&mut self, selection: ImportSelection) {
+    async fn run_claude_import(&mut self, selection: ImportSelection) {
         if self.agent_unavailable("import from Claude Code") {
             return;
         }
@@ -1092,16 +956,12 @@ impl CommandContext<'_> {
         });
     }
 
-    fn evolve(&mut self, deep: bool, description: String) {
+    fn start_evolve(&mut self, deep: bool, description: String) {
         let tier = if deep {
             EvolveTier::Deep
         } else {
             EvolveTier::Runtime
         };
-        self.app.notice(format!(
-            "evolving ({}): {description}",
-            if deep { "deep" } else { "runtime" }
-        ));
         // The explicit `/evolve` command is the user's consent; the outcome
         // notice reports exactly what was added.
         let request = EvolveRequest { description, tier };
@@ -1118,14 +978,7 @@ impl CommandContext<'_> {
 
     /// Fork Wizard to the user's GitHub and surface the one-liner install
     /// command. Runs in a background task so the TUI stays responsive.
-    fn publish(&mut self, branch: Option<String>) {
-        self.app.notice(format!(
-            "publishing Wizard{}…",
-            branch
-                .as_deref()
-                .map(|b| format!(" (branch: {b})"))
-                .unwrap_or_default()
-        ));
+    fn start_publish(&mut self, branch: Option<String>) {
         let config = self.app.config.clone();
         let notify = self.events.sender();
         tokio::spawn(async move {
@@ -1221,25 +1074,26 @@ impl CommandContext<'_> {
     /// [`FusionProvider`](crate::llm::fusion) (panel debate → synthesizer) when
     /// off, or back to the underlying single provider when on. Like a provider
     /// switch, this resets the session.
-    async fn toggle_fusion(&mut self) {
+    ///
+    /// It no longer refuses to stack with `/ultra`. The two used to be mutually
+    /// exclusive because each owned its own fan-out, so stacking them meant
+    /// every ultra candidate re-running the whole panel: candidates × panel ×
+    /// rounds before the first token. Now both are the one council, and turning
+    /// fusion on *deals* the ultra roster across the panel's providers instead
+    /// of nesting one fan-out inside the other. That is
+    /// [`Self::reseat_ultra`]'s job, and it happens on both edges of this
+    /// toggle.
+    async fn switch_fusion(&mut self) {
         if self.agent_unavailable("toggle fusion") {
             return;
         }
         if self.app.fusion_active {
             self.app.fusion_active = false;
+            // The seats went with the panel; a roster still holding them would
+            // keep answering from providers that are no longer active.
+            self.reseat_ultra();
             self.rebuild_active_provider("fusion off — back to the single model".to_string())
                 .await;
-            return;
-        }
-        // Stacked, the two multiply: every ultra candidate is a full agent run
-        // on the active client, and a fused client turns each of *its* model
-        // calls into a panel debate plus a synthesis. Refuse rather than quietly
-        // bill a turn at candidates × panel × rounds.
-        if self.app.ultra.is_some() {
-            self.app.notice(
-                "fusion cannot run under ultra — each of ultra's candidates would re-run the \
-                 whole panel; /ultra to turn ultra off first",
-            );
             return;
         }
 
@@ -1263,28 +1117,85 @@ impl CommandContext<'_> {
         let label = provider.label();
         *self.client = Arc::new(provider);
         self.app.fusion_active = true;
+        // Deal any live `/ultra` roster across the panel *before* the rebuild,
+        // because the rebuild re-arms the new agent from `app.ultra` and an
+        // unseated roster under a fused client runs the whole panel debate once
+        // per candidate.
+        self.reseat_ultra();
+        let stacked = match self.app.ultra.as_ref() {
+            Some(engine) => format!(" \u{00b7} {}", engine.label()),
+            None => String::new(),
+        };
         self.rebuild_agent_with(
             label.clone(),
-            format!("{label} — every turn now fuses the panel; /fusion to turn off"),
+            format!("{label}{stacked}. Every turn now fuses the panel; /fusion to turn off"),
             "started fusion",
         )
         .await;
     }
 
-    /// Open the `/fusion config` panel selector: pick which providers form the
-    /// debate panel and which synthesizes.
-    fn open_fusion_picker(&mut self) {
-        self.app.open_fusion_picker();
+    /// The seats an `/ultra` roster is dealt across, given what is active now.
+    ///
+    /// Empty unless `/fusion` is on, which is the whole of what "the two modes
+    /// compose" means here: `[ultra]` names no provider and never will, because
+    /// which providers exist is a question about the session and the answer
+    /// changes when `/fusion` is toggled without a line of `[ultra]` changing.
+    fn ultra_seats(&self) -> Result<Vec<ultra::Seat>, String> {
+        if !self.app.fusion_active {
+            return Ok(Vec::new());
+        }
+        let Some(fusion) = self.app.config.effective_fusion() else {
+            return Ok(Vec::new());
+        };
+        crate::llm::fusion::panel_seats(&fusion, &self.app.config.providers)
+            .map_err(|err| format!("{err:#}"))
     }
 
-    /// Toggle `/ultra`: mixture of agents. Where `/fusion` swaps the client and
-    /// therefore has to rebuild the agent from scratch, ultra changes nothing
-    /// about *which* model answers — the candidates fan out over the client and
-    /// model that are already active. So this is a plain flag on the live agent:
-    /// no rebuild, no session reset, and the conversation in front of the user
-    /// survives the toggle, which is what makes it usable mid-task ("that answer
-    /// was thin — /ultra, try again").
-    fn toggle_ultra(&mut self) {
+    /// Build an engine from `cfg` and seat it for the current session.
+    fn build_seated_ultra(&self, cfg: &UltraConfig) -> Result<Arc<ultra::UltraEngine>, String> {
+        let engine = self
+            .app
+            .config
+            .build_ultra_from(cfg)
+            .map_err(|err| format!("{err:#}"))?;
+        Ok(Arc::new(engine.with_seats(self.ultra_seats()?)))
+    }
+
+    /// Re-deal the live `/ultra` roster across the seats the session now
+    /// offers, on both edges of the `/fusion` toggle. The roster does not
+    /// change; where each candidate runs does, and an engine left holding the
+    /// wrong seats is either a panel debate per candidate or a draft from a
+    /// provider the user just switched away from.
+    fn reseat_ultra(&mut self) {
+        if self.app.ultra.is_none() {
+            return;
+        }
+        let built = self.build_seated_ultra(&self.app.config.effective_ultra());
+        match built {
+            Ok(engine) => {
+                if let Some(agent) = self.agent_slot.as_mut() {
+                    agent.set_ultra(Some(engine.clone()));
+                }
+                self.app.ultra = Some(engine);
+            }
+            // The roster stays as it was rather than being silently dropped:
+            // ultra is still on, and saying so is more useful than turning it
+            // off behind the user's back.
+            Err(err) => self
+                .app
+                .notice(format!("ultra roster could not be re-seated: {err}")),
+        }
+    }
+
+    /// Toggle `/ultra`: a council of lens subagents. Where `/fusion` swaps the
+    /// client and therefore has to rebuild the agent from scratch, ultra swaps
+    /// nothing: the candidates fan out over the client and model that are
+    /// already active, or over the fusion panel's providers when that is also
+    /// on. So this is a plain flag on the live agent: no rebuild, no session
+    /// reset, and the conversation in front of the user survives the toggle,
+    /// which is what makes it usable mid-task ("that answer was thin — /ultra,
+    /// try again").
+    fn switch_ultra(&mut self) {
         if self.agent_unavailable("toggle ultra") {
             return;
         }
@@ -1297,20 +1208,16 @@ impl CommandContext<'_> {
                 .notice("ultra off — one agent per turn again, no pre-phase");
             return;
         }
-        if self.app.fusion_active {
-            self.app.notice(
-                "ultra cannot run on top of fusion — every candidate would re-run the whole \
-                 panel; /fusion to turn fusion off first",
-            );
-            return;
-        }
-        // `build_ultra` is the sole validation gate for `[ultra]`, so a roster
-        // the user hand-edited into an unusable state surfaces here, at the
-        // toggle, instead of at the top of their next turn.
-        let engine = match self.app.config.build_ultra() {
-            Ok(engine) => Arc::new(engine),
+        // `build_ultra_from` is the sole validation gate for `[ultra]`, so a
+        // roster the user hand-edited into an unusable state surfaces here, at
+        // the toggle, instead of at the top of their next turn. Seating is part
+        // of the same step: with `/fusion` on, a roster that failed to seat
+        // would bill the turn at candidates × panel × rounds, so it is refused
+        // rather than run.
+        let engine = match self.build_seated_ultra(&self.app.config.effective_ultra()) {
+            Ok(engine) => engine,
             Err(err) => {
-                self.app.notice(format!("could not start ultra: {err:#}"));
+                self.app.notice(format!("could not start ultra: {err}"));
                 return;
             }
         };
@@ -1320,15 +1227,8 @@ impl CommandContext<'_> {
         }
         self.app.ultra = Some(engine);
         self.app.notice(format!(
-            "{label} — each turn now drafts on the active model, compares, then acts; \
-             /ultra to turn off"
+            "{label}: each turn now drafts, compares, then acts; /ultra to turn off"
         ));
-    }
-
-    /// Open the `/ultra config` roster editor: which lenses run as candidates,
-    /// and whether a judge compares their drafts.
-    fn open_ultra_picker(&mut self) {
-        self.app.open_ultra_picker();
     }
 
     /// Save the roster chosen at that editor. Building it first is not a
@@ -1338,11 +1238,11 @@ impl CommandContext<'_> {
     /// on, the live agent moves to the new roster in the same breath as the
     /// badge — the two must not disagree about how many candidates the next turn
     /// is about to spend.
-    fn apply_ultra(&mut self, ultra: UltraConfig) {
-        let engine = match self.app.config.build_ultra_from(&ultra) {
-            Ok(engine) => Arc::new(engine),
+    fn save_ultra_roster(&mut self, ultra: UltraConfig) {
+        let engine = match self.build_seated_ultra(&ultra) {
+            Ok(engine) => engine,
             Err(err) => {
-                self.app.notice(format!("ultra roster rejected: {err:#}"));
+                self.app.notice(format!("ultra roster rejected: {err}"));
                 return;
             }
         };
@@ -1374,8 +1274,9 @@ impl CommandContext<'_> {
     }
 
     /// Handle `/provider` subcommands: list, switch, add, or remove providers.
-    async fn provider(&mut self, action: ProviderAction) {
+    async fn provider_command(&mut self, action: ProviderAction) {
         match action {
+            // The bare `/provider` menu is a chooser, opened by the dispatcher.
             ProviderAction::Menu => self.app.open_provider_picker(),
             ProviderAction::List => self.provider_list(),
             ProviderAction::Use(name) => self.provider_use(name).await,
@@ -1483,7 +1384,7 @@ impl CommandContext<'_> {
     /// Finalize an interactive provider setup ([`SlashCommand::ProviderSetup`]):
     /// store the API key in `~/.wizard/credentials.toml` when present, then add
     /// and switch to the provider.
-    async fn provider_setup(
+    async fn finish_provider_setup(
         &mut self,
         name: String,
         kind: ProviderKind,
@@ -1534,7 +1435,7 @@ impl CommandContext<'_> {
 
     /// Handle `/server` subcommands: status, start, or stop the local
     /// llama-server.
-    async fn server(&mut self, action: ServerAction) {
+    async fn server_command(&mut self, action: ServerAction) {
         match action {
             ServerAction::Status => self.server_status().await,
             ServerAction::Start => self.server_start().await,
@@ -1615,13 +1516,8 @@ impl CommandContext<'_> {
 
     /// `/login <provider>`: run an OAuth sign-in in the background, streaming
     /// progress (including the URL to open) into the transcript as notices.
-    fn login(&mut self, provider: String) {
-        if provider != "xai" {
-            self.app.notice(format!(
-                "unknown login provider '{provider}' (supported: xai)"
-            ));
-            return;
-        }
+    fn start_login(&mut self, provider: String) {
+        let _ = provider;
         let notify = self.events.sender();
         self.app
             .notice("starting the xAI sign-in; your browser should open shortly");
@@ -1638,7 +1534,11 @@ impl CommandContext<'_> {
                     });
                 }
             };
-            match crate::llm::xai_oauth::login(progress).await {
+            // The TUI is reading stdin for keystrokes, so the paste fallback
+            // has no channel here; `login` still reports how to forward the
+            // callback port, which is the way through from a remote session.
+            let paste = crate::llm::oauth_callback::PasteChannel::Disabled;
+            match crate::llm::xai_oauth::login(progress, paste).await {
                 Ok(()) => {
                     // Auto-add the OAuth provider and switch to it; the main
                     // loop owns the config + agent slot.
@@ -1680,6 +1580,244 @@ impl CommandContext<'_> {
             };
             let _ = notify.send(Event::Notice(message)).await;
         });
+    }
+}
+
+/// The terminal's half of the one dispatcher.
+///
+/// Every method here is a verb: what to change, what can be seen. None of them
+/// decides what a command *means* or what it says about itself. That is
+/// [`crate::commands::surface::dispatch`]'s, once, for every surface.
+#[async_trait]
+impl CommandSurface for CommandContext<'_> {
+    fn surface(&self) -> Surface {
+        Surface::Tui
+    }
+
+    fn project_root(&self) -> PathBuf {
+        self.project_root.to_path_buf()
+    }
+
+    fn help_keys(&self) -> Option<&'static str> {
+        Some(HELP_KEYS)
+    }
+
+    /// One channel: a refusal reads like any other line of the transcript.
+    fn notice(&mut self, text: String) {
+        self.app.notice(text);
+    }
+
+    fn error(&mut self, message: String) {
+        self.app.notice(message);
+    }
+
+    /// Mid-turn the agent is out of its slot, so the session id and the task
+    /// count are unknown and the status bar's mirror is the best source for the
+    /// token counts. Reported as `None` rather than as zero.
+    fn snapshot(&self) -> SessionSnapshot {
+        let provider = self.app.config.active();
+        let agent = self.agent_slot.as_ref();
+        let (prompt_tokens, completion_tokens) = match agent {
+            Some(agent) => agent.usage().session_totals(),
+            None => (
+                self.app.status.prompt_tokens,
+                self.app.status.completion_tokens,
+            ),
+        };
+        SessionSnapshot {
+            model: self.app.status.model.clone(),
+            provider_name: provider.name.clone(),
+            provider_kind: provider.kind,
+            provider_base_url: provider.base_url.clone(),
+            mode: self.app.mode(),
+            effort: self.app.config.reasoning_effort,
+            max_steps: None,
+            session: agent.map(|agent| agent.session().id.clone()),
+            prompt_tokens,
+            completion_tokens,
+            // Only when the agent is in its slot. The status bar mirrors the
+            // two flat totals and nothing else, so mid-turn there is no cache
+            // split to report and `/cost` says so by pricing as all-fresh.
+            cache_tokens: agent.map(|agent| agent.usage().session_cache_totals()),
+            context_tokens: None,
+            background_tasks: agent.map(|agent| agent.running_tasks()),
+            todos: crate::tools::todo::progress(&self.app.todos),
+            plan: self.plan(),
+            ultra: self.app.ultra.as_ref().map(|ultra| ultra.label()),
+            usd_per_mtok_in: provider.usd_per_mtok_in,
+            usd_per_mtok_out: provider.usd_per_mtok_out,
+        }
+    }
+
+    fn plan(&self) -> PlanState {
+        PlanState {
+            plan: self.app.plan_mode,
+            omakase: self.app.omakase,
+        }
+    }
+
+    fn background_tasks(&self) -> Result<Vec<Task>, String> {
+        // The registry, not the agent. Mid-turn the agent is out of its slot,
+        // and this used to answer "unavailable while a turn is running" — the
+        // one moment anybody types `/bashes`, since a background task is
+        // something a *running* turn put there. `App::tasks` is a clone of the
+        // same `Arc` the agent holds, so it stays reachable either way.
+        match (self.agent_slot.as_ref(), self.app.tasks.as_ref()) {
+            (Some(agent), _) => Ok(agent.tasks()),
+            (None, Some(registry)) => Ok(registry.list()),
+            (None, None) => Err("background tasks: no agent has been built yet".to_string()),
+        }
+    }
+
+    fn rewind_candidates(&self) -> Vec<RewindCandidate> {
+        self.agent_slot
+            .as_ref()
+            .map(|agent| agent.rewind_candidates(20))
+            .unwrap_or_default()
+    }
+
+    async fn set_model(&mut self, tag: String) {
+        self.switch_model(tag);
+    }
+
+    async fn set_mode(&mut self, mode: Mode) -> bool {
+        self.switch_mode(mode)
+    }
+
+    async fn set_effort(&mut self, effort: Option<ReasoningEffort>) -> bool {
+        self.apply_effort(effort)
+    }
+
+    async fn set_plan(&mut self, plan: PlanState) -> bool {
+        self.apply_plan(plan)
+    }
+
+    async fn compact(&mut self) {
+        self.request_compact();
+    }
+
+    async fn reload(&mut self) {
+        self.reload_extensions().await;
+    }
+
+    async fn rewind(&mut self, turn: u64) {
+        self.rewind_to_turn(turn);
+    }
+
+    async fn btw(&mut self, question: String) {
+        self.ask_aside(question);
+    }
+
+    async fn fork(&mut self, task: String) {
+        self.start_side_quest(task);
+    }
+
+    /// A goal set here starts a turn toward it immediately, queued behind any
+    /// running one, so the dispatcher does not add the "send a message" line
+    /// that the surfaces without a queue need.
+    async fn start_goal(&mut self, goal: String) -> bool {
+        self.app.queue_goal_kickoff(&goal);
+        true
+    }
+
+    async fn evolve(&mut self, deep: bool, description: String) {
+        self.start_evolve(deep, description);
+    }
+
+    async fn publish(&mut self, branch: Option<String>) {
+        self.start_publish(branch);
+    }
+
+    async fn toggle_fusion(&mut self) {
+        self.switch_fusion().await;
+    }
+
+    async fn toggle_ultra(&mut self) {
+        self.switch_ultra();
+    }
+
+    async fn server(&mut self, action: ServerAction) {
+        self.server_command(action).await;
+    }
+
+    /// Every chooser this surface has, which is all of them: the terminal is
+    /// where the pickers live.
+    async fn open(&mut self, chooser: Chooser) -> bool {
+        match chooser {
+            Chooser::Model => self.open_model_picker().await,
+            Chooser::Mode => self.open_mode_picker(),
+            Chooser::Effort => self.open_effort_picker(),
+            Chooser::Rewind => self.open_rewind_picker(),
+            Chooser::Resume => self.app.open_resume_picker(),
+            Chooser::ResumeClaude => self.app.open_resume_claude_picker(),
+            Chooser::Agents => self.open_agents_picker(),
+            Chooser::Provider => self.app.open_provider_picker(),
+            Chooser::Settings => self.app.open_settings_picker(),
+            Chooser::FusionPanel => self.app.open_fusion_picker(),
+            Chooser::UltraRoster => self.app.open_ultra_picker(),
+        }
+        true
+    }
+
+    async fn clear(&mut self) {
+        self.clear_conversation();
+    }
+
+    async fn resume(&mut self, id: String) {
+        self.resume_session(id).await;
+    }
+
+    async fn resume_claude(&mut self, id: String) {
+        CommandContext::resume_claude(self, id).await;
+    }
+
+    async fn toggle_panel(&mut self, panel: Panel) {
+        match panel {
+            Panel::Diff => self.toggle_diff().await,
+            Panel::Todos => self.toggle_todos(),
+            Panel::Dashboard => self.toggle_dashboard(),
+        }
+    }
+
+    async fn toggle_vim(&mut self) {
+        self.app.toggle_vim();
+    }
+
+    async fn set_ui(&mut self, name: Option<String>) {
+        let text = ui_command(self.app, name.as_deref());
+        self.app.notice(text);
+    }
+
+    async fn quit(&mut self) {
+        self.app.should_quit = true;
+    }
+
+    async fn apply_ultra(&mut self, config: UltraConfig) {
+        self.save_ultra_roster(config);
+    }
+
+    async fn provider(&mut self, action: ProviderAction) {
+        self.provider_command(action).await;
+    }
+
+    async fn provider_setup(
+        &mut self,
+        name: String,
+        kind: ProviderKind,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    ) {
+        self.finish_provider_setup(name, kind, base_url, model, api_key)
+            .await;
+    }
+
+    async fn login(&mut self, provider: String) {
+        self.start_login(provider);
+    }
+
+    async fn import_claude(&mut self, selection: ImportSelection) {
+        self.run_claude_import(selection).await;
     }
 }
 

@@ -281,11 +281,20 @@ impl Tool for GenerateImageTool {
             _ => default_output_path(&ctx.cwd, args.prompt.trim()),
         };
 
+        let downloads = match download_client() {
+            Ok(downloads) => downloads,
+            Err(err) => {
+                return Ok(ToolOutput::error(format!(
+                    "failed to build image download client: {err}"
+                )));
+            }
+        };
+
         let mut lines = Vec::new();
         let mut generated: Vec<crate::llm::Image> = Vec::new();
         for (index, image) in images.iter().enumerate() {
             let path = output_path_for_index(&base_path, index, images.len());
-            let (bytes, source_url) = match materialize_image(&client, image).await {
+            let (bytes, source_url) = match materialize_image(&downloads, image).await {
                 Ok(result) => result,
                 Err(err) => {
                     return Ok(ToolOutput::error(format!(
@@ -548,8 +557,12 @@ async fn post_generations(
 }
 
 /// Decode b64 or download a URL; returns (bytes, optional source url).
+///
+/// `downloads` is [`download_client`], not the client that spoke to the
+/// generation endpoint: the URL being fetched here came out of the response
+/// body, so it is walked with the SSRF guard on every hop.
 async fn materialize_image(
-    client: &reqwest::Client,
+    downloads: &reqwest::Client,
     image: &GeneratedImage,
 ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     if let Some(b64) = &image.b64_json {
@@ -568,12 +581,33 @@ async fn materialize_image(
         .url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("image has no url or b64_json"))?;
-    let bytes = download_image(client, url).await?;
+    let bytes = download_image(downloads, url).await?;
     Ok((bytes, Some(url.to_string())))
 }
 
-/// Download image bytes from a temporary generation URL. SSRF-safe: https only,
-/// no local/private hosts.
+/// Client for downloading generated images.
+///
+/// Separate from the client that talks to the configured generation endpoint,
+/// and for one reason: the endpoint is the user's own configuration, while the
+/// URL in its response is attacker-influenced text that this process is about
+/// to fetch. So it gets [`web::no_redirect_client_builder`], which turns
+/// reqwest's automatic follow-10 off; the chain is walked by hand instead so
+/// every hop is SSRF-checked.
+fn download_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::tools::web::no_redirect_client_builder(GENERATE_TIMEOUT).build()
+}
+
+/// Download image bytes from a temporary generation URL. SSRF-guarded: https
+/// only, and the full [`web::check_url`] check — which resolves DNS — on the
+/// URL and on every redirect it leads through.
+///
+/// The old guard here was neither. It matched local *names* and literal
+/// private IPs without ever resolving anything, and it left reqwest following
+/// up to ten redirects unexamined, so `https://cdn.example.com/i.png` →
+/// `302` → `http://169.254.169.254/latest/meta-data/` fetched the cloud
+/// metadata service and wrote its answer to disk. The web tools already had
+/// the resolving check and the hand-walked chain; this now calls them rather
+/// than keeping a second, weaker copy.
 async fn download_image(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
     let parsed =
         reqwest::Url::parse(url).map_err(|err| anyhow::anyhow!("invalid image url: {err}"))?;
@@ -583,14 +617,31 @@ async fn download_image(client: &reqwest::Client, url: &str) -> anyhow::Result<V
             parsed.scheme()
         );
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("image url has no host"))?;
-    if host_is_blocked(host) {
-        anyhow::bail!("refusing to download image from local/private host '{host}'");
-    }
+    crate::tools::web::check_url(&parsed, false)
+        .await
+        .map_err(|reason| anyhow::anyhow!("refusing to download image: {reason}"))?;
+    read_image_body(client, parsed).await
+}
 
-    let response = client.get(url).send().await?;
+/// Fetch `url`, following redirects by hand with the SSRF check *and* the
+/// https requirement on each hop, and read the body up to [`MAX_IMAGE_BYTES`].
+///
+/// [`download_image`] vets the starting URL's scheme; this vets every URL the
+/// chain names afterwards, and between them "over HTTPS only" is true of the
+/// whole download. It used to be true of exactly one hop: `https://cdn/…`
+/// answering `302 Location: http://host/x.png` passed the check above and was
+/// then fetched in cleartext and written to the user's disk, because the
+/// generic hop check allows `http` and `https` both — right for `web_fetch`,
+/// wrong for this.
+async fn read_image_body(client: &reqwest::Client, url: reqwest::Url) -> anyhow::Result<Vec<u8>> {
+    let response = crate::tools::web::get_following_redirects(
+        client,
+        url,
+        false,
+        crate::tools::web::HopScheme::HttpsOnly,
+    )
+    .await
+    .map_err(|reason| anyhow::anyhow!("image download failed: {reason}"))?;
     if !response.status().is_success() {
         let status = response.status();
         anyhow::bail!("image download returned HTTP {status}");
@@ -609,36 +660,6 @@ async fn download_image(client: &reqwest::Client, url: &str) -> anyhow::Result<V
         anyhow::bail!("image download returned an empty body");
     }
     Ok(bytes)
-}
-
-fn host_is_blocked(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost")
-        || (host.len() >= 6 && host[host.len() - 6..].eq_ignore_ascii_case(".local"))
-    {
-        return true;
-    }
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    return mapped.is_loopback()
-                        || mapped.is_private()
-                        || mapped.is_link_local()
-                        || mapped.is_unspecified();
-                }
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-    }
-    false
 }
 
 async fn write_image_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -797,16 +818,144 @@ mod tests {
         assert_eq!(default_model(false), DEFAULT_OPENAI_MODEL);
     }
 
-    #[test]
-    fn host_is_blocked_for_local_targets() {
-        assert!(host_is_blocked("localhost"));
-        assert!(host_is_blocked("127.0.0.1"));
-        assert!(host_is_blocked("10.0.0.5"));
-        assert!(host_is_blocked("192.168.1.1"));
-        assert!(!host_is_blocked("cdn.x.ai"));
-        assert!(!host_is_blocked(
-            "oaidalleapiprodscus.blob.core.windows.net"
-        ));
+    #[tokio::test]
+    async fn image_downloads_refuse_local_and_non_https_urls() {
+        let client = download_client().expect("client");
+        for url in [
+            "https://localhost/i.png",
+            "https://127.0.0.1/i.png",
+            "https://10.0.0.5/i.png",
+            "https://192.168.1.1/i.png",
+            "https://[::1]/i.png",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://printer.local/i.png",
+        ] {
+            let err = format!("{:#}", download_image(&client, url).await.expect_err(url));
+            assert!(err.contains("blocked"), "{url}: {err}");
+        }
+        // http is refused before any guard runs: a generation URL is https.
+        let err = format!(
+            "{:#}",
+            download_image(&client, "http://cdn.example.com/i.png")
+                .await
+                .expect_err("http refused")
+        );
+        assert!(err.contains("only https is allowed"), "{err}");
+    }
+
+    /// A redirect off a generation URL into a private address is refused, and
+    /// the private listener is never contacted.
+    ///
+    /// The download client used to be the generation client, which carries
+    /// reqwest's default follow-10 policy, and the guard was a name/literal-IP
+    /// check that ran once on the URL the API returned. So one `302` was the
+    /// whole guard: the response body is attacker-influenceable text, and the
+    /// hop it named — the cloud metadata service, say — was fetched and its
+    /// answer written to a file in the project. The chain is walked by hand
+    /// now, with the resolving check on every hop.
+    #[tokio::test]
+    async fn a_redirect_into_a_private_address_is_refused() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let secret = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let secret_addr = secret.local_addr().expect("addr");
+        let reached = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&reached);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = secret.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 6\r\n\r\nSECRET",
+                    )
+                    .await;
+            }
+        });
+
+        // The redirecting hop stands in for the CDN the API named. It is on
+        // loopback itself, so the test enters below the URL check and asserts
+        // on what the *redirect* does — the hop the old code followed blind.
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hop_addr = hop.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hop.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{secret_addr}/creds\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let client = download_client().expect("client");
+        let start = reqwest::Url::parse(&format!("http://{hop_addr}/image.png")).expect("url");
+        let result = read_image_body(&client, start).await;
+
+        assert!(
+            result.is_err(),
+            "the redirect to a private address must be refused"
+        );
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the private listener was contacted — the redirect was followed"
+        );
+    }
+
+    /// A redirect that downgrades to cleartext is refused, even when it lands
+    /// on a perfectly public host.
+    ///
+    /// `download_image` checked the scheme of the URL the API returned and
+    /// nothing after it, so `docs/image.md`'s "downloaded over HTTPS only"
+    /// stopped being true at the first `302`: the CDN could hand the download
+    /// to `http://…`, and the bytes that got written into the project arrived
+    /// in the clear, over a connection anyone on the path could rewrite.
+    ///
+    /// The hop here names a public literal IP so that the SSRF guard — which
+    /// would refuse a private one for its own reasons — is not what fails, and
+    /// the connection is never made: the scheme is judged before the hop.
+    #[tokio::test]
+    async fn a_redirect_that_downgrades_to_http_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hop_addr = hop.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hop.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://93.184.216.34/x.png\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let client = download_client().expect("client");
+        let start = reqwest::Url::parse(&format!("http://{hop_addr}/image.png")).expect("url");
+        let err = format!(
+            "{:#}",
+            read_image_body(&client, start)
+                .await
+                .expect_err("the downgrade must be refused")
+        );
+        assert!(
+            err.contains("https is required on every hop"),
+            "the downgrade is what must be refused, not something else: {err}"
+        );
     }
 
     #[test]

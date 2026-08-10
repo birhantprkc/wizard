@@ -18,9 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
 
-use crate::agent::{AgentEvent, InterviewQuestion};
+use crate::agent::{AgentEvent, InterviewGate, InterviewQuestion};
 
 use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args};
 
@@ -168,23 +167,40 @@ impl Tool for InterviewTool {
             ));
         };
 
-        let (respond, answers) = oneshot::channel();
+        let (gate, answers) = InterviewGate::open();
         if events
             .send(AgentEvent::Interview {
                 questions: questions.clone(),
-                respond,
+                gate,
             })
             .await
             .is_err()
         {
+            // Nobody ever saw the questions, so nobody may answer them: close
+            // the gate rather than leave the desk holding a live channel.
+            gate.cancel();
             return Ok(unanswered(
                 &questions,
                 "The interview could not be presented (no surface).",
             ));
         }
 
-        match answers.await {
-            Ok(Some(answers)) => {
+        // Wait for answers, or for the surface to disappear. The answers
+        // channel waits at the gate desk now, so dropping the event no longer
+        // ends this call on its own; a closed event channel says the same thing
+        // and is the one signal that always arrives. The outer `Option` is
+        // whether anyone answered at all, the inner one is the answer itself,
+        // where `None` means the user declined.
+        let answers = tokio::select! {
+            answered = answers => answered.ok(),
+            () = events.closed() => {
+                gate.cancel();
+                None
+            }
+        };
+
+        match answers {
+            Some(Some(answers)) => {
                 let mut out = String::from("The user answered your questions:\n");
                 for (i, q) in questions.iter().enumerate() {
                     let answer = answers.get(i).map(String::as_str).unwrap_or("").trim();
@@ -198,11 +214,11 @@ impl Tool for InterviewTool {
                 out.push_str("\nIncorporate these answers into your plan, then call exit_plan.");
                 Ok(ToolOutput::ok(out))
             }
-            Ok(None) => Ok(unanswered(
+            Some(None) => Ok(unanswered(
                 &questions,
                 "The user dismissed the interview without answering.",
             )),
-            Err(_) => Ok(unanswered(
+            None => Ok(unanswered(
                 &questions,
                 "The interview ended without answers.",
             )),
@@ -267,14 +283,15 @@ mod tests {
         let ctx = ToolContext::new("/tmp").with_events(tx);
 
         let responder = async {
-            let Some(AgentEvent::Interview { questions, respond }) = rx.recv().await else {
+            let Some(AgentEvent::Interview { questions, gate }) = rx.recv().await else {
                 panic!("expected Interview event");
             };
             assert_eq!(questions.len(), 2);
             assert_eq!(questions[0].options, vec!["sqlite", "postgres"]);
-            respond
-                .send(Some(vec!["postgres".to_string(), String::new()]))
-                .expect("answers sent");
+            assert!(
+                gate.answer(Some(vec!["postgres".to_string(), String::new()])),
+                "answers sent"
+            );
         };
         let (out, ()) = tokio::join!(
             tool.execute(
@@ -299,10 +316,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolContext::new("/tmp").with_events(tx);
         let responder = async {
-            let Some(AgentEvent::Interview { respond, .. }) = rx.recv().await else {
+            let Some(AgentEvent::Interview { gate, .. }) = rx.recv().await else {
                 panic!("expected Interview event");
             };
-            respond.send(None).expect("decline sent");
+            assert!(gate.decline(), "decline sent");
         };
         let (out, ()) = tokio::join!(
             tool.execute(json!({ "questions": [{ "question": "x?" }] }), &ctx),

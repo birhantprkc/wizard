@@ -11,6 +11,20 @@ in **both directions**.
   client (Claude Code, Cursor, another Wizard) can call them. That is what
   this page covers.
 
+Two client-side details worth knowing before you add a server, because both
+change what a server sees. A spawned stdio child's environment is **cleared**
+and rebuilt from a fixed allowlist — `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`,
+`USER`, `SHELL`, `TMPDIR` — plus whatever the server's own `[server.env]`
+declares, so a server does not inherit the API keys in Wizard's environment
+and needs its own key passed explicitly (a `env:VAR` value in `[server.env]` or
+`[server.headers]` is resolved from the environment at connect time, so the
+token never sits in `mcp.toml`). Dynamic-linker variables (`LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`)
+are dropped from `[server.env]` with a warning. Every call is bounded: 20 s to
+spawn and complete `initialize`, 30 s for one `tools/list` page, 120 s for one
+`tools/call`. None of this is a sandbox — an MCP server runs with your
+privileges, exactly like a shell command.
+
 ## `wizard mcp-serve`
 
 ```bash
@@ -21,16 +35,28 @@ Runs a Model Context Protocol server on stdin/stdout, advertising Wizard's
 native tools:
 
 `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `execute`,
-`git_status`, `git_diff`, `memory`, `todo`, `web_fetch`, `web_search`,
-`generate_image`, `task_output`, `task_kill`, `subagent_status`, `subagent_kill`,
-`run_command`, and `compact`.
+`git_status`, `git_diff`, `memory`, `todo`, `manual`, `web_fetch`, `web_search`,
+`x_search`, `generate_image`, `task_output`, `task_kill`, `subagent_status`,
+`subagent_kill`, `run_command`, `compact`, and `computer`.
 
 It is self-contained: no config load, no onboarding, no LLM. It serves until
 stdin closes. Note that `run_command` is only useful inside an interactive
 Wizard surface that drains the slash-command queue; over plain MCP it will
 refuse most calls because there is no TUI/GUI attached. `compact` likewise only
 runs inside the main agent loop (it needs live conversation history); over plain
-MCP it returns an error explaining that.
+MCP it returns an error explaining that. `manual` works anywhere, since it only
+reads sections of the operating charter compiled into the binary, so a foreign
+client that calls it gets Wizard's own `WIZARD.md` back rather than anything
+about the project being served.
+
+`computer` is on this server too, and it is worth saying out loud: it drives
+the desktop — mouse, keyboard, screenshots — for the whole logged-in session,
+not just the directory being served. It is registered unconditionally so a
+caller can discover it and be told *why* it is unavailable, and on a machine
+that has not been provisioned for it (`wizard desktop-setup` on Linux,
+Accessibility and Screen Recording permissions on macOS) every call refuses
+with those instructions. On a machine that *has* been provisioned, an MCP
+client you point at `wizard mcp-serve` can use it.
 
 Tools run in the directory the server starts in; pass `--cwd <dir>` to serve a
 specific project. Add `--scripted` to also advertise agent-authored scripted

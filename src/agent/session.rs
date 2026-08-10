@@ -27,6 +27,16 @@ pub struct SessionRecord {
     pub system_note: bool,
 }
 
+/// Format version written into every new [`SessionHeader`].
+///
+/// `1` is the content-block format: `ChatMessage.content` is a block array
+/// and tool calls carry provider ids. A header with no `version` (or `0`) is
+/// a file from before that, whose messages have a string `content` and
+/// sibling `tool_calls`/`tool_name`/`images` fields;
+/// [`ChatMessage`]'s deserializer reads both and
+/// [`assign_legacy_tool_call_ids`] pairs the old files' call ids up on load.
+pub const SESSION_FORMAT_VERSION: u32 = 1;
+
 /// The session file's first line: metadata about the session itself.
 /// Old files have none.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +45,19 @@ pub struct SessionHeader {
     /// Working directory the session was started in, so `--resume` in one
     /// project cannot replay another project's conversation.
     pub cwd: String,
+    /// Format the rest of the file is written in
+    /// ([`SESSION_FORMAT_VERSION`]).
+    ///
+    /// `#[serde(default)]` is load-bearing, not tidiness. [`SessionLine`] is
+    /// `#[serde(untagged)]` and discriminated purely by which keys are
+    /// present, so a *required* field here would make every header written
+    /// before this release fail to parse as a header. It would then fall
+    /// through to the other variants, fail those too, and be dropped as a
+    /// corrupt line, taking the recorded `cwd` with it: `--resume` would stop
+    /// telling one project's sessions from another's. Absent means `0`, the
+    /// pre-block format.
+    #[serde(default)]
+    pub version: u32,
 }
 
 /// A turn-boundary line, written just before the turn's user message. Anchors
@@ -116,7 +139,7 @@ pub fn peek(id: &str, n: usize) -> Vec<(String, String)> {
         }
         if let Ok(SessionLine::Message(record)) = serde_json::from_str::<SessionLine>(line) {
             let role = format!("{:?}", record.message.role).to_lowercase();
-            let mut content = record.message.content;
+            let mut content = record.message.text();
             if content.chars().count() > PEEK_MSG_CHARS {
                 content = content.chars().take(PEEK_MSG_CHARS).collect::<String>() + " …";
             }
@@ -184,7 +207,7 @@ pub fn summaries(dir: &Path) -> Vec<SessionSummary> {
                         messages += 1;
                     }
                     if first_user.is_none() && record.message.role == Role::User {
-                        first_user = record.message.content.lines().next().map(str::to_string);
+                        first_user = record.message.text().lines().next().map(str::to_string);
                     }
                 }
                 Ok(SessionLine::Marker(marker)) => {
@@ -270,6 +293,7 @@ impl Session {
                 let header = SessionHeader {
                     timestamp: Utc::now(),
                     cwd: cwd.clone(),
+                    version: SESSION_FORMAT_VERSION,
                 };
                 let line = serde_json::to_string(&header).context("serializing session header")?;
                 writeln!(file, "{line}").with_context(|| format!("writing {}", path.display()))?;
@@ -470,6 +494,9 @@ impl Session {
                 Err(err) => tracing::warn!("skipping corrupt session line: {err}"),
             }
         }
+        // Pre-v2 files carry no tool-call ids at all; give them one before
+        // anything downstream tries to correlate by them.
+        assign_legacy_tool_call_ids(&mut messages);
         let repaired = repair_dangling_tool_calls(&mut messages);
         if repaired > 0 {
             tracing::warn!(
@@ -542,40 +569,142 @@ fn read_header_cwd(path: &Path) -> Option<String> {
 pub(crate) const INTERRUPTED_TOOL_RESULT: &str = "(not executed — interrupted)";
 
 /// Answer every assistant tool call that has no tool result with a
-/// synthesized placeholder, in place. Results are matched positionally:
-/// after an assistant message with N tool calls, the next N `Tool`-role
-/// messages answer them (system notes may interleave; any other role ends
-/// the group). Returns how many results were synthesized.
+/// synthesized placeholder, in place, matched by call id.
+///
+/// A batch's results all live on one `Tool`-role message, so the group after
+/// an assistant turn is every `Tool` message before the *next* assistant
+/// turn (system notes and the user message a tool's images ride back on may
+/// interleave), and what is missing is whichever call ids no result block
+/// names. The placeholders join the group's first `Tool` message when there
+/// is one, so a half-answered batch stays one message in the one position
+/// Anthropic accepts; otherwise that message is created there.
+///
+/// Returns how many results were synthesized.
 pub(crate) fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) -> usize {
     let mut repaired = 0;
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].role != Role::Assistant || messages[i].tool_calls.is_empty() {
+        let calls: Vec<(String, String)> = messages[i]
+            .tool_calls()
+            .into_iter()
+            .map(|call| (call.id.clone(), call.function.name.clone()))
+            .collect();
+        if messages[i].role != Role::Assistant || calls.is_empty() {
             i += 1;
             continue;
         }
-        let expected = messages[i].tool_calls.len();
-        let mut answered = 0;
+        // The tool messages answering this turn, and the ids they cover. Only
+        // the next *assistant* turn ends the group: a system note (hook
+        // context, a background-task report) and a user message (the payload
+        // a tool's images ride back on) both land inside one, and treating
+        // either as the end would report a result that is right there as
+        // missing and answer the same call twice.
+        let mut answered: Vec<String> = Vec::new();
+        let mut first_result: Option<usize> = None;
         let mut j = i + 1;
-        while j < messages.len() && answered < expected {
+        while j < messages.len() && answered.len() < calls.len() {
             match messages[j].role {
+                Role::Assistant => break,
                 Role::Tool => {
-                    answered += 1;
+                    answered.extend(
+                        messages[j]
+                            .tool_results()
+                            .into_iter()
+                            .map(|result| result.tool_use_id.clone()),
+                    );
+                    first_result.get_or_insert(j);
+                }
+                Role::System | Role::User => {}
+            }
+            j += 1;
+        }
+        let missing: Vec<(String, String)> = calls
+            .into_iter()
+            .filter(|(id, _)| !answered.contains(id))
+            .collect();
+        repaired += missing.len();
+        if !missing.is_empty() {
+            // The placeholders join the batch's *first* result message, which
+            // is the one immediately following the assistant turn: the only
+            // place Anthropic accepts results for it. With nothing answered
+            // at all, that message is created there.
+            match first_result {
+                Some(index) => {
+                    for (id, name) in missing {
+                        messages[index].push_tool_result(id, name, INTERRUPTED_TOOL_RESULT);
+                    }
+                }
+                None => {
+                    let mut message = ChatMessage::new(Role::Tool, Vec::new());
+                    for (id, name) in missing {
+                        message.push_tool_result(id, name, INTERRUPTED_TOOL_RESULT);
+                    }
+                    messages.insert(i + 1, message);
                     j += 1;
                 }
-                Role::System => j += 1,
-                _ => break,
             }
         }
-        for k in answered..expected {
-            let name = messages[i].tool_calls[k].function.name.clone();
-            messages.insert(j, ChatMessage::tool_result(name, INTERRUPTED_TOOL_RESULT));
-            j += 1;
-            repaired += 1;
-        }
-        i = j;
+        i = j.max(i + 1);
     }
     repaired
+}
+
+/// Give the tool calls and results read out of a **pre-v2** session file the
+/// ids they never carried, in place.
+///
+/// Files written before content blocks recorded neither a call id nor a
+/// result id: the adapters re-invented ids on every request and paired them
+/// by tool name plus first-in-first-out order. That correlation is gone from
+/// the adapters, so it happens here instead: once, at load, where the whole
+/// message sequence is in view rather than on every request, and only for the
+/// messages that arrived without ids.
+///
+/// Within one assistant turn the results are matched to the calls
+/// positionally, which is exactly what a legacy file's ordering means, and
+/// the ids minted are globally unique so a repaired history is
+/// indistinguishable from one written today.
+pub(crate) fn assign_legacy_tool_call_ids(messages: &mut [ChatMessage]) {
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for message in messages.iter_mut() {
+        match message.role {
+            Role::Assistant => {
+                // A new assistant turn abandons any call the old file left
+                // unanswered; its results are never coming.
+                pending.clear();
+                for block in message.content.iter_mut() {
+                    if let crate::llm::ContentBlock::ToolUse(call) = block {
+                        if call.id.is_empty() {
+                            call.id = crate::llm::synthetic_tool_call_id();
+                        }
+                        pending.push_back(call.id.clone());
+                    }
+                }
+            }
+            Role::Tool => {
+                for block in message.content.iter_mut() {
+                    if let crate::llm::ContentBlock::ToolResult(result) = block
+                        && result.tool_use_id.is_empty()
+                        && let Some(id) = pending.pop_front()
+                    {
+                        result.tool_use_id = id;
+                    }
+                }
+            }
+            // Neither a system note (hook context, background-task reports)
+            // nor a user message ends the group. That is not a nicety for old
+            // files: it is exactly what they look like. Wizard used to push a
+            // tool's images back on a user message the moment that tool
+            // returned, so a two-call batch in a pre-v2 session reads
+            // assistant, result, *user*, result. Treating the user message as
+            // the end of the batch would leave the second result with no id
+            // at all, and an empty `tool_use_id` is a 400 on the first request
+            // of the resumed session.
+            //
+            // The next assistant turn is the only thing that ends a group,
+            // and it clears `pending` above.
+            Role::System | Role::User => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,7 +712,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::llm::{FunctionCall, Role, ToolCall};
+    use crate::llm::{Role, ToolCall};
 
     /// Temp sessions dir removed on drop.
     struct TempDir(PathBuf);
@@ -608,17 +737,15 @@ mod tests {
         let session = Session::create(&tmp.0).unwrap();
 
         let mut assistant = ChatMessage::assistant("I'll read that file.");
-        assistant.tool_calls.push(ToolCall {
-            function: FunctionCall {
-                name: "read_file".to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
-            },
-        });
+        assistant.push_tool_call(ToolCall::new(
+            "read_file".to_string(),
+            json!({ "path": "src/main.rs" }),
+        ));
         let messages = [
             ChatMessage::system("You are Wizard."),
             ChatMessage::user("read main.rs"),
             assistant,
-            ChatMessage::tool_result("read_file", "fn main() {}"),
+            ChatMessage::tool_result("call_read_file", "read_file", "fn main() {}"),
         ];
         for message in &messages {
             session.append(message).unwrap();
@@ -627,16 +754,16 @@ mod tests {
         let loaded = session.load_messages().unwrap();
         assert_eq!(loaded.len(), 4);
         assert_eq!(loaded[0].role, Role::System);
-        assert_eq!(loaded[1].content, "read main.rs");
-        assert_eq!(loaded[2].tool_calls.len(), 1);
-        assert_eq!(loaded[2].tool_calls[0].function.name, "read_file");
+        assert_eq!(loaded[1].text(), "read main.rs");
+        assert_eq!(loaded[2].tool_calls().len(), 1);
+        assert_eq!(loaded[2].tool_calls()[0].function.name, "read_file");
         assert_eq!(
-            loaded[2].tool_calls[0].function.arguments["path"],
+            loaded[2].tool_calls()[0].function.arguments["path"],
             "src/main.rs"
         );
         assert_eq!(loaded[3].role, Role::Tool);
-        assert_eq!(loaded[3].tool_name.as_deref(), Some("read_file"));
-        assert_eq!(loaded[3].content, "fn main() {}");
+        assert_eq!(loaded[3].tool_name(), Some("read_file"));
+        assert_eq!(loaded[3].text(), "fn main() {}");
     }
 
     #[test]
@@ -646,7 +773,7 @@ mod tests {
         let messages = [
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi there"),
-            ChatMessage::tool_result("git_status", "clean"),
+            ChatMessage::tool_result("call_git_status", "git_status", "clean"),
         ];
         for message in &messages {
             session.append(message).unwrap();
@@ -662,7 +789,7 @@ mod tests {
         for (loaded, original) in loaded.iter().zip(&messages) {
             assert_eq!(loaded.role, original.role);
             assert_eq!(loaded.content, original.content);
-            assert_eq!(loaded.tool_name, original.tool_name);
+            assert_eq!(loaded.tool_name(), original.tool_name());
         }
     }
 
@@ -684,8 +811,8 @@ mod tests {
 
         let loaded = session.load_messages().unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].content, "first");
-        assert_eq!(loaded[1].content, "second");
+        assert_eq!(loaded[0].text(), "first");
+        assert_eq!(loaded[1].text(), "second");
     }
 
     #[test]
@@ -751,8 +878,8 @@ mod tests {
         assert!(session.truncate_after(2).unwrap());
         let messages = session.load_messages().unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "one");
-        assert_eq!(messages[1].content, "ack one");
+        assert_eq!(messages[0].text(), "one");
+        assert_eq!(messages[1].text(), "ack one");
         assert_eq!(session.turn_markers().unwrap().len(), 1);
 
         // Appending continues to work after the rewrite.
@@ -774,7 +901,7 @@ mod tests {
         assert!(session.truncate_after(3).unwrap());
         let messages = session.load_messages().unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "one");
+        assert_eq!(messages[0].text(), "one");
     }
 
     #[test]
@@ -792,7 +919,7 @@ mod tests {
         );
         let messages = session.load_messages().unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].text(), "hello");
     }
 
     #[test]
@@ -888,6 +1015,7 @@ mod tests {
         let foreign = SessionHeader {
             timestamp: Utc::now(),
             cwd: "/somewhere/else".to_string(),
+            version: SESSION_FORMAT_VERSION,
         };
         std::fs::write(
             tmp.0.join("2999-01-01T00-00-00.jsonl"),
@@ -909,6 +1037,7 @@ mod tests {
         let foreign = SessionHeader {
             timestamp: Utc::now(),
             cwd: "/somewhere/else".to_string(),
+            version: SESSION_FORMAT_VERSION,
         };
         std::fs::write(
             tmp.0.join("2999-01-01T00-00-00.jsonl"),
@@ -919,6 +1048,103 @@ mod tests {
         let latest = Session::open_latest(&tmp.0).unwrap().expect("found");
         assert_eq!(latest.id, "2026-01-01T00-00-00");
         assert_eq!(latest.cwd(), None);
+    }
+
+    #[test]
+    fn a_new_session_records_the_format_version() {
+        let tmp = TempDir::new();
+        let session = Session::create(&tmp.0).unwrap();
+        let header = std::fs::read_to_string(session.path()).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(header.lines().next().expect("a header line")).unwrap();
+        assert_eq!(line["version"], SESSION_FORMAT_VERSION);
+    }
+
+    /// A session file written by a release before content blocks: the header
+    /// has no `version`, `content` is a bare string, and `tool_calls`,
+    /// `tool_name` and `images` are sibling fields with no ids anywhere.
+    ///
+    /// Two things have to survive it. [`SessionLine`] is `#[serde(untagged)]`
+    /// and discriminated by which keys are present, so a required `version`
+    /// would reclassify the header line as corrupt and silently lose the
+    /// recorded `cwd`. And the tool call and the result answering it have to
+    /// come back paired, or the first request of the resumed session is a 400.
+    #[test]
+    fn a_pre_v2_session_file_still_loads_and_gets_its_tool_call_ids() {
+        let tmp = TempDir::new();
+        let here = std::env::current_dir().unwrap().display().to_string();
+        let path = tmp.0.join("2026-01-01T00-00-00.jsonl");
+        let legacy = format!(
+            concat!(
+                r#"{{"timestamp":"2026-01-01T00:00:00Z","cwd":"{cwd}"}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-01-01T00:00:01Z","turn":1,"prompt":"read both"}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-01-01T00:00:02Z","message":{{"role":"user","content":"read both"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-01-01T00:00:03Z","message":{{"role":"assistant","content":"on it","#,
+                r#""tool_calls":[{{"function":{{"name":"read_file","arguments":{{"path":"a"}}}}}},"#,
+                r#"{{"function":{{"name":"read_file","arguments":{{"path":"b"}}}}}}]}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-01-01T00:00:04Z","message":{{"role":"tool","tool_name":"read_file","content":"body a"}}}}"#,
+                "\n",
+                // The shape old files really have: a tool's images were
+                // pushed the moment that tool returned, so a user message
+                // sits between the two results of one batch.
+                r#"{{"timestamp":"2026-01-01T00:00:05Z","message":{{"role":"user","content":"Image(s) returned by `read_file`:","#,
+                r#""images":[{{"b64":"QUJD","mime":"image/png"}}]}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-01-01T00:00:06Z","message":{{"role":"tool","tool_name":"read_file","content":"body b"}}}}"#,
+                "\n",
+            ),
+            cwd = here
+        );
+        std::fs::write(&path, legacy).unwrap();
+
+        // The header still parses, so the file is still this project's.
+        let session = Session::open_latest(&tmp.0).unwrap().expect("resumable");
+        assert_eq!(session.cwd(), Some(here.as_str()));
+        assert_eq!(session.turn_markers().unwrap().len(), 1);
+
+        let history = session.load_history().unwrap();
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[0].text(), "read both");
+        assert_eq!(history[1].text(), "on it");
+        assert_eq!(history[3].images().len(), 1, "the images message survives");
+
+        // Both legacy calls got an id, and the results answering them got the
+        // matching one. There is nothing else to pair them by: the file
+        // records the same tool name twice. The second result is on the far
+        // side of that user message, which is where old files put it.
+        let calls = history[1].tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].id.is_empty() && !calls[1].id.is_empty());
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(history[2].tool_results()[0].tool_use_id, calls[0].id);
+        assert_eq!(history[2].tool_results()[0].content, "body a");
+        assert_eq!(history[2].tool_results()[0].name, "read_file");
+        assert_eq!(history[4].tool_results()[0].tool_use_id, calls[1].id);
+        assert_eq!(history[4].tool_results()[0].content, "body b");
+
+        // Nothing was mistaken for a dangling call, so no placeholder was
+        // synthesized on top.
+        assert!(
+            !history
+                .iter()
+                .any(|message| message.text().contains(INTERRUPTED_TOOL_RESULT)),
+            "the old file was already complete"
+        );
+    }
+
+    #[test]
+    fn a_pre_v2_user_message_keeps_its_images() {
+        let legacy: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":"what is this?","images":[{"b64":"QUJD","mime":"image/png"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.text(), "what is this?");
+        assert_eq!(legacy.images().len(), 1);
+        assert_eq!(legacy.images()[0].b64, "QUJD");
     }
 
     #[test]
@@ -938,7 +1164,7 @@ mod tests {
         session.append(&ChatMessage::assistant("done")).unwrap();
 
         let history = session.load_history().unwrap();
-        let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+        let contents: Vec<String> = history.iter().map(ChatMessage::text).collect();
         assert_eq!(
             contents,
             [
@@ -959,59 +1185,73 @@ mod tests {
         let session = Session::create(&tmp.0).unwrap();
         let mut assistant = ChatMessage::assistant("working on it");
         for name in ["read_file", "execute"] {
-            assistant.tool_calls.push(ToolCall {
-                function: FunctionCall {
-                    name: name.to_string(),
-                    arguments: json!({}),
-                },
-            });
+            assistant.push_tool_call(ToolCall::new(name.to_string(), json!({})));
         }
+        let answered = assistant.tool_calls()[0].id.clone();
+        let dangling = assistant.tool_calls()[1].id.clone();
         session.append(&ChatMessage::user("go")).unwrap();
         session.append(&assistant).unwrap();
         // Only the first call got a result before the crash.
         session
-            .append(&ChatMessage::tool_result("read_file", "contents"))
+            .append(&ChatMessage::tool_result(
+                &answered,
+                "read_file",
+                "contents",
+            ))
             .unwrap();
 
         let history = session.load_history().unwrap();
-        assert_eq!(history.len(), 4);
-        assert_eq!(history[3].role, Role::Tool);
-        assert_eq!(history[3].tool_name.as_deref(), Some("execute"));
-        assert_eq!(history[3].content, INTERRUPTED_TOOL_RESULT);
+        // The placeholder joins the batch's own message rather than starting a
+        // second one: Anthropic takes exactly one message of results per
+        // assistant turn.
+        assert_eq!(history.len(), 3);
+        let results = history[2].tool_results();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_use_id, answered);
+        assert_eq!(results[0].content, "contents");
+        assert_eq!(results[1].tool_use_id, dangling);
+        assert_eq!(results[1].name, "execute");
+        assert_eq!(results[1].content, INTERRUPTED_TOOL_RESULT);
     }
 
     #[test]
-    fn repair_handles_interleaved_notes_and_multiple_groups() {
-        let call = |name: &str| ToolCall {
-            function: FunctionCall {
-                name: name.to_string(),
-                arguments: json!({}),
-            },
-        };
+    fn repair_matches_results_to_calls_by_id_not_by_order() {
+        let call = |name: &str| ToolCall::new(name.to_string(), json!({}));
         let mut a1 = ChatMessage::assistant("");
-        a1.tool_calls.push(call("execute"));
+        a1.push_tool_call(call("execute"));
         let mut a2 = ChatMessage::assistant("");
-        a2.tool_calls.extend([call("read_file"), call("todo")]);
+        for call in [call("read_file"), call("todo")] {
+            a2.push_tool_call(call);
+        }
+        let first = a1.tool_calls()[0].id.clone();
+        // The batch's *second* call is the one that got answered, so a
+        // positional repair would "fix" the wrong one and leave a duplicate.
+        let answered = a2.tool_calls()[1].id.clone();
+        let dangling = a2.tool_calls()[0].id.clone();
         let mut messages = vec![
             ChatMessage::user("go"),
             a1,
             // Answered, with a system note interleaved before the result.
             ChatMessage::system("[note]"),
-            ChatMessage::tool_result("execute", "ok"),
+            ChatMessage::tool_result(&first, "execute", "ok"),
             a2,
-            ChatMessage::tool_result("read_file", "contents"),
-            // "todo" never answered; the next user turn follows directly.
+            ChatMessage::tool_result(&answered, "todo", "noted"),
+            // `read_file` never answered; the next user turn follows directly.
             ChatMessage::user("next"),
         ];
         assert_eq!(repair_dangling_tool_calls(&mut messages), 1);
-        assert_eq!(messages[6].role, Role::Tool);
-        assert_eq!(messages[6].tool_name.as_deref(), Some("todo"));
-        assert_eq!(messages[7].content, "next");
+        let results = messages[5].tool_results();
+        assert_eq!(results.len(), 2, "both results live on one message");
+        assert_eq!(results[0].tool_use_id, answered);
+        assert_eq!(results[1].tool_use_id, dangling);
+        assert_eq!(results[1].name, "read_file");
+        assert_eq!(messages[6].text(), "next");
 
         // A clean history is left untouched.
         let before = messages.clone();
         assert_eq!(repair_dangling_tool_calls(&mut messages), 0);
         assert_eq!(messages.len(), before.len());
+        assert_eq!(messages[5].tool_results().len(), 2);
     }
 
     #[test]
@@ -1054,7 +1294,7 @@ mod tests {
         assert!(matches!(
             &entries[2],
             SessionEntry::Message(record)
-                if record.message.role == Role::User && record.message.content == "the prompt"
+                if record.message.role == Role::User && record.message.text() == "the prompt"
         ));
         assert!(matches!(
             &entries[3],

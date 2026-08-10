@@ -1,0 +1,8 @@
+{
+  "id": "wizard",
+  "label": "Wizard",
+  "command": "wizard",
+  "args": ["acp"],
+  "installHint": "Install Wizard: curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash",
+  "installInstructionsUrl": "https://github.com/teddytennant/wizard#readme"
+}

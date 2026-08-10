@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures_util::stream;
 
 use super::*;
 use crate::config::StepBudget;
+use crate::headless::rollback_failed_cycle;
 use crate::hooks::{HookDef, HookEvent};
-use crate::llm::{ChatChunk, ChatStream};
+use crate::llm::{CacheTokens, ChatChunk, ChatStream};
+use crate::tools::ToolOutput;
 
 /// Temp project dir removed on drop.
 struct TempDir(PathBuf);
@@ -139,29 +142,14 @@ impl LlmProvider for FailingProvider {
     }
 }
 
-#[tokio::test]
-async fn a_down_provider_trips_the_breaker_instead_of_retrying_forever() {
-    let tmp = TempDir::new();
+/// An agent talking to `client`, in `tmp`, under `config`.
+fn agent_with(tmp: &TempDir, client: Arc<dyn LlmProvider>, config: Config) -> Agent {
     let session = Session::create(&tmp.0).expect("create session");
     let hooks = Arc::new(HookEngine::new(
         Vec::new(),
         tmp.0.clone(),
         session.id.clone(),
     ));
-    let provider = Arc::new(FailingProvider {
-        calls: Mutex::new(0),
-    });
-    let client: Arc<dyn LlmProvider> = provider.clone();
-
-    // Continuous mode has no per-turn attempt cap: without the breaker this
-    // turn would retry forever. Zero backoff so the test never sleeps.
-    let config = Config {
-        continuous: true,
-        retry_base_secs: 0,
-        retry_max_secs: 0,
-        ..Config::default()
-    };
-
     let mut agent = Agent::new(
         client,
         ToolRegistry::new(),
@@ -174,25 +162,96 @@ async fn a_down_provider_trips_the_breaker_instead_of_retrying_forever() {
     )
     .expect("build agent");
     agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+    agent
+}
 
+/// **The complaint, at the endpoint end.** A standing mission must sleep
+/// through a provider outage, not die of one.
+///
+/// Continuous mode has no per-turn attempt cap, so the endpoint breaker is the
+/// only thing shaping the climb — and it used to end it. Eight consecutive
+/// failures is about ten minutes on the default ladder, so a provider blip
+/// longer than a coffee break ended a mission that had been running for hours,
+/// with nobody around to restart it. Now the turn waits the outage out.
+///
+/// It is still bounded: patience runs out (some permanent failures are
+/// indistinguishable from an outage, because an unrecognized error is
+/// *defaulted* to transient) and the turn then ends as a clean circuit breaker
+/// rather than a hard error, so the cycle is rolled back properly. Time is
+/// paused, so half a day of waiting costs the test nothing.
+#[tokio::test(start_paused = true)]
+async fn a_continuous_run_waits_a_down_provider_out_rather_than_dying_of_it() {
+    let tmp = TempDir::new();
+    let provider = Arc::new(FailingProvider {
+        calls: Mutex::new(0),
+    });
+    let mut agent = agent_with(
+        &tmp,
+        provider.clone(),
+        Config {
+            continuous: true,
+            // Zero backoff: what this test measures is the breaker's cooldowns,
+            // not the ladder's delays.
+            retry_base_secs: 0,
+            retry_max_secs: 0,
+            ..Config::default()
+        },
+    );
+
+    let started = tokio::time::Instant::now();
     let (tx, _rx) = mpsc::channel(256);
-    // If the breaker were absent this would hang; reaching an assertion at
-    // all is half the proof.
     let reason = agent
         .run_turn("do something", tx)
         .await
-        .expect("turn resolves");
+        .expect("the turn resolves rather than hanging");
     assert_eq!(
         reason,
         DoneReason::CircuitBreaker,
-        "a down provider must end the turn as a circuit breaker, not hang"
+        "and it ends cleanly, so the cycle is rolled back rather than errored"
     );
-    // The loop stops dialing once the breaker trips at its threshold (8),
-    // rather than retrying without bound.
+
+    let waited = started.elapsed();
+    assert!(
+        waited > Duration::from_secs(60 * 60),
+        "it waited hours rather than giving up in the first ten minutes: {waited:?}"
+    );
+    // The escalating cooldown is what makes waiting affordable: a handful of
+    // dials an hour, not one every thirty seconds for half a day.
+    let calls = *provider.calls.lock().unwrap();
+    assert!(
+        (8..100).contains(&calls),
+        "{calls} calls: the threshold's worth, then one probe per widening cooldown"
+    );
+}
+
+/// The same outage on a watched turn ends it promptly instead, on the retry
+/// budget, with the provider's own message. Somebody is looking at a spinner
+/// and would rather be told.
+#[tokio::test(start_paused = true)]
+async fn an_interactive_turn_surfaces_a_down_provider_instead_of_waiting() {
+    let tmp = TempDir::new();
+    let provider = Arc::new(FailingProvider {
+        calls: Mutex::new(0),
+    });
+    let mut agent = agent_with(
+        &tmp,
+        provider.clone(),
+        Config {
+            continuous: false,
+            ..Config::default()
+        },
+    );
+
+    let (tx, _rx) = mpsc::channel(256);
+    let err = agent
+        .run_turn("do something", tx)
+        .await
+        .expect_err("a down provider fails a watched turn");
+    assert!(format!("{err:#}").contains("simulated outage"), "{err:#}");
     assert_eq!(
         *provider.calls.lock().unwrap(),
-        8,
-        "stopped at the trip threshold"
+        crate::agent::turn::RETRY_ATTEMPTS + 1,
+        "the first attempt plus the budget, and no waiting on the breaker"
     );
 }
 
@@ -207,6 +266,7 @@ fn final_chunk(content: &str) -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -228,6 +288,7 @@ fn image_chunk(images: Vec<Image>) -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -273,12 +334,7 @@ impl crate::tools::Tool for ImageTool {
 /// One assistant message whose only tool call is `generate_image`.
 fn calls_image_tool() -> ChatChunk {
     let mut assistant = ChatMessage::assistant("");
-    assistant.tool_calls.push(ToolCall {
-        function: FunctionCall {
-            name: "generate_image".to_string(),
-            arguments: json!({}),
-        },
-    });
+    assistant.push_tool_call(ToolCall::new("generate_image".to_string(), json!({})));
     ChatChunk {
         message: Some(assistant),
         images: Vec::new(),
@@ -287,6 +343,7 @@ fn calls_image_tool() -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -315,10 +372,10 @@ async fn model_generated_images_reach_history_disk_and_the_surfaces() {
         .rev()
         .find(|message| message.role == Role::Assistant)
         .expect("an assistant message");
-    assert_eq!(assistant.content, "here you go");
-    assert_eq!(assistant.images.len(), 1);
-    assert_eq!(assistant.images[0].b64, image.b64);
-    assert_eq!(assistant.images[0].mime, "image/png");
+    assert_eq!(assistant.text(), "here you go");
+    assert_eq!(assistant.images().len(), 1);
+    assert_eq!(assistant.images()[0].b64, image.b64);
+    assert_eq!(assistant.images()[0].mime, "image/png");
 
     // Announced to the surfaces as a path, not base64.
     let announced = drain_images(&mut rx);
@@ -327,7 +384,7 @@ async fn model_generated_images_reach_history_disk_and_the_surfaces() {
     assert_eq!(*source, ImageSource::Assistant);
     assert_eq!(saved.mime, "image/png");
     assert_eq!(
-        assistant.images[0].path.as_ref(),
+        assistant.images()[0].path.as_ref(),
         Some(&saved.path),
         "history records the same path the surfaces were given — a replayed \
          transcript re-derives nothing"
@@ -345,6 +402,76 @@ async fn model_generated_images_reach_history_disk_and_the_surfaces() {
         "images are session-scoped: {}",
         saved.path.display()
     );
+}
+
+/// A parallel batch answers on ONE message, and everything else the batch
+/// produced lands after it.
+///
+/// Both halves are wire correctness, not tidiness. Anthropic requires all of
+/// an assistant turn's results in the single message that follows it, so the
+/// old message-per-result shape was a 400 on any two-call reply. OpenAI takes
+/// one `tool` message per result but rejects anything interleaved between
+/// them, and the images payload (a user message) used to be pushed the moment
+/// the tool that produced it returned, i.e. between the two results.
+#[tokio::test]
+async fn a_parallel_batch_answers_on_one_message_with_images_after_it() {
+    let image = test_png();
+    let (mut registry, echo_calls) = recording_registry();
+    registry.register(Arc::new(ImageTool {
+        images: vec![image.clone()],
+    }));
+
+    let tmp = TempDir::new();
+    // One reply, two calls: the image tool first, so a per-call push would
+    // put its user message between the two results.
+    let (mut agent, _provider) = test_agent_in(
+        &tmp,
+        vec![
+            vec![multi_tool_chunk(&["generate_image", "echo"])],
+            vec![final_chunk("done")],
+        ],
+        Vec::new(),
+        registry,
+    );
+
+    let (tx, _rx) = mpsc::channel(64);
+    agent.run_turn("make one and echo", tx).await.expect("turn");
+    assert_eq!(echo_calls.lock().unwrap().len(), 1, "both calls ran");
+
+    let history = agent.history();
+    let assistant = history
+        .iter()
+        .position(|message| message.role == Role::Assistant && message.tool_calls().len() == 2)
+        .expect("the two-call reply");
+    let calls: Vec<String> = history[assistant]
+        .tool_calls()
+        .iter()
+        .map(|call| call.id.clone())
+        .collect();
+
+    // Exactly one tool message, holding both results, bound by id.
+    assert_eq!(history[assistant + 1].role, Role::Tool);
+    let results = history[assistant + 1].tool_results();
+    assert_eq!(results.len(), 2, "one message answers the whole batch");
+    assert_eq!(results[0].tool_use_id, calls[0]);
+    assert_eq!(results[0].name, "generate_image");
+    assert_eq!(results[0].content, "rendered 1 image");
+    assert_eq!(results[1].tool_use_id, calls[1]);
+    assert_eq!(results[1].name, "echo");
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .count(),
+        1,
+        "no second tool message was pushed for the batch"
+    );
+
+    // The images payload comes after the batch, never between its results.
+    let follow_up = &history[assistant + 2];
+    assert_eq!(follow_up.role, Role::User);
+    assert!(follow_up.text().contains("generate_image"));
+    assert_eq!(follow_up.images().len(), 1);
 }
 
 #[tokio::test]
@@ -374,16 +501,16 @@ async fn tool_images_ride_back_on_a_following_user_message() {
         .iter()
         .position(|message| message.role == Role::Tool)
         .expect("a tool result");
-    assert_eq!(history[tool_index].content, "rendered 1 image");
+    assert_eq!(history[tool_index].text(), "rendered 1 image");
     assert!(
-        history[tool_index].images.is_empty(),
+        history[tool_index].images().is_empty(),
         "the tool message carries the text only"
     );
     let follow_up = &history[tool_index + 1];
     assert_eq!(follow_up.role, Role::User);
-    assert!(follow_up.content.contains("generate_image"));
-    assert_eq!(follow_up.images.len(), 1, "the model sees it");
-    assert_eq!(follow_up.images[0].b64, image.b64);
+    assert!(follow_up.text().contains("generate_image"));
+    assert_eq!(follow_up.images().len(), 1, "the model sees it");
+    assert_eq!(follow_up.images()[0].b64, image.b64);
 
     // The surfaces get the tool's images twice over: on ToolFinished (as
     // base64, for free) and on Images (as a path, which is what they use).
@@ -433,14 +560,14 @@ async fn an_oversized_image_is_dropped_with_a_notice_and_never_enters_history() 
     let follow_up = agent
         .history()
         .iter()
-        .find(|message| message.role == Role::User && !message.images.is_empty())
+        .find(|message| message.role == Role::User && !message.images().is_empty())
         .expect("the images user message");
     assert_eq!(
-        follow_up.images.len(),
+        follow_up.images().len(),
         1,
         "the oversized image never reaches the model; the sane one does"
     );
-    assert_eq!(follow_up.images[0].b64, test_png().b64);
+    assert_eq!(follow_up.images()[0].b64, test_png().b64);
 
     let (_text, _errors, notices) = drain_events(&mut rx);
     assert!(
@@ -454,7 +581,25 @@ fn usage_chunk(content: &str, prompt_tokens: u64, completion_tokens: u64) -> Cha
     ChatChunk {
         eval_count: Some(completion_tokens),
         prompt_eval_count: Some(prompt_tokens),
+        cache: CacheTokens::NONE,
         ..final_chunk(content)
+    }
+}
+
+/// [`usage_chunk`] whose prompt was partly served from the provider's cache.
+///
+/// `prompt_tokens` is the whole prompt, cached portion included — the shape
+/// [`CacheTokens`] documents and the one every adapter reconciles to before
+/// the chunk leaves it.
+fn cached_usage_chunk(
+    content: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache: CacheTokens,
+) -> ChatChunk {
+    ChatChunk {
+        cache,
+        ..usage_chunk(content, prompt_tokens, completion_tokens)
     }
 }
 
@@ -564,24 +709,18 @@ fn recording_registry() -> (ToolRegistry, Arc<Mutex<Vec<Value>>>) {
 /// `done: true` chunk carrying one tool call.
 fn tool_call_chunk(name: &str, arguments: Value) -> ChatChunk {
     ChatChunk {
-        message: Some(ChatMessage {
-            role: Role::Assistant,
-            content: String::new(),
-            tool_calls: vec![ToolCall {
-                function: FunctionCall {
-                    name: name.to_string(),
-                    arguments,
-                },
-            }],
-            tool_name: None,
-            images: Vec::new(),
-        }),
+        message: Some(ChatMessage::assistant_turn(
+            "",
+            Vec::new(),
+            vec![ToolCall::new(name.to_string(), arguments)],
+        )),
         images: Vec::new(),
         thinking: false,
         done: true,
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -607,12 +746,7 @@ fn completion_is_empty_requires_no_text_and_no_calls() {
     assert!(completion_is_empty("", &[]));
     assert!(completion_is_empty("  \n\t", &[]));
     assert!(!completion_is_empty("done", &[]));
-    let call = ToolCall {
-        function: FunctionCall {
-            name: "execute".to_string(),
-            arguments: json!({}),
-        },
-    };
+    let call = ToolCall::new("execute".to_string(), json!({}));
     assert!(!completion_is_empty("", std::slice::from_ref(&call)));
     assert!(!completion_is_empty("done", &[call]));
 }
@@ -639,27 +773,25 @@ async fn empty_completion_retries_with_nudge_then_succeeds() {
     assert_eq!(requests.len(), 2);
     let nudge = requests[1].messages.last().expect("retry has messages");
     assert_eq!(nudge.role, Role::User);
-    assert_eq!(nudge.content, EMPTY_COMPLETION_NUDGE);
+    assert_eq!(nudge.text(), EMPTY_COMPLETION_NUDGE);
 
     // The nudge never lands in history or the persisted session.
     assert!(
         agent
             .history()
             .iter()
-            .all(|m| m.content != EMPTY_COMPLETION_NUDGE),
+            .all(|m| m.text() != EMPTY_COMPLETION_NUDGE),
         "nudge is not kept in history"
     );
     let persisted = agent.session().load_messages().expect("session readable");
     assert!(
-        persisted
-            .iter()
-            .all(|m| m.content != EMPTY_COMPLETION_NUDGE),
+        persisted.iter().all(|m| m.text() != EMPTY_COMPLETION_NUDGE),
         "nudge is not persisted"
     );
     assert!(
         persisted
             .iter()
-            .any(|m| m.content == "Here are my findings."),
+            .any(|m| m.text() == "Here are my findings."),
         "the real reply is persisted"
     );
 }
@@ -686,7 +818,7 @@ async fn double_empty_completion_surfaces_a_notice() {
         agent
             .history()
             .iter()
-            .all(|m| m.role != Role::Assistant || !m.content.is_empty()),
+            .all(|m| m.role != Role::Assistant || !m.text().is_empty()),
         "no empty assistant message in history"
     );
 }
@@ -777,6 +909,71 @@ fn loop_control_parses_known_commands() {
     assert_eq!(read_loop_control(&tmp.0), None);
 }
 
+/// Write `pause` into the project's `.wizard/loop-control`.
+fn pause_the_loop(root: &Path) {
+    let dir = root.join(".wizard");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("loop-control"), "pause").unwrap();
+}
+
+/// A paused run still answers Ctrl-C and still stops at `--max-hours`.
+///
+/// `pause` parked the loop in a two-second sleep and re-read the file,
+/// observing nothing else. So a `pause` left behind — by an operator who went
+/// home, or by a script that crashed before writing the release — outlived
+/// Ctrl-C and ran straight through the deadline, indefinitely: the two checks
+/// that would have ended the run are at the *top* of the step, which a paused
+/// run never reaches.
+#[tokio::test]
+async fn a_paused_run_still_honors_cancellation_and_the_deadline() {
+    let tmp = TempDir::new();
+    let (mut agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
+    pause_the_loop(&tmp.0);
+
+    // Ctrl-C while paused ends the run.
+    agent.cancel_handle().cancel();
+    let policy = turn::Policy::turn(&agent);
+    let mut host = turn::TurnHost { agent: &mut agent };
+    assert!(
+        matches!(
+            turn::honor_loop_control(&mut host, &policy).await,
+            Some(DoneReason::Stopped)
+        ),
+        "a paused run must still stop on cancellation"
+    );
+
+    // A deadline that falls *during* the pause ends it too, without waiting
+    // out the poll interval — the sleep is raced against the deadline, not
+    // merely re-checked after it.
+    agent.cancel_handle().clear();
+    agent.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
+    let policy = turn::Policy::turn(&agent);
+    let mut host = turn::TurnHost { agent: &mut agent };
+    let started = Instant::now();
+    assert!(
+        matches!(
+            turn::honor_loop_control(&mut host, &policy).await,
+            Some(DoneReason::TimeLimit)
+        ),
+        "a paused run must still stop at its deadline"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the deadline was waited out rather than raced: {:?}",
+        started.elapsed()
+    );
+
+    // And the file is still what releases an otherwise-unbounded pause.
+    agent.set_deadline(None);
+    std::fs::write(tmp.0.join(".wizard").join("loop-control"), "resume").unwrap();
+    let policy = turn::Policy::turn(&agent);
+    let mut host = turn::TurnHost { agent: &mut agent };
+    assert!(
+        turn::honor_loop_control(&mut host, &policy).await.is_none(),
+        "resume lets the run continue"
+    );
+}
+
 #[test]
 fn loop_control_absent_file_is_none() {
     let tmp = TempDir::new();
@@ -817,11 +1014,11 @@ async fn pre_tool_use_block_feeds_reason_to_model_as_tool_error() {
         .find(|m| m.role == Role::Tool)
         .expect("tool feedback message");
     assert!(
-        feedback.content.contains("blocked by pre_tool_use hook"),
+        feedback.text().contains("blocked by pre_tool_use hook"),
         "{}",
-        feedback.content
+        feedback.text()
     );
-    assert!(feedback.content.contains("no echoing allowed"));
+    assert!(feedback.text().contains("no echoing allowed"));
 }
 
 #[tokio::test]
@@ -879,11 +1076,11 @@ async fn post_tool_use_stdout_is_appended_to_the_result() {
         .rev()
         .find(|m| m.role == Role::Tool)
         .expect("tool feedback message");
-    assert!(feedback.content.contains("echoed"), "{}", feedback.content);
+    assert!(feedback.text().contains("echoed"), "{}", feedback.text());
     assert!(
-        feedback.content.contains("lint: all clean"),
+        feedback.text().contains("lint: all clean"),
         "hook stdout appended: {}",
-        feedback.content
+        feedback.text()
     );
 }
 
@@ -934,15 +1131,11 @@ async fn user_prompt_submit_stdout_is_appended_to_the_message() {
     let requests = provider.requests.lock().unwrap();
     let prompt = requests[0].messages.last().expect("user message");
     assert_eq!(prompt.role, Role::User);
+    assert!(prompt.text().contains("do the thing"), "{}", prompt.text());
     assert!(
-        prompt.content.contains("do the thing"),
-        "{}",
-        prompt.content
-    );
-    assert!(
-        prompt.content.contains("remember: deploy is frozen"),
+        prompt.text().contains("remember: deploy is frozen"),
         "hook context appended: {}",
-        prompt.content
+        prompt.text()
     );
 }
 
@@ -957,9 +1150,9 @@ async fn run_turn_with_reviewer(
     let reviewer = async move {
         let mut plans = Vec::new();
         while let Some(event) = rx.recv().await {
-            if let AgentEvent::PlanReady { plan, respond } = event {
+            if let AgentEvent::PlanReady { plan, gate } = event {
                 plans.push(plan);
-                respond.send(verdict.clone()).expect("verdict delivered");
+                assert!(gate.answer(verdict.clone()), "verdict delivered");
             }
         }
         plans
@@ -977,7 +1170,7 @@ fn tool_feedback_of(provider: &ScriptedProvider, index: usize) -> String {
         .rev()
         .find(|m| m.role == Role::Tool)
         .expect("tool feedback message")
-        .content
+        .text()
         .clone()
 }
 
@@ -1013,7 +1206,7 @@ async fn plan_mode_blocks_non_read_only_tools_but_the_turn_continues() {
 
     // The system prompt carried the plan-mode instructions.
     let requests = provider.requests.lock().unwrap();
-    assert!(requests[0].messages[0].content.contains("PLAN MODE"));
+    assert!(requests[0].messages[0].text().contains("PLAN MODE"));
 }
 
 #[tokio::test]
@@ -1105,8 +1298,8 @@ async fn exit_plan_approval_writes_the_plan_and_clears_plan_mode() {
     );
     // After approval, the system prompt no longer carries the plan block.
     let requests = provider.requests.lock().unwrap();
-    assert!(requests[0].messages[0].content.contains("PLAN MODE"));
-    assert!(!requests[1].messages[0].content.contains("PLAN MODE"));
+    assert!(requests[0].messages[0].text().contains("PLAN MODE"));
+    assert!(!requests[1].messages[0].text().contains("PLAN MODE"));
 }
 
 #[tokio::test]
@@ -1333,12 +1526,12 @@ async fn rewind_to_a_later_turn_keeps_earlier_turns() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
     let messages = agent.session().load_messages().unwrap();
     assert_eq!(
-        messages.first().map(|m| m.content.as_str()),
+        messages.first().map(|m| m.text()).as_deref(),
         Some("write v1"),
         "the first turn's history survives"
     );
     assert!(
-        messages.iter().all(|m| m.content != "write v2"),
+        messages.iter().all(|m| m.text() != "write v2"),
         "the second turn's history is gone"
     );
 }
@@ -1455,6 +1648,143 @@ async fn usage_counts_accumulate_emit_events_and_land_in_the_jsonl_log() {
     assert_eq!(records[0].mode, "genie");
     assert!(records[0].ts > 0);
     assert_eq!(records[0].project, tmp.0.display().to_string());
+
+    // Cost is settled at write time, not left for the reader: every record
+    // carries a figure and the provenance of the rate that produced it. The
+    // default config is the synthesized llama.cpp provider, so these turns are
+    // the self-hosted case: $0.00, and labelled as such rather than priced at
+    // the unknown-model fallback. That pins both halves of the wiring: drop
+    // `cost_usd` and the first assertion fires, stop passing the provider's
+    // kind through and the source becomes `Fallback` with a non-zero cost.
+    assert_eq!(records[0].cost_usd, Some(0.0));
+    assert_eq!(records[0].price_source, crate::usage::PriceSource::Local);
+    assert_eq!(records[1].price_source, crate::usage::PriceSource::Local);
+    // These chunks carry `CacheTokens::NONE`, which is what a backend with no
+    // prompt cache reports, so the subset counts are zero rather than absent.
+    // The turn that *does* report a split is
+    // `cached_prompt_tokens_reach_the_usage_record_and_the_price`.
+    assert_eq!(records[0].cache_read_tokens, 0);
+    assert_eq!(records[0].cache_write_tokens, 0);
+}
+
+/// Exit criterion 8's second clause: `wizard usage` shows real cost including
+/// cached-token pricing.
+///
+/// The seam this covers was built correctly on both ends and never joined in
+/// the middle: `record_cache` was defined, `ModelPrice` priced a cache read at
+/// 0.1x input and a write at 1.25x, `UsageRecord` carried both counts and
+/// `wizard usage` had a `cached` column — and no production code ever reported
+/// a hit, because `ChatChunk` had nowhere to put the number the adapters were
+/// already decoding. Every turn therefore billed as all-fresh input.
+///
+/// This drives the whole path in one go: a provider reports a split on its
+/// final chunk, the turn loop hands it to the tracker, and the record on disk
+/// carries it and is priced by it. Break any link — drop `ChatChunk::cache`,
+/// stop calling `record_cache`, stop passing the counts to `estimate_cost` —
+/// and one of the three blocks below fails.
+#[tokio::test]
+async fn cached_prompt_tokens_reach_the_usage_record_and_the_price() {
+    let tmp = TempDir::new();
+    // A metered model with a table price, so the cost column is a real
+    // number rather than the self-hosted $0.00 every other test here sees.
+    let mut config = Config::default();
+    config.providers = vec![crate::config::ProviderConfig {
+        name: "anthropic".to_string(),
+        kind: crate::config::ProviderKind::Anthropic,
+        base_url: "https://api.anthropic.com".to_string(),
+        model: "claude-opus-5".to_string(),
+        api_key_env: None,
+        gguf_path: None,
+        usd_per_mtok_in: None,
+        usd_per_mtok_out: None,
+    }];
+    config.active_provider = Some("anthropic".to_string());
+
+    // 100,000 prompt tokens, 90,000 of them read back from the cache and
+    // 5,000 written into it. That is one `/ultra` candidate's worth of a
+    // re-sent charter, which is the case caching exists for.
+    let provider = ScriptedProvider::new(vec![vec![cached_usage_chunk(
+        "warm",
+        100_000,
+        1_000,
+        CacheTokens {
+            read: 90_000,
+            write: 5_000,
+        },
+    )]]);
+    let session = Session::create(&tmp.0).expect("create session");
+    let hooks = Arc::new(HookEngine::new(
+        Vec::new(),
+        tmp.0.clone(),
+        session.id.clone(),
+    ));
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(),
+        config,
+        Vec::new(),
+        tmp.0.clone(),
+        session,
+        true,
+        hooks,
+    )
+    .expect("build agent");
+    agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+
+    let (tx, _rx) = mpsc::channel(64);
+    agent.run_turn("go", tx).await.expect("turn ok");
+
+    // 1. The counters saw it.
+    assert_eq!(agent.usage().turn_cache_totals(), (90_000, 5_000));
+    assert_eq!(agent.usage().session_cache_totals(), (90_000, 5_000));
+    assert_eq!(
+        agent.usage().turn_totals(),
+        (100_000, 1_000),
+        "the cache split is a subset of the prompt, never an addition to it"
+    );
+
+    // 2. The record on disk carries it.
+    let raw = std::fs::read_to_string(tmp.0.join("usage.jsonl")).expect("log written");
+    let record: crate::usage::UsageRecord =
+        serde_json::from_str(raw.lines().next().expect("one record")).expect("valid json");
+    assert_eq!(record.prompt_tokens, 100_000);
+    assert_eq!(record.cache_read_tokens, 90_000);
+    assert_eq!(record.cache_write_tokens, 5_000);
+    assert_eq!(record.price_source, crate::usage::PriceSource::Table);
+
+    // 3. The cost is the cached one, not the all-fresh one. claude-opus-5 is
+    //    $5/Mtok in and $25/Mtok out, so:
+    //      5,000 fresh      x $5.00   = $0.025
+    //     90,000 cache read x $0.50   = $0.045
+    //      5,000 cache write x $6.25  = $0.03125
+    //      1,000 output     x $25.00  = $0.025
+    //                                 = $0.12625
+    //    Billed as all-fresh input the same turn is 100,000 x $5.00 + output
+    //    = $0.525, which is 4.2x too much — and up to 10x on the cached
+    //    portion alone.
+    let billed = record.cost_usd.expect("a priced record");
+    assert!((billed - 0.126_25).abs() < 1e-9, "{record:?}");
+    let all_fresh = crate::usage::estimate_cost(
+        crate::usage::TurnTokens {
+            prompt: 100_000,
+            completion: 1_000,
+            cache_read: 0,
+            cache_write: 0,
+        },
+        &crate::usage::PriceInputs {
+            model: "claude-opus-5",
+            endpoint: "https://api.anthropic.com",
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+            self_hosted: false,
+        },
+    );
+    assert!(
+        billed < all_fresh.usd * 0.5,
+        "a turn that was mostly a cache hit must not be billed like a cold \
+         one: billed {billed}, all-fresh {}",
+        all_fresh.usd
+    );
 }
 
 #[tokio::test]
@@ -1492,7 +1822,7 @@ async fn prompt_tokens_near_the_context_window_trigger_compaction() {
         !agent
             .history
             .iter()
-            .any(|m| m.content.contains("[Compacted progress summary]")),
+            .any(|m| m.text().contains("[Compacted progress summary]")),
         "no compaction before a token count arrives"
     );
 
@@ -1502,7 +1832,7 @@ async fn prompt_tokens_near_the_context_window_trigger_compaction() {
         agent
             .history
             .iter()
-            .any(|m| m.content.contains("[Compacted progress summary]")),
+            .any(|m| m.text().contains("[Compacted progress summary]")),
         "token threshold compacted the history"
     );
     let (_text, errors, notices) = drain_events(&mut rx);
@@ -1528,7 +1858,7 @@ async fn prompt_tokens_near_the_context_window_trigger_compaction() {
     // instructions (todo list + plan file).
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    let summarize_prompt = &requests[1].messages[0].content;
+    let summarize_prompt = &requests[1].messages[0].text();
     assert!(summarize_prompt.contains("todo"), "{summarize_prompt}");
     assert!(
         summarize_prompt.contains(".wizard/plan.md"),
@@ -1584,13 +1914,13 @@ async fn compact_now_force_summarizes_and_keeps_the_recent_tail() {
         agent
             .history
             .iter()
-            .any(|m| m.content.contains("[Compacted progress summary]")),
+            .any(|m| m.text().contains("[Compacted progress summary]")),
         "the middle span became a summary note"
     );
     // The system prompt and the last KEEP_RECENT messages survive verbatim.
     assert_eq!(agent.history[0].role, Role::System);
     assert_eq!(
-        agent.history.last().unwrap().content,
+        agent.history.last().unwrap().text(),
         format!("msg {}", extra - 1)
     );
     // Progress note is session-persisted so resume / session readers see it.
@@ -1598,7 +1928,7 @@ async fn compact_now_force_summarizes_and_keeps_the_recent_tail() {
     assert!(
         session
             .iter()
-            .any(|m| m.role == Role::System && m.content.contains(COMPACT_SUMMARY_HEADING)),
+            .any(|m| m.role == Role::System && m.text().contains(COMPACT_SUMMARY_HEADING)),
         "compact note must land in the session JSONL as a system note"
     );
 }
@@ -1706,14 +2036,14 @@ async fn compact_tool_runs_mid_turn_and_feeds_result_back() {
         agent
             .history
             .iter()
-            .any(|m| m.role == Role::Tool && m.content.contains("compacted")),
+            .any(|m| m.role == Role::Tool && m.text().contains("compacted")),
         "compact tool result missing from history"
     );
     assert!(
         agent
             .history
             .iter()
-            .any(|m| m.content.contains(COMPACT_SUMMARY_HEADING)),
+            .any(|m| m.text().contains(COMPACT_SUMMARY_HEADING)),
         "summary note in history"
     );
 
@@ -1754,7 +2084,7 @@ async fn elevated_pressure_is_injected_into_the_completion_request() {
     let saw_pressure = requests[0]
         .messages
         .iter()
-        .any(|m| m.content.starts_with(CONTEXT_PRESSURE_HEADING));
+        .any(|m| m.text().starts_with(CONTEXT_PRESSURE_HEADING));
     assert!(
         saw_pressure,
         "pressure line must ride the completion request"
@@ -1766,7 +2096,7 @@ async fn elevated_pressure_is_injected_into_the_completion_request() {
         agent
             .history
             .iter()
-            .all(|m| !m.content.starts_with(CONTEXT_PRESSURE_HEADING)),
+            .all(|m| !m.text().starts_with(CONTEXT_PRESSURE_HEADING)),
         "pressure must not linger in history"
     );
     // And never session-persisted.
@@ -1774,7 +2104,7 @@ async fn elevated_pressure_is_injected_into_the_completion_request() {
     assert!(
         session
             .iter()
-            .all(|m| !m.content.starts_with(CONTEXT_PRESSURE_HEADING)),
+            .all(|m| !m.text().starts_with(CONTEXT_PRESSURE_HEADING)),
         "pressure must not hit the session file"
     );
 }
@@ -1795,7 +2125,7 @@ async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
     }
     // Threshold just above the current size: crossed only once the 5k
     // tool result lands, so the compaction must happen mid-turn.
-    let base: usize = agent.history.iter().map(|m| m.content.len()).sum();
+    let base: usize = agent.history.iter().map(|m| m.text().len()).sum();
     agent.config.compact_threshold_bytes = base + 1_000;
 
     let (tx, _rx) = mpsc::channel(256);
@@ -1806,7 +2136,7 @@ async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
         agent
             .history
             .iter()
-            .any(|m| m.content.contains("[Compacted progress summary]")),
+            .any(|m| m.text().contains("[Compacted progress summary]")),
         "mid-turn compaction happened"
     );
     // The in-flight turn's tail — the big tool result the model is
@@ -1815,7 +2145,7 @@ async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
         agent
             .history
             .iter()
-            .any(|m| m.role == Role::Tool && m.content.contains("BBBB")),
+            .any(|m| m.role == Role::Tool && m.text().contains("BBBB")),
         "tool feedback preserved through compaction"
     );
     // The final completion saw the compacted history.
@@ -1825,7 +2155,7 @@ async fn byte_threshold_compacts_between_steps_keeping_the_turn_tail() {
         requests[2]
             .messages
             .iter()
-            .any(|m| m.content.contains("[Compacted progress summary]"))
+            .any(|m| m.text().contains("[Compacted progress summary]"))
     );
 }
 
@@ -1911,11 +2241,11 @@ fn todo_instruction_appears_only_when_the_tool_is_registered() {
         Vec::new(),
         ToolRegistry::with_native_tools(),
     );
-    assert!(agent.history[0].content.contains("## Working todo list"));
+    assert!(agent.history[0].text().contains("## Working todo list"));
 
     let (agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), ToolRegistry::new());
     assert!(
-        !agent.history[0].content.contains("## Working todo list"),
+        !agent.history[0].text().contains("## Working todo list"),
         "no instruction without the tool"
     );
 }
@@ -1930,16 +2260,16 @@ fn context_management_instruction_is_always_injected() {
         let (agent, _provider) = test_agent_in(&tmp, Vec::new(), Vec::new(), registry);
         assert!(
             agent.history[0]
-                .content
+                .text()
                 .contains("## Context management (you own your window)"),
             "context block missing from system prompt"
         );
         assert!(
-            agent.history[0].content.contains("`compact`"),
+            agent.history[0].text().contains("`compact`"),
             "must teach the compact tool"
         );
         assert!(
-            agent.history[0].content.contains("[context pressure]"),
+            agent.history[0].text().contains("[context pressure]"),
             "must mention the live pressure signal"
         );
     }
@@ -1995,13 +2325,13 @@ async fn background_task_finish_is_injected_into_the_next_step() {
         let note = request
             .messages
             .iter()
-            .find(|m| m.role == Role::System && m.content.contains("background task #1 finished"))
+            .find(|m| m.role == Role::System && m.text().contains("background task #1 finished"))
             .expect("notification in history");
-        assert!(note.content.contains("(exit 0)"), "{}", note.content);
+        assert!(note.text().contains("(exit 0)"), "{}", note.text());
         assert!(
-            note.content.contains("task-payload"),
+            note.text().contains("task-payload"),
             "output tail included: {}",
-            note.content
+            note.text()
         );
     }
 
@@ -2028,7 +2358,7 @@ async fn background_task_finish_is_injected_into_the_next_step() {
         agent
             .history()
             .iter()
-            .filter(|m| m.content.contains("background task #1 finished"))
+            .filter(|m| m.text().contains("background task #1 finished"))
             .count(),
         1,
         "the notification appears exactly once in history"
@@ -2088,7 +2418,7 @@ async fn stream_json_sink_renders_a_scripted_run_as_jsonl_ending_in_done() {
     assert_eq!(reason, DoneReason::Completed);
 
     // Feed the turn's real event stream through the stream-json sink,
-    // exactly as run_headless wires it.
+    // exactly as the headless runner wires it.
     let buf = SharedBuf::default();
     let mut sink = StreamJsonSink::new(buf.clone());
     while let Ok(event) = rx.try_recv() {
@@ -2229,7 +2559,7 @@ async fn spawn_subagent_background_returns_immediately_and_reports_on_a_later_tu
             .history()
             .iter()
             .filter(|m| m
-                .content
+                .text()
                 .contains("background subagent #1 'worker' completed"))
             .count(),
         1,
@@ -2313,27 +2643,21 @@ impl crate::tools::Tool for CancelingTool {
 /// `done: true` chunk carrying several tool calls in one batch.
 fn multi_tool_chunk(names: &[&str]) -> ChatChunk {
     ChatChunk {
-        message: Some(ChatMessage {
-            role: Role::Assistant,
-            content: String::new(),
-            tool_calls: names
+        message: Some(ChatMessage::assistant_turn(
+            "",
+            Vec::new(),
+            names
                 .iter()
-                .map(|name| ToolCall {
-                    function: FunctionCall {
-                        name: name.to_string(),
-                        arguments: json!({}),
-                    },
-                })
+                .map(|name| ToolCall::new(name.to_string(), json!({})))
                 .collect(),
-            tool_name: None,
-            images: Vec::new(),
-        }),
+        )),
         images: Vec::new(),
         thinking: false,
         done: true,
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -2364,22 +2688,30 @@ async fn cancel_mid_batch_stops_the_turn_and_answers_skipped_calls() {
         "the call after the cancel never ran"
     );
 
-    // Both tool calls are answered — the second synthetically — so the
-    // persisted history carries no dangling tool_use.
+    // Both tool calls are answered (the second synthetically) on ONE tool
+    // message, so the persisted history carries no dangling tool_use and no
+    // batch split across two messages.
     let persisted = agent.session().load_history().expect("session readable");
     let assistant = persisted
         .iter()
-        .position(|m| m.role == Role::Assistant && m.tool_calls.len() == 2)
+        .position(|m| m.role == Role::Assistant && m.tool_calls().len() == 2)
         .expect("assistant batch persisted");
+    let calls = persisted[assistant].tool_calls();
     assert_eq!(persisted[assistant + 1].role, Role::Tool);
-    assert_eq!(persisted[assistant + 2].role, Role::Tool);
-    assert_eq!(persisted[assistant + 2].tool_name.as_deref(), Some("echo"));
+    assert_eq!(
+        persisted.len(),
+        assistant + 2,
+        "one message answers the whole batch"
+    );
+    let results = persisted[assistant + 1].tool_results();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].tool_use_id, calls[0].id);
+    assert_eq!(results[1].tool_use_id, calls[1].id);
+    assert_eq!(results[1].name, "echo");
     assert!(
-        persisted[assistant + 2]
-            .content
-            .contains("interrupted by user"),
+        results[1].content.contains("interrupted by user"),
         "{}",
-        persisted[assistant + 2].content
+        results[1].content
     );
 
     // The next turn is not poisoned by the stale cancel request.
@@ -2398,16 +2730,13 @@ async fn compaction_never_splits_a_tool_call_group() {
         agent.history.push(ChatMessage::user(format!("filler {i}")));
     }
     let mut assistant = ChatMessage::assistant("running a tool");
-    assistant.tool_calls.push(ToolCall {
-        function: FunctionCall {
-            name: "execute".to_string(),
-            arguments: json!({}),
-        },
-    });
+    assistant.push_tool_call(ToolCall::new("execute".to_string(), json!({})));
     agent.history.push(assistant); // index 5
-    agent
-        .history
-        .push(ChatMessage::tool_result("execute", "output")); // index 6
+    agent.history.push(ChatMessage::tool_result(
+        "call_execute",
+        "execute",
+        "output",
+    )); // index 6
     for i in 0..9 {
         agent.history.push(ChatMessage::user(format!("tail {i}")));
     }
@@ -2419,7 +2748,7 @@ async fn compaction_never_splits_a_tool_call_group() {
     let assistant = agent
         .history
         .iter()
-        .position(|m| !m.tool_calls.is_empty())
+        .position(|m| !m.tool_calls().is_empty())
         .expect("tool-call message survived");
     assert_eq!(
         agent.history[assistant + 1].role,
@@ -2455,14 +2784,14 @@ async fn drain_finished_notifications_reports_and_persists_once() {
     }
     let note = agent.history().last().expect("note in history");
     assert_eq!(note.role, Role::System);
-    assert!(note.content.contains("failed: boom"), "{}", note.content);
+    assert!(note.text().contains("failed: boom"), "{}", note.text());
 
     // Persisted as a system note: a resume replays it.
     let replayed = agent.session().load_history().expect("session readable");
     assert!(
         replayed
             .iter()
-            .any(|m| m.role == Role::System && m.content.contains("failed: boom")),
+            .any(|m| m.role == Role::System && m.text().contains("failed: boom")),
         "note persisted for resume"
     );
 
@@ -2504,14 +2833,14 @@ async fn side_question_answers_without_touching_history_or_session() {
         requests[0]
             .messages
             .iter()
-            .any(|m| m.role == Role::User && m.content.contains("what is 6 * 7?")),
+            .any(|m| m.role == Role::User && m.text().contains("what is 6 * 7?")),
         "question reached the model"
     );
     assert!(
         requests[0]
             .messages
             .iter()
-            .any(|m| m.role == Role::User && m.content.contains("NO tools")),
+            .any(|m| m.role == Role::User && m.text().contains("NO tools")),
         "system reminder constrains the model"
     );
 }
@@ -2618,6 +2947,7 @@ fn delta_chunk(content: &str, thinking: bool) -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -2652,10 +2982,10 @@ async fn streaming_assembles_split_deltas_and_keeps_thinking_out_of_history() {
         .rev()
         .find(|m| m.role == Role::Assistant)
         .expect("assistant message");
-    assert_eq!(assistant.content, "Hello world");
+    assert_eq!(assistant.text(), "Hello world");
     let persisted = agent.session().load_messages().expect("session readable");
     assert!(
-        persisted.iter().all(|m| !m.content.contains("pondering")),
+        persisted.iter().all(|m| !m.text().contains("pondering")),
         "thinking never reaches history or disk"
     );
 }
@@ -2725,12 +3055,12 @@ async fn a_failed_summary_falls_back_to_truncating_the_middle() {
         agent
             .history
             .iter()
-            .all(|m| !m.content.contains("[Compacted progress summary]")),
+            .all(|m| !m.text().contains("[Compacted progress summary]")),
         "no summary note on the fallback path"
     );
     assert_eq!(agent.history[0].role, Role::System);
     assert_eq!(
-        agent.history.last().unwrap().content,
+        agent.history.last().unwrap().text(),
         format!("msg {}", extra - 1),
         "the recent tail survives verbatim"
     );
@@ -2759,7 +3089,7 @@ async fn rolling_summarization_chains_oversized_spans_through_chunk_summaries() 
 
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 2, "one summarization pass per chunk");
-    let second_blob = &requests[1].messages[1].content;
+    let second_blob = &requests[1].messages[1].text();
     assert!(
         second_blob.contains("[Progress summary of the transcript so far]"),
         "the second pass sees the first pass's summary"
@@ -2770,7 +3100,7 @@ async fn rolling_summarization_chains_oversized_spans_through_chunk_summaries() 
 
     assert!(
         agent.history.iter().any(|m| m
-            .content
+            .text()
             .contains("[Compacted progress summary]\nsummary of everything")),
         "the final rolling summary is what lands in history"
     );
@@ -2784,13 +3114,13 @@ fn leaving_plan_mode_also_leaves_omakase() {
     agent.set_omakase(true);
     assert!(agent.plan_mode(), "omakase implies plan mode");
     assert!(agent.omakase());
-    assert!(agent.history[0].content.contains("Omakase"));
-    assert!(agent.history[0].content.contains("PLAN MODE"));
+    assert!(agent.history[0].text().contains("Omakase"));
+    assert!(agent.history[0].text().contains("PLAN MODE"));
 
     agent.set_plan_mode(false);
     assert!(!agent.omakase(), "no omakase without the plan phase");
-    assert!(!agent.history[0].content.contains("Omakase"));
-    assert!(!agent.history[0].content.contains("PLAN MODE"));
+    assert!(!agent.history[0].text().contains("Omakase"));
+    assert!(!agent.history[0].text().contains("PLAN MODE"));
 }
 
 /// A one-lens, no-judge ultra engine. One candidate makes the scripted
@@ -2809,6 +3139,9 @@ fn ultra_engine() -> Arc<ultra::UltraEngine> {
         judges: 0,
         timeout: Duration::from_secs(30),
         max_draft_chars: 6_000,
+        // No panel seats: these tests run ultra on its own, which is the
+        // council falling back to the session's own client and model.
+        seats: Vec::new(),
     })
 }
 
@@ -2835,7 +3168,7 @@ async fn ultra_guidance_lives_for_one_turn_and_is_never_persisted() {
         .filter(|message| ultra::is_guidance(message))
         .collect();
     assert_eq!(injected.len(), 1, "exactly one guidance block");
-    assert!(injected[0].content.contains("rename the flag in cli.rs"));
+    assert!(injected[0].text().contains("rename the flag in cli.rs"));
 
     // ...and the surface got them too, or they would be readable nowhere:
     // the candidate's pane retires within seconds and a system message is
@@ -2878,9 +3211,9 @@ async fn ultra_guidance_lives_for_one_turn_and_is_never_persisted() {
         .filter(|message| ultra::is_guidance(message))
         .collect();
     assert_eq!(injected.len(), 1, "still exactly one, not two");
-    assert!(injected[0].content.contains("and the docs too"));
+    assert!(injected[0].text().contains("and the docs too"));
     assert!(
-        !injected[0].content.contains("rename the flag in cli.rs"),
+        !injected[0].text().contains("rename the flag in cli.rs"),
         "last turn's drafts are gone"
     );
 }
@@ -3022,4 +3355,235 @@ async fn ultra_candidates_bill_the_parents_usage_log() {
     );
     let log = std::fs::read_to_string(tmp.0.join("usage.jsonl")).expect("usage log written");
     assert!(log.contains("\"prompt_tokens\":700"), "{log}");
+}
+
+// ---------------------------------------------------------------------------
+// The data event: cloning, recording, replay
+// ---------------------------------------------------------------------------
+
+/// Every shape the event stream carries has to survive being written down and
+/// read back, because that is the whole reason the reply channels moved off it:
+/// a recording, a replay and (later) a peer all go through exactly this path.
+/// The structured payloads are the ones that break: a tool result, an image
+/// reference, a hook outcome, a task status, a gate ticket. Those are what
+/// this pins.
+/// The report/request split, and specifically the half of it that is easy to
+/// get backwards.
+///
+/// A gate-bearing event *looks* like a request: something is waiting for an
+/// answer. It is still a report, because the question is a fact about the
+/// sender's turn and a watcher should see it; what a watcher must not get is
+/// the ability to answer, and that is taken away by voiding the ticket rather
+/// than by refusing to carry the event. Getting this backwards does not fail
+/// any other test: it just silently stops peers from seeing plan reviews.
+#[test]
+fn a_gate_is_a_report_and_a_command_line_is_a_request() {
+    let (gate, _verdict) = PlanGate::open();
+    let (interview, _answers) = InterviewGate::open();
+
+    assert!(
+        AgentEvent::CommandRequested("/model gpt-5.3-codex".into()).is_request(),
+        "a slash-command line asks this machine to act"
+    );
+    assert!(
+        !AgentEvent::PlanReady {
+            plan: "1. read\n2. write".into(),
+            gate,
+        }
+        .is_request(),
+        "a plan review is a fact about the sender's turn"
+    );
+    assert!(
+        !AgentEvent::Interview {
+            questions: Vec::new(),
+            gate: interview,
+        }
+        .is_request(),
+        "an interview is a fact about the sender's turn"
+    );
+    assert!(!AgentEvent::TextDelta("hello".into()).is_request());
+    assert!(!AgentEvent::StreamRetrying.is_request());
+}
+
+#[test]
+fn agent_events_round_trip_through_serde() {
+    let (gate, _verdict) = PlanGate::open();
+    let (interview, _answers) = InterviewGate::open();
+    let events = vec![
+        AgentEvent::TextDelta("hello".to_string()),
+        AgentEvent::ToolStarted {
+            name: "execute".to_string(),
+            args: json!({ "command": "ls" }),
+        },
+        AgentEvent::ToolFinished {
+            name: "execute".to_string(),
+            output: ToolOutput::error("no such file"),
+        },
+        AgentEvent::Images {
+            source: ImageSource::Tool("render_chart".to_string()),
+            images: vec![crate::images::ImageRef {
+                path: PathBuf::from("/tmp/chart.png"),
+                mime: "image/png".to_string(),
+                bytes: 4096,
+            }],
+        },
+        AgentEvent::HookFired {
+            event: "pre_tool_use".to_string(),
+            command: "./check.sh".to_string(),
+            outcome: crate::hooks::HookOutcome::Blocked("deploy is frozen".to_string()),
+        },
+        AgentEvent::TaskFinished {
+            id: 3,
+            command: "sleep 1".to_string(),
+            status: crate::tools::tasks::TaskStatus::Done(0),
+        },
+        AgentEvent::PlanReady {
+            plan: "1. do it".to_string(),
+            gate,
+        },
+        AgentEvent::Interview {
+            questions: vec![InterviewQuestion {
+                question: "which database?".to_string(),
+                options: vec!["sqlite".to_string(), "postgres".to_string()],
+            }],
+            gate: interview,
+        },
+        AgentEvent::Done {
+            reason: DoneReason::MaxSteps,
+        },
+    ];
+
+    for event in events {
+        let written = serde_json::to_string(&event).expect("event serializes");
+        let read_back: AgentEvent = serde_json::from_str(&written).expect("event deserializes");
+        assert_eq!(
+            serde_json::to_string(&read_back).expect("re-serializes"),
+            written,
+            "round trip changed the event: {written}"
+        );
+    }
+}
+
+/// Teeing the stream must not tee the answer. Two consumers can hold the same
+/// request, which is the point of a clonable event, but the turn is waiting on
+/// exactly one verdict, so the first to claim the gate is the one that gives
+/// it and the second finds it spent.
+#[test]
+fn only_one_clone_of_a_plan_event_can_answer_it() {
+    let (gate, mut verdict) = PlanGate::open();
+    let event = AgentEvent::PlanReady {
+        plan: "1. do it".to_string(),
+        gate,
+    };
+    let teed = event.clone();
+
+    let (AgentEvent::PlanReady { gate: first, .. }, AgentEvent::PlanReady { gate: second, .. }) =
+        (event, teed)
+    else {
+        panic!("both copies are plan events");
+    };
+    assert!(
+        first.answer(PlanVerdict::approve()),
+        "the consumer that claims first answers"
+    );
+    assert!(
+        !second.answer(PlanVerdict::reject("too big")),
+        "the second consumer finds the gate already spent"
+    );
+    assert!(
+        verdict.try_recv().expect("verdict delivered").approved,
+        "the turn sees the first answer and only the first"
+    );
+}
+
+/// Dropping a claimed gate is how a surface that goes away mid-review reports
+/// "no verdict": the tool must come back to plan mode rather than park forever.
+#[test]
+fn a_dropped_claim_leaves_the_gate_unanswered() {
+    let (gate, mut verdict) = PlanGate::open();
+    drop(gate.claim().expect("the gate is open"));
+    assert!(
+        verdict.try_recv().is_err(),
+        "no verdict was sent, and none can be now"
+    );
+    assert!(
+        !gate.answer(PlanVerdict::approve()),
+        "a claimed gate cannot be claimed again"
+    );
+}
+
+/// Every shared handle the agent hands out has a surface holding it.
+///
+/// These accessors exist for exactly one reason: a turn takes the `Agent` out
+/// of its slot, so anything a surface needs *during* a turn has to be a cloned
+/// `Arc` it took beforehand. An accessor of this kind with no caller is not
+/// harmless dead code — it is a feature that silently does not work at the one
+/// moment it was built for, and it reads as finished because the accessor,
+/// the registry and the tests around them are all present and green.
+///
+/// `task_registry` was exactly that. It shipped with the background-task
+/// registry and was never called: `App` took `subagent_registry` and not this
+/// one, so `/bashes` answered "unavailable while a turn is running" — during a
+/// turn, which is the only time a background task exists to list.
+///
+/// `background_gate` was the same failure taken all the way. The gate, its
+/// accessor and three doc comments describing a Ctrl-B that backgrounds the
+/// running command were all present and green; `request` had no caller and no
+/// tool ever read the gate, so the key did nothing and no document mentioned
+/// it. It is gone rather than wired, because nobody asked for the feature.
+///
+/// Grepping is the honest instrument, as it is for the console-ownership test
+/// in `trust.rs`: the failure is the *absence* of a call, and no runtime
+/// assertion can observe a call that nobody makes.
+#[test]
+fn every_shared_registry_handle_is_held_by_a_surface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    // Accessor -> the file that must take it before a turn starts.
+    let wiring = [
+        ("subagent_registry()", "app/runtime.rs"),
+        ("task_registry()", "app/runtime.rs"),
+    ];
+
+    for (accessor, expected) in wiring {
+        let mut callers: Vec<String> = Vec::new();
+        for path in rust_sources(&root) {
+            let rel = path
+                .strip_prefix(&root)
+                .expect("under src")
+                .display()
+                .to_string();
+            // The definition itself lives in agent/mod.rs; a mention there is
+            // the signature, not a call.
+            if rel == "agent/mod.rs" || rel.ends_with("tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read a source file");
+            if source.contains(accessor) {
+                callers.push(rel);
+            }
+        }
+        assert!(
+            callers.iter().any(|c| c == expected),
+            "`Agent::{accessor}` exists so a surface can use it while a turn holds the agent, \
+             and {expected} does not take it. Found in: {callers:?}"
+        );
+    }
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+    found
 }

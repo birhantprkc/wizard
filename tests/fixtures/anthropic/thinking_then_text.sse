@@ -1,0 +1,22 @@
+: Anthropic Messages API stream with extended thinking on: a thinking block
+: whose thinking_delta fragments must be flagged as reasoning rather than
+: answer text, followed by an ordinary text block at the next index.
+:
+: The distinction is load-bearing. Thinking is rendered dimmed and is never
+: fed back into history, so a provider renaming thinking_delta would silently
+: turn model reasoning into assistant output.
+:
+: Transcribed from anthropic::tests::decodes_thinking_deltas_as_thinking.
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Considering..."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer."}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

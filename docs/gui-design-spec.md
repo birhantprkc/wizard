@@ -1,8 +1,25 @@
 # Wizard GUI design spec
 
+*A design record, not a manual.* This is the brief the window was drawn from, kept because
+the code still cites it: `src/native/theme.rs`, `font.rs`, `widget/chrome.rs` and
+`widget/markdown.rs` name it as the place their chrome values are specified. For what
+`wizard gui` actually is and how to run it, read [`native-gui.md`](native-gui.md), which
+also links back here.
+
 A dark, three-pane agent workspace: chat list, conversation, git/goal rail. It began as a
 copy of a reference screenshot; what it is now is described below, and where the two
 disagree, this wins.
+
+**One renderer now, and the spec is older than it.** This described the browser GUI and the
+window (`wizard gui`, see [`native-gui.md`](native-gui.md)) alike; the browser GUI is deleted,
+so what is left is the window. Notes marked *(Native: …)* below are where the window differs
+from what the page did, kept because they are still the record of what this file asks for and
+what the window actually draws; the full list, with what is cut on purpose, is in
+[`native-gui.md`](native-gui.md). The two things the window does **not** take from here
+are the values it cannot: everything below that is a semantic colour comes from
+`crate::theme`'s token layer (the same one the TUI reads), so a palette change applies to the
+terminal and the window at once. What this file owns for the window is the chrome the
+token layer deliberately does not carry — canvas, surface, hairline — and the behaviour.
 
 The thing it should feel like is an instrument, not a product page. That means: dense but
 breathing, hairlines instead of boxes inside boxes, no colour that is not carrying meaning,
@@ -21,9 +38,9 @@ filler, because it is.
   errors), amber `#d8a13a` (a state needing attention, e.g. a provider with no key). If a
   pixel is coloured, it is saying something.
 - **Type is bundled, not hoped for**: Inter (UI) and JetBrains Mono (literals), variable-weight
-  latin subsets under the OFL, embedded in the binary and served from `/fonts/`. The system
-  fallback on a plain Linux box is DejaVu Sans, and it shows. Tabular figures throughout, so
-  ages, token counts and diffstats do not shift width as they tick.
+  latin subsets under the OFL, embedded in the binary from `assets/fonts/`. The system fallback on a plain Linux box is DejaVu
+  Sans, and it shows. Tabular figures throughout, so ages, token counts and diffstats do not
+  shift width as they tick.
 - **Sans for prose, mono for literals.** A path, model tag, provider kind, base URL, branch
   name, directory or config location is a thing you could paste into a terminal. It is set in
   mono. Everything else is Inter: 13px UI, 14px transcript body.
@@ -81,6 +98,15 @@ clickable and isn't is worse than no control.
   column), rounded with the corner nearest the composer clipped. What the *agent* says is not
   a bubble. It is long-form prose interleaved with tool rows, and boxing it would fight with
   them. The asymmetry is the point: one side is speech, the other is work.
+  *(Native: the asymmetry is there but expressed as an accent rule and an indent rather than
+  a right-aligned bubble — the selection layer's `Block` has no alignment field yet.)*
+- **The transcript is selectable, across everything in it.** A drag from a paragraph,
+  through a code block, into a tool row is one selection and copies as one. A DOM did this
+  for free; in the window it is a custom layer, and it is the single most expensive thing in
+  that surface. It is not a polish item: any transcript
+  element that is not text — an image, a collapsed row — is a hole in that drag, which is
+  why the native window renders images in the transcript as their paths and does not fold
+  rows. Clicking one opens it, drawn, in the pane.
 - `Worked for 3m 1s ⌄` collapsible section header (muted) with hairline rule.
 - Agent narration: plain paragraphs of body text.
 - Tool-call rows, inline with icons, muted single-line summaries:
@@ -92,6 +118,11 @@ clickable and isn't is worse than no control.
   - placeholder `Ask wizard to change something`
   - bottom row: `✦ Sovereign` mode chip (static; wizard has no permission gating, so there is
     no mode dropdown) · spacer · `GLM-5.2 ⌄` model picker · the send button (right).
+    *(Native: the model is stated rather than a dropdown; `/model <tag>` and Settings switch it.)*
+  - While a foreground command is waiting on an answer the composer binds to **its** stdin,
+    says so, and offers Ctrl-D. Only an in-process surface can do this: a page cannot hold a
+    live child's input across a socket that may drop, which is why the browser GUI never had
+    it. See `docs/interactive-commands.md`.
   - **The send button is the stop button.** Idle it is a light-on-dark `↑`; while the agent is
     working it becomes a square with a ring turning around it, and pressing it cancels the
     turn. One control, in the place your hand already is, and it doubles as the "something is
@@ -110,8 +141,8 @@ it, no grid of tiles, no tagline under anything.
 - **Onboarding** opens instead of a chat when no provider is configured. There is nothing to
   send a message to yet. Pick → one short form (model, API key, base URL where it matters) →
   save, probe, chat. "Skip" is available and honest about the consequence. Subscription
-  sign-in (`xai`, `chatgpt`) runs in the GUI via `POST /api/login/{provider}` (browser OAuth
-  with a loopback callback); the same flows also work from a terminal with
+  sign-in (`xai`, `chatgpt`) opens the provider's consent page in your browser and captures
+  the loopback callback (`src/gui/oauth.rs`); the same flows also work from a terminal with
   `wizard --login xai|chatgpt`. Once signed in, the provider simply appears in the list.
 - **Settings** (gear, sidebar header) manages the same providers afterwards: which is active,
   test, edit, remove, add, plus the GUI's step limit. Each row states where its key comes
@@ -141,17 +172,25 @@ with dead air beneath it.
 
 ## Behavior to wire (backend-dependent, confirm against survey)
 
-- Sidebar chats = wizard sessions on disk, grouped by workspace/repo, sorted by recency.
+Written as instructions because that is what it was: the list of what the surface had to be
+wired to, from before any of it existed. It is kept as written rather than rewritten in the
+past tense, because it is the record of what was asked for. What was built from it, what was
+cut, and what the window does instead is in [`native-gui.md`](native-gui.md).
+
+- Sidebar chats = wizard sessions on disk merged with the live heartbeat registry, grouped by
+  workspace/repo, each group sorted by recency and the groups ranked by their own newest chat.
+  One implementation, in `src/session_registry.rs`, shared by both surfaces.
 - New Chat: opens an empty session in the directory `wizard gui` runs in and focuses the
   composer; the first message starts the first turn and names the chat. On launch the GUI lands
   in the newest chat of that directory, or a new one when it has none.
 - Tool calls stream as structured rows (explore/run/write) rather than raw text where possible.
-- Composer sends follow-up user messages to the running session; the model picker reloads
-  `/api/models` each time it opens (providers change, local backends come up) and offers
-  "Manage providers…" when there is nothing to pick.
+- Composer sends follow-up user messages to the running session.
+  *(Native: there is no model picker; `/model <tag>` and the settings sheet switch it. The
+  page's dropdown reloaded a route that probed every configured provider on every open, and
+  that route went with the page — see [`native-gui.md`](native-gui.md).)*
 - Chats run on the user's own config: same mode, same `max_steps` (unlimited by default) as
-  the TUI, which Settings edits. The GUI is that agent on another surface, not a reduced one:
-  plan and interview gates ask over the WebSocket where the TUI asks at the prompt.
+  the TUI, which Settings edits. The window is that agent on another surface, not a reduced
+  one: plan and interview gates ask in a modal where the TUI asks at the prompt.
 - Git card: live diffstat of the task's workspace, current branch, per-file diffs. Committing
   is the agent's job, not a button's.
 - Goal/Progress: map to wizard's plan/todo state if available (plan.md / todo tool), else hide gracefully.

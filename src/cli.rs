@@ -8,6 +8,23 @@ use clap::Parser;
 
 use crate::config::Mode;
 
+/// `--max-hours` value parser: a time limit the rest of the program can
+/// actually turn into a `Duration`.
+///
+/// clap's default `f64` parser accepts `-1`, `nan` and `inf`, and every
+/// consumer of the flag ends up at `Duration::from_secs_f64`, which panics on
+/// all three. `wizard --max-hours -1 -p '…'` therefore died in the middle of a
+/// run instead of being refused at the command line, which is where a bad
+/// number belongs. Shared with `schedule.toml`, so the flag and the file agree
+/// on what a limit is.
+fn parse_max_hours(raw: &str) -> Result<f64, String> {
+    let hours: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number of hours"))?;
+    crate::schedule::max_hours_duration(hours).map_err(|err| err.to_string())?;
+    Ok(hours)
+}
+
 /// Wizard — your sovereign agent. Self-extending. Bring any model.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "wizard", version = crate::update::display_version(), about, long_about = None)]
@@ -48,7 +65,7 @@ pub struct Cli {
     pub omakase: bool,
 
     /// Time limit in hours for a sovereign-mode run.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_max_hours)]
     pub max_hours: Option<f64>,
 
     /// Max outer loop iterations for a sovereign-mode run.
@@ -175,7 +192,16 @@ pub enum Command {
     /// Diagnose the environment: config, providers, MCP servers, tools,
     /// hooks, writable state dirs, checkpoints. Exits 0 when no check
     /// failed.
-    Doctor,
+    Doctor {
+        /// Also write a redacted bug-report bundle under
+        /// ~/.wizard/bundles/doctor-<timestamp>/: the check report, the
+        /// allowlist-redacted config, the newest session transcript, the
+        /// usage and evolution logs, and the most recent debug logs. Secrets
+        /// are stripped, but the transcript is your own text: read the bundle
+        /// before you attach it to anything.
+        #[arg(long)]
+        bundle: bool,
+    },
 
     /// Manage scheduled runs (~/.wizard/schedule.toml): cron entries the
     /// `wizard scheduler` daemon fires as headless wizard runs.
@@ -186,9 +212,29 @@ pub enum Command {
 
     /// Run the scheduler daemon in the foreground: reload
     /// ~/.wizard/schedule.toml each pass and fire due entries as headless
-    /// wizard child processes. Daemonize externally (e.g. systemd); see
-    /// docs/scheduler.md.
-    Scheduler,
+    /// wizard child processes. With a subcommand, manage that daemon as a
+    /// background service instead (`wizard scheduler install`); see
+    /// docs/services.md.
+    Scheduler {
+        #[command(subcommand)]
+        cmd: Option<crate::platform::service::ServiceCmd>,
+    },
+
+    /// Set the messaging gateway up (`setup`), or manage it as a background
+    /// service (`install`, `start`, `stop`, `restart`, `status`, `logs`,
+    /// `uninstall`). The gateway itself still runs in the foreground as
+    /// `wizard --gateway`; the service verbs are how you keep it running
+    /// without a terminal.
+    ///
+    /// `install` captures the current directory as the gateway's project root
+    /// and the absolute path of this binary as ExecStart, and moves a bot
+    /// token that only exists in your shell into ~/.wizard/credentials.toml
+    /// (0600), never into the unit, which is world-readable. See
+    /// docs/services.md.
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
 
     /// Fleet mode: decompose a mission into independent tasks and run them
     /// as parallel headless workers, each in its own git worktree, then
@@ -226,43 +272,20 @@ pub enum Command {
     /// onboards or opens a TUI — stdin/stdout carry the JSON-RPC protocol.
     Acp,
 
-    /// Serve the browser GUI: a local web app (task sidebar, streaming
-    /// conversation, git panel) over the same agent core as the TUI. Binds
-    /// 127.0.0.1 only; agents are built lazily per task, so the server
-    /// starts fine without a reachable provider.
+    /// Open the GUI: an iced window (chat list, streaming conversation, git
+    /// rail) over the same agent core as the TUI. One process — no webview, no
+    /// HTTP, no port. Needs a build with `--features native`; chats are built
+    /// lazily, so it opens fine without a reachable provider.
+    /// See docs/native-gui.md.
     Gui {
-        /// Port to bind on 127.0.0.1. Fails when the port is taken.
-        #[arg(long, default_value_t = 4680)]
-        port: u16,
-
-        /// Do not open the browser after binding.
-        #[arg(long)]
-        no_open: bool,
-
-        /// Serve GUI assets from this directory instead of the embedded
-        /// copies (dev mode: edit gui/assets/ and reload).
-        #[arg(long, value_name = "DIR")]
-        assets: Option<PathBuf>,
-    },
-
-    /// Open the GUI as a native desktop app: the same local server as
-    /// `wizard gui`, on an OS-chosen loopback port, in a window driven by the
-    /// system webview (WebKitGTK / WKWebView — no bundled browser). Needs a
-    /// build with `--features desktop`; the plain binary says so and points at
-    /// `wizard gui`. See docs/desktop.md.
-    App {
-        /// Open the webview inspector alongside the window.
-        #[arg(long)]
-        devtools: bool,
-
-        /// Add Wizard to the launcher (Linux: ~/.local/share/applications;
-        /// macOS: ~/Applications/Wizard.app) and exit. Idempotent.
-        #[arg(long, conflicts_with = "uninstall")]
-        install: bool,
-
-        /// Remove the launcher entry written by --install and exit.
-        #[arg(long)]
-        uninstall: bool,
+        /// Accepted and ignored. `wizard gui --native` was how you asked for
+        /// the window back when a plain `wizard gui` served a browser page
+        /// instead; the page is gone, so the flag now names the only thing
+        /// there is. Kept — rather than removed — because it is written into
+        /// every existing alias, script and README that mentions the window,
+        /// and a hard clap error is a worse answer than doing what was meant.
+        #[arg(long, hide = true)]
+        native: bool,
     },
 
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
@@ -308,6 +331,278 @@ pub enum Command {
     Sync {
         #[command(subcommand)]
         cmd: SyncCmd,
+    },
+
+    /// Install skills and Lua tools from the Wizard registry: search the
+    /// published index, install an entry once its checksum verifies, and
+    /// bring installed entries up to the published version. Self-contained:
+    /// no config load, no onboarding, no LLM.
+    ///
+    /// Installs land beside the skills that ship inside the binary
+    /// (~/.wizard/skills/<name>/SKILL.md, ~/.wizard/tools/<name>.lua), each
+    /// with a receipt recording the author, version, checksum, source URL and
+    /// the standard library the entry was granted. See docs/market.md.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+
+    /// Resume a conversation. Bare, this is the subcommand spelling of
+    /// `wizard --resume`: reopen the most recent Wizard session recorded
+    /// against this project. With `--claude` it takes the conversation from
+    /// Claude Code instead, converting the chosen history into a Wizard
+    /// session and continuing it here.
+    ///
+    /// The Claude Code side is strictly read-only: ~/.claude is another
+    /// program's live state and nothing here writes a byte of it.
+    Resume {
+        /// Take the conversation from Claude Code (~/.claude/projects/)
+        /// rather than from Wizard's own sessions. With no other flag this
+        /// lists what Claude Code recorded for this directory and asks which
+        /// one to continue.
+        #[arg(long)]
+        claude: bool,
+
+        /// Take this Claude Code session instead of asking. Accepts the
+        /// session id `--claude --list` prints, or a unique prefix of one.
+        #[arg(long, value_name = "ID", requires = "claude")]
+        session: Option<String>,
+
+        /// Walk back from this line instead of the tip Claude Code would
+        /// resume from. A Claude Code transcript is a DAG, not a list: an
+        /// edited or rewound prompt appends a second child under the same
+        /// parent, so a session can hold several conversations and this picks
+        /// which one. `--claude --list` reports how many times a session
+        /// forked.
+        #[arg(long, value_name = "UUID", requires = "claude")]
+        leaf: Option<String>,
+
+        /// List the Claude Code sessions for this directory and exit without
+        /// converting anything.
+        #[arg(long, requires = "claude")]
+        list: bool,
+    },
+
+    /// Mesh peers: other machines running Wizard, what each one advertises,
+    /// and what this machine has decided about it. List the store, add a peer
+    /// by pasted address, record a trust decision, forget one — and reach a
+    /// peer over the network: ping it, refresh what it advertises, watch its
+    /// live session.
+    ///
+    /// `list` contacts nobody, so its presence column is what this machine
+    /// last observed rather than a live probe; `ping` is the command that
+    /// makes an observation. Reaching a peer needs a route for it here
+    /// (`[mesh.routes]`, or mDNS on the same LAN) and `[mesh] listen = true`
+    /// on that machine, which is off by default. Nothing here listens. See
+    /// docs/mesh.md.
+    Peers {
+        #[command(subcommand)]
+        cmd: PeersCmd,
+    },
+
+    /// Install and enable the OS dependencies the `computer` tool needs for
+    /// desktop control ("computer use"), then print what is left to do by
+    /// hand.
+    ///
+    /// On Linux this installs the X11/Wayland input and capture helpers; on
+    /// macOS nothing can be installed for you, so it reports which of
+    /// Accessibility and Screen Recording this binary still needs granted and
+    /// how to grant them. It touches no config and starts no agent.
+    /// See docs/computer-use.md.
+    DesktopSetup,
+}
+
+/// `wizard skills` subcommands. Self-contained like `sync`: they read the
+/// published index (cached under ~/.wizard/registry, so search keeps working
+/// offline) and write only under ~/.wizard/skills and ~/.wizard/tools.
+///
+/// Installing a tool is running its author's code, so the trust decision is
+/// part of this surface rather than a detail behind it.
+/// [`crate::registry_client::decide_trust`] refuses an entry that declares
+/// capabilities unless a human said yes to the exact author, version,
+/// checksum and capability list that
+/// [`crate::registry_client::grant_prompt`] prints, and the entry then runs
+/// under [`crate::tools::lua::Stdlib::Full`] rather than the sandbox.
+/// `--grant-full-stdlib` is that yes, given up front; it is spelled out
+/// rather than called `--yes` because a flag in somebody's shell history has
+/// to say what it accepted, and it still prints the grant so what was handed
+/// over is on the screen and not only in the flag.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum SkillsCmd {
+    /// Search the published index, best match first. Every term has to match
+    /// something (name, tag, author or description), so extra terms narrow
+    /// rather than widen. Works offline against the cached index.
+    Search {
+        /// Terms to match.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+
+        /// Only skills: markdown injected into the system prompt.
+        #[arg(long, conflicts_with = "tools")]
+        skills: bool,
+
+        /// Only tools: LuaJIT scripts the model can call.
+        #[arg(long)]
+        tools: bool,
+    },
+
+    /// Install one entry by name, after verifying its published checksum.
+    ///
+    /// Refuses rather than guessing when a name is published as both a skill
+    /// and a tool; say which with `--skills` or `--tools`. Refuses a name that
+    /// a built-in tool or bundled skill already has, and never overwrites
+    /// something you wrote yourself.
+    Install {
+        /// Entry name as published (`wizard skills search <name>` shows it).
+        name: String,
+
+        /// Resolve the name as a skill.
+        #[arg(long, conflicts_with = "tools")]
+        skills: bool,
+
+        /// Resolve the name as a tool.
+        #[arg(long)]
+        tools: bool,
+
+        /// Accept, before being asked, that this entry's author may run code
+        /// on this machine with your privileges under the full LuaJIT
+        /// standard library (os.execute, io.open, os.getenv). Only entries
+        /// whose manifest declares capabilities are affected; everything else
+        /// installs sandboxed either way. The grant is all or nothing and is
+        /// still printed in full.
+        #[arg(long)]
+        grant_full_stdlib: bool,
+    },
+
+    /// Bring registry installs up to the published version. A new version is
+    /// never taken silently when the name changed hands or when the install
+    /// holds a full-stdlib grant: those are reported and left alone. Exits
+    /// non-zero only when an update genuinely failed.
+    Update {
+        /// Only this entry. Default: everything installed from the registry.
+        name: Option<String>,
+
+        /// Re-grant the full LuaJIT standard library for entries that need
+        /// one, without being asked per entry. Same meaning, and same
+        /// consequences, as on `install`.
+        #[arg(long)]
+        grant_full_stdlib: bool,
+    },
+
+    /// List what is installed from the registry: author, version, and which
+    /// standard library each entry runs under. Read from the receipts beside
+    /// the installs themselves, so deleting an install deletes its record.
+    List,
+}
+
+/// `wizard peers` subcommands. Self-contained in the sense `sync` is: no
+/// config beyond `[mesh]`, no onboarding, no LLM. They read and write
+/// ~/.wizard/mesh/peers.json and ~/.wizard/node.key.
+///
+/// Five of them touch nothing else (`list`, `address`, `add`, `trust`,
+/// `forget`); three reach a peer over the network (`ping`, `refresh`,
+/// `watch`), which needs a route and a listening far end. **None of them
+/// listens**: this surface dials, so running `wizard peers` while a session
+/// holds `[mesh] listen` open does not fight it for the port.
+///
+/// The security posture is the module's ([`crate::mesh`]) and this surface
+/// does not soften it. A pasted address lands at [`crate::mesh::Trust::Known`],
+/// which may neither be sent work nor submit any; `accepts_work` is false
+/// until this machine says otherwise; trust is a three-state decision a human
+/// makes and nothing infers it from how a peer behaves; and a blocked peer is
+/// never contacted, which is why there is no command here that reaches out to
+/// one.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum PeersCmd {
+    /// List the peers on this machine with their trust state and presence.
+    /// Reads the local store only: presence is when this machine last
+    /// observed the peer, never a live probe, so a peer that went dark two
+    /// minutes ago reads as stale rather than as online.
+    List,
+
+    /// Print this machine's own mesh address and fingerprint, the text
+    /// another machine pastes into `wizard peers add`. Mints
+    /// ~/.wizard/node.key on first use.
+    Address,
+
+    /// Add a peer from a pasted address.
+    ///
+    /// Adding is not a decision: the peer lands at `known`, which is approved
+    /// for nothing. Re-adding a peer does not change what was decided about
+    /// it either, so pasting a blocked peer's address again does not unblock
+    /// it.
+    Add {
+        /// The peer's address (`wiz1...`), as printed by
+        /// `wizard peers address` on that machine.
+        address: String,
+    },
+
+    /// Record what this machine has decided about a peer.
+    ///
+    /// Moving away from `trusted` also drops anything live for that peer in
+    /// the same call, because a revocation that leaves a stream running has
+    /// revoked nothing.
+    Trust {
+        /// The peer: its full address, or a unique prefix of one. An
+        /// ambiguous prefix is refused rather than resolved to the first
+        /// match.
+        peer: String,
+
+        /// blocked (never contacted), known (approved for nothing), or
+        /// trusted (may exchange work, within its limits).
+        #[arg(value_enum)]
+        state: crate::mesh::Trust,
+    },
+
+    /// Drop a peer's record entirely.
+    ///
+    /// Not the same as blocking. A forgotten address pasted in again lands at
+    /// `known`, so forgetting a blocked peer discards the decision that was
+    /// keeping it out; use `trust <peer> blocked` when that is what you meant.
+    Forget {
+        /// The peer: its full address, or a unique prefix of one.
+        peer: String,
+    },
+
+    /// Ask a peer whether it is there, and how long the round trip took.
+    ///
+    /// The one command whose answer is a fact about *now* rather than about
+    /// the store. It needs a route (`[mesh.routes]`, or mDNS on the same
+    /// LAN) and a listener on the far end. A blocked peer is not contacted.
+    Ping {
+        /// The peer: its full address, or a unique prefix of one.
+        peer: String,
+    },
+
+    /// Fetch a peer's announcement and fold it into the local store.
+    ///
+    /// What fills in a peer's name and capability: a pasted address carries
+    /// neither, so until a peer is refreshed it renders as its own address.
+    /// The record is written to disk before this returns, and the peer is
+    /// marked seen at the moment it answered.
+    Refresh {
+        /// The peer: its full address, or a unique prefix of one.
+        peer: String,
+    },
+
+    /// Watch a trusted peer's live session stream.
+    ///
+    /// Read-only in both senses: this cannot drive the peer's session, and
+    /// nothing arriving on the stream drives this one. Trusted peers only,
+    /// on both machines — the far end decides separately whether this one may
+    /// watch it.
+    ///
+    /// Every line the peer wrote is marked with the peer's address, and every
+    /// line wizard wrote is marked `wizard`. Runs until the stream ends (the
+    /// peer revoked it, or the connection dropped) or Ctrl-C.
+    Watch {
+        /// The peer: its full address, or a unique prefix of one.
+        peer: String,
+
+        /// Stop after this many events instead of running until the stream
+        /// ends.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
 }
 
@@ -369,6 +664,30 @@ pub enum EvolveCmd {
         /// Entry number as shown by `wizard evolve list`.
         n: usize,
     },
+}
+
+/// `wizard gateway` subcommands: one gateway-specific verb plus the shared
+/// service verbs.
+///
+/// The service verbs are *flattened* rather than nested under a `service`
+/// word, so `wizard gateway install` keeps meaning exactly what it always
+/// meant — the spelling in every existing doc, unit and shell history — while
+/// `setup` sits beside it. Flattening is also what keeps `setup` off
+/// [`crate::platform::service::ServiceCmd`], which is defined once and
+/// answered by `wizard scheduler` too: a scheduler has no bot to talk to and
+/// no chat id to discover, so a `Setup` variant there would be a verb that
+/// exists only to be rejected.
+#[derive(Debug, Clone, Copy, clap::Subcommand)]
+pub enum GatewayCmd {
+    /// Guided first run: find or ask for a bot token, check it against
+    /// Telegram, discover your chat id by having you message the bot, and —
+    /// with your say-so — write that id into gateway.allowed_chat_ids.
+    /// Interactive: it needs a terminal and refuses without one.
+    Setup,
+    /// The shared service verbs (`install`, `start`, `stop`, `restart`,
+    /// `status`, `logs`, `uninstall`).
+    #[command(flatten)]
+    Service(crate::platform::service::ServiceCmd),
 }
 
 /// `wizard harness` subcommands. Self-contained: no config load,
@@ -436,7 +755,7 @@ pub enum ScheduleCmd {
         cwd: PathBuf,
 
         /// Wall-clock cap in hours for the spawned run.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_max_hours)]
         max_hours: Option<f64>,
 
         /// Run mode for the job: `sovereign` (default) or `continuous`.
@@ -553,6 +872,24 @@ mod tests {
         assert!(cli.gateway);
     }
 
+    /// A time limit that cannot become a `Duration` is refused at the command
+    /// line, not carried into the run.
+    ///
+    /// `--max-hours` had clap's stock `f64` parser, which happily produces
+    /// `-1`, `nan` and `inf`; every consumer then calls
+    /// `Duration::from_secs_f64`, which panics on all three. The failure
+    /// landed after the config was loaded and the agent was built, which is a
+    /// long way from the typo that caused it.
+    #[test]
+    fn an_impossible_max_hours_is_refused_by_the_parser() {
+        for bad in ["-1", "0", "nan", "inf", "-inf", "1e9", "not-a-number"] {
+            let arg = format!("--max-hours={bad}");
+            assert!(parse(&[arg.as_str()]).is_err(), "{arg} must be refused");
+        }
+        let cli = parse(&["--max-hours=1.5"]).expect("a real limit still parses");
+        assert_eq!(cli.max_hours, Some(1.5));
+    }
+
     #[test]
     fn long_prompt_flag_works() {
         let cli = parse(&["--prompt", "task"]).expect("long form parses");
@@ -600,7 +937,23 @@ mod tests {
     #[test]
     fn doctor_parses_as_a_subcommand() {
         let cli = parse(&["doctor"]).expect("doctor parses");
-        assert!(matches!(cli.command, Some(Command::Doctor)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor { bundle: false })
+        ));
+    }
+
+    #[test]
+    fn doctor_bundle_flag_parses() {
+        // The bundle entry point is advertised as `wizard doctor --bundle` in
+        // the module docs and the README; before this field existed clap
+        // rejected the flag with "unexpected argument" and the whole feature
+        // was unreachable from the CLI.
+        let cli = parse(&["doctor", "--bundle"]).expect("doctor --bundle parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor { bundle: true })
+        ));
     }
 
     #[test]
@@ -733,7 +1086,71 @@ mod tests {
     #[test]
     fn scheduler_parses_as_a_subcommand() {
         let cli = parse(&["scheduler"]).expect("scheduler parses");
-        assert!(matches!(cli.command, Some(Command::Scheduler)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Scheduler { cmd: None })
+        ));
+    }
+
+    /// A surface that can be managed as a service answers the same seven
+    /// verbs, because `ServiceCmd` is defined once in `platform::service`
+    /// rather than per surface. This pins that, and pins the one shape that
+    /// differs: `scheduler` still runs in the foreground with no subcommand,
+    /// where `gateway` alone is a usage error rather than a silent no-op.
+    ///
+    /// `gateway` reaches them through `GatewayCmd::Service`, flattened, so the
+    /// spellings below are the ones every existing doc and unit already uses:
+    /// adding `setup` beside them must not have turned `install` into
+    /// `service install`.
+    #[test]
+    fn a_managed_surface_answers_the_service_verbs() {
+        use crate::platform::service::ServiceCmd;
+
+        assert!(matches!(
+            parse(&["gateway", "install"]).expect("install").command,
+            Some(Command::Gateway {
+                cmd: GatewayCmd::Service(ServiceCmd::Install)
+            })
+        ));
+        assert!(matches!(
+            parse(&["gateway", "logs", "-f", "-n", "200"])
+                .expect("logs")
+                .command,
+            Some(Command::Gateway {
+                cmd: GatewayCmd::Service(ServiceCmd::Logs {
+                    follow: true,
+                    lines: 200
+                })
+            })
+        ));
+        assert!(matches!(
+            parse(&["scheduler", "status"]).expect("status").command,
+            Some(Command::Scheduler {
+                cmd: Some(ServiceCmd::Status)
+            })
+        ));
+        assert!(parse(&["gateway"]).is_err());
+    }
+
+    /// `setup` is the gateway's own verb: it parses under `gateway` and
+    /// nowhere else. The scheduler answering it would be a promise nothing
+    /// keeps — there is no scheduler token to check and no chat to discover —
+    /// which is why it lives on `GatewayCmd` rather than on the shared
+    /// `ServiceCmd`.
+    #[test]
+    fn gateway_setup_parses_and_the_scheduler_has_no_such_verb() {
+        assert!(matches!(
+            parse(&["gateway", "setup"]).expect("setup").command,
+            Some(Command::Gateway {
+                cmd: GatewayCmd::Setup
+            })
+        ));
+        // No arguments: everything it needs it asks for.
+        assert!(parse(&["gateway", "setup", "--token", "x"]).is_err());
+        assert!(
+            parse(&["scheduler", "setup"]).is_err(),
+            "the shared service verbs did not grow a gateway-only one"
+        );
     }
 
     #[test]
@@ -906,6 +1323,213 @@ mod tests {
                 cmd: EvolveCmd::Undo { n: 2 }
             })
         ));
+    }
+
+    #[test]
+    fn skills_subcommands_parse() {
+        let cli = parse(&["skills", "search", "todo", "list"]).expect("skills search parses");
+        let Some(Command::Skills {
+            cmd:
+                SkillsCmd::Search {
+                    query,
+                    skills,
+                    tools,
+                },
+        }) = cli.command
+        else {
+            panic!("expected skills search");
+        };
+        // Several bare words are one query, so `skills search todo list` does
+        // not need quoting to mean what it reads as.
+        assert_eq!(query, vec!["todo".to_string(), "list".to_string()]);
+        assert!(!skills);
+        assert!(!tools);
+
+        let cli = parse(&["skills", "install", "slugify"]).expect("skills install parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                cmd: SkillsCmd::Install {
+                    grant_full_stdlib: false,
+                    ..
+                }
+            })
+        ));
+
+        let cli = parse(&["skills", "update"]).expect("bare skills update parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                cmd: SkillsCmd::Update {
+                    name: None,
+                    grant_full_stdlib: false,
+                }
+            })
+        ));
+
+        let cli = parse(&["skills", "list"]).expect("skills list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                cmd: SkillsCmd::List
+            })
+        ));
+
+        let err = parse(&["skills"]).expect_err("bare skills requires a subcommand");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_full_stdlib_grant_is_spelled_out_and_is_never_the_default() {
+        // Installing a tool that declares capabilities runs a stranger's code
+        // with the user's privileges. The flag that accepts that has to say so
+        // where it is typed and where it is later read back out of a shell
+        // history, so there is deliberately no `-y` and no `--yes`.
+        let cli = parse(&["skills", "install", "slugify", "--grant-full-stdlib"])
+            .expect("the grant flag parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                cmd: SkillsCmd::Install {
+                    grant_full_stdlib: true,
+                    ..
+                }
+            })
+        ));
+        for bypass in ["-y", "--yes", "--force", "--trust"] {
+            parse(&["skills", "install", "slugify", bypass])
+                .expect_err(&format!("{bypass} must not be a way to skip the grant"));
+        }
+    }
+
+    #[test]
+    fn a_skills_query_may_not_be_both_kinds_at_once() {
+        // `None` means "look at both and refuse a name published as each"
+        // rather than "pick one", so asking for both kinds explicitly is a
+        // contradiction rather than a synonym for the default.
+        let err = parse(&["skills", "search", "todo", "--skills", "--tools"])
+            .expect_err("--skills --tools is a contradiction");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let err = parse(&["skills", "install", "todo", "--skills", "--tools"])
+            .expect_err("--skills --tools is a contradiction");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resume_parses_bare_and_with_claude() {
+        let cli = parse(&["resume"]).expect("bare resume parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Resume {
+                claude: false,
+                session: None,
+                leaf: None,
+                list: false,
+            })
+        ));
+
+        let cli = parse(&["resume", "--claude", "--list"]).expect("resume --claude --list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Resume {
+                claude: true,
+                list: true,
+                ..
+            })
+        ));
+
+        let cli = parse(&["resume", "--claude", "--session", "abc", "--leaf", "u-1"])
+            .expect("session and leaf parse");
+        let Some(Command::Resume { session, leaf, .. }) = cli.command else {
+            panic!("expected resume");
+        };
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(leaf.as_deref(), Some("u-1"));
+    }
+
+    #[test]
+    fn the_claude_only_flags_require_claude() {
+        // `--session` and `--leaf` name things that only exist in a Claude
+        // Code transcript. Accepting them without `--claude` would read as
+        // "resume this Wizard session", which is `/resume` and something else
+        // entirely.
+        for args in [
+            &["resume", "--session", "abc"][..],
+            &["resume", "--leaf", "u-1"],
+            &["resume", "--list"],
+        ] {
+            let err = parse(args).expect_err("must require --claude");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn peers_subcommands_parse() {
+        let cli = parse(&["peers", "list"]).expect("peers list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Peers {
+                cmd: PeersCmd::List
+            })
+        ));
+
+        let cli = parse(&["peers", "address"]).expect("peers address parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Peers {
+                cmd: PeersCmd::Address
+            })
+        ));
+
+        let cli = parse(&["peers", "add", "wiz1abc"]).expect("peers add parses");
+        let Some(Command::Peers {
+            cmd: PeersCmd::Add { address },
+        }) = cli.command
+        else {
+            panic!("expected peers add");
+        };
+        assert_eq!(address, "wiz1abc");
+
+        let cli = parse(&["peers", "forget", "wiz1abc"]).expect("peers forget parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Peers {
+                cmd: PeersCmd::Forget { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn peer_trust_takes_exactly_the_three_recorded_states() {
+        // The three states are the model's, not this surface's: a fourth
+        // spelling here would be a CLI that can express a decision the store
+        // cannot record.
+        for (raw, expected) in [
+            ("blocked", crate::mesh::Trust::Blocked),
+            ("known", crate::mesh::Trust::Known),
+            ("trusted", crate::mesh::Trust::Trusted),
+        ] {
+            let cli = parse(&["peers", "trust", "wiz1abc", raw]).expect("trust state parses");
+            let Some(Command::Peers {
+                cmd: PeersCmd::Trust { peer, state },
+            }) = cli.command
+            else {
+                panic!("expected peers trust");
+            };
+            assert_eq!(peer, "wiz1abc");
+            assert_eq!(state, expected);
+        }
+        let err = parse(&["peers", "trust", "wiz1abc", "allowed"])
+            .expect_err("a state the store cannot hold must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

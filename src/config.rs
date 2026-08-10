@@ -2,11 +2,12 @@
 //! well-known paths under `~/.wizard/` (see "Data on disk" in
 //! `docs/architecture.md`).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::Cli;
@@ -18,6 +19,17 @@ use crate::llm::openai::{OpenAiProvider, StaticToken};
 use crate::llm::openrouter;
 use crate::llm::provider::LlmProvider;
 use crate::llm::xai_oauth;
+// Every directory under `~/.wizard` is private state: session JSONLs carry
+// full tool output, `logs/` carries traces, `credentials.toml` carries API
+// keys. The mode used to be set only as a side effect of `crate::credentials`
+// writing a key, so an install that never stored one (a local-provider-only
+// setup) left the whole tree at the user's umask, world-readable on most
+// distros. `create_private_dir` creates it private instead, and tightens an
+// existing loose directory on the next load. The *how* (0700 on unix, an ACL
+// on Windows) and the deliberate warn-rather-than-fail policy for a filesystem
+// that cannot express it live in `platform::secrets`, next to the other half
+// of the same decision.
+use crate::platform::secrets::create_private_dir;
 
 /// Personality mode. Shares tools and model; differs in prompting,
 /// temperature, step budget, and confirmation behavior (`docs/modes.md`).
@@ -245,7 +257,10 @@ pub struct GatewayConfig {
     /// credentials.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
-    /// Allowed inbound chat IDs. Empty means "allow all".
+    /// Chat IDs allowed to drive the agent. The list is a closed allow-list:
+    /// empty means *nobody* is allowed, so an unconfigured gateway refuses
+    /// every message instead of handing a stranger an autonomous agent with
+    /// the unrestricted tool set. See [`crate::gateway::is_authorized`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_chat_ids: Vec<i64>,
 }
@@ -274,6 +289,22 @@ pub struct UiConfig {
     /// default; toggle live with `/vim`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vim: bool,
+    /// Which coding agent's terminal chrome the TUI wears: `wizard` (default),
+    /// `codex`, or `grok`. See [`crate::skin`], which owns the
+    /// glyphs, and `/ui` to change it live.
+    ///
+    /// A skin brings its own palette ([`crate::skin::Skin::companion_theme`]),
+    /// which is now the only thing that decides the colors. There was once a
+    /// separate `theme` key here, above a `WIZARD_THEME` environment variable,
+    /// so the two could be set independently; in practice it meant choosing a
+    /// skin left the colors of the old one in place for anybody who had ever
+    /// set it. Chrome and palette travel together.
+    ///
+    /// `Option` because every install that predates the key has no key, and an
+    /// absent key has to keep meaning "let `WIZARD_SKIN` decide" rather than
+    /// "the default, definitively".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin: Option<String>,
 }
 
 /// serde `skip_serializing_if` helper: keep `false` flags out of the written
@@ -375,6 +406,13 @@ impl Default for WebConfig {
 pub struct CheckpointConfig {
     /// Number of most recent turns whose snapshots are kept; older turns are
     /// garbage-collected at session start (default 50).
+    ///
+    /// `0` means **keep none** — every snapshot is dropped at session start and
+    /// `/rewind` has nothing to restore from. It does not mean "unlimited",
+    /// which is the way a reader is most likely to take a zero here, and
+    /// getting it wrong is silent: the setting takes effect at session start,
+    /// long before anybody wants to rewind. There is no unlimited; a large
+    /// number is how you say "effectively never collect".
     pub keep_turns: usize,
 }
 
@@ -457,6 +495,99 @@ impl Default for UpdateConfig {
             repo: default_update_repo(),
             interval_hours: default_update_interval_hours(),
         }
+    }
+}
+
+/// Default port for the mesh listener.
+///
+/// Only reached when `[mesh] listen` is turned on, and deliberately not a
+/// well-known one: 4242 is what the design this transport is modelled on uses,
+/// it is outside the registered range, and it is not something else's default.
+pub const DEFAULT_MESH_PORT: u16 = 4242;
+
+/// Default bind address for the mesh listener: every interface, on
+/// [`DEFAULT_MESH_PORT`].
+///
+/// Wide, and that is the honest default *for a listener somebody turned on*:
+/// a mesh peer is on another machine, so binding loopback would make the
+/// feature do nothing and the first thing anyone did would be to change it.
+/// The protection is that the listener does not exist unless
+/// [`MeshConfig::listen`] is set, not that it exists somewhere hard to reach.
+pub const DEFAULT_MESH_LISTEN_ADDR: &str = "0.0.0.0:4242";
+
+/// P2P mesh settings (`[mesh]` in `config.toml`); see `wizard peers` and
+/// docs/mesh.md.
+///
+/// # Every default here is off
+///
+/// `listen` and `mdns` both default to `false`, and that is the whole point of
+/// this struct existing rather than the transport picking its own defaults. A
+/// mesh that opened a socket on install would be a security surface nobody
+/// asked for, and an mDNS advertisement broadcasts this machine's name and
+/// public key to every device on the network. Wizard has shipped fail-open
+/// defaults before (the Telegram allowlist that defaulted to allow-all, project
+/// hooks that ran themselves on session start), which is why these two are
+/// written down and pinned by a test rather than assumed.
+///
+/// There is deliberately **no key here that offers this machine as compute**.
+/// `accepts_work` stays false because nothing sets it: delegated work is tier 3
+/// and is cut from this release, so a configuration key for it would be a
+/// switch with nothing behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshConfig {
+    /// Accept inbound mesh connections (default **false**).
+    ///
+    /// With this off the node can still dial peers it has routes for; what it
+    /// cannot do is be dialled. That asymmetry is the point: reaching out is a
+    /// thing this machine chose to do, and listening is a thing other machines
+    /// get to do to it.
+    pub listen: bool,
+    /// Where the listener binds when [`MeshConfig::listen`] is on
+    /// (default [`DEFAULT_MESH_LISTEN_ADDR`]). Ignored otherwise.
+    pub listen_addr: String,
+    /// Announce this node on the local network, and look for peers there
+    /// (default **false**). See [`crate::mesh::discovery`] for what mDNS does
+    /// and, more importantly, what it does not.
+    pub mdns: bool,
+    /// Where to find peers, as `mesh address -> host:port`.
+    ///
+    /// Routing, not identity, and it carries no authority whatever: a mesh
+    /// address is a public key and does not encode a location, so the location
+    /// has to be written down somewhere. A wrong or hostile entry here causes a
+    /// refused handshake, never a misdirected stream, because the identity is
+    /// checked against the certificate the far end presents and not against
+    /// anything in this map.
+    ///
+    /// Adding a route does **not** add a peer. `wizard peers add` does that,
+    /// and it is still a paste and a human decision.
+    pub routes: BTreeMap<String, String>,
+}
+
+impl Default for MeshConfig {
+    fn default() -> Self {
+        Self {
+            listen: false,
+            listen_addr: DEFAULT_MESH_LISTEN_ADDR.to_string(),
+            mdns: false,
+            routes: BTreeMap::new(),
+        }
+    }
+}
+
+impl MeshConfig {
+    /// The socket the listener binds to, parsed.
+    ///
+    /// An error rather than a fallback for a malformed value: silently binding
+    /// the default when somebody typed an address they meant is how a node ends
+    /// up listening somewhere its operator did not intend.
+    pub fn listen_socket(&self) -> Result<std::net::SocketAddr> {
+        self.listen_addr.parse().map_err(|_| {
+            anyhow!(
+                "[mesh] listen_addr = {:?} is not a `host:port` address (for example {DEFAULT_MESH_LISTEN_ADDR:?})",
+                self.listen_addr
+            )
+        })
     }
 }
 
@@ -543,8 +674,10 @@ impl Default for UltraConfig {
     }
 }
 
-/// A named LLM provider. Cloud keys are never stored here — only the name of
-/// the environment variable holding the key (`api_key_env`).
+/// A named LLM provider. Cloud keys are never stored here: the key itself
+/// lives in `~/.wizard/credentials.toml` (0600) under the provider's name, and
+/// this struct only records the name of the environment variable that
+/// overrides it (`api_key_env`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Unique id, e.g. `"local"`, `"openai"`, `"claude"`.
@@ -560,8 +693,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Model tag.
     pub model: String,
-    /// Name of the env var holding the API key (cloud only); the key itself is
-    /// never persisted.
+    /// Name of the env var that overrides the stored key (cloud only); the key
+    /// itself is never persisted here; see [`Self::resolved_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// Path to the GGUF model file (llamacpp only) — used when Wizard spawns
@@ -578,16 +711,43 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Resolve the API key: credential file (by provider name) first, then the
-    /// configured/default env var. Empty string when nothing is set.
+    /// Resolve the API key: the configured (or default) env var first, then
+    /// the key stored under this provider's name in
+    /// `~/.wizard/credentials.toml` (0600). Empty string when neither is set.
+    ///
+    /// The env var deliberately wins. Onboarding pastes the key straight into
+    /// the credential store, so the variable is the documented override for a
+    /// one-off run, a CI job, or a second key: exporting it must not be
+    /// silently ignored because something was stored months ago. Values are
+    /// trimmed so a key pasted with a trailing newline still works.
     fn resolved_key(&self, default_env: Option<&str>) -> String {
-        if let Some(key) = crate::credentials::get(&self.name)
-            && !key.is_empty()
-        {
-            return key;
-        }
+        self.resolved_key_from(
+            default_env,
+            |name| std::env::var(name).ok(),
+            crate::credentials::get,
+        )
+    }
+
+    /// Testable core of [`resolved_key`](Self::resolved_key): `lookup` supplies
+    /// the value of an environment variable and `stored` the key held under a
+    /// provider name in `credentials.toml`, both `None` when unset. Mirrors
+    /// [`Config::apply_env_from`], so the precedence can be asserted without
+    /// mutating the process environment from a test thread and without writing
+    /// the one `credentials.toml` this test binary shares.
+    fn resolved_key_from(
+        &self,
+        default_env: Option<&str>,
+        lookup: impl Fn(&str) -> Option<String>,
+        stored: impl Fn(&str) -> Option<String>,
+    ) -> String {
         let env = self.api_key_env.as_deref().or(default_env);
-        env.and_then(|name| std::env::var(name).ok())
+        if let Some(key) = env.and_then(lookup)
+            && !key.trim().is_empty()
+        {
+            return key.trim().to_string();
+        }
+        stored(&self.name)
+            .map(|key| key.trim().to_string())
             .unwrap_or_default()
     }
 
@@ -742,6 +902,24 @@ pub struct Config {
     /// error, restore that cycle's file checkpoints before moving on (the
     /// rollback is noted in `mission.toml`). Default false.
     pub rollback_failed_cycles: bool,
+    /// Continuous mode: how many cycles in a row may end badly — a hard error
+    /// or a tripped circuit breaker — before the perpetual run gives up.
+    ///
+    /// A perpetual run is supposed to outlive its own mistakes. One malformed
+    /// tool call, one unreadable file, one provider that blinked is not a
+    /// reason to end a mission that was asked to run forever; the loop rolls
+    /// the cycle back, tells the next cycle what went wrong, backs off, and
+    /// tries again. What that alone cannot survive is a setup that is broken
+    /// rather than unlucky — no disk space, a model that cannot emit a tool
+    /// call this schema will accept — where retrying is an infinite loop that
+    /// burns tokens and never lands. This is the line between the two: the
+    /// streak is *consecutive*, so any cycle that finishes resets it to zero
+    /// and only a genuinely stuck agent ever reaches the limit.
+    ///
+    /// `0` disables the bound entirely — the run then only ever ends on
+    /// `.wizard/loop-control`, `--max-hours`, or a signal. It does not mean
+    /// "give up immediately".
+    pub max_consecutive_failures: u32,
     /// Base seconds for exponential backoff when the LLM server is unreachable
     /// or rate-limited.
     pub retry_base_secs: u64,
@@ -783,6 +961,10 @@ pub struct Config {
     /// Cross-machine sync settings (`wizard sync`).
     #[serde(default)]
     pub sync: SyncConfig,
+    /// P2P mesh settings (`wizard peers`). Every default is off; see
+    /// [`MeshConfig`].
+    #[serde(default)]
+    pub mesh: MeshConfig,
     /// Model-fusion settings (`/fusion`). Absent until configured; the toggle
     /// falls back to a default panel derived from `providers` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,6 +1000,7 @@ impl Default for Config {
             omakase: false,
             plan_each_cycle: false,
             rollback_failed_cycles: false,
+            max_consecutive_failures: 5,
             retry_base_secs: 5,
             retry_max_secs: 300,
             cycle_pause_secs: 0,
@@ -831,6 +1014,7 @@ impl Default for Config {
             fleet: FleetConfig::default(),
             update: UpdateConfig::default(),
             sync: SyncConfig::default(),
+            mesh: MeshConfig::default(),
             fusion: None,
             ultra: None,
         }
@@ -993,7 +1177,7 @@ impl Config {
             Self::logs_dir()?,
             Self::wizard_dir()?.join("running"),
         ] {
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            create_private_dir(&dir)?;
         }
         Ok(())
     }
@@ -1243,15 +1427,20 @@ impl Config {
 
     /// Persist config to `~/.wizard/config.toml`, creating the directory if
     /// needed.
+    ///
+    /// Through the scratch-file-and-rename primitive, not `fs::write`, which
+    /// truncates the target and then fills it. That window is short but this
+    /// runs constantly — `/settings`, `/mode`, `/vim`, every provider change,
+    /// every onboarding step — and what it truncates is the file wizard needs
+    /// to start. A crash, a full disk or a `kill -9` inside it left a
+    /// config.toml that does not parse, and the next launch refused to run
+    /// until the user found and deleted it by hand. A rename is atomic, so a
+    /// reader sees the whole old file or the whole new one.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let raw = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(&path, raw).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        crate::platform::secrets::write_atomic(&path, raw.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     /// Apply CLI flag overrides on top of file/env config for this run.
@@ -1269,8 +1458,15 @@ impl Config {
             self.plan_first = true;
         }
         if cli.omakase {
-            // Omakase is a flavor of plan mode; it implies plan_first.
             self.omakase = true;
+        }
+        // Omakase is a flavor of plan mode, so it implies `plan_first` — and it
+        // implies it however it was asked for. Doing this after the flag rather
+        // than inside it makes `omakase = true` in config.toml, with no
+        // `--omakase` and no `--plan`, mean the same thing as the flag: every
+        // surface that starts a session in plan mode from `plan_first` starts
+        // this one in plan mode too.
+        if self.omakase {
             self.plan_first = true;
         }
         self.max_steps = self.max_steps.for_mode(self.mode);
@@ -1322,6 +1518,7 @@ mod tests {
         assert_eq!(config.cycle_pause_secs, 0);
         assert_eq!(config.compact_threshold_bytes, 48_000);
         assert!(!config.rollback_failed_cycles);
+        assert_eq!(config.max_consecutive_failures, 5);
         assert_eq!(config.checkpoints.keep_turns, 50);
         assert_eq!(config.fleet.max_minutes, 30);
         assert!(config.fleet.synthesize);
@@ -1333,6 +1530,17 @@ mod tests {
         assert_eq!(config.checkpoints.keep_turns, 7);
         let config: Config = toml::from_str("rollback_failed_cycles = true").expect("valid toml");
         assert!(config.rollback_failed_cycles);
+    }
+
+    /// A config written before the knob existed must keep the documented
+    /// default rather than deserializing to `0`, which the loop reads as "no
+    /// bound at all" — the exact opposite of the safe reading.
+    #[test]
+    fn max_consecutive_failures_defaults_when_absent_and_zero_is_explicit() {
+        let config: Config = toml::from_str("continuous = true").expect("valid toml");
+        assert_eq!(config.max_consecutive_failures, 5);
+        let config: Config = toml::from_str("max_consecutive_failures = 0").expect("valid toml");
+        assert_eq!(config.max_consecutive_failures, 0);
     }
 
     #[test]
@@ -1398,6 +1606,50 @@ mod tests {
     }
 
     #[test]
+    fn the_mesh_listener_and_mdns_are_both_off_by_default() {
+        // The one thing about `[mesh]` that must not drift. A mesh that opened
+        // a socket on install would be a security surface nobody asked for,
+        // and an mDNS advertisement broadcasts this machine's public key to
+        // every device on the network. Both are opt-in, and this is the test
+        // that says so.
+        let mesh = MeshConfig::default();
+        assert!(!mesh.listen, "the mesh listener is off until somebody asks");
+        assert!(!mesh.mdns, "and so is announcing this machine on the LAN");
+        assert!(mesh.routes.is_empty());
+        assert_eq!(mesh.listen_addr, DEFAULT_MESH_LISTEN_ADDR);
+        assert_eq!(Config::default().mesh, mesh);
+
+        // A config file that says nothing about the mesh reads back as off,
+        // rather than as whatever a missing field happens to deserialize to.
+        let quiet: Config = toml::from_str("model = \"qwen3.6:27b\"").expect("parse");
+        assert!(!quiet.mesh.listen);
+        assert!(!quiet.mesh.mdns);
+        // And a `[mesh]` section that sets something *else* still leaves the
+        // listener off: this is the fail-open shape the module keeps warning
+        // about, where a field added later defaults to the permissive side.
+        let partial: Config = toml::from_str("[mesh]\nmdns = true\n").expect("parse");
+        assert!(partial.mesh.mdns);
+        assert!(!partial.mesh.listen);
+    }
+
+    #[test]
+    fn a_malformed_listen_address_is_an_error_rather_than_a_silent_fallback() {
+        // Binding the default when somebody typed an address they meant is how
+        // a node ends up listening somewhere its operator did not intend.
+        let mesh = MeshConfig::default();
+        assert_eq!(
+            mesh.listen_socket().expect("the default parses").port(),
+            DEFAULT_MESH_PORT
+        );
+        let broken = MeshConfig {
+            listen_addr: "0.0.0.0".to_string(),
+            ..MeshConfig::default()
+        };
+        let err = broken.listen_socket().expect_err("no port");
+        assert!(format!("{err:#}").contains("host:port"), "{err:#}");
+    }
+
+    #[test]
     fn full_file_round_trips() {
         let original = Config {
             model: "llama3.3:70b".to_string(),
@@ -1412,6 +1664,7 @@ mod tests {
             omakase: true,
             plan_each_cycle: true,
             rollback_failed_cycles: true,
+            max_consecutive_failures: 9,
             retry_base_secs: 10,
             retry_max_secs: 600,
             cycle_pause_secs: 30,
@@ -1435,6 +1688,7 @@ mod tests {
             ui: UiConfig {
                 spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
                 vim: true,
+                skin: Some("codex".to_string()),
             },
             web: WebConfig {
                 fetch_max_bytes: 250_000,
@@ -1455,6 +1709,15 @@ mod tests {
             },
             sync: SyncConfig {
                 source: Some("https://example.com/wizard-sync.tar.gz".to_string()),
+            },
+            mesh: MeshConfig {
+                listen: true,
+                listen_addr: "127.0.0.1:4300".to_string(),
+                mdns: true,
+                routes: BTreeMap::from([(
+                    "wiz1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    "10.0.0.9:4242".to_string(),
+                )]),
             },
             fusion: Some(FusionConfig {
                 panel: vec!["openai".to_string()],
@@ -1505,6 +1768,10 @@ mod tests {
         assert_eq!(
             parsed.rollback_failed_cycles,
             original.rollback_failed_cycles
+        );
+        assert_eq!(
+            parsed.max_consecutive_failures,
+            original.max_consecutive_failures
         );
         assert_eq!(parsed.checkpoints, original.checkpoints);
         assert_eq!(parsed.fleet, original.fleet);
@@ -1627,6 +1894,116 @@ mod tests {
         let parsed: Config = toml::from_str(&raw).expect("parse back");
         assert_eq!(parsed.gateway.kind, GatewayKind::Telegram);
         assert_eq!(parsed.gateway.allowed_chat_ids, vec![7]);
+    }
+
+    /// Adversarial: onboarding now pastes the key instead of naming an env
+    /// var, so the stored key must be what the provider actually reads back,
+    /// and must still lose to an exported variable (the documented override).
+    ///
+    /// Both sources are injected rather than real. Under `cfg(test)`,
+    /// [`Config::wizard_dir`] is one directory for the whole process, so
+    /// `credentials.toml` is a single file that several other tests in this
+    /// binary (`gui::settings`, `app`) write concurrently
+    /// through `credentials::store`, which is a read-modify-write. A test that
+    /// stored a key there and read it back could lose its entry to an
+    /// interleaved writer and fail for reasons that have nothing to do with
+    /// precedence. The on-disk half of the contract is covered where it
+    /// belongs and without sharing: the `store_get_remove_round_trip` and
+    /// `stored_file_is_0600` tests in `crate::credentials` both run against a
+    /// tempdir of their own.
+    #[test]
+    fn the_env_var_wins_over_a_stored_provider_key() {
+        let provider = ProviderConfig {
+            name: "test-key-precedence".to_string(),
+            kind: ProviderKind::Openai,
+            base_url: "https://example.invalid/v1".to_string(),
+            model: "m".to_string(),
+            api_key_env: Some("WIZARD_TEST_KEY_PRECEDENCE".to_string()),
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+        };
+        // Stand-ins for the process environment and for credentials.toml:
+        // this test neither depends on nor disturbs either.
+        fn env_is(value: &'static str) -> impl Fn(&str) -> Option<String> {
+            move |name: &str| (name == "WIZARD_TEST_KEY_PRECEDENCE").then(|| value.to_string())
+        }
+        fn stored_is(value: &'static str) -> impl Fn(&str) -> Option<String> {
+            move |name: &str| (name == "test-key-precedence").then(|| value.to_string())
+        }
+        let nothing = |_: &str| None;
+
+        // Neither stored nor exported: no key at all. This is the state
+        // onboarding used to leave behind, and it 401s on the first turn.
+        assert_eq!(provider.resolved_key_from(None, nothing, nothing), "");
+
+        // Paste-and-store, exactly as onboarding does: with no variable
+        // exported, the stored key is what goes out.
+        assert_eq!(
+            provider.resolved_key_from(None, nothing, stored_is("sk-pasted\n")),
+            "sk-pasted",
+            "a key pasted with a trailing newline still works"
+        );
+
+        // The env var overrides the stored key, trailing newline and all
+        // (`export KEY=$(cat file)`).
+        assert_eq!(
+            provider.resolved_key_from(None, env_is("sk-exported\n"), stored_is("sk-pasted")),
+            "sk-exported"
+        );
+        // …but an empty or blank export is not an override.
+        assert_eq!(
+            provider.resolved_key_from(None, env_is("   "), stored_is("sk-pasted")),
+            "sk-pasted",
+            "a blank env var must not blank out the stored key"
+        );
+        // A different provider's stored key is not this provider's key.
+        assert_eq!(
+            provider.resolved_key_from(None, nothing, |name: &str| (name == "someone-else")
+                .then(|| "sk-theirs".to_string())),
+            ""
+        );
+        // A provider with no `api_key_env` still honors the backend default.
+        let defaulted = ProviderConfig {
+            api_key_env: None,
+            ..provider.clone()
+        };
+        assert_eq!(
+            defaulted.resolved_key_from(
+                Some("WIZARD_TEST_KEY_PRECEDENCE"),
+                env_is("sk-default"),
+                nothing
+            ),
+            "sk-default"
+        );
+    }
+
+    /// `~/.wizard` holds session JSONLs (full tool output), logs and
+    /// credentials. Every directory `ensure_dirs` creates must be private the
+    /// moment it exists, not only once some credential writer happens to
+    /// tighten it.
+    ///
+    /// The mode itself, and the fact that a pre-existing loose directory is
+    /// tightened rather than left alone, belong to
+    /// [`crate::platform::secrets`] and are asserted there (exactly 0700, plus
+    /// the exFAT/CIFS case where the chmod cannot work at all). What config
+    /// owns, and what this covers, is the *set* of directories: a new one
+    /// added to `ensure_dirs` and not created privately is the regression.
+    #[test]
+    fn state_dirs_are_created_private() {
+        Config::ensure_dirs().expect("ensure_dirs");
+        for dir in [
+            Config::wizard_dir().expect("wizard dir"),
+            Config::sessions_dir().expect("sessions dir"),
+            Config::logs_dir().expect("logs dir"),
+            Config::wizard_dir().expect("wizard dir").join("running"),
+        ] {
+            assert!(
+                crate::platform::secrets::is_protected(&dir).expect("stat"),
+                "{} must not be readable by other users",
+                dir.display()
+            );
+        }
     }
 
     #[test]

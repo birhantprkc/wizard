@@ -1,0 +1,51 @@
+version: 2
+
+updates:
+  # Cargo. 560+ transitive packages behind a binary that stores API keys and
+  # OAuth refresh tokens, and nothing was watching them: `cargo deny check
+  # advisories` in CI tells you a dependency is vulnerable, this is what opens
+  # the PR that fixes it.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # One PR per week carrying every compatible patch/minor bump, instead of
+    # twenty. Security updates stay out of the group so they arrive on their
+    # own and can be reviewed and merged without waiting on the batch.
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+    # Majors are opt-in. Every one of these is a breaking change in a crate the
+    # agent loop or the TUI is built on (ratatui/crossterm are version-locked
+    # to each other, mlua vendors LuaJIT, reqwest carries the rustls choice),
+    # so they get taken deliberately, not on a schedule.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+
+  # The workflows pin actions by major tag (`actions/checkout@v6`), so a
+  # compromised or abandoned action would sit here indefinitely without this.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies

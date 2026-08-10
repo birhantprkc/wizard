@@ -13,12 +13,6 @@
       flake-utils,
     }:
     let
-      # The fusion-core git dependency from Cargo.lock. buildRustPackage's
-      # cargoLock vendors crates.io crates by their lock hashes, but a git
-      # dependency needs its fixed-output hash supplied explicitly, keyed by
-      # "<name>-<version>".
-      fusionCoreHash = "sha256-zzXJTpv4JOLt7ubP4gRZn23VHPrrW1bjeF4AH1FLJUA=";
-
       mkWizard =
         pkgs:
         let
@@ -39,11 +33,13 @@
 
           src = ./.;
 
+          # Every dependency is a crates.io dependency (Cargo.toml says why), so
+          # buildRustPackage vendors the whole tree from the lock's own hashes.
+          # No `outputHashes` here: that attribute exists only for git
+          # dependencies, whose fixed-output hashes have to be supplied by hand
+          # and then drift from the lock every time the pinned revision moves.
           cargoLock = {
             lockFile = ./Cargo.lock;
-            outputHashes = {
-              "fusion-core-0.1.0" = fusionCoreHash;
-            };
           };
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -66,7 +62,17 @@
           meta = {
             description = cargoToml.package.description;
             homepage = cargoToml.package.repository;
-            license = lib.licenses.mit;
+            # Both, because Cargo.toml's expression is `MIT AND Apache-2.0`.
+            # The Apache half is the terminal-UI code ported from OpenAI Codex
+            # and xAI grok-build: NOTICE names every file it landed in, and
+            # LICENSE-APACHE ships beside LICENSE so a `nix build` result
+            # carries the text section 4(a) requires. Dropping either entry here
+            # would make a package whose `meta.license` says less than the crate
+            # it built.
+            license = with lib.licenses; [
+              mit
+              asl20
+            ];
             mainProgram = "wizard";
           };
         };
@@ -78,6 +84,26 @@
           inherit system;
           overlays = [ self.overlays.default ];
         };
+
+        # The windowing libraries the native GUI `dlopen`s at run time, on the
+        # platform that has them.
+        #
+        # Linux-only, because they are Linux-only: nixpkgs marks `wayland` and
+        # the Xorg client libraries as unavailable for darwin, and winit on
+        # macOS goes through AppKit and never looks for them. Listing them
+        # unconditionally made `nix develop` and `nix flake check` fail outright
+        # on macOS with "refusing to evaluate package 'wayland' … not available
+        # on the requested hostPlatform" — a broken dev shell on one of the two
+        # platforms this project supports, from an attribute that does nothing
+        # there.
+        guiLibs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+          pkgs.libxkbcommon
+          pkgs.wayland
+          pkgs.libx11
+          pkgs.libxcursor
+          pkgs.libxi
+          pkgs.libxrandr
+        ];
       in
       {
         packages = {
@@ -101,16 +127,22 @@
             pkgs.llama-cpp
           ];
 
-          # The desktop shell (`cargo build --features desktop`, `wizard app`)
-          # links the system webview through wry. The default package below does
-          # not — the feature is off by default precisely so the plain binary
-          # keeps its two-library dependency set — so WebKitGTK is a dev-shell
-          # input only, and this is where a NixOS user gets it from.
+          # The native GUI (`cargo build --features native`,
+          # `wizard gui`) needs nothing at *build* time: `tiny-skia`
+          # means no wgpu, and winit reaches X11 and Wayland through `dlopen`
+          # rather than linking them, so there is no `-dev` package to find.
+          #
+          # `dlopen` is exactly why they have to be here anyway. On NixOS there
+          # is no /usr/lib for the loader to fall back to, so a window opened
+          # from this shell finds libX11 and libwayland-client only if
+          # LD_LIBRARY_PATH names their store paths. The default package below
+          # is unaffected: it builds with default features and links no iced,
+          # which is the whole point of the feature flag. See `guiLibs` above
+          # for why the list is empty on macOS.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [
-            pkgs.webkitgtk_4_1
-            pkgs.gtk3
-          ];
+          buildInputs = guiLibs;
+
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibs;
 
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
@@ -121,7 +153,19 @@
         wizard = mkWizard final;
       };
 
-      homeManagerModules.default =
+      # `homeModules` is the preferred name: `homeManagerModules` is not a
+      # flake output Nix knows, so `nix flake check` reported it as unknown and
+      # checked nothing inside it. Home Manager reads both, and this is the
+      # name it settled on.
+      #
+      # The old name is kept as an alias rather than dropped, because it is
+      # what every existing `inputs.wizard.homeManagerModules.default` import
+      # names, and removing it turns an update into an evaluation error in
+      # someone else's config. Nix still warns that it does not recognize the
+      # attribute; that warning is the cost of not breaking those imports.
+      homeManagerModules.default = self.homeModules.default;
+
+      homeModules.default =
         {
           config,
           lib,

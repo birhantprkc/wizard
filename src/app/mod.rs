@@ -6,18 +6,24 @@ mod command;
 mod paste;
 mod picker;
 mod prompts;
+mod recover;
 mod runtime;
 mod session;
+mod tee;
 mod term;
 #[cfg(test)]
 mod tests;
 mod transcript;
 
 pub use picker::{Picker, PickerItem, PickerKind, Selection, StatusLine, Suggestion};
-pub use prompts::{Interview, PlanReview, ProviderPrompt};
+pub use prompts::{Console, Interview, PlanReview, ProviderPrompt};
 pub use runtime::run_tui;
+pub use tee::MeshTee;
 pub use term::restore_terminal_best_effort;
-pub use transcript::{PaneStatus, SubagentPane, TranscriptEntry};
+pub use transcript::{
+    LOCAL_MARKER, PaneStatus, PeerOrigin, PeerStream, SubagentPane, TranscriptOrigin,
+    TranscriptView,
+};
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -30,7 +36,7 @@ use crossterm::event::{
 };
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentEvent, DoneReason, ImageSource, PlanVerdict, ultra};
+use crate::agent::{Agent, AgentEvent, DoneReason, PlanVerdict, ultra};
 // The built-in command table and its parser live in [`crate::commands`].
 use crate::commands::CustomCommand;
 use crate::commands::{COMMANDS, ProviderAction, SlashCommand, UltraAction};
@@ -39,9 +45,11 @@ use crate::event::Event;
 use crate::image_view::ImageCache;
 use crate::import_claude::{self, ImportSelection};
 use crate::session_registry::{self, SessionRecord, SessionState};
+use crate::theme;
 use crate::tools::todo::TodoItem;
 use crate::vim::{self, Pending, VimMode, VimOp, VimState};
 
+use crate::transcript::{ToolItemOutput, TranscriptItem};
 use paste::{
     clipboard_image_bytes, looks_like_image_path_token, parse_data_image_url,
     resolve_pasted_image_path, save_image_bytes, save_pasted_image_bytes, sniff_image_ext,
@@ -51,9 +59,7 @@ use prompts::{
     PROVIDER_ADD_ROW, PROVIDER_TYPES, PromptField, ULTRA_JUDGE_ROW, WEB_BACKENDS, prompt_question,
     web_backend_label, web_backend_needs_key, xai_oauth_session_present,
 };
-use transcript::{
-    PANE_LINGER, collapse_long, fill_open_card, image_entries, replayed_refs, scroll_step,
-};
+use transcript::PANE_LINGER;
 
 /// How many user prompts may sit behind a running turn. Beyond this the next
 /// Enter is refused with a notice rather than growing without bound.
@@ -93,6 +99,25 @@ impl std::fmt::Debug for AgentRebuild {
     }
 }
 
+/// The git diff sidebar's contents while it is open (`/diff`).
+#[derive(Debug, Default)]
+pub struct DiffPane {
+    /// The rendered diff, cached so the sidebar does not shell out per frame.
+    pub text: String,
+    /// First visible line, clamped to the content height by the renderer.
+    pub scroll: u16,
+}
+
+/// Where ↑/↓ recall has got to in [`App::history`], and what it displaced.
+#[derive(Debug)]
+struct HistoryBrowse {
+    /// Index into `history` of the entry currently in the composer.
+    position: usize,
+    /// The in-progress input saved when browsing started, restored by ↓ past
+    /// the newest entry.
+    draft: String,
+}
+
 /// What the input line is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -111,7 +136,6 @@ pub enum InputMode {
 #[derive(Debug)]
 pub struct App {
     pub config: Config,
-    pub mode: Mode,
     pub input: String,
     /// Cursor position in `input`, in characters.
     pub cursor: usize,
@@ -119,25 +143,20 @@ pub struct App {
     /// Modal (vim-style) editing state for the composer. Inert (always
     /// insert-like) unless `vim.enabled`.
     pub vim: VimState,
-    pub transcript: Vec<TranscriptEntry>,
-    /// Partial assistant text of the in-flight turn (moved into the
-    /// transcript when the turn ends).
-    pub streaming: String,
-    /// Partial model reasoning of the in-flight turn, rendered dimmed and
-    /// flushed to the transcript alongside `streaming`.
-    pub streaming_thinking: String,
+    /// The conversation, its uncommitted streaming tail, this screen's fold
+    /// flags and its scroll position. One [`crate::transcript::TranscriptModel`]
+    /// and no copy of it: see [`transcript`].
+    pub transcript: TranscriptView,
     pub status: StatusLine,
     /// Latched once the user submits anything — a slash command dispatches
     /// without adding transcript entries, so `has_conversation` alone would
     /// leave the welcome screen up after it.
     pub welcome_dismissed: bool,
-    /// Git diff sidebar visibility and cached contents.
-    pub show_diff: bool,
-    pub diff_text: String,
-    /// Scroll offset (in lines, from the top) into the diff sidebar. Held
-    /// here so PgUp/PgDn can page a diff that's taller than the pane; the
-    /// renderer clamps it to the content height.
-    pub diff_scroll: u16,
+    /// The git diff sidebar while it is open: its cached contents and the
+    /// scroll offset (in lines, from the top) that lets PgUp/PgDn page a diff
+    /// taller than the pane. `None` is the sidebar being closed — there is no
+    /// separate visibility flag to disagree with the contents.
+    pub diff: Option<DiffPane>,
     /// Compact todo band above the composer (toggled by `/todos`;
     /// auto-shown on the first todo update of the session). Reserves layout
     /// rows so it never covers transcript text.
@@ -156,6 +175,10 @@ pub struct App {
     /// Background-subagent registry, so the rail can kill a detached run even
     /// while a turn holds the agent. `None` until the agent is built.
     pub subagents: Option<Arc<crate::tools::subagent_tasks::SubagentTaskRegistry>>,
+    /// Background-shell-task registry, for the same reason and by the same
+    /// route: `/bashes` has to answer while a turn holds the agent, which is
+    /// the only time somebody asks it. `None` until the agent is built.
+    pub tasks: Option<Arc<crate::tools::tasks::TaskRegistry>>,
     /// Selected rail row while the rail has keyboard focus (↓ from the
     /// composer). `None` means the composer has focus and the rail is just
     /// on display. Indexes [`App::panes`].
@@ -182,18 +205,6 @@ pub struct App {
     /// Recent transcript of the selected session (role, text), shown in the
     /// dashboard's peek panel; refreshed as the selection moves.
     pub peek_lines: Vec<(String, String)>,
-    /// First visible line of the main transcript, measured from the top of the
-    /// rendered content. Only consulted while [`Self::scroll_follow`] is false;
-    /// when following, the live tail is always in view.
-    pub scroll: u16,
-    /// When true the transcript sticks to the bottom as new output streams in.
-    /// Scrolling up (wheel, PgUp) clears it so the viewport stays put; scrolling
-    /// back down to the bottom, Esc, or Ctrl-End restores follow.
-    pub scroll_follow: bool,
-    /// Last-drawn max scroll for the main transcript (content lines past the
-    /// viewport). Written by [`crate::ui::draw`] so key handlers can turn a
-    /// follow-tail view into a stable top-anchored offset without re-wrapping.
-    pub transcript_max_scroll: std::cell::Cell<u16>,
     /// Active or just-completed mouse text selection, if any. Drives the
     /// highlight overlay and clipboard copy.
     pub selection: Option<Selection>,
@@ -217,6 +228,19 @@ pub struct App {
     pub suggestions: Vec<Suggestion>,
     /// Highlighted row in `suggestions`.
     pub suggestion_index: usize,
+    /// Whether any key has reached [`App::handle_key`] this session. Read by
+    /// [`App::notice`] to tell a reply to the user from a startup message.
+    key_pressed: bool,
+    /// The composer text the popup was dismissed at, if Escape dismissed it.
+    ///
+    /// Dismissal has to be state rather than an empty list, because
+    /// [`Self::sync_input_mode`] runs after *every* key and rebuilds the
+    /// suggestions from the input — so clearing the list on Escape was undone
+    /// before the next frame, and Escape appeared to do nothing at all.
+    /// Holding the text it was dismissed at means the popup stays shut until
+    /// the draft actually changes, which is what dismissing a completion menu
+    /// means everywhere else.
+    dismissed_suggestions_for: Option<String>,
     /// Custom commands loaded from `~/.wizard/commands/` and
     /// `<project>/.wizard/commands/` (set by `run_tui`, refreshed by
     /// `/reload`).
@@ -262,12 +286,20 @@ pub struct App {
     /// Open interview modal (the turn is paused inside the `interview` tool
     /// until the user answers or dismisses), if any.
     pub interview: Option<Interview>,
+    /// The running foreground command this composer is typing into, if any.
+    ///
+    /// Unlike `plan_review` and `interview` this is not a modal: the turn is
+    /// not paused, the transcript keeps moving, and the user can walk away from
+    /// it with Esc. What it changes is where Enter goes — see [`Console`] and
+    /// [`App::submit_console`].
+    pub console: Option<Console>,
     /// Previously submitted inputs, oldest first (↑/↓ recall).
     pub history: Vec<String>,
-    /// Position while browsing `history`; `None` when composing fresh input.
-    history_pos: Option<usize>,
-    /// The in-progress input saved when history browsing starts.
-    history_draft: String,
+    /// Where in `history` the composer is, and the draft it displaced, while
+    /// the user is browsing it. `None` when composing fresh input — one field,
+    /// because a saved draft with no position (or the reverse) is not a state
+    /// the recall can be in.
+    history_browse: Option<HistoryBrowse>,
     /// When the in-flight turn started (drives the elapsed-time display).
     pub turn_started: Option<Instant>,
     /// Label of an in-progress background agent rebuild (model switch,
@@ -330,10 +362,30 @@ pub struct App {
     /// only on the first message. Cleared once a turn completes successfully —
     /// the provider has proven itself, so a transient blip self-heals.
     pub provider_health_error: Option<String>,
+    /// This session's tee onto the mesh, when this node is listening.
+    ///
+    /// `None` for a default install, and `None` is the shipped default: a peer
+    /// watches this node by dialling it, so with `[mesh] listen` off nobody can
+    /// subscribe and a tee would be a socket bound for a stream nobody can
+    /// open. See [`MeshTee`], which is also where the one call to
+    /// [`crate::mesh::Mesh::publish_turn`] lives.
+    pub mesh: Option<MeshTee>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        // Install the active skin and theme before anything can draw. Both
+        // resolve config > environment > default, and `[ui] skin` / `[ui]
+        // theme` are the config half of each; passing them here is what makes
+        // the documented precedence real.
+        //
+        // Skin first, because it is the theme's last resort: a skin names a
+        // companion palette (`claude` chrome wants Claude Code's terracotta),
+        // and that name is only consulted when the user has chosen no theme at
+        // all. Resolving the theme first would leave every skin looking like
+        // `minimal` on a fresh install.
+        let skin_warning = crate::skin::init(config.ui.skin.as_deref());
+        let theme_warning = theme::init(crate::skin::active().companion_theme());
         let mode = config.mode;
         // Omakase implies plan mode (the read-only exploration phase).
         let omakase = config.omakase;
@@ -357,27 +409,23 @@ impl App {
             background_tasks: 0,
             background_subagents: 0,
         };
-        Self {
+        let mut app = Self {
             config,
-            mode,
             input: String::new(),
             cursor: 0,
             input_mode: InputMode::default(),
             vim,
-            transcript: Vec::new(),
-            streaming: String::new(),
-            streaming_thinking: String::new(),
+            transcript: TranscriptView::new(),
             status,
             welcome_dismissed: false,
-            show_diff: false,
-            diff_text: String::new(),
-            diff_scroll: 0,
+            diff: None,
             show_todos: false,
             todos: Vec::new(),
             todos_seen: false,
             show_dashboard: false,
             panes: Vec::new(),
             subagents: None,
+            tasks: None,
             rail_focus: None,
             attached: None,
             session_id: String::new(),
@@ -388,9 +436,6 @@ impl App {
             dashboard_selected: 0,
             dashboard_input: String::new(),
             peek_lines: Vec::new(),
-            scroll: 0,
-            scroll_follow: true,
-            transcript_max_scroll: std::cell::Cell::new(0),
             selection: None,
             card_hits: std::cell::RefCell::new(Vec::new()),
             images: std::cell::RefCell::new(ImageCache::fallback()),
@@ -398,6 +443,8 @@ impl App {
             tick: 0,
             suggestions: Vec::new(),
             suggestion_index: 0,
+            key_pressed: false,
+            dismissed_suggestions_for: None,
             custom_commands: Vec::new(),
             project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             picker: None,
@@ -410,9 +457,9 @@ impl App {
             ultra: None,
             plan_review: None,
             interview: None,
+            console: None,
             history: Vec::new(),
-            history_pos: None,
-            history_draft: String::new(),
+            history_browse: None,
             turn_started: None,
             rebuilding: None,
             spinner_verb,
@@ -429,7 +476,17 @@ impl App {
             message_queue: VecDeque::new(),
             mcp_connecting: false,
             provider_health_error: None,
+            // Joined by `run_tui` once the session has an id to stamp events
+            // with, and only when `[mesh] listen` says a peer could watch.
+            mesh: None,
+        };
+        // A skin or theme that would not load is worth saying out loud (the
+        // user asked for it); the defaults are already installed, so the
+        // session continues either way.
+        for warning in [skin_warning, theme_warning].into_iter().flatten() {
+            app.notice(warning);
         }
+        app
     }
 
     /// True while the home screen should remain up: the conversation hasn't
@@ -439,7 +496,14 @@ impl App {
     pub fn has_conversation(&self) -> bool {
         self.transcript
             .iter()
-            .any(|entry| !matches!(entry, TranscriptEntry::Notice(_)))
+            .any(|item| !matches!(item, TranscriptItem::Notice(_)))
+    }
+
+    /// The agent's autonomy setting. Derived, not stored: `/mode` writes it
+    /// through to the config, so a second copy on `App` could only ever be a
+    /// chance to disagree with the file the next reload reads.
+    pub fn mode(&self) -> Mode {
+        self.config.mode
     }
 
     /// True while the welcome screen should render: the conversation hasn't
@@ -448,7 +512,7 @@ impl App {
     pub fn welcome_visible(&self) -> bool {
         !self.has_conversation()
             && !self.welcome_dismissed
-            && self.streaming.is_empty()
+            && self.transcript.streaming() == ("", "")
             && !self.status.busy
     }
 
@@ -462,8 +526,25 @@ impl App {
 
     /// Append a system notice to the transcript.
     pub fn notice(&mut self, message: impl Into<String>) {
-        self.transcript
-            .push(TranscriptEntry::Notice(message.into()));
+        // A notice raised after the user has touched the keyboard is an answer
+        // to something they did, so it has to be visible — which means getting
+        // out from behind the welcome screen.
+        //
+        // `has_conversation` filters notices out on purpose, so that a startup
+        // notice (a hook that appended context, an MCP server that did not
+        // connect) does not replace the splash on a session nobody has used
+        // yet. That is right for those, and wrong for these: Ctrl-V on a fresh
+        // session printed "no image on the clipboard to attach" into a
+        // transcript nobody could see, and — worse — the first Ctrl-C's
+        // "press Ctrl-C again to exit" was invisible too, so a fresh session
+        // gave no warning at all before the second press quit it.
+        //
+        // Keyed on whether a key has been pressed, which is exactly the
+        // difference between the two cases.
+        if self.key_pressed {
+            self.welcome_dismissed = true;
+        }
+        self.transcript.notice(message.into());
     }
 
     /// The settings menu rows, in display order: `(action id, label, current
@@ -487,7 +568,7 @@ impl App {
             .unwrap_or_else(|_| "~/.wizard/config.toml".to_string());
         vec![
             ("model", "Model".to_string(), self.config.active().model),
-            ("mode", "Mode".to_string(), self.mode.to_string()),
+            ("mode", "Mode".to_string(), self.mode().to_string()),
             (
                 "plan_first",
                 "Plan mode at startup".to_string(),
@@ -512,6 +593,11 @@ impl App {
                 "vim",
                 "Vim mode (modal input)".to_string(),
                 on(self.config.ui.vim),
+            ),
+            (
+                "skin",
+                "Interface".to_string(),
+                crate::skin::active().label().to_string(),
             ),
             (
                 "web_backend",
@@ -603,6 +689,29 @@ impl App {
             }
             "web_backend" => {
                 self.open_web_backend_picker();
+                return None;
+            }
+            // Cycles rather than opening a picker of four: the change is
+            // visible the instant it lands, and the menu is still on screen to
+            // show it, so cycling *is* the preview.
+            "skin" => {
+                let active = crate::skin::active();
+                let next = crate::skin::Skin::ALL[(crate::skin::Skin::ALL
+                    .iter()
+                    .position(|s| *s == active)
+                    .unwrap_or(0)
+                    + 1)
+                    % crate::skin::Skin::ALL.len()];
+                let notice = command::ui_command(self, Some(next.key()));
+                // `ui_command` has already persisted and re-resolved the
+                // palette; anything it has to say is worth saying.
+                if notice.starts_with("error:") || notice.contains("could not save") {
+                    self.notice(notice);
+                }
+                self.open_settings_picker();
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = selected.min(picker.items.len().saturating_sub(1));
+                }
                 return None;
             }
             "web_allow_local" => self.config.web.allow_local = !self.config.web.allow_local,
@@ -760,89 +869,77 @@ impl App {
         });
     }
 
-    /// Rebuild the transcript view from a session's persisted messages, so a
-    /// resumed conversation reads back the way it was left. Mirrors the live
-    /// event handling: assistant text and tool calls become cards, tool
-    /// results fill the matching open card. System messages are dropped.
-    fn load_transcript(&mut self, messages: Vec<crate::llm::ChatMessage>) {
-        use crate::llm::Role;
-        self.transcript.clear();
-        // A tool's images ride back to the model on a user message the agent
-        // wrote for it (`Agent::run_tool`), so a user message full of images
-        // right after a tool answered is that tool's images — not something a
-        // person said. Same reading as the GUI's replay
-        // ([`crate::gui::transcript`]), so both surfaces rebuild the same
-        // conversation.
-        let mut just_answered: Option<String> = None;
-        for message in messages {
-            match message.role {
-                Role::System => {}
-                Role::User => {
-                    if let Some(tool) = just_answered.take()
-                        && !message.images.is_empty()
-                    {
-                        let source = ImageSource::Tool(tool);
-                        self.transcript
-                            .extend(image_entries(&source, replayed_refs(&message.images)));
-                        continue;
-                    }
-                    if !message.content.trim().is_empty() {
-                        self.transcript.push(TranscriptEntry::User(message.content));
-                    }
-                }
-                Role::Assistant => {
-                    just_answered = None;
-                    if !message.content.trim().is_empty() {
-                        self.transcript
-                            .push(TranscriptEntry::Assistant(message.content));
-                    }
-                    self.transcript.extend(image_entries(
-                        &ImageSource::Assistant,
-                        replayed_refs(&message.images),
-                    ));
-                    for call in message.tool_calls {
-                        self.transcript.push(TranscriptEntry::ToolCard {
-                            name: call.function.name,
-                            args: call.function.arguments,
-                            output: None,
-                            is_error: false,
-                            collapsed: true,
-                        });
-                    }
-                }
-                Role::Tool => {
-                    let name = message.tool_name.unwrap_or_default();
-                    just_answered = Some(name.clone());
-                    // Fill the most recent open card for this tool, as a live
-                    // ToolFinished would.
-                    let card = self
-                        .transcript
-                        .iter_mut()
-                        .rev()
-                        .find_map(|entry| match entry {
-                            TranscriptEntry::ToolCard {
-                                name: card_name,
-                                output: slot @ None,
-                                ..
-                            } if *card_name == name => Some(slot),
-                            _ => None,
-                        });
-                    match card {
-                        Some(slot) => *slot = Some(message.content),
-                        None => self.transcript.push(TranscriptEntry::ToolCard {
-                            name,
-                            args: Value::Null,
-                            output: Some(message.content),
-                            is_error: false,
-                            collapsed: true,
-                        }),
-                    }
-                }
-            }
+    /// `/resume-claude`: the conversations Claude Code recorded for this
+    /// directory, as the same picker `/resume` opens.
+    ///
+    /// Rows come from [`session_registry::claude_chats`], which is what the
+    /// window's sidebar reads, so the two surfaces cannot list different
+    /// sessions. Claude Code files its history under a slug of the working
+    /// directory, so an empty list here usually means Claude Code was run
+    /// somewhere else rather than never run — the notice says so, because
+    /// "no sessions" on its own sends people looking for a bug.
+    ///
+    /// Nothing is imported yet: selecting a row is what does that, in
+    /// [`AppCommand::resume_claude`](crate::app::command::AppCommand). The
+    /// branch-point count is on the row because it is why a conversation can
+    /// come back shorter than the file it came from.
+    pub fn open_resume_claude_picker(&mut self) {
+        let cwd = self.project_root.display().to_string();
+        let rows = session_registry::claude_chats(&cwd);
+        if rows.is_empty() {
+            self.notice(format!(
+                "Claude Code has no sessions recorded for {cwd}. It files them under a slug of \
+                 the working directory, so this is also what you get when it was run elsewhere."
+            ));
+            return;
         }
-        self.streaming.clear();
-        self.streaming_thinking.clear();
-        self.scroll_to_bottom();
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let items: Vec<PickerItem> = rows
+            .into_iter()
+            .map(|row| {
+                let ago = session_registry::relative_age(row.updated_unix, now);
+                let branches = match &row.origin {
+                    session_registry::Origin::Claude { branch_points, .. } => *branch_points,
+                    // Not reachable: `claude_chats` only produces Claude rows.
+                    // Reported as unbranched rather than panicking on a row
+                    // this picker did not build.
+                    session_registry::Origin::Wizard => 0,
+                };
+                let detail = match branches {
+                    0 => format!("{} · {ago}", row.title),
+                    1 => format!("{} · {ago} · 1 branch point", row.title),
+                    n => format!("{} · {ago} · {n} branch points", row.title),
+                };
+                PickerItem {
+                    detail,
+                    current: false,
+                    value: row.id,
+                }
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::ResumeClaude,
+            // Says what Enter *does*, because it is not what the other picker's
+            // Enter does: this one copies a conversation out of another
+            // program rather than reopening one of Wizard's own.
+            title: " continue from claude code · enter imports a copy · esc close ".to_string(),
+            items,
+            selected: 0,
+        });
+    }
+
+    /// Rebuild the transcript view from a session's persisted messages, so a
+    /// resumed conversation reads back the way it was left.
+    ///
+    /// What the messages *mean* is [`crate::transcript`]'s reading, the same
+    /// one the GUI's replay and a live turn use; all this does is project it
+    /// into the rows the TUI draws ([`transcript::replayed_entries`]). The
+    /// three-way drift that used to live here is the reason that module
+    /// exists: this surface dropped system notes the GUI showed, and reported
+    /// every failed tool call as a success because the session file does not
+    /// record the failure flag.
+    fn load_transcript(&mut self, entries: &[crate::agent::session::SessionEntry]) {
+        self.transcript.replay(entries);
     }
 
     /// Open the provider picker (level 1): the configured providers (Enter
@@ -1121,12 +1218,11 @@ impl App {
             return "idle".to_string();
         }
         // The newest in-flight tool call reads best; fall back to the verb.
-        for entry in self.transcript.iter().rev() {
-            if let TranscriptEntry::ToolCard {
-                name, output: None, ..
-            } = entry
+        for item in self.transcript.iter().rev() {
+            if let TranscriptItem::Tool(tool) = item
+                && tool.output.is_none()
             {
-                return name.clone();
+                return tool.name.clone();
             }
         }
         format!("{}…", self.spinner_verb)
@@ -1147,16 +1243,28 @@ impl App {
     /// user is currently watching that pane, in which case they have already
     /// seen it. Scroll position is left alone: a following pane stays pinned
     /// by its follow flag, a scrolled-up pane keeps its top-anchored offset.
-    fn push_pane(&mut self, run: u64, entry: TranscriptEntry) {
+    fn pane_write(&mut self, run: u64, unread: bool, write: impl FnOnce(&mut TranscriptView)) {
         let Some(index) = self.pane_index(run) else {
             return;
         };
         let attached = self.attached == Some(index);
         let pane = &mut self.panes[index];
-        pane.transcript.push(entry);
-        if !attached {
+        write(&mut pane.transcript);
+        if unread && !attached {
             pane.unread += 1;
         }
+    }
+
+    /// Fold a subagent run's event into that run's own transcript, as the
+    /// plain conversation event it is.
+    ///
+    /// The `SubagentRun*` events are the same four things a main turn emits
+    /// (a message, a tool call, its result, images) with a run id bolted on so
+    /// concurrent runs do not interleave. Translating them back rather than
+    /// folding them by hand is what keeps a pane's rendering identical to the
+    /// main chat's: there is one reducer, not two.
+    fn pane_event(&mut self, run: u64, event: AgentEvent) {
+        self.pane_write(run, true, |view| view.apply(&event));
     }
 
     /// The pane the user is inside, if any.
@@ -1164,7 +1272,12 @@ impl App {
         self.attached.and_then(|index| self.panes.get(index))
     }
 
-    /// Number of runs still going — the count shown on the rail header.
+    /// Number of runs still going.
+    ///
+    /// Not "the count shown on the rail header", which is what this claimed:
+    /// there is no rail header — `draw_rail` paints rows and nothing else, and
+    /// the status bar's running count comes from `status.background_subagents`,
+    /// which the event handler keeps by hand. Nothing calls this.
     pub fn running_panes(&self) -> usize {
         self.panes
             .iter()
@@ -1212,8 +1325,7 @@ impl App {
             return;
         };
         pane.unread = 0;
-        pane.scroll = 0;
-        pane.scroll_follow = true;
+        pane.transcript.scroll_to_bottom();
         self.attached = Some(index);
         self.rail_focus = Some(index);
     }
@@ -1252,33 +1364,23 @@ impl App {
 
     /// Scroll the pane at `index` by `delta` lines, per [`scroll_step`].
     fn scroll_pane(&mut self, index: usize, delta: i16) {
-        let Some(pane) = self.panes.get_mut(index) else {
-            return;
-        };
-        let max = pane.max_scroll.get();
-        (pane.scroll, pane.scroll_follow) =
-            scroll_step(pane.scroll_follow, pane.scroll, max, delta);
+        if let Some(pane) = self.panes.get_mut(index) {
+            pane.transcript.scroll_by(delta);
+        }
     }
 
     /// Jump a pane (or the main transcript when no pane is attached) to the
     /// live tail and re-enable stick-to-bottom.
     fn scroll_to_bottom(&mut self) {
-        if let Some(index) = self.attached {
-            if let Some(pane) = self.panes.get_mut(index) {
-                pane.scroll = 0;
-                pane.scroll_follow = true;
-            }
-            return;
+        match self.attached.and_then(|index| self.panes.get_mut(index)) {
+            Some(pane) => pane.transcript.scroll_to_bottom(),
+            None => self.transcript.scroll_to_bottom(),
         }
-        self.scroll = 0;
-        self.scroll_follow = true;
     }
 
     /// Scroll the main transcript by `delta` lines, per [`scroll_step`].
     fn scroll_transcript(&mut self, delta: i16) {
-        let max = self.transcript_max_scroll.get();
-        (self.scroll, self.scroll_follow) =
-            scroll_step(self.scroll_follow, self.scroll, max, delta);
+        self.transcript.scroll_by(delta);
     }
 
     /// Close out every pane still marked running, because the turn that owned
@@ -1301,9 +1403,38 @@ impl App {
             }
             pane.status = PaneStatus::Failed;
             pane.finished = Some(now);
-            pane.transcript
-                .push(TranscriptEntry::Notice(format!("failed: {why}")));
+            pane.transcript.notice(format!("failed: {why}"));
         }
+    }
+
+    /// Put the UI back to an idle, usable state after a turn ended without
+    /// ever saying so.
+    ///
+    /// The ordinary end of a turn is [`AgentEvent::Done`], and everything the
+    /// spinner, the rail and the composer need to know is folded out of it.
+    /// Two paths never produce one: a turn task aborted after the cooperative
+    /// interrupt ran out of patience, and a turn task that died where nothing
+    /// was watching. Each of those leaves a different piece of the surface
+    /// lying: the status bar spins over a turn that has ended, the rail keeps
+    /// a pulsing row for every subagent that was in flight (`/ultra` leaves
+    /// several), and the composer keeps typing into the stdin of a command
+    /// whose console is gone — which is what makes Enter appear to do nothing
+    /// at all.
+    ///
+    /// `why` is what the abandoned subagent panes say about themselves, so it
+    /// should name the event from the user's side ("interrupted"), not the
+    /// mechanism.
+    ///
+    /// Deliberately *not* touching [`App::message_queue`]: whether prompts
+    /// typed behind the turn should survive depends on why the turn ended, and
+    /// only the caller knows that.
+    pub(super) fn end_turn_abruptly(&mut self, why: &str) {
+        self.transcript.commit();
+        self.fail_running_panes(why);
+        self.close_stale_console();
+        self.status.busy = false;
+        self.status.step = 0;
+        self.turn_started = None;
     }
 
     /// Drop finished runs off the rail once they have been resting long enough
@@ -1353,26 +1484,17 @@ impl App {
     /// placeholder. The card is the durable record of the run once its pane
     /// retires off the rail.
     fn record_subagent_report(&mut self, name: &str, task: &str, report: &str, is_error: bool) {
-        let card = self.transcript.iter_mut().rev().find(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::ToolCard { name: card, args, .. }
-                    if card == "spawn_subagent"
-                        && args.get("subagent").and_then(|v| v.as_str()) == Some(name)
-                        && args.get("task").and_then(|v| v.as_str()) == Some(task)
-            )
-        });
-        if let Some(TranscriptEntry::ToolCard {
-            output,
-            is_error: card_error,
-            collapsed,
-            ..
-        }) = card
-        {
-            *output = Some(report.to_string());
-            *card_error = is_error;
-            *collapsed = true;
-        }
+        self.transcript.amend_tool(
+            |tool| {
+                tool.name == "spawn_subagent"
+                    && tool.args.get("subagent").and_then(Value::as_str) == Some(name)
+                    && tool.args.get("task").and_then(Value::as_str) == Some(task)
+            },
+            ToolItemOutput {
+                content: report.to_string(),
+                is_error,
+            },
+        );
     }
 
     /// Kill the selected run. Only background runs can be killed — a
@@ -1399,8 +1521,7 @@ impl App {
             if let Some(pane) = self.panes.get_mut(index) {
                 pane.status = PaneStatus::Failed;
                 pane.finished = Some(Instant::now());
-                pane.transcript
-                    .push(TranscriptEntry::Notice("killed on request".to_string()));
+                pane.transcript.notice("killed on request".to_string());
             }
             self.notice(format!("killed subagent '{name}' (#{bg})"));
         } else {
@@ -1415,7 +1536,7 @@ impl App {
             name: self.session_name.clone(),
             cwd: self.project_root.display().to_string(),
             model: self.status.model.clone(),
-            mode: self.mode.to_string(),
+            mode: self.mode().to_string(),
             state: self.session_state(),
             activity: self.session_activity(),
             pid: std::process::id(),
@@ -1529,11 +1650,28 @@ impl App {
         if self.prompt.is_some() || self.web_key_backend.is_some() {
             return;
         }
+        // A console owns the composer the same way: what is typed goes to a
+        // child process verbatim, so `/usr/local` must not open a command
+        // popup that Enter would then be read as completing.
+        if self.console.is_some() {
+            self.input_mode = InputMode::Chat;
+            self.suggestions.clear();
+            self.suggestion_index = 0;
+            return;
+        }
         self.input_mode = if self.input.trim_start().starts_with('/') {
             InputMode::Command
         } else {
             InputMode::Chat
         };
+        // Dismissed, and the draft has not moved on: stay shut. Any edit clears
+        // the dismissal, so typing another character reopens the popup.
+        if self.dismissed_suggestions_for.as_deref() == Some(self.input.as_str()) {
+            self.suggestions.clear();
+            self.suggestion_index = 0;
+            return;
+        }
+        self.dismissed_suggestions_for = None;
         self.refresh_suggestions();
     }
 
@@ -1609,6 +1747,32 @@ impl App {
         self.char_byte(self.cursor)
     }
 
+    /// Character indices of the start and end of the line the caret is on.
+    ///
+    /// The composer is a real multi-line editor — Alt+Enter inserts a hard
+    /// break — so "the line" and "the buffer" are different things, and the
+    /// readline chords below mean the line. They used to mean the buffer, which
+    /// on a three-line draft made Ctrl-K delete two lines the caret was not on
+    /// and Ctrl-U delete every line above it. Nothing restores that: vim's undo
+    /// does not cover readline chords, and vim is off by default.
+    ///
+    /// The end is the index of the newline (or the buffer end), so it is where
+    /// `$`-style "end of line" should put the caret.
+    fn line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = chars[..self.cursor.min(chars.len())]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|at| at + 1)
+            .unwrap_or(0);
+        let end = chars[self.cursor.min(chars.len())..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|at| self.cursor.min(chars.len()) + at)
+            .unwrap_or(chars.len());
+        (start, end)
+    }
+
     /// Byte offset of character index `n` in `input` (its end when out of
     /// range).
     fn char_byte(&self, n: usize) -> usize {
@@ -1622,13 +1786,19 @@ impl App {
     fn set_input(&mut self, text: String) {
         self.cursor = text.chars().count();
         self.input = text;
+        // History recall goes through here, and in Normal mode a caret one past
+        // the last character is not a place vim ever leaves you: the block sat
+        // in the empty cell after the text and the first `x` deleted nothing,
+        // moving the block instead. Vim lands *on* a character after a recall,
+        // and the first `x` deletes it.
+        self.clamp_normal_cursor();
         self.sync_input_mode();
     }
 
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
-        self.history_pos = None;
+        self.history_browse = None;
         // Staged attachments belong to the composer's contents; emptying it
         // drops them too, so a cancelled draft never carries a ghost image
         // into the next submit.
@@ -1646,7 +1816,7 @@ impl App {
                 text.pop();
             }
         }
-        self.history_pos = None;
+        self.history_browse = None;
         self.set_input(text);
     }
 
@@ -1953,7 +2123,9 @@ impl App {
             // linewise form when the operator key repeats (`dd`/`cc`/`yy`).
             if let Some(Pending::Operator(op)) = self.vim.pending {
                 self.vim.pending = None;
-                let n = self.vim.count.take().unwrap_or(1);
+                // Vim multiplies the operator's count by the motion's.
+                let n = self.vim.operator_count.take().unwrap_or(1)
+                    * self.vim.count.take().unwrap_or(1);
                 let repeated = matches!(
                     (op, key.code),
                     (VimOp::Delete, KeyCode::Char('d'))
@@ -1965,7 +2137,28 @@ impl App {
                 } else if let KeyCode::Char(motion) = key.code {
                     let chars: Vec<char> = self.input.chars().collect();
                     if let Some(m) = vim::resolve_motion(motion, n, &chars, self.cursor) {
-                        self.vim_apply_op(op, m.start, m.end);
+                        // `cw` is `ce`, not `dw`. Vim's own special case: a
+                        // change stops at the end of the word and leaves the
+                        // whitespace after it, because you are about to type a
+                        // replacement word and would otherwise have to retype
+                        // the space. `dw` takes the space and is already right.
+                        //
+                        // Both were handed the identical `w` range, so `cw` on
+                        // "foo bar baz" gave "bar baz" where vim gives
+                        // " bar baz". `/vim`'s own notice advertises `cw`.
+                        let end = match (op, motion) {
+                            (VimOp::Change, 'w' | 'W') => {
+                                let mut end = m.end;
+                                while end > m.start
+                                    && chars.get(end - 1).is_some_and(|c| c.is_whitespace())
+                                {
+                                    end -= 1;
+                                }
+                                end
+                            }
+                            _ => m.end,
+                        };
+                        self.vim_apply_op(op, m.start, end);
                     }
                 }
                 break 'dispatch;
@@ -1983,18 +2176,28 @@ impl App {
                     self.cursor = (self.cursor + n).min(len);
                     self.clamp_normal_cursor();
                 }
+                // The bare motions duplicate what `vim::resolve_motion` does
+                // for the operator forms, so they have to agree with it: these
+                // three are line-scoped there and were buffer-scoped here,
+                // which is how `0` on line two reached the start of line one.
                 KeyCode::Char('0') => {
                     self.vim.count = None;
-                    self.cursor = 0;
+                    self.cursor = self.line_bounds().0;
                 }
                 KeyCode::Char('^') => {
                     self.vim.count = None;
                     let chars: Vec<char> = self.input.chars().collect();
-                    self.cursor = vim::first_non_blank(&chars);
+                    let (start, end) = self.line_bounds();
+                    self.cursor = start + vim::first_non_blank(&chars[start..end]);
                 }
                 KeyCode::Char('$') => {
                     self.vim.count = None;
-                    self.cursor = len;
+                    // *On* the last character of the line, which is where vim
+                    // leaves you — not on the newline after it.
+                    // `clamp_normal_cursor` only knows about the buffer's end,
+                    // so it cannot do this for an inner line.
+                    let (start, end) = self.line_bounds();
+                    self.cursor = if end > start { end - 1 } else { start };
                     self.clamp_normal_cursor();
                 }
                 KeyCode::Char('w') => {
@@ -2027,7 +2230,7 @@ impl App {
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.vim.count = None;
-                    if self.history_pos.is_some() {
+                    if self.history_browse.is_some() {
                         self.history_next();
                     } else {
                         // Not browsing history: like plain ↓, drop into the
@@ -2075,16 +2278,22 @@ impl App {
                     self.vim_snapshot();
                     self.vim.register = self.vim_delete_range(start, self.cursor);
                 }
+                // To the end of the *line*, not the end of the draft — both of
+                // them deleted every line below the caret on a multi-line
+                // composer. See the module header in `vim.rs` for which
+                // commands are line-aware and which are not.
                 KeyCode::Char('D') => {
                     self.vim.count = None;
                     self.vim_snapshot();
-                    self.vim.register = self.vim_delete_range(self.cursor, len);
+                    let end = self.line_bounds().1;
+                    self.vim.register = self.vim_delete_range(self.cursor, end);
                     self.clamp_normal_cursor();
                 }
                 KeyCode::Char('C') => {
                     self.vim.count = None;
                     self.vim_snapshot();
-                    self.vim.register = self.vim_delete_range(self.cursor, len);
+                    let end = self.line_bounds().1;
+                    self.vim.register = self.vim_delete_range(self.cursor, end);
                     self.enter_insert();
                 }
                 KeyCode::Char('s') => {
@@ -2100,9 +2309,23 @@ impl App {
                 KeyCode::Char('r') => self.vim.pending = Some(Pending::Replace),
 
                 // --- operators (await a motion) ---
-                KeyCode::Char('d') => self.vim.pending = Some(Pending::Operator(VimOp::Delete)),
-                KeyCode::Char('c') => self.vim.pending = Some(Pending::Operator(VimOp::Change)),
-                KeyCode::Char('y') => self.vim.pending = Some(Pending::Operator(VimOp::Yank)),
+                //
+                // The count typed *before* the operator is set aside here, so
+                // the digits of the motion's own count start from nothing.
+                // Sharing one field made them concatenate: `2d3w` read as 23
+                // words rather than 2 x 3.
+                KeyCode::Char('d') => {
+                    self.vim.operator_count = self.vim.count.take();
+                    self.vim.pending = Some(Pending::Operator(VimOp::Delete));
+                }
+                KeyCode::Char('c') => {
+                    self.vim.operator_count = self.vim.count.take();
+                    self.vim.pending = Some(Pending::Operator(VimOp::Change));
+                }
+                KeyCode::Char('y') => {
+                    self.vim.operator_count = self.vim.count.take();
+                    self.vim.pending = Some(Pending::Operator(VimOp::Yank));
+                }
 
                 // --- paste / undo ---
                 KeyCode::Char('p') => {
@@ -2140,17 +2363,32 @@ impl App {
                 // be a no-op.
                 KeyCode::Esc => {
                     self.vim.clear_pending();
-                    if self.show_diff {
-                        self.show_diff = false;
-                        self.diff_scroll = 0;
+                    if self.diff.take().is_some() {
+                    } else if !self.suggestions.is_empty() {
+                        // The same arm Insert mode has. Without it the popup
+                        // was unreachable from Normal mode: Escape did not
+                        // close it, Tab fell through to the catch-all below,
+                        // and Up/Down are bound to history here — so the only
+                        // way out was to edit the text, while the status bar
+                        // read "↑↓ select · Tab complete · Enter run".
+                        self.dismissed_suggestions_for = Some(self.input.clone());
+                        self.suggestions.clear();
+                        self.suggestion_index = 0;
                     } else if self.show_todos {
                         // Then the todo band (it auto-opens on the first
                         // todo update, so it needs a way out that isn't
                         // `/todos`).
                         self.show_todos = false;
-                    } else if !self.scroll_follow {
+                    } else if !self.transcript.follow {
                         self.scroll_to_bottom();
                     }
+                }
+                // Completing is not a motion, and Normal mode is still where
+                // somebody who typed `/st` and hit Escape is standing. Without
+                // this Tab fell into the catch-all and cleared the count.
+                KeyCode::Tab if !self.suggestions.is_empty() => {
+                    self.accept_suggestion();
+                    self.enter_insert();
                 }
                 KeyCode::PageUp => self.scroll_transcript(10),
                 KeyCode::PageDown => self.scroll_transcript(-10),
@@ -2167,54 +2405,42 @@ impl App {
         if self.history.is_empty() {
             return;
         }
-        let pos = match self.history_pos {
+        let position = match &self.history_browse {
             None => {
-                self.history_draft = self.input.clone();
+                self.history_browse = Some(HistoryBrowse {
+                    position: self.history.len() - 1,
+                    draft: self.input.clone(),
+                });
                 self.history.len() - 1
             }
-            Some(0) => return,
-            Some(pos) => pos - 1,
+            Some(browse) if browse.position == 0 => return,
+            Some(browse) => browse.position - 1,
         };
-        self.set_input(self.history[pos].clone());
-        self.history_pos = Some(pos);
+        self.set_input(self.history[position].clone());
+        if let Some(browse) = self.history_browse.as_mut() {
+            browse.position = position;
+        }
     }
 
     fn history_next(&mut self) {
-        match self.history_pos {
-            None => {}
-            Some(pos) if pos + 1 < self.history.len() => {
-                self.set_input(self.history[pos + 1].clone());
-                self.history_pos = Some(pos + 1);
-            }
-            Some(_) => {
-                let draft = std::mem::take(&mut self.history_draft);
-                self.set_input(draft);
-                self.history_pos = None;
-            }
+        let Some(browse) = self.history_browse.as_mut() else {
+            return;
+        };
+        if browse.position + 1 < self.history.len() {
+            browse.position += 1;
+            let entry = self.history[browse.position].clone();
+            self.set_input(entry);
+            return;
         }
-    }
-
-    /// Move any in-flight streaming text into the transcript. Reasoning
-    /// flushes first: it streams before the visible reply.
-    fn flush_streaming(&mut self) {
-        if !self.streaming_thinking.is_empty() {
-            let text = std::mem::take(&mut self.streaming_thinking);
-            self.transcript.push(TranscriptEntry::Thinking(text));
-        }
-        if !self.streaming.is_empty() {
-            let text = std::mem::take(&mut self.streaming);
-            self.transcript.push(TranscriptEntry::Assistant(text));
-        }
+        // Past the newest entry: back to whatever was being composed.
+        let draft = std::mem::take(&mut browse.draft);
+        self.history_browse = None;
+        self.set_input(draft);
     }
 
     /// Toggle the expansion of the most recent finished tool card (Ctrl-T).
     fn toggle_last_tool_card(&mut self) {
-        for entry in self.transcript.iter_mut().rev() {
-            if let TranscriptEntry::ToolCard { collapsed, .. } = entry {
-                *collapsed = !*collapsed;
-                return;
-            }
-        }
+        self.transcript.toggle_last_tool();
     }
 
     /// Toggle the tool card whose header line was drawn on screen row `row`
@@ -2228,13 +2454,13 @@ impl App {
             .iter()
             .find(|(y, _)| *y == row)
             .map(|(_, index)| *index);
+        // A still-running card has nothing folded away, so clicking it is a
+        // no-op rather than a fold with no content behind it.
         if let Some(index) = hit
-            && let Some(TranscriptEntry::ToolCard {
-                output, collapsed, ..
-            }) = self.transcript.get_mut(index)
-            && output.is_some()
+            && let Some(TranscriptItem::Tool(tool)) = self.transcript.get(index)
+            && tool.output.is_some()
         {
-            *collapsed = !*collapsed;
+            self.transcript.toggle(index);
         }
     }
 
@@ -2295,6 +2521,15 @@ impl App {
                 Ok(None)
             }
             Event::Resize(_, _) => Ok(None),
+            Event::InputClosed(why) => {
+                // Nothing can reach this session again, so staying up only
+                // produces a window that repaints forever and answers nothing.
+                // The notice is recorded before quitting so the reason lands in
+                // the transcript on disk, where it can still be read afterwards.
+                self.notice(format!("{why} — ending the session"));
+                self.should_quit = true;
+                Ok(None)
+            }
             Event::Tick => {
                 self.tick = self.tick.wrapping_add(1);
                 // Keep the dashboard's session list current while it's open.
@@ -2337,6 +2572,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(None);
         }
+        // From here on, a notice is a reply to the user rather than something
+        // the session did on its own. See `App::notice`.
+        self.key_pressed = true;
 
         // Any keystroke dismisses a lingering text selection (it was copied on
         // release; the highlight is just a leftover once the user moves on).
@@ -2361,13 +2599,33 @@ impl App {
                     }
                     self.ctrl_c_armed = true;
                     if self.status.busy {
-                        self.notice("interrupting… (Ctrl-C again to exit)");
+                        // The cancel handle reaches a parked `execute` from
+                        // inside the tool, which kills the command's whole
+                        // process group — the same kill the timeout does. Say
+                        // what is being stopped, because with a console open
+                        // "interrupting" is ambiguous between the two.
+                        self.notice(match &self.console {
+                            Some(console) => {
+                                format!("stopping {}… (Ctrl-C again to exit)", console.command)
+                            }
+                            None => "interrupting… (Ctrl-C again to exit)".to_string(),
+                        });
                         return Ok(Some(AppAction::Interrupt));
                     }
                     self.notice("press Ctrl-C again to exit");
                     return Ok(None);
                 }
                 KeyCode::Char('d') => {
+                    // A running command's console owns Ctrl-D, exactly as a
+                    // terminal does: it closes the child's stdin so a program
+                    // reading a list of lines learns there are no more. Quitting
+                    // Wizard out from under a command the user is mid-answer
+                    // with would be the wrong reading of the same key.
+                    if let Some(console) = self.console.as_ref() {
+                        console.writer.eof();
+                        self.notice("stdin closed (Ctrl-D) — the command sees end of input");
+                        return Ok(None);
+                    }
                     self.should_quit = true;
                     return Ok(None);
                 }
@@ -2380,9 +2638,14 @@ impl App {
                 }
                 KeyCode::Char('u') => {
                     // Readline-style: kill from the line start to the cursor.
-                    let index = self.byte_index();
-                    self.input.drain(..index);
-                    self.cursor = 0;
+                    // The *line*, which is what this comment always claimed and
+                    // what the code did not do — it drained from the buffer
+                    // start, taking every line above the caret with it.
+                    let (line_start, _) = self.line_bounds();
+                    let from = self.char_byte(line_start);
+                    let to = self.byte_index();
+                    self.input.drain(from..to);
+                    self.cursor = line_start;
                     self.sync_input_mode();
                     return Ok(None);
                 }
@@ -2392,16 +2655,19 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Char('a') => {
-                    self.cursor = 0;
+                    self.cursor = self.line_bounds().0;
                     return Ok(None);
                 }
                 KeyCode::Char('e') => {
-                    self.cursor = self.input.chars().count();
+                    self.cursor = self.line_bounds().1;
                     return Ok(None);
                 }
                 KeyCode::Char('k') => {
-                    let index = self.byte_index();
-                    self.input.truncate(index);
+                    // To the end of the line, not the end of the draft.
+                    let (_, line_end) = self.line_bounds();
+                    let from = self.byte_index();
+                    let to = self.char_byte(line_end);
+                    self.input.drain(from..to);
                     self.sync_input_mode();
                     return Ok(None);
                 }
@@ -2669,6 +2935,12 @@ impl App {
                         PickerKind::Resume => {
                             // Item values are session ids.
                             AppAction::Command(SlashCommand::Resume(Some(item.value.clone())))
+                        }
+                        PickerKind::ResumeClaude => {
+                            // Item values are Claude Code session ids, which
+                            // the command handler resolves back to a
+                            // transcript before importing it.
+                            AppAction::Command(SlashCommand::ResumeClaude(Some(item.value.clone())))
                         }
                         PickerKind::Subagent => {
                             // Subagents are spawned by the model, not run as a
@@ -2979,12 +3251,14 @@ impl App {
                 }
                 None
             }
+            // Line-scoped, like Ctrl-A/Ctrl-E and like every other editor. On
+            // a single line — wrapped or not — this is identical to what it was.
             KeyCode::Home => {
-                self.cursor = 0;
+                self.cursor = self.line_bounds().0;
                 None
             }
             KeyCode::End => {
-                self.cursor = self.input.chars().count();
+                self.cursor = self.line_bounds().1;
                 None
             }
             KeyCode::Tab => {
@@ -3002,15 +3276,31 @@ impl App {
                 Some(AppAction::Command(SlashCommand::Plan))
             }
             KeyCode::Esc => {
-                if self.show_diff {
+                if self.console.is_some() {
+                    // Topmost thing Esc can close: the composer means something
+                    // different while a console is open, so giving it back
+                    // comes before closing a sidebar the user can still read.
+                    self.detach_console();
+                } else if self.diff.is_some() {
                     // Esc closes the diff sidebar before touching the input.
-                    self.show_diff = false;
-                    self.diff_scroll = 0;
+                    self.diff = None;
                 } else if self.show_todos {
                     // Then the todo band (it auto-opens on the first todo
                     // update, so it needs a way out that isn't `/todos`).
                     self.show_todos = false;
-                } else if !self.scroll_follow {
+                } else if !self.suggestions.is_empty() {
+                    // The command popup, before anything that touches the
+                    // draft. It was not in this chain at all, so Escape fell
+                    // through to `clear_input` and threw the typed text away
+                    // along with the menu: `/quit` then Esc left an empty
+                    // composer. Every other overlay here closes without
+                    // destroying what is behind it, and the status bar says
+                    // "Esc cancel" while the popup is up — cancelling the
+                    // popup, not the sentence.
+                    self.dismissed_suggestions_for = Some(self.input.clone());
+                    self.suggestions.clear();
+                    self.suggestion_index = 0;
+                } else if !self.transcript.follow {
                     self.scroll_to_bottom();
                 } else {
                     self.clear_input();
@@ -3021,12 +3311,16 @@ impl App {
             // top-to-bottom (offset from the top). Otherwise PgUp/PgDn scroll
             // the transcript; leaving the bottom freezes the viewport while
             // output streams, returning to it re-enables stick-to-bottom.
-            KeyCode::PageUp if self.show_diff => {
-                self.diff_scroll = self.diff_scroll.saturating_sub(10);
+            KeyCode::PageUp if self.diff.is_some() => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.scroll = diff.scroll.saturating_sub(10);
+                }
                 None
             }
-            KeyCode::PageDown if self.show_diff => {
-                self.diff_scroll = self.diff_scroll.saturating_add(10);
+            KeyCode::PageDown if self.diff.is_some() => {
+                if let Some(diff) = self.diff.as_mut() {
+                    diff.scroll = diff.scroll.saturating_add(10);
+                }
                 None
             }
             KeyCode::PageUp => {
@@ -3040,7 +3334,7 @@ impl App {
             KeyCode::Up => {
                 // While browsing history, ↑/↓ keep navigating history even
                 // when a recalled slash command repopulates suggestions.
-                if suggesting && self.history_pos.is_none() {
+                if suggesting && self.history_browse.is_none() {
                     self.suggestion_index = if self.suggestion_index == 0 {
                         self.suggestions.len() - 1
                     } else {
@@ -3052,13 +3346,13 @@ impl App {
                 None
             }
             KeyCode::Down => {
-                if suggesting && self.history_pos.is_none() {
+                if suggesting && self.history_browse.is_none() {
                     self.suggestion_index = if self.suggestion_index + 1 >= self.suggestions.len() {
                         0
                     } else {
                         self.suggestion_index + 1
                     };
-                } else if self.history_pos.is_some() {
+                } else if self.history_browse.is_some() {
                     // Mid-history: ↓ keeps walking forward through it.
                     self.history_next();
                 } else if !self.focus_rail() {
@@ -3103,6 +3397,12 @@ impl App {
         }
         if self.prompt.is_some() {
             return self.submit_prompt_field();
+        }
+        // A running command with an open console owns Enter. Checked after the
+        // provider-setup prompts above, which are a half-finished piece of
+        // configuration the user started themselves and should get to finish.
+        if self.console.is_some() {
+            return self.submit_console();
         }
         if self.input_mode == InputMode::Command && !self.suggestions.is_empty() {
             let typed = self
@@ -3165,6 +3465,68 @@ impl App {
         }
     }
 
+    /// Enter while a command's console is open: send the line to the child.
+    ///
+    /// The line goes **as typed**, with a newline appended and nothing else
+    /// done to it. No trimming, no `/command` parsing, no `@file` expansion:
+    /// an installer asking for an install prefix wants the characters the user
+    /// typed, `/usr/local` is not a slash command, and a password is not a
+    /// place for a helpful rewrite.
+    ///
+    /// An *empty* line is sent too, and that is the whole point of the bug
+    /// report: pressing Enter at `Do you want to continue? [Y/n]` is how a
+    /// person accepts the default, and swallowing it as "nothing to submit"
+    /// is precisely the behaviour that made the prompt unanswerable.
+    fn submit_console(&mut self) -> Option<AppAction> {
+        let line = std::mem::take(&mut self.input);
+        self.clear_input();
+        let console = self.console.as_ref()?;
+        if !console.writer.line(line.clone()) {
+            // Either the command ended between the keystroke and here, or the
+            // queue is full because it is not reading. Say so and hand the
+            // composer back rather than dropping the line in silence.
+            self.console = None;
+            self.notice("that command is no longer reading input — Enter goes to the agent again");
+            return None;
+        }
+        // Echo it into the running command's card. Nothing else will: a pipe
+        // does not echo the way a terminal does, so without this the answer the
+        // user gave leaves no trace in the conversation at all.
+        self.transcript.console_echo(&line);
+        self.transcript.scroll_to_bottom();
+        None
+    }
+
+    /// Drop a console whose command is gone without having said so.
+    ///
+    /// The tool announces `ConsoleClosed` on every path it controls; this is
+    /// for the paths it does not — a turn that died on a hard error, or a turn
+    /// task aborted after the cooperative interrupt ran out of patience. Silent
+    /// on the common case, because on the common case there is nothing open.
+    pub(super) fn close_stale_console(&mut self) {
+        if self.console.take().is_some() {
+            self.notice("the command ended — Enter goes to the agent again");
+        }
+    }
+
+    /// Let go of a running command's console (Esc).
+    ///
+    /// The command keeps running — this is not a kill, which is Ctrl-C. What it
+    /// gives back is the composer, so the user can talk to the agent about
+    /// something else while a build grinds on. The command's timeout clock,
+    /// stopped while somebody was there to answer it, starts again when the
+    /// writer drops: nobody is attending it any more, so "unattended" is once
+    /// again the truth.
+    fn detach_console(&mut self) {
+        let Some(console) = self.console.take() else {
+            return;
+        };
+        self.notice(format!(
+            "detached from {} — Enter goes to the agent again (Ctrl-C stops the command)",
+            console.command
+        ));
+    }
+
     /// Submit `input` as a user prompt: record it verbatim in history and
     /// the transcript, hand the preprocessed form (custom-command and `@file`
     /// expansion, plus any staged image attachments) to the agent.
@@ -3198,8 +3560,7 @@ impl App {
             }
             self.push_history(&input);
             self.clear_input();
-            self.transcript.push(TranscriptEntry::User(input));
-            self.scroll_to_bottom();
+            self.record_prompt(input);
             let position = self.message_queue.len() + 1;
             self.message_queue.push_back(prepared);
             self.notice(format!("queued — will send after this turn (#{position})"));
@@ -3207,9 +3568,22 @@ impl App {
         }
         self.push_history(&input);
         self.clear_input();
-        self.transcript.push(TranscriptEntry::User(input));
-        self.scroll_to_bottom();
+        self.record_prompt(input);
         Some(AppAction::Submit(prepared))
+    }
+
+    /// Record a prompt in the conversation and jump to it.
+    ///
+    /// Attachments are deliberately not passed along. A staged image is a
+    /// `PathBuf` at this point, not the
+    /// [`ImageRef`](crate::images::ImageRef) a rendered row needs, and the TUI
+    /// has never drawn a thumbnail of what the *user* sent — only of what the
+    /// turn produced. Handing the model half a reference so the renderer could
+    /// ignore it would put a difference between a live turn and its replay
+    /// that no screen shows.
+    fn record_prompt(&mut self, text: String) {
+        self.transcript.user(text, Vec::new());
+        self.scroll_to_bottom();
     }
 
     /// Pop the next queued user prompt, if any. Used by the main loop once a
@@ -3236,8 +3610,7 @@ impl App {
              begin executing them. Keep going until you reach a natural \
              checkpoint, then summarize the progress made and what remains."
         );
-        self.transcript.push(TranscriptEntry::User(kickoff.clone()));
-        self.scroll_to_bottom();
+        self.record_prompt(kickoff.clone());
         self.message_queue
             .push_back(crate::commands::Preprocessed::text_only(kickoff));
     }
@@ -3544,72 +3917,64 @@ impl App {
         }
     }
 
-    /// Fold an agent event into the transcript / status.
+    /// Fold an agent event into the conversation, and into whatever else on
+    /// this screen the same event drives.
+    ///
+    /// The conversation half is one line: the model reads the event, exactly
+    /// as the GUI's does. Everything below is what is *not* conversation — the
+    /// status bar's counters, the modal a gate opens, the subagent rail — and
+    /// none of it touches the transcript, which is what keeps the two surfaces
+    /// from drifting again.
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        self.transcript.apply(&event);
+        // The tee: the same value, on its way to the peers watching this node.
+        //
+        // Here rather than in the turn task, because *here* is the one place
+        // every agent event on this surface passes through — a turn's stream, a
+        // session-start hook, a background task reporting in, a subagent run —
+        // and a tee hung off the turn alone would show a watcher a session that
+        // went silent between turns. What crosses is not decided here: see
+        // [`MeshTee::publish`].
+        if let Some(mesh) = &self.mesh {
+            mesh.publish(&event);
+        }
         match event {
-            AgentEvent::TextDelta(delta) => {
-                self.streaming.push_str(&delta);
-            }
-            AgentEvent::ThinkingDelta(delta) => {
-                self.streaming_thinking.push_str(&delta);
-            }
-            AgentEvent::ToolStarted { name, args } => {
-                self.flush_streaming();
-                self.transcript.push(TranscriptEntry::ToolCard {
-                    name,
-                    args,
-                    output: None,
-                    is_error: false,
-                    collapsed: false,
-                });
-            }
-            AgentEvent::ToolFinished { name, output } => {
-                if let Some(output) = fill_open_card(&mut self.transcript, &name, output) {
-                    // No matching running card (e.g. denied before start
-                    // was emitted) — record the result standalone.
-                    let collapsed = output.is_error || collapse_long(&output.content);
-                    self.transcript.push(TranscriptEntry::ToolCard {
-                        name,
-                        args: Value::Null,
-                        output: Some(output.content),
-                        is_error: output.is_error,
-                        collapsed,
-                    });
-                }
-            }
-            AgentEvent::Images { source, images } => {
-                // The model's own images arrive right after its reply, a tool's
-                // right after that tool's card — so appending puts each one
-                // under the thing that made it.
-                self.flush_streaming();
-                self.transcript.extend(image_entries(&source, images));
+            // Already folded above; there is nothing else on screen these
+            // drive. (`ToolFinished`'s pairing, the orphan row it falls back
+            // to, and the notice wording for a finished task or subagent all
+            // live in the model now, so a second phrasing of any of them
+            // cannot appear here.)
+            AgentEvent::TextDelta(_)
+            | AgentEvent::ThinkingDelta(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::Images { .. }
+            | AgentEvent::Error(_)
+            | AgentEvent::Notice(_)
+            | AgentEvent::StreamRetrying
+            | AgentEvent::HookFired { .. } => {}
+            // The pre-phase's drafts and verdict, as a card that is always
+            // folded: it is tens of KB, and the point of the turn is the
+            // answer below it.
+            AgentEvent::UltraGuidance { .. } => self.transcript.set_last_tool_folded(true),
+            AgentEvent::CommandRequested(line) => {
+                // A turn in flight can't be reconfigured, so queue the command;
+                // the main loop drains it once the agent is back in its slot.
+                // The notice the user sees was written by the model above.
+                self.pending_agent_commands.push(line);
             }
             AgentEvent::StepCompleted { step } => {
                 self.status.step = step;
             }
-            AgentEvent::Error(message) => {
-                self.flush_streaming();
-                self.notice(format!("error: {message}"));
-            }
-            AgentEvent::Notice(message) => {
-                self.flush_streaming();
-                self.notice(message);
-            }
-            AgentEvent::StreamRetrying => {
-                // The partial completion is being re-generated from scratch;
-                // flushing it would double the text once the retry streams.
-                self.streaming.clear();
-                self.streaming_thinking.clear();
-            }
-            AgentEvent::HookFired {
-                event,
-                command,
-                outcome,
-            } => {
-                self.notice(format!("hook {event}: {outcome} ({command})"));
-            }
-            AgentEvent::PlanReady { plan, respond } => {
-                self.flush_streaming();
+            AgentEvent::PlanReady { plan, gate } => {
+                // Claim the verdict channel before anything else can: the modal
+                // below is what answers this gate, and the turn stays parked
+                // inside `exit_plan` until it does. A gate already claimed
+                // (a duplicate event, or a second consumer on a teed stream) is
+                // not ours to review.
+                let Some(respond) = gate.claim() else {
+                    return;
+                };
                 // A plan awaiting review implies plan mode is on, however
                 // the turn was started (e.g. `--plan`).
                 self.plan_mode = true;
@@ -3620,8 +3985,10 @@ impl App {
                     scroll: 0,
                 });
             }
-            AgentEvent::Interview { questions, respond } => {
-                self.flush_streaming();
+            AgentEvent::Interview { questions, gate } => {
+                let Some(respond) = gate.claim() else {
+                    return;
+                };
                 // Defensive: an empty set would leave the modal with nothing
                 // to answer and the turn wedged — decline immediately.
                 if questions.is_empty() {
@@ -3636,19 +4003,45 @@ impl App {
                     });
                 }
             }
-            AgentEvent::OmakaseProceeding { plan } => {
-                self.flush_streaming();
+            // A foreground command opened its stdin to a human. Claim the
+            // writer before anything else can — the same rule, and the same
+            // reason, as `PlanReady` above: the composer below is what types
+            // into this child, and a gate somebody else already claimed is not
+            // ours to drive.
+            AgentEvent::ConsoleOpened { command, gate } => {
+                let Some(writer) = gate.claim() else {
+                    return;
+                };
+                self.notice(format!(
+                    "▶ {command} — Enter now types into this command \
+                     (Esc detaches · Ctrl-D ends input · Ctrl-C stops it)"
+                ));
+                self.console = Some(Console {
+                    command,
+                    gate,
+                    writer,
+                });
+            }
+            // Already folded into the running tool's card by the model above;
+            // there is nothing else on screen it drives.
+            AgentEvent::ConsoleOutput { .. } => {}
+            AgentEvent::ConsoleClosed { gate } => {
+                // Only if it is *this* console. A close for a command we never
+                // attached to (or already detached from) must not silently
+                // take the composer back from one we did.
+                if self.console.as_ref().is_some_and(|open| open.gate == gate) {
+                    self.console = None;
+                    self.notice("command finished — Enter goes to the agent again");
+                }
+            }
+            AgentEvent::OmakaseProceeding { .. } => {
                 // Chef's choice: no review gate. Mirror the agent clearing its
-                // flags and surface the plan it chose.
+                // flags, and open the card the model just laid down — it is
+                // the only record of a decision the user never got to review,
+                // so folding it by length would hide the whole point of it.
                 self.plan_mode = false;
                 self.omakase = false;
-                self.transcript.push(TranscriptEntry::ToolCard {
-                    name: "omakase plan (chef's choice)".to_string(),
-                    args: Value::Null,
-                    output: Some(plan),
-                    is_error: false,
-                    collapsed: false,
-                });
+                self.transcript.set_last_tool_folded(false);
                 self.notice("omakase — chef's choice: proceeding with the agent's own plan");
             }
             AgentEvent::Usage {
@@ -3671,23 +4064,6 @@ impl App {
                 // with the post-compact estimate without touching /cost totals.
                 self.status.context_tokens = tokens;
             }
-            // The ultra pre-phase's drafts and verdict, as a collapsed card.
-            // This is the *only* durable record of them: the candidates' panes
-            // retire off the rail seconds after they finish, minutes before the
-            // main agent is done working from what they wrote, and the guidance
-            // itself is a system message, which the transcript never renders.
-            AgentEvent::UltraGuidance { label, guidance } => {
-                self.flush_streaming();
-                self.transcript.push(TranscriptEntry::ToolCard {
-                    name: label,
-                    args: Value::Null,
-                    output: Some(guidance),
-                    is_error: false,
-                    // Always folded: it is tens of KB, and the point of the turn
-                    // is the answer below it, not the drafts behind it.
-                    collapsed: true,
-                });
-            }
             // TaskStarted is also mirrored to the gateway's JSON stream (see
             // output.rs); the TUI additionally bumps the live status-bar
             // counter (see draw_status_bar) so a running task stays visible
@@ -3695,50 +4071,25 @@ impl App {
             AgentEvent::TaskStarted { .. } => {
                 self.status.background_tasks += 1;
             }
-            AgentEvent::TaskFinished {
-                id,
-                command,
-                status,
-            } => {
+            AgentEvent::TaskFinished { .. } => {
                 self.status.background_tasks = self.status.background_tasks.saturating_sub(1);
-                self.notice(format!(
-                    "background task #{id} finished ({}): {command}",
-                    status.describe()
-                ));
             }
             // Same pattern as TaskStarted/TaskFinished above, for subagents
             // delegated with `background: true`.
             AgentEvent::SubagentStarted { .. } => {
                 self.status.background_subagents += 1;
             }
-            AgentEvent::SubagentFinished {
-                id,
-                name,
-                task,
-                completed,
-                ..
-            } => {
+            AgentEvent::SubagentFinished { .. } => {
                 self.status.background_subagents =
                     self.status.background_subagents.saturating_sub(1);
-                let kind = if name == crate::agent::subagent::FORK_NAME {
-                    "fork"
-                } else {
-                    "background subagent"
-                };
-                self.notice(format!(
-                    "{kind} #{id} '{name}' {}: {task}",
-                    if completed {
-                        "finished"
-                    } else {
-                        "hit its step budget"
-                    }
-                ));
             }
             // ---- The subagent rail --------------------------------------
             //
             // These carry a `run` id, so concurrent runs (even two of the same
             // subagent) each land in their own pane instead of interleaving
-            // into the parent transcript.
+            // into the parent transcript. Their conversation content is
+            // translated back into ordinary events and folded by the same
+            // model — see [`App::pane_event`].
             AgentEvent::SubagentRunStarted {
                 run,
                 bg,
@@ -3748,36 +4099,23 @@ impl App {
                 self.panes.push(SubagentPane::new(run, bg, name, task));
             }
             AgentEvent::SubagentRunText { run, text } => {
-                self.push_pane(run, TranscriptEntry::Assistant(text));
+                self.pane_write(run, true, |view| view.assistant(text));
             }
             AgentEvent::SubagentRunToolStarted { run, name, args } => {
-                self.push_pane(
-                    run,
-                    TranscriptEntry::ToolCard {
-                        name,
-                        args,
-                        output: None,
-                        is_error: false,
-                        collapsed: false,
-                    },
-                );
+                self.pane_event(run, AgentEvent::ToolStarted { name, args });
             }
             AgentEvent::SubagentRunToolFinished { run, name, output } => {
-                let Some(index) = self.pane_index(run) else {
-                    return;
-                };
-                // Same collapse policy as the main transcript; a miss (no
-                // open card in the pane) is dropped.
-                fill_open_card(&mut self.panes[index].transcript, &name, output);
+                // No unread bump: a result landing on a card the badge
+                // already counted is not a second thing to go and look at.
+                let event = AgentEvent::ToolFinished { name, output };
+                self.pane_write(run, false, |view| view.apply(&event));
             }
             AgentEvent::SubagentRunImages {
                 run,
                 source,
                 images,
             } => {
-                for entry in image_entries(&source, images) {
-                    self.push_pane(run, entry);
-                }
+                self.pane_event(run, AgentEvent::Images { source, images });
             }
             AgentEvent::SubagentRunStep { run, step } => {
                 if let Some(index) = self.pane_index(run) {
@@ -3790,65 +4128,7 @@ impl App {
                 output,
                 error,
                 ..
-            } => {
-                let Some(index) = self.pane_index(run) else {
-                    return;
-                };
-                let attached = self.attached == Some(index);
-                let pane = &mut self.panes[index];
-                pane.status = if completed {
-                    PaneStatus::Done
-                } else {
-                    PaneStatus::Failed
-                };
-                pane.finished = Some(Instant::now());
-                // The subagent's final message is the step that made no tool
-                // call, so the sub-loop ends on it without streaming it — it
-                // arrives here, as the report. Without this the pane would show
-                // all of the work and none of the conclusion.
-                if !output.trim().is_empty() {
-                    let already_last = matches!(
-                        pane.transcript.last(),
-                        Some(TranscriptEntry::Assistant(text)) if text == &output
-                    );
-                    if !already_last {
-                        pane.transcript
-                            .push(TranscriptEntry::Assistant(output.clone()));
-                    }
-                }
-                match &error {
-                    Some(error) => pane
-                        .transcript
-                        .push(TranscriptEntry::Notice(format!("failed: {error}"))),
-                    None if !completed => pane
-                        .transcript
-                        .push(TranscriptEntry::Notice("hit its step budget".to_string())),
-                    None => {}
-                }
-                if !attached {
-                    pane.unread += 1;
-                }
-
-                // The pane retires off the rail shortly; fold its report back
-                // into the `spawn_subagent` card in the main chat so the run is
-                // still there to read afterwards. A foreground run's card
-                // already carries the report (it is the tool's own result), so
-                // only a detached one needs writing back.
-                let (name, task, bg) = (pane.name.clone(), pane.task.clone(), pane.bg);
-                if bg.is_some() {
-                    let report = match &error {
-                        Some(error) => format!("failed: {error}"),
-                        None if !completed => {
-                            format!(
-                                "hit its step budget after {} step(s).\n\n{output}",
-                                pane.steps
-                            )
-                        }
-                        None => output,
-                    };
-                    self.record_subagent_report(&name, &task, &report, !completed);
-                }
-            }
+            } => self.finish_pane(run, completed, output, error),
             AgentEvent::TodoUpdated(items) => {
                 self.todos = items;
                 // Auto-show the overlay the first time the agent starts a
@@ -3858,16 +4138,15 @@ impl App {
                     self.show_todos = true;
                 }
             }
-            AgentEvent::CommandRequested(line) => {
-                // A turn in flight can't be reconfigured, so queue the command;
-                // the main loop drains it once the agent is back in its slot.
-                self.notice(format!("agent requested {line} (runs after this turn)"));
-                self.pending_agent_commands.push(line);
-            }
             AgentEvent::Done { reason } => {
-                self.flush_streaming();
                 self.status.busy = false;
                 self.turn_started = None;
+                // A console cannot outlive the turn that opened it. The tool
+                // closes its own on the way out, but a turn that died on a hard
+                // error never reached that line, and a composer left pointing
+                // at a dead child is a composer whose Enter key does nothing —
+                // which is the bug, not the fix.
+                self.close_stale_console();
                 match reason {
                     DoneReason::Completed => {}
                     DoneReason::MaxSteps => self.notice(format!(
@@ -3882,6 +4161,59 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Close a subagent run's pane out: its report, its verdict, and the
+    /// write-back into the `spawn_subagent` card that launched it.
+    fn finish_pane(&mut self, run: u64, completed: bool, output: String, error: Option<String>) {
+        let Some(index) = self.pane_index(run) else {
+            return;
+        };
+        let attached = self.attached == Some(index);
+        let pane = &mut self.panes[index];
+        pane.status = if completed {
+            PaneStatus::Done
+        } else {
+            PaneStatus::Failed
+        };
+        pane.finished = Some(Instant::now());
+        // The subagent's final message is the step that made no tool call, so
+        // the sub-loop ends on it without streaming it — it arrives here, as
+        // the report. Without this the pane would show all of the work and
+        // none of the conclusion.
+        let already_last = matches!(
+            pane.transcript.last(),
+            Some(TranscriptItem::Text(text)) if text == &output
+        );
+        if !already_last {
+            pane.transcript.assistant(output.clone());
+        }
+        match &error {
+            Some(error) => pane.transcript.notice(format!("failed: {error}")),
+            None if !completed => pane.transcript.notice("hit its step budget".to_string()),
+            None => {}
+        }
+        if !attached {
+            pane.unread += 1;
+        }
+
+        // The pane retires off the rail shortly; fold its report back into the
+        // `spawn_subagent` card in the main chat so the run is still there to
+        // read afterwards. A foreground run's card already carries the report
+        // (it is the tool's own result), so only a detached one needs writing
+        // back.
+        let (name, task, steps, bg) = (pane.name.clone(), pane.task.clone(), pane.steps, pane.bg);
+        if bg.is_none() {
+            return;
+        }
+        let report = match &error {
+            Some(error) => format!("failed: {error}"),
+            None if !completed => {
+                format!("hit its step budget after {steps} step(s).\n\n{output}")
+            }
+            None => output,
+        };
+        self.record_subagent_report(&name, &task, &report, !completed);
     }
 }
 

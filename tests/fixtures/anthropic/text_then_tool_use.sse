@@ -1,0 +1,34 @@
+: Anthropic Messages API stream (POST /v1/messages, anthropic-version
+: 2023-06-01). The common assistant turn: a text block, then a tool_use block
+: whose input JSON arrives split across two input_json_delta fragments, then
+: the stop_reason and the output token count.
+:
+: Lines starting with a colon are SSE comments. Both adapters skip every line
+: that does not begin with "data" plus a colon, so this header travels with
+: the bytes without changing what is parsed.
+:
+: Transcribed from anthropic::tests::decodes_sse_text_and_tool_use. See the
+: header of tests/recorded_provider.rs for how to re-record it from a live
+: stream once the adapter's dump hook exists.
+
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"execute"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

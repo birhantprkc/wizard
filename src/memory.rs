@@ -311,7 +311,23 @@ fn validate_name(name: &str) -> Result<()> {
 /// Collapse a description to a single trimmed line for the frontmatter and
 /// the index.
 fn flatten(description: &str) -> String {
-    description.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Whitespace-collapsing is what stops a description forging a second index
+    // row, and it is not enough on its own: `ESC`, the C1 introducers and the
+    // bidi/zero-width set are not whitespace, so they survived — into an index
+    // line that is pinned into this project's system prompt for every later
+    // session. A page that talks the model into saving one memory gets
+    // persistence, which is the reason to be strict here and not in a renderer.
+    //
+    // Same predicate the mesh uses, so there is one audited answer to "what is
+    // invisible" rather than two that drift.
+    description
+        .chars()
+        .filter(|ch| !crate::mesh::is_invisible(*ch))
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Pull a `key: value` line out of the frontmatter block of an entry file.
@@ -373,6 +389,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.store.dir());
         }
+    }
+
+    #[test]
+    fn a_description_cannot_smuggle_escapes_into_the_system_prompt() {
+        // The index line built from this is pinned into the project's system
+        // prompt for every later session, so a page that persuades the model to
+        // save one memory gets persistence. Collapsing whitespace stops a
+        // forged second row; it does nothing about `ESC`, the C1 introducers,
+        // or bidi and zero-width characters, none of which are whitespace.
+        let hostile = "notes\u{1b}[2Jcleared\u{9b}31m and \u{202e}reversed\u{202c}\u{200b}";
+        let flat = flatten(hostile);
+
+        assert!(
+            !flat.chars().any(char::is_control),
+            "a control character reached the index: {flat:?}"
+        );
+        assert!(!flat.contains('\u{202e}'), "{flat:?}");
+        assert!(!flat.contains('\u{200b}'), "{flat:?}");
+        assert!(flat.contains("notes"), "{flat:?}");
+        assert!(flat.contains("reversed"), "{flat:?}");
+
+        // Still one line, still single-spaced — the property it always had.
+        assert!(!flat.contains('\n'));
+        assert_eq!(flatten("  a   b \n c "), "a b c");
     }
 
     #[test]

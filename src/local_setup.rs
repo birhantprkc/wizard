@@ -127,11 +127,12 @@ pub async fn download_gguf(tier: &GgufModel, dest: &Path, progress: &dyn Progres
 // ---------------------------------------------------------------------------
 
 /// Install `llama-server` from the official llama.cpp releases when it is
-/// missing: pick the newest release asset for this machine (Vulkan build when
-/// a GPU and loader are present, CPU otherwise), extract the whole release
-/// tree to `~/.wizard/llama.cpp` (the binary resolves its shared libraries via
-/// an `$ORIGIN` runpath, so the `.so` files must stay beside it), and link it
-/// from `~/.wizard/bin/llama-server`. Returns the linked path.
+/// missing: pick the newest release asset for this machine (see
+/// [`asset_variants_for`]: the Metal build on macOS, Vulkan on Linux when a
+/// GPU and loader are present, CPU otherwise), extract the whole release tree
+/// to `~/.wizard/llama.cpp` (the binary resolves its shared libraries via an
+/// `$ORIGIN` runpath, so the `.so`/`.dylib` files must stay beside it), and
+/// link it from `~/.wizard/bin/llama-server`. Returns the linked path.
 ///
 /// Termux has no matching prebuilt (llama.cpp publishes Ubuntu/macOS assets,
 /// not Android/Bionic). Fail with an install hint instead of downloading a
@@ -142,7 +143,7 @@ pub async fn install_llama_server(progress: &dyn Progress) -> Result<PathBuf> {
             "Termux cannot use the prebuilt llama-server releases (they target \
              Ubuntu glibc, not Android/Bionic). Install a Termux-native build \
              yourself, e.g. build llama.cpp from source inside Termux and put \
-             `llama-server` on PATH, or point [server].bin at it — then re-run. \
+             `llama-server` on PATH or in ~/.wizard/bin — then re-run. \
              Cloud providers work without a local runtime."
         );
     }
@@ -176,21 +177,39 @@ pub async fn install_llama_server(progress: &dyn Progress) -> Result<PathBuf> {
     ))
 }
 
-/// Candidate release-asset variants, preferred first. llama.cpp ships no
-/// Linux CUDA asset; Vulkan is the prebuilt GPU backend (it falls back to CPU
-/// at runtime), so try it when a GPU and a Vulkan loader are present.
+/// Candidate release-asset variants for this machine, preferred first.
 fn asset_variants() -> Vec<String> {
-    let suffix = if std::env::consts::ARCH == "aarch64" {
-        "arm64"
-    } else {
-        "x64"
-    };
-    let mut variants = Vec::new();
-    if crate::hardware::has_gpu() && vulkan_loader_present() {
-        variants.push(format!("ubuntu-vulkan-{suffix}"));
+    asset_variants_for(std::env::consts::OS, std::env::consts::ARCH, || {
+        crate::hardware::has_gpu() && vulkan_loader_present()
+    })
+}
+
+/// Candidate release-asset variants for an OS and arch, preferred first, as
+/// `install.sh`'s `llamacpp_variants` picks them. `vulkan` is only consulted
+/// where a Vulkan asset exists, so the OSes that ship one build per arch never
+/// pay for the loader probe.
+///
+/// One arm per OS: adding Windows means adding its arm and its asset names
+/// (llama.cpp publishes `win-*` assets), leaving the others untouched.
+fn asset_variants_for(os: &str, arch: &str, vulkan: impl FnOnce() -> bool) -> Vec<String> {
+    let suffix = if arch == "aarch64" { "arm64" } else { "x64" };
+    match os {
+        // macOS ships a single per-arch build with the Metal backend baked
+        // in, so there is no GPU/CPU variant to choose between.
+        "macos" => vec![format!("macos-{suffix}")],
+        // Linux and anything else that runs the Ubuntu build. llama.cpp
+        // ships no Linux CUDA asset; Vulkan is the prebuilt GPU backend (it
+        // falls back to CPU at runtime), so try it when a GPU and a Vulkan
+        // loader are present, with the plain CPU build as the fallback.
+        _ => {
+            let mut variants = Vec::new();
+            if vulkan() {
+                variants.push(format!("ubuntu-vulkan-{suffix}"));
+            }
+            variants.push(format!("ubuntu-{suffix}"));
+            variants
+        }
     }
-    variants.push(format!("ubuntu-{suffix}"));
-    variants
 }
 
 fn vulkan_loader_present() -> bool {
@@ -399,14 +418,47 @@ mod tests {
         let variants = asset_variants();
         assert!(!variants.is_empty());
         let last = variants.last().unwrap();
-        assert!(
-            last == "ubuntu-x64" || last == "ubuntu-arm64",
-            "unexpected fallback variant {last}"
-        );
-        // Vulkan, when offered, is tried before the CPU build.
-        if variants.len() == 2 {
-            assert!(variants[0].contains("vulkan"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(variants.len(), 1, "macOS ships one build per arch");
+            assert!(
+                last == "macos-x64" || last == "macos-arm64",
+                "unexpected macOS variant {last}"
+            );
+        } else {
+            assert!(
+                last == "ubuntu-x64" || last == "ubuntu-arm64",
+                "unexpected fallback variant {last}"
+            );
+            // Vulkan, when offered, is tried before the CPU build.
+            if variants.len() == 2 {
+                assert!(variants[0].contains("vulkan"));
+            }
         }
+    }
+
+    #[test]
+    fn macos_asks_for_the_metal_build_for_its_arch() {
+        // The Rust port used to emit only `ubuntu-*`, which no Mac can run.
+        assert_eq!(
+            asset_variants_for("macos", "aarch64", || panic!("no Vulkan probe on macOS")),
+            vec!["macos-arm64".to_string()]
+        );
+        assert_eq!(
+            asset_variants_for("macos", "x86_64", || panic!("no Vulkan probe on macOS")),
+            vec!["macos-x64".to_string()]
+        );
+    }
+
+    #[test]
+    fn linux_prefers_vulkan_then_falls_back_to_cpu() {
+        assert_eq!(
+            asset_variants_for("linux", "x86_64", || true),
+            vec!["ubuntu-vulkan-x64".to_string(), "ubuntu-x64".to_string()]
+        );
+        assert_eq!(
+            asset_variants_for("linux", "aarch64", || false),
+            vec!["ubuntu-arm64".to_string()]
+        );
     }
 
     #[test]

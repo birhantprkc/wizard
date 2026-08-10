@@ -1,7 +1,7 @@
-//! Git status, diffs and branches for the GUI's git panel.
+//! Git status, diffs and branches for the window's git rail.
 //!
-//! Shells out to `git` in the task's workspace (`tokio::process`, never the
-//! server's own cwd). Semantics match the TUI's `/diff` sidebar: unstaged +
+//! Shells out to `git` in the chat's workspace (`tokio::process`, never the
+//! process's own cwd). Semantics match the TUI's `/diff` sidebar: unstaged +
 //! staged numstat merged per path, untracked files counted as pure
 //! additions, and Wizard's own `.wizard/` state skipped throughout.
 
@@ -13,12 +13,12 @@ use serde::Serialize;
 
 /// How many diff lines one file's [`diff`] hands back before it is cut off. A
 /// regenerated lockfile changes by tens of thousands of lines; past a few
-/// hundred screens nobody is reading it, and shipping all of it only stalls
-/// the tab that has to render it.
+/// hundred screens nobody is reading it, and carrying all of it only stalls
+/// the pane that has to draw it.
 const MAX_DIFF_LINES: usize = 20_000;
 
-/// Response shape of `GET /api/git`.
-#[derive(Debug, Serialize)]
+/// The rail's summary of the workspace.
+#[derive(Debug, Clone)]
 pub struct GitStatus {
     pub branch: String,
     pub dirty: bool,
@@ -29,7 +29,7 @@ pub struct GitStatus {
 
 /// One changed file: `status` is `M` (modified/renamed), `A` (added),
 /// `D` (deleted), or `?` (untracked).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GitFile {
     pub path: String,
     pub status: char,
@@ -96,9 +96,9 @@ pub async fn status(root: &Path) -> Result<GitStatus> {
     })
 }
 
-/// Response shape of `GET /api/git/diff`: one changed file, parsed into hunks
-/// so the client colors it without re-parsing a diff of its own.
-#[derive(Debug, Serialize)]
+/// One changed file, parsed into hunks so the pane colors it without
+/// re-parsing a diff of its own.
+#[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
     /// The same `M|A|D|?` alphabet [`GitFile`] uses.
@@ -114,7 +114,7 @@ pub struct FileDiff {
 }
 
 /// One `@@` hunk.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Hunk {
     /// Git's own `@@ -1,4 +1,6 @@ fn main()` line, section heading included.
     pub header: String,
@@ -123,7 +123,7 @@ pub struct Hunk {
 
 /// One line of a hunk. `text` keeps git's leading marker (`+`, `-`, or the
 /// context space), so a line copied out of the view is the diff line git wrote.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub text: String,
@@ -243,11 +243,13 @@ fn parse_diff(text: &str) -> (Vec<Hunk>, bool, bool) {
     (hunks, binary, truncated)
 }
 
-/// Response shape of `GET /api/git/branches`.
-#[derive(Debug, Serialize)]
+/// What the branch switcher lists.
+///
+/// Only the list. Which one is checked out is [`GitStatus::branch`], read by
+/// the same rail from the same refresh — a second `git branch --show-current`
+/// here would be a second subprocess to answer a question already answered.
+#[derive(Debug, Clone)]
 pub struct Branches {
-    /// The checked-out branch, or `None` on a detached HEAD.
-    pub current: Option<String>,
     /// Local branches, most recently committed on first — the ones you are
     /// likely to want are the ones you touched last.
     pub branches: Vec<String>,
@@ -265,10 +267,7 @@ pub async fn branches(root: &Path) -> Result<Branches> {
         ],
     )
     .await?;
-    let current = git_output(root, &["branch", "--show-current"]).await?;
-    let current = current.trim();
     Ok(Branches {
-        current: (!current.is_empty()).then(|| current.to_string()),
         branches: listing
             .lines()
             .map(str::trim)
@@ -463,15 +462,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branches_lists_locals_and_names_the_current_one() {
+    async fn branches_lists_the_locals_and_status_names_the_checked_out_one() {
         let dir = repo().await;
         let root = dir.path();
         git_output(root, &["branch", "feat/one"]).await.unwrap();
 
         let listing = branches(root).await.unwrap();
-        assert_eq!(listing.current.as_deref(), Some("main"));
         assert!(listing.branches.contains(&"main".to_string()));
         assert!(listing.branches.contains(&"feat/one".to_string()));
+        assert_eq!(status(root).await.unwrap().branch, "main");
     }
 
     #[tokio::test]
@@ -482,10 +481,7 @@ mod tests {
 
         assert_eq!(checkout(root, "feat/one", false).await.unwrap(), "feat/one");
         assert_eq!(checkout(root, "wip/new", true).await.unwrap(), "wip/new");
-        assert_eq!(
-            branches(root).await.unwrap().current.as_deref(),
-            Some("wip/new")
-        );
+        assert_eq!(status(root).await.unwrap().branch, "wip/new");
 
         // Git's refusals are the guard rail: an uncommitted change the switch
         // would overwrite must fail, not be forced or stashed behind the user.
@@ -498,8 +494,8 @@ mod tests {
         let err = checkout(root, "main", false).await.unwrap_err().to_string();
         assert!(err.contains("would be overwritten"), "unexpected: {err}");
         assert_eq!(
-            branches(root).await.unwrap().current.as_deref(),
-            Some("wip/new"),
+            status(root).await.unwrap().branch,
+            "wip/new",
             "a refused checkout leaves the branch alone"
         );
 
@@ -629,14 +625,17 @@ mod tests {
 
     /// A change git records but has no lines for: the file's diff is honestly
     /// empty rather than an error the client would have to interpret.
+    ///
+    /// Unix-only because the *premise* is: git records an execute-bit flip as
+    /// a change only where the filesystem has one, so on a platform where
+    /// [`crate::platform::exe_swap::set_executable`] is a no-op there is no
+    /// mode-only change to ask about.
     #[cfg(unix)]
     #[tokio::test]
     async fn diff_of_a_mode_only_change_is_empty() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = repo().await;
         let root = dir.path();
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(root.join("a.txt"), perms).unwrap();
+        crate::platform::exe_swap::set_executable(&root.join("a.txt")).unwrap();
 
         let diff = diff(root, "a.txt").await.unwrap();
         assert_eq!((diff.additions, diff.deletions), (0, 0));

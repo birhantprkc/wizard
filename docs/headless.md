@@ -4,7 +4,13 @@ A sovereign run (`wizard --mode sovereign -p "task"`, or any `-p` run without a 
 
 ## `text` (default)
 
-The human-readable stream you get today: assistant deltas as they arrive, dimmed reasoning, `→ tool` / `← tool [ok]` one-liners, a busy spinner on terminals, and a `[run finished: ...]` trailer with token totals.
+The human-readable stream you get today: assistant deltas as they arrive, dimmed reasoning, `→ tool {args}` / `← tool [ok]` one-liners (`[error]` on a failure), a busy spinner on terminals, a `[turn done: Completed]` line per turn, and a trailer:
+
+```
+[run finished: Completed — 1200 prompt + 240 completion tokens]
+```
+
+The reason there is the Rust variant name (`Completed`, `MaxSteps`, `TimeLimit`, `Stopped`, `CircuitBreaker`), not the snake_case spelling the structured formats use, and the token clause is dropped when both counters are zero.
 
 A subagent's tool calls print inline under the subagent's name (`→ researcher ▸ web_fetch {…}` / `← researcher ▸ web_fetch [ok]`); the TUI puts them on its [subagent rail](usage.md#the-subagent-rail) instead. The structured formats below label them the same way in their `name` fields.
 
@@ -20,15 +26,18 @@ Silent until the run ends, then exactly one JSON object on stdout:
   "steps": 3,
   "usage": {"prompt_tokens": 1200, "completion_tokens": 240},
   "tool_calls": [{"name": "execute", "calls": 2, "errors": 0}],
-  "errors": []
+  "errors": [],
+  "images": []
 }
 ```
+
+`images` collects, in order, every image the run announced (`generate_image`, an image-carrying tool result, a subagent's), as a reference to where it was written — so a script consuming the summary can pick the files up.
 
 `reason` is one of `completed | max_steps | time_limit | stopped | circuit_breaker`. `max_steps` only appears when the config caps the turn with a positive `max_steps`; the default budget (`max_steps = 0`) has no ceiling to hit.
 
 ## `stream-json`
 
-One JSON object per line (JSONL) as events arrive, always terminated by a `done` line:
+One JSON object per line (JSONL) as events arrive, terminated by a `done` line:
 
 ```
 {"type":"tool_call","name":"execute","args":{"command":"cargo test"}}
@@ -40,9 +49,11 @@ One JSON object per line (JSONL) as events arrive, always terminated by a `done`
 {"type":"done","reason":"completed","usage":{"prompt_tokens":1200,"completion_tokens":240}}
 ```
 
-Other line types you may see: `thinking_delta`, `todo`, `task_finished`, `plan` (auto-approved, with the plan text), `hook`, and `error`. `turn_done` closes each agent turn; the final `done` line carries the run outcome and total usage.
+Other line types you may see: `thinking_delta`, `notice`, `error`, `stream_retrying`, `hook`, `plan` (auto-approved, with the plan text; `omakase: true` on the chef's-choice path), `interview`, `todo`, `images`, `task_started` / `task_finished`, `subagent_started` / `subagent_finished`, `command_requested`, `ultra_guidance`, and `console_opened` / `console_output` / `console_closed`. `turn_done` closes each agent turn; the final `done` line carries the run outcome and total usage.
 
-In both structured formats the spinner and decorative headers are suppressed: stdout is pure JSON, diagnostics go to stderr.
+A hard error (config, provider unreachable) ends the process before the sink writes its summary, so a run that exits 1 emits **no** `done` line, no `json` object, and no text trailer. Read the exit code, not the last line.
+
+In both structured formats the spinner and decorative headers are suppressed and stdout is pure JSON. Failures a run survives arrive in-band — the `errors` array in the `json` summary, `{"type":"error"}` lines in `stream-json` — and tracing diagnostics go to the log file under `~/.wizard/logs/` (see [logging.md](logging.md)). Stderr carries exactly one thing: the `error: …` line a hard failure prints on its way to exit 1, which is the only diagnostic such a run produces. Do not discard it with `2>/dev/null`.
 
 ## Exit codes
 
@@ -53,8 +64,10 @@ The process exit code encodes why the run ended:
 | 0 | completed (or gracefully stopped via `.wizard/loop-control`) |
 | 1 | hard error (config, provider unreachable, ...) |
 | 2 | step budget exhausted — only when a positive `max_steps` caps the turn |
-| 3 | circuit breaker (repeated identical failures) |
+| 3 | circuit breaker |
 | 4 | `--max-hours` time limit |
+
+Exit 3 covers three breakers: a sovereign run's same call *faulting* identically 6 times in a row, any one tool failing 8 times in a row, and the provider breaker opening after 8 consecutive transient model-call failures. Only a fault — a tool that could not be run at all — reaches the first one; a tool that ran and reported a non-zero exit or a missing file is diagnostic signal and never trips it, and 3 identical repeats are the nudge to change approach rather than the trip. Exit 0 also covers a user interrupt, not only `.wizard/loop-control`.
 
 So a CI invocation can distinguish "the agent finished" from "the agent gave up":
 
@@ -67,4 +80,4 @@ case $? in
 esac
 ```
 
-The TUI and the gateway are unaffected by `--output-format`; they always exit 0 on a clean quit.
+A real TUI session and the gateway are unaffected by `--output-format`; they exit 0 on a clean quit. Note that `wizard -p "task"` with no terminal on stdin/stdout falls through to the headless runner, which does honor `--output-format` and these exit codes — that is what makes the format usable from a pipe or a CI job without `--mode sovereign`.

@@ -15,9 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, PlanGate};
 
 use super::{Tool, ToolContext, ToolError, ToolOutput, parse_args};
 
@@ -129,27 +128,44 @@ impl Tool for ExitPlanTool {
         // rejected or interrupted review.
         self.persist(ctx, &plan)?;
 
-        let (respond, verdict) = oneshot::channel();
+        let (gate, verdict) = PlanGate::open();
         if events
             .send(AgentEvent::PlanReady {
                 plan: plan.clone(),
-                respond,
+                gate,
             })
             .await
             .is_err()
         {
-            // The surface is gone; the turn is ending anyway.
+            // The surface is gone; the turn is ending anyway. Close the gate
+            // so the desk is not left holding a verdict channel nobody can
+            // reach.
+            gate.cancel();
             return Ok(ToolOutput::error(
                 "plan review was cancelled (no surface to approve it); still in plan mode",
             ));
         }
 
-        Ok(match verdict.await {
-            Ok(verdict) if verdict.approved => {
+        // Park until the reviewer answers, or until the surface goes away.
+        // The verdict channel now waits at the gate desk rather than inside the
+        // event, so a consumer that drops the event mid-review no longer
+        // releases this call by dropping the sender with it. A closed event
+        // channel is the same news arriving one step earlier: there is nobody
+        // left to review anything.
+        let verdict = tokio::select! {
+            answer = verdict => answer.ok(),
+            () = events.closed() => {
+                gate.cancel();
+                None
+            }
+        };
+
+        Ok(match verdict {
+            Some(verdict) if verdict.approved => {
                 self.plan_mode.store(false, Ordering::SeqCst);
                 ToolOutput::ok("Plan approved — proceed to execute it.")
             }
-            Ok(verdict) => {
+            Some(verdict) => {
                 let feedback = if verdict.feedback.trim().is_empty() {
                     "the plan was not accepted".to_string()
                 } else {
@@ -160,7 +176,7 @@ impl Tool for ExitPlanTool {
                      and call exit_plan again."
                 ))
             }
-            Err(_) => ToolOutput::error("plan review ended without a verdict; still in plan mode"),
+            None => ToolOutput::error("plan review ended without a verdict; still in plan mode"),
         })
     }
 }
@@ -229,11 +245,11 @@ mod tests {
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
         let reviewer = async {
-            let Some(AgentEvent::PlanReady { plan, respond }) = rx.recv().await else {
+            let Some(AgentEvent::PlanReady { plan, gate }) = rx.recv().await else {
                 panic!("expected PlanReady");
             };
             assert_eq!(plan, "# the plan");
-            respond.send(PlanVerdict::approve()).expect("verdict sent");
+            assert!(gate.answer(PlanVerdict::approve()), "verdict sent");
         };
         let (out, ()) = tokio::join!(
             tool.execute(json!({ "plan": "# the plan" }), &ctx),
@@ -257,12 +273,13 @@ mod tests {
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
         let reviewer = async {
-            let Some(AgentEvent::PlanReady { respond, .. }) = rx.recv().await else {
+            let Some(AgentEvent::PlanReady { gate, .. }) = rx.recv().await else {
                 panic!("expected PlanReady");
             };
-            respond
-                .send(PlanVerdict::reject("cover the error path too"))
-                .expect("verdict sent");
+            assert!(
+                gate.answer(PlanVerdict::reject("cover the error path too")),
+                "verdict sent"
+            );
         };
         let (out, ()) = tokio::join!(tool.execute(json!({ "plan": "# p" }), &ctx), reviewer);
         let out = out.expect("executes");
@@ -285,10 +302,12 @@ mod tests {
         let ctx = ToolContext::new(&tmp.0).with_events(tx);
 
         let reviewer = async {
-            let Some(AgentEvent::PlanReady { respond, .. }) = rx.recv().await else {
+            let Some(AgentEvent::PlanReady { gate, .. }) = rx.recv().await else {
                 panic!("expected PlanReady");
             };
-            drop(respond); // surface went away without answering
+            // Surface went away without answering: claiming and dropping the
+            // channel is what a review modal being torn down does.
+            drop(gate.claim());
         };
         let (out, ()) = tokio::join!(tool.execute(json!({ "plan": "# p" }), &ctx), reviewer);
         let out = out.expect("executes");

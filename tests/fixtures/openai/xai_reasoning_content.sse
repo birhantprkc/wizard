@@ -1,0 +1,15 @@
+: xAI grok-4.3 through the OpenAI-compatible endpoint. Reasoning arrives as
+: delta.reasoning_content, which is not an OpenAI field: it is the vendor
+: extension the same adapter has to understand, and it must be flagged as
+: thinking so it renders dimmed and never re-enters history.
+:
+: Transcribed from openai::tests::decodes_xai_reasoning_content_as_thinking.
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"grok-4.3","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Weighing the "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"grok-4.3","choices":[{"index":0,"delta":{"reasoning_content":"options."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"grok-4.3","choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"}]}
+
+data: [DONE]
+

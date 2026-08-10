@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -18,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::provider::LlmProvider;
 use super::{
-    ChatChunk, ChatMessage, ChatRequest, ChatStream, FunctionCall, Image, ProviderError, Role,
-    ToolCall,
+    CacheTokens, ChatChunk, ChatMessage, ChatRequest, ChatStream, ContentBlock, FunctionCall,
+    Image, ProviderError, Role, ToolCall,
 };
 
 /// Supplies the `Authorization: Bearer` token for each request. The plain
@@ -67,10 +68,23 @@ impl TokenSource for StaticToken {
     }
 }
 
+/// OpenAI's own API root, scheme included. `prompt_cache_key` is a field of
+/// *this* endpoint's Chat Completions API, not of the wire shape, so it is
+/// matched on rather than guessed at; see [`is_openai_api`].
+const OPENAI_API_ROOT: &str = "https://api.openai.com";
+
 /// Client bound to one OpenAI-compatible endpoint.
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     http: reqwest::Client,
+    /// Read timeout `http` was built with, resolved once from the endpoint's
+    /// locality (see [`crate::llm::client_read_timeout_for`]). `reqwest`
+    /// exposes no accessor for a built client's timeouts, so it is recorded
+    /// here: [`OpenAiProvider::with_headers`] has to rebuild the client and
+    /// must not silently put a local endpoint back on the cloud policy, and
+    /// "which policy did this client get" is the first question when a long
+    /// local generation dies at exactly five minutes.
+    read_timeout: Option<Duration>,
     /// Base URL including the API version segment, e.g.
     /// `https://api.openai.com/v1`. Trailing slashes are trimmed.
     base_url: String,
@@ -81,6 +95,10 @@ pub struct OpenAiProvider {
     auth: Arc<dyn TokenSource>,
     /// Vendor prefix for [`LlmProvider::label`] (`openai`, `xai`, ...).
     vendor: &'static str,
+    /// Whether requests carry a `prompt_cache_key` (see [`is_openai_api`] and
+    /// [`prompt_cache_key`]). Resolved once from the base URL, because it is
+    /// a property of the endpoint and not of the request.
+    keyed_prompt_cache: bool,
 }
 
 impl OpenAiProvider {
@@ -108,19 +126,31 @@ impl OpenAiProvider {
         vendor: &'static str,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let http = crate::llm::cloud_http_builder().build().unwrap_or_default();
+        // An OpenAI-compatible endpoint is not necessarily a hosted one: LM
+        // Studio, vLLM and llama.cpp all speak this wire shape from the
+        // user's own machine, where a silent socket means a slow prefill and
+        // not a dead connection.
+        let read_timeout = crate::llm::client_read_timeout_for(&base_url);
+        let http = crate::llm::chat_http_builder(read_timeout)
+            .build()
+            .unwrap_or_default();
+        let keyed_prompt_cache = is_openai_api(&base_url);
         Self {
             http,
+            read_timeout,
             base_url,
             model: model.into(),
             auth,
             vendor,
+            keyed_prompt_cache,
         }
     }
 
     /// Rebuild the inner HTTP client with `headers` sent on every request
     /// (e.g. OpenRouter's attribution headers). Invalid header names or
-    /// values are skipped.
+    /// values are skipped. The timeout policy the client was constructed with
+    /// is carried over: adding a header must not move a local endpoint back
+    /// onto the cloud read timeout.
     pub fn with_headers(mut self, headers: &[(&str, &str)]) -> Self {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
         let mut map = HeaderMap::new();
@@ -131,11 +161,19 @@ impl OpenAiProvider {
                 map.insert(name, value);
             }
         }
-        self.http = crate::llm::cloud_http_builder()
+        self.http = crate::llm::chat_http_builder(self.read_timeout)
             .default_headers(map)
             .build()
             .unwrap_or_default();
         self
+    }
+
+    /// The read timeout this client's endpoint locality resolved to. Test-only
+    /// because nothing in the running agent needs to ask; it exists so the
+    /// policy a constructor actually applied is assertable at all.
+    #[cfg(test)]
+    pub(crate) fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     fn url(&self, path: &str) -> String {
@@ -177,9 +215,18 @@ impl OpenAiProvider {
         }
     }
 
-    /// Error for a non-success HTTP status, with the token source's hint
+    /// Error for a non-success HTTP response, with the token source's hint
     /// appended on 403 (e.g. OAuth plan gating).
-    fn http_failure(&self, status: reqwest::StatusCode, body: String) -> anyhow::Error {
+    ///
+    /// Takes the whole response rather than a status and a body so the
+    /// server's `Retry-After` is read off the headers *before* `text()`
+    /// consumes it: a 429 that names a deadline is the only thing that stops
+    /// the agent's backoff from guessing, and this is the path every chat
+    /// completion fails through.
+    async fn http_failure(&self, response: reqwest::Response) -> anyhow::Error {
+        let status = response.status();
+        let retry_after = crate::llm::retry_after_from_headers(response.headers());
+        let body = response.text().await.unwrap_or_default();
         let hint = if status == reqwest::StatusCode::FORBIDDEN {
             self.auth
                 .forbidden_hint()
@@ -188,10 +235,11 @@ impl OpenAiProvider {
         } else {
             String::new()
         };
-        anyhow::Error::new(ProviderError::http(
+        crate::llm::http_error_with_retry_after(
             status.as_u16(),
             format!("{} returned HTTP {status}: {body}{hint}", self.base_url),
-        ))
+            retry_after,
+        )
     }
 
     /// Translate a native [`ChatRequest`] into the OpenAI Chat Completions
@@ -237,8 +285,104 @@ impl OpenAiProvider {
         {
             body["reasoning_effort"] = json!(effort);
         }
+        // Prompt caching on this API is *keyed*, not annotated: there is no
+        // per-block breakpoint to place (that is Anthropic's `cache_control`).
+        // The server matches the longest cached prefix of the messages array
+        // by itself, and this one field only decides which cache the request
+        // is routed to, so turn two of a conversation lands on the prefix turn
+        // one warmed instead of racing across machines.
+        if self.keyed_prompt_cache
+            && let Some(key) = prompt_cache_key(&request.model, &request.messages)
+        {
+            body["prompt_cache_key"] = json!(key);
+        }
         body
     }
+}
+
+/// Whether `base_url` is OpenAI's own API, the only endpoint in this family
+/// known to implement `prompt_cache_key`.
+///
+/// Everything else that speaks this wire shape degrades to no key at all,
+/// which is not a loss of caching, only of routing affinity:
+///
+/// * llama.cpp, LM Studio and vLLM reuse their own KV cache across requests
+///   without being told which conversation they are serving, and there is no
+///   prompt-caching API to key into (see `llamacpp.rs`);
+/// * Cloudflare Workers AI has no prompt cache at all (see `cloudflare.rs`);
+/// * xAI, DeepSeek and the other hosted endpoints configured as an `openai`
+///   provider cache automatically and document no key field.
+///
+/// Sending it to them anyway would put a field on the wire that is at best
+/// ignored and at worst rejected by a strict server, so the match is on the
+/// endpoint rather than on the wire shape. The comparison is anchored at the
+/// scheme and terminated at the path so `https://api.openai.com.example.net`
+/// is not mistaken for it.
+fn is_openai_api(base_url: &str) -> bool {
+    let Some(rest) = base_url.strip_prefix(OPENAI_API_ROOT) else {
+        return false;
+    };
+    // What follows the host has to be a boundary: a path, a port, or nothing.
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with(':')
+}
+
+/// The `prompt_cache_key` for one request: a short digest of the system
+/// prompt and the model tag.
+///
+/// What the server caches is the *prefix* of the messages array, and the
+/// system prompt is the largest part of that prefix which does not change
+/// between the turns of one conversation: the charter, the tool list, the
+/// project instructions. Digesting it yields a key that is identical on every
+/// turn of a session (so a follow-up turn routes to the machine holding the
+/// prefix the first turn warmed) and different for another project, another
+/// mode, or another model, which is exactly the grouping worth separating.
+///
+/// Only the **leading** run of system messages counts, and that restriction
+/// is the whole difference between a key that works and one that looks like
+/// it does. `Role::System` is not reserved for the prompt here: the agent
+/// loop pushes a tool-failure nudge as a system message, and so do the task
+/// and subagent notes, all of them landing in the middle of the history and
+/// staying there. Folding those into the digest re-keys the session the first
+/// time a tool fails, routing every later turn away from the cache the
+/// earlier ones warmed, for a prefix that never changed. The leading run is
+/// literally the prefix the server caches, so it is what the key follows: it
+/// moves when a compaction rewrites the head of the history (where a new key
+/// is correct, the prefix really did change) and not otherwise.
+///
+/// It is a routing hint and never an identity. Nothing user-supplied is
+/// echoed and nothing about the machine goes in; the digest is truncated to
+/// eight bytes, so what lands on the wire is a bucket name and not a
+/// recoverable copy of the prompt.
+///
+/// `None` when the request opens with no system prompt. There is then no
+/// stable prefix to route on, and a constant fallback key would herd every
+/// such request onto a single cache.
+fn prompt_cache_key(model: &str, messages: &[ChatMessage]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut hashed_anything = false;
+    for message in messages.iter().take_while(|m| m.role == Role::System) {
+        let text = message.text();
+        if text.is_empty() {
+            continue;
+        }
+        hasher.update(text.as_bytes());
+        // A separator, so two system messages cannot be reshuffled into the
+        // same digest as one concatenated message.
+        hasher.update([0]);
+        hashed_anything = true;
+    }
+    if !hashed_anything {
+        return None;
+    }
+    // The model is part of the key because a cached prefix belongs to one
+    // model: routing a gpt-5 turn to the cache a gpt-4o turn filled buys
+    // nothing.
+    hasher.update(model.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("wz-{hex}"))
 }
 
 /// Models that accept a `reasoning_effort` request field: xAI Grok 4.x and
@@ -269,31 +413,35 @@ fn rejects_temperature(model: &str) -> bool {
         || model.starts_with("o4")
 }
 
-/// Translate native messages into the OpenAI `messages` array. Tool calls are
-/// assigned synthetic ids (`call_N`) as they appear on assistant messages;
-/// `tool`-role results are correlated back to those ids by tool name (the
-/// earliest unmatched call of the same name), since Wizard's wire format does
-/// not carry call ids.
+/// Translate native messages into the OpenAI `messages` array. Tool calls
+/// carry the id the provider itself issued, and each `tool_result` block
+/// becomes its own `tool`-role message bound to that id: the shape this API
+/// wants, where Anthropic wants all of a batch's results in one message.
 ///
-/// User messages with [`ChatMessage::images`] become multimodal content arrays
-/// (`text` + `image_url` data-URLs).
+/// A `tool`-role [`ChatMessage`] holding a whole parallel batch therefore
+/// expands to N consecutive `tool` messages here, with nothing interleaved
+/// between them: OpenAI rejects a `tool` message whose `tool_call_id` does
+/// not belong to the assistant turn it is answering, and it used to be the
+/// agent loop that put a user message full of images (or a system nudge)
+/// in the middle of a batch.
+///
+/// User messages with images become multimodal content arrays (`text` +
+/// `image_url` data-URLs).
 fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    let mut pending: BTreeMap<String, VecDeque<String>> = BTreeMap::new();
-    let mut seq: u64 = 0;
     let mut out = Vec::with_capacity(messages.len());
 
     for message in messages {
         match message.role {
-            Role::System => out.push(json!({ "role": "system", "content": message.content })),
-            Role::User if message.images.is_empty() => {
-                out.push(json!({ "role": "user", "content": message.content }))
+            Role::System => out.push(json!({ "role": "system", "content": message.text() })),
+            Role::User if message.images().is_empty() => {
+                out.push(json!({ "role": "user", "content": message.text() }))
             }
             // A user message carrying images becomes a multi-part content
             // array: the text first, then one `image_url` part per image as a
             // base64 data URI (the OpenAI / xAI vision format).
             Role::User => {
-                let mut parts = vec![json!({ "type": "text", "text": message.content })];
-                for image in &message.images {
+                let mut parts = vec![json!({ "type": "text", "text": message.text() })];
+                for image in message.images() {
                     parts.push(json!({
                         "type": "image_url",
                         "image_url": { "url": image.data_uri() },
@@ -307,30 +455,24 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 // images the model generated are named in the text instead of
                 // silently 400-ing the request.
                 let content = super::assistant_content(message);
+                let tool_calls = message.tool_calls();
                 // OpenAI requires `content: null` (not "") when only tool calls
                 // are present.
-                value["content"] = if content.is_empty() && !message.tool_calls.is_empty() {
+                value["content"] = if content.is_empty() && !tool_calls.is_empty() {
                     Value::Null
                 } else {
                     json!(content)
                 };
-                if !message.tool_calls.is_empty() {
-                    let calls: Vec<Value> = message
-                        .tool_calls
+                if !tool_calls.is_empty() {
+                    let calls: Vec<Value> = tool_calls
                         .iter()
                         .map(|call| {
-                            seq += 1;
-                            let id = format!("call_{seq}");
-                            pending
-                                .entry(call.function.name.clone())
-                                .or_default()
-                                .push_back(id.clone());
                             let arguments = match &call.function.arguments {
                                 Value::String(raw) => raw.clone(),
                                 other => other.to_string(),
                             };
                             json!({
-                                "id": id,
+                                "id": call.id,
                                 "type": "function",
                                 "function": { "name": call.function.name, "arguments": arguments },
                             })
@@ -341,16 +483,13 @@ fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 out.push(value);
             }
             Role::Tool => {
-                let name = message.tool_name.clone().unwrap_or_default();
-                let id = pending
-                    .get_mut(&name)
-                    .and_then(|queue| queue.pop_front())
-                    .unwrap_or_else(|| format!("call_{name}"));
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": message.content,
-                }));
+                for result in message.tool_results() {
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": result.tool_use_id,
+                        "content": result.content,
+                    }));
+                }
             }
         }
     }
@@ -375,9 +514,7 @@ impl LlmProvider for OpenAiProvider {
             )));
         }
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(self.http_failure(status, body));
+            return Err(self.http_failure(response).await);
         }
         Ok(())
     }
@@ -394,9 +531,7 @@ impl LlmProvider for OpenAiProvider {
             .await
             .with_context(|| format!("listing models from {}", self.base_url))?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(self.http_failure(status, body));
+            return Err(self.http_failure(response).await);
         }
         let models: ModelsResponse = response
             .json()
@@ -412,9 +547,7 @@ impl LlmProvider for OpenAiProvider {
             .await
             .with_context(|| format!("chat request to {} failed", self.base_url))?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(self.http_failure(status, body));
+            return Err(self.http_failure(response).await);
         }
         let bytes = response
             .bytes_stream()
@@ -509,6 +642,71 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// An error the endpoint reported *inside* an HTTP 200 stream.
+    ///
+    /// The status line is written before the model runs, so anything that goes
+    /// wrong after the first byte cannot be an HTTP status any more. Every
+    /// endpoint on this wire shape therefore has an in-band form, and the ones
+    /// that matter most are the transient ones: OpenRouter forwards an
+    /// upstream 429 or 502 this way, and xAI reports a mid-generation capacity
+    /// failure the same. With no field to decode them into they parsed as a
+    /// chunk with no choices and no usage — perfectly valid, silently ignored
+    /// — and the stream then ended as a *successful, empty* completion. An
+    /// empty completion is strictly worse than an error: the error retries,
+    /// while the empty completion looks exactly like the model choosing to say
+    /// nothing and ends the turn.
+    #[serde(default)]
+    error: Option<StreamError>,
+}
+
+/// An error object riding inside a 200 stream. Endpoints disagree about the
+/// shape, so every field is optional and each is read where it lands.
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    #[serde(default)]
+    message: Option<String>,
+    /// The upstream HTTP status, when the gateway forwards one (OpenRouter
+    /// puts the proxied provider's status here). It decides the retry class,
+    /// so a 429 relayed mid-stream backs off like a 429 received up front.
+    #[serde(default)]
+    code: Option<Value>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+/// The status an in-band [`StreamError`] should be classified as.
+///
+/// A numeric `code` is the endpoint telling us the upstream status outright
+/// and is used as-is. Otherwise the failure is attributed to the server: it
+/// had already accepted the request and started generating, so whatever went
+/// wrong was not something about the request that a retry would repeat. 502 is
+/// the honest reading of "the thing behind the gateway broke", and it is
+/// transient, which is the answer that matters.
+fn stream_error_status(error: &StreamError) -> u16 {
+    error
+        .code
+        .as_ref()
+        .and_then(|code| match code {
+            Value::Number(number) => number.as_u64(),
+            // Several gateways send the status as a string, and some send a
+            // symbolic name ("rate_limit_exceeded") that is not a status at
+            // all; only the digits are believed.
+            Value::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        })
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|&code| (400..600).contains(&code))
+        .unwrap_or(502)
+}
+
+/// The user-facing message for an in-band [`StreamError`].
+fn stream_error_message(error: &StreamError) -> String {
+    let detail = error
+        .message
+        .clone()
+        .or_else(|| error.kind.clone())
+        .unwrap_or_else(|| "no detail given".to_string());
+    format!("the response stream reported an error mid-generation: {detail}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,6 +808,11 @@ impl ImagePart {
 #[derive(Debug, Deserialize)]
 struct ToolCallDelta {
     index: u64,
+    /// The `call_…` id OpenAI issued, sent once on the delta that opens the
+    /// call. It rides through history on the [`ToolCall`] and comes back as
+    /// the answering message's `tool_call_id`.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     function: Option<FunctionDelta>,
 }
@@ -628,11 +831,77 @@ struct Usage {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// OpenAI's nesting for the cached-prefix counter.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// The same number, flattened onto `usage` itself. Several
+    /// OpenAI-compatible gateways report it here instead, and reading only
+    /// one of the two spellings is how a cache hit silently reads as a miss.
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+    /// DeepSeek's spelling of the same number. Its disk cache reports a
+    /// hit/miss *pair* at the top of `usage` and no `prompt_tokens_details`
+    /// at all, so neither shape above finds anything on a DeepSeek response.
+    /// The miss half is not read: `prompt_tokens == hit + miss` is stated by
+    /// DeepSeek's own docs, so the hit alone is the subset this seam wants
+    /// and deriving the remainder from `prompt_tokens` cannot disagree with
+    /// itself the way carrying both numbers could.
+    ///
+    /// Checked 2026-08-07 against api-docs.deepseek.com/guides/kv_cache.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+}
+
+/// `usage.prompt_tokens_details` (subset): the breakdown of `prompt_tokens`.
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+    /// OpenRouter's counterpart to `cached_tokens`, and the only cache-write
+    /// count that reaches this adapter at all.
+    ///
+    /// OpenAI's own cache is automatic and bills no write, so this field is
+    /// absent on a direct OpenAI response and stays 0. OpenRouter is
+    /// different in kind: it proxies Anthropic models, whose cache writes are
+    /// billed at a 1.25x premium, and it forwards that count here. Dropping
+    /// it would price an OpenRouter Claude turn's cache writes as ordinary
+    /// input and under-state the turn.
+    ///
+    /// Checked 2026-08-07 against openrouter.ai/docs/features/prompt-caching.
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Prompt tokens that were served from the cache, from whichever of the
+    /// three shapes the endpoint used.
+    ///
+    /// This is a *subset* of `prompt_tokens`, not an addition to it: OpenAI
+    /// bills the cached part at a discount but still counts it, so the two
+    /// must never be summed.
+    fn cached_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .or(self.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
+    }
+
+    /// Prompt tokens the endpoint wrote into its cache, when it reports any.
+    /// See [`PromptTokensDetails::cache_write_tokens`]; `None` everywhere
+    /// except OpenRouter, which is the honest answer for a cache that is
+    /// filled automatically and free.
+    fn cache_write_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens)
+    }
 }
 
 /// Per-index accumulator for a streamed tool call.
 #[derive(Debug, Default)]
 struct ToolAccum {
+    id: String,
     name: String,
     arguments: String,
 }
@@ -669,17 +938,36 @@ struct SseState<S> {
     tool_calls: BTreeMap<u64, ToolAccum>,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    /// Prompt tokens the server served from its cache (a subset of
+    /// `prompt_eval_count`). See [`Usage::cached_tokens`] and the note in
+    /// [`build_final`].
+    cached_prompt_tokens: Option<u64>,
+    /// Prompt tokens the server wrote into its cache, when it reports any
+    /// (OpenRouter does; nothing else on this wire shape does). Also a subset
+    /// of `prompt_eval_count`. See [`Usage::cache_write_tokens`].
+    cache_write_tokens: Option<u64>,
     /// Last `finish_reason` seen ("stop", "length", "tool_calls", ...).
     done_reason: Option<String>,
     /// Saw `data: [DONE]` or EOF — drain the buffer, then emit the final chunk.
     saw_done: bool,
+    /// The endpoint *said* the reply was over: a `data: [DONE]` sentinel, or a
+    /// `finish_reason` on a choice. Distinct from [`SseState::saw_done`],
+    /// which EOF also sets, and that distinction is the whole point — a
+    /// connection that dies mid-generation reaches the same EOF a completed
+    /// stream does, and without this flag the decoder cannot tell the two
+    /// apart and hands the agent a successful, truncated completion.
+    terminated: bool,
+    /// An in-band error the stream reported (see [`StreamChunk::error`]),
+    /// raised once the buffer has been drained rather than the instant it is
+    /// parsed, so the text that arrived before it is still delivered.
+    failure: Option<StreamError>,
     /// The synthesized `done: true` chunk has been emitted.
     emitted_final: bool,
 }
 
 /// Build the final `done: true` chunk from accumulated tool-call fragments.
 fn build_final<S>(state: &SseState<S>) -> ChatChunk {
-    let tool_calls: Vec<ToolCall> = state
+    let mut tool_calls: Vec<ToolCall> = state
         .tool_calls
         .values()
         .filter(|accum| !accum.name.is_empty())
@@ -691,6 +979,7 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
                     .unwrap_or_else(|_| Value::String(accum.arguments.clone()))
             };
             ToolCall {
+                id: accum.id.clone(),
                 function: FunctionCall {
                     name: accum.name.clone(),
                     arguments,
@@ -698,13 +987,37 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
             }
         })
         .collect();
-    let message = if tool_calls.is_empty() {
-        None
-    } else {
-        let mut message = ChatMessage::assistant("");
-        message.tool_calls = tool_calls;
-        Some(message)
-    };
+    // OpenAI itself always sends an id; a compatible server (vLLM, a proxy)
+    // may not, and a result with an empty `tool_call_id` is a 400.
+    crate::llm::ensure_tool_call_ids(&mut tool_calls);
+    // Whether `prompt_cache_key` bought anything is only knowable from this
+    // counter, and a cache that silently stopped hitting (a reordered system
+    // prompt, a per-turn timestamp in the prefix) costs real money while
+    // looking exactly like a cache that is working. It rides out on the chunk
+    // (`ChatChunk::cache`) so the turn is billed at the cached rate, and is
+    // logged besides: the cost column says the turn was cheap, not which step
+    // stopped hitting.
+    //
+    // The write count is almost always zero and that is not a placeholder:
+    // OpenAI's prompt cache is automatic and bills no write, so zero is the
+    // honest reading for every endpoint that speaks plain OpenAI. OpenRouter
+    // is the exception, because it proxies models (Anthropic's) whose writes
+    // *are* billed, and it reports them; see
+    // [`PromptTokensDetails::cache_write_tokens`].
+    if let Some(cached) = state.cached_prompt_tokens.filter(|&count| count > 0) {
+        tracing::debug!(
+            cached_tokens = cached,
+            cache_write_tokens = ?state.cache_write_tokens,
+            prompt_tokens = ?state.prompt_eval_count,
+            "prompt cache hit"
+        );
+    }
+    let message = (!tool_calls.is_empty()).then(|| {
+        ChatMessage::new(
+            Role::Assistant,
+            tool_calls.into_iter().map(ContentBlock::ToolUse).collect(),
+        )
+    });
     ChatChunk {
         message,
         images: Vec::new(),
@@ -713,6 +1026,10 @@ fn build_final<S>(state: &SseState<S>) -> ChatChunk {
         done_reason: state.done_reason.clone(),
         eval_count: state.eval_count,
         prompt_eval_count: state.prompt_eval_count,
+        cache: CacheTokens {
+            read: state.cached_prompt_tokens.unwrap_or(0),
+            write: state.cache_write_tokens.unwrap_or(0),
+        },
     }
 }
 
@@ -726,6 +1043,7 @@ fn text_chunk(content: String, thinking: bool) -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -741,6 +1059,7 @@ fn image_chunk(images: Vec<Image>) -> ChatChunk {
         done_reason: None,
         eval_count: None,
         prompt_eval_count: None,
+        cache: CacheTokens::NONE,
     }
 }
 
@@ -759,8 +1078,12 @@ where
         tool_calls: BTreeMap::new(),
         prompt_eval_count: None,
         eval_count: None,
+        cached_prompt_tokens: None,
+        cache_write_tokens: None,
         done_reason: None,
         saw_done: false,
+        terminated: false,
+        failure: None,
         emitted_final: false,
     };
     stream::try_unfold(state, |mut state| async move {
@@ -782,6 +1105,7 @@ where
                 let payload = payload.trim();
                 if payload == "[DONE]" {
                     state.saw_done = true;
+                    state.terminated = true;
                     continue;
                 }
                 let chunk: StreamChunk = match serde_json::from_str(payload) {
@@ -789,7 +1113,22 @@ where
                     // Ignore keep-alives and anything we cannot parse.
                     Err(_) => continue,
                 };
+                if let Some(error) = chunk.error {
+                    // Stop reading the socket, but finish draining what is
+                    // already buffered: the deltas ahead of the error are real
+                    // output and the agent has already been shown them.
+                    state.failure = Some(error);
+                    state.saw_done = true;
+                    state.terminated = true;
+                    continue;
+                }
                 if let Some(usage) = chunk.usage {
+                    if let Some(cached) = usage.cached_tokens() {
+                        state.cached_prompt_tokens = Some(cached);
+                    }
+                    if let Some(written) = usage.cache_write_tokens() {
+                        state.cache_write_tokens = Some(written);
+                    }
                     if let Some(prompt) = usage.prompt_tokens {
                         state.prompt_eval_count = Some(prompt);
                     }
@@ -800,9 +1139,16 @@ where
                 if let Some(choice) = chunk.choices.into_iter().next() {
                     if let Some(reason) = choice.finish_reason {
                         state.done_reason = Some(reason);
+                        // Several compatible servers send a finish reason and
+                        // then simply close, with no `[DONE]` at all. That is
+                        // a complete reply and must not read as a cut stream.
+                        state.terminated = true;
                     }
                     for delta in choice.delta.tool_calls {
                         let accum = state.tool_calls.entry(delta.index).or_default();
+                        if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
+                            accum.id = id;
+                        }
                         if let Some(function) = delta.function {
                             if let Some(name) = function.name {
                                 accum.name.push_str(&name);
@@ -841,6 +1187,16 @@ where
                 }
             }
             if state.saw_done {
+                if let Some(error) = state.failure.take() {
+                    return Err(crate::llm::http_error_with_retry_after(
+                        stream_error_status(&error),
+                        stream_error_message(&error),
+                        None,
+                    ));
+                }
+                if !state.terminated {
+                    return Err(crate::llm::stream_ended_early("the response stream"));
+                }
                 state.emitted_final = true;
                 let final_chunk = build_final(&state);
                 return Ok(Some((final_chunk, state)));
@@ -850,7 +1206,9 @@ where
                 Some(Err(e)) => return Err(e),
                 None => {
                     // EOF: flush a trailing line without a newline, then emit
-                    // the final chunk on the next pass.
+                    // the final chunk on the next pass — unless nothing in the
+                    // stream ever said the reply was over, in which case this
+                    // EOF *is* the failure and the pass above raises it.
                     if !state.buf.is_empty() && state.buf.last() != Some(&b'\n') {
                         state.buf.push(b'\n');
                     }
@@ -862,8 +1220,247 @@ where
     .boxed()
 }
 
+/// Recorded-stream fixtures for this adapter and for the three backends built
+/// on the same shape: `cloudflare` and `llamacpp` wrap this client outright,
+/// and `ollama` reaches the same conclusions over its own transport.
+///
+/// The point of serving a recording over a real socket rather than feeding
+/// bytes to the decoder in-process is that it captures **the request the
+/// adapter sent**. Half of every adapter's contract is the body it puts on the
+/// wire, and an in-process decoder test can never see it: a body the provider
+/// would reject with an HTTP 400 passes those tests forever.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A recorded two-call parallel batch, **both calls naming the same
+    /// tool**. Transcribed from a `gpt-4o` stream: each call opens on its own
+    /// `index` carrying its own `call_…` id, and the arguments arrive in
+    /// fragments afterwards, interleaved between the two indices.
+    ///
+    /// Same-tool is the case the whole id change exists for. Correlating a
+    /// result to a call by tool name cannot represent it: both calls here are
+    /// `read_file`, so a name lookup has two answers and picks one.
+    ///
+    /// **The bytes live on disk**, not in this literal, and they are the same
+    /// bytes `tests/recorded_provider.rs` serves over a socket. An inline
+    /// literal asserts what the author believed the wire format was and keeps
+    /// asserting it after the provider changes; a fixture at least fails in
+    /// one place when it is re-recorded, and cannot drift from the copy the
+    /// transport tests use because there is no second copy.
+    pub(crate) const PARALLEL_TOOL_BATCH_SSE: &str =
+        include_str!("../../tests/fixtures/openai/parallel_tool_calls.sse");
+
+    /// A history whose last turn is a two-call parallel batch to **one** tool
+    /// and the two answers to it, plus the system prompt that gives a keyed
+    /// prompt cache something to key on.
+    ///
+    /// Shared by all four adapters in this family so they are all asked the
+    /// same question: given one `Role::Tool` message holding a whole batch,
+    /// what goes on the wire?
+    pub(crate) fn parallel_batch_request(model: &str) -> crate::llm::ChatRequest {
+        use crate::llm::{ChatMessage, ChatRequest, FunctionCall, ToolCall, ToolSpec};
+
+        // Written out rather than built with `ToolCall::new`, which mints a
+        // synthetic id: these ids are the provider's own, and the fixture
+        // stream answers to exactly these two.
+        let mut assistant = ChatMessage::assistant("reading both");
+        assistant.push_tool_call(ToolCall {
+            id: "call_aaa".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": "a" }),
+            },
+        });
+        assistant.push_tool_call(ToolCall {
+            id: "call_bbb".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": "b" }),
+            },
+        });
+        let mut results = ChatMessage::tool_result("call_aaa", "read_file", "contents of a");
+        results.push_tool_result("call_bbb", "read_file", "contents of b");
+
+        ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage::system("You are Wizard."),
+                ChatMessage::user("read both"),
+                assistant,
+                results,
+            ],
+            tools: vec![ToolSpec::function(
+                "read_file",
+                "Read a file.",
+                serde_json::json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+            )],
+            stream: true,
+            options: None,
+        }
+    }
+
+    /// A recorded stream, served once over loopback.
+    pub(crate) struct Recorded {
+        /// Server root to point a provider at: no trailing slash and no
+        /// `/v1`, because the adapters in this family disagree about which of
+        /// them owns that suffix.
+        pub(crate) root: String,
+        captured: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Recorded {
+        /// Bind a loopback port that captures the next request's body and
+        /// answers it with `body` as a chunked `text/event-stream`.
+        ///
+        /// Chunked, and in frames far smaller than one event, because that is
+        /// what hands the decoder reads that start and end mid-JSON: the
+        /// reassembly buffer is the part an in-process stream of whole events
+        /// never exercises.
+        pub(crate) async fn replay(body: &'static str) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            let captured = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&captured);
+
+            tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                *sink.lock().expect("capture lock") = Some(read_request_body(&mut socket).await);
+
+                let head = "HTTP/1.1 200 OK\r\n\
+                            content-type: text/event-stream\r\n\
+                            cache-control: no-cache\r\n\
+                            transfer-encoding: chunked\r\n\
+                            \r\n";
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                for frame in body.as_bytes().chunks(48) {
+                    let size = format!("{:x}\r\n", frame.len());
+                    if socket.write_all(size.as_bytes()).await.is_err()
+                        || socket.write_all(frame).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                    let _ = socket.flush().await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+                let _ = socket.flush().await;
+
+                // Drain before dropping: closing a socket that still has
+                // unread bytes in its receive buffer sends an RST, which
+                // would tear down the response the client is still reading.
+                let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                    let mut scratch = [0u8; 1024];
+                    while let Ok(read) = socket.read(&mut scratch).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            });
+
+            Self {
+                root: format!("http://127.0.0.1:{port}"),
+                captured,
+            }
+        }
+
+        /// The request body the adapter put on the wire, parsed. Panics when
+        /// nothing connected, which can only mean the request was never sent.
+        pub(crate) fn request_body(&self) -> serde_json::Value {
+            let raw = self
+                .captured
+                .lock()
+                .expect("capture lock")
+                .clone()
+                .expect("the adapter sent a request");
+            serde_json::from_str(&raw).expect("the adapter sent valid json")
+        }
+    }
+
+    /// Read one HTTP request off `socket` and return its body. Byte at a time
+    /// through the head, so none of the body is swallowed before
+    /// `content-length` is known.
+    async fn read_request_body(socket: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match socket.read(&mut byte).await {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+        let length = String::from_utf8_lossy(&head)
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if length == 0 {
+            return String::new();
+        }
+        let mut body = vec![0u8; length];
+        if socket.read_exact(&mut body).await.is_err() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// Assert that `messages` answers the parallel batch on the assistant
+    /// message at `assistant` the way this API requires: every result is its
+    /// own `tool`-role message, they are **consecutive** (nothing spliced
+    /// between them), and each `tool_call_id` is one of the ids the assistant
+    /// turn actually issued.
+    ///
+    /// The third clause is the one that fails when a result is matched to a
+    /// call by name: two calls to the same tool produce two results, and a
+    /// name match hands both of them the first call's id.
+    pub(crate) fn assert_batch_is_answerable(messages: &[serde_json::Value], assistant: usize) {
+        let issued: Vec<&str> = messages[assistant]["tool_calls"]
+            .as_array()
+            .expect("the assistant turn carries its tool calls")
+            .iter()
+            .map(|call| call["id"].as_str().expect("every call has an id"))
+            .collect();
+        assert!(
+            issued.len() > 1,
+            "this assertion is about a *batch*; got {issued:?}"
+        );
+
+        let answers = &messages[assistant + 1..assistant + 1 + issued.len()];
+        let answered: Vec<&str> = answers
+            .iter()
+            .map(|message| {
+                assert_eq!(
+                    message["role"], "tool",
+                    "a batch's results must be consecutive: {message}"
+                );
+                message["tool_call_id"]
+                    .as_str()
+                    .expect("every result names the call it answers")
+            })
+            .collect();
+        assert_eq!(
+            answered, issued,
+            "each result must carry the id of the call it answers, in order"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{PARALLEL_TOOL_BATCH_SSE, Recorded, assert_batch_is_answerable};
     use super::*;
     use crate::llm::{ChatOptions, ToolSpec};
 
@@ -955,7 +1552,7 @@ mod tests {
         // No chat API takes image content in an assistant turn; replaying one
         // must degrade to text rather than 400 the request.
         let mut assistant = ChatMessage::assistant("here it is");
-        assistant.images.push(Image::new("QUJD", "image/png"));
+        assistant.push_image(Image::new("QUJD", "image/png"));
         let out = build_messages(&[assistant]);
         let content = out[0]["content"].as_str().expect("plain text content");
         assert!(content.starts_with("here it is"));
@@ -974,19 +1571,15 @@ mod tests {
     #[test]
     fn translates_native_request_to_openai_shape() {
         let mut assistant = ChatMessage::assistant("");
-        assistant.tool_calls.push(ToolCall {
-            function: FunctionCall {
-                name: "read_file".to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
-            },
-        });
+        assistant.push_tool_call(ToolCall::new("read_file", json!({ "path": "src/main.rs" })));
+        let call_id = assistant.tool_calls()[0].id.clone();
         let request = ChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![
                 ChatMessage::system("You are Wizard."),
                 ChatMessage::user("read it"),
                 assistant,
-                ChatMessage::tool_result("read_file", "fn main() {}"),
+                ChatMessage::tool_result(&call_id, "read_file", "fn main() {}"),
             ],
             tools: vec![ToolSpec::function(
                 "read_file",
@@ -1018,7 +1611,7 @@ mod tests {
         assert_eq!(call["type"], "function");
         assert_eq!(call["function"]["name"], "read_file");
         // arguments are serialized to a JSON *string* for OpenAI.
-        let id = call["id"].as_str().expect("call id");
+        assert_eq!(call["id"], call_id, "the provider's own id, verbatim");
         let args = call["function"]["arguments"]
             .as_str()
             .expect("arguments serialized to a string");
@@ -1027,7 +1620,7 @@ mod tests {
         let tool_msg = &body["messages"][3];
         assert_eq!(tool_msg["role"], "tool");
         assert_eq!(
-            tool_msg["tool_call_id"], id,
+            tool_msg["tool_call_id"], call_id,
             "result correlates to the call"
         );
         assert_eq!(tool_msg["content"], "fn main() {}");
@@ -1036,6 +1629,491 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         let temperature = body["temperature"].as_f64().expect("temperature number");
         assert!((temperature - 0.7).abs() < 1e-6);
+    }
+
+    /// A two-call batch, which both Claude and GPT emit by default and for
+    /// which there was no test anywhere.
+    ///
+    /// This API wants one `tool` message per result, and it wants them
+    /// consecutive: a user message (the images payload) or a system message
+    /// (the failure nudge) spliced between two results is rejected, and the
+    /// agent loop used to push exactly that. The batch is answered by one
+    /// [`ChatMessage`] here, so the only thing that can come after the results
+    /// is another turn.
+    #[test]
+    fn a_parallel_batch_becomes_consecutive_tool_messages_correlated_by_id() {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.push_tool_call(ToolCall::new("read_file", json!({ "path": "a" })));
+        assistant.push_tool_call(ToolCall::new("read_file", json!({ "path": "b" })));
+        let ids: Vec<String> = assistant
+            .tool_calls()
+            .iter()
+            .map(|call| call.id.clone())
+            .collect();
+        let mut results = ChatMessage::tool_result(&ids[0], "read_file", "contents of a");
+        results.push_tool_result(&ids[1], "read_file", "contents of b");
+
+        let out = build_messages(&[ChatMessage::user("read both"), assistant, results]);
+        assert_eq!(out.len(), 4, "user, assistant, then one message per result");
+        assert_eq!(out[1]["tool_calls"][0]["id"], ids[0]);
+        assert_eq!(out[1]["tool_calls"][1]["id"], ids[1]);
+        // Both calls name the same tool, so a name-plus-order match cannot
+        // tell them apart; the ids can.
+        assert_eq!(out[2]["role"], "tool");
+        assert_eq!(out[2]["tool_call_id"], ids[0]);
+        assert_eq!(out[2]["content"], "contents of a");
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], ids[1]);
+        assert_eq!(out[3]["content"], "contents of b");
+    }
+
+    /// The whole reason tool-call ids exist. Both calls in this batch name
+    /// `read_file`, so "which result answers which call" has no answer in the
+    /// tool name; only the id distinguishes them, and getting it wrong feeds
+    /// the model file `a`'s contents as the answer to the read of `b`.
+    #[test]
+    fn two_calls_to_the_same_tool_stay_distinguishable_by_id() {
+        let request = super::testing::parallel_batch_request("gpt-4o");
+        let out = build_messages(&request.messages);
+
+        assert_batch_is_answerable(&out, 2);
+        assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(out[2]["tool_calls"][1]["function"]["name"], "read_file");
+        // The bodies are what makes a mix-up observable: swap the two
+        // `tool_call_id`s and these two lines are what catches it.
+        assert_eq!(out[3]["content"], "contents of a");
+        assert_eq!(out[4]["content"], "contents of b");
+    }
+
+    /// The other half of the contract: a real request, over a real socket,
+    /// answered by a recorded two-call stream.
+    ///
+    /// `build_messages` tests assert what this adapter *believes* it sends.
+    /// This one asserts what it actually sent, which is the only place a body
+    /// the API would reject with an HTTP 400 can be caught.
+    #[tokio::test]
+    async fn a_parallel_batch_round_trips_over_a_recorded_stream() {
+        let recorded = Recorded::replay(PARALLEL_TOOL_BATCH_SSE).await;
+        let provider = OpenAiProvider::new(format!("{}/v1", recorded.root), "gpt-4o", "sk-test");
+
+        let mut stream = provider
+            .chat_stream(super::testing::parallel_batch_request("gpt-4o"))
+            .await
+            .expect("stream opens");
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk decodes"));
+        }
+
+        // What went out: the batch this API accepts.
+        let sent = recorded.request_body();
+        let messages = sent["messages"].as_array().expect("messages array");
+        assert_batch_is_answerable(messages, 2);
+        assert_eq!(messages.len(), 5, "system, user, assistant, result, result");
+
+        // What came back: two calls, both `read_file`, told apart by id.
+        let last = chunks.last().expect("a final chunk");
+        assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("tool_calls"));
+        let calls = last
+            .message
+            .as_ref()
+            .expect("tool call message")
+            .tool_calls();
+        assert_eq!(calls.len(), 2, "the batch is not collapsed into one call");
+        assert_eq!(calls[0].id, "call_aaa");
+        assert_eq!(calls[1].id, "call_bbb");
+        assert_eq!(calls[0].function.name, calls[1].function.name);
+        assert_eq!(calls[0].function.arguments["path"], "a");
+        assert_eq!(calls[1].function.arguments["path"], "b");
+        assert_eq!(last.prompt_eval_count, Some(2048));
+        assert_eq!(last.eval_count, Some(31));
+    }
+
+    #[test]
+    fn the_prompt_cache_key_rides_only_on_openais_own_api() {
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                ChatMessage::system("You are Wizard."),
+                ChatMessage::user("hi"),
+            ],
+            tools: Vec::new(),
+            stream: true,
+            options: None,
+        };
+
+        let hosted = OpenAiProvider::new("https://api.openai.com/v1", "gpt-4o", "sk-test");
+        let key = hosted.build_request_body(&request)["prompt_cache_key"]
+            .as_str()
+            .expect("OpenAI's own endpoint gets the key")
+            .to_string();
+        assert!(key.starts_with("wz-"), "{key}");
+
+        // Everything else in the family degrades to no key rather than
+        // putting a field on the wire that is at best ignored: a local
+        // OpenAI-compatible server, Cloudflare's endpoint, xAI, OpenRouter.
+        for base_url in [
+            "http://127.0.0.1:1234/v1",
+            "https://api.cloudflare.com/client/v4/accounts/acc/ai/v1",
+            "https://api.x.ai/v1",
+            "https://openrouter.ai/api/v1",
+            // A host that merely starts with OpenAI's name is not OpenAI.
+            "https://api.openai.com.example.net/v1",
+        ] {
+            let other = OpenAiProvider::new(base_url, "gpt-4o", "k");
+            assert!(
+                other
+                    .build_request_body(&request)
+                    .get("prompt_cache_key")
+                    .is_none(),
+                "{base_url} must not receive prompt_cache_key"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prompt_cache_key_is_stable_per_prefix_and_model() {
+        let turn = |system: &str, model: &str, user: &str| {
+            prompt_cache_key(
+                model,
+                &[ChatMessage::system(system), ChatMessage::user(user)],
+            )
+        };
+
+        // The point of the key: two turns of one conversation route to the
+        // same cache even though the user text differs.
+        assert_eq!(
+            turn("You are Wizard.", "gpt-4o", "first"),
+            turn("You are Wizard.", "gpt-4o", "second"),
+        );
+        // A different prefix, mode or project is a different cache.
+        assert_ne!(
+            turn("You are Wizard.", "gpt-4o", "x"),
+            turn("You are Wizard, in a different project.", "gpt-4o", "x"),
+        );
+        // A cached prefix belongs to one model.
+        assert_ne!(
+            turn("You are Wizard.", "gpt-4o", "x"),
+            turn("You are Wizard.", "gpt-5", "x"),
+        );
+        // Two system messages cannot reshuffle into the same digest as one.
+        assert_ne!(
+            prompt_cache_key(
+                "gpt-4o",
+                &[ChatMessage::system("ab"), ChatMessage::system("c")]
+            ),
+            prompt_cache_key("gpt-4o", &[ChatMessage::system("abc")]),
+        );
+        // No system prompt: no stable prefix, so no key rather than one
+        // constant key funnelling every such request onto one cache.
+        assert_eq!(prompt_cache_key("gpt-4o", &[ChatMessage::user("hi")]), None);
+        assert_eq!(
+            prompt_cache_key("gpt-4o", &[ChatMessage::system("")]),
+            None,
+            "an empty system prompt is not a prefix"
+        );
+        // Nothing recoverable from the prompt reaches the wire.
+        let key = turn("SECRET-PROJECT-NAME", "gpt-4o", "x").expect("a key");
+        assert!(!key.contains("SECRET"), "{key}");
+        assert_eq!(key.len(), "wz-".len() + 16, "truncated digest: {key}");
+    }
+
+    /// A mid-conversation system message must not move the key.
+    ///
+    /// `Role::System` is not reserved for the system prompt: the agent loop
+    /// pushes a tool-failure nudge as one (`turn.rs`, after the batch's
+    /// results), and the task and subagent notes are system messages too.
+    /// They land in the middle of the history and stay there, so digesting
+    /// every system message meant one failed tool call re-keyed the rest of
+    /// the session and sent every later turn to a cold cache, for a prefix
+    /// that had not changed a byte.
+    #[test]
+    fn a_mid_conversation_system_note_does_not_re_key_the_session() {
+        let prompt = ChatMessage::system("You are Wizard.");
+        let quiet = vec![
+            prompt.clone(),
+            ChatMessage::user("read both"),
+            ChatMessage::assistant("done"),
+        ];
+        let nudged = vec![
+            prompt.clone(),
+            ChatMessage::user("read both"),
+            ChatMessage::assistant("done"),
+            // Exactly what `turn.rs` pushes after a tool reports a failure.
+            ChatMessage::system("The `execute` tool failed; try a narrower command."),
+            ChatMessage::user("keep going"),
+        ];
+        assert_eq!(
+            prompt_cache_key("gpt-4o", &quiet),
+            prompt_cache_key("gpt-4o", &nudged),
+            "a nudge in the middle of the history is not part of the cached prefix"
+        );
+
+        // The head of the array still is. A compaction splices its summary in
+        // at index 1, and that genuinely rewrites the prefix, so the key is
+        // supposed to move with it.
+        let compacted = vec![
+            prompt,
+            ChatMessage::system("Summary of earlier conversation: ..."),
+            ChatMessage::user("keep going"),
+        ];
+        assert_ne!(
+            prompt_cache_key("gpt-4o", &quiet),
+            prompt_cache_key("gpt-4o", &compacted),
+            "a rewritten prefix is a different cache"
+        );
+
+        // And a history that opens with a user message has no prefix to route
+        // on at all, however many system notes appear later.
+        assert_eq!(
+            prompt_cache_key(
+                "gpt-4o",
+                &[ChatMessage::user("hi"), ChatMessage::system("a note")]
+            ),
+            None
+        );
+    }
+
+    /// `prompt_cache_key` is only worth sending if the cache hits, and this
+    /// counter is the only evidence either way. Endpoints disagree about
+    /// where it rides, and reading one spelling makes a hit read as a miss.
+    #[test]
+    fn cached_tokens_are_read_from_every_usage_shape() {
+        let parse = |raw: &str| serde_json::from_str::<Usage>(raw).expect("usage parses");
+
+        // OpenAI's own shape.
+        let nested = parse(
+            r#"{"prompt_tokens":2048,"completion_tokens":31,"prompt_tokens_details":{"cached_tokens":1920}}"#,
+        );
+        assert_eq!(nested.cached_tokens(), Some(1920));
+        assert_eq!(
+            nested.prompt_tokens,
+            Some(2048),
+            "cached tokens are a subset of the prompt, never an addition to it"
+        );
+        assert_eq!(
+            nested.cache_write_tokens(),
+            None,
+            "OpenAI's cache is automatic and reports no write"
+        );
+
+        // The flattened shape several compatible gateways report.
+        assert_eq!(
+            parse(r#"{"prompt_tokens":2048,"cached_tokens":1920}"#).cached_tokens(),
+            Some(1920)
+        );
+
+        // DeepSeek's hit/miss pair, with no `prompt_tokens_details` at all.
+        // Its own docs state `prompt_tokens == hit + miss`, so the hit is
+        // already the subset this seam wants.
+        let deepseek = parse(
+            r#"{"prompt_tokens":2048,"completion_tokens":31,"prompt_cache_hit_tokens":1920,"prompt_cache_miss_tokens":128}"#,
+        );
+        assert_eq!(deepseek.cached_tokens(), Some(1920));
+        assert_eq!(
+            deepseek.prompt_tokens.expect("prompt tokens"),
+            1920 + 128,
+            "DeepSeek's hit and miss halves sum to the prompt it reported"
+        );
+
+        // OpenRouter reports the write half beside the read half. It is the
+        // only endpoint on this wire shape that has one to report, because it
+        // proxies Anthropic, whose writes are billed at a premium.
+        let openrouter = parse(
+            r#"{"prompt_tokens":10339,"completion_tokens":60,"prompt_tokens_details":{"cached_tokens":10318,"cache_write_tokens":21}}"#,
+        );
+        assert_eq!(openrouter.cached_tokens(), Some(10_318));
+        assert_eq!(openrouter.cache_write_tokens(), Some(21));
+
+        // A cold prompt reports the field as zero, not as absent.
+        assert_eq!(
+            parse(r#"{"prompt_tokens":2048,"prompt_tokens_details":{"cached_tokens":0}}"#)
+                .cached_tokens(),
+            Some(0)
+        );
+        // A backend that reports no breakdown at all still parses.
+        let bare = parse(r#"{"prompt_tokens":11,"completion_tokens":4}"#);
+        assert_eq!(bare.cached_tokens(), None);
+        assert_eq!(bare.cache_write_tokens(), None);
+    }
+
+    /// DeepSeek is the reason this adapter reads three spellings rather than
+    /// two: its disk cache discounts a hit to about 2% of the miss rate, so a
+    /// hit decoded as a miss over-bills the cached portion roughly fiftyfold,
+    /// and the two shapes that existed before find nothing on its response.
+    #[tokio::test]
+    async fn deepseeks_hit_and_miss_pair_reaches_the_chunk() {
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2048,\"completion_tokens\":31,\"prompt_cache_hit_tokens\":1920,\"prompt_cache_miss_tokens\":128}}\n\ndata: [DONE]\n\n"
+                .to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+        let mut last = None;
+        while let Some(chunk) = chunks.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+        let last = last.expect("a final chunk");
+        assert_eq!(last.prompt_eval_count, Some(2048));
+        assert_eq!(
+            last.cache,
+            CacheTokens {
+                read: 1_920,
+                // DeepSeek's cache fills as a side effect of the miss and is
+                // billed at the plain miss rate, so there is no write to bill.
+                write: 0
+            },
+        );
+    }
+
+    /// OpenRouter proxying an Anthropic model is the one place on this wire
+    /// shape where a cache *write* exists. Anthropic bills it at 1.25x input,
+    /// so dropping it prices the write as ordinary input and under-states the
+    /// turn — the one direction the cost column must never fail in.
+    #[tokio::test]
+    async fn openrouters_cache_write_count_reaches_the_chunk() {
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10339,\"completion_tokens\":60,\"prompt_tokens_details\":{\"cached_tokens\":10318,\"cache_write_tokens\":21}}}\n\ndata: [DONE]\n\n"
+                .to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+        let mut last = None;
+        while let Some(chunk) = chunks.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+        let last = last.expect("a final chunk");
+        assert_eq!(last.prompt_eval_count, Some(10_339));
+        assert_eq!(
+            last.cache,
+            CacheTokens {
+                read: 10_318,
+                write: 21
+            },
+        );
+        assert!(
+            last.cache.read + last.cache.write <= last.prompt_eval_count.expect("prompt"),
+            "both counts are subsets of the prompt, never additions to it"
+        );
+    }
+
+    /// Collects the text of every `tracing` event emitted on this thread
+    /// while a [`tracing::subscriber::DefaultGuard`] built on it is alive.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+        }
+    }
+
+    /// The counter reaching the end of the stream it arrived on.
+    ///
+    /// Cache accounting is the only way to tell a `prompt_cache_key` that is
+    /// working from one that silently stopped matching, and the payload it
+    /// rides on is the same one the token counts ride on, so dropping it is
+    /// invisible everywhere else.
+    ///
+    /// Both halves are asserted: the count on the chunk, which is what stops
+    /// the turn being billed as 2,048 fresh input tokens when 1,920 of them
+    /// were served from the cache, and the log line, which is what says
+    /// *which step* stopped hitting once the cost column has gone quiet.
+    #[tokio::test]
+    async fn a_cache_hit_reaches_the_end_of_the_stream_it_arrived_on() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("wizard=debug"))
+            .with(tracing_subscriber::fmt::layer().with_writer(capture.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(PARALLEL_TOOL_BATCH_SSE.as_bytes().to_vec())];
+        let mut chunks = decode_sse(stream::iter(parts));
+        let mut last = None;
+        while let Some(chunk) = chunks.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+        drop(guard);
+
+        let last = last.expect("a final chunk");
+        assert_eq!(last.prompt_eval_count, Some(2048));
+        assert_eq!(last.eval_count, Some(31));
+        assert_eq!(
+            last.cache,
+            CacheTokens {
+                read: 1_920,
+                // OpenAI's prompt cache is automatic and bills no cache
+                // write, so there is no honest number to put here but zero.
+                write: 0
+            },
+            "the cached count has to leave the adapter, not just be logged"
+        );
+
+        let logged = capture.text();
+        assert!(logged.contains("prompt cache hit"), "{logged}");
+        assert!(
+            logged.contains("cached_tokens=1920"),
+            "the cached count itself, not just that something was cached: {logged}"
+        );
+        assert!(
+            logged.contains("prompt_tokens=Some(2048)"),
+            "a cached count is only readable next to the prompt it is part of: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_prompt_reports_no_cache_hit() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // `cached_tokens: 0` is what a cold prompt reports, and it is not a
+        // hit: logging one would make every first turn look cached.
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("wizard=debug"))
+            .with(tracing_subscriber::fmt::layer().with_writer(capture.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\ndata: [DONE]\n\n"
+                .to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+        let mut last = None;
+        while let Some(chunk) = chunks.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+        drop(guard);
+
+        assert!(
+            !capture.text().contains("prompt cache hit"),
+            "{}",
+            capture.text()
+        );
+        assert_eq!(
+            last.expect("a final chunk").cache,
+            CacheTokens::NONE,
+            "a cold prompt prices as all-fresh, which is what it was"
+        );
     }
 
     #[test]
@@ -1132,12 +2210,14 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
     }
 
-    #[test]
-    fn http_failures_downcast_to_provider_error() {
-        let err = provider().http_failure(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "slow down".to_string(),
-        );
+    #[tokio::test]
+    async fn http_failures_downcast_to_provider_error() {
+        let provider = scripted_provider(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nContent-Length: \
+             10\r\nConnection: close\r\n\r\nslow down!",
+        )
+        .await;
+        let err = failed_chat(&provider).await;
         let provider_err = err
             .downcast_ref::<ProviderError>()
             .expect("typed provider error");
@@ -1145,7 +2225,12 @@ mod tests {
         assert!(provider_err.is_transient());
         assert!(provider_err.message.contains("slow down"), "body surfaces");
 
-        let err = provider().http_failure(reqwest::StatusCode::BAD_REQUEST, "bad".to_string());
+        let provider = scripted_provider(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: \
+             3\r\nConnection: close\r\n\r\nbad",
+        )
+        .await;
+        let err = failed_chat(&provider).await;
         let provider_err = err.downcast_ref::<ProviderError>().expect("typed");
         assert_eq!(provider_err.status, Some(400));
         assert!(!provider_err.is_transient());
@@ -1170,7 +2255,7 @@ mod tests {
 
         let first = chunks.next().await.expect("content").expect("ok");
         assert!(!first.done);
-        assert_eq!(first.message.expect("message").content, "Hi");
+        assert_eq!(first.message.expect("message").text(), "Hi");
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
@@ -1178,11 +2263,60 @@ mod tests {
         assert_eq!(last.eval_count, Some(4));
         assert_eq!(last.prompt_eval_count, Some(11));
         let message = last.message.expect("tool call message");
-        assert_eq!(message.tool_calls.len(), 1);
-        assert_eq!(message.tool_calls[0].function.name, "execute");
-        assert_eq!(message.tool_calls[0].function.arguments["command"], "ls");
+        assert_eq!(message.tool_calls().len(), 1);
+        assert_eq!(message.tool_calls()[0].function.name, "execute");
+        assert_eq!(message.tool_calls()[0].function.arguments["command"], "ls");
+        assert_eq!(
+            message.tool_calls()[0].id,
+            "call_x",
+            "the id the stream carried, sent only on the delta that opens the call"
+        );
 
         assert!(chunks.next().await.is_none(), "stream ends after done");
+    }
+
+    /// A compatible server that streams a batch without ids.
+    ///
+    /// OpenAI itself always sends `call_…`, but vLLM, some proxies and the
+    /// llama.cpp grammar-constrained implementation have all shipped releases
+    /// that omit it, and both of these calls name the same tool. Without an id
+    /// minted here the two results are indistinguishable downstream, and the
+    /// `tool` messages they become carry an empty `tool_call_id`, which the
+    /// strict servers in this family answer with an HTTP 400.
+    #[tokio::test]
+    async fn an_id_less_batch_from_a_compatible_server_gets_ids_at_the_seam() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}},{\"index\":1,\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+                    .to_vec(),
+            ),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+        let mut last = None;
+        while let Some(chunk) = chunks.next().await {
+            last = Some(chunk.expect("chunk decodes"));
+        }
+
+        let message = last.expect("a final chunk").message.expect("tool calls");
+        let calls = message.tool_calls();
+        assert_eq!(calls.len(), 2, "the batch is not collapsed");
+        assert!(!calls[0].id.is_empty(), "an id was minted: {:?}", calls[0]);
+        assert!(!calls[1].id.is_empty(), "an id was minted: {:?}", calls[1]);
+        assert_ne!(
+            calls[0].id, calls[1].id,
+            "two calls to one tool must not share an id"
+        );
+
+        // And the minted ids are what the answering messages are bound by, so
+        // the round trip is answerable rather than merely non-empty.
+        let mut assistant = ChatMessage::assistant("");
+        for call in calls {
+            assistant.push_tool_call(call.clone());
+        }
+        let mut results = ChatMessage::tool_result(&message.tool_calls()[0].id, "read_file", "a");
+        results.push_tool_result(&message.tool_calls()[1].id, "read_file", "b");
+        assert_batch_is_answerable(&build_messages(&[assistant, results]), 0);
     }
 
     #[tokio::test]
@@ -1208,15 +2342,15 @@ mod tests {
 
         let first = chunks.next().await.expect("reasoning").expect("ok");
         assert!(first.thinking, "reasoning delta is flagged");
-        assert_eq!(first.message.expect("message").content, "Weighing the ");
+        assert_eq!(first.message.expect("message").text(), "Weighing the ");
 
         let second = chunks.next().await.expect("reasoning").expect("ok");
         assert!(second.thinking);
-        assert_eq!(second.message.expect("message").content, "options.");
+        assert_eq!(second.message.expect("message").text(), "options.");
 
         let third = chunks.next().await.expect("content").expect("ok");
         assert!(!third.thinking, "visible text is not flagged");
-        assert_eq!(third.message.expect("message").content, "Done.");
+        assert_eq!(third.message.expect("message").text(), "Done.");
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
@@ -1258,11 +2392,11 @@ mod tests {
 
         let first = chunks.next().await.expect("reasoning").expect("ok");
         assert!(first.thinking);
-        assert_eq!(first.message.expect("message").content, "why");
+        assert_eq!(first.message.expect("message").text(), "why");
 
         let second = chunks.next().await.expect("content").expect("ok");
         assert!(!second.thinking);
-        assert_eq!(second.message.expect("message").content, "Hi");
+        assert_eq!(second.message.expect("message").text(), "Hi");
 
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done);
@@ -1283,7 +2417,7 @@ mod tests {
         let mut chunks = decode_sse(stream::iter(parts));
 
         let text = chunks.next().await.expect("text").expect("ok");
-        assert_eq!(text.message.expect("message").content, "here you go");
+        assert_eq!(text.message.expect("message").text(), "here you go");
         assert!(text.images.is_empty());
 
         let image = chunks.next().await.expect("image").expect("ok");
@@ -1311,7 +2445,7 @@ mod tests {
         let mut chunks = decode_sse(stream::iter(parts));
 
         let text = chunks.next().await.expect("text").expect("ok");
-        assert_eq!(text.message.expect("message").content, "two:");
+        assert_eq!(text.message.expect("message").text(), "two:");
 
         let images = chunks.next().await.expect("images").expect("ok");
         assert_eq!(images.images.len(), 2);
@@ -1337,10 +2471,180 @@ mod tests {
         let mut chunks = decode_sse(stream::iter(parts));
 
         let text = chunks.next().await.expect("text").expect("ok");
-        assert_eq!(text.message.expect("message").content, "still here");
+        assert_eq!(text.message.expect("message").text(), "still here");
         let last = chunks.next().await.expect("final").expect("ok");
         assert!(last.done, "the unusable image is dropped, the stream lives");
         assert!(chunks.next().await.is_none());
+    }
+
+    /// A stream that stops before the endpoint says the reply is over is a
+    /// failure, not a short answer.
+    ///
+    /// Every decoder here synthesizes its own final chunk, so an EOF used to
+    /// produce a clean `done: true` carrying whatever text had arrived. That
+    /// is the worst available reading of a dropped connection: the agent gets
+    /// a well-formed completion, ends the turn, and nothing anywhere reports a
+    /// problem — which is what "it randomly stops" looks like from the user's
+    /// side. It has to be typed and transient so the retry ladder climbs.
+    #[tokio::test]
+    async fn a_stream_cut_before_it_finished_is_a_transient_failure() {
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"half a sen\"}}]}\n\n".to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        // What arrived still streams: it was already on screen, and
+        // `AgentEvent::StreamRetrying` is what discards it on the retry.
+        let first = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").text(), "half a sen");
+
+        let err = chunks
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("a cut stream is not a completed reply");
+        let provider = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed, or the ladder cannot classify it");
+        assert_eq!(provider.status, None, "no status was ever received");
+        assert!(
+            provider.is_transient(),
+            "a dropped connection is exactly what a retry is for"
+        );
+        assert!(chunks.next().await.is_none());
+    }
+
+    /// A `finish_reason` with no `[DONE]` after it is a complete reply. Plenty
+    /// of compatible servers (vLLM behind a proxy, some gateways) never send
+    /// the sentinel, and refusing those streams would turn every turn against
+    /// them into an endless retry.
+    #[tokio::test]
+    async fn a_finish_reason_without_the_done_sentinel_ends_the_stream_cleanly() {
+        let parts: Vec<Result<Vec<u8>>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_vec(),
+        )];
+        let mut chunks = decode_sse(stream::iter(parts));
+        assert_eq!(
+            chunks
+                .next()
+                .await
+                .expect("text")
+                .expect("ok")
+                .message
+                .expect("message")
+                .text(),
+            "all of it"
+        );
+        let last = chunks.next().await.expect("final").expect("ok");
+        assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("stop"));
+        assert!(chunks.next().await.is_none());
+    }
+
+    /// An error object *inside* a 200 stream.
+    ///
+    /// The status line is written before the model runs, so a gateway that
+    /// loses its upstream two seconds in has nowhere to put the failure but
+    /// the stream body. There was no field to decode it into, so it parsed as
+    /// a chunk with no choices, was ignored, and the stream ended as a
+    /// successful *empty* completion — which the agent reads as the model
+    /// choosing to say nothing, and does not retry.
+    #[tokio::test]
+    async fn an_error_object_inside_a_200_stream_fails_the_stream() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"working\"}}]}\n\n".to_vec()),
+            Ok(
+                b"data: {\"error\":{\"message\":\"upstream is rate limited\",\"code\":429}}\n\n"
+                    .to_vec(),
+            ),
+        ];
+        let mut chunks = decode_sse(stream::iter(parts));
+
+        // The text ahead of the error is still delivered.
+        let first = chunks.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").text(), "working");
+
+        let err = chunks
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("an in-band error is an error");
+        let provider = err.downcast_ref::<ProviderError>().expect("typed");
+        assert_eq!(
+            provider.status,
+            Some(429),
+            "a relayed 429 backs off like a 429 received up front"
+        );
+        assert!(provider.is_transient());
+        assert!(provider.message.contains("upstream is rate limited"));
+    }
+
+    /// The shapes gateways actually send an in-band error in, and what each
+    /// one classifies as. The default matters most: an error with nothing
+    /// numeric on it is attributed to the server, because the request had
+    /// already been accepted and generation had already started, so nothing
+    /// about the request is what failed.
+    #[test]
+    fn in_band_error_shapes_all_classify_as_something_retryable() {
+        let parse = |raw: &str| {
+            serde_json::from_str::<StreamChunk>(raw)
+                .expect("parses")
+                .error
+                .expect("an error object")
+        };
+
+        // A numeric status, and the string spelling several gateways use.
+        assert_eq!(
+            stream_error_status(&parse(r#"{"error":{"code":502,"message":"bad gateway"}}"#)),
+            502
+        );
+        assert_eq!(
+            stream_error_status(&parse(r#"{"error":{"code":"503","message":"down"}}"#)),
+            503
+        );
+        // A symbolic code is not a status; it must not be parsed as one.
+        assert_eq!(
+            stream_error_status(&parse(
+                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#
+            )),
+            502
+        );
+        // Nonsense outside the status range never becomes the classification.
+        assert_eq!(
+            stream_error_status(&parse(r#"{"error":{"code":0,"message":"x"}}"#)),
+            502
+        );
+        assert_eq!(
+            stream_error_status(&parse(r#"{"error":{"type":"server_error"}}"#)),
+            502
+        );
+        // Every one of them is retryable, which is the property that matters.
+        for raw in [
+            r#"{"error":{"code":502}}"#,
+            r#"{"error":{"code":"503"}}"#,
+            r#"{"error":{"type":"server_error"}}"#,
+            r#"{"error":{}}"#,
+        ] {
+            let error = parse(raw);
+            assert!(
+                ProviderError::http(stream_error_status(&error), "x").is_transient(),
+                "{raw}"
+            );
+        }
+        // The type name stands in when there is no message.
+        assert!(
+            stream_error_message(&parse(r#"{"error":{"type":"server_error"}}"#))
+                .contains("server_error")
+        );
+        // A 400 relayed in-band stays permanent: the request really was bad.
+        assert!(
+            !ProviderError::http(
+                stream_error_status(&parse(r#"{"error":{"code":400,"message":"bad"}}"#)),
+                "x"
+            )
+            .is_transient()
+        );
     }
 
     #[tokio::test]
@@ -1356,9 +2660,109 @@ mod tests {
         let mut chunks = decode_sse(stream::iter(parts));
 
         let first = chunks.next().await.expect("content").expect("ok");
-        assert_eq!(first.message.expect("message").content, "ok");
+        assert_eq!(first.message.expect("message").text(), "ok");
         assert!(chunks.next().await.expect("final").expect("ok").done);
         assert!(chunks.next().await.is_none());
+    }
+
+    /// A provider pointed at a one-shot fixture server that answers the next
+    /// request with `response` verbatim.
+    async fn scripted_provider(response: &'static str) -> OpenAiProvider {
+        let root = crate::llm::testing::one_shot_http_server(response).await;
+        OpenAiProvider::new(format!("{root}/v1"), "gpt-4o", "sk-test")
+    }
+
+    /// The error from one chat completion that must fail. Written out rather
+    /// than `expect_err` because [`ChatStream`] is not `Debug`.
+    async fn failed_chat(provider: &OpenAiProvider) -> anyhow::Error {
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            stream: true,
+            options: None,
+        };
+        match provider.chat_stream(request).await {
+            Ok(_) => panic!("the scripted response must fail the request"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_completion_carries_the_servers_retry_after() {
+        // The failure this prevents: OpenRouter (or OpenAI, or any
+        // compatible endpoint) answers a chat completion `429` with
+        // `Retry-After: 60`, the error reaches the agent's retry loop with
+        // nothing under it, and the loop sleeps a ladder draw of a few
+        // seconds instead of the minute the server asked for, re-billing the
+        // prompt into another 429.
+        let provider = scripted_provider(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: \
+             application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n\
+             {\"error\":\"rate limited\"}",
+        )
+        .await;
+        let err = failed_chat(&provider).await;
+
+        let status = err
+            .downcast_ref::<ProviderError>()
+            .expect("the provider error is the head of the chain");
+        assert_eq!(status.status, Some(429));
+        assert!(status.is_transient());
+        assert!(
+            status.message.contains("rate limited"),
+            "{}",
+            status.message
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::llm::RetryAfter>()
+                .map(|hint| hint.0),
+            Some(std::time::Duration::from_secs(60)),
+            "the server's own deadline reaches the retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_the_header_leaves_the_ladder_in_charge() {
+        let provider = scripted_provider(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: \
+             5\r\nConnection: close\r\n\r\nbusy!",
+        )
+        .await;
+        let err = failed_chat(&provider).await;
+        assert_eq!(
+            err.downcast_ref::<ProviderError>()
+                .expect("typed")
+                .status
+                .unwrap(),
+            503
+        );
+        assert!(
+            err.downcast_ref::<crate::llm::RetryAfter>().is_none(),
+            "nothing is invented when the server said nothing"
+        );
+    }
+
+    #[test]
+    fn a_local_endpoint_is_not_given_the_cloud_stall_detector() {
+        // LM Studio / vLLM / text-generation-webui on loopback, configured as
+        // an `openai` provider: a long prefill on weak hardware is silent for
+        // minutes and must not be killed at five.
+        let local = OpenAiProvider::new("http://127.0.0.1:1234/v1", "m", "");
+        assert_eq!(local.read_timeout(), None);
+        // Adding headers rebuilds the inner client; the policy must survive.
+        let local = local.with_headers(&[("HTTP-Referer", "https://wizard.local")]);
+        assert_eq!(local.read_timeout(), None);
+
+        // A hosted endpoint keeps it: there, silence is a dead connection.
+        let cloud = OpenAiProvider::new("https://openrouter.ai/api/v1", "m", "k");
+        assert!(cloud.read_timeout().is_some());
+        assert!(
+            cloud
+                .with_headers(&[("HTTP-Referer", "https://wizard.dev")])
+                .read_timeout()
+                .is_some()
+        );
     }
 
     #[test]

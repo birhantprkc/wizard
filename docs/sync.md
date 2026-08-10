@@ -23,7 +23,7 @@ On the other machine:
 wizard sync pull wizard-sync-20260709.tar.gz
 ```
 
-One command each side. Pull verifies the bundle, prints what is new, changed, and identical, backs up anything it overwrites, and applies. The first pull pins the sender's signing key; compare the fingerprint it prints against `wizard sync key` on the source machine (see [Trust model](#trust-model)). To preview without changing anything, add `--dry-run`: it runs the full verification and prints the same summary, then stops.
+One command each side. Pull verifies the bundle, prints what is new, changed, and identical, backs up anything it overwrites, and applies. The first pull pins the sender's signing key; compare the fingerprint it prints against `wizard sync key` on the source machine (see [Trust model](#trust-model)). To preview without changing anything, add `--dry-run`: it runs the full verification and prints the same summary, then stops. A dry run pins nothing either, so a first `pull --dry-run` reports the key it *would* pin and leaves `trusted_keys` untouched.
 
 ## What's in a bundle
 
@@ -43,7 +43,7 @@ Paths are relative to `~/.wizard/`. Pieces missing on the packing machine are sk
 
 Bundles are signed with ed25519. Each machine generates a signing keypair on its first `pack`; the seed lives at `~/.wizard/sync/key` (mode 0600). The bundle embeds the sender's public key, and `manifest.sig` signs the manifest, which lists the sha256 of every file.
 
-Verification on `pull` is all-or-nothing: the signature, then the trust check, then every file hash. Nothing is written to `~/.wizard/` until everything passes.
+Verification on `pull` is all-or-nothing: the manifest signature and every file's size and sha256 first, then the trust check. Nothing is written to `~/.wizard/` until everything passes.
 
 Trust is on first use, like SSH:
 

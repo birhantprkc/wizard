@@ -13,7 +13,6 @@
 //! `config.toml`. The account id needed on every API call is a claim inside the
 //! `id_token` and is stored alongside the tokens.
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::oauth_callback::{self, Callback, Cancel};
+use super::oauth_callback::{self, Callback, Cancel, PasteChannel};
 use super::xai_oauth::{generate_pkce, jwt_exp};
 use crate::config::Config;
 
@@ -76,18 +75,21 @@ pub fn token_path() -> Result<PathBuf> {
     Ok(Config::wizard_dir()?.join("chatgpt_oauth.json"))
 }
 
-/// Write tokens atomically at 0600 (temp file in the same dir, then rename).
+/// Write tokens atomically, owner-only, through
+/// [`crate::platform::secrets::write_private_atomic`].
+///
+/// This used to be a hand-written copy of that sequence with a *fixed* scratch
+/// name, `.chatgpt_oauth.json.tmp`, opened `truncate(true)` — the same bug
+/// `xai_oauth::save_tokens` documents and fixed the same way. Two Wizards
+/// refreshing an expired access token at the same moment, ordinary on a
+/// machine running two sessions, both truncated that one name and interleaved
+/// their writes into a single inode: the first rename published a JSON blob
+/// spliced from two token sets and the second failed with ENOENT. The platform
+/// primitive owns the scratch name, the modes, and the fsync-before-rename for
+/// every secret Wizard stores.
 pub fn save_tokens(path: &Path, tokens: &StoredTokens) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        harden_dir(parent);
-    }
     let json = serde_json::to_string_pretty(tokens).context("serializing ChatGPT tokens")?;
-    let tmp = path.with_file_name(".chatgpt_oauth.json.tmp");
-    write_private(&tmp, json.as_bytes())?;
-    std::fs::rename(&tmp, path).with_context(|| format!("saving {}", path.display()))?;
-    Ok(())
+    crate::platform::secrets::write_private_atomic(path, json.as_bytes())
 }
 
 /// Read the stored tokens; `Ok(None)` when the file is absent.
@@ -109,35 +111,6 @@ pub fn clear_tokens(path: &Path) -> Result<()> {
         Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
     }
 }
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(unix)]
-fn harden_dir(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-}
-
-#[cfg(not(unix))]
-fn harden_dir(_dir: &Path) {}
 
 // ---------------------------------------------------------------------------
 // The id_token's account-id claim
@@ -171,6 +144,15 @@ pub struct PendingLogin {
     redirect_uri: String,
     verifier: String,
     listener: TcpListener,
+}
+
+impl PendingLogin {
+    /// The port the redirect will come back on — either of the two registered
+    /// ones, whichever [`bind_callback_listener`] got. `None` only if the
+    /// socket cannot name itself, which costs a hint and nothing more.
+    fn callback_port(&self) -> Option<u16> {
+        self.listener.local_addr().ok().map(|addr| addr.port())
+    }
 }
 
 /// Bind the (registered) callback port and build the authorize URL. The
@@ -212,6 +194,17 @@ pub fn begin_login() -> Result<PendingLogin> {
 /// it when a second sign-in replaces this one. A caller with no competition for
 /// the port passes [`Cancel::never`].
 pub async fn wait_and_complete(pending: PendingLogin, cancel: Cancel) -> Result<StoredTokens> {
+    wait_and_complete_with_paste(pending, cancel, PasteChannel::Disabled).await
+}
+
+/// [`wait_and_complete`], with the option of taking the redirect off stdin as
+/// well as off the listener — the only way through for a session whose browser
+/// is on another machine and no tunnel between them.
+pub async fn wait_and_complete_with_paste(
+    pending: PendingLogin,
+    cancel: Cancel,
+    paste: PasteChannel,
+) -> Result<StoredTokens> {
     let PendingLogin {
         state,
         redirect_uri,
@@ -220,9 +213,16 @@ pub async fn wait_and_complete(pending: PendingLogin, cancel: Cancel) -> Result<
         ..
     } = pending;
     let expected = state.clone();
-    let code = oauth_callback::serve_redirect(listener, cancel, |target| {
-        parse_callback(target, &expected)
-    })
+    let spec = matches!(paste, PasteChannel::Stdin).then(|| oauth_callback::PasteSpec {
+        callback_path: CALLBACK_PATH,
+        state: expected.clone(),
+    });
+    let code = oauth_callback::serve_redirect_or_paste(
+        listener,
+        cancel,
+        |target| parse_callback(target, &expected),
+        spec,
+    )
     .await?;
 
     let token = exchange_code(&code, &redirect_uri, &verifier).await?;
@@ -253,7 +253,10 @@ pub fn provider_config() -> crate::config::ProviderConfig {
 
 /// The self-contained terminal flow (`wizard --login chatgpt`): open the
 /// browser, wait, exchange. `report` receives progress lines.
-pub async fn login<F>(report: F) -> Result<()>
+///
+/// `paste` says whether this caller owns stdin and can therefore offer the
+/// remote-session fallback; see [`PasteChannel`].
+pub async fn login<F>(report: F, paste: PasteChannel) -> Result<()>
 where
     F: Fn(&str) + Send + Sync,
 {
@@ -263,9 +266,15 @@ where
         pending.authorize_url
     ));
     open_browser(&pending.authorize_url);
+    if let Some(hint) = pending
+        .callback_port()
+        .and_then(oauth_callback::remote_hint)
+    {
+        report(&hint);
+    }
     report("waiting for the browser callback (5 minute timeout)...");
     // Nothing else in a terminal run competes for the callback port.
-    wait_and_complete(pending, Cancel::never()).await?;
+    wait_and_complete_with_paste(pending, Cancel::never(), paste).await?;
     report(&format!(
         "signed in to ChatGPT; tokens saved to {}",
         token_path()?.display()
@@ -285,7 +294,7 @@ pub struct TokenResponse {
 
 /// Exchange the authorization `code` for tokens (form-encoded, per OAuth).
 async fn exchange_code(code: &str, redirect_uri: &str, verifier: &str) -> Result<TokenResponse> {
-    let http = reqwest::Client::new();
+    let http = crate::llm::oauth_http_client();
     let response = http
         .post(TOKEN_URL)
         .form(&[
@@ -324,8 +333,19 @@ pub struct RevokedGrant {
 
 /// Refresh an access token (JSON body, per Codex). Returns the tokens to
 /// persist; the caller merges them (a refresh may omit the refresh token).
+///
+/// Every failure here is typed, because this runs on the way into a model call
+/// and whatever it raises is what the agent's retry ladder has to classify. An
+/// untyped error lands on
+/// [`error_is_transient`](crate::agent::error_is_transient)'s permissive
+/// fallback and is retried, which is the wrong answer for exactly the one case
+/// that matters: [`RevokedGrant`] is permanent, and retrying it burns the
+/// backoff ladder and a circuit-breaker trip before the user is finally shown
+/// the line telling them to sign in again. The reachability failures go the
+/// other way and stay retryable: the token host being unreachable for a moment
+/// must not end a run that has been going for an hour.
 pub async fn refresh(refresh_token: &str) -> Result<TokenResponse> {
-    let http = reqwest::Client::new();
+    let http = crate::llm::oauth_http_client();
     let response = http
         .post(TOKEN_URL)
         .json(&json!({
@@ -335,24 +355,42 @@ pub async fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         }))
         .send()
         .await
-        .context("refreshing the ChatGPT token")?;
+        .map_err(|source| {
+            anyhow::Error::new(crate::llm::ProviderError::transport(format!(
+                "could not reach {TOKEN_URL} to refresh the ChatGPT token: {source}"
+            )))
+        })?;
     let status = response.status();
     if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
         let body = response.text().await.unwrap_or_default();
-        return Err(RevokedGrant {
+        let revoked = RevokedGrant {
             status: status.as_u16(),
             body,
-        }
-        .into());
+        };
+        // The typed `ProviderError` rides *under* `RevokedGrant` on the chain,
+        // the same arrangement `http_error_with_retry_after` uses: the
+        // caller's `err.is::<RevokedGrant>()` still finds it, the message the
+        // user sees is still the revoked-grant one, and the retry class is now
+        // readable too.
+        return Err(
+            anyhow::Error::new(crate::llm::ProviderError::http(401, revoked.to_string()))
+                .context(revoked),
+        );
     }
     if !status.is_success() {
+        let retry_after = crate::llm::retry_after_from_headers(response.headers());
         let body = response.text().await.unwrap_or_default();
-        bail!("ChatGPT token refresh failed (HTTP {status}): {body}");
+        return Err(crate::llm::http_error_with_retry_after(
+            status.as_u16(),
+            format!("ChatGPT token refresh failed (HTTP {status}): {body}"),
+            retry_after,
+        ));
     }
-    response
-        .json()
-        .await
-        .context("parsing the ChatGPT refresh response")
+    response.json().await.map_err(|source| {
+        anyhow::Error::new(crate::llm::ProviderError::transport(format!(
+            "could not parse the ChatGPT refresh response: {source}"
+        )))
+    })
 }
 
 /// True when `access_token` expires within [`EXPIRY_LEEWAY_SECS`]. A token with
@@ -511,6 +549,104 @@ mod tests {
                 .as_bytes(),
         );
         format!("{header}.{payload}.sig")
+    }
+
+    /// The store goes through `platform::secrets`, which owns the scratch name.
+    ///
+    /// The name this module used to hard-code, `.chatgpt_oauth.json.tmp`, was
+    /// opened with `truncate(true)`: anything already at that name was
+    /// overwritten. That is both how two concurrent refreshes spliced one token
+    /// file — ordinary on a machine running two sessions, since an expired
+    /// access token has both of them refreshing at once — and how a name
+    /// planted by another local user would have redirected the write. Planting
+    /// that exact name is therefore the observation that the old sequence is
+    /// gone; `xai_oauth` carries the same test for the same reason.
+    #[test]
+    fn saving_tokens_never_reuses_the_old_fixed_scratch_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("wizard-home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let planted = home.join(".chatgpt_oauth.json.tmp");
+        std::fs::write(&planted, b"not ours").expect("plant the old scratch name");
+
+        let path = home.join("chatgpt_oauth.json");
+        save_tokens(
+            &path,
+            &StoredTokens {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt".to_string()),
+                id_token: None,
+                account_id: None,
+            },
+        )
+        .expect("save");
+
+        assert_eq!(
+            std::fs::read(&planted).expect("read the planted file"),
+            b"not ours",
+            "the old fixed scratch name is still written through"
+        );
+        assert_eq!(
+            load_tokens(&path)
+                .expect("load")
+                .expect("present")
+                .access_token,
+            "at"
+        );
+
+        // The write cleans up after itself: nothing new but the token file.
+        let mut left: Vec<String> = std::fs::read_dir(&home)
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![".chatgpt_oauth.json.tmp", "chatgpt_oauth.json"],
+            "{left:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "tokens stay owner-only");
+        }
+    }
+
+    /// Concurrent refreshes publish one writer's file, never a splice.
+    #[test]
+    fn concurrent_saves_never_publish_a_spliced_token_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("wizard-home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let path = home.join("chatgpt_oauth.json");
+
+        // Long enough that one write is many syscalls, so a splice shows up as
+        // a mixed file rather than needing a lucky interleaving.
+        let tokens: Vec<StoredTokens> = (0..8u8)
+            .map(|n| StoredTokens {
+                access_token: std::iter::repeat_n(char::from(b'a' + n), 200_000).collect(),
+                refresh_token: None,
+                id_token: None,
+                account_id: None,
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for token in &tokens {
+                scope.spawn(|| save_tokens(&path, token).expect("save"));
+            }
+        });
+
+        let landed = load_tokens(&path).expect("parses").expect("present");
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.access_token == landed.access_token),
+            "the published file is not any one writer's"
+        );
     }
 
     #[test]

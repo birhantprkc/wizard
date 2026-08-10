@@ -9,6 +9,12 @@ use tokio::sync::mpsc;
 
 use crate::agent::AgentEvent;
 
+/// Consecutive terminal-read failures after which input is declared gone.
+/// Small on purpose: the errors this counts are not the recoverable kind
+/// arriving in a burst, they are the same failure repeating as fast as the
+/// reader can ask for it.
+const INPUT_FAULT_LIMIT: u32 = 64;
+
 /// Everything the TUI main loop reacts to.
 #[derive(Debug)]
 pub enum Event {
@@ -53,6 +59,17 @@ pub enum Event {
     /// already sent as [`Event::Notice`]; this only clears the in-flight flag
     /// so another `/btw` can run.
     BtwFinished,
+    /// Terminal input has ended and will never resume: stdin closed, the pty
+    /// was detached, or the reader gave up on a stream that only produces
+    /// errors. Carries a short reason for the farewell notice.
+    ///
+    /// The main loop must **quit** on this. Without it the reader task simply
+    /// returned while the tick task kept ticking, so the TUI went on repainting
+    /// at its full cadence — a session that looks completely alive and can
+    /// never receive another keystroke. The only way out is killing it from
+    /// another terminal, which is as close to "it randomly stopped" as this
+    /// program gets.
+    InputClosed(String),
 }
 
 /// Owns the merged event channel. A background task pumps crossterm's
@@ -72,23 +89,44 @@ impl EventLoop {
         let input_tx = tx.clone();
         tokio::spawn(async move {
             let mut stream = EventStream::new();
-            while let Some(item) = stream.next().await {
+            // Consecutive read errors. A single one is worth ignoring — a
+            // signal arriving mid-read shows up here — but a detached pty
+            // fails *every* read, and the old `continue` turned that into a
+            // spin that pegged a core for as long as the session was left
+            // open. Past this many in a row the stream is treated as gone.
+            let mut faults: u32 = 0;
+            let ended = loop {
+                let Some(item) = stream.next().await else {
+                    break "terminal input ended (stdin closed)".to_string();
+                };
                 let event = match item {
                     Ok(CrosstermEvent::Key(key)) => Event::Key(key),
                     Ok(CrosstermEvent::Mouse(mouse)) => Event::Mouse(mouse),
                     Ok(CrosstermEvent::Paste(text)) => Event::Paste(text),
                     Ok(CrosstermEvent::Resize(cols, rows)) => Event::Resize(cols, rows),
-                    Ok(CrosstermEvent::FocusGained | CrosstermEvent::FocusLost) => continue,
+                    Ok(CrosstermEvent::FocusGained | CrosstermEvent::FocusLost) => {
+                        faults = 0;
+                        continue;
+                    }
                     Err(err) => {
                         tracing::warn!("terminal event stream error: {err}");
+                        faults += 1;
+                        if faults >= INPUT_FAULT_LIMIT {
+                            break format!("terminal input failed repeatedly: {err}");
+                        }
                         continue;
                     }
                 };
+                faults = 0;
                 if input_tx.send(event).await.is_err() {
-                    // Receiver gone: the main loop has shut down.
-                    break;
+                    // Receiver gone: the main loop has shut down. Nothing to
+                    // report to — return rather than announce.
+                    return;
                 }
-            }
+            };
+            // Say so rather than returning quietly, or the tick task keeps the
+            // frame repainting over a session nobody can type into.
+            let _ = input_tx.send(Event::InputClosed(ended)).await;
         });
 
         let tick_tx = tx.clone();

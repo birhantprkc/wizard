@@ -14,7 +14,6 @@
 //! Tokens never go into `config.toml`; keys live in env vars or dedicated
 //! files only.
 
-use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::oauth_callback::{self, Callback, Cancel};
+use super::oauth_callback::{self, Callback, Cancel, PasteChannel};
 use super::openai::TokenSource;
 use crate::config::Config;
 
@@ -41,6 +40,8 @@ const SCOPE: &str = "openid profile email offline_access grok-cli:access api:acc
 /// xAI only redirects the browser to the address it has on file, so this is the
 /// single port the flow can work on.
 const CALLBACK_PORT: u16 = 56121;
+/// The path half of that registered callback.
+const CALLBACK_PATH: &str = "/callback";
 /// Refresh the access token when it expires within this many seconds.
 const EXPIRY_LEEWAY_SECS: i64 = 120;
 
@@ -177,7 +178,12 @@ static TEST_DISCOVERY_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// Process-wide, like the flows it stands in for: a test that sets it takes
 /// [`oauth_callback::serial_callback_port`] first, which is the same lock the
 /// one fixed callback port already forces it to hold.
+///
+/// The only caller is `src/gui/oauth.rs`, which lives behind `--features
+/// native`: a default-feature test build compiles this seam and exercises none
+/// of it, which is not the same thing as it being unused.
 #[cfg(test)]
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) fn use_test_discovery_url(url: &str) {
     *TEST_DISCOVERY_URL
         .lock()
@@ -226,48 +232,21 @@ pub fn token_path() -> Result<PathBuf> {
     Ok(Config::wizard_dir()?.join("xai_oauth.json"))
 }
 
-/// Write tokens atomically: 0600 temp file in the same directory, then
-/// rename over the target. The parent directory is created (and tightened to
-/// 0700) first.
+/// Write tokens atomically, owner-only, through
+/// [`crate::platform::secrets::write_private_atomic`].
+///
+/// This used to be a hand-written copy of that sequence (create the parent,
+/// chmod 0700, open 0600, chmod again, write, fsync, rename) with a *fixed*
+/// scratch name, `.xai_oauth.json.tmp`. Two Wizards refreshing an expired
+/// access token at the same moment, which is ordinary on a machine running two
+/// sessions, both truncated that one name and interleaved their writes into a
+/// single inode: the first rename published a JSON blob spliced from two token
+/// sets and the second failed with ENOENT. The platform primitive owns the
+/// scratch name, the modes, and the fsync-before-rename for every secret
+/// Wizard stores.
 pub fn save_tokens(path: &Path, tokens: &StoredTokens) -> Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("token path {} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-    }
-
     let raw = serde_json::to_string_pretty(tokens).context("serializing xAI tokens")?;
-    let tmp = dir.join(".xai_oauth.json.tmp");
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        // create(true) keeps the mode of a pre-existing file; enforce 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting permissions on {}", tmp.display()))?;
-        }
-        file.write_all(raw.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
-    Ok(())
+    crate::platform::secrets::write_private_atomic(path, raw.as_bytes())
 }
 
 /// Read stored tokens; `Ok(None)` when nobody has logged in yet.
@@ -324,7 +303,7 @@ struct PendingLogin {
 /// Discover the endpoints, mint PKCE + state, and build the authorize URL for a
 /// `redirect_uri` the **caller** serves.
 async fn begin_login(redirect_uri: &str) -> Result<PendingLogin> {
-    let http = reqwest::Client::new();
+    let http = crate::llm::oauth_http_client();
     let discovery = discover(&http).await?;
 
     let pkce = generate_pkce()?;
@@ -363,7 +342,7 @@ async fn complete_login(pending: PendingLogin, code: &str, state: &str) -> Resul
         state == pending.state,
         "the sign-in state did not match — start again"
     );
-    let http = reqwest::Client::new();
+    let http = crate::llm::oauth_http_client();
     let token = exchange_code(
         &http,
         &pending.token_endpoint,
@@ -407,6 +386,9 @@ pub fn provider_config() -> crate::config::ProviderConfig {
 pub struct PendingBrowserLogin {
     /// Send the user here.
     pub authorize_url: String,
+    /// The port the redirect will come back on — needed to explain the flow to
+    /// a session whose browser is on another machine.
+    pub port: u16,
     listener: TcpListener,
     pending: PendingLogin,
 }
@@ -422,9 +404,10 @@ pub async fn begin_browser_login() -> Result<PendingBrowserLogin> {
         .port();
     // Derived from the port actually bound, so authorize and token-exchange
     // agree byte-for-byte on the redirect_uri.
-    let pending = begin_login(&format!("http://127.0.0.1:{port}/callback")).await?;
+    let pending = begin_login(&format!("http://127.0.0.1:{port}{CALLBACK_PATH}")).await?;
     Ok(PendingBrowserLogin {
         authorize_url: pending.authorize_url.clone(),
+        port,
         listener,
         pending,
     })
@@ -440,13 +423,31 @@ pub async fn wait_and_complete(
     pending: PendingBrowserLogin,
     cancel: Cancel,
 ) -> Result<StoredTokens> {
+    wait_and_complete_with_paste(pending, cancel, PasteChannel::Disabled).await
+}
+
+/// [`wait_and_complete`], with the option of taking the redirect off stdin as
+/// well as off the listener — the only way through for a session whose browser
+/// is on another machine and no tunnel between them.
+pub async fn wait_and_complete_with_paste(
+    pending: PendingBrowserLogin,
+    cancel: Cancel,
+    paste: PasteChannel,
+) -> Result<StoredTokens> {
     let PendingBrowserLogin {
         listener, pending, ..
     } = pending;
     let expected_state = pending.state.clone();
-    let code = oauth_callback::serve_redirect(listener, cancel, |target| {
-        parse_callback(target, &expected_state)
-    })
+    let spec = matches!(paste, PasteChannel::Stdin).then(|| oauth_callback::PasteSpec {
+        callback_path: CALLBACK_PATH,
+        state: expected_state.clone(),
+    });
+    let code = oauth_callback::serve_redirect_or_paste(
+        listener,
+        cancel,
+        |target| parse_callback(target, &expected_state),
+        spec,
+    )
     .await?;
     let state = pending.state.clone();
     complete_login(pending, &code, &state).await
@@ -455,7 +456,10 @@ pub async fn wait_and_complete(
 /// The self-contained terminal flow (`wizard --login xai`, `/login xai`): open
 /// the browser, wait, exchange. `report` receives human-readable progress lines
 /// (stdout for the CLI flag, transcript notices for the slash command).
-pub async fn login<F>(report: F) -> Result<()>
+///
+/// `paste` says whether this caller owns stdin and can therefore offer the
+/// remote-session fallback; see [`PasteChannel`].
+pub async fn login<F>(report: F, paste: PasteChannel) -> Result<()>
 where
     F: Fn(&str) + Send + Sync,
 {
@@ -465,9 +469,12 @@ where
         pending.authorize_url
     ));
     open_browser(&pending.authorize_url);
+    if let Some(hint) = oauth_callback::remote_hint(pending.port) {
+        report(&hint);
+    }
     report("waiting for the browser callback (5 minute timeout)...");
     // Nothing else in a terminal run competes for the callback port.
-    wait_and_complete(pending, Cancel::never()).await?;
+    wait_and_complete_with_paste(pending, Cancel::never(), paste).await?;
     report(&format!(
         "signed in to xAI; tokens saved to {}",
         token_path()?.display()
@@ -556,7 +563,7 @@ fn parse_callback(target: &str, expected_state: &str) -> Callback {
         Ok(url) => url,
         Err(_) => return Callback::Ignored,
     };
-    if url.path() != "/callback" {
+    if url.path() != CALLBACK_PATH {
         return Callback::Ignored;
     }
     let mut code = None;
@@ -630,7 +637,42 @@ async fn exchange_code(
 pub struct XaiTokenSource {
     http: reqwest::Client,
     path: PathBuf,
-    cache: Mutex<Option<StoredTokens>>,
+    /// The tokens, and when they were last replaced. Both live under the one
+    /// lock, which is held *across* the refresh HTTP call: a refresh token is
+    /// single-use, so two concurrent refreshes would spend the same one and
+    /// the loser would be told its grant was revoked — and then delete the
+    /// token file. `/ultra` fans several candidates at one endpoint per turn,
+    /// so concurrent is the ordinary case, not the exotic one.
+    cache: Mutex<TokenCache>,
+}
+
+/// The cached tokens plus the moment they were last refreshed.
+#[derive(Debug, Default)]
+struct TokenCache {
+    tokens: Option<StoredTokens>,
+    /// When [`XaiTokenSource::refresh`] last succeeded. `None` before the
+    /// first one. See [`XaiTokenSource::refresh_after_unauthorized`], which
+    /// compares it against the moment a caller *entered* to decide whether the
+    /// 401 it is reacting to has already been answered by somebody else.
+    refreshed_at: Option<Instant>,
+}
+
+/// Turn a refresh failure into an error the retry ladder can classify.
+///
+/// This is the whole point of the function. A refresh runs on the way into
+/// every model call, so whatever it raises is what the agent sees, and an
+/// untyped `anyhow` error reaches
+/// [`error_is_transient`](crate::agent::error_is_transient)'s permissive
+/// fallback and is retried — including the one case that must never be
+/// retried, a grant the user has to sign in again to replace. Naming a status
+/// makes each outcome say what it is: `None` for a transport failure that a
+/// retry may well fix, 401 for a session that is gone, the endpoint's own
+/// status for anything it answered with.
+fn refresh_error(status: Option<u16>, message: String) -> anyhow::Error {
+    anyhow::Error::new(match status {
+        Some(status) => crate::llm::ProviderError::http(status, message),
+        None => crate::llm::ProviderError::transport(message),
+    })
 }
 
 impl XaiTokenSource {
@@ -642,32 +684,41 @@ impl XaiTokenSource {
     /// Source reading from an explicit path (tests).
     pub fn with_path(path: PathBuf) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::llm::oauth_http_client(),
             path,
-            cache: Mutex::new(None),
+            cache: Mutex::new(TokenCache::default()),
         }
     }
 
     /// Ensure the cache holds tokens, loading from disk on first use.
-    fn ensure_loaded<'a>(
-        &self,
-        cache: &'a mut Option<StoredTokens>,
-    ) -> Result<&'a mut StoredTokens> {
-        if cache.is_none() {
-            *cache = load_tokens(&self.path)?;
+    ///
+    /// "Not signed in" is a permanent 401 rather than a bare message: there is
+    /// no token file, so no amount of backing off produces one, and letting it
+    /// climb the ladder spends seven retries and a circuit-breaker trip before
+    /// showing the user the one line that would have helped them.
+    fn ensure_loaded<'a>(&self, cache: &'a mut TokenCache) -> Result<&'a mut StoredTokens> {
+        if cache.tokens.is_none() {
+            cache.tokens = load_tokens(&self.path)?;
         }
-        cache.as_mut().ok_or_else(|| {
-            anyhow!("not signed in to xAI; run `wizard --login xai` (or /login xai) first")
+        cache.tokens.as_mut().ok_or_else(|| {
+            refresh_error(
+                Some(401),
+                "not signed in to xAI; run `wizard --login xai` (or /login xai) first".to_string(),
+            )
         })
     }
 
     /// Refresh the access token via the stored refresh token. On a 400/401
     /// from the token endpoint the stored tokens are cleared (the grant is
     /// gone for good) and the user is told to log in again.
-    async fn refresh(&self, cache: &mut Option<StoredTokens>) -> Result<()> {
+    async fn refresh(&self, cache: &mut TokenCache) -> Result<()> {
         let tokens = self.ensure_loaded(cache)?;
         let refresh_token = tokens.refresh_token.clone().ok_or_else(|| {
-            anyhow!("the stored xAI session has no refresh token; run `wizard --login xai` again")
+            refresh_error(
+                Some(401),
+                "the stored xAI session has no refresh token; run `wizard --login xai` again"
+                    .to_string(),
+            )
         })?;
         let token_endpoint = tokens.token_endpoint.clone();
         validate_xai_https(&token_endpoint)?;
@@ -684,26 +735,51 @@ impl XaiTokenSource {
             .form(&form)
             .send()
             .await
-            .with_context(|| format!("refreshing the xAI access token at {token_endpoint}"))?;
+            // A DNS failure, a refused connect, a dead TLS handshake or the
+            // client's own request timeout: auth.x.ai being unreachable for a
+            // moment is not a reason to end a run that has been going for an
+            // hour, so it carries no status and is therefore transient.
+            .map_err(|source| {
+                refresh_error(
+                    None,
+                    format!(
+                        "could not reach {token_endpoint} to refresh the xAI access token: {source}"
+                    ),
+                )
+            })?;
         let status = response.status();
         if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
         {
             let body = response.text().await.unwrap_or_default();
             let _ = clear_tokens(&self.path);
-            *cache = None;
-            bail!(
-                "the xAI session was revoked or expired (HTTP {status}: {body}); \
-                 run `wizard --login xai` to sign in again"
-            );
+            cache.tokens = None;
+            return Err(refresh_error(
+                Some(401),
+                format!(
+                    "the xAI session was revoked or expired (HTTP {status}: {body}); \
+                     run `wizard --login xai` to sign in again"
+                ),
+            ));
         }
         if !status.is_success() {
+            let retry_after = crate::llm::retry_after_from_headers(response.headers());
             let body = response.text().await.unwrap_or_default();
-            bail!("xAI token refresh returned HTTP {status}: {body}");
+            // The endpoint's own status, so a 429 or a 503 from auth.x.ai
+            // backs off and comes back rather than ending the run.
+            return Err(crate::llm::http_error_with_retry_after(
+                status.as_u16(),
+                format!("xAI token refresh returned HTTP {status}: {body}"),
+                retry_after,
+            ));
         }
-        let refreshed: TokenResponse = response
-            .json()
-            .await
-            .context("parsing the xAI refresh response")?;
+        let refreshed: TokenResponse = response.json().await.map_err(|source| {
+            // A truncated or non-JSON body from the token endpoint means the
+            // response was mangled in transit, not that the grant is bad.
+            refresh_error(
+                None,
+                format!("could not parse the xAI refresh response: {source}"),
+            )
+        })?;
 
         let updated = StoredTokens {
             access_token: refreshed.access_token,
@@ -712,8 +788,12 @@ impl XaiTokenSource {
             token_type: refreshed.token_type.unwrap_or_else(|| "Bearer".to_string()),
             token_endpoint,
         };
+        // Persisted before it is cached, so a re-exec or a second Wizard picks
+        // up the token this one just minted instead of replaying the spent
+        // refresh token it still has on disk.
         save_tokens(&self.path, &updated)?;
-        *cache = Some(updated);
+        cache.tokens = Some(updated);
+        cache.refreshed_at = Some(Instant::now());
         Ok(())
     }
 }
@@ -726,11 +806,36 @@ impl TokenSource for XaiTokenSource {
         if expires_soon_at(&tokens.access_token, unix_now()) {
             self.refresh(&mut cache).await?;
         }
-        Ok(cache.as_ref().map(|tokens| tokens.access_token.clone()))
+        Ok(cache
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.access_token.clone()))
     }
 
+    /// Force a refresh after the API answered 401 — unless somebody already
+    /// did.
+    ///
+    /// The 401 this reacts to happened strictly before this call started, so a
+    /// refresh that *completed* after it started has already replaced the
+    /// token that was rejected: refreshing again would spend a second
+    /// single-use grant to obtain a token no better than the one now in hand.
+    /// That is not merely wasteful. xAI rotates the refresh token, and a burst
+    /// of N parallel subagents all hitting one expiry would queue N refreshes
+    /// on this mutex, each one racing the server's tolerance for a grant it has
+    /// just superseded; the first to be judged stale takes the whole session
+    /// down, because a rejected refresh deletes the token file.
+    ///
+    /// Timing is read before the lock deliberately — the wait *is* the window
+    /// in which someone else's refresh lands.
     async fn refresh_after_unauthorized(&self) -> Result<bool> {
+        let entered = Instant::now();
         let mut cache = self.cache.lock().await;
+        if cache
+            .refreshed_at
+            .is_some_and(|refreshed| refreshed >= entered)
+        {
+            return Ok(true);
+        }
         self.refresh(&mut cache).await?;
         Ok(true)
     }
@@ -847,6 +952,61 @@ mod tests {
     }
 
     #[test]
+    fn saving_tokens_leaves_no_scratch_file_and_never_reuses_a_fixed_name() {
+        // The store went through `platform::secrets`, which owns the scratch
+        // name. The name this module used to hard-code, `.xai_oauth.json.tmp`,
+        // was opened with `truncate(true)`: anything already sitting there was
+        // overwritten, which is both how two concurrent refreshes spliced one
+        // token file and how a name planted by another local user would have
+        // redirected the write. Planting that exact name is therefore the
+        // observation that the old sequence is gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("wizard-home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let planted = home.join(".xai_oauth.json.tmp");
+        std::fs::write(&planted, b"not ours").expect("plant the old scratch name");
+
+        let path = home.join("xai_oauth.json");
+        save_tokens(
+            &path,
+            &StoredTokens {
+                access_token: "at".to_string(),
+                refresh_token: None,
+                token_type: "Bearer".to_string(),
+                token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
+            },
+        )
+        .expect("save");
+
+        assert_eq!(
+            std::fs::read(&planted).expect("read the planted file"),
+            b"not ours",
+            "the old fixed scratch name is still written through"
+        );
+        assert_eq!(
+            load_tokens(&path)
+                .expect("load")
+                .expect("present")
+                .access_token,
+            "at"
+        );
+
+        // And the write cleans up after itself: the only files this call may
+        // add are the token file and nothing else.
+        let mut left: Vec<String> = std::fs::read_dir(&home)
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![".xai_oauth.json.tmp", "xai_oauth.json"],
+            "{left:?}"
+        );
+    }
+
+    #[test]
     fn missing_token_file_reads_as_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("absent.json");
@@ -944,5 +1104,176 @@ mod tests {
             err.to_string().contains("wizard --login xai"),
             "error should name the login command: {err}"
         );
+    }
+
+    /// Every way a refresh can fail has to reach the retry ladder as a
+    /// classifiable error, and the two directions matter for opposite reasons.
+    ///
+    /// A refresh runs on the way into every model call, so whatever it raises
+    /// is what ends the turn. Untyped, all of them took
+    /// `error_is_transient`'s permissive fallback and were retried: a session
+    /// the user has to sign in again to replace burned the whole ladder and a
+    /// circuit-breaker trip before finally showing them the line that would
+    /// have helped. Typed, "the token host was briefly unreachable" retries
+    /// (which is the failure that silently ends a long run) and "the grant is
+    /// gone" stops at once with the instruction.
+    #[test]
+    fn refresh_failures_are_typed_so_the_ladder_can_tell_them_apart() {
+        let unreachable = refresh_error(None, "dns lookup failed".to_string());
+        let provider = unreachable
+            .downcast_ref::<crate::llm::ProviderError>()
+            .expect("typed");
+        assert_eq!(provider.status, None);
+        assert!(
+            provider.is_transient(),
+            "auth.x.ai being unreachable for a moment must not end an hour-long run"
+        );
+
+        let revoked = refresh_error(Some(401), "sign in again".to_string());
+        assert!(
+            !revoked
+                .downcast_ref::<crate::llm::ProviderError>()
+                .expect("typed")
+                .is_transient(),
+            "a revoked grant never refreshes, however long we wait"
+        );
+
+        // The token endpoint's own transient statuses stay transient.
+        for status in [429, 500, 503] {
+            assert!(
+                refresh_error(Some(status), "later".to_string())
+                    .downcast_ref::<crate::llm::ProviderError>()
+                    .expect("typed")
+                    .is_transient(),
+                "HTTP {status} from the token endpoint"
+            );
+        }
+    }
+
+    /// Not being signed in is permanent, not a thing to back off from.
+    #[tokio::test]
+    async fn not_being_signed_in_ends_the_call_instead_of_climbing_the_ladder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = XaiTokenSource::with_path(dir.path().join("xai_oauth.json"));
+        let err = source.bearer().await.expect_err("must fail");
+        let provider = err
+            .downcast_ref::<crate::llm::ProviderError>()
+            .expect("typed");
+        assert_eq!(provider.status, Some(401));
+        assert!(
+            !provider.is_transient(),
+            "no amount of backoff produces a token file that is not there"
+        );
+
+        // A session stored without a refresh token is the same kind of dead
+        // end: there is nothing to refresh with.
+        let path = dir.path().join("no-refresh.json");
+        save_tokens(
+            &path,
+            &StoredTokens {
+                access_token: "at".to_string(),
+                refresh_token: None,
+                token_type: "Bearer".to_string(),
+                token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
+            },
+        )
+        .expect("save");
+        let source = XaiTokenSource::with_path(path);
+        let err = source
+            .refresh_after_unauthorized()
+            .await
+            .expect_err("nothing to refresh with");
+        assert!(
+            !err.downcast_ref::<crate::llm::ProviderError>()
+                .expect("typed")
+                .is_transient()
+        );
+        assert!(format!("{err:#}").contains("wizard --login xai"));
+    }
+
+    /// A 401 that another task's refresh has already answered must not spend a
+    /// second single-use grant.
+    ///
+    /// xAI rotates the refresh token, so N parallel subagents meeting one
+    /// expiry queue N refreshes on this mutex, each spending a grant the
+    /// previous one just superseded. The first the server judges stale comes
+    /// back as "revoked" — and a revoked refresh *deletes the token file*, so
+    /// a burst of concurrency signs the user out of a session that was fine.
+    ///
+    /// The stored endpoint is deliberately not an x.ai host: a refresh that
+    /// actually ran would fail at [`validate_xai_https`], with no network
+    /// call. So the `Ok` below can only mean the refresh was skipped.
+    #[tokio::test]
+    async fn a_401_already_answered_while_waiting_for_the_lock_spends_no_second_grant() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("xai_oauth.json");
+        save_tokens(
+            &path,
+            &StoredTokens {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt".to_string()),
+                token_type: "Bearer".to_string(),
+                token_endpoint: "https://not-xai.example/token".to_string(),
+            },
+        )
+        .expect("save");
+        let source = Arc::new(XaiTokenSource::with_path(path));
+
+        // The control: a refresh that does run against this store fails.
+        {
+            let mut cache = source.cache.lock().await;
+            source
+                .refresh(&mut cache)
+                .await
+                .expect_err("the pinning check refuses a non-x.ai endpoint");
+        }
+
+        // Hold the lock, as the task doing the real refresh would.
+        let mut held = source.cache.lock().await;
+        let waiter = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { source.refresh_after_unauthorized().await }
+        });
+        // Let it reach the lock and park there; its own "entered" stamp is
+        // taken before that, which is the whole point.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The sibling's refresh lands and the lock is handed over — the exact
+        // sequence a real one goes through.
+        held.refreshed_at = Some(Instant::now());
+        drop(held);
+
+        assert!(
+            waiter
+                .await
+                .expect("the task ran")
+                .expect("a refresh that already happened is not a failure"),
+            "the caller is still told to retry its request, with the new token"
+        );
+    }
+
+    /// The opposite case, so the skip above cannot be a refusal to ever
+    /// refresh: a 401 nobody has answered still drives a real refresh.
+    #[tokio::test]
+    async fn a_401_nobody_has_answered_still_refreshes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("xai_oauth.json");
+        save_tokens(
+            &path,
+            &StoredTokens {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt".to_string()),
+                token_type: "Bearer".to_string(),
+                token_endpoint: "https://not-xai.example/token".to_string(),
+            },
+        )
+        .expect("save");
+        let source = XaiTokenSource::with_path(path);
+        source
+            .refresh_after_unauthorized()
+            .await
+            .expect_err("the refresh ran, and this store cannot satisfy it");
     }
 }

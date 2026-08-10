@@ -157,12 +157,23 @@ impl ImageCache {
                 };
                 // Still ask, for the terminal's real cell size — an image only
                 // lands on a whole number of rows if we know how tall one is.
-                let mut picker =
-                    Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+                // Except under a multiplexer, where asking costs the keyboard;
+                // see `multiplexer`.
+                let mut picker = match multiplexer() {
+                    Some(_) => Picker::halfblocks(),
+                    None => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+                };
                 picker.set_protocol_type(protocol);
                 return Self::new(Some(picker));
             }
             _ => {}
+        }
+        // A multiplexer is not asked. This is the whole reason `multiplexer`
+        // exists — see its comment. Half-blocks, which need no query and which
+        // tmux passes through fine.
+        if let Some(which) = multiplexer() {
+            tracing::debug!("{which} detected: skipping the image query, using half-blocks");
+            return Self::fallback();
         }
         // Nothing to draw with: half-blocks are 24-bit colour, and without
         // colour there is nothing between them and noise.
@@ -175,6 +186,8 @@ impl ImageCache {
     }
 
     /// Half-blocks against an assumed cell size — no I/O, no terminal query.
+    ///
+    /// Also what a multiplexed terminal gets, deliberately: see [`multiplexer`].
     /// What [`App`](crate::app::App) starts with (and what tests draw against),
     /// so a frame can be rendered before, or entirely without, [`Self::detect`].
     pub fn fallback() -> Self {
@@ -382,6 +395,50 @@ fn decode(path: &Path) -> Result<DynamicImage, image::ImageError> {
 }
 
 /// The name for a [`ProtocolType`] in [`PROTOCOL_ENV`].
+/// The terminal multiplexer we are running under, if any.
+///
+/// # Why this costs the keyboard, and not just an image
+///
+/// `Picker::from_query_stdio` writes a DSR query and reads the reply. To do
+/// that, ratatui-image spawns a **detached** thread that loops on
+/// `io::stdin().read()` until it parses an answer. Its timeout only makes the
+/// *caller* give up: the thread is never joined and never cancelled, so if no
+/// answer ever comes it sits on stdin for the life of the process.
+///
+/// Under tmux or screen no answer ever comes. The query goes out wrapped in
+/// multiplexer passthrough, and tmux's `allow-passthrough` is **off** by
+/// default, so the terminal never sees it and nothing replies. From then on
+/// that thread races crossterm's `EventStream` for every byte the user types
+/// and wins most of them.
+///
+/// Measured on this tree before the fix: twenty keystrokes sent into a tmux
+/// pane, four tenths of a second apart, produced exactly **one** character in
+/// the composer. Arrow keys came through shredded — the ESC went to the thief
+/// and the rest landed as literal `[[D`. With the query skipped, all twenty
+/// land. The symptom is a terminal agent that ignores you, which reads as a
+/// hang rather than as a missing feature, and nothing on screen points at
+/// images.
+///
+/// So a multiplexer is never asked. It costs nothing real: tmux does not pass
+/// graphics protocols through by default either, so the honest answer there is
+/// half-blocks anyway. Somebody who has turned passthrough on can still force
+/// a protocol with `WIZARD_IMAGE_PROTOCOL`, which skips the query too.
+fn multiplexer() -> Option<&'static str> {
+    if std::env::var_os("TMUX").is_some() {
+        return Some("tmux");
+    }
+    // GNU screen sets STY; both set TERM to a screen*/tmux* family, which
+    // catches the case where the variables were scrubbed but TERM was not.
+    if std::env::var_os("STY").is_some() {
+        return Some("screen");
+    }
+    match std::env::var("TERM") {
+        Ok(term) if term.starts_with("tmux") => Some("tmux"),
+        Ok(term) if term.starts_with("screen") => Some("screen"),
+        _ => None,
+    }
+}
+
 fn parse_protocol(name: &str) -> Option<ProtocolType> {
     match name {
         "halfblocks" => Some(ProtocolType::Halfblocks),
@@ -482,6 +539,62 @@ mod tests {
             mime: "image/png".to_string(),
             bytes,
         }
+    }
+
+    /// A multiplexer is recognised from any of the three things that mark one.
+    ///
+    /// This is the guard on `Picker::from_query_stdio`, and what it prevents is
+    /// not a missing image — it is a terminal agent that ignores the keyboard.
+    /// The query's reader thread is detached and never joined, so under tmux
+    /// (where `allow-passthrough` is off by default and no reply can arrive) it
+    /// sits on stdin forever and races crossterm for the user's keystrokes.
+    /// Measured before the fix: twenty keypresses into a tmux pane produced one
+    /// character. See [`multiplexer`].
+    ///
+    /// Serial, and it restores what it finds: these are process-wide.
+    #[test]
+    fn a_multiplexer_is_recognised_however_it_announces_itself() {
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["TMUX", "STY", "TERM"]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        let restore = || {
+            for (key, value) in &saved {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        };
+        let clear = || unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("STY");
+            std::env::remove_var("TERM");
+        };
+
+        clear();
+        unsafe { std::env::set_var("TERM", "xterm-256color") };
+        assert_eq!(multiplexer(), None, "a plain terminal is asked");
+
+        clear();
+        unsafe { std::env::set_var("TMUX", "/tmp/tmux-1000/default,123,0") };
+        assert_eq!(multiplexer(), Some("tmux"), "$TMUX is the direct signal");
+
+        clear();
+        unsafe { std::env::set_var("STY", "1234.pts-0.host") };
+        assert_eq!(multiplexer(), Some("screen"), "GNU screen sets $STY");
+
+        // TERM alone, for the case where the variables were scrubbed — a
+        // sudo, a `env -i`, a service manager — but TERM survived.
+        clear();
+        unsafe { std::env::set_var("TERM", "screen-256color") };
+        assert_eq!(multiplexer(), Some("screen"));
+
+        clear();
+        unsafe { std::env::set_var("TERM", "tmux-256color") };
+        assert_eq!(multiplexer(), Some("tmux"));
+
+        restore();
     }
 
     #[test]

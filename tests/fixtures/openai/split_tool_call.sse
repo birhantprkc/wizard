@@ -1,0 +1,21 @@
+: OpenAI chat-completions SSE stream (POST /v1/chat/completions with
+: stream_options.include_usage). A content delta, then one tool call whose
+: arguments arrive as two fragments under the same tool_calls index, then the
+: usage block that rides on the final delta, then the [DONE] sentinel.
+:
+: Lines starting with a colon are SSE comments. Both adapters skip every line
+: that does not begin with "data" plus a colon, so this header travels with
+: the bytes without changing what is parsed.
+:
+: Transcribed from openai::tests::decodes_sse_with_split_tool_call. See the
+: header of tests/recorded_provider.rs for how to re-record it from a live
+: stream once the adapter's dump hook exists.
+
+data: {"choices":[{"delta":{"content":"Hi"}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"execute","arguments":"{\"command\":"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":4}}
+
+data: [DONE]
+

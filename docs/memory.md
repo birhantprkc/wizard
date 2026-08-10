@@ -17,8 +17,9 @@ Memory is per project, keyed on the project root, and lives entirely under
   release-flow.md
 ```
 
-The slug is the project root with every non-alphanumeric character replaced by `-`
-(`/home/you/app` → `-home-you-app`). An entry file:
+The slug is the *canonicalized* project root with every character that is not ASCII
+alphanumeric replaced by `-` (`/home/you/app` → `-home-you-app`). Case is kept, and a
+symlinked project root slugs to whatever it resolves to. An entry file:
 
 ```markdown
 ---
@@ -62,8 +63,11 @@ There is no link database; resolution is a file lookup in the memory directory.
 ## What not to save
 
 A memory has to earn its place, or the store becomes a junk drawer nobody trusts. The
-rules are in the tool description and the system prompt, so the model applies them
-before every save:
+rules are not resident in the system prompt: the always-on memory section carries the
+four types and the link syntax (what you need to *write* a memory correctly) and then
+points at `manual` topic `memory`, which serves the rules below. The `memory` tool's own
+description points at the same topic, so the model is told to look them up on the step
+where it is already about to save or delete:
 
 - Never save what the repo already records: code structure, past fixes, anything in the
   git history.
@@ -74,7 +78,7 @@ before every save:
 
 ## Seeing and managing them
 
-`/memory` in the TUI (and in the browser GUI) is the human's window onto the store:
+`/memory` in the TUI (and in the window) is the human's view of the store:
 
 | Command | What it does |
 |---------|--------------|
@@ -82,8 +86,10 @@ before every save:
 | `/memory read <name>` | Show one memory's full content |
 | `/memory forget <name>` | Delete one memory |
 
-The agent may run these itself through `run_command` — every one of them is something
-the `memory` tool already lets it do.
+The agent may run all three itself through `run_command`. Two of them it could do
+anyway: the `memory` tool's actions are `save`, `read`, and `delete`. It has no `list`,
+so bare `/memory` is the one thing here the tool does not already grant — the model
+otherwise sees the store only through the injected index.
 
 ## Compatibility
 

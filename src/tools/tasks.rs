@@ -2,8 +2,8 @@
 //! [`ToolContext`](super::ToolContext), plus the `task_output` and
 //! `task_kill` tools.
 //!
-//! The `execute` tool with `run_in_background: true` (or a mid-flight Ctrl-B
-//! promote) spawns a detached child and registers it here. A monitor task
+//! The `execute` tool with `run_in_background: true` spawns a detached child
+//! and registers it here. A monitor task
 //! captures stdout/stderr into a tail-capped buffer, enforces the
 //! [`BACKGROUND_TIMEOUT`], and records the exit. The agent loop calls
 //! [`TaskRegistry::drain_completed`] at the top of every step to notify the
@@ -41,7 +41,8 @@ const MAX_TAIL_BYTES: usize = 28_000;
 pub const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Lifecycle state of one background task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Running,
     /// Exited with the given code (`-1` when terminated by a signal).
@@ -353,15 +354,14 @@ impl TaskRegistry {
 
 /// Kill a background task's whole process tree and reap the child.
 ///
-/// Background children are spawned as their own process-group leaders, so on
-/// Unix the SIGKILL goes to the group: `sh -c` may fork the command rather
-/// than exec it (dash does), and killing only the shell would leave a
-/// grandchild running — and holding the output pipes open, which blocks the
-/// monitor until the orphan exits.
+/// Background children are spawned as their own process-group leaders, so the
+/// SIGKILL goes to the whole group: the shell may fork the command rather than
+/// exec it (dash does), and killing only the shell would leave a grandchild
+/// running, holding the output pipes open, which blocks the monitor until the
+/// orphan exits.
 async fn kill_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
     if let Some(pid) = child.id() {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        crate::platform::process::kill_group(pid);
     }
     let _ = child.kill().await;
 }
@@ -508,21 +508,19 @@ mod tests {
     use std::process::Stdio;
 
     use super::*;
+    use crate::platform::process::ProcessGroupExt;
 
-    /// Spawn `sh -c <script>` with piped stdio, ready for the registry —
-    /// same configuration as the `execute` tool's background branch,
-    /// including the own process group that `kill_tree` targets.
+    /// Spawn `script` through the platform shell with piped stdio, ready for
+    /// the registry: the same configuration as the `execute` tool's background
+    /// branch, including the own process group that `kill_tree` targets.
     fn spawn_sh(script: &str) -> tokio::process::Child {
-        let mut command = tokio::process::Command::new("sh");
+        let mut command = crate::platform::shell::tokio_command(script);
         command
-            .arg("-c")
-            .arg(script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
+            .kill_on_drop(true)
+            .own_process_group();
         command.spawn().expect("spawn test child")
     }
 

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -28,12 +29,16 @@ use std::io::IsTerminal;
 use crate::image_view::ImageCache;
 
 use super::command::CommandContext;
+use super::recover::{
+    COMPACTION_DEADLINE, DrawFaults, RebuildRecovery, TerminalWatchdog, rebuild_recovery,
+    spawn_answering, turn_failure, within,
+};
 use super::session::{
     SessionTarget, build_agent, is_local_kind, load_skill_roots, restore_ultra,
     spawn_session_rebuild, startup_client,
 };
 use super::term::{
-    TerminalGuard, copy_to_clipboard, edit_config_file, edit_prompt_in_editor,
+    TerminalGuard, copy_to_clipboard, edit_config_file, edit_prompt_in_editor, is_terminal_armed,
     restore_terminal_best_effort, setup_terminal,
 };
 use super::{AgentRebuild, App, AppAction, INTERRUPT_GRACE};
@@ -49,7 +54,7 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     // cannot do anything sensible.
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         if cli.prompt.is_some() {
-            return crate::agent::run_headless(config, cli).await;
+            return crate::headless::run(config, cli).await;
         }
         anyhow::bail!("wizard needs a terminal for the TUI; pass -p \"task\" to run headless");
     }
@@ -61,6 +66,33 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     let active_is_cloud = !is_local_kind(config.active().kind);
 
     let project_root = std::env::current_dir().context("resolving project root")?;
+
+    // Settle the per-project trust question here, and only here.
+    //
+    // This is the one moment of the TUI's life when the terminal is genuinely
+    // ours: the `is_terminal` checks above have passed, `setup_terminal` has
+    // not run (no raw mode, no alternate screen), and `EventLoop`, whose task
+    // owns crossterm's `EventStream` and drains stdin, is not started until
+    // after it. So a blocking `read_line` is safe *here* and catastrophic
+    // three hundred lines further down, which is why `trust` takes the
+    // capability as a declaration from the caller rather than probing for a
+    // tty (see `crate::trust::Console`).
+    //
+    // Everything downstream keeps declaring nothing: `build_agent` below and
+    // every mid-session rebuild (`/model`, a provider switch, `/fusion`, crash
+    // recovery) go through `hooks::load`, which refuses rather than asks. They
+    // find the answer this call recorded and ask nothing.
+    //
+    // The refusal is *not* printed. The alternate screen wipes the terminal a
+    // moment later, so anything written here is invisible; it goes into the
+    // transcript as a notice instead, once `App` exists (below). Routing the
+    // question itself through the TUI's own modal path (the `PlanReady` /
+    // `Interview` shape) would mean the rebuild tasks blocking on a `oneshot`
+    // back through the event loop, and a rebuild is not a turn: nothing owns
+    // its answer, `/model` would hang behind a modal, and it would re-ask on
+    // every branch switch. One question, before the TUI, is the smaller design.
+    let trust_refusal = crate::trust::preflight(&project_root);
+
     let mut skills = load_skill_roots();
 
     let mcp_path = Config::mcp_config_path()?;
@@ -105,6 +137,18 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     {
         agent.set_plan_mode(true);
     }
+    // `--omakase` / `omakase = true`: chef's choice. The badge in the status
+    // line is lit from `config.omakase` alone (see `App::new`), so without
+    // this the TUI claimed omakase while the agent ran plain plan mode — no
+    // `OMAKASE_PROMPT`, `interview` still asking, `exit_plan` still opening the
+    // human review modal. `set_omakase(true)` turns plan mode on by itself,
+    // which is what makes `omakase = true` in config.toml — with no `--plan`
+    // and no `plan_first` — land the agent in the mode the badge advertises.
+    if config.omakase
+        && let Some(agent) = agent_slot.as_mut()
+    {
+        agent.set_omakase(true);
+    }
     let mut agent_task: Option<JoinHandle<Agent>> = None;
     // The running turn's cooperative cancel handle, cloned off the agent before
     // it moved into `agent_task` — which is the only moment it can be had, and
@@ -146,12 +190,40 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     // The rail kills background subagents through this, so it must be reachable
     // while a turn holds the agent — hence a cloned Arc, not the agent itself.
     app.subagents = agent_slot.as_ref().map(|agent| agent.subagent_registry());
+    app.tasks = agent_slot.as_ref().map(|agent| agent.task_registry());
     app.session_started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // Register this session so other sessions' /dashboard can see it.
     crate::session_registry::write(&app.session_record());
+
+    // Join the mesh, if `[mesh] listen` says a peer could watch this node.
+    //
+    // After the session id, because every event the tee publishes is stamped
+    // with it and a watcher demuxes on it. A failure is a notice rather than a
+    // fatal: the port being taken (another Wizard is already listening, most
+    // likely) is a reason not to be watchable, not a reason not to work.
+    match super::MeshTee::join(&app.config, &app.session_id).await {
+        Ok(Some(tee)) => {
+            let at = tee
+                .listening_at()
+                .map_or_else(|_| "?".to_string(), |at| at.to_string());
+            // Said out loud, always. A socket this process opened because a
+            // config file asked it to is exactly the thing a user should not
+            // have to go and check for.
+            app.notice(format!(
+                "mesh: listening on {at} as {} — trusted peers may watch this session",
+                tee.address()
+            ));
+            app.mesh = Some(tee);
+        }
+        Ok(None) => {}
+        Err(err) => app.notice(format!(
+            "mesh: not listening — {err:#}\n\
+             this session runs normally; no peer can watch it"
+        )),
+    }
     // `wizard agents` opens straight into the dashboard.
     if matches!(cli.command, Some(crate::cli::Command::Agents)) {
         app.show_dashboard = true;
@@ -163,6 +235,14 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     }
     // No startup notice: the welcome screen already shows the model, mode,
     // and help pointers until the first message arrives.
+
+    // ...except this one. The project ships hooks that are not going to run,
+    // and the user has to be told where they went: silently dropping them is
+    // what makes "my hooks stopped firing" unanswerable. It reads as
+    // conversation, so it survives the first draw and scrolls with history.
+    if let Some(why) = trust_refusal {
+        app.notice(format!("wizard: {why}"));
+    }
 
     // session_start hooks fire before the first draw; their activity (and
     // any failures) lands in the transcript as notices.
@@ -184,9 +264,15 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     *app.images.borrow_mut() = ImageCache::detect();
     tracing::debug!("terminal images: {:?}", app.images.borrow());
 
-    let mut events = EventLoop::new(Duration::from_millis(100));
+    // Terminal setup (raw mode, alternate screen, keyboard-enhancement probe)
+    // must finish *before* EventLoop starts. EventLoop spawns a task that
+    // immediately owns crossterm's EventStream; if that stream is already
+    // draining stdin, `supports_keyboard_enhancement` can miss its CSI reply
+    // and loop forever on poll errors — blank alternate screen, only Ctrl-C
+    // gets you out. First paint also wants the terminal fully configured.
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
+    let mut events = EventLoop::new(Duration::from_millis(100));
 
     // Probe the cloud provider's health off the draw path so the network
     // round-trip doesn't delay launch. Only a failure is surfaced; success is
@@ -215,55 +301,97 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
     {
         let manager = Arc::clone(&manager);
         let mcp_path = mcp_path.clone();
-        let notify = events.sender();
-        tokio::spawn(async move {
-            let mcp_config = match McpConfig::load(&mcp_path) {
-                Ok(config) => config,
-                Err(err) => {
-                    tracing::warn!("loading {}: {err:#}", mcp_path.display());
-                    // Tell the loop to clear the indicator (no servers will
-                    // connect): nothing configured, nothing missing.
-                    let _ = notify
-                        .send(Event::McpConnected {
+        // A panic while connecting (a malformed `initialize` reply, a server
+        // that closes its pipe mid-handshake) would otherwise leave the
+        // "connecting MCP…" indicator up for the rest of the session.
+        spawn_answering(
+            events.sender(),
+            Event::McpConnected {
+                connected: 0,
+                configured: 0,
+            },
+            async move {
+                let mcp_config = match McpConfig::load(&mcp_path) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!("loading {}: {err:#}", mcp_path.display());
+                        // Tell the loop to clear the indicator (no servers will
+                        // connect): nothing configured, nothing missing.
+                        return Some(Event::McpConnected {
                             connected: 0,
                             configured: 0,
-                        })
-                        .await;
-                    return;
-                }
-            };
-            if mcp_config.servers.is_empty() {
-                // Nothing to connect: keep the empty manager and skip the
-                // registry rebuild entirely (the agent already has every tool).
-                let _ = notify
-                    .send(Event::McpConnected {
+                        });
+                    }
+                };
+                if mcp_config.servers.is_empty() {
+                    // Nothing to connect: keep the empty manager and skip the
+                    // registry rebuild entirely (the agent already has every
+                    // tool).
+                    return Some(Event::McpConnected {
                         connected: 0,
                         configured: 0,
-                    })
-                    .await;
-                return;
-            }
-            let configured = mcp_config.servers.len();
-            {
-                let mut manager = manager.lock().await;
-                if let Err(err) = manager.reload(&mcp_config).await {
-                    tracing::warn!("connecting MCP servers: {err:#}");
+                    });
                 }
-            }
-            let connected = manager.lock().await.connection_count();
-            let _ = notify
-                .send(Event::McpConnected {
+                let configured = mcp_config.servers.len();
+                {
+                    let mut manager = manager.lock().await;
+                    if let Err(err) = manager.reload(&mcp_config).await {
+                        tracing::warn!("connecting MCP servers: {err:#}");
+                    }
+                }
+                let connected = manager.lock().await.connection_count();
+                Some(Event::McpConnected {
                     connected,
                     configured,
                 })
-                .await;
-        });
+            },
+        );
     }
 
     let mut last_heartbeat = Instant::now();
+    // See `recover::DrawFaults` and `recover::TerminalWatchdog`: the loop
+    // rides out a bad frame instead of exiting, and takes the terminal back if
+    // something restored it while the TUI was still using it.
+    let mut draw_faults = DrawFaults::new();
+    let mut watchdog = TerminalWatchdog::new();
+    // Consecutive background rebuilds that came back empty-handed. Reset on
+    // the first one that produces an agent.
+    let mut failed_rebuilds: u32 = 0;
 
     loop {
-        terminal.draw(|frame| crate::ui::draw(frame, &app))?;
+        // A panic on a spawned task runs the process-wide hook in `main`,
+        // which restores the terminal — correctly, because it cannot know the
+        // process is going to survive. It does, tokio having caught the panic,
+        // and the TUI is now painting into the user's scrollback with raw mode
+        // off. Take the terminal back before drawing anything into it.
+        if watchdog.should_rearm(is_terminal_armed(), Instant::now()) {
+            match setup_terminal() {
+                Ok(fresh) => {
+                    terminal = fresh;
+                    let _ = terminal.clear();
+                    app.notice(
+                        "the terminal was reset by a background failure — display restored \
+                         (see the session log for the panic)",
+                    );
+                }
+                Err(err) => tracing::warn!("could not re-arm the terminal: {err:#}"),
+            }
+        }
+
+        if let Err(err) = terminal.draw(|frame| crate::ui::draw(frame, &app)) {
+            if draw_faults.failed() {
+                return Err(
+                    anyhow::Error::new(err).context("the terminal stopped accepting frames")
+                );
+            }
+            // One failed write is routinely an `EINTR` or a full pty buffer,
+            // not a dead terminal. Say so once, then keep drawing.
+            if draw_faults.consecutive() == 1 {
+                tracing::warn!("frame not drawn: {err}");
+            }
+        } else {
+            draw_faults.succeeded();
+        }
 
         // Refresh this session's heartbeat so other dashboards see it live.
         if last_heartbeat.elapsed() >= Duration::from_secs(3) {
@@ -309,6 +437,33 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 agent_slot = Some(agent);
             }
             app.notice(rebuild.notice);
+            // An empty agent slot is invisible: the composer still accepts
+            // text, `drain_message_queue` still declines to start a turn, and
+            // the session is over without ever saying so. Try again from the
+            // session file, and when that stops working say plainly what the
+            // state is instead of retrying into the void.
+            match rebuild_recovery(agent_slot.is_some(), failed_rebuilds + 1) {
+                RebuildRecovery::Idle => failed_rebuilds = 0,
+                RebuildRecovery::Retry => {
+                    failed_rebuilds += 1;
+                    spawn_session_rebuild(
+                        &mut app,
+                        &client,
+                        &skills,
+                        &project_root,
+                        &manager,
+                        events.sender(),
+                        "agent restored",
+                    );
+                }
+                RebuildRecovery::GiveUp => {
+                    failed_rebuilds += 1;
+                    app.notice(
+                        "error: the agent could not be rebuilt — this session cannot run \
+                         another turn; /quit and relaunch",
+                    );
+                }
+            }
             // A `/model` in the queue triggered this rebuild and deferred the
             // rest of the queued commands; drain them now the agent is back.
             drain_agent_commands(
@@ -415,7 +570,17 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
 
         let turn_done = matches!(&event, Event::Agent(AgentEvent::Done { .. }));
 
-        let action = app.handle_event(event)?;
+        // An event handler that fails is a failure to react to one keystroke.
+        // Propagating it here would unwind out of `run_tui` and end the
+        // process, taking the conversation with it — for a keypress the user
+        // could simply have pressed again. It goes in the transcript instead.
+        let action = match app.handle_event(event) {
+            Ok(action) => action,
+            Err(err) => {
+                app.notice(format!("error: could not handle that input: {err:#}"));
+                None
+            }
+        };
         if let Some(action) = action {
             match action {
                 AppAction::Submit(prepared) => {
@@ -486,11 +651,18 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     // keystroke / click / scroll.
                     if let Some(selection) = app.selection {
                         let mut text = String::new();
-                        terminal.draw(|frame| {
+                        // A failed frame here costs one copy, not the session:
+                        // the next loop iteration redraws, and the user can
+                        // drag again. The main draw above is what decides
+                        // whether the terminal is actually gone.
+                        let drawn = terminal.draw(|frame| {
                             crate::ui::draw(frame, &app);
                             text = crate::ui::selection_text(frame.buffer_mut(), &selection);
-                        })?;
-                        if text.is_empty() {
+                        });
+                        if let Err(err) = drawn {
+                            app.notice(format!("could not read the selection: {err}"));
+                            app.selection = None;
+                        } else if text.is_empty() {
                             app.selection = None;
                         } else if let Err(err) = copy_to_clipboard(&text) {
                             app.notice(format!("could not copy selection: {err:#}"));
@@ -524,16 +696,48 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             match agent_slot.take() {
                 Some(mut agent) => {
                     app.compacting = true;
-                    let notify = events.sender();
-                    tokio::spawn(async move {
-                        let notice = agent.compact_now().await.describe();
-                        let rebuild = AgentRebuild {
-                            agent: Some(agent),
+                    // The agent has left its slot, so a panic in the summariser
+                    // would strand it: no `AgentRebuilt`, no agent, `compacting`
+                    // lit forever, and every message from then on silently
+                    // queued. The fallback hands the loop an empty rebuild,
+                    // which its recovery path turns back into a working agent.
+                    spawn_answering(
+                        events.sender(),
+                        Event::AgentRebuilt(Box::new(AgentRebuild {
+                            agent: None,
                             model: None,
-                            notice,
-                        };
-                        let _ = notify.send(Event::AgentRebuilt(Box::new(rebuild))).await;
-                    });
+                            notice: "compacting crashed — restarting the agent".to_string(),
+                        })),
+                        async move {
+                            // Bounded for the same reason the rebuild is: a
+                            // summarisation call that never returns holds the
+                            // agent hostage, and there is no key that gets it
+                            // back.
+                            let rebuild = match within(
+                                "compacting the conversation",
+                                COMPACTION_DEADLINE,
+                                agent.compact_now(),
+                            )
+                            .await
+                            {
+                                Ok(outcome) => AgentRebuild {
+                                    agent: Some(agent),
+                                    model: None,
+                                    notice: outcome.describe(),
+                                },
+                                // The agent is dropped with the timed-out
+                                // future; the loop rebuilds it from the
+                                // session, which is where the history it was
+                                // compacting lives anyway.
+                                Err(timed_out) => AgentRebuild {
+                                    agent: None,
+                                    model: None,
+                                    notice: timed_out,
+                                },
+                            };
+                            Some(Event::AgentRebuilt(Box::new(rebuild)))
+                        },
+                    );
                 }
                 None => app.notice("the agent is busy — try again in a moment"),
             }
@@ -552,13 +756,16 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                 Some(ctx) => {
                     app.btw_inflight = true;
                     let notify = events.sender();
-                    tokio::spawn(async move {
+                    // `btw_inflight` gates the next `/btw`; a panic that never
+                    // sent `BtwFinished` disabled the command for the rest of
+                    // the session with nothing on screen to explain it.
+                    spawn_answering(notify.clone(), Event::BtwFinished, async move {
                         let notice = match ctx.ask(&question).await {
                             Ok(answer) => format!("/btw {question}\n{answer}"),
                             Err(err) => format!("/btw failed: {err:#}"),
                         };
                         let _ = notify.send(Event::Notice(notice)).await;
-                        let _ = notify.send(Event::BtwFinished).await;
+                        Some(Event::BtwFinished)
                     });
                 }
                 None => {
@@ -683,11 +890,14 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                     }
                 }
                 Err(err) => {
-                    // The turn task panicked and took the agent with it — and,
-                    // with it, every subagent loop that would have closed its
-                    // own pane.
+                    // The turn task was aborted, or died somewhere the
+                    // `catch_unwind` in `start_agent_turn` could not reach, and
+                    // took the agent with it — and with it every subagent loop
+                    // that would have closed its own pane. The queued messages
+                    // are left alone: they are the user's, they were typed
+                    // before any of this, and the rebuild below will run them.
                     app.notice(format!("agent task crashed: {err}"));
-                    app.fail_running_panes("the turn crashed");
+                    app.end_turn_abruptly("the turn crashed");
                     spawn_session_rebuild(
                         &mut app,
                         &client,
@@ -715,15 +925,11 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
             interrupt_at = None;
             agent_cancel = None;
             handle.abort();
-            app.flush_streaming();
             // Aborting drops every subagent loop the turn had in flight
-            // mid-poll, so none of them will ever close its own pane. Close
-            // them here, or the rail keeps a pulsing row for each of them for
-            // the rest of the session — N of them per interrupted `/ultra` turn.
-            app.fail_running_panes("interrupted");
-            app.status.busy = false;
-            app.status.step = 0;
-            app.turn_started = None;
+            // mid-poll and whatever `execute` was parked on, so none of them
+            // will ever close its own pane or announce that its console
+            // closed. `end_turn_abruptly` is what takes all of that back.
+            app.end_turn_abruptly("interrupted");
             // Queued prompts belong to the interrupted conversation flow —
             // drop them so the rebuild doesn't auto-start a turn the user may
             // no longer want.
@@ -784,6 +990,12 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
         agent.fire_session_end(None).await;
     }
 
+    // Tell the peers watching that the session ended and close the socket,
+    // rather than leaving every watcher's stream to expire at an idle timeout.
+    if let Some(tee) = app.mesh.take() {
+        tee.leave().await;
+    }
+
     // Drop this session's heartbeat so it leaves the dashboard immediately.
     session_registry::remove(&app.session_id);
 
@@ -822,8 +1034,7 @@ fn start_agent_turn(
     *idle_fork_tx = None;
     app.status.busy = true;
     app.status.step = 0;
-    app.streaming.clear();
-    app.streaming_thinking.clear();
+    app.transcript.commit();
     app.turn_started = Some(Instant::now());
     app.roll_spinner_verb();
 
@@ -854,12 +1065,30 @@ fn start_agent_turn(
     let images = prepared.images;
     *agent_task = Some(tokio::spawn(async move {
         let fallback = agent_tx.clone();
-        if let Err(err) = agent.run_turn_with_images(&prompt, images, agent_tx).await {
-            // run_turn normally ends with Done itself;
-            // on a hard error make sure the UI unblocks.
-            let _ = fallback
-                .send(AgentEvent::Error(format!("turn failed: {err:#}")))
+        // The turn runs inside `catch_unwind` because the alternative is the
+        // session ending on its feet. `Done` is what clears `App::status.busy`,
+        // returns the agent to its slot, and drains the queued messages; a
+        // turn task that unwinds sends no `Done`, so the spinner spins
+        // forever, every subsequent Enter queues a message that will never be
+        // sent, and the only way out is Ctrl-C twice. Nothing on screen says
+        // any of that happened. Catching it here turns the same crash into an
+        // error line, a stopped turn, and a working prompt.
+        //
+        // The agent is handed back afterwards rather than rebuilt. It is an
+        // owned value whose future was dropped mid-poll, so its conversation
+        // may be a message short of tidy — but the history it holds is the
+        // session's, the tool registry and MCP connections behind it are live,
+        // and throwing all of that away to re-read the session file is a
+        // strictly worse answer to "the renderer for one tool result had a
+        // bug".
+        let outcome =
+            std::panic::AssertUnwindSafe(agent.run_turn_with_images(&prompt, images, agent_tx))
+                .catch_unwind()
                 .await;
+        // run_turn normally ends with Done itself; on a hard error — or a
+        // panic — make sure the UI unblocks.
+        if let Some(message) = turn_failure(outcome) {
+            let _ = fallback.send(AgentEvent::Error(message)).await;
             let _ = fallback
                 .send(AgentEvent::Done {
                     reason: DoneReason::Stopped,

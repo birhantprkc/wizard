@@ -1,0 +1,58 @@
+# minimal: the default look.
+#
+# Monochrome base, one accent, whitespace instead of boxes. It reads as a tool
+# rather than a toy, survives SSH and 16-color terminals unchanged (every
+# value below is already an ANSI-16 name), and ages well.
+#
+# Rules it keeps to, and the reason for each:
+#   - No 24-bit colors. A theme that ships in the binary has to render the
+#     same over a serial console as it does in a modern terminal.
+#   - No background colors anywhere. The TUI paints on the terminal's own
+#     background so transparency and the user's color scheme survive.
+#   - Hues only where the meaning is conventional: green additions and red
+#     deletions in a diff. Everything else says what it means with brightness,
+#     bold, and glyphs (✓ / ✗), which is what keeps the UI legible when the
+#     color depth drops to nothing at all.
+
+name = "minimal"
+description = "monochrome base, one accent, no boxes (default)"
+
+# Floating layers (pickers, the plan review, the todo band) get a soft edge;
+# sectioning inside the chat is done with padding and dim rules, never a box.
+border = "rounded"
+
+[tokens]
+# Body text follows the terminal's own foreground.
+text = "reset"
+muted = "gray"
+faint = "darkgray"
+accent = "white"
+code = "white"
+heading = "white"
+link = "darkgray"
+quote = "gray"
+border = "darkgray"
+
+# Semantics, monochrome: an error is the loud one, a warning is the same
+# brightness (it is bold at the call site), success stays quiet.
+error = "white"
+warning = "white"
+success = "green"
+
+# Tool / subagent / session lifecycle.
+"tool.running" = "white"
+"tool.done" = "gray"
+"tool.failed" = "white"
+
+# The `/diff` sidebar keeps the conventional colors: this is the one place a
+# hue carries the meaning, and inverting it would be actively confusing.
+"diff.add" = "green"
+"diff.del" = "red"
+"diff.meta" = "gray"
+"diff.hunk" = "white"
+
+# Backgrounds. `reset` is the house rule: this UI paints on the terminal’s
+# own background so transparency and the user’s colour scheme survive. The
+# skins that want a slab declare one; these two never do.
+"bg.raised" = "reset"
+"bg.sunken" = "reset"

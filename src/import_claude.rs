@@ -11,6 +11,11 @@
 //! does the actual IO. Both the blocking onboarding TUI
 //! ([`crate::onboarding`]) and the in-app `/settings` menu call [`run_import`],
 //! so the import behaves identically wherever it is triggered.
+//!
+//! Claude Code's *conversations* are a separate concern with a separate,
+//! strictly read-only reader: see [`crate::claude_session`]. The `~/.claude`
+//! path detectors live here, next to each other, so there is one place that
+//! knows the layout.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,6 +109,14 @@ pub fn claude_home() -> Option<PathBuf> {
 pub fn claude_json_path() -> Option<PathBuf> {
     let path = dirs::home_dir()?.join(".claude.json");
     path.is_file().then_some(path)
+}
+
+/// `~/.claude/projects` if it exists — one subdirectory per working directory,
+/// each holding that project's session transcripts. Read by
+/// [`crate::claude_session`], which never writes there.
+pub fn claude_projects_dir() -> Option<PathBuf> {
+    let dir = claude_home()?.join("projects");
+    dir.is_dir().then_some(dir)
 }
 
 /// `~/.claude/commands/**/*.md` (recursive), each paired with its flattened

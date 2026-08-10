@@ -1,6 +1,15 @@
 //! Binary entry point: parse arguments, install a terminal-restoring panic
-//! hook, and hand off to the library runner. Routing (genie TUI, sovereign
-//! headless, `--evolve`) happens in [`wizard::run`].
+//! hook, and hand off to the library runner. Every routing decision (the genie
+//! TUI, the sovereign headless loop, `--evolve`, and each subcommand) lives in
+//! [`wizard::run`], so there is exactly one place that answers "what does this
+//! invocation do".
+//!
+//! What stays here is only what cannot happen anywhere else: the environment
+//! writes below are safe *because* no other thread exists yet, and the panic
+//! hook has to be installed before any surface that could take the terminal
+//! away has started.
+
+use std::io::Write;
 
 use clap::Parser;
 
@@ -18,21 +27,22 @@ fn main() {
         unsafe { std::env::set_var("WIZARD_HARNESS_DIR", dir) };
     }
 
-    // `wizard app` picks its display backend before GTK can initialize — and,
-    // like the above, before any thread exists to race the environment. See
-    // `desktop::select_display_backend` for why it does not simply take
-    // Wayland when Wayland is there.
-    // SAFETY: no other threads have been spawned yet.
-    if matches!(cli.command, Some(wizard::cli::Command::App { .. })) {
-        unsafe { wizard::desktop::select_display_backend() };
-    }
+    // Diagnostics before any surface starts. Every `tracing` event emitted
+    // before the subscriber is installed is dropped, and the surfaces below
+    // (the TUI, the ACP and MCP stdio servers, the GUI) are exactly the ones
+    // that cannot print a diagnostic themselves. Failure is silent by design:
+    // see `wizard::logging::init`.
+    let _ = wizard::logging::init();
 
     // If the TUI is up when something panics, raw mode and the alternate
     // screen must be torn down before the panic message prints, or the
-    // terminal is left unusable.
+    // terminal is left unusable. The panic also goes to the session log: on
+    // the alternate screen, or inside `wizard acp` where the editor swallows
+    // the process's stderr, the printed message is often never seen at all.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         wizard::app::restore_terminal_best_effort();
+        wizard::logging::log_panic(info);
         default_hook(info);
     }));
 
@@ -53,7 +63,6 @@ fn main() {
     // Headless runs encode their outcome in the exit code (see
     // `wizard::output::exit_code`); flush before exiting so structured
     // output is never cut off.
-    use std::io::Write as _;
     let _ = std::io::stdout().flush();
     std::process::exit(code);
 }

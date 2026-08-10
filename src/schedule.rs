@@ -41,6 +41,34 @@ const KILL_GRACE: Duration = Duration::from_secs(120);
 /// Rotate `scheduler.log` past this size (rename to `.log.old`).
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Largest accepted `--max-hours` / `max_hours`: one year.
+///
+/// A cap rather than "any positive number" because the value ends up in
+/// `Instant + Duration`, which panics on overflow just as
+/// `Duration::from_secs_f64` panics on a negative. A time limit longer than a
+/// year is not a limit anybody means, so refusing it costs nothing and makes
+/// every downstream arithmetic total.
+pub const MAX_HOURS_CAP: f64 = 24.0 * 365.0;
+
+/// The wall-clock budget a `max_hours` value stands for, or an error saying
+/// why the number is unusable.
+///
+/// Every conversion goes through here. `Duration::from_secs_f64` panics on a
+/// negative, a NaN and an infinity, and the value reaching it is an `f64` that
+/// came either from a flag or from a hand-edited `schedule.toml` — so
+/// `max_hours = -1` in that file used to take down the scheduler daemon the
+/// moment the job fired, and `--max-hours -1` took down the run it was given
+/// to.
+pub fn max_hours_duration(hours: f64) -> Result<Duration> {
+    if !hours.is_finite() || hours <= 0.0 {
+        bail!("max_hours must be a positive, finite number of hours, got {hours}");
+    }
+    if hours > MAX_HOURS_CAP {
+        bail!("max_hours must be at most {MAX_HOURS_CAP} (one year), got {hours}");
+    }
+    Ok(Duration::from_secs_f64(hours * 3600.0))
+}
+
 /// One scheduled job (`[[entries]]` in schedule.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleEntry {
@@ -61,6 +89,14 @@ pub struct ScheduleEntry {
     /// Disabled entries are kept in the file but never fired.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+impl ScheduleEntry {
+    /// This entry's wall-clock budget: `None` when it has no limit, `Err`
+    /// when the number in the file is not one [`max_hours_duration`] accepts.
+    pub fn max_duration(&self) -> Result<Option<Duration>> {
+        self.max_hours.map(max_hours_duration).transpose()
+    }
 }
 
 fn default_mode() -> String {
@@ -183,11 +219,7 @@ fn validate_entry(entry: &ScheduleEntry) -> Result<()> {
             entry.cwd.display()
         );
     }
-    if let Some(hours) = entry.max_hours
-        && (!hours.is_finite() || hours <= 0.0)
-    {
-        bail!("max_hours must be a positive number, got {hours}");
-    }
+    entry.max_duration()?;
     Ok(())
 }
 
@@ -200,7 +232,48 @@ pub fn load_schedule(path: &Path) -> Result<ScheduleFile> {
         }
         Err(err) => return Err(err).context(format!("reading {}", path.display())),
     };
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let file: ScheduleFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+
+    // Say something about a field nobody can use, once, here.
+    //
+    // `due_entries` drops such an entry with a bare `return false`, which is
+    // the right thing for a hot loop that runs every second — but it is the
+    // *only* thing that happens to it. A job whose expression has a typo is
+    // therefore never fired and never explains itself: the daemon keeps
+    // running, `schedule list` keeps showing the entry as enabled, and the
+    // next time is simply never. `schedule add` validates, so this is the
+    // path where a hand-edited or externally-written file lands.
+    //
+    // `max_hours` is checked for the same reason and one more: the number
+    // goes into `Duration::from_secs_f64`, which *panics* on a negative or a
+    // NaN. Before this, `max_hours = -1` here went unremarked all the way to
+    // the daemon spawning the job, and took the daemon down with it — a
+    // long-running process killed by a line somebody typed into a config
+    // file. `due_entries` now refuses to fire it and this says why.
+    //
+    // Warnings rather than an error, deliberately: one bad entry must not
+    // stop the other jobs from firing, which is what returning `Err` here
+    // would do.
+    for entry in &file.entries {
+        if let Err(err) = parse_cron(&entry.cron) {
+            tracing::warn!(
+                "schedule entry {:?} has an unusable cron ({:?}): {err}. It will never \
+                 fire until this is fixed; `wizard schedule add` validates the \
+                 expression if you want to rewrite it.",
+                entry.name,
+                entry.cron,
+            );
+        }
+        if let Err(err) = entry.max_duration() {
+            tracing::warn!(
+                "schedule entry {:?} has an unusable max_hours: {err}. It will never \
+                 fire until this is fixed.",
+                entry.name,
+            );
+        }
+    }
+    Ok(file)
 }
 
 /// Write the schedule file, creating parent directories as needed.
@@ -357,9 +430,7 @@ async fn run_foreground(path: &Path, name: &str) -> Result<i32> {
         .kill_on_drop(true)
         .spawn()
         .context("spawning the job")?;
-    let deadline = entry
-        .max_hours
-        .map(|hours| Duration::from_secs_f64(hours * 3600.0) + KILL_GRACE);
+    let deadline = entry.max_duration()?.map(|budget| budget + KILL_GRACE);
     let status = match deadline {
         Some(cap) => match tokio::time::timeout(cap, child.wait()).await {
             Ok(status) => status.context("waiting for the job")?,
@@ -408,6 +479,13 @@ pub fn due_entries<'a, Tz: TimeZone>(
             let Ok(cron) = parse_cron(&entry.cron) else {
                 return false;
             };
+            // Same treatment as an unparseable cron, and for a sharper
+            // reason: `spawn_job` turns `max_hours` into a `Duration`, and a
+            // negative or NaN one panics the daemon rather than the job.
+            // `load_schedule` has already warned about it by name.
+            if entry.max_duration().is_err() {
+                return false;
+            }
             let basis = last_fired.get(&entry.name).unwrap_or(started);
             match cron.find_next_occurrence(basis, false) {
                 Ok(next) => next <= *now,
@@ -503,6 +581,9 @@ fn spawn_job(entry: &ScheduleEntry, jobs_dir: &Path) -> Result<RunningJob> {
     let log_err = log
         .try_clone()
         .with_context(|| format!("cloning the log handle for {}", log_path.display()))?;
+    // Before the child exists: a budget this process cannot represent is the
+    // entry's problem, not a reason to leave an orphan running.
+    let budget = entry.max_duration()?;
     let child = child_command(entry)?
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -516,9 +597,7 @@ fn spawn_job(entry: &ScheduleEntry, jobs_dir: &Path) -> Result<RunningJob> {
         name: entry.name.clone(),
         child,
         started: now,
-        deadline: entry
-            .max_hours
-            .map(|hours| now + Duration::from_secs_f64(hours * 3600.0) + KILL_GRACE),
+        deadline: budget.map(|budget| now + budget + KILL_GRACE),
         log_path,
     })
 }
@@ -616,6 +695,56 @@ fn acquire_daemon_lock(wizard_dir: &Path) -> Result<std::fs::File> {
 #[cfg(not(unix))]
 fn acquire_daemon_lock(_wizard_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Service name for the scheduler daemon: `wizard-scheduler.service` under
+/// systemd, `com.teddytennant.wizard.scheduler` under launchd.
+pub const SERVICE_NAME: &str = "wizard-scheduler";
+
+/// Describe the scheduler as a supervised service.
+///
+/// The working directory is the home directory rather than the current one,
+/// which is the opposite of the gateway's choice and for the opposite reason:
+/// every entry in `schedule.toml` carries its own `cwd` and the daemon
+/// `chdir`s each child into it, so the daemon's own directory is never the
+/// project — capturing wherever the operator happened to be standing would
+/// only pin a directory that might later be deleted, taking the service with
+/// it.
+pub fn service_spec() -> Result<crate::platform::service::ServiceSpec> {
+    let home = dirs::home_dir().context("could not determine the home directory")?;
+    crate::platform::service::ServiceSpec::for_surface(
+        SERVICE_NAME,
+        "Wizard scheduled runs",
+        "https://github.com/teddytennant/wizard/blob/main/docs/services.md",
+        "wizard scheduler",
+        &["scheduler"],
+        Some(home),
+    )
+}
+
+/// `wizard scheduler <install|start|stop|restart|status|logs|uninstall>`.
+///
+/// Unlike the gateway there is no credential to arrange: the daemon spawns
+/// `wizard` children that load their own config, so a scheduler service that
+/// starts is a scheduler service that works. An empty schedule is still worth
+/// saying out loud — a daemon with nothing to fire looks identical to a broken
+/// one from the outside.
+pub fn run_service(cmd: crate::platform::service::ServiceCmd) -> Result<i32> {
+    let spec = service_spec()?;
+    if matches!(cmd, crate::platform::service::ServiceCmd::Install) {
+        let path = Config::schedule_path()?;
+        let entries = load_schedule(&path)
+            .map(|file| file.entries.len())
+            .unwrap_or(0);
+        if entries == 0 {
+            println!(
+                "note: {} has no entries yet, so the daemon will sit idle. \
+                 Add one with `wizard schedule add`.",
+                path.display()
+            );
+        }
+    }
+    crate::platform::service::dispatch(&spec, cmd)
 }
 
 /// `wizard scheduler`: the foreground daemon loop. Each pass it reaps
@@ -746,6 +875,135 @@ mod tests {
             max_hours: None,
             enabled: true,
         }
+    }
+
+    /// A schedule file with one unusable cron still loads, and the entries
+    /// beside it still fire.
+    ///
+    /// The silent case this guards: `due_entries` drops an entry it cannot
+    /// parse and says nothing, so before the warning in `load_schedule` a
+    /// typo'd expression meant a job that never ran and never explained
+    /// itself. Returning `Err` from the loader would have been the other
+    /// wrong answer — one bad line would stop every other job from firing,
+    /// which is worse than the thing being fixed.
+    #[test]
+    fn a_bad_cron_does_not_stop_the_schedule_loading_or_the_good_entries_firing() {
+        let dir = std::env::temp_dir().join(format!("wizard-cron-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("schedule.toml");
+
+        let file = ScheduleFile {
+            entries: vec![
+                entry("broken", "not a cron at all"),
+                entry("nightly", "0 3 * * *"),
+            ],
+        };
+        save_schedule(&path, &file).expect("write");
+
+        let loaded = load_schedule(&path).expect("a bad entry must not fail the load");
+        assert_eq!(
+            loaded.entries.len(),
+            2,
+            "the bad entry is kept, not dropped"
+        );
+
+        // The good one still fires; the bad one is simply never due.
+        let started = utc("2026-01-01T00:00:00Z");
+        let now = utc("2026-01-02T03:00:00Z");
+        let due: Vec<&str> = due_entries(&loaded.entries, &Default::default(), &started, &now)
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(
+            due.contains(&"nightly"),
+            "the good entry must still fire: {due:?}"
+        );
+        assert!(
+            !due.contains(&"broken"),
+            "the unparseable one cannot fire: {due:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every number `Duration::from_secs_f64` would panic on is refused
+    /// instead, and a sane one converts.
+    #[test]
+    fn max_hours_is_rejected_before_it_can_panic_a_duration() {
+        assert_eq!(
+            max_hours_duration(2.0).expect("two hours"),
+            Duration::from_secs(7200)
+        );
+        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                max_hours_duration(bad).is_err(),
+                "max_hours = {bad} must be refused, not converted"
+            );
+        }
+        // Bounded above as well: the value also lands in `Instant + Duration`,
+        // which overflows and panics on absurd inputs.
+        assert!(max_hours_duration(MAX_HOURS_CAP).is_ok());
+        assert!(max_hours_duration(MAX_HOURS_CAP + 1.0).is_err());
+        assert!(max_hours_duration(f64::MAX).is_err());
+    }
+
+    /// A hand-edited `max_hours = -1` cannot take the daemon down.
+    ///
+    /// The whole path used to be: `load_schedule` warns about a bad *cron* and
+    /// nothing else, `due_entries` finds the entry due, and `spawn_job` calls
+    /// `Duration::from_secs_f64(-3600.0)` — which panics, in a process that is
+    /// meant to run for months. So the entry has to be refused at the same
+    /// seam an unusable cron is, and the conversion has to be fallible.
+    #[test]
+    fn a_negative_max_hours_never_fires_and_never_panics() {
+        let dir = std::env::temp_dir().join(format!("wizard-hours-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("schedule.toml");
+
+        let mut bad = entry("negative", "* * * * *");
+        bad.max_hours = Some(-1.0);
+        let mut good = entry("nightly", "* * * * *");
+        good.max_hours = Some(1.0);
+        save_schedule(
+            &path,
+            &ScheduleFile {
+                entries: vec![bad, good],
+            },
+        )
+        .expect("write");
+
+        let loaded = load_schedule(&path).expect("a bad entry must not fail the load");
+        assert_eq!(
+            loaded.entries.len(),
+            2,
+            "the bad entry is kept, not dropped"
+        );
+
+        let started = utc("2026-01-01T00:00:00Z");
+        let now = utc("2026-01-01T00:02:00Z");
+        let due: Vec<&str> = due_entries(&loaded.entries, &Default::default(), &started, &now)
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            due,
+            vec!["nightly"],
+            "an unusable max_hours must not fire; a usable one must: {due:?}"
+        );
+
+        // And the conversion the daemon and `schedule run` both perform is an
+        // error rather than a panic.
+        assert!(loaded.entries[0].max_duration().is_err());
+        assert_eq!(
+            loaded.entries[1].max_duration().expect("one hour"),
+            Some(Duration::from_secs(3600))
+        );
+        // `schedule add` refuses to write one in the first place.
+        let mut rejected = entry("nan", "* * * * *");
+        rejected.max_hours = Some(f64::NAN);
+        assert!(validate_entry(&rejected).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn utc(s: &str) -> DateTime<Utc> {

@@ -6,7 +6,14 @@ Long-running commands (dev servers, builds, watchers) don't have to block the ag
 { "command": "cargo build --release", "run_in_background": true }
 ```
 
-The command is spawned detached and registered as a background task; the call returns immediately with `Background task #N started: <command>`. The agent keeps working while the task runs.
+The command is spawned detached and registered as a background task; the call returns immediately with
+
+```
+Background task #N started: <command>
+You will be notified when it finishes; use task_output to inspect it or task_kill to stop it.
+```
+
+The agent keeps working while the task runs.
 
 ## Lifecycle
 
@@ -19,7 +26,7 @@ The command is spawned detached and registered as a background task; the call re
   <last ~2 KB of output>
   ```
 
-- The TUI and headless surfaces print a one-line notice when a task finishes
+- The TUI, the `text` headless format, and `stream-json` (a `task_finished` line) each report a finished task; the `json` format does not — it only carries the run summary
 - All still-running tasks are killed when the agent shuts down
 
 The spawn still flows through the regular tool dispatch pipeline, so `pre_tool_use`/`post_tool_use` hooks apply to it like any other `execute` call.
@@ -30,7 +37,7 @@ Two companion tools:
 
 | Tool | Arguments | Does |
 |------|-----------|------|
-| `task_output` | `id`, `tail_bytes` (optional, default 20 000) | Return the task's status and the tail of its buffered output. Read-only, works in plan mode. |
+| `task_output` | `id`, `tail_bytes` (optional, default 20 000, clamped to 28 000) | Return the task's status and the tail of its buffered output. Read-only, works in plan mode. |
 | `task_kill` | `id` | Terminate a running task. |
 
 Statuses: `running`, `exit <code>`, `killed`, `timed out`.

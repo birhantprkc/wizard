@@ -53,7 +53,7 @@ Sovereign mode is the autonomous, proactive agent. It runs headless for a single
 - Auto-approves all tool calls (no per-action y/n)
 - Temperature: 0.6 (tighter tool-call formatting)
 - Loop limit: none by default; a `max_steps` capped below 100 is raised to 100, since nobody is at the prompt to say "continue"
-- Circuit breaker: stops after 3 consecutive identical failures
+- Circuit breakers: 6 consecutive *identical* tool failures (sovereign only) ends the turn — at 3 the model is nudged to change approach first — or 8 consecutive failures of one tool whatever the arguments
 - Best for: long-running refactors, test suites, multi-file features, CI/scripted runs
 
 ### Flags
@@ -74,6 +74,14 @@ During a long sovereign-mode run, write to `.wizard/loop-control` in the project
 | `stop` | Graceful shutdown after current step |
 | `pause` | Wait until file is removed or set to `resume` |
 | `skip` | Skip the current sub-task |
+
+All three are read between steps inside a turn *and* at the boundary between outer
+cycles, so a command written into the gap between one cycle finishing and the next
+starting is not lost. Every wait the loop performs — the `cycle_pause_secs` idle pause,
+the backoff after a failed cycle, and a `pause` hold itself — wakes twice a second to
+re-read this file, so `stop` takes effect within about a second however long the wait
+was configured to be. `--max-hours` is checked in the same places: a hold or a pause
+cannot outlive the run's deadline.
 
 ### Example
 
@@ -100,12 +108,38 @@ below keep it safe.
 ### What makes it run forever
 
 - **Durable mission.** The goal is persisted to `<project>/.wizard/mission.toml` along
-  with a cycle count and rolling progress log. It survives restarts and binary
-  self-replacement: relaunch with `--continuous` (no `-p`) and it resumes the mission.
+  with a cycle count, a rolling progress log, and a liveness stamp (see
+  [Watching a run](#watching-a-run)). It survives restarts and binary self-replacement:
+  relaunch with `--continuous` (no `-p`) and it resumes the mission.
+- **Failed cycles do not end the run.** A hard error — a malformed tool call, an
+  unreadable path, a provider error that is not transient — ends the *cycle*, not the
+  mission. The loop rolls the cycle back (if `rollback_failed_cycles` is on), records
+  what happened in `mission.toml`, waits out a backoff that doubles per failure from
+  `retry_base_secs` to `retry_max_secs`, and opens the next cycle with a prompt that
+  names the failure, warns that the working tree may have been rolled back under it,
+  and demands a materially different approach. The bound is
+  `max_consecutive_failures` (default 5): **consecutive**, so any cycle that lands
+  resets it to zero, and only a run that fails that many times with nothing succeeding
+  in between gives up. Set it to `0` to disable the bound entirely.
+- **Circuit-breaker trips are waited out, not fatal.** The endpoint breaker opens after
+  8 consecutive transient model-call failures and closes itself by admitting one
+  recovery probe once its cooldown expires — 30 seconds after a first trip, then
+  doubling per consecutive trip up to a 15-minute cap, so a provider in a long
+  outage is retried a handful of times an hour rather than a hundred. A continuous
+  run sleeps out that cooldown and starts the next cycle instead of exiting;
+  a trip counts as one failed cycle toward
+  `max_consecutive_failures`, so a provider that is genuinely gone still ends the run
+  rather than looping on it forever.
 - **Sleep-and-wake.** Transient provider failures (server unreachable, busy, `429`/`5xx`,
-  dropped stream) do not abort the run. The loop backs off exponentially
-  (`retry_base_secs` → `retry_max_secs`) and retries indefinitely, so a paused or
-  restarting model server is waited out.
+  dropped stream) do not abort the run. The wait climbs the ladder from
+  `retry_base_secs` to `retry_max_secs` and a continuous run retries for as long as the
+  circuit breaker permits, so a paused or restarting model server is waited out. Each
+  wait is drawn at random from
+  `[retry_base_secs, ceiling]` rather than being exactly the ceiling, so parallel workers
+  and subagents pointed at one endpoint do not retry in lockstep. When the endpoint
+  answers a `429` with a `Retry-After`, that deadline is honored instead when it is
+  longer than the ladder's own wait (capped, so a bad header cannot park a turn), and the
+  notice says so.
 - **Context compaction.** When the conversation grows past `compact_threshold_bytes`,
   older history is summarized into a compact progress note so a run can continue
   indefinitely without overflowing the model's context window. The agent is also
@@ -115,16 +149,41 @@ below keep it safe.
 - **Self-evolution + re-exec.** When the agent calls `evolve` (adding a skill, MCP
   server, scripted tool, or subagent, or rebuilding its own binary with `deep`), the
   loop saves the mission, re-execs into the freshly built image to load the new
-  capabilities, and resumes the mission.
+  capabilities, and resumes the mission. The relaunch carries the run's terms with it:
+  the wall clock left on `--max-hours` and the `--output-format` selection. An 8-hour
+  run that evolves itself at hour one comes back with 7 hours, not with no deadline;
+  a `--output-format json` run does not start printing prose into a consumer's stream.
+  If less than a minute of the deadline is left, the re-exec is skipped entirely — the
+  new binary is already on disk and the next launch picks it up.
+
+### Watching a run
+
+`mission.toml` is also the liveness record. Alongside `goal`, `cycles`, and `notes` it
+carries:
+
+| Field | Meaning |
+|-------|---------|
+| `phase` | What the loop believed it was doing — `cycle 12: running turn`, `cycle 12: backing off 40s after a failed cycle`, `held by operator pause (.wizard/loop-control)` |
+| `heartbeat` | When `phase` was last stamped |
+| `consecutive_failures` | Failed cycles since the last one that landed, against `max_consecutive_failures` |
+
+These are stamped at phase boundaries by the loop itself, not by a background timer. A
+timer would keep ticking while the agent hangs on a model call that will never answer,
+which is exactly the state worth detecting: a `phase` of `cycle 12: running turn` with
+an hour-old `heartbeat` is a wedged run, while the same heartbeat under
+`cycle 12: idle pause (3600s)` is a run doing precisely what it was told.
 
 ### Stopping it
 
 The same `.wizard/loop-control` file is the kill switch: write `stop` for a graceful
-shutdown after the current step, or `pause` to hold. `--max-hours` and the circuit
-breaker (3 identical failures in a row) also terminate a continuous run. Deep
-self-modification remains gated by an automated `cargo build` + `--version` smoke test,
-with the previous binary kept as `wizard.prev` for one-`mv` rollback and every evolution
-appended to `~/.wizard/evolution.jsonl`.
+shutdown after the current step, or `pause` to hold. Otherwise a continuous run ends
+on `--max-hours`, or on `max_consecutive_failures` cycles in a row that ended in a hard
+error or a tripped breaker with nothing succeeding in between. A single circuit-breaker
+trip does not end it — see above. Deep self-modification remains gated by an automated
+`cargo build --release --locked`, `cargo test --release --locked`, and `--version` smoke
+test (see [evolve.md](evolve.md#the-gate); the test rung makes it slow), with the
+previous binary kept as `wizard.prev` for one-`mv` rollback and every evolution appended
+to `~/.wizard/evolution.jsonl`.
 
 ### Tuning (`~/.wizard/config.toml`)
 
@@ -134,6 +193,7 @@ appended to `~/.wizard/evolution.jsonl`.
 | `retry_base_secs` | `5` | Base backoff when the model server is unavailable |
 | `retry_max_secs` | `300` | Cap on backoff between retries |
 | `cycle_pause_secs` | `0` | Pause between continuous cycles |
+| `max_consecutive_failures` | `5` | Failed cycles in a row before a continuous run gives up; `0` disables the bound |
 | `compact_threshold_bytes` | `48000` | History size that triggers compaction |
 | `rollback_failed_cycles` | `false` | Restore a failed cycle's file checkpoints (see [checkpoints.md](checkpoints.md)) |
 
@@ -183,12 +243,12 @@ wizard --omakase -p "ship the smallest fix that passes the suite"
 | Knob | Effect |
 |------|--------|
 | `--plan` (flag) | This run starts in plan mode |
-| `--omakase` (flag) | Sets `omakase` + `plan_first` in config. The GUI applies chef's-choice on the agent; headless, continuous, and the gateway currently turn on plan mode from `plan_first` and still auto-approve `exit_plan` (the usual unattended plan-then-execute path). Full chef's-choice prompting (no interview, self-justifying plan) is live in the TUI, the GUI, and via the gateway's `/omakase` chat toggle |
+| `--omakase` (flag) | Sets `omakase` + `plan_first` in config. Full chef's-choice prompting (no interview, self-justifying plan) is applied when the agent is built, on every surface: the TUI, the GUI, the gateway and headless/sovereign/continuous runs. All of them also auto-approve `exit_plan`, which is what makes it a single unattended plan-then-execute turn |
 | `plan_first = true` (config) | Every session starts in plan mode |
-| `omakase = true` (config) | Implies `plan_first`. Applied as chef's-choice on TUI/GUI agent construction; headless/gateway use the plan_first path above unless `/omakase` is toggled on the gateway |
+| `omakase = true` (config) | Implies `plan_first`, whether or not `--omakase` or `--plan` was passed. Applied as chef's choice when the agent is built, on every surface |
 | `plan_each_cycle = true` (config) | Continuous mode re-enters plan mode at the top of every cycle |
 
-With no human in the loop, `exit_plan` is auto-approved on the plain plan path: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute. Omakase, where it is fully applied, makes the agent decide for itself (no interview, plan written to `.wizard/plan.md` and surfaced before execution). The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
+With no human in the loop, `exit_plan` is auto-approved on the plain plan path: the plan is printed (or, on the gateway, included in the chat reply), approval is sent automatically, and the same turn proceeds to execute. Omakase makes the agent decide for itself on top of that (no interview, plan written to `.wizard/plan.md` and surfaced before execution). The gateway also accepts `/plan` and `/omakase` chat messages to toggle these modes for subsequent messages.
 
 The last presented plan is always available at `<project>/.wizard/plan.md`.
 
@@ -211,7 +271,7 @@ Each mode injects a different system prompt:
 
 **Sovereign** emphasizes autonomy, completing the full task end-to-end, running tests, and committing when appropriate.
 
-Both prompts include loaded skills from the `skills/` directory and any project-level `AGENTS.md`.
+Both prompts include loaded skills from the `skills/` directory and your instruction files: `~/.wizard/WIZARD.md`, plus, for each directory from the project root outwards, the first of `WIZARD.md`, `AGENTS.md`, `CLAUDE.md` that exists there.
 
 ## Choosing a mode
 

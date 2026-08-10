@@ -931,34 +931,100 @@ async fn supervise_loop(
 async fn run_collect_text(agent: &mut Agent, prompt: &str) -> Result<String> {
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let collector = tokio::spawn(async move {
-        let mut text = String::new();
+        let mut collected = TurnText::default();
         while let Some(event) = rx.recv().await {
-            match event {
-                AgentEvent::TextDelta(delta) => {
-                    print!("{delta}");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    text.push_str(&delta);
-                }
-                AgentEvent::ToolStarted { name, .. } => println!("\n→ {name}"),
-                AgentEvent::ToolFinished { name, output } => {
-                    let status = if output.is_error { "error" } else { "ok" };
-                    println!("← {name} [{status}]");
-                }
-                AgentEvent::Error(message) => eprintln!("\nwizard error: {message}"),
-                AgentEvent::Notice(message) => eprintln!("\nwizard: {message}"),
-                AgentEvent::PlanReady { respond, .. } => {
-                    let _ = respond.send(PlanVerdict::approve());
-                }
-                _ => {}
-            }
+            collected.handle(event);
         }
-        text
+        collected.text
     });
     let turn = agent.run_turn(prompt, tx).await;
     let text = collector.await.context("output collector panicked")?;
     println!();
     turn?;
     Ok(text)
+}
+
+/// Folds one planning or synthesis turn into the text `fleet` parses, echoing
+/// it to stdout as it arrives so the run reads like a normal headless one.
+///
+/// A struct rather than a match inside the collector loop because what it
+/// collects is not decoration: [`decompose`] parses this string into the task
+/// list the whole fleet then runs, so a duplicated half-sentence is a wrong
+/// plan, not a cosmetic glitch.
+#[derive(Default)]
+struct TurnText {
+    /// The assistant text of the turn, in arrival order.
+    text: String,
+    /// Length of `text` at the last completed step: what a retry may not undo.
+    committed: usize,
+}
+
+impl TurnText {
+    fn handle(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(delta) => {
+                print!("{delta}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                self.text.push_str(&delta);
+            }
+            AgentEvent::ToolStarted { name, .. } => println!("\n→ {name}"),
+            AgentEvent::ToolFinished { name, output } => {
+                let status = if output.is_error { "error" } else { "ok" };
+                println!("← {name} [{status}]");
+            }
+            AgentEvent::Error(message) => eprintln!("\nwizard error: {message}"),
+            AgentEvent::Notice(message) => eprintln!("\nwizard: {message}"),
+            AgentEvent::StepCompleted { .. } => self.committed = self.text.len(),
+            AgentEvent::StreamRetrying => {
+                // The dead attempt is re-generated from scratch, so its partial
+                // text goes: keeping it would hand the parser the same task
+                // list twice, the first copy cut off mid-line. What was already
+                // printed cannot be unprinted, so the cut is marked instead.
+                self.text.truncate(self.committed);
+                println!("\n… stream interrupted; the response restarts below …");
+            }
+            AgentEvent::PlanReady { gate, .. } => {
+                // Nobody watches a fleet planning turn; approve so it proceeds.
+                gate.answer(PlanVerdict::approve());
+            }
+            AgentEvent::Interview { gate, .. } => {
+                // No interactive user either: decline rather than park the turn
+                // inside the tool until the process is killed.
+                gate.decline();
+            }
+            // The planning turn's product is its text; everything else is
+            // bookkeeping for surfaces the fleet does not have. Spelled out so
+            // a new event has to be decided about here instead of disappearing
+            // into a wildcard.
+            AgentEvent::ThinkingDelta(_)
+            | AgentEvent::Images { .. }
+            | AgentEvent::HookFired { .. }
+            | AgentEvent::OmakaseProceeding { .. }
+            | AgentEvent::Usage { .. }
+            | AgentEvent::ContextSize { .. }
+            | AgentEvent::UltraGuidance { .. }
+            | AgentEvent::TodoUpdated(_)
+            | AgentEvent::TaskStarted { .. }
+            | AgentEvent::TaskFinished { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::SubagentRunStarted { .. }
+            | AgentEvent::SubagentRunText { .. }
+            | AgentEvent::SubagentRunToolStarted { .. }
+            | AgentEvent::SubagentRunToolFinished { .. }
+            | AgentEvent::SubagentRunImages { .. }
+            | AgentEvent::SubagentRunStep { .. }
+            | AgentEvent::SubagentRunDone { .. }
+            | AgentEvent::CommandRequested(_)
+            | AgentEvent::Done { .. } => {}
+            // A shell command's console. A fleet run has no human at the
+            // keyboard, so its tool context leaves `ConsoleAccess` at `None`
+            // and no command opens one; there is nothing to collect.
+            AgentEvent::ConsoleOpened { .. }
+            | AgentEvent::ConsoleOutput { .. }
+            | AgentEvent::ConsoleClosed { .. } => {}
+        }
+    }
 }
 
 /// The planning turn: ask the model to decompose `mission` into at most
@@ -1384,7 +1450,7 @@ mod tests {
     use crate::agent::session::Session;
     use crate::hooks::HookEngine;
     use crate::llm::provider::LlmProvider;
-    use crate::llm::{ChatChunk, ChatMessage, ChatRequest, ChatStream};
+    use crate::llm::{CacheTokens, ChatChunk, ChatMessage, ChatRequest, ChatStream};
     use crate::tools::registry::ToolRegistry;
 
     fn task(id: &str, prompt: &str) -> FleetTask {
@@ -1892,6 +1958,7 @@ mod tests {
             done_reason: None,
             eval_count: None,
             prompt_eval_count: None,
+            cache: CacheTokens::NONE,
         }]
     }
 
@@ -2008,5 +2075,41 @@ mod tests {
         assert!(p.contains("git merge"));
         assert!(p.contains("--abort"));
         assert!(!p.contains("force-push"), "never instructs force anything");
+    }
+
+    /// The planning turn's text becomes the task list, so a completion that
+    /// dies mid-stream must not leave its half-written tasks in front of the
+    /// re-generated ones: the fleet would run a plan the model never finished
+    /// writing.
+    #[test]
+    fn a_retried_stream_leaves_no_duplicate_in_the_collected_text() {
+        let mut collected = TurnText::default();
+        collected.handle(AgentEvent::TextDelta("intro. ".to_string()));
+        collected.handle(AgentEvent::StepCompleted { step: 1 });
+        collected.handle(AgentEvent::TextDelta("1. half a ta".to_string()));
+        collected.handle(AgentEvent::StreamRetrying);
+        collected.handle(AgentEvent::TextDelta("1. the whole task".to_string()));
+
+        assert_eq!(collected.text, "intro. 1. the whole task");
+    }
+
+    /// A fleet planning turn has no reviewer, so both gates answer themselves
+    /// rather than parking the turn inside the tool forever.
+    #[test]
+    fn plan_and_interview_gates_are_answered_without_a_human() {
+        let mut collected = TurnText::default();
+        let (gate, mut verdict) = crate::agent::PlanGate::open();
+        collected.handle(AgentEvent::PlanReady {
+            plan: "1. do it".to_string(),
+            gate,
+        });
+        assert!(verdict.try_recv().expect("verdict sent").approved);
+
+        let (gate, mut answers) = crate::agent::InterviewGate::open();
+        collected.handle(AgentEvent::Interview {
+            questions: Vec::new(),
+            gate,
+        });
+        assert_eq!(answers.try_recv().expect("interview answered"), None);
     }
 }

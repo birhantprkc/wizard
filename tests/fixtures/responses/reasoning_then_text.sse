@@ -1,0 +1,41 @@
+: OpenAI Responses API stream (POST /responses, store=false,
+: include=["reasoning.encrypted_content"]) as the ChatGPT subscription
+: endpoint at chatgpt.com/backend-api/codex serves it.
+:
+: The ordinary answering turn: reasoning summary deltas, then answer text,
+: then the completed reasoning item carrying the encrypted payload, then
+: usage. The two delta kinds are the reason this fixture exists: they arrive
+: on different event names and mean different things, and a decoder that
+: folds reasoning_summary_text into output_text puts the model's private
+: deliberation into the transcript as its answer.
+:
+: The reasoning item lands AFTER the answer text here, which is what the
+: endpoint does, and the adapter still has to replay it first on the next
+: request; nothing about that ordering is in the item itself.
+:
+: Lines starting with a colon are SSE comments. The adapter skips every line
+: that does not begin with "data" plus a colon, so this header and the event:
+: lines travel with the bytes without changing what is parsed.
+:
+: Transcribed from chatgpt::tests::decodes_text_and_a_tool_call and the
+: encrypted-reasoning assertions beside it. See the header of
+: tests/recorded_provider.rs for how to re-record it from a live stream once
+: the adapter's dump hook exists.
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"Weighing the "}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"options."}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Four"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"teen."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_9","encrypted_content":"gAAAAAB-still-opaque","summary":[{"type":"summary_text","text":"Weighing the options."}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":3}}}
