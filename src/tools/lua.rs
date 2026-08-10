@@ -1375,4 +1375,3 @@ return "reachable:[" .. table.concat(reachable, ",") .. "]"
         assert!(out.content.contains("nil/nil"), "{}", out.content);
     }
 }
-
