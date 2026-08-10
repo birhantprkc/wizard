@@ -132,14 +132,6 @@ Only these variables, by name, and only when they are set to a non-empty value w
 
 ## After replacing the binary
 
-> **`wizard update` does not work in v2.0.0.** `wizard-release.pub` is still a
-> placeholder rather than a real minisign public key, so `wizard update` refuses
-> every download before it fetches anything, and no published release carries a
-> signature for it to check either. Until that changes, "replacing the binary"
-> means a source build or a fresh checkout. The rest of this section describes
-> what happens when the file at the unit's `ExecStart` path is replaced, however
-> it got there.
-
 When the new binary is put in place by a rename over the old path — which is what `wizard update` will do once it can, and what `cargo install`-style flows do — a running service keeps executing the image it already opened, so **it survives the swap and keeps running the old version**. The next start picks up the new one:
 
 ```bash

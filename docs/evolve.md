@@ -154,7 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
   | WIZARD_WITH_TOOLCHAIN=1 WIZARD_BUILD_FROM_SOURCE=1 bash
 ```
 
-`WIZARD_BUILD_FROM_SOURCE=1` is there because in v2.0.0 no download path works: `wizard-release.pub` is still a placeholder rather than a real minisign key, so `install.sh` refuses before it fetches anything and so does `wizard update`. A source build needs a Rust toolchain anyway, which makes the toolchain flag redundant on that path — it matters again once there is a signed release to download. See [Getting started](getting-started.md#install).
+`WIZARD_BUILD_FROM_SOURCE=1` builds from the release tag rather than downloading its assets, which is the path that needs a Rust toolchain. See [Getting started](getting-started.md#install).
 
 ---
 

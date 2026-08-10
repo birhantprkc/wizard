@@ -4,38 +4,7 @@ Wizard installs from one command and launches as a terminal UI agent. (In v2.0.0
 
 ## Install
 
-> **Read this first: no download path works today.** `wizard-release.pub` in
-> this repository is still a placeholder rather than a real minisign public key,
-> and neither client will install something it cannot verify. `install.sh`
-> aborts with *"this install.sh carries no release signing key, so it cannot
-> verify any release"* before it fetches anything, and `wizard update` refuses
-> for the same reason. No published release carries a `checksums.txt.minisig`
-> either, so even a real key would find nothing to check. Until a signed release
-> is published, the three paths that work are a **source build**, **Nix**, and a
-> **checkout** — everything else on this page describes how the download will
-> behave once there is something signed to download.
->
-> ```bash
-> # source build: clones the newest release tag (or main, with a warning, when
-> # the repo has none) and runs cargo build --release
-> curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
->   | WIZARD_BUILD_FROM_SOURCE=1 bash
-> ```
->
-> This needs `git`, a Rust toolchain and a C linker; the installer tries to
-> install the last two for you and names the package to install if it cannot
-> (`build-essential`, `gcc`, `base-devel`, `build-base`). On Termux it is what
-> happens anyway. See [Nix / NixOS](#nix--nixos) for the other two paths.
->
-> The refusal comes first, ahead of everything a flavor would do, so
-> `WIZARD_LOCAL=1` on its own declines in about a second rather than after
-> installing llama.cpp and pulling a multi-gigabyte GGUF. That ordering is
-> deliberate: refusing after the expensive part is refusing after the expensive
-> part. To preinstall the local stack today, pair the flavor with
-> `WIZARD_BUILD_FROM_SOURCE=1`, which is the path that skips the key check
-> altogether.
-
-Once a signed release exists, the one-liner is:
+The one-liner is:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
@@ -147,7 +116,7 @@ cargo build --release --features native
 
 `WIZARD_NATIVE=1` installs `wizard-native` next to `wizard` and never replaces it, so the plain binary keeps its runs-anywhere promise. The asset exists for glibc Linux and macOS on both architectures; there is no musl or Termux build of it. A plain binary asked for `wizard gui` says it has no window and prints these lines. `--native` is still accepted and ignored, so an alias written when there were two GUIs still opens the one there is. See [Native GUI](native-gui.md).
 
-Today the asset half of that is not reachable — no signed release exists, so the download refuses ([Install](#install)) — but `WIZARD_NATIVE=1` combined with `WIZARD_BUILD_FROM_SOURCE=1` builds it from the same checkout, and so does the `cargo build --release --features native` line above.
+`WIZARD_NATIVE=1` downloads that asset; combined with `WIZARD_BUILD_FROM_SOURCE=1` it builds the window from the same checkout instead, and so does the `cargo build --release --features native` line above.
 
 ### Model tiers (automatic)
 
@@ -485,17 +454,6 @@ Example:
 
 ## Updating
 
-> **`wizard update` cannot install anything today.** The release public key
-> compiled into the binary is still the placeholder, so it refuses at the
-> signature check — before any binary is fetched — with *"this build embeds no
-> release signing key (wizard-release.pub is still the placeholder), so it
-> cannot verify any release"*. There is no flag or
-> environment variable that skips that, by design. Until a signed release
-> exists, update by rebuilding — re-run `install.sh` with
-> `WIZARD_BUILD_FROM_SOURCE=1`, `nix profile upgrade`, or `git pull && cargo
-> build --release`. Everything in this section describes the behaviour that
-> takes over once the key is real.
-
 `wizard update` upgrades the binary in place: it downloads the latest release from GitHub, checks the published `checksums.txt` against its minisign signature, verifies the tarball's sha256 against that file, and swaps it in with an atomic rename. The change takes effect on the next `wizard` launch. With `WIZARD_MIRROR` set it tries that mirror first and falls back to GitHub on any failure, saying which one it used ([The download mirror](#the-download-mirror)); everything below applies unchanged to whichever host answered.
 
 **Verification is mandatory and there is no way to skip it.** `checksums.txt` and its detached signature `checksums.txt.minisig` are both fetched *before* anything is downloaded, and each of these aborts the update with the current binary untouched:
@@ -530,7 +488,7 @@ interval_hours = 24           # hours between startup checks
 
 With `auto = true` the new binary is fetched in the background and takes effect on the next launch (the running process is never hot-swapped); it is skipped when the install directory needs `sudo`, falling back to the notice. It goes through the same mandatory signature and checksum verification as `wizard update`, and a failure there is silent: the notice is all you get, and the binary is left alone.
 
-Re-running the installer still works and leaves an existing `~/.wizard/config.toml` untouched. Today that means the source-build flavor, since the download path refuses ([Install](#install)):
+Re-running the installer still works and leaves an existing `~/.wizard/config.toml` untouched:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
@@ -546,9 +504,8 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
   | WIZARD_VERSION=v2.0.0 WIZARD_BUILD_FROM_SOURCE=1 bash
 ```
 
-(`WIZARD_BUILD_FROM_SOURCE=1` is required for the same reason it is above: the
-download path refuses while the release signing key is a placeholder.
-`WIZARD_VERSION` names the ref the source build clones as well as the release
+(`WIZARD_BUILD_FROM_SOURCE=1` builds that tag from source instead of
+downloading its assets. `WIZARD_VERSION` names the ref the source build clones as well as the release
 tag it would have downloaded, so it pins both flavors; `WIZARD_REF` overrides it
 for the source build alone.)
 

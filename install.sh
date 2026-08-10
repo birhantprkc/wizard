@@ -201,7 +201,7 @@ fi
 # compiled into the binary (src/update.rs), so the installer and `wizard update`
 # trust one key and a test asserts the two copies have not drifted. Editing this
 # line is editing what this script will install.
-WIZARD_RELEASE_PUBKEY="RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md"
+WIZARD_RELEASE_PUBKEY="RWQVojXCTN+B/wZ//qcSQpiznLrxQd6DKKnhovJjGLrjWk2Gfftu3Gbi"
 # Set once `checksums.txt` in $TMP_DIR has been fetched *and* its signature has
 # verified, so a second asset does not re-verify the same file.
 CHECKSUMS_VERIFIED=0

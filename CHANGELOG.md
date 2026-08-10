@@ -4,7 +4,7 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
-## [2.0.0] - unreleased
+## [2.0.0] - 2026-08-10
 
 The 2.0 line: the browser GUI is replaced by a window that links the agent core in process, the gateway becomes something you can leave running, a project's own hooks stop running unasked, and every long-running surface stops dying on failures it could have ridden out. It is a breaking release, and three of the breaks are silent — nothing errors, the thing just stops happening. Read [Breaking changes](#breaking-changes) before upgrading a machine that is doing work for you.
 
@@ -44,7 +44,7 @@ The 2.0 line: the browser GUI is replaced by a window that links the agent core 
   wizard-native gui
   ```
 
-  `WIZARD_BUILD_FROM_SOURCE=1` is not optional today; see [Known issues](#known-issues). `WIZARD_APP=1`, the old spelling, is honored as a deprecated alias for `WIZARD_NATIVE=1` so an existing provisioning script gets a window rather than silently getting nothing. `wizard update` keeps the two apart (`native_assets` in `src/update.rs`): a native build updates to a native asset and never to the plain one.
+  `WIZARD_BUILD_FROM_SOURCE=1` is one way to skip the signature check by building from a git ref. `WIZARD_APP=1`, the old spelling, is honored as a deprecated alias for `WIZARD_NATIVE=1` so an existing provisioning script gets a window rather than silently getting nothing. `wizard update` keeps the two apart (`native_assets` in `src/update.rs`): a native build updates to a native asset and never to the plain one.
 
 - **`wizard app` is removed, the browser GUI is deleted, and `wizard gui` no longer takes `--port`, `--no-open` or `--assets`.** The window is now a native [iced](https://iced.rs) application that links the agent core in process: no webview, no loopback HTTP server, no port, and no JSON round trip per streaming token. What went with the page it replaced: the axum server, the WebSocket protocol, `gui/assets/`, and `docs/gui-protocol.md`, the ~500-line document that specified those frames for integrators. There is no replacement protocol, because there is no longer a socket to speak it on.
 
@@ -54,8 +54,7 @@ The 2.0 line: the browser GUI is replaced by a window that links the agent core 
 
 - **The installer and the updater refuse a release they cannot verify.** Releases are now signed with minisign: `install.sh` fetches `checksums.txt` and `checksums.txt.minisig`, verifies the signature under the public key inlined in the script, and verifies each asset's SHA-256 against that file. Every failure aborts — no signature, a bad one, one from another key, no `checksums.txt`, no entry for that asset, a digest mismatch, or a host with neither `sha256sum` nor `shasum`. `wizard update` applies the same rules with the key compiled in.
 
-  **What breaks:** a scripted `curl … | bash` that used to install a binary now exits non-zero on any of the above. Verifying a signature needs `minisign` on PATH or an OpenSSL that does ed25519 and blake2b; macOS ships LibreSSL, which has neither, so `brew install minisign` first. And until a real key is seeded, *every* download path refuses — see [Known issues](#known-issues).
-
+  **What breaks:** a scripted `curl … | bash` that used to install a binary now exits non-zero on any of the above. Verifying a signature needs `minisign` on PATH or an OpenSSL that does ed25519 and blake2b; macOS ships LibreSSL, which has neither, so `brew install minisign` first. 
   **Remediation:** install `minisign`, or add `WIZARD_BUILD_FROM_SOURCE=1`, which skips the signature question entirely by building from a git ref.
 
 - **The Home Manager module is exported as `homeModules.default`.** 1.8.0 exported it as `homeManagerModules.default`, which is not a flake output name Nix knows, so `nix flake check` reported it as unknown and checked nothing inside it. `homeModules` is the name Home Manager settled on and the one it reads first.
@@ -151,21 +150,6 @@ An adversarial audit ran against 2.0.0 before release. Its findings, all fixed h
 - **A download nobody has agreed to trust yet is bounded**, and a late-arriving tool can no longer win a name.
 
 ### Known issues
-
-- **No download path works in 2.0.0.** `wizard-release.pub` in this repository is still the literal placeholder `RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md` rather than a real minisign public key, and neither client will install something it cannot verify. `refuse_placeholder_key` in `install.sh` runs early in `main` — before the install flavors and before the download — so `install.sh` aborts with *"this install.sh carries no release signing key, so it cannot verify any release"* in about a second, having fetched nothing and installed nothing. The `build_from_source` fallback further down, after `download_binary` finds nothing, is not reached on that path, so it cannot rescue it. `wizard update` refuses for the same reason, and no published release carries a `checksums.txt.minisig` for a real key to check anyway.
-
-  Three paths work: a source build, Nix, and a checkout.
-
-  ```bash
-  # source build: clones the newest release tag and runs cargo build --release
-  curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
-    | WIZARD_BUILD_FROM_SOURCE=1 bash
-
-  # Nix
-  nix run github:teddytennant/wizard
-  ```
-
-  `WIZARD_BUILD_FROM_SOURCE=1` skips the signature question entirely, which is why it works; it is forced on Termux, and that makes Termux the one platform where the plain one-liner behaves as documented. See [getting-started.md](docs/getting-started.md#install).
 
 - **The window is still settling.** The TUI remains the surface everything ships to first.
 
