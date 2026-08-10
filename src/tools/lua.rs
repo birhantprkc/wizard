@@ -92,14 +92,16 @@ fn sandboxed_libs() -> StdLib {
     StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::BIT | StdLib::JIT
 }
 
-/// Memory a sandboxed script may allocate before its allocations start
-/// failing as ordinary Lua errors. Generous for text munging, far below what
-/// it takes to disturb the host.
+/// Memory a sandboxed script may hold before the deadline hook stops it with
+/// an ordinary Lua error. Generous for text munging, far below what it takes
+/// to disturb the host.
 const SANDBOX_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// How often the sandbox's deadline hook runs. Often enough that a tight loop
-/// is caught promptly, rarely enough not to matter to an honest script.
-const SANDBOX_HOOK_INSTRUCTIONS: u32 = 100_000;
+/// is caught promptly and that an allocating loop cannot get far past the
+/// memory ceiling between two checks, rarely enough not to matter to an honest
+/// script.
+const SANDBOX_HOOK_INSTRUCTIONS: u32 = 10_000;
 
 /// Base-library globals blanked for a [`Stdlib::Sandboxed`] run.
 ///
@@ -306,6 +308,29 @@ fn run_lua_blocking(
     })?;
 
     if stdlib == Stdlib::Sandboxed {
+        // Turn the JIT off before the instruction hook below is installed, and
+        // do it while `jit` is still reachable (`blank_globals` takes it away).
+        //
+        // LuaJIT compiles hot paths into traces, and a trace does not check for
+        // a count hook the way the interpreter does: the hook the sandbox
+        // installs stops being called once a loop is compiled, so the deadline
+        // it enforces would silently stop applying to exactly the runaway loop
+        // it exists to catch. Worse than not firing, erroring out of a hook
+        // that fires *while a trace is running* unwinds through JIT-compiled
+        // frames, which is what SIGSEGVs the suite on Apple Silicon.
+        //
+        // `jit.off(true, true)` disables compilation and flushes any traces
+        // already recorded, so every sandboxed chunk runs interpreted, where
+        // the hook is reliable. This costs a registry tool the JIT and buys the
+        // bound being real; a locally authored tool (`Stdlib::Full`) is not
+        // hooked at all and keeps the JIT.
+        lua.load("jit.off(true, true)")
+            .exec()
+            .map_err(|err| ToolError::Execution {
+                tool: tool.to_string(),
+                source: anyhow::anyhow!("disabling the JIT for a sandboxed run: {err}"),
+            })?;
+
         blank_globals(&lua).map_err(|err| ToolError::Execution {
             tool: tool.to_string(),
             source: anyhow::anyhow!("sandboxing the LuaJIT state: {err}"),
@@ -329,19 +354,40 @@ fn run_lua_blocking(
         // and an instruction hook turns the spin into one too. Both apply to
         // sandboxed runs only: a locally authored tool is the user's own code
         // and has always been allowed to take as long as it likes.
-        lua.set_memory_limit(SANDBOX_MEMORY_LIMIT)
-            .map_err(|err| ToolError::Execution {
-                tool: tool.to_string(),
-                source: anyhow::anyhow!("setting the sandbox memory limit: {err}"),
-            })?;
+        // The ceiling is enforced by *watching* allocation, not by starving the
+        // allocator.
+        //
+        // `set_memory_limit` makes the next allocation past the limit fail, and
+        // handing LuaJIT an allocation failure is where this used to SIGSEGV on
+        // Apple Silicon: LuaJIT on 64-bit does not properly support the foreign
+        // allocator mlua installs to implement the limit, and its out-of-memory
+        // path is the part that does not survive. It is a hard crash of the
+        // whole process, so it takes the agent with it — strictly worse than
+        // the OOM it was added to prevent.
+        //
+        // Reading `used_memory` from the hook below reaches the same ceiling
+        // one step earlier, as an ordinary Lua error raised between
+        // instructions rather than an allocation the VM cannot satisfy. The
+        // hook runs often enough that a script cannot get far past the line
+        // before it is stopped.
         let deadline = std::time::Instant::now() + timeout;
         lua.set_hook(
             mlua::HookTriggers::new().every_nth_instruction(SANDBOX_HOOK_INSTRUCTIONS),
-            move |_lua, _debug| {
+            move |lua, _debug| {
                 if std::time::Instant::now() >= deadline {
                     return Err(mlua::Error::runtime(
                         "sandboxed tool exceeded its time budget",
                     ));
+                }
+                // `used_memory` is 0 when mlua could not install its allocator,
+                // which reads as "no reading available" rather than "nothing
+                // allocated": the bound is skipped instead of tripping at once.
+                let used = lua.used_memory();
+                if used > SANDBOX_MEMORY_LIMIT {
+                    return Err(mlua::Error::runtime(format!(
+                        "sandboxed tool exceeded its memory budget ({} MB)",
+                        SANDBOX_MEMORY_LIMIT / (1024 * 1024)
+                    )));
                 }
                 Ok(mlua::VmState::Continue)
             },
@@ -1329,3 +1375,4 @@ return "reachable:[" .. table.concat(reachable, ",") .. "]"
         assert!(out.content.contains("nil/nil"), "{}", out.content);
     }
 }
+
