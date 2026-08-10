@@ -19,14 +19,6 @@ That installs the `wizard` binary. First run asks which provider you want and ha
 
 > **Other ways to install:** local-stack preinstall, minimal, bring-your-own-model, Nix, macOS, Termux, plus a first-run walkthrough, all in **[Getting started](docs/getting-started.md)**.
 
-## Upgrading from 1.x
-
-2.0.0 is a breaking release, and three of the breaks are silent: nothing errors, the thing just stops happening. Read [CHANGELOG.md](CHANGELOG.md) before upgrading a machine that is doing work for you.
-
-- **A gateway bot with no `allowed_chat_ids` now answers nobody.** In 1.8.0 an empty list allowed everyone; in 2.0.0 the list is closed and an empty one refuses every message. Run `wizard gateway setup`, or put your chat id in `allowed_chat_ids` under `[gateway]` in `~/.wizard/config.toml`, and restart. See [Gateway](docs/gateway.md#the-allow-list).
-- **A project's own `.wizard/hooks.toml` does not load until you trust it.** Cloning is not consent, so a project hooks file is gated on a recorded yes. Start Wizard once interactively in that directory and answer `y` — `wizard -p`, `--mode sovereign` and `--continuous` ask too, as long as they are in the foreground on a real terminal. Runs that genuinely cannot ask (piped or redirected stdin, `--output-format json`, the gateway, systemd units, CI) need `WIZARD_TRUST_PROJECT=1` instead. `~/.wizard/hooks.toml` is unaffected. See [Hooks](docs/hooks.md#project-trust).
-- **`wizard-desktop` is now `wizard-native`, and the old binary can never update itself.** The release assets were renamed, so a 1.8.0 `wizard-desktop` looks for `wizard-desktop-*` and gets a 404 forever. Reinstall with `WIZARD_NATIVE=1` and delete the old binary. The window it opens is a different program too: the browser GUI, its loopback server and its WebSocket protocol are gone, replaced by a native iced window. See [Native GUI](docs/native-gui.md).
-
 ---
 
 ## What it does
