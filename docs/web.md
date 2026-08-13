@@ -47,7 +47,9 @@ Search endpoints get their redirects walked by hand too, since these clients fol
 
 ### xAI Grok web search
 
-The `xai` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider). **If you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`. Because the search runs remotely, it is slower than a scrape: the request timeout is 120 s.
+The `xai` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider). **If you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`.
+
+The search runs on a fast non-reasoning Grok, not the flagship chat model. Searching is a fetch-and-format job, and the flagship model spends most of the wall clock reasoning about a list of links for the same hits, so a typical query lands in a few seconds instead of twenty. Set `[web] search_model` to pin a different model. The default is a pinned snapshot; if xAI retires it, the search retries once on the flagship model rather than failing. The request timeout is 45 s.
 
 ## x_search
 
@@ -60,7 +62,7 @@ Search X (formerly Twitter) via xAI Grok's server-side `x_search` tool on the Re
   - `excluded_x_handles` (optional) — exclude these handles (same limit; cannot combine with `allowed_x_handles`)
   - `from_date` / `to_date` (optional) — passed through to xAI as-is; give them as `YYYY-MM-DD`. Wizard does not validate the format, so a malformed date fails at the API, not here
 - **Auth:** same as xAI web search — OAuth from `/login xai` first, then a stored `xai` key, then `XAI_API_KEY` / `[web] search_api_key_env`. Independent of `search_backend`.
-- **Timeout:** 120 s (server-side search loop).
+- **Timeout:** 45 s (server-side search loop). Runs on the same fast model as xAI web search, and honors `[web] search_model` too.
 
 No extra config is required beyond xAI sign-in or an API key. Results render as the same numbered title/url/snippet list as `web_search`.
 
@@ -72,6 +74,7 @@ fetch_max_bytes = 100000          # cap on web_fetch response bytes (default 100
 allow_local = false               # permit localhost/private-range fetches (default false)
 search_backend = "duckduckgo"     # duckduckgo | brave | tavily | exa | serper | xai
 search_api_key_env = "BRAVE_API_KEY"  # optional env-var fallback when no key was pasted
+search_model = "grok-4.6"         # xai backend only: model that runs the search (default: a fast non-reasoning Grok)
 ```
 
 Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand: it also handles the API key.

@@ -1204,9 +1204,20 @@ pub struct XaiSearch {
     tool_options: Value,
 }
 
-/// Whole-request timeout for an xAI search. Generous: the server-side
-/// search loop is much slower than a single scrape.
-const XAI_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Whole-request timeout for an xAI search. Still generous — the server-side
+/// search loop is slower than a single scrape — but not the multi-minute wait
+/// it used to be: with a non-reasoning search model a normal query lands in a
+/// few seconds, so anything past this is hung, not thinking.
+const XAI_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Model that runs the server-side search loop.
+///
+/// Deliberately *not* [`xai_oauth::DEFAULT_MODEL`]: search is a fetch-and-
+/// format job, not a reasoning one, and the flagship model spends most of the
+/// wall clock thinking about a list of links. The non-reasoning model returns
+/// the same hits in roughly a quarter of the time. Override with
+/// `[web] search_model`.
+const XAI_SEARCH_MODEL: &str = "grok-4.20-0309-non-reasoning";
 
 /// Whether an xAI OAuth session exists on disk (`wizard --login xai`).
 fn xai_signed_in() -> bool {
@@ -1218,15 +1229,21 @@ fn xai_signed_in() -> bool {
 /// Resolve xAI auth for search tools: OAuth session if signed in, else a
 /// stored `xai` key, else `search_api_key_env` / `XAI_API_KEY`.
 fn resolve_xai_auth(ctx: &ToolContext) -> Result<XaiSearch, String> {
+    let model = ctx
+        .web
+        .search_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
     if xai_signed_in() {
         let source = XaiTokenSource::new()
             .map_err(|err| format!("opening the xAI OAuth token store: {err:#}"))?;
-        return Ok(XaiSearch::oauth(source));
+        return Ok(XaiSearch::oauth(source).with_model_override(model));
     }
     if let Some(key) = crate::credentials::get("xai")
         && !key.trim().is_empty()
     {
-        return Ok(XaiSearch::api_key(key));
+        return Ok(XaiSearch::api_key(key).with_model_override(model));
     }
     let env_name = ctx
         .web
@@ -1234,7 +1251,7 @@ fn resolve_xai_auth(ctx: &ToolContext) -> Result<XaiSearch, String> {
         .as_deref()
         .unwrap_or(xai_oauth::DEFAULT_KEY_ENV);
     match std::env::var(env_name) {
-        Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key)),
+        Ok(key) if !key.trim().is_empty() => Ok(XaiSearch::api_key(key).with_model_override(model)),
         _ => Err(format!(
             "xAI search needs auth: run `/login xai` to sign in (or `wizard --login xai`), \
              or set ${env_name} to an xAI API key"
@@ -1247,7 +1264,7 @@ impl XaiSearch {
     fn oauth(source: XaiTokenSource) -> Self {
         Self {
             base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
-            model: xai_oauth::DEFAULT_MODEL.to_string(),
+            model: XAI_SEARCH_MODEL.to_string(),
             auth: XaiAuth::Oauth(source),
             server_tool: XaiServerTool::WebSearch,
             tool_options: json!({}),
@@ -1258,11 +1275,19 @@ impl XaiSearch {
     fn api_key(key: impl Into<String>) -> Self {
         Self {
             base_url: xai_oauth::DEFAULT_BASE_URL.to_string(),
-            model: xai_oauth::DEFAULT_MODEL.to_string(),
+            model: XAI_SEARCH_MODEL.to_string(),
             auth: XaiAuth::ApiKey(key.into()),
             server_tool: XaiServerTool::WebSearch,
             tool_options: json!({}),
         }
+    }
+
+    /// Apply a `[web] search_model` override, if one is configured.
+    fn with_model_override(mut self, model: Option<&str>) -> Self {
+        if let Some(model) = model {
+            self.model = model.to_string();
+        }
+        self
     }
 
     /// Switch the server-side tool (`web_search` or `x_search`).
@@ -1298,7 +1323,7 @@ impl XaiSearch {
 
     /// The Responses API request body: a single user turn that hands Grok the
     /// chosen server-side tool and constrains it to a JSON-only reply.
-    fn request_body(&self, query: &str, count: usize) -> Value {
+    fn request_body(&self, model: &str, query: &str, count: usize) -> Value {
         let mut tool = json!({ "type": self.server_tool.as_str() });
         if let Some(map) = self.tool_options.as_object() {
             for (key, value) in map {
@@ -1306,7 +1331,7 @@ impl XaiSearch {
             }
         }
         json!({
-            "model": self.model,
+            "model": model,
             "input": [{
                 "role": "user",
                 "content": xai_search_prompt(self.server_tool, query, count)
@@ -1315,23 +1340,23 @@ impl XaiSearch {
             "include": ["no_inline_citations"],
         })
     }
-}
 
-#[async_trait]
-impl SearchBackend for XaiSearch {
-    async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(XAI_SEARCH_TIMEOUT)
-            .build()?;
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let body = self.request_body(query, count);
+    /// One search request against a given model.
+    async fn search_with_model(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        model: &str,
+        query: &str,
+        count: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        let body = self.request_body(model, query, count);
 
         let mut retried = false;
         let response = loop {
             let token = self.bearer().await?;
             let response = client
-                .post(&url)
+                .post(url)
                 .bearer_auth(token)
                 .json(&body)
                 .send()
@@ -1354,6 +1379,47 @@ impl SearchBackend for XaiSearch {
             anyhow::bail!("xAI {} error: {message}", self.server_tool.label());
         }
         Ok(parse_xai_results(&payload, count))
+    }
+}
+
+/// Whether a failed search looks like "that model does not exist" rather than
+/// a network or auth problem. [`XAI_SEARCH_MODEL`] is a pinned snapshot, so it
+/// can be retired out from under us; this is what decides to try the flagship
+/// model instead of failing the search.
+fn looks_like_unknown_model(err: &anyhow::Error) -> bool {
+    if let Some(err) = err.downcast_ref::<reqwest::Error>() {
+        return matches!(
+            err.status(),
+            Some(reqwest::StatusCode::NOT_FOUND) | Some(reqwest::StatusCode::BAD_REQUEST)
+        );
+    }
+    err.to_string().to_ascii_lowercase().contains("model")
+}
+
+#[async_trait]
+impl SearchBackend for XaiSearch {
+    async fn search(&self, query: &str, count: usize) -> anyhow::Result<Vec<SearchResult>> {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(XAI_SEARCH_TIMEOUT)
+            .build()?;
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+
+        let err = match self
+            .search_with_model(&client, &url, &self.model, query, count)
+            .await
+        {
+            Ok(results) => return Ok(results),
+            Err(err) => err,
+        };
+        // The default is a pinned snapshot; if it has been retired, fall back
+        // to the flagship model rather than leaving search broken. A model the
+        // user configured is their choice, so that failure is reported as-is.
+        if self.model != XAI_SEARCH_MODEL || !looks_like_unknown_model(&err) {
+            return Err(err);
+        }
+        self.search_with_model(&client, &url, xai_oauth::DEFAULT_MODEL, query, count)
+            .await
     }
 }
 
@@ -1809,6 +1875,7 @@ impl Tool for XSearchTool {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2133,10 +2200,50 @@ mod tests {
     }
 
     fn http_response(content_type: &str, body: &str) -> String {
+        http_response_status(200, content_type, body)
+    }
+
+    fn http_response_status(status: u16, content_type: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    /// Like [`serve`], but records each request body and picks the response
+    /// from the request count (1-based), so a test can drive a retry.
+    async fn serve_recording<F>(bodies: Arc<Mutex<Vec<String>>>, respond: F) -> SocketAddr
+    where
+        F: Fn(usize) -> String + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let respond = Arc::new(respond);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let bodies = Arc::clone(&bodies);
+                let respond = Arc::clone(&respond);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = request
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body.to_string())
+                        .unwrap_or_default();
+                    let count = {
+                        let mut seen = bodies.lock().expect("lock");
+                        seen.push(body);
+                        seen.len()
+                    };
+                    let _ = socket.write_all(respond(count).as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
     }
 
     /// Context whose `[web]` settings allow loopback fetches.
@@ -3039,7 +3146,7 @@ mod tests {
                 "allowed_x_handles": ["xai"],
                 "from_date": "2026-01-01"
             }));
-        let body = backend.request_body("status of grok", 3);
+        let body = backend.request_body(&backend.model, "status of grok", 3);
         assert_eq!(body["tools"][0]["type"], "x_search");
         assert_eq!(body["tools"][0]["allowed_x_handles"], json!(["xai"]));
         assert_eq!(body["tools"][0]["from_date"], "2026-01-01");
@@ -3051,10 +3158,69 @@ mod tests {
 
     #[test]
     fn web_search_request_body_still_uses_web_search_tool() {
-        let body = XaiSearch::api_key("test-key").request_body("rust", 5);
+        let backend = XaiSearch::api_key("test-key");
+        let body = backend.request_body(&backend.model, "rust", 5);
         assert_eq!(body["tools"][0]["type"], "web_search");
         let prompt = body["input"][0]["content"].as_str().expect("prompt");
         assert!(prompt.contains("web_search"), "{prompt}");
+    }
+
+    #[test]
+    fn xai_search_defaults_to_the_fast_model() {
+        // Searching on the flagship reasoning model is several times slower
+        // for the same links, so the default must stay the fast one.
+        assert_eq!(XaiSearch::api_key("test-key").model, XAI_SEARCH_MODEL);
+        assert_ne!(XAI_SEARCH_MODEL, xai_oauth::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn search_model_config_overrides_the_default() {
+        let backend = XaiSearch::api_key("test-key").with_model_override(Some("grok-4.6"));
+        assert_eq!(backend.model, "grok-4.6");
+        let body = backend.request_body(&backend.model, "rust", 5);
+        assert_eq!(body["model"], "grok-4.6");
+    }
+
+    #[test]
+    fn blank_search_model_keeps_the_default() {
+        let backend = XaiSearch::api_key("test-key").with_model_override(None);
+        assert_eq!(backend.model, XAI_SEARCH_MODEL);
+    }
+
+    #[tokio::test]
+    async fn a_retired_default_model_falls_back_to_the_flagship() {
+        let envelope =
+            r#"{"results":[{"title":"Rust","url":"https://rust-lang.org","description":"lang"}]}"#;
+        let ok = json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": envelope, "annotations": [] }]
+            }]
+        })
+        .to_string();
+        // First request 404s (model gone), second succeeds.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let addr = serve_recording(recorded, move |calls| {
+            if calls == 1 {
+                http_response_status(404, "application/json", r#"{"error":"model not found"}"#)
+            } else {
+                http_response_status(200, "application/json", &ok)
+            }
+        })
+        .await;
+        let backend = XaiSearch::api_key("test-key").with_base_url(format!("http://{addr}"));
+        let results = backend.search("rust", 5).await.expect("search ok");
+        assert_eq!(results.len(), 1);
+        let bodies = seen.lock().expect("lock");
+        assert_eq!(bodies.len(), 2, "expected one retry");
+        assert!(bodies[0].contains(XAI_SEARCH_MODEL), "{}", bodies[0]);
+        assert!(
+            bodies[1].contains(xai_oauth::DEFAULT_MODEL),
+            "{}",
+            bodies[1]
+        );
     }
 
     #[tokio::test]

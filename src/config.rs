@@ -384,6 +384,12 @@ pub struct WebConfig {
     /// `~/.wizard/credentials.toml` under the backend name). Read at call time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_api_key_env: Option<String>,
+    /// Model the `xai` search backend runs its server-side search loop on.
+    /// Defaults to a fast non-reasoning Grok, which answers a search in a few
+    /// seconds where the flagship model spends most of that time thinking.
+    /// Ignored by every other backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_model: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -393,6 +399,7 @@ impl Default for WebConfig {
             allow_local: false,
             search_backend: "duckduckgo".to_string(),
             search_api_key_env: None,
+            search_model: None,
         }
     }
 }
@@ -1695,6 +1702,7 @@ mod tests {
                 allow_local: true,
                 search_backend: "brave".to_string(),
                 search_api_key_env: Some("BRAVE_API_KEY".to_string()),
+                search_model: Some("grok-4.6".to_string()),
             },
             checkpoints: CheckpointConfig { keep_turns: 12 },
             fleet: FleetConfig {
