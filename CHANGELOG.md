@@ -4,6 +4,27 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
+## [2.0.1] - 2026-08-12
+
+The first patch on the 2.0 line. Compaction stops looping on a still-full window, tools stop flooding the context with listings, the composer stays with the agent while a command that will never prompt is running, and xAI's default is grok-4.6.
+
+### Added
+
+- **grok-4.6 is the default xAI model.** Both Chat Completions and OAuth point at it, it is first in the onboarding picker, and its 500K context window and published rates are mapped. grok-4.5 stays available behind it.
+
+### Changed
+
+- **Compaction keeps a token budget, not a message count.** The kept tail is the newest messages that fit 40% of the window, still capped at 10. A pass that used to leave the window over the 80% trigger (and fire again on the next step, 302 times in one session) now leaves it half empty. The summarizer's tokens are recorded in `wizard usage`. A span that is mostly a note an earlier pass wrote is left alone rather than fed back through the model.
+- **Stale `read_file` results are stubbed** when a later `write_file` or `edit_file` changed the same path, so the wrong contents stop riding along on every step until a full pass happened to sweep them up.
+- **Tools have their own output budgets.** `execute`, `read_file`, web fetches and manual sections keep 30 KB. `git_diff` gets 16 KB, `search_files` 12 KB, listings and `git_status` 8 KB, and a tool's error text 4 KB.
+- **The Anthropic preamble is cached for an hour.** Tool schemas and the system prompt are written once a session; the previous five-minute TTL dropped them on any pause and cost a full cold write at 1.25x. History breakpoints stay on five minutes.
+- **ACP speaks agent-client-protocol 2.0.** The stdio agent uses the builder + handler model, and long prompts are spawned off the dispatch loop so session/cancel still works.
+- **Dependencies.** ratatui 0.30.2 (with ratatui-image 10 and crossterm 0.29), mlua 0.12, agent-client-protocol 2.0, ed25519-dalek 3, getrandom 0.4.2, plus a cargo-minor-and-patch sweep.
+
+### Fixed
+
+- **A command that never prompts no longer takes the composer.** Every foreground command opened a console and the TUI switched Enter into it; `ls` and `cargo build` held the agent hostage for as long as they ran. The surface still claims the writer the moment the console opens, but it keeps the console aside until the tool reports the command is waiting.
+
 ## [2.0.0] - 2026-08-10
 
 The 2.0 line: the browser GUI is replaced by a window that links the agent core in process, the gateway becomes something you can leave running, a project's own hooks stop running unasked, and every long-running surface stops dying on failures it could have ridden out. It is a breaking release, and three of the breaks are silent — nothing errors, the thing just stops happening. Read [Breaking changes](#breaking-changes) before upgrading a machine that is doing work for you.
@@ -157,4 +178,5 @@ An adversarial audit ran against 2.0.0 before release. Its findings, all fixed h
 
   What is *not* affected: `wizard peers` and the mesh itself are unchanged, and the model and layout under the explorer (`src/graph/`) keep building and keep running their tests. The code is wired out, not deleted — `src/native/graph/mod.rs` lists the four seams that put it back, and `the_window_has_no_route_into_the_graph_explorer` fails the build if one of them returns by accident.
 
+[2.0.1]: https://github.com/teddytennant/wizard/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/teddytennant/wizard/compare/v1.8.0...v2.0.0
