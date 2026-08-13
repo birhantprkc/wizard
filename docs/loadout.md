@@ -4,8 +4,6 @@ A fresh Wizard install comes equipped already. Besides the binary, the installer
 
 The loadout is installed in every flavor except `WIZARD_MINIMAL=1`, which skips it. Each file is written only if it does not already exist, so nothing under `~/.wizard/` that you already have is ever overwritten: re-running the installer on an existing setup adds only what is missing.
 
-> No release is signed yet, so `install.sh` refuses to fetch a binary and never reaches the loadout step. Until then it lands only via `WIZARD_BUILD_FROM_SOURCE=1`, or by copying `loadout/` into `~/.wizard/` yourself.
-
 > Historical note: this loadout used to ship as a separate distribution called Wizard Arsenal. It has been absorbed into Wizard's default install; there is nothing extra to add on.
 
 ---

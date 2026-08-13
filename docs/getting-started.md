@@ -80,7 +80,7 @@ cd ~/wizard-src && git pull && cargo build --release \
   && install -m755 target/release/wizard "$PREFIX/bin/wizard"
 ```
 
-`wizard update` will not swap in a glibc Linux prebuilt on Termux.
+`wizard update` will not swap in a glibc Linux prebuilt on Termux; it builds the tag from source instead.
 
 ### Nix / NixOS
 
@@ -91,7 +91,7 @@ nix run github:teddytennant/wizard              # run without installing
 nix profile install github:teddytennant/wizard  # add to your profile
 ```
 
-The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard, plus the X11/Wayland libraries `--features native` opens a window with), `overlays.default`, and `homeModules.default` for wiring it into a Home Manager config (it was called `homeManagerModules.default` before 2.0.0, which is not an output name Nix recognizes, so `nix flake check` skipped it; that spelling is still exported as an alias, so an existing import keeps working). On NixOS the curl installer detects the system, points you at these commands, and, if you run it anyway, installs the static musl binary into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there).
+The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard, plus the X11/Wayland libraries `--features native` opens a window with), `overlays.default`, and `homeModules.default` for wiring it into a Home Manager config (it was called `homeManagerModules.default` before 2.0.0, which is not an output name Nix recognizes, so `nix flake check` skipped it; that spelling is still exported as an alias, so an existing import keeps working). On NixOS the curl installer detects the system, points you at these commands, and, if you run it anyway, prefers the musl asset into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there). The published musl assets are not yet statically linked, so that prebuilt does not start; `wizard update` then builds the tag from source instead of leaving you on the old binary.
 
 `packages.default` builds with default features, so it does **not** carry the native GUI — build one from a checkout of the flake with `cargo build --release --features native` inside `nix develop`.
 
@@ -455,6 +455,8 @@ Example:
 ## Updating
 
 `wizard update` upgrades the binary in place: it downloads the latest release from GitHub, checks the published `checksums.txt` against its minisign signature, verifies the tarball's sha256 against that file, and swaps it in with an atomic rename. The change takes effect on the next `wizard` launch. With `WIZARD_MIRROR` set it tries that mirror first and falls back to GitHub on any failure, saying which one it used ([The download mirror](#the-download-mirror)); everything below applies unchanged to whichever host answered.
+
+When this binary cannot verify a download (it was compiled with the placeholder signing key) or no published asset runs here (NixOS without a static musl loader, Termux), it clones the tag and `cargo build --release --locked` instead. That is the same trust as `WIZARD_BUILD_FROM_SOURCE=1` on the installer. A failed signature or digest is still fatal: it does not compile something else around a check that failed. Background auto-update (`[update].auto`) stays download-only, so it never starts a multi-minute compile unattended.
 
 **Verification is mandatory and there is no way to skip it.** `checksums.txt` and its detached signature `checksums.txt.minisig` are both fetched *before* anything is downloaded, and each of these aborts the update with the current binary untouched:
 

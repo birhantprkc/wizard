@@ -6,6 +6,10 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Fixed
+
+- **`wizard update` builds from source when it cannot install a prebuilt.** A binary compiled with the placeholder signing key, or a host no published asset runs on (NixOS without a static musl loader, Termux), used to refuse every release. It now clones the tag and `cargo build --release --locked`, the same trust as `WIZARD_BUILD_FROM_SOURCE=1`. A failed signature or digest is still fatal. Background auto-update stays download-only.
+
 ### Changed
 
 - **Skills are an index, not a dump.** The system prompt lists each skill's name, description, and path. The body is read from disk when the skill matches. A skill can set `always: true` to inline its body; that is the exception. A long skill no longer rides along on every turn that is not using it.

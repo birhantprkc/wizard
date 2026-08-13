@@ -81,19 +81,6 @@ wizard -p "list files in the current directory"
 
 ## The installer's BYOM flavor
 
-> **This does not work yet.** `install.sh` verifies every release asset against a
-> minisign key baked into the script, and that key is still the placeholder
-> `RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md`. The installer refuses
-> up front rather than fetch anything it cannot verify. Until a signed release
-> exists, the only path through is building from source:
->
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
->   | WIZARD_BYOM=1 WIZARD_BUILD_FROM_SOURCE=1 bash
-> ```
->
-> Everything below describes what the flavor does once it can run.
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | WIZARD_BYOM=1 bash
 ```
@@ -106,7 +93,7 @@ With `WIZARD_BYOM=1`, the installer:
 
 No model is chosen at install time: the first `wizard` run opens onboarding, and the tag you pick there is pulled on first run. For headless/non-interactive installs, set `WIZARD_MODEL=<tag>`: the installer pulls that tag and writes the config itself (a fresh config gets a full `[[providers]]` Ollama entry; an existing config keeps everything else and only has its `model =` line(s) updated), so no onboarding is needed.
 
-The old `install-byom.sh` URL is still wired up: it is a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`). It hits the same unsigned-release refusal, so it needs `WIZARD_BUILD_FROM_SOURCE=1` too.
+The old `install-byom.sh` URL is still wired up: it is a thin shim that fetches `install.sh` and runs it with `WIZARD_BYOM=1`, passing all other `WIZARD_*` variables through (plus the shim-only `WIZARD_INSTALLER_REF` to pick which ref to fetch `install.sh` from, default `main`).
 
 ## Model requirements
 

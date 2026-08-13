@@ -124,7 +124,7 @@ wizard gateway stop
 wizard gateway uninstall   # stop, disable, remove the unit
 ```
 
-(`wizard update` is not one of the reasons to restart in v2.0.0: it refuses every download while `wizard-release.pub` is a placeholder. See [Services](services.md#after-replacing-the-binary).)
+After `wizard update`, restart the service so it picks up the new binary. See [Services](services.md#after-replacing-the-binary).
 
 Two things worth knowing up front, both covered in full by [Services](services.md):
 

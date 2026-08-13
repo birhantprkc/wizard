@@ -37,14 +37,9 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 wizard-native gui
 ```
 
-`WIZARD_BUILD_FROM_SOURCE=1` is not optional today, and the reason is not about
-this window: no release has been signed yet. `install.sh` carries the literal
-`RELEASE-SIGNING-KEY-NOT-YET-GENERATED-see-SECURITY.md` where the minisign
-public key goes (its `WIZARD_RELEASE_PUBKEY=` line), and
-`refuse_placeholder_key` refuses to install *any* prebuilt asset before the
-first download rather than install one it cannot verify. When a key exists and a
-release is signed, `WIZARD_NATIVE=1` on its own fetches
-`wizard-native-<target>.tar.gz` and this paragraph goes away.
+`WIZARD_NATIVE=1` on its own fetches `wizard-native-<target>.tar.gz`. Add
+`WIZARD_BUILD_FROM_SOURCE=1` to compile the window from the same checkout
+instead of downloading it.
 
 A build without the feature refuses `wizard gui` with a message carrying both
 of those lines, plus the four ways to drive a machine you are not sitting at:

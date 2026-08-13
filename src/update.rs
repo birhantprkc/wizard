@@ -26,6 +26,15 @@
 //!   is handed to `sudo install`, so a world-writable staging path with a
 //!   predictable name would let any local user have root install their binary.
 //!
+//! A download is not always possible. A binary compiled with the placeholder
+//! key cannot verify any release, and some hosts (NixOS without a static musl
+//! loader, Termux) have no runnable prebuilt. Those two cases fall back to
+//! cloning the tag and `cargo build --release --locked`, which is the same
+//! trust as `WIZARD_BUILD_FROM_SOURCE=1` on `install.sh`. A failed signature
+//! or digest is never a reason to compile something else. The background
+//! auto-update path does not take this fallback: compiling for minutes in a
+//! fire-and-forget task is worse than leaving the notice.
+//!
 //! A download mirror can be put in front of GitHub with `WIZARD_MIRROR` (off by
 //! default). It changes which host answers and nothing else: the rules above
 //! hold whoever that is, any mirror failure falls back to GitHub, and the user
@@ -1055,6 +1064,149 @@ fn binary_runs(binary: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Locate `name` on `PATH`.
+fn find_command(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A working `cargo`: `PATH` first, then `~/.cargo/bin` for a rustup install
+/// that is not yet on this process's `PATH`.
+fn find_cargo() -> Option<PathBuf> {
+    if let Some(cargo) = find_command("cargo") {
+        return Some(cargo);
+    }
+    let candidate = dirs::home_dir()?.join(".cargo").join("bin").join("cargo");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Why a failed download may be rebuilt from source rather than refused.
+///
+/// Signature and digest failures are never eligible: those are "stop", not
+/// "try another path". A placeholder key, a host with no runnable prebuilt,
+/// and a platform we publish nothing for are the only three, and they are
+/// the same three `install.sh` already builds from source for.
+fn source_build_reason(err: &anyhow::Error) -> Option<&'static str> {
+    let text = format!("{err:#}");
+    // Eligible first: a placeholder-key refusal is wrapped as "not the
+    // release key's", and that outer wording is also used for a real
+    // signature failure. The inner phrase is what distinguishes them.
+    if text.contains("embeds no release signing key") {
+        return Some("this build embeds no release signing key");
+    }
+    if text.contains("no prebuilt wizard binary runs") {
+        return Some("no prebuilt binary runs on this system");
+    }
+    if text.contains("no matching prebuilt")
+        || text.contains("Termux has no matching")
+        || text.contains("no prebuilt wizard release")
+    {
+        return Some("this platform has no prebuilt release");
+    }
+    None
+}
+
+/// Clone `tag` and `cargo build --release --locked` it, then swap the result
+/// in. Trust is the git tag, the same as `WIZARD_BUILD_FROM_SOURCE=1`.
+fn build_from_source(repo: &str, tag: &str, dest_exe: &Path, report: Report<'_>) -> Result<()> {
+    let git = find_command("git")
+        .context("git is required to build from source but was not found on PATH")?;
+    let cargo = find_cargo().context(
+        "cargo is required to build from source but was not found; install a Rust toolchain \
+         (https://rustup.rs) and retry, or use the Nix flake",
+    )?;
+
+    let dest_dir = dest_exe
+        .parent()
+        .context("the current executable has no parent directory")?;
+    let writable = dir_is_writable(dest_dir);
+    let scratch = staging_dir()?;
+    let src_dir = scratch.join(format!("src-{tag}"));
+    let _ = std::fs::remove_dir_all(&src_dir);
+
+    let url = format!("https://github.com/{repo}");
+    report(&format!("cloning {url}@{tag}"));
+    let clone = std::process::Command::new(&git)
+        .args(["clone", "--depth", "1", "--branch", tag])
+        .arg(&url)
+        .arg(&src_dir)
+        .status()
+        .context("running git clone")?;
+    if !clone.success() {
+        let _ = std::fs::remove_dir_all(&src_dir);
+        bail!("git clone of {url} at {tag} failed");
+    }
+    if !src_dir.join("Cargo.toml").is_file() {
+        let _ = std::fs::remove_dir_all(&src_dir);
+        bail!("cloned {url}@{tag} but there is no Cargo.toml");
+    }
+
+    report("running cargo build --release --locked (this can take a few minutes)");
+    let mut cmd = std::process::Command::new(&cargo);
+    cmd.args(["build", "--release", "--locked"])
+        .current_dir(&src_dir);
+    if cfg!(feature = "native") {
+        cmd.args(["--features", "native"]);
+    }
+    let status = cmd
+        .status()
+        .context("running cargo build --release --locked")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&src_dir);
+        bail!("cargo build --release --locked failed for {tag}");
+    }
+
+    let built = src_dir.join("target").join("release").join("wizard");
+    if !built.is_file() {
+        let _ = std::fs::remove_dir_all(&src_dir);
+        bail!("build succeeded but {} is missing", built.display());
+    }
+    if !binary_runs(&built) {
+        let _ = std::fs::remove_dir_all(&src_dir);
+        bail!("the binary built from {tag} does not run on this system");
+    }
+
+    let result = install_over(&built, dest_exe, writable);
+    let _ = std::fs::remove_dir_all(&src_dir);
+    result
+}
+
+/// Install `tag` at `dest_exe`: download when this binary can verify one,
+/// otherwise (or when no published asset runs here) build the tag from
+/// source. `allow_source` is true for `wizard update` and false for the
+/// background auto-update, which must not start a multi-minute compile.
+async fn apply_update(
+    repo: &str,
+    tag: &str,
+    dest_exe: &Path,
+    report: Report<'_>,
+    allow_source: bool,
+) -> Result<()> {
+    if release_key().is_err() {
+        if !allow_source {
+            release_key()?;
+        }
+        report(&format!(
+            "this build embeds no release signing key, so it cannot verify a download; \
+             building {tag} from source"
+        ));
+        return build_from_source(repo, tag, dest_exe, report);
+    }
+    match download_and_install(repo, tag, dest_exe, report).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if allow_source && let Some(why) = source_build_reason(&err) {
+                report(&format!("{why}; building {tag} from source"));
+                build_from_source(repo, tag, dest_exe, report)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Download the release for `tag` and swap it in at `dest_exe`, trying each
 /// host in `sources` until one of them installs.
 ///
@@ -1339,8 +1491,8 @@ pub async fn run(check: bool, to: Option<String>, force: bool, rollback: bool) -
         return Ok(0);
     }
 
-    println!("downloading {tag}…");
-    download_and_install(repo, &tag, &dest_exe, &|line| println!("{line}"))
+    println!("updating to {tag}…");
+    apply_update(repo, &tag, &dest_exe, &|line| println!("{line}"), true)
         .await
         .with_context(|| format!("updating to {tag}"))?;
     println!("updated v{current} → {tag} — restart wizard to use it.");
@@ -1457,7 +1609,7 @@ async fn check_and_maybe_apply(cfg: UpdateConfig) -> Result<()> {
             // auto-update stops working, permanently, and says nothing. The
             // interactive path prints it; the automatic one owed at least a log
             // line, because it is the path nobody is watching.
-            if let Err(err) = download_and_install(&cfg.repo, &latest, &exe, &|_| {}).await {
+            if let Err(err) = apply_update(&cfg.repo, &latest, &exe, &|_| {}, false).await {
                 tracing::warn!("automatic update to {latest} did not install: {err:#}");
             }
         }
@@ -1518,6 +1670,75 @@ mod tests {
         assert!(semver::Version::parse(current_version()).is_ok());
         // The display never adds a component the real version lacks.
         assert!(current_version().starts_with(display_version()));
+    }
+
+    #[test]
+    fn a_placeholder_or_unrunnable_prebuilt_may_build_from_source() {
+        // The three cases install.sh already builds from source for: a binary
+        // that cannot verify anything, a host no published asset runs on, and
+        // a platform we ship nothing for.
+        assert_eq!(
+            source_build_reason(&anyhow!(
+                "this build embeds no release signing key (wizard-release.pub is still the placeholder)"
+            )),
+            Some("this build embeds no release signing key")
+        );
+        assert_eq!(
+            source_build_reason(&anyhow!(
+                "no prebuilt wizard binary runs on this system (tried wizard-x86_64-unknown-linux-musl.tar.gz)"
+            )),
+            Some("no prebuilt binary runs on this system")
+        );
+        assert_eq!(
+            source_build_reason(&anyhow!(
+                "no prebuilt wizard release for this platform (linux/x86_64)"
+            )),
+            Some("this platform has no prebuilt release")
+        );
+        assert_eq!(
+            source_build_reason(&anyhow!(
+                "Termux has no matching prebuilt release asset (Android/Bionic)."
+            )),
+            Some("this platform has no prebuilt release")
+        );
+    }
+
+    #[test]
+    fn a_bad_signature_or_digest_is_never_a_reason_to_compile() {
+        // These are "stop", not "try another path". Building from source
+        // around a failed check would make the check optional. The
+        // "not the release key's" wrapper alone is not enough: a
+        // placeholder-key refusal is wrapped the same way, and that
+        // one *is* eligible (asserted above).
+        for text in [
+            "release signature verification FAILED: checksums.txt does not match its signature",
+            "checksum mismatch for wizard.tar.gz from https://example — aborting update",
+            "signed by key AABBCCDD, but this binary trusts EEFF0011",
+            "GitHub Releases served a v2.0.1 checksums.txt that is not the release key's: \
+             release signature verification FAILED",
+            "the trusted comment does not match the global signature",
+            "this signature is for a different release: it was made for \"wizard v1.0.0\"",
+        ] {
+            assert!(
+                source_build_reason(&anyhow!("{text}")).is_none(),
+                "{text} must stay fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_placeholder_refusal_wrapped_as_not_the_release_key_still_builds() {
+        // This is the sentence `wizard update` prints today: verified_checksums
+        // wraps release_key()'s placeholder refusal. The outer wording must
+        // not hide the inner cause.
+        assert_eq!(
+            source_build_reason(&anyhow!(
+                "updating to v2.0.1: GitHub Releases served a v2.0.1 checksums.txt that \
+                 is not the release key's: this build embeds no release signing key \
+                 (wizard-release.pub is still the placeholder)"
+            )),
+            Some("this build embeds no release signing key")
+        );
     }
 
     #[test]

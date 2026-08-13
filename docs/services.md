@@ -132,7 +132,7 @@ Only these variables, by name, and only when they are set to a non-empty value w
 
 ## After replacing the binary
 
-When the new binary is put in place by a rename over the old path — which is what `wizard update` will do once it can, and what `cargo install`-style flows do — a running service keeps executing the image it already opened, so **it survives the swap and keeps running the old version**. The next start picks up the new one:
+When the new binary is put in place by a rename over the old path — which is what `wizard update` does, and what `cargo install`-style flows do — a running service keeps executing the image it already opened, so **it survives the swap and keeps running the old version**. The next start picks up the new one:
 
 ```bash
 wizard gateway restart
