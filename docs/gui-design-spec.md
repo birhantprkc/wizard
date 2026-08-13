@@ -134,7 +134,7 @@ Both are the same surface: a sheet with a hairline-separated stack of blocks. No
 it, no grid of tiles, no tagline under anything.
 
 - The **provider list** is the one list shape, used twice: to show what is configured
-  (`xai` · `xaioauth · grok-4.5 · signed in`, active marked by a light rule down its left
+  (`xai` · `xaioauth · grok-4.6 · signed in`, active marked by a light rule down its left
   edge, actions as quiet text on the right) and, one step in, to pick what to add (provider
   name, its endpoint host in mono, right-aligned). A provider is a name and where it points;
   that is all a row says.

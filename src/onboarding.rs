@@ -246,6 +246,7 @@ const ANTHROPIC_MODELS: &[&str] = &[
 ];
 /// xAI (Grok) model options offered in the picker (first is the default).
 const XAI_MODELS: &[&str] = &[
+    "grok-4.6",
     "grok-4.5",
     "grok-4.3",
     "grok-4.20-0309-reasoning",
@@ -376,8 +377,8 @@ fn collect_answers(terminal: &mut Tui) -> Result<Option<Answers>> {
     // The BYOM local flavors sit alongside the cloud providers for people who
     // want to bring their own model and pick the pieces themselves.
     let provider_options = [
-        Opt::new("xAI account sign-in", "grok-4.5 via OAuth, no API key"),
-        Opt::new("xAI (Grok), API key", "grok-4.5 via XAI_API_KEY"),
+        Opt::new("xAI account sign-in", "grok-4.6 via OAuth, no API key"),
+        Opt::new("xAI (Grok), API key", "grok-4.6 via XAI_API_KEY"),
         Opt::new(
             "Local",
             "one pick — llama.cpp & Ollama set up for you, model sized to this machine; \

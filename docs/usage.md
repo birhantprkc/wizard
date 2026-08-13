@@ -518,7 +518,7 @@ host is used because that is who invoiced the tokens, whereas the provider's
 `name` is a label you can type. A host with no published rate for such a
 model gets `fallback`, not the nearest host's number: a price that belongs to
 someone else, flagged `table`, is the one error nothing downstream can spot.
-Model ids that exactly one vendor sells (`claude-opus-5`, `grok-4.5`, …)
+Model ids that exactly one vendor sells (`claude-opus-5`, `grok-4.6`, …)
 carry no host at all and price the same wherever you buy them.
 
 One known limit remains: the lookup has no **per-request** prompt size, so

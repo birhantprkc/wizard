@@ -577,7 +577,7 @@ impl LlmProvider for OpenAiProvider {
 pub(crate) fn context_window(model: &str) -> Option<u32> {
     let model = model.to_ascii_lowercase();
     // xAI Grok (served through this provider with vendor "xai").
-    if model.starts_with("grok-4.5") {
+    if model.starts_with("grok-4.6") || model.starts_with("grok-4.5") {
         return Some(500_000);
     }
     // grok-4.3 and the grok-4.20 snapshots are 1M-context.
@@ -2776,6 +2776,7 @@ mod tests {
         assert_eq!(context_window("grok-3"), Some(131_072));
         assert_eq!(context_window("grok-4.3"), Some(1_000_000));
         assert_eq!(context_window("grok-4.20-0309-reasoning"), Some(1_000_000));
+        assert_eq!(context_window("grok-4.6"), Some(500_000));
         assert_eq!(context_window("grok-4.5"), Some(500_000));
         assert_eq!(context_window("grok-build-0.1"), Some(256_000));
         assert_eq!(context_window("gemini-3.5-flash"), Some(1_048_576));

@@ -340,7 +340,7 @@ Any OpenAI-compatible endpoint, OpenRouter, Cloudflare Workers AI, Anthropic, or
 The same thing is scriptable with explicit arguments:
 
 ```
-/provider add xai xai https://api.x.ai/v1 grok-4.5 XAI_API_KEY
+/provider add xai xai https://api.x.ai/v1 grok-4.6 XAI_API_KEY
 /provider add openai openai https://api.openai.com/v1 gpt-5.6-sol OPENAI_API_KEY
 /provider add gemini openai https://generativelanguage.googleapis.com/v1beta/openai gemini-3.5-flash GEMINI_API_KEY
 /provider use xai

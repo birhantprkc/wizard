@@ -48,7 +48,7 @@ const EXPIRY_LEEWAY_SECS: i64 = 120;
 /// Default Chat Completions base URL for both xAI provider kinds.
 pub const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 /// Default model for both xAI provider kinds.
-pub const DEFAULT_MODEL: &str = "grok-4.5";
+pub const DEFAULT_MODEL: &str = "grok-4.6";
 /// Default env var holding a plain xAI API key (`kind = "xai"`).
 pub const DEFAULT_KEY_ENV: &str = "XAI_API_KEY";
 

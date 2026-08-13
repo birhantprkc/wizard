@@ -532,10 +532,11 @@ const PRICES: &[(&str, ModelPrice)] = &[
     ("gpt-5.4-nano", ModelPrice::per_mtok_cached(0.2, 1.25, 0.02)),
     ("gpt-5-mini", ModelPrice::per_mtok_cached(0.25, 2.0, 0.025)),
     ("gpt-5-nano", ModelPrice::per_mtok_cached(0.05, 0.4, 0.005)),
-    // xAI: checked 2026-08-07 against docs.x.ai/docs/models. Standard
-    // (under-200k-request) tier; see hazard 3. Cached input is 0.15x to 0.2x
+    // xAI: checked 2026-08-12 against docs.x.ai/developers/models. Standard
+    // (under-200k-request) tier; see hazard 3. Cached input is 0.15x to 0.25x
     // here rather than the 0.1x `per_mtok` would have assumed, so these rates
     // are the published ones, not derived.
+    ("grok-4.6", ModelPrice::per_mtok_cached(2.0, 6.0, 0.5)),
     ("grok-4.5", ModelPrice::per_mtok_cached(2.0, 6.0, 0.3)),
     ("grok-4.3", ModelPrice::per_mtok_cached(1.25, 2.5, 0.2)),
     ("grok-4.20", ModelPrice::per_mtok_cached(1.25, 2.5, 0.2)),
@@ -655,8 +656,8 @@ const PRICES: &[(&str, ModelPrice)] = &[
 /// **Why a second table rather than a seller column on every row.** Almost
 /// every id in [`PRICES`] is sold by exactly one vendor: `claude-opus-5`
 /// costs what Anthropic charges wherever Wizard's Anthropic provider points,
-/// and `grok-4.5` is xAI's whether it arrives as `grok-4.5` or
-/// `grok-4.5-0309-reasoning`. Stamping a seller onto those rows would be
+/// and `grok-4.6` is xAI's whether it arrives as `grok-4.6` or
+/// `grok-4.6-0309-reasoning`. Stamping a seller onto those rows would be
 /// noise on 30 entries to make four legible, and worse, it would invite the
 /// lookup to *require* a seller — turning every unrecognised endpoint (a
 /// gateway, a mirror, a Bedrock ARN) into a fallback for models whose price
@@ -1682,6 +1683,7 @@ mod tests {
 
     #[test]
     fn xai_models_price_at_their_published_rates() {
+        assert_rate(headline("grok-4.6"), 2.0 + 6.0, "grok-4.6");
         assert_rate(headline("grok-4.5"), 2.0 + 6.0, "grok-4.5");
         assert_rate(headline("grok-4.3"), 1.25 + 2.5, "grok-4.3");
         assert_rate(
@@ -1691,10 +1693,10 @@ mod tests {
         );
         assert_rate(headline("grok-build-0.1"), 1.0 + 2.0, "grok-build-0.1");
 
-        // xAI's cached rate is 0.15x, not the 0.1x the Anthropic-derived
-        // constructor would have assumed: 100k fresh at $2 + 900k at $0.30.
-        let cached = warm("grok-4.5");
-        assert_rate(cached, 0.2 + 0.27, "grok-4.5 cache read");
+        // xAI's cached rate is 0.25x on 4.6, not the 0.1x the Anthropic-derived
+        // constructor would have assumed: 100k fresh at $2 + 900k at $0.50.
+        let cached = warm("grok-4.6");
+        assert_rate(cached, 0.2 + 0.45, "grok-4.6 cache read");
         assert!(
             cached.usd > 0.2 + 0.18,
             "the derived 0.1x rate would have under-billed a cached Grok turn: {cached:?}"

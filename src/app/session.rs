@@ -303,7 +303,7 @@ const BYOP_ENV_FALLBACKS: &[(&str, ProviderKind, &str, &str, &str)] = &[
         "XAI_API_KEY",
         ProviderKind::Xai,
         "https://api.x.ai/v1",
-        "grok-4.5",
+        "grok-4.6",
         "xai",
     ),
     (
