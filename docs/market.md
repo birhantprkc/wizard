@@ -98,7 +98,7 @@ Reach for `/publish` when the change is in `~/.wizard/src`: a new built-in tool,
 
 # The skills and tools registry
 
-`/publish` shares a whole Wizard. `wizard skills` shares one piece of one: a skill (markdown injected into the system prompt) or a tool (a LuaJIT script the model can call).
+`/publish` shares a whole Wizard. `wizard skills` shares one piece of one: a skill (markdown listed in the system-prompt index, body read when it matches) or a tool (a LuaJIT script the model can call).
 
 The registry is a git-backed static site. One public repo holds `registry.json` plus a directory per entry, and nothing else: no backend, no database, no accounts. Submitting is a pull request; CI validates the manifest, smoke-tests the entry, and regenerates the index on merge.
 

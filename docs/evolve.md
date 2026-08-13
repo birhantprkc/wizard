@@ -17,13 +17,13 @@ Works on every install. `/evolve` writes config/data under `~/.wizard/` and `/re
 
 ### Skills
 
-A Markdown file of guidelines, workflows, or domain knowledge, injected into the system prompt.
+A Markdown file of guidelines, workflows, or domain knowledge. The system prompt lists its name and description; the body is read from disk when the skill matches (or inlined if the skill sets `always: true`).
 
 ```
 > /evolve add a skill for writing conventional commit messages
 ```
 
-Wizard writes `~/.wizard/skills/conventional-commits/SKILL.md` and reloads it into context.
+Wizard writes `~/.wizard/skills/conventional-commits/SKILL.md` and reloads the index. The body is read when the skill matches.
 
 ### MCP servers
 

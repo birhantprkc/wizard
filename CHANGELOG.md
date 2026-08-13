@@ -4,6 +4,12 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
+## [Unreleased]
+
+### Changed
+
+- **Skills are an index, not a dump.** The system prompt lists each skill's name, description, and path. The body is read from disk when the skill matches. A skill can set `always: true` to inline its body; that is the exception. A long skill no longer rides along on every turn that is not using it.
+
 ## [2.0.1] - 2026-08-12
 
 The first patch on the 2.0 line. Compaction stops looping on a still-full window, tools stop flooding the context with listings, the composer stays with the agent while a command that will never prompt is running, and xAI's default is grok-4.6.

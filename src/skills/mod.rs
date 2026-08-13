@@ -1,6 +1,13 @@
 //! Skills loader: markdown files with optional YAML-style frontmatter,
-//! discovered as `<dir>/<skill-name>/SKILL.md` and injected into the system
-//! prompt. Loaded at startup and on `/reload`.
+//! discovered as `<dir>/<skill-name>/SKILL.md`. Loaded at startup and on
+//! `/reload`.
+//!
+//! The system prompt carries an *index* (name, description, path), not the
+//! body. The model reads the file with `read_file` when the skill matches,
+//! the same split the charter uses with `manual`. A skill may opt back into
+//! a resident body with `always: true` in its frontmatter; that is the
+//! exception, not the default. A long skill (wrangler is ~11 KB) that is
+//! pasted into every session is a tax on every turn that is not using it.
 //!
 //! Two roots are scanned: the bundled `skills/` directory shipped alongside
 //! the binary, and `~/.wizard/skills/` where `/evolve` writes new ones.
@@ -19,6 +26,11 @@ pub struct SkillMeta {
     pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// When true, `render_for_prompt` inlines the body instead of just the
+    /// index. Default is false: the body stays on disk until the skill is
+    /// actually needed.
+    #[serde(default)]
+    pub always: bool,
 }
 
 /// One loaded skill.
@@ -165,14 +177,20 @@ pub fn load_skills(roots: &[PathBuf]) -> Result<Vec<Skill>> {
 }
 
 /// Render loaded skills as a system-prompt section: a `## Skills` header
-/// followed by each skill's name and body. Returns an empty string when no
-/// skills are loaded.
+/// followed by each skill's name, description, and path. The body stays on
+/// disk unless the skill opted in with `always: true`. Returns an empty
+/// string when no skills are loaded.
 pub fn render_for_prompt(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
-    let mut out = String::from("## Skills\n");
+    let mut out = String::from(
+        "## Skills\n\n\
+         Name and description only. Read a skill's file before acting on it; \
+         do not guess its body from the description. A skill with `always: true` \
+         has its body inlined below.\n",
+    );
     for skill in skills {
         out.push_str("\n### ");
         out.push_str(&skill.name);
@@ -184,11 +202,16 @@ pub fn render_for_prompt(skills: &[Skill]) -> String {
                 out.push('\n');
             }
         }
-        let body = skill.body.trim();
-        if !body.is_empty() {
-            out.push('\n');
-            out.push_str(body);
-            out.push('\n');
+        out.push_str("File: `");
+        out.push_str(&skill.path.display().to_string());
+        out.push_str("`\n");
+        if skill.meta.always {
+            let body = skill.body.trim();
+            if !body.is_empty() {
+                out.push('\n');
+                out.push_str(body);
+                out.push('\n');
+            }
         }
     }
     out
@@ -211,7 +234,7 @@ pub(crate) fn split_frontmatter(raw: &str) -> (SkillMeta, String) {
 }
 
 /// Parse the simple `key: value` frontmatter lines we support (`name`,
-/// `description`). Unknown keys and malformed lines are ignored.
+/// `description`, `always`). Unknown keys and malformed lines are ignored.
 fn parse_meta(lines: &[&str]) -> SkillMeta {
     let mut meta = SkillMeta::default();
     for line in lines {
@@ -229,10 +252,17 @@ fn parse_meta(lines: &[&str]) -> SkillMeta {
         match key.trim() {
             "name" => meta.name = Some(value.to_string()),
             "description" => meta.description = Some(value.to_string()),
+            "always" => meta.always = parse_bool(value),
             _ => {}
         }
     }
     meta
+}
+
+/// YAML-ish truthy values. Anything else is false, including the empty
+/// string (already filtered above) and unknown tokens.
+fn parse_bool(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1")
 }
 
 /// Strip one matching pair of surrounding quotes, if present.
@@ -271,7 +301,7 @@ mod tests {
         write_skill(
             &root,
             "commits",
-            "---\nname: conventional-commits\ndescription: \"How to write commits\"\n---\n\nUse `type(scope): subject`.\n",
+            "---\nname: conventional-commits\ndescription: \"How to write commits\"\nalways: true\n---\n\nUse `type(scope): subject`.\n",
         );
         let skill = parse_skill(&root.join("commits/SKILL.md")).expect("parse");
         assert_eq!(skill.name, "conventional-commits");
@@ -279,6 +309,7 @@ mod tests {
             skill.meta.description.as_deref(),
             Some("How to write commits")
         );
+        assert!(skill.meta.always);
         assert_eq!(skill.body, "Use `type(scope): subject`.");
         std::fs::remove_dir_all(root).ok();
     }
@@ -333,13 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn render_includes_header_name_description_and_body() {
+    fn render_includes_header_name_description_and_path() {
         let skills = vec![Skill {
             name: "demo".to_string(),
             path: PathBuf::from("demo/SKILL.md"),
             meta: SkillMeta {
                 name: Some("demo".to_string()),
                 description: Some("A demo skill".to_string()),
+                always: false,
             },
             body: "Body text.".to_string(),
         }];
@@ -347,6 +379,27 @@ mod tests {
         assert!(rendered.starts_with("## Skills\n"));
         assert!(rendered.contains("### demo\n"));
         assert!(rendered.contains("A demo skill\n"));
+        assert!(rendered.contains("File: `demo/SKILL.md`\n"));
+        assert!(
+            !rendered.contains("Body text."),
+            "default skills keep their body off the prompt: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_inlines_body_when_always_is_set() {
+        let skills = vec![Skill {
+            name: "demo".to_string(),
+            path: PathBuf::from("demo/SKILL.md"),
+            meta: SkillMeta {
+                name: Some("demo".to_string()),
+                description: Some("A demo skill".to_string()),
+                always: true,
+            },
+            body: "Body text.".to_string(),
+        }];
+        let rendered = render_for_prompt(&skills);
         assert!(rendered.contains("Body text.\n"));
+        assert!(rendered.contains("File: `demo/SKILL.md`\n"));
     }
 }

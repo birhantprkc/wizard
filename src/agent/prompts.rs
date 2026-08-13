@@ -8,8 +8,9 @@
 //! subject comes up* does not have to be resident to be known: the always-on
 //! prompt carries the index, the ladder's rung names, and the handful of rules
 //! that govern every reply, while [`manual_page`] serves any section in full to
-//! the `manual` tool. Skills already work this way (see [`crate::skills`]), so
-//! the shape is not new here.
+//! the `manual` tool. Skills already work this way (see [`crate::skills`]):
+//! the prompt carries the name, the description, and the path, and the body
+//! is read from disk when the skill matches. So the shape is not new here.
 //!
 //! The digest is *generated* from the charter rather than written out beside
 //! it. A fork may amend `WIZARD.md` (§7 says so), and a hand-written summary

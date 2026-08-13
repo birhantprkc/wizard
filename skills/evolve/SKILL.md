@@ -26,7 +26,9 @@ If an MCP server or script can do it, stay Tier 1.
 ### Skills
 
 `~/.wizard/skills/<name>/SKILL.md` — optional `name`/`description` frontmatter,
-then an imperative markdown body. User skills shadow bundled names.
+then an imperative markdown body. The prompt lists name and description; the
+body is read from disk when the skill matches. Set `always: true` to inline
+the body. User skills shadow bundled names.
 
 ### MCP servers
 

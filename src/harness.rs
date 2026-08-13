@@ -195,9 +195,10 @@ empty file falls back to that default.
 - `tool_descriptions/<tool>.md` — the description advertised to the model
   for the named native tool. Only the description is overridable; tool
   behavior, parameters, and access class are compiled in.
-- `skills/<name>/SKILL.md` — skills loaded into the prompt's skills section.
-  Bundle skills shadow bundled and user skills by name; new directories add
-  new skills.
+- `skills/<name>/SKILL.md` — skills listed in the prompt's skills index
+  (name, description, path). The body is read from disk when the skill
+  matches, unless the skill sets `always: true`. Bundle skills shadow
+  bundled and user skills by name; new directories add new skills.
 - `subagents/<name>.toml` — spawnable subagent definitions (`name`,
   `description`, `system_prompt`, optional `tool_scope`; optional `max_steps`
   only if you want a hard cap — default is unlimited).

@@ -135,7 +135,8 @@ pub enum EvolveTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvolveChannel {
-    /// Markdown skill injected into the system prompt.
+    /// Markdown skill listed in the system-prompt index; the body is read
+    /// from disk when the skill matches (or inlined if it sets `always: true`).
     Skill,
     /// External MCP server registered in `~/.wizard/mcp.toml`.
     McpServer,
@@ -399,7 +400,7 @@ const TIER1_SYSTEM_PROMPT: &str = r##"You are Wizard's self-extension planner. W
 
 Channels and their exact JSON shapes:
 
-1. "skill" — knowledge, guidelines, or a workflow injected into the system prompt as markdown:
+1. "skill" — knowledge, guidelines, or a workflow. The prompt lists its name and description; the body is read from disk when the skill matches:
 {"channel":"skill","name":"kebab-case-name","description":"one-line summary","body":"full markdown content of the skill"}
 
 2. "mcp_server" — register an external Model Context Protocol tool server (computer use, browsers, databases, search, ...):

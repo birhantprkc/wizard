@@ -437,7 +437,8 @@ pub enum SkillsCmd {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
 
-        /// Only skills: markdown injected into the system prompt.
+        /// Only skills: markdown listed in the system-prompt index; the body
+        /// is read from disk when the skill matches.
         #[arg(long, conflicts_with = "tools")]
         skills: bool,
 

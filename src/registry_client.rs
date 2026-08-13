@@ -124,7 +124,8 @@ const BUNDLED_SKILL_NAMES: [&str; 2] = ["coding", "evolve"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryKind {
-    /// Markdown injected into the system prompt.
+    /// Markdown listed in the system-prompt index; the body is read from
+    /// disk when the skill matches (or inlined if it sets `always: true`).
     Skill,
     /// A LuaJIT script the model can call.
     Tool,
