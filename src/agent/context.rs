@@ -335,23 +335,30 @@ impl CompactOutcome {
 /// provider, and Anthropic additionally takes the system prompt as a top-level
 /// field, so its adapter hoists every `Role::System` message out of the
 /// history — which means the first message left standing has to be one the API
-/// accepts as an opener.
+/// accepts as an opener. [`compact`] picks the note's role from whatever the
+/// tail now starts with, so a tail that begins on an assistant turn still
+/// opens with a user message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
-    /// The tail begins at a `Role::User` message.
+    /// The tail begins at a user or assistant message.
     ///
-    /// A real conversation has one every turn, so this both keeps tool-call
-    /// groups whole and leaves a user message opening the request for free.
+    /// User-only used to look sufficient: a finished turn has a user message
+    /// every few entries, so walking back from the token cut landed nearby
+    /// and the in-flight tool results stayed grouped. Mid-turn that user is
+    /// the prompt at the start of the history, and the walk went all the
+    /// way back onto it. One live session then spent an hour summarizing a
+    /// single note 69 times while the fat tool tail (and the elevated
+    /// pressure that made the model call `compact` again) never moved.
+    /// Stopping on an assistant turn keeps the tool-call group whole and
+    /// actually cuts to the budget.
     Conversation,
     /// The tail begins at the nearest message that is not a tool result.
     ///
     /// A sub-loop's history has exactly *one* user message — the task at index
-    /// 1 — and [`Anchor::Conversation`] would walk the boundary all the way
-    /// back onto it and find nothing it was allowed to cut, so a sub-run that
-    /// outgrew its window simply failed. Stopping at an assistant turn instead
-    /// is safe for tool-call groups (the calls and their results go together),
-    /// and the note that replaces the span becomes the user message that opens
-    /// the request — see [`compact`].
+    /// 1, so even the conversation rule above would sometimes rather start
+    /// there. Allowing a system note as well lets a sub-run that already
+    /// compacted keep that note as the opener instead of walking onto the
+    /// task and finding nothing to cut.
     SubLoop,
 }
 
@@ -359,7 +366,11 @@ impl Anchor {
     /// Whether the kept tail may start at `message`.
     fn may_begin_tail(self, message: &ChatMessage) -> bool {
         match self {
-            Anchor::Conversation => message.role == Role::User,
+            // Not a tool result: that would orphan it from the assistant
+            // message that asked for it. System notes are skipped so a
+            // previous progress note is folded into the next summary
+            // rather than becoming the tail opener.
+            Anchor::Conversation => message.role == Role::User || message.role == Role::Assistant,
             Anchor::SubLoop => message.role != Role::Tool,
         }
     }
@@ -512,8 +523,10 @@ pub async fn compact(
 ///   half-empty window still folds away.
 ///
 /// Then the [`Anchor`] rule moves it back to somewhere the tail is allowed to
-/// begin, which is what keeps an assistant tool-call message with its results
-/// and leaves the request with an opener the API accepts.
+/// begin, which is what keeps an assistant tool-call message with its results.
+/// Mid-turn that is the nearest assistant message, not the user prompt at the
+/// start of the history: walking onto that user is how a pass used to
+/// summarize one note and leave the tool tail (and the pressure) untouched.
 fn cut_boundary(history: &[ChatMessage], anchor: Anchor, low_water: u64) -> Option<usize> {
     const START: usize = 1;
     // Need history[0] (system prompt) + a non-empty middle + the recent tail.
@@ -1069,40 +1082,125 @@ mod tests {
         );
     }
 
-    /// A sub-loop's history: system prompt, the task, then assistant/tool
-    /// pairs and nothing else. `Anchor::Conversation` has exactly one user
-    /// message to aim at — the task — and it is `start`, so the boundary walks
-    /// all the way back and there is nothing left to cut. That is the shape
-    /// that used to make a long subagent run un-compactable, and it is
-    /// entirely invisible on a parent conversation.
-    #[test]
-    fn a_sub_loops_history_offers_a_conversation_anchor_no_boundary_at_all() {
+    /// Mid-turn: one user prompt, then a long assistant/tool loop whose
+    /// results overshoot the low-water mark. Walking the cut back onto that
+    /// user used to make the span a single earlier note and leave the fat
+    /// tail (and the pressure that made the model call `compact`) untouched.
+    /// One live session then spent an hour summarizing one message 69 times.
+    #[tokio::test]
+    async fn a_mid_turn_pass_cuts_the_tool_loop_instead_of_one_earlier_note() {
         let mut history = vec![
+            ChatMessage::system("you are wizard"),
+            ChatMessage::system(format!(
+                "{COMPACT_SUMMARY_HEADING}\nwhat happened so far: {}",
+                "detail, ".repeat(100)
+            )),
+            ChatMessage::user("keep going"),
+        ];
+        for step in 0..12 {
+            history.push(ChatMessage::assistant(format!("step {step}")));
+            // 10k tokens each, so a handful fill the 40k low-water mark and
+            // the leftover tail is shorter than KEEP_RECENT. Smaller results
+            // would leave a second pass something the message-count rule
+            // still wants to fold.
+            history.push(ChatMessage::tool_result(
+                format!("id{step}"),
+                "probe",
+                "x".repeat(40_000),
+            ));
+        }
+        let before = history.len();
+
+        let compacted = compact(
+            &mut history,
+            Anchor::Conversation,
+            budget(),
+            &stub(),
+            "model",
+        )
+        .await;
+        match compacted.outcome {
+            CompactOutcome::Summarized(count) => {
+                assert!(
+                    count > 1,
+                    "a mid-turn pass has to fold more than the earlier note: {count}"
+                );
+            }
+            other => panic!("expected a real cut, got {other:?}"),
+        }
+        let after = crate::llm::estimate_history_tokens(&history);
+        assert!(
+            after <= LOW_WATER + 1_000,
+            "the tool tail was cut to the budget, not left standing: {after}"
+        );
+
+        let assistant = history
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .expect("an assistant turn survived in the tail");
+        assert_eq!(
+            history[assistant + 1].role,
+            Role::Tool,
+            "the in-flight tool-call group stayed paired"
+        );
+        assert!(
+            history.len() < before,
+            "history shrank: {before} → {}",
+            history.len()
+        );
+
+        // The anti-thrash property still holds: a second pass does not spend
+        // another call re-summarizing the note it just wrote.
+        let second = compact(
+            &mut history,
+            Anchor::Conversation,
+            budget(),
+            &stub(),
+            "model",
+        )
+        .await;
+        assert_eq!(second.outcome, CompactOutcome::Nothing);
+        assert_eq!(second.usage, CompactUsage::default());
+    }
+
+    /// Conversation will not open the tail on a system note, so a previous
+    /// progress note is folded into the next summary. SubLoop will, because
+    /// a sub-run that already compacted has that note as the only opener it
+    /// can keep without walking onto the task.
+    #[test]
+    fn conversation_skips_a_system_note_that_a_sub_loop_would_keep() {
+        let history = vec![
             ChatMessage::system("you are a worker"),
             ChatMessage::user("the task"),
+            ChatMessage::system(format!("{COMPACT_SUMMARY_HEADING}\nso far")),
+            ChatMessage::assistant("step"),
+            ChatMessage::tool_result("id", "probe", "output"),
         ];
-        for step in 0..8 {
-            history.push(ChatMessage::assistant(format!("step {step}")));
-            history.push(ChatMessage::tool_result("id", "probe", "output"));
-        }
-        let naive = history.len() - KEEP_RECENT;
-        assert!(naive > 1, "there is a middle span to cut");
+        let note = 2;
 
-        let mut end = naive;
+        let mut end = note;
         while end > 1 && !Anchor::Conversation.may_begin_tail(&history[end]) {
             end -= 1;
         }
-        assert_eq!(end, 1, "the only user message is the task at index 1");
+        assert_eq!(
+            history[end].role,
+            Role::User,
+            "conversation walks past the note onto the user"
+        );
 
-        let mut end = naive;
+        let mut end = note;
         while end > 1 && !Anchor::SubLoop.may_begin_tail(&history[end]) {
             end -= 1;
         }
-        assert!(end > 1, "the sub-loop anchor finds a boundary: {end}");
-        assert_ne!(
+        assert_eq!(
             history[end].role,
-            Role::Tool,
-            "and never one that orphans a tool result"
+            Role::System,
+            "a sub-loop can open on the note it already wrote"
+        );
+        assert!(
+            history[end].text().starts_with(COMPACT_SUMMARY_HEADING),
+            "{}",
+            history[end].text()
         );
     }
 

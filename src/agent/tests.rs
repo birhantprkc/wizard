@@ -2786,8 +2786,9 @@ async fn compaction_never_splits_a_tool_call_group() {
     assert_eq!(agent.history.len(), 16, "naive cut would be index 6");
 
     let outcome = agent.compact_now().await;
-    // Snapped back to the user message at index 4: only 3 messages went.
-    assert_eq!(outcome, CompactOutcome::Summarized(3));
+    // Snapped back to the assistant at index 5, not past it onto the user:
+    // the tool-call group stays the tail opener and 4 messages went.
+    assert_eq!(outcome, CompactOutcome::Summarized(4));
     let assistant = agent
         .history
         .iter()

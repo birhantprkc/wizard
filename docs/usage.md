@@ -545,8 +545,10 @@ History compaction triggers on **either** the byte threshold
 - models none of the above recognises: byte threshold only
 
 Compaction also runs *between steps inside a turn*, so a long tool loop
-cannot overflow the window mid-turn. The most recent messages (including the
-in-flight turn's tool results) are always preserved verbatim, and the
+cannot overflow the window mid-turn. The newest messages that fit 40% of the
+window stay verbatim (capped at ten), and the cut is allowed to land on an
+assistant turn so an in-flight tool loop is actually folded instead of
+walking back to the user prompt and summarizing one earlier note. The
 summary is instructed to carry over the todo list state and the plan file
 path (`.wizard/plan.md`).
 

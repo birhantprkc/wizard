@@ -8,6 +8,7 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ### Fixed
 
+- **Mid-turn `compact` no longer folds one earlier note and leaves the tool tail.** The kept tail can now start on an assistant message, so a long in-flight tool loop is cut to the token budget instead of walking back to the only user prompt. That walk is what made one session spend an hour summarizing a single message 69 times while pressure stayed elevated.
 - **`wizard update` builds from source when it cannot install a prebuilt.** A binary compiled with the placeholder signing key, or a host no published asset runs on (NixOS without a static musl loader, Termux), used to refuse every release. It now clones the tag and `cargo build --release --locked`, the same trust as `WIZARD_BUILD_FROM_SOURCE=1`. A failed signature or digest is still fatal. Background auto-update stays download-only.
 
 ### Changed
