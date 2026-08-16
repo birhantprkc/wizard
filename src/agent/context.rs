@@ -75,6 +75,41 @@ const COMPACT_LOW_WATER_FRACTION: f64 = 0.4;
 /// to invalidate that prefix anyway.
 const STALE_RESULT_MIN_BYTES: usize = 500;
 
+/// Characters one tool result outside the recent window may carry before
+/// [`prune_tool_results`] cuts it down to a head/tail excerpt.
+///
+/// This is the number that makes a compaction pass cheap, or unnecessary. The
+/// summarizer is billed for every character of the span it reads, and on a
+/// working session that span is overwhelmingly tool output: a `cargo test`
+/// run, a large source file read whole, a directory listing. What a model
+/// comes back to in that output is the start (what was asked) and the end
+/// (what it found, how it ended); the middle is the part nobody re-reads. So
+/// the middle can go for free, before any model is asked to read it, and the
+/// pass either summarizes a much smaller span or finds it has nothing left to
+/// do.
+///
+/// 8192 is deliberately generous. A tool result already arrives capped at
+/// [`MAX_OUTPUT_BYTES`](crate::tools) (30 KB), so this is roughly a quarter of
+/// the worst case and several times what any surface renders of a result. A
+/// result under it is one the model can still read end to end, which is the
+/// property worth keeping: this is not a place to be clever about what matters,
+/// because the cost of guessing wrong is context the model was relying on.
+const PRUNE_RESULT_MAX_CHARS: usize = 8_192;
+
+/// Left in place of the middle of a pruned tool result.
+///
+/// A fixed string rather than a formatted one, and that is what makes pruning
+/// idempotent. [`prune_tool_results`] budgets the head and the tail against
+/// this marker's length to land the excerpt on exactly
+/// [`PRUNE_RESULT_MAX_CHARS`]; a marker whose length depended on how much it
+/// elided would make that accounting circular, and an excerpt that came out a
+/// few characters over the threshold would be re-pruned by the next pass, and
+/// the one after that, each time losing a little more of a result the model
+/// can no longer recover.
+const PRUNE_OMISSION_MARKER: &str = "\n\n[... middle of this tool result elided \
+     to reclaim context; run the tool again if you need the part that is \
+     missing ...]\n\n";
+
 /// Soft pressure band: the model is nudged to call `compact` once fill crosses
 /// this fraction of the known window (auto-compact still waits for
 /// [`COMPACT_WINDOW_FRACTION`]).
@@ -287,9 +322,18 @@ pub enum CompactOutcome {
     Nothing,
     /// Summarized `count` middle messages into one progress note.
     Summarized(usize),
-    /// Nothing was worth summarizing, but `count` tool results that a later
-    /// edit had superseded were replaced with stubs. See
-    /// [`evict_superseded_reads`].
+    /// No summarization call was made, but `count` tool results were cut down
+    /// mechanically on the way: results a later edit had superseded, replaced
+    /// with stubs ([`evict_superseded_reads`]), and oversized results outside
+    /// the recent window, cut to a head/tail excerpt ([`prune_tool_results`]).
+    ///
+    /// One variant for both because both are the same event from every
+    /// caller's side: the context shrank, it is worth a notice and not an
+    /// error, and the pass cost nothing. A pass that reports this either found
+    /// nothing left worth summarizing or found the mechanical passes had
+    /// already brought the history under the mark a summary would have cut to,
+    /// which is the outcome worth having, because the reclaimed context is
+    /// free.
     Evicted(usize),
     /// The summary LLM failed, so `count` middle messages were dropped.
     Truncated { count: usize, error: String },
@@ -313,11 +357,11 @@ impl CompactOutcome {
             }
             CompactOutcome::Evicted(count) => {
                 let results = if *count == 1 {
-                    "1 stale tool result".to_string()
+                    "1 oversized or stale tool result".to_string()
                 } else {
-                    format!("{count} stale tool results")
+                    format!("{count} oversized or stale tool results")
                 };
-                format!("elided {results}; nothing else to compact yet")
+                format!("elided {results}; no summarization call needed")
             }
             CompactOutcome::Truncated { count, error } => format!(
                 "compacted {} by truncation (summary failed: {error})",
@@ -427,14 +471,15 @@ pub struct Compacted {
 }
 
 impl Compacted {
-    /// A pass that summarized nothing, having evicted `evicted` stale tool
-    /// results on the way (usually zero).
-    fn no_summary(evicted: usize) -> Self {
+    /// A pass that summarized nothing, having cut `elided` tool results down
+    /// mechanically on the way (usually zero). See
+    /// [`CompactOutcome::Evicted`].
+    fn no_summary(elided: usize) -> Self {
         Self {
-            outcome: if evicted == 0 {
+            outcome: if elided == 0 {
                 CompactOutcome::Nothing
             } else {
-                CompactOutcome::Evicted(evicted)
+                CompactOutcome::Evicted(elided)
             },
             note: None,
             usage: CompactUsage::default(),
@@ -460,6 +505,15 @@ impl Compacted {
 /// context *about* the transcript), and a user message when it is not, because
 /// then the note is the only thing left that can open the request — see
 /// [`Anchor`].
+///
+/// # The free passes run first
+///
+/// [`evict_superseded_reads`] and [`prune_tool_results`] both reclaim context
+/// with no model call at all, so both run before the boundary is chosen. That
+/// ordering is worth two things. The span the summarizer reads is smaller, so
+/// the call it is billed for is cheaper; and when the two of them alone bring
+/// the history to the low-water mark this pass was aiming for, there is
+/// nothing left for a summary to reclaim and the call is skipped outright.
 pub async fn compact(
     history: &mut Vec<ChatMessage>,
     anchor: Anchor,
@@ -472,10 +526,24 @@ pub async fn compact(
     // it will actually be sent at, and so the summarizer is not paid to read
     // a file's old contents.
     let evicted = evict_superseded_reads(history);
+    // Then, still for free: the middles of tool results too large to be worth
+    // carrying whole.
+    let pruned = prune_tool_results(history);
+
+    // The payoff. Pruning is gated on a per-result size and knows nothing
+    // about the window, so it is perfectly capable of reclaiming more than
+    // this pass needed; when it has, the summarization call would be spent
+    // cutting a history that already fits. Gated on `pruned` rather than on
+    // the mechanical passes generally, because eviction has always run ahead
+    // of an unconditional cut and a forced `/compact` still means "cut
+    // something".
+    if pruned > 0 && crate::llm::estimate_history_tokens(history) <= budget.low_water_tokens() {
+        return Compacted::no_summary(evicted + pruned);
+    }
 
     let start = 1;
     let Some(end) = cut_boundary(history, anchor, budget.low_water_tokens()) else {
-        return Compacted::no_summary(evicted);
+        return Compacted::no_summary(evicted + pruned);
     };
     let count = end - start;
 
@@ -669,6 +737,110 @@ fn evict_superseded_reads(history: &mut [ChatMessage]) -> usize {
         }
     }
     evicted
+}
+
+/// Cut every oversized tool result outside the recent window down to a
+/// head/tail excerpt, and report how many were cut.
+///
+/// The mechanical half of compaction, and the half that costs nothing. A
+/// summarization call is billed for the whole span it reads, and most of that
+/// span is tool output whose middle nobody is going to look at again; deleting
+/// the middle first means the model is either asked to read much less or, when
+/// this alone gets the history under the mark, never asked at all. See
+/// [`PRUNE_RESULT_MAX_CHARS`] for why the budget is what it is.
+///
+/// Bounded to the messages before the last [`KEEP_RECENT`], which is the same
+/// reserve [`cut_boundary`] refuses to summarize past, on purpose: those are
+/// the results of the calls the model just made, so they are the ones it is
+/// most likely still working from, and there is exactly one notion of "recent"
+/// in this module. Everything older has already been read once and is being
+/// re-sent on every step until something shrinks it.
+///
+/// Like [`evict_superseded_reads`] this rewrites messages mid-history and so
+/// throws away the provider's cached prefix from that point on, so it only
+/// ever runs inside a compaction pass, which was going to invalidate that
+/// prefix anyway. And like eviction it replaces the result's
+/// *content*, never the block: a `tool_result` separated from the `tool_use`
+/// that asked for it is a hard 400 from every provider.
+///
+/// None of it reaches the transcript on disk. A session file is append-only
+/// ([`session::Session::append`](super::session)): each result was written
+/// whole as it landed and no later pass rewrites those lines, so what is cut
+/// here is cut from what the model is sent and from nothing else. The full
+/// result is still in `~/.wizard/sessions/`, which is what makes this safe to
+/// do without asking anyone.
+fn prune_tool_results(history: &mut [ChatMessage]) -> usize {
+    let recent = history.len().saturating_sub(KEEP_RECENT);
+    let mut pruned = 0;
+    for message in &mut history[..recent] {
+        for block in &mut message.content {
+            let crate::llm::ContentBlock::ToolResult(result) = block else {
+                continue;
+            };
+            let Some(excerpt) = prune_excerpt(&result.content) else {
+                continue;
+            };
+            result.content = excerpt;
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// `content` cut to a bounded head, [`PRUNE_OMISSION_MARKER`], and a bounded
+/// tail, or `None` when it already fits [`PRUNE_RESULT_MAX_CHARS`].
+///
+/// Two properties this has to hold, because a compaction pass may run over the
+/// same history any number of times and each trip through here is
+/// unrecoverable:
+///
+/// * an excerpt is *exactly* [`PRUNE_RESULT_MAX_CHARS`] characters, so a
+///   second pass over it takes the `None` branch and changes nothing. That is
+///   what the fixed marker buys: the head and the tail are budgeted against
+///   its known length rather than against a count of what they omitted.
+/// * an excerpt is strictly smaller than the content that produced it, since
+///   this only runs on content strictly over the threshold. A pruning pass
+///   therefore always terminates and never grows a result.
+///
+/// Counted and cut in `char`s, never bytes, so a multibyte result cannot be
+/// split down the middle of a code point and arrive at the provider as
+/// mojibake. The same care [`truncate_output`](crate::tools) takes, for the
+/// same reason. The tail gets three quarters of the budget because a tool
+/// result ends in its conclusion: the failing assertion, the exit status, the
+/// summary line.
+fn prune_excerpt(content: &str) -> Option<String> {
+    let total = content.chars().count();
+    if total <= PRUNE_RESULT_MAX_CHARS {
+        return None;
+    }
+    let marker = PRUNE_OMISSION_MARKER.chars().count();
+    // A marker wider than the budget it is being fitted into would make the
+    // "excerpt" longer than the threshold, which breaks both properties above.
+    // Unreachable at the constants this file ships, and cheaper to rule out
+    // than to reason about if either of them ever moves.
+    if marker >= PRUNE_RESULT_MAX_CHARS {
+        return None;
+    }
+    let budget = PRUNE_RESULT_MAX_CHARS - marker;
+    let head = budget / 4;
+    let tail = budget - head;
+
+    // Byte offsets of char boundaries, so the slices below cannot land inside
+    // a code point. `total > PRUNE_RESULT_MAX_CHARS` guarantees the tail
+    // starts after the head ends, so the two never overlap.
+    let boundary = |index: usize| {
+        content
+            .char_indices()
+            .nth(index)
+            .map_or(content.len(), |(at, _)| at)
+    };
+    let head_end = boundary(head);
+    let tail_start = boundary(total - tail);
+    Some(format!(
+        "{}{PRUNE_OMISSION_MARKER}{}",
+        &content[..head_end],
+        &content[tail_start..]
+    ))
 }
 
 /// Summarize `span` with a rolling per-chunk pass, so an arbitrarily large
@@ -1169,7 +1341,7 @@ mod tests {
     /// can keep without walking onto the task.
     #[test]
     fn conversation_skips_a_system_note_that_a_sub_loop_would_keep() {
-        let history = vec![
+        let history = [
             ChatMessage::system("you are a worker"),
             ChatMessage::user("the task"),
             ChatMessage::system(format!("{COMPACT_SUMMARY_HEADING}\nso far")),
@@ -1202,6 +1374,211 @@ mod tests {
             "{}",
             history[end].text()
         );
+    }
+
+    /// A history in the shape a tool loop leaves behind: the system prompt,
+    /// then paired assistant tool-call and tool-result messages. Results
+    /// landing before the [`KEEP_RECENT`] reserve carry `old`, results inside
+    /// it carry `recent`, so a test says in one line which half it wants fat.
+    fn tool_loop_history(old: &str, recent: &str) -> Vec<ChatMessage> {
+        const STEPS: usize = 10;
+        let reserve = (1 + STEPS * 2) - KEEP_RECENT;
+        let mut history = vec![ChatMessage::system("you are wizard")];
+        for step in 0..STEPS {
+            history.push(ChatMessage::assistant(format!("step {step}")));
+            // `len()` before the push is the index this result will occupy.
+            let body = if history.len() < reserve { old } else { recent };
+            history.push(ChatMessage::tool_result(format!("id{step}"), "probe", body));
+        }
+        history
+    }
+
+    /// A tool result several times the per-result budget.
+    fn oversized() -> String {
+        "y".repeat(PRUNE_RESULT_MAX_CHARS * 5)
+    }
+
+    /// Pruning has to be a fixed point after one application, because a
+    /// compaction pass can run over the same history any number of times and
+    /// every trip through the excerpt is unrecoverable. So an excerpt lands
+    /// *at* the threshold rather than near it: strictly smaller than what
+    /// triggered the cut, and small enough that the next pass declines.
+    #[test]
+    fn pruning_a_second_time_changes_nothing() {
+        let body = oversized();
+        let mut history = tool_loop_history(&body, &body);
+        assert_eq!(prune_tool_results(&mut history), 5);
+
+        let reserve = history.len() - KEEP_RECENT;
+        for result in history[..reserve]
+            .iter()
+            .flat_map(ChatMessage::tool_results)
+        {
+            let length = result.content.chars().count();
+            assert_eq!(
+                length, PRUNE_RESULT_MAX_CHARS,
+                "an excerpt lands exactly on the threshold"
+            );
+            assert!(
+                length < body.chars().count(),
+                "and is strictly smaller than the result that triggered the cut"
+            );
+            assert!(result.content.contains(PRUNE_OMISSION_MARKER));
+        }
+
+        let settled: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            prune_tool_results(&mut history),
+            0,
+            "a second pass finds nothing over the threshold"
+        );
+        for (message, before) in history.iter().zip(&settled) {
+            assert_eq!(&message.content, before, "and rewrote nothing");
+        }
+    }
+
+    /// The reserve is the one notion of "recent" this module has: the results
+    /// of the calls the model just made are the ones it is most likely still
+    /// working from, and [`cut_boundary`] already refuses to summarize past
+    /// them. Pruning stops in the same place.
+    #[test]
+    fn the_recent_reserve_is_not_pruned() {
+        let body = oversized();
+        let mut history = tool_loop_history(&body, &body);
+        let reserve = history.len() - KEEP_RECENT;
+
+        prune_tool_results(&mut history);
+
+        for result in history[reserve..]
+            .iter()
+            .flat_map(ChatMessage::tool_results)
+        {
+            assert_eq!(
+                result.content, body,
+                "a result inside the reserve is carried whole"
+            );
+        }
+    }
+
+    /// A result is cut in `char`s, never bytes: a cut through the middle of a
+    /// code point would reach the provider as mojibake, and the tail of a tool
+    /// result (the failing assertion, the exit status) is the half worth
+    /// keeping.
+    #[test]
+    fn a_multibyte_result_is_cut_on_char_boundaries() {
+        let content = format!("héad{}táil", "ü".repeat(PRUNE_RESULT_MAX_CHARS * 3));
+        assert!(
+            content.len() > content.chars().count(),
+            "the fixture is genuinely multibyte"
+        );
+
+        let excerpt = prune_excerpt(&content).expect("over the threshold");
+        assert_eq!(excerpt.chars().count(), PRUNE_RESULT_MAX_CHARS);
+        assert!(excerpt.starts_with("héad"), "{}", &excerpt[..16]);
+        assert!(excerpt.ends_with("táil"));
+        assert!(excerpt.contains(PRUNE_OMISSION_MARKER));
+        assert!(
+            excerpt.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
+            "nothing was split down the middle of a code point"
+        );
+
+        assert_eq!(
+            prune_excerpt("héad"),
+            None,
+            "a result already under the threshold is left alone"
+        );
+    }
+
+    /// The payoff. Pruning knows nothing about the window, so it can reclaim
+    /// more than the pass needed; when it has, the summarization call would be
+    /// spent cutting a history that already fits, and it is skipped. The pass
+    /// still reports what it did and still bills nothing.
+    #[tokio::test]
+    async fn pruning_alone_can_meet_the_budget_and_skip_the_summary() {
+        let mut history = tool_loop_history(&oversized(), "ok");
+        let before = crate::llm::estimate_history_tokens(&history);
+        assert!(
+            before > LOW_WATER,
+            "the history is over the mark a pass cuts to: {before}"
+        );
+        assert!(
+            cut_boundary(&history, Anchor::Conversation, LOW_WATER).is_some(),
+            "and a summarization pass had a span it would have paid to read"
+        );
+        let length = history.len();
+
+        let compacted = compact(
+            &mut history,
+            Anchor::Conversation,
+            budget(),
+            &stub(),
+            "model",
+        )
+        .await;
+
+        assert_eq!(compacted.outcome, CompactOutcome::Evicted(5));
+        assert_eq!(
+            compacted.usage,
+            CompactUsage::default(),
+            "no model was called"
+        );
+        assert!(compacted.note.is_none());
+        assert!(
+            compacted
+                .outcome
+                .describe()
+                .contains("no summarization call"),
+            "{}",
+            compacted.outcome.describe()
+        );
+
+        let after = crate::llm::estimate_history_tokens(&history);
+        assert!(
+            after <= LOW_WATER,
+            "the free pass alone got the history under the mark: {after}"
+        );
+        assert_eq!(
+            history.len(),
+            length,
+            "and nothing was folded away to do it"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|m| !m.text().starts_with(COMPACT_SUMMARY_HEADING)),
+            "no summary note was written"
+        );
+    }
+
+    /// The common case: results the model can still read end to end. Pruning
+    /// leaves every one of them byte for byte, and the pass it runs inside
+    /// still does what it always did. A free win that did not happen must not
+    /// stand in for the summary, or a `/compact` over a history of ordinary
+    /// tool output would quietly stop cutting anything.
+    #[tokio::test]
+    async fn small_results_are_left_whole_and_the_ordinary_pass_still_runs() {
+        let mut history = tool_loop_history("ok", "ok");
+        let before: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+
+        assert_eq!(prune_tool_results(&mut history), 0);
+        for (message, original) in history.iter().zip(&before) {
+            assert_eq!(&message.content, original, "nothing was rewritten");
+        }
+
+        let compacted = compact(
+            &mut history,
+            Anchor::Conversation,
+            budget(),
+            &stub(),
+            "model",
+        )
+        .await;
+        assert!(
+            matches!(compacted.outcome, CompactOutcome::Summarized(_)),
+            "{:?}",
+            compacted.outcome
+        );
+        assert!(compacted.usage.reported());
     }
 
     /// The reported prompt size is what trips auto-compaction, and only
