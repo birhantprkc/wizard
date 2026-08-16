@@ -19,6 +19,7 @@ pub mod publish;
 pub mod registry;
 pub mod scripted;
 pub mod shell;
+pub mod spill;
 pub mod subagent_tasks;
 pub mod tasks;
 pub mod todo;
@@ -429,10 +430,46 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(
 /// Bytes reserved for the truncation marker inside the `max_bytes` budget.
 const TRUNCATION_MARKER_RESERVE: usize = 192;
 
+/// Elision marker between head and tail when the omitted bytes were spilled to
+/// a file. Short because the notice below the preview carries the counts and
+/// the path; this only has to mark where the cut is.
+const SPILL_ELISION: &str = "\n... [output truncated] ...\n";
+
+/// Name suggested for a spill file. Generic because `truncate_output` does not
+/// know which tool it is truncating for: the forty call sites pass a budget and
+/// nothing else, and changing that to thread a label through every tool in the
+/// tree buys a nicer `ls` and nothing the model can see.
+const SPILL_FILE_NAME: &str = "tool-output.txt";
+
 /// Truncate `text` to at most `max_bytes` (cutting on char boundaries),
-/// keeping the head and a larger tail — build and test failures land at the
-/// end of output — around a marker that says how much was omitted.
-pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
+/// keeping the head and a larger tail (build and test failures land at the end
+/// of output) around a marker that says how much was omitted.
+///
+/// When a session has installed a spill sink ([`spill`]), the omitted bytes are
+/// not lost: the full text goes to a private file and the marker becomes a path
+/// the model can `read_file` or `search_files`. Without a sink, and whenever
+/// spilling fails, this is the lossy truncation it has always been.
+pub(crate) fn truncate_output(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    if let Some(framed) = spill_and_frame(&text, max_bytes) {
+        return framed;
+    }
+    truncate_output_without_spill(text, max_bytes)
+}
+
+/// [`truncate_output`] with the spill path taken out: oversized text loses its
+/// middle and that is the end of it.
+///
+/// For `read_file`, which cannot use a spill file. Its answer to "this output
+/// is too long" is already `start_line`/`end_line` on a file that exists, so
+/// spilling would copy a file the model can already address in order to hand
+/// back an instruction to read a file, and a model that followed it literally
+/// would spend a call to arrive where it started. Also the fallback for every
+/// other caller when no sink is installed, which is what unit tests and
+/// short-lived subprocesses run with.
+pub(crate) fn truncate_output_without_spill(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
@@ -446,7 +483,87 @@ pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
         text.push_str("\n... [output truncated]");
         return text;
     }
-    let budget = max_bytes - TRUNCATION_MARKER_RESERVE;
+    let (head_end, tail_start) = frame(&text, max_bytes - TRUNCATION_MARKER_RESERVE);
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n... [output truncated] {omitted} bytes omitted from the middle; rerun a narrower \
+         command for the full output, or task_output for a background task ...\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+/// Write `text` to the installed spill sink and build the model-facing
+/// preview around a pointer to it, or `None` when there is no sink, the spill
+/// failed, or the budget cannot hold the notice.
+///
+/// Every `None` here is a fall-through to plain truncation, never an error: a
+/// tool call that already produced too much output must not also fail because
+/// the scratch directory was read-only.
+fn spill_and_frame(text: &str, max_bytes: usize) -> Option<String> {
+    // A budget this small has no head+tail framing to hang a path off, and the
+    // notice alone would not fit. Leave it on the plain head cut.
+    if max_bytes <= TRUNCATION_MARKER_RESERVE {
+        return None;
+    }
+    let sink = spill::installed()?;
+    let path = match sink.spill(text, SPILL_FILE_NAME) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!(
+                "could not spill {} bytes of tool output: {err:#}",
+                text.len()
+            );
+            return None;
+        }
+    };
+    let location = path.display().to_string();
+
+    // Size the notice at its widest before deciding how much preview fits. The
+    // omitted count is not known yet and depends on this reserve, but it can
+    // never have more digits than the length of the whole text, so measuring
+    // with that overstates the notice by nothing worse than a few bytes and can
+    // never understate it. Understating is the one failure that matters: it
+    // would put a result over the cap the caller asked for.
+    let reserve = SPILL_ELISION.len() + "\n\n".len() + spill_notice(text.len(), &location).len();
+    if max_bytes <= reserve {
+        // A long spill path against a small budget (an error message, say).
+        // Nothing would be left for the preview, so drop the file rather than
+        // leave one nothing points at.
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+
+    let (head_end, tail_start) = frame(text, max_bytes - reserve);
+    Some(format!(
+        "{}{SPILL_ELISION}{}\n\n{}",
+        &text[..head_end],
+        &text[tail_start..],
+        spill_notice(tail_start - head_end, &location)
+    ))
+}
+
+/// What the model reads in place of the bytes that were cut: how many, where
+/// they are, and which tools get them back.
+///
+/// Naming the tools matters more than it looks. The old marker said "rerun a
+/// narrower command", and a model that follows that instruction redoes the work
+/// that produced the output. This says the work is already on disk and the
+/// recovery is a read, so the cheaper move is also the obvious one.
+fn spill_notice(omitted: usize, location: &str) -> String {
+    format!(
+        "(Omitted {omitted} bytes. Full output at {location}. Use read_file on that path with \
+         start_line/end_line, or search_files with that path to search within it.)"
+    )
+}
+
+/// Split `text` into a head and a tail together no longer than `budget`,
+/// cutting on char boundaries and weighting the tail, where a failing build
+/// puts its summary.
+///
+/// Boundary adjustment only ever shrinks the head and grows the tail's start,
+/// so the two pieces stay inside `budget` and cannot overlap.
+fn frame(text: &str, budget: usize) -> (usize, usize) {
     let mut head_end = budget / 4;
     while head_end > 0 && !text.is_char_boundary(head_end) {
         head_end -= 1;
@@ -455,13 +572,7 @@ pub(crate) fn truncate_output(mut text: String, max_bytes: usize) -> String {
     while tail_start < text.len() && !text.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    let omitted = tail_start - head_end;
-    format!(
-        "{}\n... [output truncated] {omitted} bytes omitted from the middle; rerun a narrower \
-         command for the full output, or task_output for a background task ...\n{}",
-        &text[..head_end],
-        &text[tail_start..]
-    )
+    (head_end, tail_start)
 }
 
 /// A callable capability exposed to the model.
@@ -511,7 +622,21 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::spill::{SpillSink, hold_sink};
     use super::*;
+
+    /// The one file in a sink directory, and a failure naming what was there
+    /// instead. Every spilling test writes exactly one.
+    fn only_spill_file(dir: &Path) -> PathBuf {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()))
+            .map(|entry| entry.expect("a dir entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected one spill file: {entries:?}");
+        entries.pop().expect("the one entry")
+    }
 
     /// One cap for every tool meant one result could inject 30 KB — about
     /// 7.5k tokens — and then ride along on every step after it. A budget is
@@ -519,6 +644,8 @@ mod tests {
     /// command's stdout is the answer, a directory listing is a signpost.
     #[test]
     fn a_signpost_tool_gets_less_of_the_window_than_the_answer_tools() {
+        // The marker text below is the no-sink one, so hold the slot empty.
+        let _hold = hold_sink(None);
         for budget in [MAX_DIFF_BYTES, MAX_SEARCH_BYTES, MAX_LISTING_BYTES] {
             assert!(
                 budget < MAX_OUTPUT_BYTES,
@@ -551,6 +678,7 @@ mod tests {
 
     #[test]
     fn truncate_keeps_head_and_tail_and_counts_omitted_bytes() {
+        let _hold = hold_sink(None);
         let text = format!("HEAD{}TAIL", "x".repeat(10_000));
         let out = truncate_output(text, 1_000);
         assert!(
@@ -566,6 +694,8 @@ mod tests {
 
     #[test]
     fn truncate_tail_is_larger_than_head() {
+        // Counts letters, and a spill notice carries its own; keep it out.
+        let _hold = hold_sink(None);
         let text = "h".repeat(500) + &"t".repeat(10_000);
         let out = truncate_output(text, 1_000);
         let heads = out.chars().filter(|&c| c == 'h').count();
@@ -587,5 +717,170 @@ mod tests {
         let out = truncate_output(text, 100);
         assert!(out.starts_with("xxx"));
         assert!(out.ends_with("[output truncated]"));
+    }
+
+    /// The whole point: the bytes that leave the result are still somewhere the
+    /// model can reach, byte for byte, and it is told where.
+    #[test]
+    fn a_spilled_result_names_a_file_holding_the_complete_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = SpillSink::in_dir(tmp.path().join("session"));
+        let dir = sink.dir().to_path_buf();
+        let _hold = hold_sink(Some(sink));
+
+        let text = format!("HEAD{}TAIL", "x".repeat(60_000));
+        let out = truncate_output(text.clone(), MAX_OUTPUT_BYTES);
+
+        assert!(out.starts_with("HEAD"), "head kept: {}", &out[..16]);
+        assert!(out.contains("TAIL"), "tail kept");
+        assert!(
+            out.contains("Full output at "),
+            "points somewhere: {out:.400}"
+        );
+        let spilled = only_spill_file(&dir);
+        assert!(
+            out.contains(&spilled.display().to_string()),
+            "names the file it wrote"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&spilled).expect("read the spill file"),
+            text,
+            "nothing was lost, including the middle"
+        );
+        assert!(
+            !out.contains("rerun a narrower"),
+            "the model is sent to the file, not back to the work: {out:.400}"
+        );
+    }
+
+    /// A result over its cap is the bug the cap exists to prevent, and the
+    /// notice is part of the result: a path is as long as the box's temp dir
+    /// makes it, so the preview has to shrink by exactly that much.
+    #[test]
+    fn a_spilled_result_stays_inside_every_budget() {
+        for budget in [
+            MAX_OUTPUT_BYTES,
+            MAX_DIFF_BYTES,
+            MAX_SEARCH_BYTES,
+            MAX_LISTING_BYTES,
+            MAX_ERROR_BYTES,
+            TRUNCATION_MARKER_RESERVE + 1,
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sink = SpillSink::in_dir(tmp.path().join("session"));
+            let _hold = hold_sink(Some(sink));
+
+            let out = truncate_output("é".repeat(MAX_OUTPUT_BYTES), budget);
+            assert!(
+                out.len() <= budget,
+                "{budget}: result is {} bytes",
+                out.len()
+            );
+        }
+    }
+
+    /// Two spills of the same text from the same session are two files. A name
+    /// derived from the content, or a fixed one, would have the second call
+    /// either overwrite the first or fail against `create_new`.
+    #[test]
+    fn two_spills_of_identical_output_do_not_collide() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = SpillSink::in_dir(tmp.path().join("session"));
+        let dir = sink.dir().to_path_buf();
+        let _hold = hold_sink(Some(sink));
+
+        let text = "y".repeat(50_000);
+        let first = truncate_output(text.clone(), MAX_OUTPUT_BYTES);
+        let second = truncate_output(text.clone(), MAX_OUTPUT_BYTES);
+
+        let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read the sink dir")
+            .map(|entry| entry.expect("a dir entry").path())
+            .collect();
+        assert_eq!(files.len(), 2, "two calls, two files: {files:?}");
+        assert_ne!(first, second, "and two different notices");
+        for file in files {
+            assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
+        }
+    }
+
+    /// With no sink the function is the one it has always been, down to the
+    /// bytes. Tests, `wizard --print` in a pipeline and any short-lived
+    /// subprocess run this way, and a spill directory they never clean up
+    /// would be litter rather than a feature.
+    #[test]
+    fn without_a_sink_nothing_changes() {
+        let _hold = hold_sink(None);
+        let text = format!("HEAD{}TAIL", "x".repeat(10_000));
+
+        for budget in [MAX_OUTPUT_BYTES, MAX_ERROR_BYTES, 1_000, 100] {
+            assert_eq!(
+                truncate_output(text.clone(), budget),
+                truncate_output_without_spill(text.clone(), budget),
+                "budget {budget} must be untouched by the spill path"
+            );
+        }
+        assert!(truncate_output(text, 1_000).contains("rerun a narrower"));
+    }
+
+    /// A path long enough that the notice cannot fit leaves the result as it
+    /// was rather than blowing the cap, and takes the orphan file with it: a
+    /// spill nothing points at is a leak, not a fallback.
+    #[test]
+    fn a_notice_that_cannot_fit_falls_back_and_cleans_up() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let deep = tmp.path().join("d".repeat(120)).join("e".repeat(120));
+        let sink = SpillSink::in_dir(&deep);
+        let _hold = hold_sink(Some(sink));
+
+        let budget = TRUNCATION_MARKER_RESERVE + 8;
+        let out = truncate_output("z".repeat(20_000), budget);
+
+        assert!(out.len() <= budget, "still capped: {} bytes", out.len());
+        assert!(
+            out.contains("rerun a narrower"),
+            "fell back to plain truncation: {out}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&deep)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "no spill file left behind for a notice that was never emitted"
+        );
+    }
+
+    /// `read_file` is the one tool a spill cannot help. Its output is already a
+    /// file the model can address with `start_line`/`end_line`, so spilling
+    /// would copy that file in order to tell the model to read a file.
+    #[tokio::test]
+    async fn read_file_never_spills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = SpillSink::in_dir(tmp.path().join("session"));
+        let dir = sink.dir().to_path_buf();
+        let _hold = hold_sink(Some(sink));
+
+        let big = tmp.path().join("big.txt");
+        std::fs::write(&big, "line of text\n".repeat(4_000)).expect("write the big file");
+        let ctx = ToolContext::new(tmp.path());
+        let out = file::ReadFileTool
+            .execute(serde_json::json!({ "path": "big.txt" }), &ctx)
+            .await
+            .expect("read_file runs");
+
+        assert!(!out.is_error);
+        assert!(
+            out.content.len() <= MAX_OUTPUT_BYTES,
+            "still capped: {} bytes",
+            out.content.len()
+        );
+        assert!(
+            !out.content.contains("Full output at"),
+            "no spill pointer in a read result"
+        );
+        assert!(
+            !dir.exists() || std::fs::read_dir(&dir).map(|e| e.count()).unwrap_or(0) == 0,
+            "and nothing written to the sink"
+        );
     }
 }

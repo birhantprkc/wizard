@@ -14,6 +14,7 @@ use super::shell::{render_command_result, run_command};
 use super::{
     MAX_ERROR_BYTES, MAX_LISTING_BYTES, MAX_OUTPUT_BYTES, MAX_SEARCH_BYTES, Tool, ToolAccess,
     ToolContext, ToolError, ToolOutput, parse_args, resolve_path, truncate_output,
+    truncate_output_without_spill,
 };
 
 /// Maximum number of lines a single `read_file` call returns.
@@ -133,7 +134,12 @@ impl Tool for ReadFileTool {
                 slice.len()
             ));
         }
-        Ok(ToolOutput::ok(truncate_output(numbered, MAX_OUTPUT_BYTES)))
+        // Never spills: the file itself is the spill file, and `start_line` /
+        // `end_line` above are the way back to the rest of it.
+        Ok(ToolOutput::ok(truncate_output_without_spill(
+            numbered,
+            MAX_OUTPUT_BYTES,
+        )))
     }
 }
 

@@ -859,6 +859,13 @@ impl Agent {
         if let Some(images) = open_image_store(&session.id) {
             ctx = ctx.with_images(images);
         }
+        // Oversized tool output spills to a file this session owns, so the model
+        // can `read` or `grep` the part that did not fit instead of rerunning the
+        // command that produced it. Installed here, beside the image store, for
+        // the same reason: both are per-session, and a sink left pointing at the
+        // previous conversation would write one session's output into another's
+        // directory.
+        crate::tools::spill::install(crate::tools::spill::SpillSink::for_session(&session.id));
 
         let mut agent = Self {
             client,
@@ -1064,6 +1071,9 @@ impl Agent {
         // Images follow the session: the fresh conversation writes into its own
         // directory, and the old one's files stay where its transcript points.
         self.ctx.images = open_image_store(&self.session.id);
+        crate::tools::spill::install(crate::tools::spill::SpillSink::for_session(
+            &self.session.id,
+        ));
         self.hooks.set_session_id(self.session.id.clone());
         self.history.truncate(1);
         self.dispatcher.reset_failures();
