@@ -405,6 +405,24 @@ fn unknown_slash_command_passes_through_as_a_prompt() {
 }
 
 #[test]
+fn ctrl_y_with_nothing_to_copy_says_so_instead_of_touching_the_clipboard() {
+    // The guard in front of the clipboard write, which is the only part of
+    // Ctrl-Y a test can safely reach: the copy itself spawns `tmux` and writes
+    // the terminal, so the reply path is verified against a real terminal
+    // rather than here. What matters is that the key is bound (it does not
+    // fall through to the composer and type a `y`) and that an empty
+    // transcript takes the notice branch.
+    let mut app = app();
+    let action = press_ctrl(&mut app, 'y');
+    assert!(action.is_none());
+    assert!(app.input.is_empty(), "Ctrl-Y must not reach the composer");
+    assert!(matches!(
+        app.transcript.last(),
+        Some(TranscriptItem::Notice(text)) if text.contains("nothing to copy")
+    ));
+}
+
+#[test]
 fn builtin_command_with_bad_args_keeps_its_usage_notice() {
     let mut app = app();
     type_str(&mut app, "/mode warlock");

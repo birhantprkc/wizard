@@ -170,7 +170,9 @@ pub struct StatusLine {
 /// terminal cells. Because wizard captures the mouse (so the wheel scrolls the
 /// transcript), the terminal's own click-drag-to-select is pre-empted — so the
 /// app draws the highlight itself ([`crate::ui`]) and copies the covered cells
-/// to the clipboard (native tool, then OSC 52) on release.
+/// to the clipboard on release, down every route that applies at once
+/// ([`crate::app::term::copy_to_clipboard`]) rather than stopping at the first
+/// one that reports success.
 #[derive(Debug, Clone, Copy)]
 pub struct Selection {
     /// Cell where the drag began (mouse-down).

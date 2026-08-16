@@ -167,6 +167,48 @@ and `NOTICE` carries the licence attribution. Trademarks belong to their
 owners. A skin reproduces the chrome and nothing else: the name on the screen,
 the commands, the model and every fact reported on it are Wizard's.
 
+## Copying text out
+
+Two ways to copy, one machinery behind both:
+
+- **Drag** across the transcript. The covered text is copied when you release.
+  Wizard captures the mouse so the wheel scrolls, which pre-empts your
+  terminal's own click-drag selection, so this is the replacement for it.
+  Holding **Shift** while you drag falls back to the terminal's selection.
+- **Ctrl-Y** copies the last reply, whole. This is the one to use for an
+  answer: a drag only copies what is on screen, so anything scrolled off the
+  top is not in it, and there is nothing to drag with over a serial console or
+  a terminal that eats mouse events.
+
+Every copy is attempted on **every route the terminal stack offers**, because
+which one you will actually paste from is not knowable from inside Wizard:
+
+| Route | What it sets | When |
+|---|---|---|
+| Native tool | The clipboard of the machine Wizard runs on, via `wl-copy` / `xclip` / `xsel` / `pbcopy` / `clip.exe` | Always locally. Over SSH only when there is a display; first in a local session, last in a remote one |
+| tmux paste buffer | What `prefix ]` pastes, via `tmux load-buffer -w` | Inside tmux |
+| OSC 52 | The clipboard of the terminal you are *sitting at*, wrapped in tmux's or screen's passthrough when one is in the way | Always, up to 74994 bytes of text |
+
+They are not fallbacks for each other. Over SSH the native tool is the wrong
+one: `xclip` on the server sets the server's clipboard, which nobody can see,
+and exits successfully doing it. OSC 52 is the only route that can reach your
+own machine. Inside tmux, the paste buffer is the route that is certain to
+work.
+
+**Inside tmux**, the load-bearing route is `tmux load-buffer -w`, which fills
+the paste buffer and asks tmux to push the text out to the real terminal with
+its own escape. A bare OSC 52 from an application does not get through: tmux's
+default `set-clipboard external` ignores it, and the DCS passthrough Wizard
+also sends has been gated behind `set -g allow-passthrough on` since tmux
+3.3a. Turn that option on if you want the passthrough route too; nothing
+breaks without it.
+
+**Over 74994 bytes** the escape is skipped rather than sent, because terminals
+drop an oversized OSC 52 in silence and a copy that reports success and pastes
+nothing is the worst outcome available. Wizard says so on screen and the other
+routes still run, so in tmux the text is in the paste buffer even when the
+outer terminal got nothing.
+
 ## Color
 
 The TUI paints from a table of **semantic tokens** (`accent`, `muted`, `error`,

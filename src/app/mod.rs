@@ -2455,6 +2455,39 @@ impl App {
         self.transcript.toggle_last_tool();
     }
 
+    /// Copy the last block of assistant text to the clipboard (Ctrl-Y).
+    ///
+    /// The keyboard path to the copy that otherwise only a mouse drag can
+    /// reach. Dragging is fine for a phrase and useless for an answer: it
+    /// copies what is on *screen*, so anything scrolled off the top is not in
+    /// the selection, and it is unavailable outright to anyone working without
+    /// a mouse or through a terminal that eats drag events.
+    ///
+    /// "The last block" is the newest committed [`TranscriptItem::Text`], not
+    /// the whole turn. A turn that narrated between tool calls left several,
+    /// and the one the user just read is the one they mean. Text still
+    /// streaming is not committed yet and is deliberately not copied: half an
+    /// answer that looks like a whole one is worse than a notice saying to
+    /// wait.
+    fn copy_last_reply(&mut self) {
+        let reply = self.transcript.iter().rev().find_map(|item| match item {
+            TranscriptItem::Text(text) if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        let Some(reply) = reply else {
+            self.notice("nothing to copy yet: no reply on this transcript");
+            return;
+        };
+        let lines = reply.lines().count();
+        match term::copy_to_clipboard(&reply) {
+            // Unlike a drag, this leaves no highlight behind, so the copy has
+            // to say it happened or the key looks dead.
+            Ok(None) => self.notice(format!("copied the last reply ({lines} lines)")),
+            Ok(Some(notice)) => self.notice(notice),
+            Err(err) => self.notice(format!("could not copy the last reply: {err:#}")),
+        }
+    }
+
     /// Toggle the tool card whose header line was drawn on screen row `row`
     /// in the last frame (a plain click on it). No-op off-card, on a
     /// still-running card, or while an overlay covers the transcript (the
@@ -2685,6 +2718,12 @@ impl App {
                 }
                 KeyCode::Char('t') => {
                     self.toggle_last_tool_card();
+                    return Ok(None);
+                }
+                // Copy the last reply. The keyboard half of the copy story,
+                // which until now was a mouse drag or nothing.
+                KeyCode::Char('y') => {
+                    self.copy_last_reply();
                     return Ok(None);
                 }
                 // Attach an image from the clipboard — the explicit companion to

@@ -1,5 +1,6 @@
 //! Terminal lifecycle: raw mode + alternate screen setup/teardown, editor
-//! suspension (`$EDITOR`), and clipboard writes (native tools + OSC 52).
+//! suspension (`$EDITOR`), and clipboard writes (native tools, OSC 52, and
+//! the multiplexer's own paste buffer).
 
 use anyhow::{Context, Result};
 use ratatui::Terminal;
@@ -21,9 +22,10 @@ pub(super) fn setup_terminal() -> Result<Tui> {
     // the wheel cycled previous messages instead of scrolling the text.
     // Tradeoff: capture pre-empts the terminal's native click-drag-to-select,
     // so wizard draws its own selection instead — drag to highlight, and the
-    // covered text is copied to the clipboard on release (native tool first,
-    // OSC 52 as fallback — see `copy_to_clipboard`, the Down/Drag/Up handlers
-    // in `handle_event`, and the highlight overlay in `crate::ui`). Holding
+    // covered text is copied on release by every route the terminal stack
+    // offers (see `copy_to_clipboard`, the Down/Drag/Up handlers in
+    // `handle_event`, and the highlight overlay in `crate::ui`). Ctrl-Y is the
+    // keyboard path to the same copy, for the last reply. Holding
     // Shift still forces the terminal's own selection as a fallback. Bracketed
     // paste stays on so pasted text lands in the composer as one chunk.
     crossterm::execute!(
@@ -281,39 +283,382 @@ pub(super) fn edit_prompt_in_editor(app: &mut App, terminal: &mut Tui) {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Copy `text` to the system clipboard.
+// ---- Clipboard ---------------------------------------------------------
+//
+// There is no one mechanism that copies out of a full-screen TUI everywhere,
+// so this section runs several and reports what actually landed. Three
+// channels matter, and they are not alternatives to each other:
+//
+//   * A native clipboard tool (`wl-copy`, `xclip`, `xsel`, `pbcopy`,
+//     `clip.exe`) sets the clipboard of the machine the *tool* runs on. That
+//     is the right machine when Wizard is local and the wrong one over SSH.
+//   * OSC 52 is an escape the terminal emulator interprets, so it is the only
+//     channel that can reach the clipboard of the machine the *user* is
+//     sitting at while Wizard runs on a server.
+//   * tmux's paste buffer is where `prefix ]` pastes from, and is therefore
+//     what a tmux user means by "copy" regardless of what the outer terminal
+//     did with the escape.
+//
+// Both of the interesting failures are silent by construction. A native tool
+// on a remote host exits zero after writing a clipboard nobody can see, and a
+// bare OSC 52 inside tmux is swallowed before the outer terminal ever sees it
+// (tmux only forwards the sequence it emits itself, and its DCS passthrough is
+// off by default since 3.3a). So both used to report success while copying
+// nothing. See `copy_to_clipboard` for the resulting order.
+
+/// The parts of the environment that decide where a copy can land.
 ///
-/// Prefers a native clipboard tool (`wl-copy` / `xclip` / `pbcopy` / …) when one
-/// is available: OSC 52 alone often looks successful while never reaching the
-/// host clipboard — common under tmux, and under Alacritty on Wayland where the
-/// sequence is ignored or stripped. Falls back to OSC 52 so copy still works
-/// over SSH when no local clipboard tool is on PATH.
-pub(super) fn copy_to_clipboard(text: &str) -> Result<()> {
-    if copy_via_native(text).is_ok() {
-        // Still emit OSC 52 best-effort so a remote client (or a terminal that
-        // only understands the escape) also picks it up. Failures here are
-        // silent: the native write already succeeded.
-        let _ = copy_via_osc52(text);
-        return Ok(());
-    }
-    copy_via_osc52(text).context(
-        "no native clipboard tool succeeded (wl-copy/xclip/xsel/pbcopy) and OSC 52 write failed",
-    )
+/// Captured as data rather than read at each decision point so the ordering
+/// and the framing are testable without setting process-wide environment
+/// variables from a parallel test run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CopyEnv {
+    /// Running inside a tmux client (`$TMUX`).
+    tmux: bool,
+    /// Running inside GNU screen, which frames escapes its own way.
+    screen: bool,
+    /// This process is on the far end of an SSH session.
+    ssh: bool,
+    /// A display the native clipboard tools could plausibly write to.
+    display: bool,
 }
 
-/// OSC 52: `ESC ] 52 ; c ; <base64> BEL` — `c` targets the clipboard. Needs no
-/// clipboard daemon and works over SSH when the terminal (and any multiplexer)
-/// forwards the sequence. Written straight to stdout; non-printing, so it does
-/// not disturb the rendered frame.
-fn copy_via_osc52(text: &str) -> Result<()> {
+impl CopyEnv {
+    fn detect() -> Self {
+        let set = |key: &str| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+        Self::from_parts(
+            set("TMUX"),
+            set("STY"),
+            &std::env::var("TERM").unwrap_or_default(),
+            set("SSH_CONNECTION") || set("SSH_TTY"),
+            set("DISPLAY") || set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET") || cfg!(not(unix)),
+        )
+    }
+
+    /// Split out from [`CopyEnv::detect`] because the multiplexer question is
+    /// the one with a trap in it: tmux sets `TERM=screen-256color` on plenty
+    /// of installs, so a `$TERM`-first reading of "am I under screen" says yes
+    /// inside tmux and frames every escape the wrong way. `$TMUX` decides
+    /// first, and `$TERM` only gets a say when it does not.
+    fn from_parts(tmux: bool, sty: bool, term: &str, ssh: bool, display: bool) -> Self {
+        Self {
+            tmux,
+            screen: !tmux && (sty || term.starts_with("screen")),
+            ssh,
+            display,
+        }
+    }
+
+    /// Whether the escape and the multiplexer buffer are tried before the
+    /// native tools.
+    ///
+    /// Over SSH they must be: `xclip` on the server writes a clipboard on the
+    /// server, and exits zero doing it, so letting it answer first is how a
+    /// copy comes to report success while the user's own clipboard never
+    /// changes. Inside tmux the same reordering is merely correct rather than
+    /// critical, since the paste about to be attempted is probably `prefix ]`.
+    ///
+    /// Order only. No leg suppresses another any more, which is the other half
+    /// of the same bug: the previous code returned the moment a native tool
+    /// exited zero and never sent the escape at all.
+    fn prefer_escape(self) -> bool {
+        self.ssh || self.tmux
+    }
+
+    /// Whether a native clipboard tool is worth spawning at all.
+    ///
+    /// Remote with no display is the one case where it is not: every candidate
+    /// fails, and all the attempt buys is five process spawns on every drag.
+    /// A forwarded X11 session still has a display, and still gets the run.
+    fn native_worth_trying(self) -> bool {
+        !self.ssh || self.display
+    }
+}
+
+/// Largest selection Wizard will push through OSC 52, in bytes of text before
+/// encoding.
+///
+/// Terminals cap the sequence, and the ones that cap it mostly discard an
+/// oversized one rather than truncating it, which is the failure worth
+/// designing against: a copy that reports success and pastes nothing. The real
+/// ceilings are all far higher than this and they disagree with each other
+/// (xterm parses 600_000 bytes of sequence, tmux and iTerm2 buffer 1 MiB,
+/// Ghostty 8 MiB, several others impose nothing at all), so there is no
+/// number that is exactly right.
+///
+/// This one is deliberately conservative and deliberately conventional: it is
+/// the budget hterm's `osc52.sh` picked (100_000 bytes for the whole sequence,
+/// less the framing, times three quarters for base64), which spread through
+/// enough shell helpers and editor plugins to have become the de-facto
+/// interoperable size. A selection past it is a transcript dump, and the
+/// routes that have no cap at all still take it.
+const OSC52_MAX_TEXT: usize = 74_994;
+
+/// How much of a DCS string sequence to hand GNU screen at once, wrapper
+/// included.
+///
+/// screen buffers a string sequence in a fixed `MAXSTR` array and drops
+/// whatever runs past it. That bound has moved with the version (256, then 512
+/// in 4.2.0, then 768 in 4.2.1, and 2560 on current builds), so the safe chunk
+/// is the oldest one rather than the newest: overshooting silently loses the
+/// tail of the payload, and undershooting costs a few extra four-byte
+/// wrappers. 256 is what hterm's reference implementation settled on for the
+/// same reason.
+const SCREEN_CHUNK: usize = 256 - 4;
+
+/// Copy `text` to the clipboard by every route this terminal stack offers.
+///
+/// Every applicable route runs. That is the correction: the previous version
+/// treated them as a fallback chain and returned as soon as a native tool
+/// exited zero, which over SSH is exactly the case where the native tool wrote
+/// a clipboard nobody was looking at. Which route the user actually pastes
+/// from is not knowable from in here, so guessing wrong has to stay cheap.
+///
+/// The routes, in the order they are tried:
+///
+/// 1. **A native clipboard tool** (`wl-copy` / `xclip` / `pbcopy` / …), first
+///    in a local session, because there it is the one channel certain to reach
+///    the clipboard the user will paste from. Over SSH it moves behind the
+///    other two and is skipped entirely with no display to write to.
+/// 2. **tmux's own paste buffer**, whenever `$TMUX` says there is one. This is
+///    what a tmux user means by copy, and it holds regardless of what the
+///    outer terminal did with any escape. `load-buffer -w` also has tmux push
+///    the buffer outward with an OSC 52 of its own, which is the one route
+///    that survives tmux's default settings.
+/// 3. **The clipboard escape**, framed for the multiplexer that has to carry
+///    it, skipped when the selection is over [`OSC52_MAX_TEXT`].
+///
+/// Returns the notice worth putting on screen, or `None` when the copy was
+/// unremarkable. An error means nothing at all accepted the text.
+pub(super) fn copy_to_clipboard(text: &str) -> Result<Option<String>> {
+    copy_with_env(text, CopyEnv::detect())
+}
+
+/// [`copy_to_clipboard`] with the environment passed in, so the ordering is
+/// reachable from a test.
+fn copy_with_env(text: &str, env: CopyEnv) -> Result<Option<String>> {
+    let mut landed: Vec<&'static str> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    let mut record = |result: Result<()>, label: &'static str| match result {
+        Ok(()) => landed.push(label),
+        Err(err) => failures.push(format!("{err:#}")),
+    };
+
+    let native = env.native_worth_trying();
+    if native && !env.prefer_escape() {
+        record(copy_via_native(text), "the system clipboard");
+    }
+
+    if env.tmux {
+        record(copy_via_tmux_buffer(text), "tmux's paste buffer");
+    }
+
+    let escape = clipboard_escape(text, env);
+    let oversize = escape.is_none();
+    if let Some(sequence) = escape {
+        record(write_escape(&sequence), "the terminal (OSC 52)");
+    }
+
+    if native && env.prefer_escape() {
+        record(copy_via_native(text), "this host's clipboard");
+    }
+
+    if landed.is_empty() {
+        let detail = if failures.is_empty() {
+            "no clipboard channel is available here".to_string()
+        } else {
+            failures.join("; ")
+        };
+        if oversize {
+            anyhow::bail!(
+                "selection is {} bytes, past the {OSC52_MAX_TEXT}-byte cap on the clipboard \
+                 escape, and nothing else took it: {detail}",
+                text.len()
+            );
+        }
+        anyhow::bail!("could not copy: {detail}");
+    }
+
+    if oversize {
+        return Ok(Some(format!(
+            "selection is {} bytes, past the {OSC52_MAX_TEXT}-byte cap on the clipboard escape. \
+             It went to {}, but the terminal's own clipboard was left alone.",
+            text.len(),
+            landed.join(" and ")
+        )));
+    }
+    Ok(None)
+}
+
+/// Frame the OSC 52 clipboard escape for `text` the way this terminal stack
+/// needs it, or `None` when the selection is too big to send honestly.
+///
+/// Pure, and separate from the write, because everything interesting about
+/// this code is in the bytes: a terminal is not something a test can hold.
+fn clipboard_escape(text: &str, env: CopyEnv) -> Option<String> {
+    if text.len() > OSC52_MAX_TEXT {
+        return None;
+    }
+    let sequence = osc52(text);
+    Some(if env.tmux {
+        wrap_tmux(&sequence)
+    } else if env.screen {
+        wrap_screen(&sequence)
+    } else {
+        sequence
+    })
+}
+
+/// `ESC ] 52 ; c ; <base64> BEL`. The `c` selects the clipboard (as against
+/// the primary selection), and the payload is base64 so it can carry newlines
+/// and anything else a transcript row holds without terminating the sequence
+/// early.
+///
+/// BEL rather than the equally legal `ESC \` terminator, because of what
+/// [`wrap_tmux`] then has to do to this string: BEL leaves exactly one ESC in
+/// the whole sequence, so the doubling rule has one place to apply instead of
+/// two, and the tmux form ends `…BEL ESC \` instead of a run of three escapes
+/// whose reading depends on where the wrapper stops. Every implementation that
+/// wraps for tmux uses BEL for this reason.
+fn osc52(text: &str) -> String {
     use base64::Engine;
-    use std::io::Write;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+/// tmux's DCS passthrough: `ESC P tmux ; <payload> ESC \`, with every ESC in
+/// the payload doubled.
+///
+/// The doubling is not decoration. tmux scans the passthrough body for the
+/// string terminator, so an undoubled ESC inside it ends the sequence there
+/// and the rest of the base64 is printed into the pane as text. Doubling makes
+/// tmux emit one ESC per pair and keeps looking for the real terminator.
+///
+/// Worth knowing where this does and does not help. tmux has two independent
+/// doors to the outer terminal's clipboard and ships with both of them shut:
+/// `allow-passthrough` (off by default since 3.3a) is what carries this
+/// sequence, and `set-clipboard` (`external` by default, which means "ignore
+/// what applications send me") is what would carry a bare, unwrapped OSC 52.
+/// So neither escape works on a stock install, which is the whole reported
+/// bug. This one is still sent because it costs nothing and it is the entire
+/// answer for anyone who has turned the option on; [`copy_via_tmux_buffer`] is
+/// what carries the copy for everyone else, through a third door that is open
+/// by default.
+fn wrap_tmux(payload: &str) -> String {
+    let mut out = String::with_capacity(payload.len() + 16);
+    out.push_str("\x1bPtmux;");
+    for ch in payload.chars() {
+        if ch == '\x1b' {
+            out.push('\x1b');
+        }
+        out.push(ch);
+    }
+    out.push_str("\x1b\\");
+    out
+}
+
+/// GNU screen's DCS wrapper, in pieces screen will not truncate.
+///
+/// screen passes the body of a string sequence (`ESC P … ESC \`) through to
+/// the terminal it is attached to, unaltered and with no doubling rule of its
+/// own, but it drops whatever runs past [`SCREEN_CHUNK`], and a base64'd
+/// selection passes that in a couple of lines. Splitting the escape across
+/// consecutive string sequences works because the outer terminal sees the
+/// concatenated bodies as one stream: the same bytes, delivered in
+/// instalments.
+///
+/// A chunk never ends on a lone ESC. Splitting an escape from the byte it
+/// introduces would hand the outer terminal an introducer with no argument
+/// followed by an argument with no introducer.
+fn wrap_screen(payload: &str) -> String {
+    let mut out = String::with_capacity(payload.len() + payload.len() / SCREEN_CHUNK * 4 + 8);
+    let mut chunk = String::with_capacity(SCREEN_CHUNK);
+    for ch in payload.chars() {
+        if chunk.len() + ch.len_utf8() > SCREEN_CHUNK && !chunk.ends_with('\x1b') {
+            out.push_str("\x1bP");
+            out.push_str(&chunk);
+            out.push_str("\x1b\\");
+            chunk.clear();
+        }
+        chunk.push(ch);
+    }
+    if !chunk.is_empty() {
+        out.push_str("\x1bP");
+        out.push_str(&chunk);
+        out.push_str("\x1b\\");
+    }
+    out
+}
+
+/// Load `text` into tmux's paste buffer, which is what `prefix ]` pastes.
+///
+/// `-w` (tmux 3.2 and later) additionally has tmux set the outer terminal's
+/// clipboard with an OSC 52 of its own. That flag is the practical answer to
+/// the whole problem: tmux's default `set-clipboard external` ignores an
+/// application's OSC 52 outright, and its DCS passthrough is off by default,
+/// so a sequence Wizard writes itself is discarded on a stock install, while
+/// one tmux emits on its own behalf is not. Older tmux rejects the flag (it
+/// arrived in 3.2) and exits nonzero straight away rather than hanging, so the
+/// retry without it costs one failed spawn and still fills the paste buffer.
+///
+/// Runs on the event loop, like every other leg of a copy, which is fine
+/// because tmux drains its stdin as fast as it is written and answers in
+/// milliseconds. A tmux server wedged badly enough to stop reading would stall
+/// the frame instead, at the pipe buffer.
+fn copy_via_tmux_buffer(text: &str) -> Result<()> {
+    if pipe_to("tmux", &["load-buffer", "-w", "-"], text.as_bytes()).is_ok() {
+        return Ok(());
+    }
+    pipe_to("tmux", &["load-buffer", "-"], text.as_bytes()).context("loading tmux's paste buffer")
+}
+
+/// Write a terminal escape where the terminal will actually read it.
+///
+/// stdout, because that is the handle the rest of this module drives: the
+/// ratatui backend, the alternate screen, the mouse capture and the keyboard
+/// flags all go through `std::io::stdout()`, so an escape sent anywhere else
+/// could reach a different device than the frame it belongs to. Under a
+/// multiplexer this is the pane's pty either way, and getting past the
+/// multiplexer is a framing problem rather than a file-descriptor one.
+///
+/// The tty is the fallback for the case where that reasoning breaks down,
+/// which is stdout redirected somewhere that is not a terminal at all. `$SSH_TTY`
+/// first because it names this session's pty outright, then `/dev/tty`, which
+/// needs a controlling terminal that a redirected process may not have.
+fn write_escape(sequence: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
     let mut stdout = std::io::stdout();
-    write!(stdout, "\x1b]52;c;{encoded}\x07").context("writing clipboard escape")?;
-    stdout.flush().context("flushing clipboard escape")?;
-    Ok(())
+    if stdout.is_terminal() {
+        stdout
+            .write_all(sequence.as_bytes())
+            .context("writing clipboard escape")?;
+        return stdout.flush().context("flushing clipboard escape");
+    }
+
+    let mut last: Option<anyhow::Error> = None;
+    for path in [std::env::var_os("SSH_TTY"), Some("/dev/tty".into())]
+        .into_iter()
+        .flatten()
+    {
+        match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(mut tty) => {
+                tty.write_all(sequence.as_bytes())
+                    .with_context(|| format!("writing clipboard escape to {:?}", path))?;
+                return tty
+                    .flush()
+                    .with_context(|| format!("flushing clipboard escape to {:?}", path));
+            }
+            Err(err) => {
+                last = Some(anyhow::Error::new(err).context(format!("opening {:?}", path)));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        anyhow::anyhow!("stdout is not a terminal and no tty is available for the clipboard escape")
+    }))
 }
 
 /// Pipe `text` into the first available OS clipboard writer.
@@ -540,5 +885,215 @@ mod tests {
         assert_eq!(program, crate::platform::shell::name());
         assert_eq!(args.len(), 2, "expected <flag> <line>, got {args:?}");
         assert_eq!(args[1], "code --wait \"/some/draft.md\"");
+    }
+
+    /// A plain terminal takes the sequence as it stands.
+    const PLAIN: CopyEnv = CopyEnv {
+        tmux: false,
+        screen: false,
+        ssh: false,
+        display: true,
+    };
+
+    #[test]
+    fn a_plain_terminal_gets_the_bare_osc_52_escape() {
+        let escape = clipboard_escape("hi", PLAIN).expect("a two-byte selection fits");
+        // `aGk=` is base64("hi"); `c` is the clipboard selection, and BEL ends
+        // the sequence.
+        assert_eq!(escape, "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn the_payload_is_base64_so_newlines_cannot_end_the_sequence_early() {
+        // A transcript selection is multi-line by definition, and a raw
+        // payload would end at the first control byte in it.
+        let escape = clipboard_escape("one\ntwo", PLAIN).expect("fits");
+        assert_eq!(escape, "\x1b]52;c;b25lCnR3bw==\x07");
+        assert_eq!(
+            escape.matches('\x07').count(),
+            1,
+            "exactly one terminator: {escape:?}"
+        );
+    }
+
+    #[test]
+    fn under_tmux_the_escape_is_wrapped_in_the_dcs_passthrough() {
+        let env = CopyEnv {
+            tmux: true,
+            ..PLAIN
+        };
+        let escape = clipboard_escape("hi", env).expect("fits");
+        assert_eq!(escape, "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
+    }
+
+    #[test]
+    fn tmux_passthrough_doubles_every_escape_in_the_payload() {
+        // The one that bites: tmux reads the passthrough body looking for the
+        // string terminator, so a single ESC inside it ends the sequence there
+        // and the rest of the base64 is printed into the pane as text. This is
+        // asserted on a payload with several escapes, not on the one the OSC
+        // 52 builder happens to produce, so the rule stays the rule.
+        let wrapped = wrap_tmux("a\x1bb\x1b\x1bc");
+        assert_eq!(wrapped, "\x1bPtmux;a\x1b\x1bb\x1b\x1b\x1b\x1bc\x1b\\");
+        assert!(wrapped.starts_with("\x1bPtmux;"));
+        assert!(wrapped.ends_with("\x1b\\"));
+
+        // Every ESC between the introducer and the terminator is part of a
+        // pair.
+        let body = &wrapped["\x1bPtmux;".len()..wrapped.len() - 2];
+        assert_eq!(body.matches('\x1b').count() % 2, 0, "body: {body:?}");
+    }
+
+    #[test]
+    fn under_screen_the_escape_is_split_into_sequences_screen_will_not_truncate() {
+        // Long enough to need several chunks: screen drops whatever runs past
+        // its string-sequence limit, so one long sequence loses the tail of
+        // the payload and pastes garbage.
+        let text = "x".repeat(4_000);
+        let env = CopyEnv {
+            screen: true,
+            ..PLAIN
+        };
+        let escape = clipboard_escape(&text, env).expect("fits under the cap");
+
+        let chunks: Vec<&str> = escape
+            .split("\x1b\\")
+            .filter(|part| !part.is_empty())
+            .collect();
+        assert!(
+            chunks.len() > 1,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(chunk.starts_with("\x1bP"), "chunk without a DCS introducer");
+            // The introducer and the terminator count against screen's buffer
+            // too, so what has to fit is the whole string sequence, not its
+            // body. 256 is the oldest MAXSTR any screen shipped with.
+            assert!(
+                chunk.len() + "\x1b\\".len() <= 256,
+                "string sequence of {} bytes is past the oldest screen's MAXSTR",
+                chunk.len() + 2
+            );
+        }
+
+        // Concatenating the bodies has to reproduce the escape exactly: the
+        // point of chunking is that the outer terminal sees one stream.
+        let rebuilt: String = chunks.iter().map(|chunk| &chunk[2..]).collect();
+        assert_eq!(rebuilt, osc52(&text));
+    }
+
+    #[test]
+    fn a_screen_chunk_never_ends_on_a_lone_escape() {
+        // Splitting an ESC from the byte it introduces hands the outer
+        // terminal an introducer with no argument followed by an argument with
+        // no introducer. Forced here by a payload that is all escapes, so a
+        // boundary lands on one no matter where it falls.
+        let wrapped = wrap_screen(&"\x1b".repeat(SCREEN_CHUNK * 3));
+        for chunk in wrapped.split("\x1b\\").filter(|part| !part.is_empty()) {
+            let body = &chunk[2..];
+            assert!(!body.is_empty(), "an empty chunk carries nothing");
+        }
+        let rebuilt: String = wrapped
+            .split("\x1b\\")
+            .filter(|part| !part.is_empty())
+            .map(|chunk| &chunk[2..])
+            .collect();
+        assert_eq!(rebuilt, "\x1b".repeat(SCREEN_CHUNK * 3));
+    }
+
+    #[test]
+    fn an_oversize_selection_gets_no_escape_rather_than_a_truncated_one() {
+        // Terminals drop an oversized OSC 52 in silence, so sending one is a
+        // copy that reports success and pastes nothing. `None` here is what
+        // makes `copy_with_env` say so out loud.
+        assert!(clipboard_escape(&"x".repeat(OSC52_MAX_TEXT), PLAIN).is_some());
+        assert!(clipboard_escape(&"x".repeat(OSC52_MAX_TEXT + 1), PLAIN).is_none());
+        // And the decision is on the text, not on the framing: the same
+        // selection is over the cap under every multiplexer.
+        for env in [
+            CopyEnv {
+                tmux: true,
+                ..PLAIN
+            },
+            CopyEnv {
+                screen: true,
+                ..PLAIN
+            },
+        ] {
+            assert!(clipboard_escape(&"x".repeat(OSC52_MAX_TEXT + 1), env).is_none());
+        }
+    }
+
+    #[test]
+    fn ssh_and_tmux_put_the_escape_ahead_of_the_native_clipboard_tools() {
+        // The bug this ordering exists for: `xclip` on the far end of an SSH
+        // session writes the *server's* clipboard, which nobody can see, and
+        // exits zero doing it. Running it first means every copy over SSH
+        // reports success and changes nothing the user can paste.
+        assert!(CopyEnv { ssh: true, ..PLAIN }.prefer_escape());
+        assert!(
+            CopyEnv {
+                tmux: true,
+                ..PLAIN
+            }
+            .prefer_escape()
+        );
+        assert!(
+            !PLAIN.prefer_escape(),
+            "a local session should still lead with the native tool"
+        );
+    }
+
+    #[test]
+    fn the_native_tools_are_skipped_only_when_there_is_no_display_to_write_to() {
+        // Five process spawns per drag, every one of them certain to fail, is
+        // what a headless server used to pay before the escape got its turn.
+        assert!(
+            !CopyEnv {
+                ssh: true,
+                display: false,
+                ..PLAIN
+            }
+            .native_worth_trying()
+        );
+        // A forwarded X11 session is remote and still has somewhere to write.
+        assert!(
+            CopyEnv {
+                ssh: true,
+                display: true,
+                ..PLAIN
+            }
+            .native_worth_trying()
+        );
+        // Local sessions always try, display or not: macOS sets no $DISPLAY
+        // and `pbcopy` works fine there.
+        assert!(
+            CopyEnv {
+                ssh: false,
+                display: false,
+                ..PLAIN
+            }
+            .native_worth_trying()
+        );
+    }
+
+    #[test]
+    fn tmux_is_not_mistaken_for_screen_by_the_term_string_it_sets() {
+        // tmux ships `TERM=screen-256color` on plenty of installs, so reading
+        // $TERM first says "screen" inside tmux and frames every escape with
+        // the wrong wrapper.
+        let inside_tmux = CopyEnv::from_parts(true, false, "screen-256color", true, false);
+        assert!(inside_tmux.tmux);
+        assert!(!inside_tmux.screen);
+
+        let inside_screen = CopyEnv::from_parts(false, true, "screen.xterm-256color", false, true);
+        assert!(inside_screen.screen);
+        assert!(!inside_screen.tmux);
+
+        // $STY is the reliable marker, but a screen session that lost it is
+        // still recognisable from $TERM.
+        assert!(CopyEnv::from_parts(false, false, "screen", false, false).screen);
+        assert!(!CopyEnv::from_parts(false, false, "xterm-256color", false, false).screen);
     }
 }

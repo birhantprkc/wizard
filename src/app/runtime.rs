@@ -664,12 +664,22 @@ pub async fn run_tui(mut config: Config, cli: Cli) -> Result<i32> {
                             app.selection = None;
                         } else if text.is_empty() {
                             app.selection = None;
-                        } else if let Err(err) = copy_to_clipboard(&text) {
-                            app.notice(format!("could not copy selection: {err:#}"));
+                        } else {
+                            match copy_to_clipboard(&text) {
+                                // A copy that could not take every route it
+                                // wanted still says so: the one thing worse
+                                // than a failed copy is a successful-looking
+                                // one that pastes nothing.
+                                Ok(Some(notice)) => app.notice(notice),
+                                Ok(None) => {}
+                                Err(err) => {
+                                    app.notice(format!("could not copy selection: {err:#}"));
+                                }
+                            }
                         }
-                        // Success is silent: the persistent highlight is the
-                        // feedback, and an unchanged transcript keeps the
-                        // highlight aligned with the selected rows.
+                        // An ordinary copy is silent: the persistent highlight
+                        // is the feedback, and an unchanged transcript keeps
+                        // the highlight aligned with the selected rows.
                     }
                 }
             }
