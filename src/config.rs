@@ -934,6 +934,30 @@ pub struct Config {
     pub retry_max_secs: u64,
     /// Pause between continuous cycles (0 = none).
     pub cycle_pause_secs: u64,
+    /// Quality gates: commands that must exit zero before a sovereign or
+    /// continuous run is allowed to finish (see [`crate::gates`] and
+    /// `docs/modes.md`). Merged with `--gate` flags and the project's own
+    /// `.wizard/gates.toml`; never applied in genie mode.
+    ///
+    /// Here as well as on the command line because a gate is a standing rule,
+    /// not a per-invocation one. A user who has to remember `--gate 'cargo
+    /// test'` on every run is a user whose unattended runs are ungated on the
+    /// day it matters.
+    #[serde(default)]
+    pub gates: Vec<String>,
+    /// How many consecutive gate checks may fail before the run gives up and
+    /// reports the gates as failing. `0` is unlimited, leaving only
+    /// `--max-hours` and `.wizard/loop-control` to end it.
+    ///
+    /// The bound exists because a model that cannot fix the problem does not
+    /// stop trying: it says "fixed it" again, the workspace has not changed,
+    /// and the loop would hand it the same failure forever. Consecutive, so a
+    /// run that gets the gates green and later breaks them starts over.
+    pub gate_max_attempts: u32,
+    /// Wall clock for a single gate command, also clamped to the run's own
+    /// `--max-hours`. A gate that hangs must not be the thing that outlives
+    /// the deadline the whole run is being judged against.
+    pub gate_timeout_secs: u64,
     /// When the provider's context window is unknown and the serialized chat
     /// history exceeds this many bytes, compact older messages into a summary.
     /// With a known window, the reported prompt size governs instead.
@@ -1011,6 +1035,9 @@ impl Default for Config {
             retry_base_secs: 5,
             retry_max_secs: 300,
             cycle_pause_secs: 0,
+            gates: Vec::new(),
+            gate_max_attempts: 3,
+            gate_timeout_secs: 1_800,
             compact_threshold_bytes: 48_000,
             providers: Vec::new(),
             active_provider: None,
@@ -1523,6 +1550,10 @@ mod tests {
         assert_eq!(config.retry_base_secs, 5);
         assert_eq!(config.retry_max_secs, 300);
         assert_eq!(config.cycle_pause_secs, 0);
+        // No gate unless one is asked for: a gate runs commands unattended.
+        assert!(config.gates.is_empty());
+        assert_eq!(config.gate_max_attempts, 3);
+        assert_eq!(config.gate_timeout_secs, 1_800);
         assert_eq!(config.compact_threshold_bytes, 48_000);
         assert!(!config.rollback_failed_cycles);
         assert_eq!(config.max_consecutive_failures, 5);
@@ -1675,6 +1706,9 @@ mod tests {
             retry_base_secs: 10,
             retry_max_secs: 600,
             cycle_pause_secs: 30,
+            gates: vec!["cargo fmt --check".to_string(), "cargo test".to_string()],
+            gate_max_attempts: 4,
+            gate_timeout_secs: 600,
             compact_threshold_bytes: 96_000,
             providers: vec![ProviderConfig {
                 name: "openai".to_string(),
@@ -1756,6 +1790,9 @@ mod tests {
         assert_eq!(parsed.retry_base_secs, original.retry_base_secs);
         assert_eq!(parsed.retry_max_secs, original.retry_max_secs);
         assert_eq!(parsed.cycle_pause_secs, original.cycle_pause_secs);
+        assert_eq!(parsed.gates, original.gates);
+        assert_eq!(parsed.gate_max_attempts, original.gate_max_attempts);
+        assert_eq!(parsed.gate_timeout_secs, original.gate_timeout_secs);
         assert_eq!(
             parsed.compact_threshold_bytes,
             original.compact_threshold_bytes

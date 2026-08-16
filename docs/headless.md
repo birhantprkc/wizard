@@ -53,7 +53,7 @@ Other line types you may see: `thinking_delta`, `notice`, `error`, `stream_retry
 
 A hard error (config, provider unreachable) ends the process before the sink writes its summary, so a run that exits 1 emits **no** `done` line, no `json` object, and no text trailer. Read the exit code, not the last line.
 
-In both structured formats the spinner and decorative headers are suppressed and stdout is pure JSON. Failures a run survives arrive in-band — the `errors` array in the `json` summary, `{"type":"error"}` lines in `stream-json` — and tracing diagnostics go to the log file under `~/.wizard/logs/` (see [logging.md](logging.md)). Stderr carries exactly one thing: the `error: …` line a hard failure prints on its way to exit 1, which is the only diagnostic such a run produces. Do not discard it with `2>/dev/null`.
+In both structured formats the spinner and decorative headers are suppressed and stdout is pure JSON. Failures a run survives arrive in-band — the `errors` array in the `json` summary, `{"type":"error"}` lines in `stream-json` — and tracing diagnostics go to the log file under `~/.wizard/logs/` (see [logging.md](logging.md)). Stderr carries two things, both worth keeping: the `error: …` line a hard failure prints on its way to exit 1, and, when a quality gate is failing at the end of a run, the line naming it (the `json` summary object has no room for it and stdout stays pure JSON). Do not discard them with `2>/dev/null`.
 
 ## Exit codes
 
@@ -66,6 +66,7 @@ The process exit code encodes why the run ended:
 | 2 | step budget exhausted — only when a positive `max_steps` caps the turn |
 | 3 | circuit breaker |
 | 4 | `--max-hours` time limit |
+| 5 | a quality gate (`--gate`) was still failing when the run ended, whatever ended it (see [modes.md](modes.md#quality-gates)) |
 
 Exit 3 covers three breakers: a sovereign run's same call *faulting* identically 6 times in a row, any one tool failing 8 times in a row, and the provider breaker opening after 8 consecutive transient model-call failures. Only a fault — a tool that could not be run at all — reaches the first one; a tool that ran and reported a non-zero exit or a missing file is diagnostic signal and never trips it, and 3 identical repeats are the nudge to change approach rather than the trip. Exit 0 also covers a user interrupt, not only `.wizard/loop-control`.
 

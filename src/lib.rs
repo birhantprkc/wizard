@@ -20,6 +20,7 @@ pub mod doctor;
 pub mod event;
 pub mod evolve;
 pub mod fleet;
+pub mod gates;
 pub mod gateway;
 pub mod git_util;
 pub mod graph;

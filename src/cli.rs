@@ -72,6 +72,16 @@ pub struct Cli {
     #[arg(long = "loop", value_name = "N")]
     pub loop_limit: Option<u32>,
 
+    /// Quality gate: a command that must exit zero before a sovereign or
+    /// continuous run is allowed to finish. Repeatable; every gate must pass.
+    /// A failing gate is fed back to the model as another turn instead of
+    /// being accepted, and a run that ends with one still failing exits 5
+    /// however it ended. Merged with the `gates` config key and the project's
+    /// own `.wizard/gates.toml`. Ignored in genie mode, where a human is
+    /// watching. See `docs/modes.md`.
+    #[arg(long = "gate", value_name = "COMMAND")]
+    pub gate: Vec<String>,
+
     /// Run sovereign mode perpetually: keep working toward the goal,
     /// self-directing and self-improving, until stopped (loop-control
     /// `stop` or --max-hours). Implies --mode sovereign.
@@ -160,6 +170,9 @@ impl Cli {
         }
         if self.loop_limit.is_some() {
             ignored.push("--loop");
+        }
+        if !self.gate.is_empty() {
+            ignored.push("--gate");
         }
         if self.continuous {
             ignored.push("--continuous");
@@ -819,6 +832,7 @@ mod tests {
         assert!(!cli.plan);
         assert_eq!(cli.max_hours, None);
         assert_eq!(cli.loop_limit, None);
+        assert!(cli.gate.is_empty());
         assert!(!cli.continuous);
         assert_eq!(cli.output_format, crate::output::OutputFormat::Text);
         assert_eq!(cli.cwd, None);
@@ -889,6 +903,23 @@ mod tests {
         }
         let cli = parse(&["--max-hours=1.5"]).expect("a real limit still parses");
         assert_eq!(cli.max_hours, Some(1.5));
+    }
+
+    /// `--gate` accumulates, and keeps whole command lines intact.
+    ///
+    /// The two ways to get this wrong are both silent: a non-repeatable flag
+    /// would keep only the last gate, and a space-splitting one would turn
+    /// `cargo test --lib` into three gates, two of which cannot run. Either
+    /// way the run reports a clean pass on gates that never happened.
+    #[test]
+    fn the_gate_flag_repeats_and_keeps_its_command_line_whole() {
+        let cli = parse(&["--gate", "cargo fmt --check", "--gate", "cargo test --lib"])
+            .expect("repeated gates parse");
+        assert_eq!(cli.gate, vec!["cargo fmt --check", "cargo test --lib"]);
+        assert!(
+            cli.ignored_top_level_flags().contains(&"--gate"),
+            "a subcommand that cannot honour a gate must say so, not drop it"
+        );
     }
 
     #[test]

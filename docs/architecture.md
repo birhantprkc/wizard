@@ -90,6 +90,7 @@ Parses arguments and selects the surface:
 | `--evolve` / `--deep` | Self-extension mode |
 | `--publish` | Fork-and-distribute |
 | `--max-hours` / `--loop` | Sovereign run limits |
+| `--gate` | Quality gate: a command that must exit 0 before a sovereign/continuous run may finish (repeatable) |
 | `--cwd` | Project root override |
 | `--bg` | Internal (hidden): marks a headless run dispatched from `/dashboard` |
 | `--output-format text\|json\|stream-json` | Headless output |

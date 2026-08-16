@@ -62,6 +62,7 @@ Sovereign mode is the autonomous, proactive agent. It runs headless for a single
 |------|--------|
 | `--max-hours 2` | Time limit for the run |
 | `--loop 10` | Max outer loop iterations |
+| `--gate "cargo test"` | A command that must exit 0 before the run may finish. Repeatable. See [Quality gates](#quality-gates) |
 | `--continuous` | Run perpetually, never stopping at "done" (implies sovereign). See below |
 | `--cwd /path/to/repo` | Set project root |
 
@@ -91,6 +92,66 @@ wizard --mode sovereign \
   --max-hours 1 \
   --cwd ~/projects/myapp
 ```
+
+### Quality gates
+
+```bash
+wizard --mode sovereign --gate "cargo fmt --check" --gate "cargo test" -p "add rate limiting"
+```
+
+The circuit breakers and the step and time caps stop a *bad* run. Nothing there stops
+a run from declaring success without evidence: a model that writes a plausible patch,
+never runs the suite and says "done" ends with exit code 0. A gate is a command that
+must exit 0 before the run is allowed to finish. The model does not run it and cannot
+see it coming.
+
+When the model reports the task complete, every gate runs in order, in the project
+root, through the same shell as `execute`. All pass, and the run finishes. One fails,
+and its output is fed back as another turn: fix the cause, not the gate. Gates apply
+to sovereign and continuous runs. **Genie mode ignores them entirely**: a human is
+there to judge the result, and running the suite behind their back at the end of every
+turn would be a surprise, not a safeguard.
+
+Gates come from three places, merged in this order with blanks and duplicates dropped:
+the `gates` config key, the project's own `.wizard/gates.toml` (`gates = ["cargo test"]`),
+then `--gate` flags.
+
+**A failed gate is not re-run while the workspace is unchanged.** This is the detail
+that decides whether the feature helps or just burns the budget: a model that cannot
+fix the problem will keep saying "fixed it" without touching a file, and re-running a
+twenty-minute suite against identical inputs spends the whole run. So each failure is
+recorded against a fingerprint of the workspace, and if the fingerprint has not moved
+the model is told exactly that instead. "Changed" means: `HEAD`, `git status`, and the
+size plus modification time of every tracked and every untracked-but-not-ignored file
+(outside a git repo, a bounded walk of the tree skipping `target/`, `node_modules/`,
+`__pycache__` and friends). Ignored files are excluded deliberately, because a `cargo test`
+gate rewrites `target/` every time it runs, and counting build output as a change would
+make every re-check look like progress. Only *failures* are cached this way; a passing
+gate is always re-run, because a stale skip of a failure costs one turn while a stale
+skip of a pass would hand back exactly the unverified success gates exist to prevent.
+
+Reaching a limit is not success. The exit code says whether the work is verified:
+
+| Exit | Meaning |
+|------|---------|
+| `0` | The run finished and every gate passed (or none was configured) |
+| `5` | A gate was failing when the run ended, however it ended: attempts spent, `--max-hours`, or an operator stop |
+| `2` / `3` / `4` | The usual step-budget / breaker / time-limit codes, for runs that never reached a gate check |
+
+The failing gate is named on the last line of output (on stderr under
+`--output-format json`, whose stdout stays one summary object), so
+`wizard --gate "cargo test" -p "…" && deploy` refuses to deploy on a red suite. The
+`reason` field still reports why the *loop* stopped (`completed`, `time_limit`); whether
+the work is verified is the exit code's job.
+
+Remediation turns do not consume `--loop`, which is the budget for the work itself;
+they have their own bound, and they obey `--max-hours` like everything else.
+
+| Key (`~/.wizard/config.toml`) | Default | Effect |
+|-----|---------|--------|
+| `gates` | `[]` | Gate commands applied to every sovereign/continuous run |
+| `gate_max_attempts` | `3` | Consecutive failing gate checks before the run gives up and reports failure; `0` is unlimited |
+| `gate_timeout_secs` | `1800` | Wall clock for one gate, additionally clamped to what is left of `--max-hours` |
 
 ## Continuous mode (perpetual sovereign)
 

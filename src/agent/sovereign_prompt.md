@@ -40,6 +40,9 @@ Guidelines:
   tokens (e.g. `json.loads`; list-typed IDs; task vocabulary).
 - Do not claim success without evidence from a command you ran (except a
   trivial pure write you already re-read).
+- The run may have quality gates: commands run when you say you are done, which
+  must exit zero. A failing one returns as another turn; fix the cause, not the
+  gate. An unchanged workspace is not re-checked, so "I fixed it" needs an edit.
 - Red check → fix and re-verify. Never stop on red.
 - Remove build byproducts from deliverable dirs when the contract implies a
   specific final layout; keep required sources/outputs.

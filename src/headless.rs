@@ -621,6 +621,11 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
         .transpose()?
         .map(|budget| Instant::now() + budget);
     agent.set_deadline(deadline);
+    // Quality gates (`--gate`, the `gates` config key, the project's
+    // `.wizard/gates.toml`). `None` when none are configured, which is the
+    // default and must cost nothing. See [`crate::gates`] for why a run that
+    // finishes is not the same thing as a run that succeeded.
+    let mut gates = crate::gates::Gates::for_run(&config, &cli, &project_root);
     // `--plan` / `plan_first = true`: the first turn starts in plan mode.
     // The model investigates read-only, presents a plan via exit_plan, the
     // printer below auto-approves it, and the same turn proceeds to execute
@@ -721,6 +726,17 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
             "wizard {} — model {model} @ {endpoint} — task: {goal}",
             config.mode
         ));
+        if let Some(gates) = gates.as_ref() {
+            crate::output::print_line(&format!(
+                "gates (all must exit 0 before this run may finish): {}",
+                gates
+                    .commands()
+                    .iter()
+                    .map(|command| format!("`{command}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
 
     // session_start hooks fire once for the whole run.
@@ -759,6 +775,14 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // re-exec into the freshly built/extended binary.
     let mut reexec_after = false;
     let mut iteration: u32 = 0;
+    // Iterations spent fixing a failing gate rather than advancing the task.
+    // They extend the `--loop` bound instead of consuming it: `--loop` is the
+    // budget for the *work*, and its default of 1 would otherwise mean a gate
+    // could report a failure and never be given a turn to have it fixed, which
+    // is a gate that does nothing but slow the run down. The remediation turns
+    // have their own bound (`gate_max_attempts`) and the same wall clock as
+    // everything else.
+    let mut gate_iterations: u32 = 0;
     // Cycles that ended in a hard error or a tripped breaker since the last
     // one that landed. Mirrored into the mission so it is visible from outside
     // the process; the local copy is what the bound is checked against.
@@ -771,7 +795,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
 
     loop {
         iteration += 1;
-        if !config.continuous && iteration > max_iterations {
+        if !config.continuous && iteration > max_iterations.saturating_add(gate_iterations) {
             break;
         }
 
@@ -896,27 +920,64 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                         input = CONTINUE_AFTER_MAX_STEPS.to_string();
                     }
                     DoneReason::Completed => {
-                        if config.continuous {
-                            // Never idle: record the cycle and self-direct the
-                            // next most valuable action toward the mission.
-                            failure_streak = 0;
-                            let cycles = match mission_state.as_mut() {
-                                Some(mission) => {
-                                    mission.record_cycle(Some(format!("cycle done: {reason:?}")));
-                                    mission.stamp(format!("cycle {iteration}: completed"));
-                                    persist(mission, &project_root);
-                                    mission.cycles
+                        // "Done" is a claim, not evidence. With gates
+                        // configured, the claim has to survive them before the
+                        // loop is allowed to act on it, in continuous mode
+                        // too, where acting on it means recording a completed
+                        // cycle and moving the mission on.
+                        let decision = match gates.as_mut() {
+                            Some(gates) => gates.check(deadline, &tx).await,
+                            None => crate::gates::GateDecision::Finish,
+                        };
+                        match decision {
+                            crate::gates::GateDecision::Retry(prompt) => {
+                                gate_iterations = gate_iterations.saturating_add(1);
+                                stamp(
+                                    mission_state.as_mut(),
+                                    &project_root,
+                                    format!("cycle {iteration}: a quality gate failed"),
+                                );
+                                input = prompt;
+                            }
+                            crate::gates::GateDecision::GiveUp => {
+                                // The gates are still failing and there is no
+                                // budget left to fix them. Reaching a limit is
+                                // not success: the reported reason stays the
+                                // truthful one and the exit code comes from
+                                // the gate verdict (see `gates::exit_code`).
+                                if deadline_passed(deadline, Instant::now()) {
+                                    final_reason = DoneReason::TimeLimit;
                                 }
-                                // Unreachable while `continuous` implies a
-                                // mission, but the count is cosmetic and a
-                                // missing mission must not leave `input`
-                                // unchanged — that would re-issue the original
-                                // goal verbatim, forever.
-                                None => u64::from(iteration),
-                            };
-                            input = continuation_prompt(&goal, cycles);
-                        } else {
-                            break;
+                                break;
+                            }
+                            crate::gates::GateDecision::Finish => {
+                                if config.continuous {
+                                    // Never idle: record the cycle and
+                                    // self-direct the next most valuable
+                                    // action toward the mission.
+                                    failure_streak = 0;
+                                    let cycles = match mission_state.as_mut() {
+                                        Some(mission) => {
+                                            mission.record_cycle(Some(format!(
+                                                "cycle done: {reason:?}"
+                                            )));
+                                            mission.stamp(format!("cycle {iteration}: completed"));
+                                            persist(mission, &project_root);
+                                            mission.cycles
+                                        }
+                                        // Unreachable while `continuous`
+                                        // implies a mission, but the count is
+                                        // cosmetic and a missing mission must
+                                        // not leave `input` unchanged — that
+                                        // would re-issue the original goal
+                                        // verbatim, forever.
+                                        None => u64::from(iteration),
+                                    };
+                                    input = continuation_prompt(&goal, cycles);
+                                } else {
+                                    break;
+                                }
+                            }
                         }
                     }
                     DoneReason::Stopped | DoneReason::TimeLimit => {
@@ -1113,6 +1174,20 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
         persist(mission, &project_root);
     }
 
+    // The gate verdict is the run's last word on whether the work is verified,
+    // and it has to be legible on every output format. The notice covers text
+    // and stream-json; the json sink keeps stdout to one summary object and
+    // drops notices, so its consumer gets the line on stderr next to the exit
+    // code it will actually branch on.
+    if let Some(gates) = gates.as_ref()
+        && let Some(summary) = gates.summary(final_reason)
+    {
+        let _ = tx.send(AgentEvent::Notice(summary.clone())).await;
+        if !text_mode {
+            crate::output::eprint_line(&format!("wizard: {summary}"));
+        }
+    }
+
     // session_end hooks fire however the run ended (including just before a
     // self-evolve re-exec replaces the process).
     agent.fire_session_end(Some(&tx)).await;
@@ -1194,7 +1269,10 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     if let Some(sink) = sink.as_mut() {
         sink.finish(final_reason);
     }
-    Ok(crate::output::exit_code(final_reason))
+    // Gates outrank the loop's own reason for stopping: a caller scripting
+    // `wizard … && deploy` is asking whether the work is verified, not why the
+    // loop exited.
+    Ok(crate::gates::exit_code(final_reason, gates.as_ref()))
 }
 
 #[cfg(test)]
@@ -1274,6 +1352,56 @@ mod tests {
             production.contains("agent.set_omakase("),
             "--omakase must reach the agent on this surface too, not just --plan"
         );
+    }
+
+    /// Quality gates reach the finish path, the loop bound, and the exit code.
+    ///
+    /// Grep, for the same reason as the omakase test above: the defect is an
+    /// *absent* call. A `Gates` that is built and never consulted is a run that
+    /// prints its gate list at startup, never runs a gate, and exits 0, which
+    /// is indistinguishable at runtime from a run whose gates all passed, and
+    /// is exactly the "finished but not verified" outcome the feature exists to
+    /// make impossible.
+    #[test]
+    fn the_headless_runner_actually_checks_its_gates() {
+        let source = include_str!("headless.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("this module ends with its test module");
+        assert!(
+            production.contains("Gates::for_run("),
+            "the run has to build its gate set"
+        );
+        assert!(
+            production.contains("gates.check(deadline, &tx)"),
+            "a built gate set that is never checked is worse than none"
+        );
+        assert!(
+            production.contains("crate::gates::exit_code(final_reason, gates.as_ref())"),
+            "a failing gate has to reach the process exit code"
+        );
+        assert!(
+            production.contains("max_iterations.saturating_add(gate_iterations)"),
+            "gate remediation must not be capped by the default --loop of 1"
+        );
+    }
+
+    /// A run with no gates configured exits exactly as it always did.
+    #[test]
+    fn a_run_without_gates_keeps_the_exit_codes_it_always_had() {
+        for reason in [
+            DoneReason::Completed,
+            DoneReason::MaxSteps,
+            DoneReason::TimeLimit,
+            DoneReason::Stopped,
+            DoneReason::CircuitBreaker,
+        ] {
+            assert_eq!(
+                crate::gates::exit_code(reason, None),
+                crate::output::exit_code(reason),
+                "{reason:?} must not change for the runs that configured no gate"
+            );
+        }
     }
 
     #[test]
