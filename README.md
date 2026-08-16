@@ -86,7 +86,7 @@ Everything is indexed in **[docs/README.md](docs/README.md)**, grouped by what y
 - [Architecture](docs/architecture.md): how it's built
 - [Security](SECURITY.md): threat model
 - [WIZARD.md](WIZARD.md): the agent's bundled behavioral charter, inherited and editable by every fork
-- [CHANGELOG.md](CHANGELOG.md): what changed in 2.0, what breaks coming from 1.x, and what to do about each break
+- [CHANGELOG.md](CHANGELOG.md): what changed in 2.1, what breaks coming from 1.x, and what to do about each break
 
 ## Development
 
