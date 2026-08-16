@@ -550,10 +550,22 @@ fn spill_and_frame(text: &str, max_bytes: usize) -> Option<String> {
 /// narrower command", and a model that follows that instruction redoes the work
 /// that produced the output. This says the work is already on disk and the
 /// recovery is a read, so the cheaper move is also the obvious one.
+///
+/// It says *result* rather than *output* on purpose, and the difference is not
+/// pedantry. The file holds everything the tool handed back, which is not
+/// always everything the underlying command produced: `execute` bounds its own
+/// capture at [`shell::CAPTURE_HEAD_BYTES`] + [`shell::CAPTURE_TAIL_BYTES`]
+/// while the child is still running, so a command that outruns 2 MiB reaches
+/// this function already missing its middle. Saying "full output" there sends
+/// the model looking for lines that were never captured — observed costing a
+/// run half a minute of reconciling a line count against the script that
+/// printed it. The bytes the capture dropped are marked in the middle of the
+/// file by [`shell::CappedBuffer::into_string`], so the text stays honest to
+/// anyone who reads it; this notice just no longer promises otherwise.
 fn spill_notice(omitted: usize, location: &str) -> String {
     format!(
-        "(Omitted {omitted} bytes. Full output at {location}. Use read_file on that path with \
-         start_line/end_line, or search_files with that path to search within it.)"
+        "(Omitted {omitted} bytes here. The tool's full result is at {location}. Use read_file on \
+         that path with start_line/end_line, or search_files with that path to search within it.)"
     )
 }
 
@@ -734,7 +746,7 @@ mod tests {
         assert!(out.starts_with("HEAD"), "head kept: {}", &out[..16]);
         assert!(out.contains("TAIL"), "tail kept");
         assert!(
-            out.contains("Full output at "),
+            out.contains("full result is at "),
             "points somewhere: {out:.400}"
         );
         let spilled = only_spill_file(&dir);
@@ -875,7 +887,7 @@ mod tests {
             out.content.len()
         );
         assert!(
-            !out.content.contains("Full output at"),
+            !out.content.contains("full result is at"),
             "no spill pointer in a read result"
         );
         assert!(
