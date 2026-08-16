@@ -160,6 +160,7 @@ pub fn exec_replace(binary: &std::path::Path) -> Result<std::convert::Infallible
         // failure: a binary that is not executable, the wrong architecture, a
         // missing interpreter.
         let err = std::process::Command::new(binary).exec();
+        restore_sigpipe_ignore();
         Err(anyhow::Error::new(err)
             .context(format!("failed to exec-replace with {}", binary.display())))
     }
@@ -169,6 +170,36 @@ pub fn exec_replace(binary: &std::path::Path) -> Result<std::convert::Infallible
             "exec-replace is only supported on Unix; the new binary is staged at {}",
             binary.display()
         )
+    }
+}
+
+/// Put `SIGPIPE` back to `SIG_IGN` after an exec that did not happen.
+///
+/// [`exec_replace`] does not fork. The standard library ignores `SIGPIPE` at
+/// startup, and then restores the default disposition immediately before
+/// `execvp` so the new program does not inherit that oddity. For `spawn` that
+/// restore happens in the forked child and nothing here notices; for `exec`
+/// there is no child, so it happens in *this* process. On success the image is
+/// gone and it is exactly right. On failure the call returns, and without this
+/// the process keeps running with `SIGPIPE` defaulted.
+///
+/// The consequence is not theoretical and not confined to the failure being
+/// reported. From that point on, any write to a pipe whose reader has gone
+/// kills the process outright instead of returning `EPIPE` — the behaviour
+/// [`crate::output`] relies on to survive `wizard ... | head`. It reached CI
+/// as a suite that died mid-run with signal 13, in a different place each
+/// time, because which test wrote to a closed pipe first depends on how the
+/// harness scheduled them.
+///
+/// Deep evolve is the caller that matters: it exec-replaces into a newly built
+/// binary, and the whole point of the error path is that a failed swap leaves
+/// a *working* agent behind.
+#[cfg(unix)]
+fn restore_sigpipe_ignore() {
+    // SAFETY: `signal` with `SIG_IGN` installs no handler, so there is no
+    // async-signal-safety obligation on a callback, and it borrows nothing.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 
@@ -323,6 +354,32 @@ mod tests {
         assert!(
             format!("{err:#}").contains(&absent.display().to_string()),
             "got: {err:#}"
+        );
+    }
+
+    /// The failure path must not leave the process a different one than it
+    /// found. `exec` resets `SIGPIPE` to the default in this very process
+    /// before `execvp`, and when the exec does not happen that reset stands:
+    /// the next write to a closed pipe kills a process that was supposed to
+    /// get `EPIPE`. This ran as a suite dying with signal 13 somewhere else
+    /// entirely, so the assertion belongs next to the call that caused it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exec_leaves_sigpipe_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("never-built");
+        exec_replace(&absent).expect_err("a missing binary cannot be exec'd");
+
+        // Read the disposition without disturbing it: a null `act` queries.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null action pointer only reads, and `current` is a valid
+        // writable `sigaction` for the duration of the call.
+        let rc = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut current) };
+        assert_eq!(rc, 0, "querying the SIGPIPE disposition failed");
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "a failed exec left SIGPIPE defaulted, so a closed pipe now kills the process"
         );
     }
 
