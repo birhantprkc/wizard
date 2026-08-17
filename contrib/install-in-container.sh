@@ -39,24 +39,41 @@ die() {
 # under test), and nixos/nix has no awk or sed. Installing them here keeps a
 # failure below attributable to install.sh rather than to the image.
 #
+# A signature checker is on the list for the same reason. install.sh verifies
+# checksums.txt against its minisign signature before it unpacks anything and
+# refuses when it can find nothing to verify with, so an image carrying neither
+# minisign nor an openssl that does ed25519 and blake2b cannot reach a single
+# branch this harness exists to exercise: it dies at the signature, one line
+# into the download. That is install.sh being right, and it tests nothing.
+#
+# Which of the two goes in is per-manager on purpose, so the matrix covers both
+# of install.sh's paths rather than one of them four times: minisign where it
+# packages cleanly (alpine, nix), and openssl on debian/ubuntu, where it drives
+# the fallback that hosts without minisign take. openssl is named there even
+# though it is already present — ca-certificates depends on it, so those legs
+# were verifying through a package nothing asked for, and the day that
+# dependency goes they fail on a missing signature checker with nothing in the
+# diff to say why.
+#
 # The manager is discovered rather than passed in, so adding an image to the
 # CI matrix needs no edit here as long as it uses one of these three.
 if command -v apk >/dev/null 2>&1; then
     log "alpine: installing prerequisites with apk"
-    apk add --no-cache bash curl ca-certificates tar findutils grep >/dev/null
+    apk add --no-cache bash curl ca-certificates tar findutils grep minisign >/dev/null
 elif command -v apt-get >/dev/null 2>&1; then
     log "debian/ubuntu: installing prerequisites with apt-get"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null
     apt-get install -y -qq --no-install-recommends \
-        bash curl ca-certificates tar findutils >/dev/null
+        bash curl ca-certificates tar findutils openssl >/dev/null
 elif command -v nix-env >/dev/null 2>&1; then
     # curl is listed even though the base image has one: `nix-env -i` rebuilds
     # the user environment from the packages it can enumerate, and the curl the
     # image ships comes in through nix's own closure rather than as a profile
     # element, so installing anything at all drops it off PATH.
     log "nix: installing prerequisites with nix-env"
-    nix-env -iA nixpkgs.gawk nixpkgs.gnused nixpkgs.curl nixpkgs.cacert >/dev/null 2>&1 \
+    nix-env -iA nixpkgs.gawk nixpkgs.gnused nixpkgs.curl nixpkgs.cacert \
+        nixpkgs.minisign >/dev/null 2>&1 \
         || die "nix-env could not install the prerequisites"
 else
     die "no supported package manager (apk / apt-get / nix-env) in this image"

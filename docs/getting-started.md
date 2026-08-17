@@ -1,6 +1,6 @@
 # Getting started
 
-Wizard installs from one command and launches as a terminal UI agent. (In v2.0.0 that command has to build from source — see [Install](#install) for why.) The default install puts down the binary and the [default loadout](loadout.md) (no model, no config); the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Cloudflare Workers AI, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
+Wizard installs from one command and launches as a terminal UI agent. The default install puts down the binary and the [default loadout](loadout.md) (no model, no config); the first `wizard` run opens [onboarding](#first-run) to pick a provider. Local is one pick: Wizard detects your hardware, downloads a fitting GGUF, and sets up [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` itself (or reuses an existing Ollama install), so no API key is needed. Or bring a key for any OpenAI-compatible endpoint (OpenAI, OpenRouter, Cloudflare Workers AI, Groq, vLLM, LM Studio, llama.cpp, Ollama), Anthropic, or xAI (API key or account sign-in). See [Using a cloud or remote provider](#using-a-cloud-or-remote-provider) and [Using Ollama instead](#using-ollama-instead).
 
 ## Install
 
@@ -53,11 +53,11 @@ The same script has four mutually exclusive flavors:
 | Termux (Android) | Supported via on-device **source build** into `$PREFIX/bin`. No matching prebuilt release (Bionic libc). The native GUI, stock llama.cpp Ubuntu assets, and the Ollama curl installer are skipped; use a cloud provider, or put a Termux-built `llama-server` on `PATH` |
 | Windows | Not supported natively; use WSL2 |
 
-The installer downloads the prebuilt binary matching your OS and architecture, verifies the release signature and the binary's checksum, and falls back to a source build when no prebuilt asset is available. On Termux it always builds from source, which is why Termux is the one platform the plain one-liner works on today: everywhere else the signing-key refusal above ends the run before the download, and therefore before that fallback is reachable at all.
+The installer downloads the prebuilt binary matching your OS and architecture, verifies the release signature and the binary's checksum, and falls back to a source build when no prebuilt asset is available. On Termux it always builds from source (no matching prebuilt). Everywhere else the one-liner installs a signed release binary.
 
 ### Termux (Android)
 
-Wizard runs as the TUI inside [Termux](https://termux.dev). There is no Android APK and no `aarch64-linux-android` release asset in any release; the phone compiles Wizard itself. This is the one platform where the install one-liner works as written today, because it forces the source build that the missing signing key makes mandatory everywhere else.
+Wizard runs as the TUI inside [Termux](https://termux.dev). There is no Android APK and no `aarch64-linux-android` release asset in any release; the phone compiles Wizard itself. The one-liner still works: Termux always takes the source-build path.
 
 ```bash
 pkg install rust git clang make pkg-config openssl curl

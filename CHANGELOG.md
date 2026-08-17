@@ -6,6 +6,10 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docs and CI catch up to signed releases.** v2.1.0 (and every tag since v2.0.0) ships a `checksums.txt.minisig` that verifies against `wizard-release.pub`, so the install-script legs on ubuntu and debian block on push again, and Getting started no longer says the one-liner has to build from source.
+
 ## [2.1.0] - 2026-08-16
 
 Oversized tool output goes to a file instead of being thrown away, a sovereign run can be made to prove it finished, code mode lets one Lua program stand in for a fixed sequence of calls, and copying text out over SSH works.

@@ -525,25 +525,18 @@ jobs:
         include:
           # The mainstream FHS path: /usr/local/bin, the gnu asset.
           #
-          # These two legs are the ones that normally block on push, and they
-          # are non-blocking for exactly as long as the newest published
-          # release predates release signing. install.sh now refuses a release
-          # whose checksums.txt carries no valid minisign signature, with no
-          # flag to skip it, and every release published so far carries none:
-          # the leg reports an accurate refusal against an asset set that
-          # cannot satisfy it. Nothing in the script can fix that, only cutting
-          # a signed release can.
-          #
-          # Remove `experimental: true` from both entries (and this paragraph)
-          # in the change that follows the first signed tag.
+          # These two legs block on push. They were non-blocking while the
+          # newest published release predated release signing, against which
+          # install.sh's mandatory signature check could only report an
+          # accurate refusal; v2.0.0 onwards are signed (current: v2.1.0), and
+          # both legs have verified a real signature and installed a working
+          # binary on every run since.
           - image: ubuntu:22.04
             flavor: default
-            experimental: true
           # Oldest glibc the release binaries claim to support, and the leg
           # that covers WIZARD_MINIMAL (binary, no loadout).
           - image: debian:oldstable
             flavor: minimal
-            experimental: true
           # musl. Marked non-blocking because it fails on a defect outside
           # this workflow, not on a flake: the published
           # wizard-x86_64-unknown-linux-musl asset is not static (it requests
