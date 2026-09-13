@@ -102,6 +102,12 @@ directory are taken; URLs, globs, `$VAR` paths, `..`, `~`, email addresses and v
 numbers like `3.11` are not. A real path it misses costs a vaguer line, which is much
 cheaper than a filename it made up sitting in front of the model every step.
 
+The deadline is also raced against the model stream now, not only checked between steps. A
+reply still streaming when the clock runs out is dropped, the tool calls in it never run,
+and the run ends with exit code 4. Before this, that reply ran to completion, every tool
+call it asked for was dispatched, and the clock was consulted on the way into the next
+step, which is minutes of work and writes to the workspace after the run was over.
+
 ### Example
 
 ```bash

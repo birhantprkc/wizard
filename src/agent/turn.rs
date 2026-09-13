@@ -286,7 +286,8 @@ pub(super) struct Policy {
     /// Last step number the loop will run (see
     /// [`StepBudget::last_step`](crate::config::StepBudget::last_step)).
     pub max_steps: u32,
-    /// Wall-clock cap, checked between steps.
+    /// Wall-clock cap, checked between steps and raced against the model
+    /// stream.
     pub deadline: Option<Instant>,
     /// The same cap as something to say: the per-step time note, when this run
     /// has a deadline. `None` leaves every request exactly as it was.
@@ -647,7 +648,7 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
             // Cancelled mid-stream: the partial completion is discarded (it
             // never entered history), so nothing dangles.
             Ok(retry::Climbed::Cancelled) => {
-                return Ok(Ran::ended(DoneReason::Stopped, steps_used, last_text));
+                return Ok(Ran::ended(cancelled_reason(policy), steps_used, last_text));
             }
             Ok(retry::Climbed::Done(streamed)) => streamed,
             // A reply cut off mid tool call: recover once rather than ending
@@ -664,7 +665,7 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
                 match recover_truncated(host, policy, sink, &truncated).await? {
                     Some(retried) => retried,
                     None => {
-                        return Ok(Ran::ended(DoneReason::Stopped, steps_used, last_text));
+                        return Ok(Ran::ended(cancelled_reason(policy), steps_used, last_text));
                     }
                 }
             }
@@ -681,7 +682,7 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
             match nudge_once(host, policy, sink).await? {
                 Some(retried) => retried,
                 None => {
-                    return Ok(Ran::ended(DoneReason::Stopped, steps_used, last_text));
+                    return Ok(Ran::ended(cancelled_reason(policy), steps_used, last_text));
                 }
             }
         } else {
@@ -1030,6 +1031,18 @@ fn detach_notes(host: &mut impl Host, pushed: usize) {
     }
 }
 
+/// Why a model call that came back cancelled ended the run.
+///
+/// The stream is raced against the deadline as well as the interrupt (see
+/// [`stream`]), and the two want different words: one is the operator, the
+/// other is `--max-hours` doing what it was set for.
+fn cancelled_reason(policy: &Policy) -> DoneReason {
+    match policy.deadline {
+        Some(deadline) if Instant::now() >= deadline => DoneReason::TimeLimit,
+        _ => DoneReason::Stopped,
+    }
+}
+
 /// Re-ask once after a completion came back with nothing in it, in memory only
 /// so neither the nudge nor the discarded reply reaches the record. `None` when
 /// the retry was cancelled.
@@ -1238,6 +1251,12 @@ async fn stream(
         let chunk = tokio::select! {
             biased;
             () = super::cancelled(cancel) => return Ok(None),
+            // The deadline, mid-stream. Without this arm `--max-hours` could
+            // only be noticed between steps, so a run cut off during a long
+            // reply went on streaming it, ran every tool call it asked for,
+            // and only then looked at the clock — minutes of work, and writes
+            // to the workspace, after the run was over.
+            () = sleep_until_deadline(policy.deadline) => return Ok(None),
             chunk = next => match chunk {
                 // A stream that has gone silent is not a stream that ended:
                 // raise it as a transport failure so the ladder redials
@@ -1981,6 +2000,15 @@ mod tests {
         provider: Arc<ScriptedProvider>,
         registry: ToolRegistry,
     ) -> Agent {
+        test_agent_with(root, provider, registry)
+    }
+
+    /// [`test_agent`] for a provider that is not the scripted one.
+    fn test_agent_with(
+        root: &std::path::Path,
+        provider: Arc<dyn LlmProvider>,
+        registry: ToolRegistry,
+    ) -> Agent {
         let session = Session::create(root).expect("create session");
         let hooks = Arc::new(HookEngine::new(
             Vec::new(),
@@ -2549,6 +2577,40 @@ mod tests {
         assert!(
             note.ends_with(&format!("Not written yet: {}.", wanted.display())),
             "the missing path is not named in {note:?}"
+        );
+    }
+
+    /// The deadline ends a call that is still in flight. Before this, it was
+    /// only checked between steps, so a reply that was still streaming when
+    /// the clock ran out finished, dispatched its tool calls, and wrote to the
+    /// workspace after the run was supposed to be over.
+    #[tokio::test]
+    async fn the_deadline_ends_a_model_call_that_is_still_streaming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The first stream this provider opens never says anything, which is
+        // exactly the state a run is in when its clock runs out mid-call.
+        let mut agent = test_agent_with(
+            dir.path(),
+            Arc::new(StallingProvider {
+                stalled: std::sync::atomic::AtomicBool::new(false),
+            }),
+            ToolRegistry::new(),
+        );
+        agent.set_time_budget(Some(TimeBudget::new(
+            Instant::now(),
+            Duration::from_millis(200),
+            budget::DEFAULT_WRAP_UP_AT,
+            budget::DEFAULT_FINISH_AT,
+        )));
+
+        let (tx, _rx) = mpsc::channel(64);
+        let started = Instant::now();
+        let reason = agent.run_turn("go", tx).await.expect("turn ok");
+        assert_eq!(reason, DoneReason::TimeLimit);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the run outlived its deadline by {:?}",
+            started.elapsed()
         );
     }
 
