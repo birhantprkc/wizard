@@ -85,6 +85,18 @@ pub struct Cli {
     #[arg(long = "gate", value_name = "COMMAND")]
     pub gate: Vec<String>,
 
+    /// Review the claim of done before acting on it: a fresh reviewer checks
+    /// the request was actually satisfied, and a failed review buys one round
+    /// of rework. On by default for headless, sovereign, continuous and
+    /// scheduled runs; off by default in the TUI, where you are reading the
+    /// claim yourself. Overrides the `completion_review` config key.
+    #[arg(long = "completion-review", overrides_with = "no_completion_review")]
+    pub completion_review: bool,
+
+    /// Turn the completion review off for this run.
+    #[arg(long = "no-completion-review", overrides_with = "completion_review")]
+    pub no_completion_review: bool,
+
     /// Run sovereign mode perpetually: keep working toward the goal,
     /// self-directing and self-improving, until stopped (loop-control
     /// `stop` or --max-hours). Implies --mode sovereign.
@@ -177,6 +189,12 @@ impl Cli {
         }
         if !self.gate.is_empty() {
             ignored.push("--gate");
+        }
+        if self.completion_review {
+            ignored.push("--completion-review");
+        }
+        if self.no_completion_review {
+            ignored.push("--no-completion-review");
         }
         if self.continuous {
             ignored.push("--continuous");

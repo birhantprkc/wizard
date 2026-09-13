@@ -111,6 +111,11 @@ pub(crate) fn deadline_passed(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
+/// Seconds left on the run's wall clock, or `None` for a run without one.
+pub(crate) fn secs_left(deadline: Option<Instant>) -> Option<u64> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()).as_secs())
+}
+
 /// Hours left on the run's wall clock, or `None` for a run without one. An
 /// expired deadline reports `0.0` rather than going negative, so callers can
 /// compare against a floor without worrying about the sign.
@@ -431,6 +436,53 @@ fn stamp(mission: Option<&mut mission::Mission>, project_root: &Path, phase: imp
     if let Some(mission) = mission {
         mission.stamp(phase);
         persist(mission, project_root);
+    }
+}
+
+/// One completion review. `Some(prompt)` is the rework turn it asked for;
+/// `None` means the run may finish.
+///
+/// A reviewer that could not run at all does not fail the run. Nothing about
+/// the work is known either way at that point, and ending a run that may be
+/// perfectly good because a second model call did not connect trades one wrong
+/// answer for another. It says so on the way out instead, which is the same
+/// standing a run with no review configured has.
+async fn run_completion_review(
+    agent: &Agent,
+    request: &str,
+    rounds_used: u32,
+    budget: Option<Duration>,
+    events: &mpsc::Sender<AgentEvent>,
+) -> Option<String> {
+    let notice = |message: String| async move {
+        let _ = events.send(AgentEvent::Notice(message)).await;
+    };
+    let verdict = match agent.review_completion(request, budget).await {
+        Ok(verdict) => verdict,
+        Err(err) => {
+            tracing::warn!("completion review could not run: {err:#}");
+            notice(format!(
+                "review could not run ({err:#}); the claim of done was not checked"
+            ))
+            .await;
+            return None;
+        }
+    };
+    notice(format!("review: {}", verdict.summary())).await;
+    match critic::plan_after_review(&verdict, rounds_used) {
+        critic::ReviewAction::Rework(prompt) => Some(prompt),
+        critic::ReviewAction::Accept => {
+            // Out of rounds with the review still unhappy. The work lands
+            // because arguing costs more than it finds, but the run must not
+            // go quiet about it.
+            if let critic::ReviewVerdict::Fail(why) = &verdict {
+                notice(format!(
+                    "review still failing after its rework round: {why}"
+                ))
+                .await;
+            }
+            None
+        }
     }
 }
 
@@ -783,6 +835,22 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // have their own bound (`gate_max_attempts`) and the same wall clock as
     // everything else.
     let mut gate_iterations: u32 = 0;
+    // Is the claim of done reviewed before the loop acts on it? Headless is
+    // never the interactive surface, so this is the config key or the default
+    // for an unattended run, which is yes.
+    let review_on = critic::review_enabled(config.completion_review, false);
+    // Iterations spent on a review's rework, which extend the `--loop` bound
+    // for the same reason gate remediation does: `--loop` is the budget for
+    // the work, and a review with no turn to fix what it found is a review
+    // that only slows the run down. Its own bound is `REVIEW_MAX_ROUNDS`.
+    let mut review_iterations: u32 = 0;
+    // Reviews spent on the claim currently being judged. Reset when one lands,
+    // so a continuous mission gets a review per cycle rather than one ever.
+    let mut review_rounds: u32 = 0;
+    // Effect count (files written, commands run) as of the last claim that
+    // landed. A turn that only read and then said it was finished has nothing
+    // for a reviewer to look at.
+    let mut effects_mark = agent.effects();
     // Cycles that ended in a hard error or a tripped breaker since the last
     // one that landed. Mirrored into the mission so it is visible from outside
     // the process; the local copy is what the bound is checked against.
@@ -800,7 +868,12 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
 
     loop {
         iteration += 1;
-        if !config.continuous && iteration > max_iterations.saturating_add(gate_iterations) {
+        if !config.continuous
+            && iteration
+                > max_iterations
+                    .saturating_add(gate_iterations)
+                    .saturating_add(review_iterations)
+        {
             break;
         }
 
@@ -956,7 +1029,51 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                 break;
                             }
                             crate::gates::GateDecision::Finish => {
-                                if config.continuous {
+                                // Gates, when there are any, say the commands
+                                // the operator named still pass. They cannot
+                                // say the agent did the thing it was asked
+                                // for: nothing runs a gate for "serve this
+                                // repo over HTTP". That is this review's
+                                // question, and it is asked once.
+                                let rework = match critic::plan_review(
+                                    review_on,
+                                    agent.effects().saturating_sub(effects_mark),
+                                    review_rounds,
+                                    secs_left(deadline),
+                                ) {
+                                    Err(skip) => {
+                                        tracing::debug!(
+                                            "completion review skipped: {}",
+                                            skip.summary()
+                                        );
+                                        None
+                                    }
+                                    Ok(()) => {
+                                        review_rounds = review_rounds.saturating_add(1);
+                                        stamp(
+                                            mission_state.as_mut(),
+                                            &project_root,
+                                            format!("cycle {iteration}: reviewing the claim"),
+                                        );
+                                        run_completion_review(
+                                            &agent,
+                                            &goal,
+                                            review_rounds,
+                                            secs_left(deadline).map(Duration::from_secs),
+                                            &tx,
+                                        )
+                                        .await
+                                    }
+                                };
+                                if let Some(prompt) = rework {
+                                    review_iterations = review_iterations.saturating_add(1);
+                                    stamp(
+                                        mission_state.as_mut(),
+                                        &project_root,
+                                        format!("cycle {iteration}: the review sent it back"),
+                                    );
+                                    input = prompt;
+                                } else if config.continuous {
                                     // "Done" survived the gates; now it must
                                     // survive an INDEPENDENT critic before the
                                     // cycle is allowed to land. A goal loop that
@@ -991,6 +1108,12 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     // cycle and self-direct the
                                                     // next action. Never idle.
                                                     failure_streak = 0;
+                                                    // This claim is settled, so
+                                                    // the next cycle gets its
+                                                    // own review and is judged
+                                                    // on its own work.
+                                                    review_rounds = 0;
+                                                    effects_mark = agent.effects();
                                                     let cycles = match mission_state.as_mut() {
                                                         Some(mission) => {
                                                             mission.record_cycle(Some(
@@ -1482,8 +1605,41 @@ mod tests {
             "a failing gate has to reach the process exit code"
         );
         assert!(
-            production.contains("max_iterations.saturating_add(gate_iterations)"),
+            production.contains(".saturating_add(gate_iterations)"),
             "gate remediation must not be capped by the default --loop of 1"
+        );
+    }
+
+    /// The completion review reaches the finish path, the loop bound and the
+    /// skip rule. Grep, for the same reason as the gate test above: the defect
+    /// is an *absent* call, and a review that is planned and never run is a run
+    /// that reports Completed with nothing checked, which is the whole thing
+    /// this is here to stop.
+    #[test]
+    fn the_headless_runner_actually_reviews_its_claim_of_done() {
+        let source = include_str!("headless.rs");
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("this module ends with its test module");
+        assert!(
+            production.contains("critic::review_enabled(config.completion_review, false)"),
+            "headless is the unattended surface, so it takes the unattended default"
+        );
+        assert!(
+            production.contains("critic::plan_review("),
+            "the skip rules are one function and this surface has to ask it"
+        );
+        assert!(
+            production.contains("run_completion_review("),
+            "a planned review that is never run checks nothing"
+        );
+        assert!(
+            production.contains("agent.effects().saturating_sub(effects_mark)"),
+            "a turn that wrote nothing and ran nothing must not cost a review"
+        );
+        assert!(
+            production.contains(".saturating_add(review_iterations)"),
+            "the review's rework must not be capped by the default --loop of 1"
         );
     }
 

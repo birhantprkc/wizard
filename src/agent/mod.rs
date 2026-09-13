@@ -20,7 +20,7 @@ pub mod ultra;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -106,13 +106,71 @@ impl CritiqueContext {
     /// `goal`. See [`Agent::critique_goal`] for the semantics; this is the
     /// snapshot form for callers that are out of the agent's slot.
     pub async fn critique(&self, goal: &str) -> Result<critic::GoalVerdict> {
-        let config = critic::critic_config();
-        let task = critic::critic_task(goal, &self.ctx.cwd);
+        let output = self
+            .run(
+                critic::critic_config(),
+                critic::critic_task(goal, &self.ctx.cwd),
+                subagent::RunScope::ReadOnly,
+                None,
+            )
+            .await?;
+        Ok(critic::parse_verdict(&output).unwrap_or_else(|| {
+            critic::GoalVerdict::Bar(
+                "the critic did not return a clear OURS/BAR/PLATEAU verdict; judge the goal again"
+                    .to_string(),
+            )
+        }))
+    }
+
+    /// Run one completion review over `request` and return its verdict.
+    ///
+    /// Same independence as the critic and one more capability: the reviewer
+    /// gets `execute` as well as the read-only tools, because re-running the
+    /// request's own acceptance command is most of what it is for. An unclear
+    /// reply is a `Fail`, never a pass. A reviewer that mumbles must not be the
+    /// reason a run reports success.
+    pub async fn review(
+        &self,
+        request: &str,
+        budget: Option<Duration>,
+    ) -> Result<critic::ReviewVerdict> {
+        let output = self
+            .run(
+                critic::review_config(),
+                critic::review_task(request, &self.ctx.cwd),
+                subagent::RunScope::Inspect,
+                budget,
+            )
+            .await?;
+        Ok(critic::parse_review(&output).unwrap_or_else(|| {
+            critic::ReviewVerdict::Fail(
+                "the review did not return a clear PASS/FAIL verdict, so nothing about this run \
+                 has been checked; check the request's deliverables yourself"
+                    .to_string(),
+            )
+        }))
+    }
+
+    /// Spawn one fresh judging run and hand back its final text.
+    ///
+    /// `budget` is what is left of the *caller's* deadline, and it only ever
+    /// shortens the run: a judge that outlives the run it is judging has turned
+    /// a `--max-hours` contract into a suggestion. `None` keeps the subagent
+    /// default.
+    async fn run(
+        &self,
+        config: subagent::SubagentConfig,
+        task: String,
+        scope: subagent::RunScope,
+        budget: Option<Duration>,
+    ) -> Result<String> {
+        let default = subagent::DEFAULT_DEADLINE;
         let options = subagent::SpawnOptions {
             model: Some(self.model.clone()),
-            scope: subagent::RunScope::ReadOnly,
+            scope,
             cancel: self.cancel.clone(),
             breaker: self.breaker.clone(),
+            deadline: Some(budget.map_or(default, |left| left.min(default))),
             ..Default::default()
         };
         let result = subagent::spawn(
@@ -126,12 +184,7 @@ impl CritiqueContext {
             &self.ctx,
         )
         .await?;
-        Ok(critic::parse_verdict(&result.output).unwrap_or_else(|| {
-            critic::GoalVerdict::Bar(
-                "the critic did not return a clear OURS/BAR/PLATEAU verdict; judge the goal again"
-                    .to_string(),
-            )
-        }))
+        Ok(result.output)
     }
 }
 
@@ -1416,10 +1469,37 @@ impl Agent {
         self.critique_context(None).critique(goal).await
     }
 
-    /// Snapshot for running the goal critic without borrowing the agent. Pass
-    /// `events` to stream the critic's panes to a surface, or `None` for a
-    /// silent run whose only output is the returned verdict. Same mid-turn
-    /// pattern as [`Self::fork_context`].
+    /// Run one completion review over the request this run was given, and
+    /// return its verdict.
+    ///
+    /// The claim under review is the agent's own "done", so the reviewer is
+    /// spawned with none of its history: it reads the request and the machine,
+    /// and nothing the agent said about either. See [`crate::agent::critic`].
+    /// `budget` is what is left of the run's own deadline, so the review cannot
+    /// outlive the run it is reviewing.
+    pub async fn review_completion(
+        &self,
+        request: &str,
+        budget: Option<Duration>,
+    ) -> Result<critic::ReviewVerdict> {
+        self.critique_context(None).review(request, budget).await
+    }
+
+    /// Tool calls this session has made that wrote a file or ran a command.
+    ///
+    /// Read-only calls do not count and neither does a call that could not be
+    /// carried out. It is what answers "did this turn do anything worth
+    /// reviewing?" without guessing from the transcript: a turn that only read
+    /// and then said it was finished has nothing for a reviewer to check, and
+    /// reviewing it anyway is a model call spent on an unchanged tree.
+    pub fn effects(&self) -> u64 {
+        self.dispatcher.effects()
+    }
+
+    /// Snapshot for running the critic or the completion review without
+    /// borrowing the agent. Pass `events` to stream the run's panes to a
+    /// surface, or `None` for a silent run whose only output is the returned
+    /// verdict. Same mid-turn pattern as [`Self::fork_context`].
     pub fn critique_context(&self, events: Option<mpsc::Sender<AgentEvent>>) -> CritiqueContext {
         let mut ctx = self.ctx.clone();
         ctx.events = events;

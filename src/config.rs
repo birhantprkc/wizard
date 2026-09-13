@@ -992,6 +992,17 @@ pub struct Config {
     /// `--max-hours`. A gate that hangs must not be the thing that outlives
     /// the deadline the whole run is being judged against.
     pub gate_timeout_secs: u64,
+    /// Review a run's claim of done before acting on it: one fresh reviewer
+    /// checks the request was actually satisfied, and a failed review buys one
+    /// round of rework (see [`crate::agent::critic`] and `docs/modes.md`).
+    ///
+    /// Unset, which is the default, means "on where nobody is watching": every
+    /// headless run, `--continuous` cycle and scheduled job reviews, the TUI
+    /// does not. The user at a prompt is already reading what the agent claims
+    /// and can say so; an extra model call per turn is their time and their
+    /// money. Set it to `true` or `false` and that answer holds everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_review: Option<bool>,
     /// When the provider's context window is unknown and the serialized chat
     /// history exceeds this many bytes, compact older messages into a summary.
     /// With a known window, the reported prompt size governs instead.
@@ -1108,6 +1119,7 @@ impl Default for Config {
             gates: Vec::new(),
             gate_max_attempts: 3,
             gate_timeout_secs: 1_800,
+            completion_review: None,
             compact_threshold_bytes: 48_000,
             max_context_tokens: 150_000,
             prune_after_tokens: 32_000,
@@ -1587,6 +1599,14 @@ impl Config {
         }
         if cli.omakase {
             self.omakase = true;
+        }
+        // Either flag settles the question for this run; clap makes them
+        // mutually exclusive, so neither can be reached through the other.
+        if cli.completion_review {
+            self.completion_review = Some(true);
+        }
+        if cli.no_completion_review {
+            self.completion_review = Some(false);
         }
         // Omakase is a flavor of plan mode, so it implies `plan_first` — and it
         // implies it however it was asked for. Doing this after the flag rather
