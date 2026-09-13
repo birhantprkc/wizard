@@ -4,7 +4,7 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
-## [Unreleased]
+## [3.1.2] - 2026-09-12
 
 ### Added
 
@@ -12,6 +12,13 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   the function in that plugin's VM and publishes `Service::Callable`; `ctx.inject`
   returns a callable as a JS function. Matches the Lua host so all three
   languages share one callable namespace.
+
+### Fixed
+
+- **Copying from the transcript no longer pastes a left margin.** A drag that
+  took in a row with a block marker (`· `, `• `, the Grok rail) kept the two or
+  three blank columns in front of every other line. The copy now starts each
+  row where its text starts, in all three skins.
 
 ## [3.1.1] - 2026-09-12
 
