@@ -329,7 +329,7 @@ impl OpenAiProvider {
         }
         if let Some(options) = &request.options
             && let Some(effort) = &options.reasoning_effort
-            && supports_reasoning_effort(&request.model)
+            && let Some(effort) = reasoning_effort_for(&request.model, effort)
         {
             body["reasoning_effort"] = json!(effort);
         }
@@ -348,21 +348,43 @@ impl OpenAiProvider {
     }
 }
 
-/// Models that accept a `reasoning_effort` request field: xAI Grok 4.x and
-/// OpenAI's reasoning families (o-series, gpt-5). Anything else 400s on it, so
-/// it is sent only for these. Mirrors the families in [`context_window`].
-/// Tags marked "non-reasoning" (e.g. xAI's `grok-4.20-*-non-reasoning`)
-/// reject the field even inside a supporting family.
-fn supports_reasoning_effort(model: &str) -> bool {
+/// The `reasoning_effort` value to send for `model`, or `None` when the model
+/// takes no such field.
+///
+/// The families that accept one are xAI Grok 4.x and OpenAI's reasoning
+/// families (o-series, gpt-5); anything else 400s on it, so it is sent only
+/// for these. Mirrors the families in [`context_window`]. Tags marked
+/// "non-reasoning" (e.g. xAI's `grok-4.20-*-non-reasoning`) reject the field
+/// even inside a supporting family.
+///
+/// `xhigh` is the one level that is not universal. It is xAI's, documented for
+/// grok-4.6 and later, and xAI states that a Grok model without it treats the
+/// request as `high` rather than failing — so a Grok tag gets it through
+/// whatever its version, which is what keeps this table from having to know
+/// the next model's name. OpenAI's families have no such level and would
+/// reject the request outright, so for them it is clamped to `high`, which is
+/// what the user asking for the most reasoning meant.
+///
+/// Checked 2026-09-13 against
+/// docs.x.ai/developers/model-capabilities/text/reasoning.
+fn reasoning_effort_for<'a>(model: &str, effort: &'a str) -> Option<&'a str> {
     let model = model.to_ascii_lowercase();
     if model.contains("non-reasoning") {
-        return false;
+        return None;
     }
-    model.starts_with("grok-4")
+    let grok = model.starts_with("grok-4");
+    let takes_effort = grok
         || model.starts_with("gpt-5")
         || model.starts_with("o1")
         || model.starts_with("o3")
-        || model.starts_with("o4")
+        || model.starts_with("o4");
+    if !takes_effort {
+        return None;
+    }
+    if !grok && effort.eq_ignore_ascii_case("xhigh") {
+        return Some("high");
+    }
+    Some(effort)
 }
 
 /// OpenAI reasoning models (o-series, gpt-5 family) reject any non-default
@@ -2056,6 +2078,53 @@ mod tests {
         };
         let body = provider().build_request_body(&request);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// `xhigh` is xAI's fourth level and nobody else's. A Grok tag gets it
+    /// verbatim whatever its version (xAI downgrades it to `high` itself on a
+    /// model that does not have it); an OpenAI reasoning model, which would
+    /// reject the request, gets `high`.
+    #[test]
+    fn xhigh_reaches_grok_and_is_clamped_for_everyone_else() {
+        let body = |model: &str, effort: &str| {
+            provider().build_request_body(&ChatRequest {
+                model: model.to_string(),
+                messages: vec![ChatMessage::user("hi")],
+                tools: Vec::new(),
+                stream: true,
+                options: Some(ChatOptions {
+                    temperature: None,
+                    num_ctx: None,
+                    reasoning_effort: Some(effort.to_string()),
+                }),
+            })
+        };
+
+        for model in ["grok-4.6", "grok-4.6-0901", "grok-4.20-multi-agent-0309"] {
+            assert_eq!(
+                body(model, "xhigh")["reasoning_effort"],
+                "xhigh",
+                "{model} takes xhigh"
+            );
+        }
+        for model in ["gpt-5", "o3-mini", "o4-mini"] {
+            assert_eq!(
+                body(model, "xhigh")["reasoning_effort"],
+                "high",
+                "{model} has no xhigh and 400s on it"
+            );
+        }
+        // A tag that takes no effort field at all is still left alone.
+        assert!(
+            body("grok-4.20-0309-non-reasoning", "xhigh")
+                .get("reasoning_effort")
+                .is_none()
+        );
+        // The other three levels are untouched by the clamp.
+        for effort in ["low", "medium", "high"] {
+            assert_eq!(body("gpt-5", effort)["reasoning_effort"], effort);
+            assert_eq!(body("grok-4.6", effort)["reasoning_effort"], effort);
+        }
     }
 
     #[tokio::test]

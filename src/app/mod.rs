@@ -3113,6 +3113,7 @@ impl App {
                                 "low" => Some(ReasoningEffort::Low),
                                 "medium" => Some(ReasoningEffort::Medium),
                                 "high" => Some(ReasoningEffort::High),
+                                "xhigh" => Some(ReasoningEffort::Xhigh),
                                 _ => None,
                             };
                             AppAction::Command(SlashCommand::Effort(Some(effort)))

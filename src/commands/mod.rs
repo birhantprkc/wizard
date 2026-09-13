@@ -64,7 +64,7 @@ pub enum SlashCommand {
     Model(Option<String>),
     /// `/mode [genie|sovereign]` — show or switch mode.
     Mode(Option<Mode>),
-    /// `/effort [low|medium|high|default]` — set the reasoning effort sent to
+    /// `/effort [low|medium|high|xhigh|default]` — set the reasoning effort sent to
     /// models that support it. `None` opens the picker; `Some(None)` clears
     /// back to the provider default; `Some(Some(e))` sets the level.
     Effort(Option<Option<ReasoningEffort>>),
@@ -391,9 +391,10 @@ impl SlashCommand {
                     Ok(Self::Effort(Some(Some(ReasoningEffort::Medium))))
                 }
                 Some("high") => Ok(Self::Effort(Some(Some(ReasoningEffort::High)))),
+                Some("xhigh") => Ok(Self::Effort(Some(Some(ReasoningEffort::Xhigh)))),
                 Some("default") | Some("off") | Some("none") => Ok(Self::Effort(Some(None))),
                 Some(other) => Err(format!(
-                    "unknown effort '{other}' (low|medium|high|default)"
+                    "unknown effort '{other}' (low|medium|high|xhigh|default)"
                 )),
             },
             "evolve" => {
@@ -832,7 +833,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "effort",
-        args: "[low|medium|high|default]",
+        args: "[low|medium|high|xhigh|default]",
         description: "set reasoning effort (Grok 4.x, OpenAI o-series / gpt-5)",
         takes_args: false,
         tui: Execution::Agent,
@@ -1821,6 +1822,10 @@ mod tests {
         assert_eq!(
             parse("/effort med"),
             Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::Medium))))
+        );
+        assert_eq!(
+            parse("/effort xhigh"),
+            Ok(SlashCommand::Effort(Some(Some(ReasoningEffort::Xhigh))))
         );
         assert_eq!(parse("/effort off"), Ok(SlashCommand::Effort(Some(None))));
         assert_eq!(

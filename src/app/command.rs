@@ -798,6 +798,11 @@ impl CommandContext<'_> {
         let current = self.app.config.reasoning_effort;
         let rows = [
             (
+                "xhigh",
+                "maximum depth — Grok 4.6 and later only",
+                Some(ReasoningEffort::Xhigh),
+            ),
+            (
                 "high",
                 "most reasoning — slowest, best on hard tasks",
                 Some(ReasoningEffort::High),
@@ -814,7 +819,7 @@ impl CommandContext<'_> {
             ),
             (
                 "default",
-                "leave the provider default (e.g. Grok 4.5 → high)",
+                "leave the provider default (e.g. Grok 4.6 → high)",
                 None,
             ),
         ];

@@ -139,7 +139,13 @@ impl fmt::Display for Mode {
 /// Reasoning effort forwarded as the `reasoning_effort` request field to models
 /// that expose the knob (xAI Grok 4.x, OpenAI's o-series and gpt-5). Providers
 /// without one ignore it. `None` in [`Config`] leaves the provider default
-/// (Grok 4.5, for one, defaults to high).
+/// (Grok 4.x defaults to high).
+///
+/// `Xhigh` is xAI's fourth step, above its default: "maximum reasoning depth,
+/// with correspondingly higher latency", documented for grok-4.6 and later.
+/// It is the one level that is not universal, so
+/// [`crate::llm::wire`] clamps it to `high` for the model families that would
+/// reject it; see `reasoning_effort_for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
@@ -147,6 +153,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Xhigh,
 }
 
 impl ReasoningEffort {
@@ -156,6 +163,7 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
         }
     }
 }
