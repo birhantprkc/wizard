@@ -496,6 +496,14 @@ pub struct UpdateConfig {
     pub interval_hours: u64,
 }
 
+fn default_wrap_up_at() -> f64 {
+    crate::agent::budget::DEFAULT_WRAP_UP_AT
+}
+
+fn default_finish_at() -> f64 {
+    crate::agent::budget::DEFAULT_FINISH_AT
+}
+
 fn default_update_notify() -> bool {
     true
 }
@@ -1006,6 +1014,18 @@ pub struct Config {
     /// what keeps the fraction meaningful on a large window without making it
     /// useless on a small one.
     pub max_context_tokens: u32,
+    /// Fraction of a timed run's wall clock (`--max-hours`, a schedule
+    /// entry's `max_hours`) spent before each step's note starts asking for
+    /// the deliverable on disk. `1.0` turns the stage off.
+    ///
+    /// Only runs that were given a deadline have a clock to be a fraction of.
+    /// Without one nothing is added to any request.
+    #[serde(default = "default_wrap_up_at")]
+    pub time_wrap_up_at: f64,
+    /// Fraction spent before the note says to stop starting anything that
+    /// changes state and land what is there. `1.0` turns the stage off.
+    #[serde(default = "default_finish_at")]
+    pub time_finish_at: f64,
     /// Prompt size, in tokens, past which old tool results are shrunk between
     /// compactions (`0` turns it off).
     ///
@@ -1109,6 +1129,8 @@ impl Default for Config {
             gate_max_attempts: 3,
             gate_timeout_secs: 1_800,
             compact_threshold_bytes: 48_000,
+            time_wrap_up_at: default_wrap_up_at(),
+            time_finish_at: default_finish_at(),
             max_context_tokens: 150_000,
             prune_after_tokens: 32_000,
             providers: Vec::new(),

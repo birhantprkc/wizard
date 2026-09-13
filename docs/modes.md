@@ -84,6 +84,24 @@ re-read this file, so `stop` takes effect within about a second however long the
 was configured to be. `--max-hours` is checked in the same places: a hold or a pause
 cannot outlive the run's deadline.
 
+### The clock
+
+With `--max-hours` (or a schedule entry's `max_hours`), every step's request ends with one
+line saying how much of the run is left: `[time budget] 10m10s of 15m left.` Past 60% of
+the budget the line also says to get the deliverable on disk and improve it in place
+rather than starting new work; past 85% it says to stop starting anything that changes
+state and land what's there. Both thresholds are `time_wrap_up_at` and `time_finish_at` in
+the table below. The line is ephemeral: it rides after the cached prefix, it never reaches
+the session file, and a run with no deadline adds nothing, so an interactive session sends
+exactly what it sent before.
+
+If the task text named output paths that still don't exist, the late lines name them:
+`Not written yet: /app/out.txt.` What counts as a path is deliberately narrow. Quoted
+tokens, tokens with a known file extension, and relative paths under the working
+directory are taken; URLs, globs, `$VAR` paths, `..`, `~`, email addresses and version
+numbers like `3.11` are not. A real path it misses costs a vaguer line, which is much
+cheaper than a filename it made up sitting in front of the model every step.
+
 ### Example
 
 ```bash
@@ -269,6 +287,8 @@ to `~/.wizard/evolution.jsonl`.
 | `compact_threshold_bytes` | `48000` | History size that triggers compaction |
 | `max_context_tokens` | `150000` | Cap on the window compaction measures against; `0` uses the whole window |
 | `prune_after_tokens` | `32000` | Prompt size past which old tool results are cut down between compactions; `0` disables |
+| `time_wrap_up_at` | `0.6` | Fraction of a timed run spent before the per-step line asks for the deliverable on disk; `1.0` turns the stage off |
+| `time_finish_at` | `0.85` | Fraction spent before it asks the run to stop changing state and land; `1.0` turns the stage off |
 | `rollback_failed_cycles` | `false` | Restore a failed cycle's file checkpoints (see [checkpoints.md](checkpoints.md)) |
 
 > **Run it in a container or VM.** Continuous mode executes every tool call with no

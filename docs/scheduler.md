@@ -36,6 +36,14 @@ about on load and never fired. `--max-hours` on the command line is checked
 against the same rule, and a value that fails it is refused before the run
 starts.
 
+`max_hours` is passed to the child as `--max-hours`, and the run can see it. Every step's
+request carries a line saying how much of the budget is left, which turns into "write the
+deliverable now" at 60% spent and "stop changing things and land it" at 85%, naming any
+output path the prompt asked for that is still not on disk. So a nightly entry with
+`max_hours = 2.0` winds itself down before the daemon's kill at `max_hours + grace` ever
+comes up, and a scheduled run that gets cut off is much more likely to leave the file it
+was asked for behind. See [The clock](modes.md#the-clock).
+
 ## CLI
 
 ```bash

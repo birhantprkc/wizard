@@ -47,6 +47,7 @@ use crate::llm::{
 };
 use crate::tools::{ToolContext, ToolOutput};
 
+use super::budget::{self, TimeBudget};
 use super::{
     Agent, AgentEvent, CONTEXT_PRESSURE_HEADING, DoneReason, EMPTY_COMPLETION_NUDGE, ImageSource,
     LoopControl, PressureLevel, absorb_images, breaker, clear_loop_control, completion_is_empty,
@@ -287,6 +288,9 @@ pub(super) struct Policy {
     pub max_steps: u32,
     /// Wall-clock cap, checked between steps.
     pub deadline: Option<Instant>,
+    /// The same cap as something to say: the per-step time note, when this run
+    /// has a deadline. `None` leaves every request exactly as it was.
+    pub time_budget: Option<TimeBudget>,
     /// The interrupt this run observes, between tool calls and inside the
     /// retry ladder's waits.
     pub cancel: Option<super::CancelHandle>,
@@ -338,6 +342,7 @@ impl Policy {
             // calling tools. Everything else here can still end it.
             max_steps: agent.config.max_steps.last_step(),
             deadline: agent.deadline,
+            time_budget: agent.time_budget.clone(),
             cancel: Some(agent.cancel.clone()),
             model: agent.model.clone(),
             native_tools: agent.native_tools,
@@ -398,6 +403,10 @@ impl Policy {
         Self {
             max_steps,
             deadline: None,
+            // Declined with the deadline above: a sub-run is raced against its
+            // own timeout from the outside, and a clock the parent owns is not
+            // a clock this run can act on.
+            time_budget: None,
             cancel: None,
             model,
             native_tools,
@@ -629,10 +638,10 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
                 context::MIN_RECLAIM_CHARS,
             );
         }
-        let signal = attach_pressure(host, policy, &reading);
+        let notes = attach_notes(host, policy, &reading);
 
         let completion = completion(host, policy, sink).await;
-        detach_pressure(host, signal);
+        detach_notes(host, notes);
 
         let streamed = match completion {
             // Cancelled mid-stream: the partial completion is discarded (it
@@ -961,50 +970,62 @@ async fn measure(host: &impl Host, policy: &Policy) -> super::ContextPressure {
     })
 }
 
-/// Push the ephemeral pressure note for the next completion when the policy
-/// carries one and the reading warrants it; report whether one went on.
+/// Push the ephemeral notes the next completion rides with — how full the
+/// context is, and how much of the run's clock is left — and report how many
+/// went on.
 ///
-/// The note is a **user** message at the very end of the history, and that is
+/// Each is a **user** message at the very end of the history, and that is
 /// load-bearing rather than cosmetic. Anthropic takes its system prompt as a
 /// separate top-level field, so its adapter hoists *every* `Role::System`
 /// message in the history into it; a system note carrying a live token count
 /// therefore rewrote the cached prefix on every single request. Prompt caching
 /// then never hits and every request pays the 1.25x cache-*write* premium for a
 /// prefix nothing will ever read, which is strictly worse than not caching at
-/// all. As the last user block it sits after everything cacheable, so the prefix
-/// stays byte-identical from one request to the next however the number moves.
-fn attach_pressure(
-    host: &mut impl Host,
-    policy: &Policy,
-    reading: &super::ContextPressure,
-) -> bool {
-    if !policy.pressure_signal || reading.level == PressureLevel::Ok {
-        return false;
+/// all. As trailing user blocks they sit after everything cacheable, so the
+/// prefix stays byte-identical from one request to the next however the numbers
+/// move.
+///
+/// A run with no deadline and comfortable headroom pushes nothing, which is
+/// what keeps an interactive session's requests identical to what they were
+/// before any of this existed.
+fn attach_notes(host: &mut impl Host, policy: &Policy, reading: &super::ContextPressure) -> usize {
+    let mut pushed = 0;
+    if policy.pressure_signal && reading.level != PressureLevel::Ok {
+        host.history_mut()
+            .push(ChatMessage::user(reading.signal_line()));
+        pushed += 1;
     }
-    host.history_mut()
-        .push(ChatMessage::user(reading.signal_line()));
-    true
+    if let Some(budget) = policy.time_budget.as_ref() {
+        // Last, so it is the final thing the model reads before it answers.
+        let now = Instant::now();
+        let line = budget.signal_line(now, &budget.missing(now));
+        host.history_mut().push(ChatMessage::user(line));
+        pushed += 1;
+    }
+    pushed
 }
 
-/// Drop the note [`attach_pressure`] just added, when it added one.
+/// Drop the notes [`attach_notes`] just added.
 ///
-/// Positional rather than a scan of the whole history: the note is pushed last
+/// Positional rather than a scan of the whole history: they are pushed last
 /// and taken off before anything else is pushed, whereas a text-prefix scan over
-/// user messages would eat a real prompt that happened to start with the
-/// heading.
-fn detach_pressure(host: &mut impl Host, injected: bool) {
-    if !injected {
-        return;
-    }
-    let history = host.history_mut();
-    let last_is_signal = history.last().is_some_and(|message| {
-        message.role == Role::User && message.text().starts_with(CONTEXT_PRESSURE_HEADING)
-    });
-    debug_assert!(
-        last_is_signal,
-        "the pressure note must still be the last message when it is dropped"
-    );
-    if last_is_signal {
+/// user messages would eat a real prompt that happened to start with one of the
+/// headings.
+fn detach_notes(host: &mut impl Host, pushed: usize) {
+    for _ in 0..pushed {
+        let history = host.history_mut();
+        let last_is_note = history.last().is_some_and(|message| {
+            message.role == Role::User
+                && (message.text().starts_with(CONTEXT_PRESSURE_HEADING)
+                    || message.text().starts_with(budget::TIME_BUDGET_HEADING))
+        });
+        debug_assert!(
+            last_is_note,
+            "an ephemeral note must still be the last message when it is dropped"
+        );
+        if !last_is_note {
+            return;
+        }
         history.pop();
     }
 }
@@ -1018,12 +1039,12 @@ async fn nudge_once(
     sink: &Sink,
 ) -> Result<Option<Streamed>> {
     let reading = measure(host, policy).await;
-    let signal = attach_pressure(host, policy, &reading);
+    let notes = attach_notes(host, policy, &reading);
     host.history_mut()
         .push(ChatMessage::user(EMPTY_COMPLETION_NUDGE));
     let retried = completion(host, policy, sink).await;
     host.history_mut().pop();
-    detach_pressure(host, signal);
+    detach_notes(host, notes);
     Ok(match retried? {
         retry::Climbed::Done(streamed) => Some(streamed),
         retry::Climbed::Cancelled => None,
@@ -1083,7 +1104,7 @@ async fn recover_truncated(
         host.compact(sink).await;
     }
     let reading = measure(host, policy).await;
-    let signal = attach_pressure(host, policy, &reading);
+    let notes = attach_notes(host, policy, &reading);
     let nudge = if overflowed {
         super::CONTEXT_OVERFLOW_NUDGE.to_string()
     } else {
@@ -1092,7 +1113,7 @@ async fn recover_truncated(
     host.history_mut().push(ChatMessage::user(nudge));
     let retried = completion(host, policy, sink).await;
     host.history_mut().pop();
-    detach_pressure(host, signal);
+    detach_notes(host, notes);
     Ok(match retried? {
         retry::Climbed::Done(streamed) => Some(streamed),
         retry::Climbed::Cancelled => None,
@@ -2360,8 +2381,8 @@ mod tests {
 
         // First request: comfortable headroom, so there is no note to add.
         let reading = measure(&host, &policy).await;
-        let injected = attach_pressure(&mut host, &policy, &reading);
-        assert!(!injected, "a fresh session is not under pressure");
+        let injected = attach_notes(&mut host, &policy, &reading);
+        assert_eq!(injected, 0, "a fresh session with no deadline adds nothing");
         completion(&host, &policy, &sink)
             .await
             .expect("first completion streams");
@@ -2370,12 +2391,12 @@ mod tests {
         // prompt filling 60% of the window, which is the elevated band.
         host.agent.usage.record(Some(120_000), Some(1));
         let reading = measure(&host, &policy).await;
-        let injected = attach_pressure(&mut host, &policy, &reading);
-        assert!(injected, "60% of the window must raise the signal");
+        let injected = attach_notes(&mut host, &policy, &reading);
+        assert_eq!(injected, 1, "60% of the window must raise the signal");
         completion(&host, &policy, &sink)
             .await
             .expect("second completion streams");
-        detach_pressure(&mut host, injected);
+        detach_notes(&mut host, injected);
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
@@ -2421,6 +2442,113 @@ mod tests {
                 .iter()
                 .all(|message| !message.text().starts_with(CONTEXT_PRESSURE_HEADING)),
             "the note is ephemeral"
+        );
+    }
+
+    /// A run with no deadline is the run it always was: no time note anywhere
+    /// in any request. This is the whole "interactive sessions are unchanged"
+    /// claim, asserted rather than asserted about.
+    #[tokio::test]
+    async fn a_run_with_no_deadline_says_nothing_about_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![final_chunk(
+            ChatMessage::assistant("done"),
+        )]]));
+        let mut agent = test_agent(dir.path(), Arc::clone(&provider), ToolRegistry::new());
+        let (tx, _rx) = mpsc::channel(64);
+        agent.run_turn("go", tx).await.expect("turn ok");
+
+        assert!(
+            provider.requests()[0]
+                .messages
+                .iter()
+                .all(|message| !message.text().starts_with(budget::TIME_BUDGET_HEADING)),
+            "no --max-hours, no note"
+        );
+    }
+
+    /// With a deadline, every step's request ends with the clock, and the
+    /// wording follows the stage the run is in.
+    #[tokio::test]
+    async fn a_timed_run_carries_the_clock_on_every_step() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut call = ChatMessage::assistant("");
+        call.push_tool_call(ToolCall::new("execute", json!({ "command": "ls" })));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![final_chunk(call)],
+            vec![final_chunk(ChatMessage::assistant("done"))],
+        ]));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BlobTool(8)));
+        let mut agent = test_agent(dir.path(), Arc::clone(&provider), registry);
+        agent.set_time_budget(Some(TimeBudget::new(
+            Instant::now(),
+            Duration::from_secs(3600),
+            budget::DEFAULT_WRAP_UP_AT,
+            budget::DEFAULT_FINISH_AT,
+        )));
+
+        let (tx, _rx) = mpsc::channel(256);
+        agent.run_turn("go", tx).await.expect("turn ok");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for (step, request) in requests.iter().enumerate() {
+            let note = request.messages.last().expect("a last message");
+            assert_eq!(note.role, Role::User, "a system note would move the prefix");
+            let text = note.text();
+            assert!(
+                text.starts_with("[time budget] 59m") && text.ends_with("of 1h left."),
+                "step {step} note was {text:?}"
+            );
+        }
+        assert!(
+            agent
+                .history
+                .iter()
+                .all(|message| !message.text().starts_with(budget::TIME_BUDGET_HEADING)),
+            "the note is ephemeral"
+        );
+    }
+
+    /// Past the wrap-up threshold the note asks for the file and names the one
+    /// the task called for that is not there.
+    #[tokio::test]
+    async fn the_late_note_names_a_deliverable_that_is_not_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![final_chunk(
+            ChatMessage::assistant("done"),
+        )]]));
+        let mut agent = test_agent(dir.path(), Arc::clone(&provider), ToolRegistry::new());
+        let wanted = dir.path().join("answer.txt");
+        agent.set_time_budget(Some(
+            TimeBudget::new(
+                Instant::now() - Duration::from_secs(70),
+                Duration::from_secs(100),
+                budget::DEFAULT_WRAP_UP_AT,
+                budget::DEFAULT_FINISH_AT,
+            )
+            .with_deliverables(vec![wanted.clone()]),
+        ));
+
+        let (tx, _rx) = mpsc::channel(64);
+        agent
+            .run_turn("write answer.txt", tx)
+            .await
+            .expect("turn ok");
+
+        let note = provider.requests()[0]
+            .messages
+            .last()
+            .expect("a last message")
+            .text();
+        assert!(
+            note.contains("Get the deliverable on disk now"),
+            "wrap-up wording missing from {note:?}"
+        );
+        assert!(
+            note.ends_with(&format!("Not written yet: {}.", wanted.display())),
+            "the missing path is not named in {note:?}"
         );
     }
 
@@ -2901,6 +3029,7 @@ mod tests {
             background_drain,
             operator_control,
             pressure_signal,
+            time_budget,
         } = policy;
 
         // What it carries.
@@ -2920,6 +3049,10 @@ mod tests {
         // run parked inside a model call, where a between-steps check would
         // not fire until the call returned.
         assert!(deadline.is_none(), "spawn owns the deadline");
+        assert!(
+            time_budget.is_none(),
+            "a clock the parent owns is not one a sub-run can act on"
+        );
         assert!(cancel.is_none(), "spawn owns the interrupt");
         // These three are declined outright.
         assert!(

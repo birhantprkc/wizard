@@ -995,7 +995,12 @@ async fn a_paused_run_still_honors_cancellation_and_the_deadline() {
     // out the poll interval — the sleep is raced against the deadline, not
     // merely re-checked after it.
     agent.cancel_handle().clear();
-    agent.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
+    agent.set_time_budget(Some(crate::agent::budget::TimeBudget::new(
+        Instant::now(),
+        Duration::from_millis(50),
+        crate::agent::budget::DEFAULT_WRAP_UP_AT,
+        crate::agent::budget::DEFAULT_FINISH_AT,
+    )));
     let policy = turn::Policy::turn(&agent);
     let mut host = turn::TurnHost { agent: &mut agent };
     let started = Instant::now();
@@ -1013,7 +1018,7 @@ async fn a_paused_run_still_honors_cancellation_and_the_deadline() {
     );
 
     // And the file is still what releases an otherwise-unbounded pause.
-    agent.set_deadline(None);
+    agent.set_time_budget(None);
     std::fs::write(tmp.0.join(".wizard").join("loop-control"), "resume").unwrap();
     let policy = turn::Policy::turn(&agent);
     let mut host = turn::TurnHost { agent: &mut agent };

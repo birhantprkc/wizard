@@ -6,6 +6,7 @@
 //! Ratatui TUI (genie) or the headless runner (sovereign) consumes.
 
 pub mod breaker;
+pub mod budget;
 pub mod context;
 pub mod drafts;
 mod event;
@@ -718,8 +719,13 @@ pub struct Agent {
     /// memories are saved. Re-read on every system prompt refresh so
     /// `/reload` picks up changes.
     memory_index: Option<String>,
-    /// Wall-clock deadline for sovereign runs (`--max-hours`).
+    /// Wall-clock deadline for sovereign runs (`--max-hours`), derived from
+    /// [`Self::time_budget`] and cached here because the loop checks it
+    /// between every step and inside every wait.
     deadline: Option<Instant>,
+    /// The same deadline with what the model is told about it: how much is
+    /// left, and which of the task's named outputs are still not on disk.
+    time_budget: Option<budget::TimeBudget>,
     /// Warning from session resume (corrupt/unreadable file), emitted on
     /// the next turn so the UI can surface it.
     load_warning: Option<String>,
@@ -959,6 +965,7 @@ impl Agent {
             agents_md,
             memory_index,
             deadline: None,
+            time_budget: None,
             load_warning,
             plan_mode,
             plan_prompt_on: false,
@@ -1169,9 +1176,15 @@ impl Agent {
         Ok(restored)
     }
 
-    /// Set (or clear) the wall-clock deadline for this run (`--max-hours`).
-    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
-        self.deadline = deadline;
+    /// Set (or clear) this run's wall-clock budget (`--max-hours`, or a
+    /// schedule entry's `max_hours`).
+    ///
+    /// One setter rather than two: the deadline the loop enforces and the
+    /// number the model is shown are the same fact, and a run that had been
+    /// given one without the other is exactly the bug this replaced.
+    pub fn set_time_budget(&mut self, budget: Option<budget::TimeBudget>) {
+        self.deadline = budget.as_ref().map(budget::TimeBudget::deadline);
+        self.time_budget = budget;
     }
 
     /// `/clear`: drop everything but the system prompt and start a fresh
