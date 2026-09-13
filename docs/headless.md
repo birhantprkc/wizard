@@ -55,6 +55,27 @@ A hard error (config, provider unreachable) ends the process before the sink wri
 
 In both structured formats the spinner and decorative headers are suppressed and stdout is pure JSON. Failures a run survives arrive in-band — the `errors` array in the `json` summary, `{"type":"error"}` lines in `stream-json` — and tracing diagnostics go to the log file under `~/.wizard/logs/` (see [logging.md](logging.md)). Stderr carries two things, both worth keeping: the `error: …` line a hard failure prints on its way to exit 1, and, when a quality gate is failing at the end of a run, the line naming it (the `json` summary object has no room for it and stdout stays pure JSON). Do not discard them with `2>/dev/null`.
 
+## The claim of done is reviewed
+
+A headless run ends when the model replies without calling a tool. That reply is
+a claim, and on its own nothing checks it: a run that wrote no file and said
+"Completed" used to exit 0 and look exactly like one that did the work.
+
+So every headless run, one-shot or `--continuous` or started by the scheduler,
+reviews the claim once before acting on it. A fresh subagent reads the original
+request and the machine, checks that what the request named exists and is not
+empty, runs the request's own acceptance command when it states one, and returns
+`PASS` or `FAIL`. A `FAIL` goes back to the agent as one more turn, with what is
+wrong; the rework turn does not consume `--loop`, which is the budget for the
+work itself. The review's own bound is one round.
+
+The review is skipped when the turn wrote nothing and ran nothing, when the claim
+has already had its round, and in the last minute of `--max-hours`. The verdict arrives as a notice, so it
+shows up in every output format: `~ review: PASS ...` under `text`, a
+`{"type":"notice"}` line under `stream-json`. `--no-completion-review` turns it off, and
+so does `completion_review = false`. See
+[modes.md](modes.md#completion-review).
+
 ## Exit codes
 
 The process exit code encodes why the run ended:
