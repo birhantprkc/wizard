@@ -758,7 +758,7 @@ impl Council {
 
         let options = SpawnOptions {
             model: Some(model.to_string()),
-            read_only: true,
+            scope: subagent::RunScope::ReadOnly,
             // The interrupt and the deadline are spawn's to enforce, and its
             // pane is spawn's to close. This used to be a biased `select!`
             // wrapped around the call, which is how a caller ends up guessing
@@ -1479,7 +1479,7 @@ pub async fn run(
 
 /// The tool set a candidate or judge gets.
 ///
-/// **Safety is not this function's job** — `SpawnOptions { read_only: true }` is
+/// **Safety is not this function's job** — `SpawnOptions`' read-only scope is
 /// what holds the no-write, no-recurse invariant: [`Tool::access`] defaults to
 /// [`ToolAccess::Execute`], so [`subagent::read_only_registry`] already strips
 /// `spawn_subagent`, `run_command`, `exit_plan`, `execute`, `write_file`,

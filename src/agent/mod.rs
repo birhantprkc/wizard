@@ -110,7 +110,7 @@ impl CritiqueContext {
         let task = critic::critic_task(goal, &self.ctx.cwd);
         let options = subagent::SpawnOptions {
             model: Some(self.model.clone()),
-            read_only: true,
+            scope: subagent::RunScope::ReadOnly,
             cancel: self.cancel.clone(),
             breaker: self.breaker.clone(),
             ..Default::default()
@@ -221,7 +221,11 @@ impl ForkContext {
         let run = subagent::next_run_id();
         let options = subagent::SpawnOptions {
             model: Some(self.model.clone()),
-            read_only: self.read_only,
+            scope: if self.read_only {
+                subagent::RunScope::ReadOnly
+            } else {
+                subagent::RunScope::Full
+            },
             inherited_history: None, // spawn_fork sets this itself
             // A fork is detached by definition: it runs alongside the main
             // conversation and reports back whenever it is done, so the turn

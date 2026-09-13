@@ -355,6 +355,38 @@ pub fn read_only_registry(parent: &ToolRegistry) -> ToolRegistry {
     registry
 }
 
+/// Keep the read-only tools of `parent` plus `execute`: a run that may look at
+/// the machine and run commands on it, and has no tool that writes a file.
+///
+/// What a reviewer needs. It has to be able to run the acceptance command the
+/// request states, and it must not be able to rewrite the thing it is judging.
+/// Not a sandbox: `execute` can redirect into a file like any shell, which is
+/// why the reviewer's prompt tells it to judge and not build. This narrowing
+/// removes the accident, not the ability.
+pub fn inspect_registry(parent: &ToolRegistry) -> ToolRegistry {
+    let mut registry = read_only_registry(parent);
+    if let Some(tool) = parent.get(EXECUTE_TOOL_NAME) {
+        registry.register(Arc::clone(tool));
+    }
+    registry
+}
+
+/// Name of the shell tool [`RunScope::Inspect`] keeps.
+const EXECUTE_TOOL_NAME: &str = "execute";
+
+/// How much of the parent's tool set a delegated run gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunScope {
+    /// Everything the definition's `tool_scope` allows.
+    #[default]
+    Full,
+    /// Read-only tools only: the run may look, not touch. Plan-mode
+    /// delegation.
+    ReadOnly,
+    /// Read-only tools plus `execute` (see [`inspect_registry`]).
+    Inspect,
+}
+
 /// Per-run overrides for [`spawn`].
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
@@ -362,8 +394,8 @@ pub struct SpawnOptions {
     /// active model. The parent passes its live model so `/model` switches
     /// apply.
     pub model: Option<String>,
-    /// Restrict the subagent to read-only tools (plan mode).
-    pub read_only: bool,
+    /// How much of the parent's tool set this run gets (see [`RunScope`]).
+    pub scope: RunScope,
     /// When set, seed the run from the parent conversation instead of a fresh
     /// system prompt + bare task. Used by [`spawn_fork`] (`/fork`): the side
     /// quest inherits history, tools, and prompt, then appends its brief.
@@ -401,7 +433,7 @@ impl Default for SpawnOptions {
     fn default() -> Self {
         Self {
             model: None,
-            read_only: false,
+            scope: RunScope::Full,
             inherited_history: None,
             cancel: None,
             deadline: Some(DEFAULT_DEADLINE),
@@ -779,8 +811,10 @@ async fn run_loop(
         .clone()
         .unwrap_or_else(|| loaded.active().model);
     let mut scoped = scoped_registry(registry, config.tool_scope.as_deref());
-    if options.read_only {
-        scoped = read_only_registry(&scoped);
+    match options.scope {
+        RunScope::Full => {}
+        RunScope::ReadOnly => scoped = read_only_registry(&scoped),
+        RunScope::Inspect => scoped = inspect_registry(&scoped),
     }
     let native_tools = crate::llm::provider::probe_native_tools(client.as_ref(), &model).await;
     if !native_tools {
@@ -1069,7 +1103,11 @@ impl Tool for SpawnSubagentTool {
         // actually made.
         let options = SpawnOptions {
             model: self.active_model(),
-            read_only: args.plan_mode,
+            scope: if args.plan_mode {
+                RunScope::ReadOnly
+            } else {
+                RunScope::Full
+            },
             cancel: if args.background {
                 None
             } else {
@@ -1477,6 +1515,46 @@ mod tests {
     }
 
     #[test]
+    fn inspect_registry_keeps_the_read_only_tools_and_execute() {
+        let mut parent = ToolRegistry::new();
+        parent.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "mutate",
+            access: ToolAccess::Edit,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: EXECUTE_TOOL_NAME,
+            access: ToolAccess::Execute,
+        }));
+        parent.register(Arc::new(FakeTool {
+            name: "other_side_effect",
+            access: ToolAccess::Execute,
+        }));
+
+        // A reviewer has to be able to run the request's own check, and must
+        // have no tool that rewrites what it is judging.
+        let filtered = inspect_registry(&parent);
+        assert!(filtered.get("probe").is_some());
+        assert!(filtered.get(EXECUTE_TOOL_NAME).is_some());
+        assert!(filtered.get("mutate").is_none());
+        assert!(filtered.get("other_side_effect").is_none());
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn inspect_registry_without_execute_is_just_the_read_only_set() {
+        let mut parent = ToolRegistry::new();
+        parent.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+        }));
+        assert_eq!(inspect_registry(&parent).len(), 1);
+    }
+
+    #[test]
     fn scoped_registry_selects_named_tools_and_skips_unknown() {
         let mut parent = ToolRegistry::new();
         parent.register(Arc::new(FakeTool {
@@ -1565,7 +1643,7 @@ mod tests {
 
         let options = SpawnOptions {
             model: Some("parent-active-model".to_string()),
-            read_only: false,
+            scope: RunScope::Full,
             ..Default::default()
         };
         let result = spawn(
