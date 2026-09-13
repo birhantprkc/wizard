@@ -50,6 +50,16 @@ fn defaults_match_docs() {
     assert!(config.gates.is_empty());
     assert_eq!(config.gate_max_attempts, 3);
     assert_eq!(config.gate_timeout_secs, 1_800);
+    // Unset, so the surface decides: reviewed headless, not reviewed in the TUI.
+    assert_eq!(config.completion_review, None);
+    assert!(crate::agent::critic::review_enabled(
+        config.completion_review,
+        false
+    ));
+    assert!(!crate::agent::critic::review_enabled(
+        config.completion_review,
+        true
+    ));
     assert_eq!(config.compact_threshold_bytes, 48_000);
     assert_eq!(config.max_context_tokens, 150_000);
     assert_eq!(config.prune_after_tokens, 32_000);
@@ -230,6 +240,7 @@ fn full_file_round_trips() {
         gates: vec!["cargo fmt --check".to_string(), "cargo test".to_string()],
         gate_max_attempts: 4,
         gate_timeout_secs: 600,
+        completion_review: Some(false),
         compact_threshold_bytes: 96_000,
         max_context_tokens: 200_000,
         prune_after_tokens: 64_000,
@@ -1367,6 +1378,25 @@ fn plan_flag_sets_plan_first() {
     };
     config.apply_cli(&cli(&[]));
     assert!(config.plan_first);
+}
+
+#[test]
+fn the_completion_review_flags_set_the_key_either_way() {
+    let mut config = Config::default();
+    config.apply_cli(&cli(&["--completion-review"]));
+    assert_eq!(config.completion_review, Some(true));
+
+    let mut config = Config::default();
+    config.apply_cli(&cli(&["--no-completion-review"]));
+    assert_eq!(config.completion_review, Some(false));
+
+    // Neither flag touches a key the config file already answered.
+    let mut config = Config {
+        completion_review: Some(true),
+        ..Config::default()
+    };
+    config.apply_cli(&cli(&[]));
+    assert_eq!(config.completion_review, Some(true));
 }
 
 #[test]

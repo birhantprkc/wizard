@@ -63,6 +63,7 @@ Sovereign mode is the autonomous, proactive agent. It runs headless for a single
 | `--max-hours 2` | Time limit for the run |
 | `--loop 10` | Max outer loop iterations |
 | `--gate "cargo test"` | A command that must exit 0 before the run may finish. Repeatable. See [Quality gates](#quality-gates) |
+| `--completion-review` / `--no-completion-review` | Review the claim of done for this run. On by default headless. See [Completion review](#completion-review) |
 | `--continuous` | Run perpetually, never stopping at "done" (implies sovereign). See below |
 | `--cwd /path/to/repo` | Set project root |
 
@@ -176,6 +177,70 @@ they have their own bound, and they obey `--max-hours` like everything else.
 | `gates` | `[]` | Gate commands applied to every sovereign/continuous run |
 | `gate_max_attempts` | `3` | Consecutive failing gate checks before the run gives up and reports failure; `0` is unlimited |
 | `gate_timeout_secs` | `1800` | Wall clock for one gate, additionally clamped to what is left of `--max-hours` |
+
+### Completion review
+
+The most common complaint about a coding agent is not that it fails. It is that
+it says it is finished and it is not: the file it was asked for was never
+written, or it was checked against the agent's own example instead of the thing
+the request named, or the server that made the check pass was torn down right
+after. A gate cannot catch that, because nobody writes a gate command for "serve
+this repo over HTTP".
+
+So on every headless, sovereign, continuous and scheduled run, the claim of done
+gets one review. A fresh subagent that never saw the run, and gets none of its
+reasoning or its summary, reads the request and the machine instead. Four things:
+restate the request and list what it names, check each named thing exists and is
+not empty, run the request's own acceptance path literally when it states one,
+and ask whether the answer still holds if the input changes. It has the read-only
+tools plus `execute`, so it can run the check; it has no tool that writes a file,
+so it cannot quietly finish the work itself.
+
+Then `PASS` and the run finishes, or `FAIL` and what is wrong goes back as one
+more turn. One more, not a conversation. A second reviewer over the first, or a
+third round of "it is done" / "no it is not", costs a model call each and finds
+less than the first pass did; whatever survives one round of specific feedback
+is not going to fall to another round of the same prompt.
+
+In continuous mode it runs per cycle and before the goal critic, which is the
+cheaper order: a cycle whose deliverable is missing is sent back without the
+critic being asked whether the mission goal is met. The two questions are
+different, and the review is the one that fails fast.
+
+Three things skip the review outright, so it never costs a call it cannot repay:
+
+- a turn that wrote no file and ran no command, which leaves nothing to check
+- a claim that has already had its review and its round of rework
+- less than a minute left on `--max-hours`, since a review killed halfway has
+  spent the run's last minute and reported nothing
+
+**Genie mode (the TUI) does not review by default.** You are reading the claim as
+it arrives and can say "no you didn't" yourself, and an extra model call per turn
+is your time and your money. `completion_review = true` turns it on there, with
+the same rules: the verdict arrives as a notice, and a failed review queues one
+rework turn.
+
+Cost is two model calls per claim, one to look and one to judge, on a fresh
+short context: the reviewer starts from the request and its own tool results,
+not from the run's grown history. That last part is what keeps it cheap, because
+the run's own calls get more expensive as its history grows and the review's do
+not. `bash bench/completion-review.sh` measures it against a scripted provider:
+
+| tool calls in the run | model calls | prompt characters |
+|---|---|---|
+| 4 | 5 to 7 (+40%) | 50478 to 55204 (+9%) |
+| 10 | 11 to 13 (+18%) | 119844 to 124572 (+4%) |
+| 20 | 21 to 23 (+10%) | 256524 to 261252 (+2%) |
+
+The review's own share is flat at about 4700 prompt characters however long the
+run was. A rework turn costs whatever that turn costs, and only happens on a
+`FAIL`.
+
+| Key (`~/.wizard/config.toml`) | Default | Effect |
+|-----|---------|--------|
+| `completion_review` | unset | Review the claim of done. Unset means on for headless, sovereign, continuous and scheduled runs, off in the TUI. `true` / `false` holds everywhere |
+
+`--completion-review` and `--no-completion-review` set it for one run.
 
 ## Continuous mode (perpetual sovereign)
 

@@ -582,22 +582,38 @@ pub async fn run_tui(
         if let Event::GoalCritiqued(verdict) = event {
             app.goal_inflight = false;
             app.goal_plateaus = match &verdict {
-                crate::agent::goal_critic::GoalVerdict::Plateau => app.goal_plateaus + 1,
+                crate::agent::critic::GoalVerdict::Plateau => app.goal_plateaus + 1,
                 _ => 0,
             };
-            match crate::agent::goal_critic::plan_after_verdict(&verdict, app.goal_plateaus) {
-                crate::agent::goal_critic::CriticAction::Accept => {
+            match crate::agent::critic::plan_after_verdict(&verdict, app.goal_plateaus) {
+                crate::agent::critic::CriticAction::Accept => {
                     app.notice("goal met: the independent critic signed off.");
                     app.active_goal = None;
                 }
-                crate::agent::goal_critic::CriticAction::Rework(prompt) => {
+                crate::agent::critic::CriticAction::Rework(prompt) => {
                     if app.active_goal.is_some() {
                         app.queue_goal_turn(prompt);
                     }
                 }
-                crate::agent::goal_critic::CriticAction::Stop(why) => {
+                crate::agent::critic::CriticAction::Stop(why) => {
                     app.notice(format!("goal loop stopped: {why}"));
                     app.active_goal = None;
+                }
+            }
+            continue;
+        }
+
+        if let Event::CompletionReviewed(verdict) = event {
+            app.review_inflight = false;
+            match crate::agent::critic::plan_after_review(&verdict, app.review_rounds) {
+                crate::agent::critic::ReviewAction::Accept => {
+                    // Either it passed, or the rework round is spent and the
+                    // claim stands. Both were announced by the notice the
+                    // review itself sent; nothing to add.
+                }
+                crate::agent::critic::ReviewAction::Rework(prompt) => {
+                    app.expected_review_rework = Some(prompt.clone());
+                    app.queue_prompt_turn(prompt);
                 }
             }
             continue;
@@ -1032,12 +1048,12 @@ pub async fn run_tui(
                             let notify = events.sender();
                             spawn_answering(
                                 notify.clone(),
-                                Event::GoalCritiqued(crate::agent::goal_critic::GoalVerdict::Bar(
+                                Event::GoalCritiqued(crate::agent::critic::GoalVerdict::Bar(
                                     "the goal critic crashed; judge the goal again".to_string(),
                                 )),
                                 async move {
                                     let verdict = ctx.critique(&goal).await.unwrap_or_else(|err| {
-                                        crate::agent::goal_critic::GoalVerdict::Bar(format!(
+                                        crate::agent::critic::GoalVerdict::Bar(format!(
                                             "the goal critic could not run ({err:#}); judge again"
                                         ))
                                     });
@@ -1052,6 +1068,12 @@ pub async fn run_tui(
                             );
                         }
                     }
+                    // Off in the TUI unless asked for: the user is reading
+                    // the claim as it arrives and can say so themselves, and
+                    // an extra model call per turn is their time and their
+                    // money. `completion_review = true` turns it on, and then
+                    // it works exactly as it does headless.
+                    maybe_review_completion(&mut app, &agent, &events);
                     agent_slot = Some(agent);
                     // The provider just served a turn, so any earlier health
                     // warning was transient — drop it so it self-heals.
@@ -1125,6 +1147,9 @@ pub async fn run_tui(
             app.active_goal = None;
             app.expected_goal_prompt = None;
             app.goal_turn_running = false;
+            // Same for a review's rework: the turn it was going to fix is gone.
+            app.expected_review_rework = None;
+            app.review_request = None;
             app.notice("interrupted");
             spawn_session_rebuild(
                 &mut app,
@@ -1262,6 +1287,17 @@ fn start_agent_turn(
         app.goal_turn_running = true;
         app.expected_goal_prompt = None;
     }
+    // What the completion review will judge this turn against, and what it
+    // counts as work. A turn starting on the review's own rework continues the
+    // claim already open; anything else is a new request, so the round count
+    // starts over.
+    app.review_effects_mark = agent.effects();
+    if app.expected_review_rework.as_deref() == Some(prompt.as_str()) {
+        app.expected_review_rework = None;
+    } else {
+        app.review_request = Some(prompt.clone());
+        app.review_rounds = 0;
+    }
     *agent_task = Some(tokio::spawn(async move {
         let fallback = agent_tx.clone();
         // The turn runs inside `catch_unwind` because the alternative is the
@@ -1297,6 +1333,66 @@ fn start_agent_turn(
         agent
     }));
     true
+}
+
+/// Start a completion review of the turn that just finished, when one is due.
+///
+/// Runs off the event loop, because a model call must not freeze the TUI: the
+/// verdict comes back as [`Event::CompletionReviewed`]. A reviewer that panics
+/// releases the latch with a `Pass`, which is the same standing a run with no
+/// review has. Nothing about the work is known either way at that point, and
+/// throwing away a turn over a second model call that fell over trades one
+/// wrong answer for another.
+fn maybe_review_completion(app: &mut App, agent: &Agent, events: &EventLoop) {
+    use crate::agent::critic;
+
+    let enabled = critic::review_enabled(app.config.completion_review, true);
+    let Some(request) = app.review_request.clone() else {
+        return;
+    };
+    // One judge per finished turn. A goal turn already has the critic looking
+    // at it, and two independent verifiers over the same turn is the stacking
+    // this design is built to avoid.
+    if app.review_inflight
+        || app.goal_inflight
+        || critic::plan_review(
+            enabled,
+            agent.effects().saturating_sub(app.review_effects_mark),
+            app.review_rounds,
+            None,
+        )
+        .is_err()
+    {
+        return;
+    }
+    app.review_rounds = app.review_rounds.saturating_add(1);
+    app.review_inflight = true;
+    let ctx = agent.critique_context(None);
+    let notify = events.sender();
+    spawn_answering(
+        notify.clone(),
+        Event::CompletionReviewed(critic::ReviewVerdict::Pass),
+        async move {
+            let verdict = match ctx.review(&request, None).await {
+                Ok(verdict) => verdict,
+                Err(err) => {
+                    let _ = notify
+                        .send(Event::Notice(format!(
+                            "completion review could not run ({err:#}); the claim was not checked"
+                        )))
+                        .await;
+                    return Some(Event::CompletionReviewed(critic::ReviewVerdict::Pass));
+                }
+            };
+            let _ = notify
+                .send(Event::Notice(format!(
+                    "completion review: {}",
+                    verdict.summary()
+                )))
+                .await;
+            Some(Event::CompletionReviewed(verdict))
+        },
+    );
 }
 
 /// Ensure a collector is pumping `AgentEvent`s into the main event loop while

@@ -122,6 +122,9 @@ pub struct Dispatcher {
     failure_streak: Option<(String, u32)>,
     /// Per-tool consecutive-failure counts (args ignored).
     tool_failures: ToolFailureCounter,
+    /// Calls that wrote a file or ran a command and actually happened. See
+    /// [`Self::effects`].
+    effects: u64,
 }
 
 /// What [`Dispatcher::dispatch`] tells the agent loop to do after one call.
@@ -177,6 +180,7 @@ impl Dispatcher {
             plan_mode,
             failure_streak: None,
             tool_failures: ToolFailureCounter::default(),
+            effects: 0,
         }
     }
 
@@ -198,6 +202,7 @@ impl Dispatcher {
             plan_mode: Arc::new(AtomicBool::new(false)),
             failure_streak: None,
             tool_failures: ToolFailureCounter::default(),
+            effects: 0,
         }
     }
 
@@ -220,6 +225,20 @@ impl Dispatcher {
     pub fn reset_failures(&mut self) {
         self.failure_streak = None;
         self.tool_failures.reset();
+    }
+
+    /// How many calls have written a file or run a command since this
+    /// dispatcher was built.
+    ///
+    /// Monotonic, so a caller reads it before and after the stretch it cares
+    /// about rather than resetting it. Two callers sharing one counter and each
+    /// clearing it is how one of them silently stops working.
+    ///
+    /// Read-only calls never count, and neither does a [`Grade::Fault`]: a call
+    /// that could not be carried out changed nothing on the machine, which is
+    /// the same question this counter answers.
+    pub fn effects(&self) -> u64 {
+        self.effects
     }
 
     /// Run one tool call through the pipeline.
@@ -390,6 +409,15 @@ impl Dispatcher {
         grade: Grade,
         sink: &Sink,
     ) -> DispatchOutcome {
+        if grade != Grade::Fault
+            && self
+                .registry
+                .get(name)
+                .is_some_and(|tool| tool.access() != ToolAccess::ReadOnly)
+        {
+            self.effects = self.effects.saturating_add(1);
+        }
+
         if !sink.tool_finished(name, &output).await {
             return DispatchOutcome::stopped();
         }
@@ -600,6 +628,116 @@ impl ToolFailureCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::FunctionCall;
+    use crate::tools::{Tool, ToolError};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    struct FakeTool {
+        name: &'static str,
+        access: ToolAccess,
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl Tool for FakeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake tool for dispatch tests"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        fn access(&self) -> ToolAccess {
+            self.access
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            if self.fails {
+                return Err(ToolError::Execution {
+                    tool: self.name.to_string(),
+                    source: anyhow::anyhow!("scripted failure"),
+                });
+            }
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
+
+    fn dir_for_hooks() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: json!({}),
+            },
+        }
+    }
+
+    /// What decides whether a finished run is worth reviewing: a turn that only
+    /// looked at things and then said it was done has nothing for a reviewer to
+    /// check, and a call that could not be made changed nothing either.
+    #[tokio::test]
+    async fn effects_count_writes_and_commands_and_nothing_else() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(FakeTool {
+            name: "probe",
+            access: ToolAccess::ReadOnly,
+            fails: false,
+        }));
+        registry.register(Arc::new(FakeTool {
+            name: "write",
+            access: ToolAccess::Edit,
+            fails: false,
+        }));
+        registry.register(Arc::new(FakeTool {
+            name: "run",
+            access: ToolAccess::Execute,
+            fails: false,
+        }));
+        registry.register(Arc::new(FakeTool {
+            name: "broken",
+            access: ToolAccess::Execute,
+            fails: true,
+        }));
+        let mut dispatcher = Dispatcher::new(
+            registry,
+            Mode::Sovereign,
+            Arc::new(HookEngine::new(
+                Vec::new(),
+                dir_for_hooks(),
+                "dispatch-test".to_string(),
+            )),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let dir = std::env::temp_dir();
+        let ctx = ToolContext::new(&dir);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        // Keep the channel drained; a full one would stop the turn.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sink = Sink::Turn(tx);
+
+        assert_eq!(dispatcher.effects(), 0);
+        dispatcher.dispatch(&call("probe"), &ctx, &sink).await;
+        assert_eq!(dispatcher.effects(), 0, "reading is not doing");
+        dispatcher.dispatch(&call("broken"), &ctx, &sink).await;
+        assert_eq!(
+            dispatcher.effects(),
+            0,
+            "a call that could not be carried out changed nothing"
+        );
+        dispatcher.dispatch(&call("write"), &ctx, &sink).await;
+        dispatcher.dispatch(&call("run"), &ctx, &sink).await;
+        assert_eq!(dispatcher.effects(), 2);
+    }
 
     #[test]
     fn tool_failures_nudge_then_trip() {
