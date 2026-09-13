@@ -4,6 +4,55 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
+## [3.2.0] - 2026-09-13
+
+### Added
+
+- **A run with a deadline can see the clock.** `--max-hours`, a scheduled run's
+  limit and a fleet worker's cap were all silent kill switches: the model was
+  never told, so a 15-minute job would still be exploring when it was cut off,
+  sometimes without having written the file it was asked for. Each step of a
+  timed run now carries one line saying how much time is left. Past 60% it says
+  to get the deliverable on disk and improve it in place rather than start new
+  work; past 85% it says the run stops when the clock does. Either late note
+  names the output paths the request asked for that do not exist yet. A session
+  with no deadline, which includes every interactive one, is unchanged and
+  carries no note. Thresholds are `time_wrap_up_at` and `time_finish_at`. See
+  [Modes](docs/modes.md).
+- **A headless run reviews its own claim of done.** "It said it was finished and
+  it wasn't" is the common complaint about autonomous agents, and the cause is
+  usually that the agent checked its own example rather than the thing it was
+  asked for. When a headless or sovereign run reports done, a reviewer with no
+  history of the work restates the request, checks that everything it named
+  exists, runs the request's own acceptance command literally, and tries a second
+  case the request also covers. A failure sends one round of specific feedback
+  back, then the claim lands with a notice. One review, one rework: stacking more
+  makes results worse. It is skipped when the run wrote nothing and ran nothing.
+  On in headless runs, off in the terminal where you are watching;
+  `completion_review` or `--completion-review` changes either. See
+  [Modes](docs/modes.md).
+- **`xhigh` reasoning effort.** Grok 4.6 takes four levels; `/effort` offered
+  three.
+
+### Fixed
+
+- **xAI requests carried no prompt cache key, so almost nothing was cached.**
+  xAI's cache is per server and a key is what routes a conversation back to the
+  same one. Wizard had the field and sent it only to OpenAI. Measured on the same
+  prompt prefix: 8.9% of input tokens cached without it, 97.2% with it, and
+  cached input reads at a quarter of the price.
+- **A run kept working after its deadline.** The clock was only read between
+  steps, so a reply already streaming finished and every tool call in it ran.
+  The deadline now cancels the call in flight.
+- **A fleet worker was never told its own time cap.** `[fleet] max_minutes`
+  killed workers from outside without ever giving them a deadline.
+
+### Changed
+
+- **Shrinking old tool results now prices a rewrite against the cache it
+  invalidates.** Rewriting the head of a conversation throws away every cached
+  token after it, which on xAI can cost more than the tokens it saves.
+
 ## [3.1.2] - 2026-09-12
 
 ### Added
