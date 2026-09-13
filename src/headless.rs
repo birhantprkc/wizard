@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    Agent, AgentEvent, DoneReason, LoopControl, build_headless_agent, clear_loop_control,
-    goal_critic, mission, read_loop_control,
+    Agent, AgentEvent, DoneReason, LoopControl, build_headless_agent, clear_loop_control, critic,
+    mission, read_loop_control,
 };
 use crate::cli::Cli;
 use crate::config::Config;
@@ -790,7 +790,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // Consecutive `PLATEAU` verdicts from the goal critic. Two in a row end a
     // continuous run: the critic can name no gap another round would close, so
     // there is nothing left for the loop to do but report it (see
-    // `crate::agent::goal_critic`).
+    // `crate::agent::critic`).
     let mut plateau_streak: u32 = 0;
     // Raised by SIGTERM/SIGHUP/SIGINT. The handler also cancels the turn in
     // flight, so this is read at the boundary to stop the *next* cycle from
@@ -979,16 +979,14 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                 ));
                                             }
                                             plateau_streak = match &verdict {
-                                                goal_critic::GoalVerdict::Plateau => {
-                                                    plateau_streak + 1
-                                                }
+                                                critic::GoalVerdict::Plateau => plateau_streak + 1,
                                                 _ => 0,
                                             };
-                                            match goal_critic::plan_after_verdict(
+                                            match critic::plan_after_verdict(
                                                 &verdict,
                                                 plateau_streak,
                                             ) {
-                                                goal_critic::CriticAction::Accept => {
+                                                critic::CriticAction::Accept => {
                                                     // Verified done: record the
                                                     // cycle and self-direct the
                                                     // next action. Never idle.
@@ -1017,7 +1015,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     };
                                                     input = continuation_prompt(&goal, cycles);
                                                 }
-                                                goal_critic::CriticAction::Rework(prompt) => {
+                                                critic::CriticAction::Rework(prompt) => {
                                                     // Not done. The cycle does
                                                     // not land; the builder gets
                                                     // the one gap and tries
@@ -1036,7 +1034,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     );
                                                     input = prompt;
                                                 }
-                                                goal_critic::CriticAction::Stop(why) => {
+                                                critic::CriticAction::Stop(why) => {
                                                     if text_mode {
                                                         spinner.println(&format!(
                                                             "[goal loop stopping: {why}]"

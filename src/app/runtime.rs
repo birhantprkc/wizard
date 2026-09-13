@@ -582,20 +582,20 @@ pub async fn run_tui(
         if let Event::GoalCritiqued(verdict) = event {
             app.goal_inflight = false;
             app.goal_plateaus = match &verdict {
-                crate::agent::goal_critic::GoalVerdict::Plateau => app.goal_plateaus + 1,
+                crate::agent::critic::GoalVerdict::Plateau => app.goal_plateaus + 1,
                 _ => 0,
             };
-            match crate::agent::goal_critic::plan_after_verdict(&verdict, app.goal_plateaus) {
-                crate::agent::goal_critic::CriticAction::Accept => {
+            match crate::agent::critic::plan_after_verdict(&verdict, app.goal_plateaus) {
+                crate::agent::critic::CriticAction::Accept => {
                     app.notice("goal met: the independent critic signed off.");
                     app.active_goal = None;
                 }
-                crate::agent::goal_critic::CriticAction::Rework(prompt) => {
+                crate::agent::critic::CriticAction::Rework(prompt) => {
                     if app.active_goal.is_some() {
                         app.queue_goal_turn(prompt);
                     }
                 }
-                crate::agent::goal_critic::CriticAction::Stop(why) => {
+                crate::agent::critic::CriticAction::Stop(why) => {
                     app.notice(format!("goal loop stopped: {why}"));
                     app.active_goal = None;
                 }
@@ -1032,12 +1032,12 @@ pub async fn run_tui(
                             let notify = events.sender();
                             spawn_answering(
                                 notify.clone(),
-                                Event::GoalCritiqued(crate::agent::goal_critic::GoalVerdict::Bar(
+                                Event::GoalCritiqued(crate::agent::critic::GoalVerdict::Bar(
                                     "the goal critic crashed; judge the goal again".to_string(),
                                 )),
                                 async move {
                                     let verdict = ctx.critique(&goal).await.unwrap_or_else(|err| {
-                                        crate::agent::goal_critic::GoalVerdict::Bar(format!(
+                                        crate::agent::critic::GoalVerdict::Bar(format!(
                                             "the goal critic could not run ({err:#}); judge again"
                                         ))
                                     });

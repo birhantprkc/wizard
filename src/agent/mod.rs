@@ -7,9 +7,9 @@
 
 pub mod breaker;
 pub mod context;
+pub mod critic;
 pub mod drafts;
 mod event;
-pub mod goal_critic;
 pub mod mission;
 pub mod prompts;
 mod retry;
@@ -105,9 +105,9 @@ impl CritiqueContext {
     /// Run a fresh critic over the current artifact and return its verdict on
     /// `goal`. See [`Agent::critique_goal`] for the semantics; this is the
     /// snapshot form for callers that are out of the agent's slot.
-    pub async fn critique(&self, goal: &str) -> Result<goal_critic::GoalVerdict> {
-        let config = goal_critic::critic_config();
-        let task = goal_critic::critic_task(goal, &self.ctx.cwd);
+    pub async fn critique(&self, goal: &str) -> Result<critic::GoalVerdict> {
+        let config = critic::critic_config();
+        let task = critic::critic_task(goal, &self.ctx.cwd);
         let options = subagent::SpawnOptions {
             model: Some(self.model.clone()),
             read_only: true,
@@ -126,14 +126,12 @@ impl CritiqueContext {
             &self.ctx,
         )
         .await?;
-        Ok(
-            goal_critic::parse_verdict(&result.output).unwrap_or_else(|| {
-                goal_critic::GoalVerdict::Bar(
+        Ok(critic::parse_verdict(&result.output).unwrap_or_else(|| {
+            critic::GoalVerdict::Bar(
                 "the critic did not return a clear OURS/BAR/PLATEAU verdict; judge the goal again"
                     .to_string(),
             )
-            }),
-        )
+        }))
     }
 }
 
@@ -1408,9 +1406,9 @@ impl Agent {
     /// builder's turn: the independence the verdict rests on is structural, not
     /// a promise in a prompt. It is read-only — it inspects and rules, it does
     /// not touch the tree. An unclear reply is read as "judge again"
-    /// ([`goal_critic::GoalVerdict::Bar`]), never as a pass, so a critic that
+    /// ([`critic::GoalVerdict::Bar`]), never as a pass, so a critic that
     /// mumbles cannot wave work through.
-    pub async fn critique_goal(&self, goal: &str) -> Result<goal_critic::GoalVerdict> {
+    pub async fn critique_goal(&self, goal: &str) -> Result<critic::GoalVerdict> {
         self.critique_context(None).critique(goal).await
     }
 

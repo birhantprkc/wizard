@@ -3857,7 +3857,7 @@ impl App {
     /// Queue the first working turn for a freshly set `/goal`, and arm the
     /// critic-gated loop: the goal becomes the standing one, and when this
     /// turn finishes an independent critic judges it (see
-    /// [`crate::agent::goal_critic`]). The prompt lands in the transcript and
+    /// [`crate::agent::critic`]). The prompt lands in the transcript and
     /// the message queue, so the main loop's post-command drain starts it when
     /// the agent is idle, or right after the current turn otherwise.
     pub fn queue_goal_kickoff(&mut self, goal: &str) {
