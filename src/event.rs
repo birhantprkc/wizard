@@ -81,6 +81,11 @@ pub enum Event {
     /// rework turn, a second `PLATEAU` stops and reports. See
     /// [`crate::agent::critic`].
     GoalCritiqued(crate::agent::critic::GoalVerdict),
+    /// The completion review finished judging a turn's claim of done. Off by
+    /// default in the TUI; `completion_review = true` turns it on. `PASS` is
+    /// silent bar a notice, `FAIL` queues one rework turn. See
+    /// [`crate::agent::critic`].
+    CompletionReviewed(crate::agent::critic::ReviewVerdict),
     /// Terminal input has ended and will never resume: stdin closed, the pty
     /// was detached, or the reader gave up on a stream that only produces
     /// errors. Carries a short reason for the farewell notice.

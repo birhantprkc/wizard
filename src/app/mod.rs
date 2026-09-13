@@ -442,6 +442,23 @@ pub struct App {
     pub goal_inflight: bool,
     /// Consecutive `PLATEAU` verdicts in this loop; two in a row stop it.
     pub goal_plateaus: u32,
+    /// The request the in-flight turn is answering, kept for the completion
+    /// review. The user's own words, not a summary of them: the agent's
+    /// reading of the request is the thing under review.
+    pub review_request: Option<String>,
+    /// The exact next prompt that is the review's own rework, armed when one is
+    /// queued. A turn starting on it continues the same claim, same request and
+    /// same round count, instead of opening a new one. Matching on the text,
+    /// like `expected_goal_prompt`, keeps a user's own message queued ahead of
+    /// it from being mistaken for the rework.
+    pub expected_review_rework: Option<String>,
+    /// True while a completion review is judging, so nothing starts a second.
+    pub review_inflight: bool,
+    /// Reviews spent on the claim being judged. Reset when one lands.
+    pub review_rounds: u32,
+    /// The agent's effect count as of the last claim that landed, so a turn
+    /// that wrote nothing and ran nothing is not reviewed.
+    pub review_effects_mark: u64,
     /// Set by `/fork <task>`; the main loop detaches a side quest that inherits
     /// the full conversation (so it works mid-turn too). Cleared once spawned.
     pub pending_fork: Option<String>,
@@ -592,6 +609,11 @@ impl App {
             active_goal: None,
             expected_goal_prompt: None,
             goal_turn_running: false,
+            review_request: None,
+            expected_review_rework: None,
+            review_inflight: false,
+            review_rounds: 0,
+            review_effects_mark: 0,
             goal_inflight: false,
             goal_plateaus: 0,
             pending_fork: None,
@@ -2753,7 +2775,8 @@ impl App {
             | Event::ProviderHealthFailed(_)
             | Event::StarterPrompts(_)
             | Event::BtwFinished
-            | Event::GoalCritiqued(_) => Ok(None),
+            | Event::GoalCritiqued(_)
+            | Event::CompletionReviewed(_) => Ok(None),
         }
     }
 
@@ -3886,6 +3909,22 @@ impl App {
             return;
         }
         self.expected_goal_prompt = Some(prompt.clone());
+        self.record_prompt(prompt.clone());
+        self.message_queue
+            .push_back(crate::commands::Preprocessed::text_only(prompt));
+    }
+
+    /// Queue one agent turn on `prompt`, with nothing armed on it. Used by the
+    /// completion review's rework. No-op with a warning if the queue is full,
+    /// so the rework is never silently lost.
+    pub fn queue_prompt_turn(&mut self, prompt: String) {
+        if self.message_queue.len() >= MESSAGE_QUEUE_CAP {
+            self.notice(format!(
+                "the message queue is full ({MESSAGE_QUEUE_CAP}): the review's rework will not \
+                 auto-start; send a message once a turn finishes"
+            ));
+            return;
+        }
         self.record_prompt(prompt.clone());
         self.message_queue
             .push_back(crate::commands::Preprocessed::text_only(prompt));
