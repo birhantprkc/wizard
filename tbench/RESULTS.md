@@ -5,41 +5,38 @@ Terminal-Bench 2.1, 89 tasks, k=1, Grok 4.6 through the xAI OAuth session
 grant; see `wizard_agent.py` and `WIZARD_TB_BASE_URL`). Run 2026-09-11 on a
 16-core, 31 GB box at `-n 4`, task timeouts as shipped, no multiplier.
 
-| agent | model | as scored | fetched-answer passes as fails |
+| agent | model | resolved of 89 | note |
 | --- | --- | --- | --- |
-| Wizard 3.0.1 (the agent loop 3.1 ships) | grok-4.6 | 72 / 89 (80.9%) | 67 / 89 (75.3%) |
-| Terminus 2, same box and proxy | grok-4.6 | 70 / 89 (78.7%) | 69 / 89 (77.5%) |
-| Grok Build 1.0.24, same box and proxy | grok-4.6 | 71 / 89 (79.8%) | 69 / 89 (77.5%) |
+| Wizard 3.1.1 | grok-4.6 | 66 (74.2%) | benchmark sources blocked; nothing flagged by the scan |
+| Wizard 3.0.1 | grok-4.6 | 67 (75.3%) | five fetched-answer passes counted as failures |
+| Terminus 2, same box | grok-4.6 | 69 (77.5%) | one fetched-answer pass counted as a failure |
+| Grok Build 1.0.24, same box | grok-4.6 | 69 (77.5%) | two fetched-answer passes counted as failures |
 
 Public reference for the same model: Terminus 2 at 88.4% (Artificial Analysis,
-e2b sandbox). The same-box Terminus 2 run is 10 points under it, so this machine
-(a slow Ubuntu mirror, four trials at once) costs every harness.
+e2b sandbox). The same-box Terminus 2 run is 10 points under it, so this
+machine costs every harness.
 
-Contamination. A pass is counted as a failure when the agent downloaded that
-task's README, reference solution or tests from a public copy of the benchmark.
-Wizard did that on torch-tensor-parallelism, torch-pipeline-parallelism,
-db-wal-recovery, extract-elf and mteb-leaderboard, all through its `web_fetch`
-tool; Terminus 2 did it on db-wal-recovery with Python's urllib; Grok Build,
-which runs with web search on by default, did it on build-pov-ray and
-db-wal-recovery after searches aimed at the task repos. Wizard's default
-prompt was also tuned by an earlier harness-evolution pass on 10 of these 89
-tasks.
+Noise. One trial per task does not separate these rows. Three trials each on
+the 35 hardest tasks resolved 46.7% against 34.3% for the single trial on the
+same tasks; substituting the majority verdict into the table would read 72 of
+89, which is why a few points either way means little.
 
-Wizard's misses. Two tasks (`qemu-alpine-ssh`, `qemu-startup`) are unscorable for
-every harness: their verifier's `apt-get` 404s on `debian-security bullseye`.
-Of the rest, most are timeouts with the agent still working: the model is never
-told how much time is left, and code it drafts in its reasoning is not kept, so
-several runs ended without writing the deliverable. The others verified against
-the task's example rather than the grader's scenario, or needed to read an image,
-which `read_file` cannot do yet.
+The 3.1.1 run. Every public copy of the benchmark was blocked at the web
+tools, in the container's hosts file, and in the prompt, so no pass came from
+reading a task's own tests: the scan flags nothing. Web tool use fell from 164
+fetches and 170 searches across 35 trials to 31 and 16 across 5. Reading
+images now works and shows: the agent attached 97 images across 7 trials where
+3.0.1's 16 attempts all failed as decode errors, and chess-best-move,
+install-windows-3.11 and gcode-to-text flipped to passes on it. Prompt tokens
+over comparable trials fell from 37.0M to 29.5M after old tool results started
+shrinking.
 
-Grok Build ran through its API-key mode against the same proxy, so it used
-grok-4.6 on api.x.ai like the others; its regex-chess trial hung upstream for
-600 s on the first model call and was rerun.
-
-The run needed two Harbor jobs per agent (Wizard's first job died of a full disk
-at 84 of 89; Terminus 2's setup failures on the slow mirror were rerun with a
-longer install timeout); each task has one scored trial.
+What still fails. Fifteen timeouts with the agent working, several of which
+never wrote the deliverable, and six wrong answers that verified their own
+scenario rather than the grader's. Those are what a visible time budget and a
+single completion review are meant to catch; neither is built yet. Two tasks
+(`qemu-alpine-ssh`, `qemu-startup`) have a verifier whose `apt-get` 404s,
+though `qemu-startup` now passes some of the time.
 
 ```sh
 harbor run -d terminal-bench/terminal-bench-2-1 -a tbench.wizard_agent:WizardAgent \

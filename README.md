@@ -45,15 +45,15 @@ The first run is one screen: sign in with xAI or ChatGPT, paste an API key, or r
 ## Terminal-Bench
 
 <!-- BENCH:tbench -->
-| agent | model | as scored | with fetched-answer passes counted as fails |
-|---|---|---:|---:|
-| wizard 3.1 | Grok 4.6 | 72 of 89 (80.9%) | 67 of 89 (75.3%) |
-| Terminus 2, same box and proxy | Grok 4.6 | 70 of 89 (78.7%) | 69 of 89 (77.5%) |
-| Grok Build 1.0.24, same box and proxy | Grok 4.6 | 71 of 89 (79.8%) | 69 of 89 (77.5%) |
-| Terminus 2, public reference (Artificial Analysis, on e2b) | Grok 4.6 | 88.4% | |
+| agent | model | resolved of 89 |
+|---|---|---:|
+| wizard 3.1.1 | Grok 4.6 | 66 (74.2%) |
+| Terminus 2, same box | Grok 4.6 | 69 (77.5%) |
+| Grok Build 1.0.24, same box | Grok 4.6 | 69 (77.5%) |
+| Terminus 2, public reference (Artificial Analysis, on e2b) | Grok 4.6 | 88.4% |
 <!-- /BENCH -->
 
-Run 2026-09-11 with Harbor, one trial per task, all three agents on the same machine through the same token proxy, via the [`tbench/`](tbench/README.md) adapter. Five of wizard's passes came after its web tools downloaded that task's tests, reference solution or README from a public copy of the benchmark, one of Terminus 2's did, and two of Grok Build's did (it runs with web search on by default); the right column counts those as failures, and it is the number to quote. With one trial per task, a two-task spread is noise. Wizard's default prompt was also tuned on 10 of the 89 tasks. What went wrong on the rest, and what is being changed, is in [`tbench/RESULTS.md`](tbench/RESULTS.md).
+Run 2026-09-12 with Harbor, one trial per task, through the [`tbench/`](tbench/README.md) adapter. Wizard's run had every public copy of the benchmark blocked, so no pass came from reading a task's own tests; the two same-box control rows are earlier runs with their fetched-answer passes counted as failures. One trial per task is noisy: three tries each on the 35 hardest tasks resolved 46.7% where a single try resolved 34.3%. Wizard's default prompt was also tuned on 10 of the 89 tasks. The per-task list, every failure's reason, and what is being changed are in [`tbench/RESULTS.md`](tbench/RESULTS.md).
 
 ## Also
 
