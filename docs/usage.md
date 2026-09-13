@@ -566,7 +566,7 @@ which rate was used, in this order of precedence:
 
 Cached tokens are priced at the vendor's published cached-input rate, which
 is nowhere near uniform: Anthropic and OpenAI discount a cache read to 0.1x
-input, xAI to 0.15x–0.2x depending on the model, and DeepSeek's disk cache to
+input, xAI to 0.15x–0.25x depending on the model, and DeepSeek's disk cache to
 about 0.008x. Where a vendor publishes no cached rate — or says caching is not
 supported on that model at all, as Groq does for `llama-3.3-70b-versatile` — a
 cache read is priced as fresh input rather than at a guessed discount, since
@@ -662,6 +662,29 @@ A pass rewrites nothing unless it reclaims at least 16k characters, since
 rewriting the middle of a history costs the provider's cached prefix from
 that point on. Nothing is lost: the session JSONL is append-only and still
 holds every result in full, which is what the elided line points at.
+
+### Keeping the cached prefix warm
+
+OpenAI and xAI both take a `prompt_cache_key` on a chat request. It does not
+turn caching on — both caches are automatic — it says which conversation the
+request belongs to, so the turn is routed back to the machine that already
+holds its prefix. xAI's cache is per server, and xAI's own grok-4.6 page is
+blunt about what happens without one: "you often pay full input price on a
+cache-cold server". At grok-4.6's rates that is $2.00 per million input tokens
+instead of $0.50.
+
+Wizard sends it to both endpoints, and to nothing else: a key is a field a
+strict server can reject, so it goes only where the endpoint documents it.
+The key is a short digest of the leading system messages and the model tag,
+which makes it stable for the life of a session and different for another
+project, mode or model. Mid-history system notes (a tool-failure nudge, a
+subagent report) are deliberately left out of the digest — they are not part
+of the prefix the server caches, and folding them in would re-key the session
+the first time a tool failed.
+
+The other half is not rewriting what is already cached, which is why the
+tool-result pass above has a floor and why the `[context pressure]` line is
+appended as the last message rather than spliced into the system prompt.
 
 ### Drafts from reasoning
 
