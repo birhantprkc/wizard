@@ -38,8 +38,11 @@ planning and synthesis turns drive a real in-process agent); `status` and
      summary (the `--output-format json` object from stdout) are written to
      `results/<id>.json`, and the slot's worktree is reused for the next
      queued task.
-   - **watchdog**: a child running past `[fleet] max_minutes` is killed and
-     recorded as timed out.
+   - **watchdog**: a child running past `[fleet] max_minutes` plus 30 seconds
+     is killed and recorded as timed out. The worker is started with
+     `--max-hours max_minutes`, so it sees the cap on every step and normally
+     stops itself first (see [The clock](modes.md#the-clock)); the kill is the
+     backstop for one that did not.
    - **heartbeat**: `.wizard/fleet/heartbeat` is touched every tick.
    - **stop**: a `stop` sentinel (written by `wizard fleet stop`) or ctrl-c
      kills the children, marks `fleet.toml` stopped, and skips synthesis.
@@ -116,7 +119,8 @@ sentinel.
 
 ```toml
 [fleet]
-max_minutes = 30   # per-worker wall-clock cap; the watchdog kills past it
+max_minutes = 30   # per-worker wall-clock cap; the worker gets it as --max-hours
+                   # and the watchdog kills 30s past it
 synthesize = true  # false: skip the merge turn, just print branches + table
 ```
 
