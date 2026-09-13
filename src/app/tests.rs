@@ -5290,3 +5290,44 @@ fn the_health_line_names_the_fix() {
         "cannot reach api.x.ai"
     );
 }
+
+#[test]
+fn a_drag_copy_leaves_the_transcript_gutter_behind_in_every_skin() {
+    // Drag from the screen edge across a notice and a wrapped reply. Each skin
+    // puts a different marker or rail in front of the text; none of it, and
+    // none of the blank columns under it, belongs in the clipboard.
+    for skin in [
+        crate::skin::Skin::Wizard,
+        crate::skin::Skin::Codex,
+        crate::skin::Skin::Grok,
+    ] {
+        let _skin = crate::skin::pin(skin);
+        let theme = Arc::new(theme::load(skin.companion_theme()).expect("companion theme loads"));
+        let _theme = theme::pin(theme);
+        let mut app = themed_fixture();
+        app.transcript.assistant(
+            "First paragraph of the reply that is long enough to wrap around onto a second \
+             row of the screen for sure."
+                .to_string(),
+        );
+        let backend = ratatui::backend::TestBackend::new(92, 60);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row = (0..buf.area.height)
+            .find(|&y| row_text(&buf, y).contains("First paragraph"))
+            .expect("the reply is on screen");
+        let selection = Selection {
+            anchor: (0, row),
+            head: (40, row + 1),
+            dragging: false,
+        };
+        let text = crate::ui::selection_text(&buf, &selection, &app.text_origins.borrow());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("First paragraph") && !lines[1].starts_with(' '),
+            "{} copied a gutter:\n{text}",
+            skin.key()
+        );
+    }
+}

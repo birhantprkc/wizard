@@ -35,7 +35,7 @@ fn selection_on_one_row_includes_the_head_cell() {
     let rows = selection_rows(&sel((1, 0), (3, 0)), 6, 3);
     assert_eq!(rows, vec![(0, 1, 4)]);
     assert_eq!(
-        selection_text(&sample_buffer(), &sel((1, 0), (3, 0))),
+        selection_text(&sample_buffer(), &sel((1, 0), (3, 0)), &[]),
         "bcd"
     );
 }
@@ -43,8 +43,8 @@ fn selection_on_one_row_includes_the_head_cell() {
 #[test]
 fn selection_orders_endpoints_regardless_of_drag_direction() {
     // Dragging up-and-left yields the same span as down-and-right.
-    let forward = selection_text(&sample_buffer(), &sel((1, 0), (2, 2)));
-    let backward = selection_text(&sample_buffer(), &sel((2, 2), (1, 0)));
+    let forward = selection_text(&sample_buffer(), &sel((1, 0), (2, 2)), &[]);
+    let backward = selection_text(&sample_buffer(), &sel((2, 2), (1, 0)), &[]);
     assert_eq!(forward, backward);
     assert_eq!(forward, "bcdef\nghi\njkl");
 }
@@ -52,7 +52,7 @@ fn selection_orders_endpoints_regardless_of_drag_direction() {
 #[test]
 fn selection_trims_trailing_blanks_per_row() {
     // Middle row "ghi" padded to width 6; the blanks must not be copied.
-    let text = selection_text(&sample_buffer(), &sel((0, 1), (5, 1)));
+    let text = selection_text(&sample_buffer(), &sel((0, 1), (5, 1)), &[]);
     assert_eq!(text, "ghi");
 }
 
@@ -67,7 +67,7 @@ fn selection_strips_the_gutter_indent_shared_by_every_row() {
     buf.set_string(0, 1, "  world", Style::default());
     buf.set_string(0, 2, "    nest", Style::default());
     assert_eq!(
-        selection_text(&buf, &sel((0, 0), (9, 2))),
+        selection_text(&buf, &sel((0, 0), (9, 2)), &[]),
         "hello\nworld\n  nest"
     );
 }
@@ -79,7 +79,10 @@ fn selection_keeps_indent_that_is_not_shared() {
     let mut buf = Buffer::empty(Rect::new(0, 0, 8, 2));
     buf.set_string(0, 0, "hello", Style::default());
     buf.set_string(0, 1, "  world", Style::default());
-    assert_eq!(selection_text(&buf, &sel((0, 0), (7, 1))), "hello\n  world");
+    assert_eq!(
+        selection_text(&buf, &sel((0, 0), (7, 1)), &[]),
+        "hello\n  world"
+    );
 }
 
 #[test]
@@ -87,7 +90,7 @@ fn a_one_line_selection_keeps_its_own_indent() {
     // Nothing to compare against, so the spaces might be code. Leave them.
     let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
     buf.set_string(0, 0, "    foo()", Style::default());
-    assert_eq!(selection_text(&buf, &sel((0, 0), (9, 0))), "    foo()");
+    assert_eq!(selection_text(&buf, &sel((0, 0), (9, 0)), &[]), "    foo()");
 }
 
 #[test]
@@ -98,7 +101,10 @@ fn selection_does_not_grow_a_gutter_on_continuation_rows() {
     let mut buf = Buffer::empty(Rect::new(0, 0, 10, 2));
     buf.set_string(0, 0, "  hello", Style::default());
     buf.set_string(0, 1, "  world", Style::default());
-    assert_eq!(selection_text(&buf, &sel((2, 0), (9, 1))), "hello\nworld");
+    assert_eq!(
+        selection_text(&buf, &sel((2, 0), (9, 1)), &[]),
+        "hello\nworld"
+    );
 }
 
 #[test]
@@ -1619,4 +1625,25 @@ fn an_error_notice_leads_with_the_glyph() {
     let screen = render(&app).join("\n");
     assert!(screen.contains("✗ provider said no"), "{screen}");
     assert!(!screen.contains("error:"), "{screen}");
+}
+
+#[test]
+fn selection_skips_the_gutter_left_of_each_rows_text_origin() {
+    // An assistant block: a `· ` marker on the first row, two blank columns
+    // under it, all behind a one-column margin. Counting spaces saw a shared
+    // indent of one, so every row after the first pasted two spaces in.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 12, 3));
+    buf.set_string(0, 0, " · hello", Style::default());
+    buf.set_string(0, 1, "   world", Style::default());
+    buf.set_string(0, 2, "     code", Style::default());
+    let origins = [(0, 3), (1, 3), (2, 3)];
+    assert_eq!(
+        selection_text(&buf, &sel((0, 0), (11, 2)), &origins),
+        "hello\nworld\n  code"
+    );
+    // One row dragged from the edge loses its gutter too.
+    assert_eq!(
+        selection_text(&buf, &sel((0, 1), (11, 1)), &origins),
+        "world"
+    );
 }

@@ -766,7 +766,11 @@ pub async fn run_tui(
                         // whether the terminal is actually gone.
                         let drawn = terminal.draw(|frame| {
                             crate::ui::draw(frame, &app);
-                            text = crate::ui::selection_text(frame.buffer_mut(), &selection);
+                            text = crate::ui::selection_text(
+                                frame.buffer_mut(),
+                                &selection,
+                                &app.text_origins.borrow(),
+                            );
                         });
                         if let Err(err) = drawn {
                             app.notice(format!("could not read the selection: {err}"));

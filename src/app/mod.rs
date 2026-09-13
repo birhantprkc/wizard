@@ -275,6 +275,11 @@ pub struct App {
     /// [`crate::ui::draw`] every frame (hence the interior mutability: draw
     /// takes `&App`) and emptied while an overlay covers the transcript.
     pub card_hits: std::cell::RefCell<Vec<(u16, usize)>>,
+    /// Where the text starts on each transcript row of the last-drawn frame,
+    /// as `(row, column)`. Everything left of it is gutter (margin, marker,
+    /// rail), so a drag-copy skips those cells. Rebuilt every frame like
+    /// `card_hits`, and empty while an overlay covers the transcript.
+    pub text_origins: std::cell::RefCell<Vec<(u16, u16)>>,
     /// What this terminal can draw an image with, and every image it has drawn
     /// recently. Starts at the half-block floor so a frame can be rendered
     /// before anything has asked the terminal; `run_tui` replaces it with
@@ -545,6 +550,7 @@ impl App {
             peek_lines: Vec::new(),
             selection: None,
             card_hits: std::cell::RefCell::new(Vec::new()),
+            text_origins: std::cell::RefCell::new(Vec::new()),
             images: std::cell::RefCell::new(ImageCache::fallback()),
             should_quit: false,
             tick: 0,

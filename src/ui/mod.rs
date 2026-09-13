@@ -137,10 +137,15 @@ pub(super) fn warning() -> Style {
 /// of them. The shared parts (the transcript blocks, the pickers, the diff
 /// sidebar, a subagent pane) are helpers all three call.
 pub fn draw(frame: &mut Frame, app: &App) {
+    app.text_origins.borrow_mut().clear();
     match skin::active() {
         skin::Skin::Codex => codex::draw(frame, app),
         skin::Skin::Grok => grok::draw(frame, app),
         skin::Skin::Wizard => draw_house(frame, app),
+    }
+    // A drag over an overlay copies the overlay, which has no gutter.
+    if overlay_open(app) {
+        app.text_origins.borrow_mut().clear();
     }
 }
 
@@ -349,21 +354,23 @@ pub(super) fn selection_rows(
 
 /// Extract the text under a selection from a rendered cell buffer, in reading
 /// order, one `\n` per screen row. Trailing whitespace is trimmed per line so
-/// the copy isn't padded out to the row width. Shared leading whitespace
-/// across the selected rows is then stripped, so a drag that covers the
-/// transcript gutter (the one-column side margin, the `· `/`❯ ` marker, the
-/// grok rail) does not paste as an indented block.
-pub fn selection_text(buf: &Buffer, selection: &Selection) -> String {
+/// the copy isn't padded out to the row width.
+///
+/// `origins` is the frame's [`App::text_origins`](crate::app::App): on a
+/// transcript row, the cells left of the text are gutter (the side margin,
+/// the `· `/`❯ `/`• ` marker, the grok rail) and are not copied. Shared
+/// leading spaces across the selected rows are then stripped too, which is
+/// what handles a code block's inset and rows with no recorded origin.
+pub fn selection_text(buf: &Buffer, selection: &Selection, origins: &[(u16, u16)]) -> String {
     let area = buf.area;
     let rows = selection_rows(selection, area.width, area.height);
-    // Stream selection starts the first row at the click and every row
-    // below it at column 0, so the highlight covers the gutter on
-    // continuation rows. Those columns were never under the cursor on
-    // the first row; remember how many we skipped so the indent strip
-    // can treat them as leading spaces the first line "has".
-    let first_omitted = rows.first().map(|&(_, start, _)| start).unwrap_or(0);
     let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+    let mut starts: Vec<u16> = Vec::with_capacity(rows.len());
     for (y, start, end) in rows {
+        let start = origins
+            .iter()
+            .find(|&&(row, _)| row == y)
+            .map_or(start, |&(_, x)| start.max(x));
         let mut line = String::new();
         for x in start..end {
             if let Some(cell) = buf.cell(Position::new(x, y)) {
@@ -371,8 +378,9 @@ pub fn selection_text(buf: &Buffer, selection: &Selection) -> String {
             }
         }
         lines.push(line.trim_end().to_string());
+        starts.push(start);
     }
-    strip_shared_leading_indent(&mut lines, first_omitted);
+    strip_shared_leading_indent(&mut lines, &starts);
     let out = lines.join("\n");
     // A selection of only blank cells trims to nothing; report it as empty so
     // the caller skips the copy.
@@ -391,44 +399,40 @@ pub fn selection_text(buf: &Buffer, selection: &Selection) -> String {
 /// chrome. Relative indent inside the selection (code fences, nested lists)
 /// is left alone because it is not shared.
 ///
-/// `first_omitted` is the start column of the first selected row. Stream
-/// selection skips those cells on the first row and includes them on every
-/// row below, which is how a copy used to grow a left margin after line one.
-fn strip_shared_leading_indent(lines: &mut [String], first_omitted: u16) {
+/// `starts` is the screen column each line was read from. Stream selection
+/// starts the first row at the click and the rows below at the left edge (or
+/// their text origin), so indent is compared by the column the text lands
+/// in, not by how many spaces each line happens to begin with. Comparing
+/// space counts is how a copy used to grow a left margin after line one.
+fn strip_shared_leading_indent(lines: &mut [String], starts: &[u16]) {
     // A one-line drag of indented code has nothing to compare against, so the
     // indent is content. The gutter only becomes obvious across several rows.
     let leading = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let text_column = |index: usize, line: &str| starts[index] as usize + leading(line);
     let mut min = None;
     let mut count = 0usize;
     for (index, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let n = leading(line)
-            + if index == 0 {
-                first_omitted as usize
-            } else {
-                0
-            };
+        let n = text_column(index, line);
         count += 1;
         min = Some(min.map_or(n, |m: usize| m.min(n)));
     }
     if count < 2 {
         return;
     }
-    let Some(indent) = min.filter(|&n| n > 0) else {
+    let Some(indent) = min else {
         return;
     };
     for (index, line) in lines.iter_mut().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let skip = if index == 0 {
-            indent.saturating_sub(first_omitted as usize)
-        } else {
-            indent
-        };
-        *line = line.chars().skip(skip).collect();
+        let skip = indent.saturating_sub(starts[index] as usize);
+        if skip > 0 {
+            *line = line.chars().skip(skip).collect();
+        }
     }
 }
 
@@ -469,7 +473,7 @@ pub(super) fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     // an accent column off the row it belongs to, and a tinted row is exactly
     // `inner_width` wide by construction.
     let rendered = transcript_text(app, &mut cache, image_box(inner), inner_width);
-    let (lines, row_tags) = (rendered.lines, rendered.tags);
+    let (lines, row_tags, indents) = (rendered.lines, rendered.tags, rendered.indents);
     let total = lines.len();
     let max_scroll = total.saturating_sub(inner_height);
     // Cache for key handlers so they can convert a follow-tail view into a
@@ -496,6 +500,12 @@ pub(super) fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+    app.text_origins.borrow_mut().extend(
+        indents[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, indent)| (inner.y + offset as u16, inner.x + indent)),
+    );
 
     // Before the move: the scroll hint below needs to know whether the top row
     // has room for it.
@@ -612,6 +622,8 @@ pub(super) enum RowTag {
 pub(super) struct Rendered {
     lines: Vec<Line<'static>>,
     tags: Vec<RowTag>,
+    /// Columns of block chrome (marker, accent, pads) before each row's text.
+    indents: Vec<u16>,
     blocks: Vec<ImageBlock>,
     /// Nothing has been pushed yet, so a caller appending more gets the
     /// blank-line spacing right.
@@ -689,6 +701,7 @@ pub(super) fn transcript_text(
     let Rendered {
         mut lines,
         mut tags,
+        mut indents,
         blocks,
         empty,
     } = items_text(&app.transcript, app.tick, cache, budget, width);
@@ -698,9 +711,13 @@ pub(super) fn transcript_text(
     // block, so nothing shifts sideways at the moment a turn lands.
     let (thinking, streaming) = app.transcript.streaming();
     let chrome = skin::chrome();
-    let decorate = |lines: &mut Vec<Line<'static>>, kind: BlockKind, text: Text<'static>| {
+    let decorate = |lines: &mut Vec<Line<'static>>,
+                    indents: &mut Vec<u16>,
+                    kind: BlockKind,
+                    text: Text<'static>| {
         let style = chrome.blocks.of(kind);
         let content = wrap_lines(text, style.content_width(width as u16) as usize);
+        indents.resize(lines.len(), 0);
         lines.extend(skin::layout::decorate(
             style,
             content,
@@ -708,6 +725,7 @@ pub(super) fn transcript_text(
             app.tick,
             true,
         ));
+        indents.resize(lines.len(), style.indent());
     };
 
     if !thinking.is_empty() {
@@ -716,7 +734,12 @@ pub(super) fn transcript_text(
         }
         first = false;
         // In-flight reasoning, dimmed so it reads as background noise.
-        decorate(&mut lines, BlockKind::Thinking, thinking_text(thinking));
+        decorate(
+            &mut lines,
+            &mut indents,
+            BlockKind::Thinking,
+            thinking_text(thinking),
+        );
     }
     if !streaming.is_empty() {
         if !first {
@@ -735,7 +758,7 @@ pub(super) fn transcript_text(
             Some(last) => last.spans.push(tail),
             None => text.lines.push(Line::from(tail)),
         }
-        decorate(&mut lines, BlockKind::Assistant, text);
+        decorate(&mut lines, &mut indents, BlockKind::Assistant, text);
     } else if app.status.busy && !tool_running(&app.transcript) {
         // Waiting on the model with nothing to show for it yet. A running
         // tool's card is its own indicator, so this row stays away then.
@@ -746,9 +769,11 @@ pub(super) fn transcript_text(
     }
 
     tags.resize(lines.len(), RowTag::Text);
+    indents.resize(lines.len(), 0);
     Rendered {
         lines,
         tags,
+        indents,
         blocks,
         empty: first,
     }
@@ -807,6 +832,7 @@ pub(super) fn items_text(
     let chrome = skin::chrome();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut tags: Vec<RowTag> = Vec::new();
+    let mut indents: Vec<u16> = Vec::new();
     let mut blocks: Vec<ImageBlock> = Vec::new();
     let mut prev_tool = false;
     let mut prev_notice = false;
@@ -912,6 +938,7 @@ pub(super) fn items_text(
                 )
             }
         };
+        indents.resize(lines.len(), 0);
         if !content.is_empty() {
             lines.extend(skin::layout::decorate(
                 style,
@@ -921,6 +948,7 @@ pub(super) fn items_text(
                 running,
             ));
         }
+        indents.resize(lines.len(), style.indent());
 
         // Keep the tags in lockstep with whatever the item pushed: a tool
         // card's header line is clickable, an image block's rows are paintable,
@@ -944,6 +972,7 @@ pub(super) fn items_text(
     Rendered {
         lines,
         tags,
+        indents,
         blocks,
         empty: first,
     }
@@ -2650,7 +2679,7 @@ pub(super) fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area:
         image_box(inner),
         inner_width,
     );
-    let (mut lines, mut row_tags) = (rendered.lines, rendered.tags);
+    let (mut lines, mut row_tags, mut indents) = (rendered.lines, rendered.tags, rendered.indents);
     if lines.is_empty() {
         let spinner = spinner_frame(app.tick);
         lines.push(Line::from(vec![
@@ -2667,6 +2696,7 @@ pub(super) fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area:
         ]));
     }
     row_tags.resize(lines.len(), RowTag::Text);
+    indents.resize(lines.len(), 0);
 
     // Stick-to-bottom like the main transcript: follow the live tail by
     // default; once the user scrolls up, hold their top-anchored offset so
@@ -2680,6 +2710,12 @@ pub(super) fn draw_pane(frame: &mut Frame, app: &App, pane: &SubagentPane, area:
         (pane.transcript.scroll as usize).min(max_scroll)
     };
     let end = (start + inner_height).min(total);
+    app.text_origins.borrow_mut().extend(
+        indents[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, indent)| (inner.y + offset as u16, inner.x + indent)),
+    );
     frame.render_widget(
         Paragraph::new(Text::from(lines[start..end].to_vec())),
         inner,
