@@ -63,18 +63,45 @@ pub(crate) const KEEP_WHOLE_RESULTS: usize = 12;
 /// stay verbatim however far back they are.
 const DIGEST_MIN_CHARS: usize = 500;
 
-/// Characters one pass has to reclaim before it rewrites anything.
+/// Characters one pass has to reclaim before it rewrites anything, at minimum.
 ///
 /// Every rewrite mid-history throws away the provider's cached prefix from
 /// that point on, so a pass that runs between compactions has to be worth that
 /// much. Without a floor the newest result crossing the [`KEEP_RECENT`]
 /// boundary would trigger a rewrite on every single step, paying a full
 /// re-prefill of the tail to reclaim a few hundred characters. 16k characters
-/// is about 4k tokens, comfortably more than the tail a rewrite costs.
+/// is about 4k tokens.
+///
+/// It is a floor and not the whole test, because what a rewrite costs is not
+/// fixed: see [`RECLAIM_TAIL_DIVISOR`].
 ///
 /// A compaction pass passes `0`: it was going to invalidate that prefix
 /// anyway.
 pub(crate) const MIN_RECLAIM_CHARS: usize = 16_384;
+
+/// The second half of the same floor: a pass must reclaim at least this
+/// fraction (one tenth) of the context its earliest rewrite invalidates.
+///
+/// A flat floor prices the rewrite wrong, and it prices it wrong in the
+/// direction that costs money. What a rewrite costs is not the rewritten
+/// message, it is *everything after it*: the cached prefix ends where the
+/// first edit lands, so a pass that touches the oldest result in a 150k-token
+/// history makes the next request re-prefill ~145k tokens at full price. On
+/// grok-4.6 that is $1.50 per million above the cached rate, about 22 cents,
+/// to reclaim the 4k tokens a 16k-character floor asks for — which then save
+/// half a cent a step. Over a hundred steps to break even.
+///
+/// A tenth is the break-even for a turn with roughly thirty steps left in it
+/// at xAI's ratio (a cache read is a quarter of fresh input, so reclaiming R
+/// against a tail T pays off after 3T/R steps). It is deliberately a ratio and
+/// not a token price: every provider with a prompt cache has the same shape,
+/// only the constant differs, and the pass has no business knowing which
+/// endpoint it is running against.
+///
+/// The effect is that the pass waits and then cuts more at once, instead of
+/// nibbling. xAI's own advice is the blunt version of the same point: "never
+/// modify earlier messages. Only append new ones."
+const RECLAIM_TAIL_DIVISOR: usize = 10;
 
 /// Heading of the note [`compact`] leaves in place of the span it summarized.
 /// Public because it is the only handle anything downstream has on that note:
@@ -890,6 +917,19 @@ pub(crate) fn shrink_old_results(
 
     if reclaimed < min_reclaim {
         return 0;
+    }
+    // The other half of the floor. What a rewrite costs is not the message it
+    // rewrites, it is every token after it: the provider's cached prefix ends
+    // at the first edit. So the pass is also priced against the tail its
+    // earliest edit invalidates. See [`RECLAIM_TAIL_DIVISOR`].
+    if min_reclaim > 0
+        && let Some((first, _, _)) = planned.first()
+    {
+        let invalidated = crate::llm::estimate_history_tokens(&history[*first..]);
+        let reclaimed_tokens = crate::llm::estimate_tokens_from_chars(reclaimed);
+        if reclaimed_tokens < invalidated / RECLAIM_TAIL_DIVISOR as u64 {
+            return 0;
+        }
     }
     let shrunk = planned.len();
     for (index, block_index, content) in planned {
@@ -1873,6 +1913,54 @@ mod tests {
             shrink_old_results(&mut history, KEEP_WHOLE_RESULTS, 0),
             1,
             "the same pass inside a compaction, which pays that cost anyway, still cuts"
+        );
+    }
+
+    /// A flat floor is not enough on a long history, because what a rewrite
+    /// costs grows with the history and the floor does not.
+    ///
+    /// Here one old result is worth a little more than [`MIN_RECLAIM_CHARS`]
+    /// and the conversation behind it is a quarter of a million characters
+    /// that all become uncacheable the moment that result is touched. The old
+    /// rule said yes to that trade. The tail test says wait, and the same pass
+    /// inside a compaction — which is paying for the tail regardless — still
+    /// cuts.
+    #[test]
+    fn a_pass_that_would_reclaim_a_sliver_of_a_long_history_waits() {
+        let big = MIN_RECLAIM_CHARS + DIGEST_MIN_CHARS;
+        let mut history = worked_history(500, &|step| {
+            if step == 0 {
+                "y".repeat(big)
+            } else {
+                // Under DIGEST_MIN_CHARS and under PRUNE_RESULT_MAX_CHARS, so
+                // none of these is a candidate: the only thing to reclaim is
+                // step 0, and all the rest is the tail it would cost.
+                "ok\n".repeat(160)
+            }
+        });
+        let tail = crate::llm::estimate_history_tokens(&history);
+        assert!(
+            crate::llm::estimate_tokens_from_chars(big) < tail / RECLAIM_TAIL_DIVISOR as u64,
+            "the fixture has to be a sliver of its own tail: {big} chars against {tail} tokens"
+        );
+
+        let before: Vec<_> = history
+            .iter()
+            .map(|message| message.content.clone())
+            .collect();
+        assert_eq!(
+            shrink_old_results(&mut history, KEEP_WHOLE_RESULTS, MIN_RECLAIM_CHARS),
+            0,
+            "over the flat floor, under the tail it would invalidate"
+        );
+        for (message, original) in history.iter().zip(&before) {
+            assert_eq!(&message.content, original, "nothing was rewritten");
+        }
+
+        assert_eq!(
+            shrink_old_results(&mut history, KEEP_WHOLE_RESULTS, 0),
+            1,
+            "a compaction pass pays for the tail either way and still cuts"
         );
     }
 
