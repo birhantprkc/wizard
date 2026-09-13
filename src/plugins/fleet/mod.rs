@@ -62,6 +62,11 @@ use crate::git_util as git;
 /// check the stop sentinel, touch the heartbeat.
 const TICK: Duration = Duration::from_secs(1);
 
+/// Grace beyond `[fleet] max_minutes` before the watchdog hard-kills a
+/// worker. The worker gets the same number as `--max-hours` and normally ends
+/// itself first (exit code 4); this is what catches one that did not.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(30);
+
 /// Max length of the mission slug used in branch names.
 const SLUG_MAX: usize = 24;
 
@@ -476,8 +481,14 @@ fn truncate_chars(text: &str, max: usize) -> String {
 
 /// Argv (after the binary itself) of one worker child: a headless sovereign
 /// run in the slot's worktree emitting one final JSON summary on stdout.
-pub fn worker_args(prompt: &str, worktree: &Path) -> Vec<String> {
-    vec![
+///
+/// `max_minutes` rides along as `--max-hours` so the worker knows the cap it
+/// is working against and winds itself down inside it. The watchdog below is
+/// then the backstop it was always meant to be, not the only thing that knows
+/// the clock: before this a worker was killed mid-sentence at 30 minutes with
+/// no idea any limit existed.
+pub fn worker_args(prompt: &str, worktree: &Path, max_minutes: u64) -> Vec<String> {
+    let mut args = vec![
         "--mode".to_string(),
         "sovereign".to_string(),
         "-p".to_string(),
@@ -486,7 +497,13 @@ pub fn worker_args(prompt: &str, worktree: &Path) -> Vec<String> {
         worktree.display().to_string(),
         "--output-format".to_string(),
         "json".to_string(),
-    ]
+    ];
+    if max_minutes > 0 {
+        args.push("--max-hours".to_string());
+        #[allow(clippy::cast_precision_loss)]
+        args.push(((max_minutes as f64) / 60.0).to_string());
+    }
+    args
 }
 
 /// Atomically claim the next queued task: rename `queue/<id>.json` into
@@ -610,7 +627,12 @@ struct Worker {
 /// Spawn one worker child in `worktree`: direct argv (no shell), cwd set
 /// both ways, `WIZARD_FLEET=1`, stdout/stderr captured to log files,
 /// `kill_on_drop` as the teardown backstop.
-fn spawn_worker(task: FleetTask, worktree: &Path, dirs: &FleetDirs) -> Result<Worker> {
+fn spawn_worker(
+    task: FleetTask,
+    worktree: &Path,
+    dirs: &FleetDirs,
+    max_minutes: u64,
+) -> Result<Worker> {
     let exe = std::env::current_exe().context("locating the wizard binary for the worker")?;
     let stdout_path = dirs.logs().join(format!("{}.stdout", task.id));
     let stderr_path = dirs.logs().join(format!("{}.stderr", task.id));
@@ -620,7 +642,7 @@ fn spawn_worker(task: FleetTask, worktree: &Path, dirs: &FleetDirs) -> Result<Wo
         .with_context(|| format!("creating {}", stderr_path.display()))?;
     let prompt = worker_prompt(&task);
     let child = tokio::process::Command::new(exe)
-        .args(worker_args(&prompt, worktree))
+        .args(worker_args(&prompt, worktree, max_minutes))
         .current_dir(worktree)
         .env("WIZARD_FLEET", "1")
         .stdin(Stdio::null())
@@ -823,7 +845,10 @@ async fn supervise_loop(
     max_minutes: u64,
     reporter: &FleetReporter,
 ) -> Result<bool> {
-    let max_age = Duration::from_secs(max_minutes.saturating_mul(60));
+    // The worker carries `--max-hours max_minutes` and stops itself inside
+    // it, so this is the backstop for a child that did not. Same shape as the
+    // scheduler daemon's `max_hours + KILL_GRACE`.
+    let max_age = Duration::from_secs(max_minutes.saturating_mul(60)) + WATCHDOG_GRACE;
     loop {
         touch_heartbeat(dirs);
 
@@ -905,7 +930,7 @@ async fn supervise_loop(
                 TickAction::Spawn(i) => {
                     if let Some(task) = claim_next(&dirs.queue(), &dirs.claimed())? {
                         let slot = &mut slots[i];
-                        let worker = spawn_worker(task, &slot.worktree, dirs)?;
+                        let worker = spawn_worker(task, &slot.worktree, dirs, max_minutes)?;
                         reporter.println(format!(
                             "→ task '{}' ({}) started on {}",
                             worker.task.id, worker.task.title, slot.branch
@@ -1613,7 +1638,7 @@ mod tests {
 
     #[test]
     fn worker_args_construction() {
-        let args = worker_args("do the thing", Path::new("/tmp/wt/0"));
+        let args = worker_args("do the thing", Path::new("/tmp/wt/0"), 30);
         assert_eq!(
             args,
             vec![
@@ -1625,7 +1650,16 @@ mod tests {
                 "/tmp/wt/0",
                 "--output-format",
                 "json",
+                "--max-hours",
+                "0.5",
             ]
+        );
+        // A worker with no cap is told of none, and `--max-hours 0` would be
+        // refused by the flag's own validator anyway.
+        assert!(
+            !worker_args("do the thing", Path::new("/tmp/wt/0"), 0)
+                .contains(&"--max-hours".to_string()),
+            "no cap, no flag"
         );
     }
 

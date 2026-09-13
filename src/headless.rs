@@ -615,12 +615,28 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // `schedule.toml`). `--max-hours` now has a clap validator, so a bad value
     // is refused before the run starts; this stays a `?` rather than an
     // `unwrap` so the flag's parser is the only thing that has to hold.
-    let deadline = cli
+    //
+    // The budget carries more than the instant: the run's total, so the
+    // per-step note can say "5m of 15m left" rather than a bare number, and
+    // the output paths the task named, so the late note can say which of them
+    // are still not on disk. Extraction is deliberately timid (see
+    // [`crate::agent::budget::named_paths`]); a task that names none of its
+    // outputs in a shape it recognizes just gets the clock.
+    let time_budget = cli
         .max_hours
         .map(crate::schedule::max_hours_duration)
         .transpose()?
-        .map(|budget| Instant::now() + budget);
-    agent.set_deadline(deadline);
+        .map(|total| {
+            crate::agent::budget::TimeBudget::new(
+                Instant::now(),
+                total,
+                config.time_wrap_up_at,
+                config.time_finish_at,
+            )
+            .with_deliverables(crate::agent::budget::named_paths(&goal, &project_root))
+        });
+    let deadline = time_budget.as_ref().map(|budget| budget.deadline());
+    agent.set_time_budget(time_budget);
     // Quality gates (`--gate`, the `gates` config key, the project's
     // `.wizard/gates.toml`). `None` when none are configured, which is the
     // default and must cost nothing. See [`crate::gates`] for why a run that

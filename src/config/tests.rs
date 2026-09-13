@@ -233,6 +233,8 @@ fn full_file_round_trips() {
         compact_threshold_bytes: 96_000,
         max_context_tokens: 200_000,
         prune_after_tokens: 64_000,
+        time_wrap_up_at: 0.5,
+        time_finish_at: 0.9,
         providers: vec![ProviderConfig {
             name: "openai".to_string(),
             kind: ProviderKind::OPENAI,
