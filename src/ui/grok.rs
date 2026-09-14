@@ -136,7 +136,6 @@ const SLASH_CONTENT_INSET: u16 = 2;
 /// are not reproduced: Wizard has no console-generation probe to switch on, and
 /// every terminal it supports draws these.
 const RAIL: &str = "\u{2503}"; // ┃  accent_bar()
-const RAIL_COLLAPSED: &str = "\u{2759}"; // ❙  collapsed_accent()
 const DIAMOND: &str = "\u{25c6}"; // ◆  diamond_filled()
 const PROMPT_ARROW: &str = "\u{276f} "; // ❯  prompt_arrow(), width 2
 const TOKEN_ARROW: &str = "\u{21e3}"; // ⇣  token_arrow()
@@ -415,10 +414,8 @@ impl Row {
 ///
 /// Ported from `P/src/scrollback/state/layout.rs:1579-1587`: two *groupable*
 /// entries that are both *collapsed* pack solid, so a run of folded tool calls
-/// reads as one group; everything else gets one blank row. This is the rule the
-/// `┃` → `❙` switch goes with — a run that packs would otherwise merge its
-/// rails into one unbroken bar, which is exactly what the thinner glyph and the
-/// half-brightness are there to prevent.
+/// reads as one group; everything else gets one blank row. Collapsed entries
+/// drop the rail (column still reserved), so packing them does not merge bars.
 fn gap_after(above: &Entry, below: &Entry) -> u16 {
     let groupable = above.kind.groupable() && below.kind.groupable();
     let collapsed = above.mode == Mode::Collapsed && below.mode == Mode::Collapsed;
@@ -473,15 +470,17 @@ fn decorate(entry: &Entry, width: u16, tick: u64) -> Vec<Line<'static>> {
                 .map(|span| Span::styled(span.content, on(span.style, line_bg))),
         );
         // Carry the band to the block's right edge, so a tinted block is a
-        // rectangle rather than the shape of its text.
+        // rectangle rather than the shape of its text. grok-build fills
+        // content + right pad with the panel (`entry_renderer.rs:715-720`);
+        // the rail and left pad stay on the block.
         if line_bg.is_some() {
             let head = if bullet { bullet_width } else { 0 };
             let fill = content_width.saturating_sub(used + head);
             if fill > 0 {
                 spans.push(blanks(fill, line_bg));
             }
-        }
-        if bg.is_some() {
+            spans.push(blanks(PAD_RIGHT as usize, line_bg));
+        } else if bg.is_some() {
             spans.push(blanks(PAD_RIGHT as usize, bg));
         }
         out.push(Line::from(spans));
@@ -530,15 +529,17 @@ fn rail_span(entry: &Entry, row: u16, tick: u64, bg: Option<Color>) -> Span<'sta
         // the loading-spinner motion.
         return Span::styled(RAIL, on(theme::style(token), bg));
     }
+    if entry.mode == Mode::Collapsed && !matches!(entry.kind, Kind::Subagent | Kind::BgTask) {
+        // grok-build drops `block.accent()` whenever Collapsed
+        // (`entry_renderer.rs:696-700`). The column stays reserved.
+        // Subagent/bg-task are one-row (so Collapsed for grouping) but keep a
+        // rail while running (`subagent.rs:263-270`).
+        return blanks(ACCENT as usize, bg);
+    }
     if entry.animated {
         let brightness = motion::wave(tick, row, WAVE_ROWS, WAVE_SPEED);
         let color = motion::breathe(theme::color(token), brightness);
         return Span::styled(RAIL, on(Style::default().fg(color), bg));
-    }
-    if entry.mode == Mode::Collapsed && entry.kind.groupable() {
-        // A thinner glyph at half brightness, so the rails of a packed run of
-        // collapsed entries read as separate blocks rather than one long bar.
-        return Span::styled(RAIL_COLLAPSED, on(fade(token, DIM_ACCENT), bg));
     }
     Span::styled(RAIL, on(theme::style(token), bg))
 }
@@ -1411,12 +1412,9 @@ fn subagent_entry(tool: &ToolItem, app: &App, index: usize, width: u16) -> Entry
     Entry {
         kind: Kind::Subagent,
         mode: Mode::Collapsed,
-        accent: running.then_some(Token::ToolRunning).or(if failed {
-            Some(Token::ToolFailed)
-        } else {
-            Some(Token::Muted)
-        }),
-        // Static rail, animated bullet: the split upstream is easy to miss.
+        // Rail only while running (`subagent.rs:263-270`). Finished rows keep
+        // the column empty. Failed still swap ◆ for ✗ (house rule).
+        accent: running.then_some(Token::ToolRunning),
         animated: false,
         pending: false,
         bullet: Some(if failed {
@@ -1424,7 +1422,7 @@ fn subagent_entry(tool: &ToolItem, app: &App, index: usize, width: u16) -> Entry
         } else if running {
             (DIAMOND, Token::ToolRunning)
         } else {
-            (DIAMOND, Token::Muted)
+            (DIAMOND, Token::Success)
         }),
         rows: vec![Row::plain(super::truncate_line(
             Line::from(spans),
@@ -1464,13 +1462,8 @@ fn bg_task_entry(tool: &ToolItem, index: usize, width: u16) -> Entry {
     Entry {
         kind: Kind::BgTask,
         mode: Mode::Collapsed,
-        accent: Some(if failed {
-            Token::ToolFailed
-        } else if running {
-            Token::ToolRunning
-        } else {
-            Token::Muted
-        }),
+        // Same as subagent: rail only while running (`bg_task.rs`).
+        accent: running.then_some(Token::ToolRunning),
         animated: false,
         pending: false,
         bullet: Some(if failed {
@@ -1478,7 +1471,7 @@ fn bg_task_entry(tool: &ToolItem, index: usize, width: u16) -> Entry {
         } else if running {
             (DIAMOND, Token::ToolRunning)
         } else {
-            (DIAMOND, Token::Muted)
+            (DIAMOND, Token::Success)
         }),
         rows: vec![Row::plain(super::truncate_line(
             Line::from(vec![
@@ -3654,7 +3647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_tool_paints_a_bar_and_a_finished_one_a_thinner_mark() {
+    fn a_running_tool_paints_a_bar_and_a_collapsed_one_drops_it() {
         let running = tool_entry(
             &ToolItem {
                 name: "execute".into(),
@@ -3688,9 +3681,8 @@ mod tests {
             0,
             60,
         );
-        // Collapsed and groupable: the thinner `❙`. Read never paints a rail at
-        // all, so this one is a cleared column — assert the glyph rule directly
-        // instead, on a block that does have one.
+        // Collapsed drops the rail (column stays). grok-build's renderer
+        // clears `block.accent()` whenever Collapsed (`entry_renderer.rs:696-700`).
         assert_eq!(done.mode, Mode::Collapsed);
         let other = Entry {
             kind: Kind::Tool,
@@ -3703,7 +3695,52 @@ mod tests {
             card: None,
             images: Vec::new(),
         };
-        assert!(text(&decorate(&other, 60, 0)[0]).starts_with(RAIL_COLLAPSED));
+        assert!(
+            !text(&decorate(&other, 60, 0)[0]).starts_with(RAIL),
+            "collapsed tools keep the column empty"
+        );
+    }
+
+    #[test]
+    fn a_finished_subagent_drops_the_rail_a_running_one_keeps_it() {
+        let running = subagent_entry(
+            &ToolItem {
+                name: "spawn_subagent".into(),
+                args: serde_json::json!({ "subagent": "worker", "task": "look" }),
+                call_id: String::new(),
+                output: None,
+                progress: String::new(),
+                timing: crate::transcript::ToolTiming::default(),
+            },
+            &app(),
+            0,
+            60,
+        );
+        assert_eq!(running.accent, Some(Token::ToolRunning));
+        assert!(text(&decorate(&running, 60, 0)[0]).starts_with(RAIL));
+
+        let done = subagent_entry(
+            &ToolItem {
+                name: "spawn_subagent".into(),
+                args: serde_json::json!({ "subagent": "worker", "task": "look" }),
+                call_id: String::new(),
+                output: Some(crate::transcript::ToolItemOutput {
+                    content: "ok".into(),
+                    is_error: false,
+                }),
+                progress: String::new(),
+                timing: crate::transcript::ToolTiming::default(),
+            },
+            &app(),
+            0,
+            60,
+        );
+        assert!(done.accent.is_none());
+        assert!(
+            !text(&decorate(&done, 60, 0)[0]).starts_with(RAIL),
+            "finished subagent keeps the column empty"
+        );
+        assert_eq!(done.bullet, Some((DIAMOND, Token::Success)));
     }
 
     #[test]
@@ -3784,6 +3821,18 @@ mod tests {
                 .any(|span| span.style.bg == Some(sunken)),
             "the output is banded: {:?}",
             text(&rows[1])
+        );
+        let last = rows[1].spans.last().expect("right pad");
+        assert_eq!(last.style.bg, Some(sunken), "right pad sits on the panel");
+        assert_eq!(
+            rows[1].width() as u16,
+            60,
+            "panel row runs to the block edge"
+        );
+        // Rail and left pad stay off the panel.
+        assert!(
+            rows[1].spans[0].style.bg.is_none(),
+            "the rail stays off the panel"
         );
     }
 
