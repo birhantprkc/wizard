@@ -4851,13 +4851,13 @@ fn the_grok_shortcut_bar_names_keys_the_way_grok_build_does() {
     // and a plain character stays lowercase. Wizard writes keys lowercase
     // everywhere else, which is exactly why this one has to be asserted.
     let rows = skinned_welcome(crate::skin::Skin::Grok, 92, 40).join("\n");
-    for key in ["Enter:send", "Shift+Enter:newline", "Ctrl+t:expand"] {
+    for key in ["Enter:send", "Shift+Enter:newline", "Shift+Tab:mode"] {
         assert!(
             rows.contains(key),
             "the grok shortcut bar should write '{key}':\n{rows}"
         );
     }
-    for lowercased in ["enter:send", "shift+enter", "ctrl+t"] {
+    for lowercased in ["enter:send", "shift+enter", "shift+tab"] {
         assert!(
             !rows.contains(lowercased),
             "'{lowercased}' is Wizard's casing, not Grok Build's:\n{rows}"

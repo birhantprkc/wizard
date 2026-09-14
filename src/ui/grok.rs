@@ -2727,7 +2727,7 @@ fn status_chip_spans(app: &App) -> Vec<Span<'static>> {
     if let Some(label) = app.vim.label() {
         chips.push(vec![Span::styled(label, super::dim())]);
     }
-    let used = app.status.context_tokens as u64;
+    let used = app.status.context_tokens;
     let total = app.config.max_context_tokens as u64;
     chips.push(vec![Span::styled(
         format!("{} / {}", fmt_tokens(used), fmt_tokens(total)),
@@ -2908,7 +2908,7 @@ fn slash_preview(app: &App) -> Option<SlashPreview> {
     if app.suggestions.is_empty() {
         return None;
     }
-    if app.input.chars().next() != Some('/') {
+    if !app.input.starts_with('/') {
         return None;
     }
     let name: String = app
