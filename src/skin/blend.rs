@@ -32,7 +32,7 @@ pub const ENV_BG: &str = "WIZARD_BG";
 /// The terminal's background color, if it can be known.
 ///
 /// Order: `WIZARD_BG` (an `#rrggbb` the user set), then `COLORFGBG` (which
-/// reports palette *indices*, not colors — see [`ansi_rgb`]), then nothing.
+/// reports palette *indices*, not colors — see [`indexed_to_rgb`]), then nothing.
 pub fn terminal_bg() -> Option<(u8, u8, u8)> {
     if let Ok(raw) = std::env::var(ENV_BG)
         && let Some(rgb) = parse_hex(raw.trim())
@@ -45,7 +45,7 @@ pub fn terminal_bg() -> Option<(u8, u8, u8)> {
     let raw = std::env::var("COLORFGBG").ok()?;
     let last = raw.rsplit(';').next()?.trim();
     let index: u8 = last.parse().ok()?;
-    Some(ansi_rgb(index))
+    Some(indexed_to_rgb(index))
 }
 
 /// `#rrggbb` (with or without the `#`) as an RGB triple.
@@ -64,8 +64,9 @@ fn parse_hex(text: &str) -> Option<(u8, u8, u8)> {
 /// color scheme says they are and no program can know it — which is the whole
 /// reason a tint is computed against this rather than assumed. The xterm
 /// defaults are close enough to decide "dark or light", which is all the
-/// blend below needs from the low slots.
-fn ansi_rgb(index: u8) -> (u8, u8, u8) {
+/// blend below needs from the low slots. Same mapping grok-build uses in
+/// `recede.rs` as `indexed_to_rgb`.
+pub fn indexed_to_rgb(index: u8) -> (u8, u8, u8) {
     const BASE: [(u8, u8, u8); 16] = [
         (0, 0, 0),
         (128, 0, 0),
@@ -232,12 +233,12 @@ mod tests {
     fn colorfgbg_reports_a_palette_index_and_the_last_field_is_the_background() {
         // rxvt emits three fields with the cursor color in the middle, so
         // "the second field" is wrong on exactly the terminals that set it.
-        assert_eq!(ansi_rgb(0), (0, 0, 0));
-        assert_eq!(ansi_rgb(15), (255, 255, 255));
+        assert_eq!(indexed_to_rgb(0), (0, 0, 0));
+        assert_eq!(indexed_to_rgb(15), (255, 255, 255));
         // The cube's corners and one ramp step, at xterm's levels.
-        assert_eq!(ansi_rgb(16), (0, 0, 0));
-        assert_eq!(ansi_rgb(231), (255, 255, 255));
-        assert_eq!(ansi_rgb(232), (8, 8, 8));
+        assert_eq!(indexed_to_rgb(16), (0, 0, 0));
+        assert_eq!(indexed_to_rgb(231), (255, 255, 255));
+        assert_eq!(indexed_to_rgb(232), (8, 8, 8));
     }
 
     #[test]

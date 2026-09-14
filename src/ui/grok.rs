@@ -260,10 +260,9 @@ fn fade(token: Token, amount: f32) -> Style {
 }
 
 /// Dim a painted region toward `toward`. Ported from grok-build
-/// `recede_area` (`xai-grok-pager-render/.../color.rs:242`): blend when both
-/// ends are RGB, otherwise DIM and drop BOLD. TokyoNight 256 almost always
-/// takes the DIM path; that is the same fallback grok-build uses when the
-/// prompt bg is not expressible as RGB.
+/// `recede_area`: blend when both ends resolve to RGB (including Indexed
+/// via the 256-color cube), otherwise DIM and drop BOLD. Named ANSI and
+/// Reset still take the DIM path; their RGB is terminal-dependent.
 fn recede_area(buf: &mut Buffer, area: Rect, toward: Color) {
     const OPACITY: f32 = 0.66;
     let base = rgb(toward);
@@ -283,10 +282,12 @@ fn recede_area(buf: &mut Buffer, area: Rect, toward: Color) {
     }
 }
 
-/// A colour as RGB, when it is one.
+/// A colour as RGB, when it is expressible. Indexed uses the same xterm
+/// cube grok-build's `color_to_rgb` does.
 fn rgb(color: Color) -> Option<(u8, u8, u8)> {
     match color {
         Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(n) => Some(blend::indexed_to_rgb(n)),
         _ => None,
     }
 }
@@ -3940,6 +3941,16 @@ mod tests {
         let cell = buf.cell((0, 0)).unwrap();
         assert_ne!(cell.fg, Color::Rgb(200, 200, 200));
         assert!(!cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn recede_area_blends_indexed_fg_toward_rgb_bg() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf.cell_mut((0, 0)).unwrap().set_fg(Color::Indexed(255));
+        recede_area(&mut buf, Rect::new(0, 0, 1, 1), Color::Rgb(0, 0, 0));
+        let cell = buf.cell((0, 0)).unwrap();
+        assert!(!cell.modifier.contains(Modifier::DIM));
+        assert_ne!(cell.fg, Color::Indexed(255));
     }
 
     /// Render at `width`×`height` under the `grok` skin, one string per row.
