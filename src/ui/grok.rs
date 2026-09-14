@@ -981,12 +981,15 @@ fn tool_entry(tool: &ToolItem, app: &App, folded: bool, index: usize, width: u16
     let kind = ToolKind::of(&tool.name);
     let running = tool.output.is_none();
     let failed = tool.output.as_ref().is_some_and(|out| out.is_error);
+    // Fold is a boolean, so rest is one step more open than grok-build's
+    // default: Collapsed there, Truncated here. Execute and Read already
+    // rest Truncated upstream. Truncated and Expanded paint the same body
+    // for ListDir/Search/Edit/Fetch/Other; only MCP (`use_tool`) caps
+    // Truncated at 3 lines and Expanded at 10.
     let mode = if folded {
         Mode::Collapsed
-    } else if kind == ToolKind::Execute || kind == ToolKind::Read {
-        Mode::Truncated
     } else {
-        Mode::Expanded
+        Mode::Truncated
     };
 
     let mut rows = vec![Row::plain(super::truncate_line(
@@ -994,7 +997,7 @@ fn tool_entry(tool: &ToolItem, app: &App, folded: bool, index: usize, width: u16
         bulleted_width(width) as usize,
     ))];
     if mode != Mode::Collapsed {
-        rows.extend(tool_output(tool, kind, running, width));
+        rows.extend(tool_output(tool, kind, running, width, mode));
     }
 
     Entry {
@@ -1229,13 +1232,15 @@ fn match_summary(output: &str) -> String {
 /// Ported from the per-variant renderers (§4.3 of the port notes): a command's
 /// output is flush left on a `bg_dark` panel band with a two-sided window
 /// (`execute.rs:567-590`), a file read gets a right-aligned line-number gutter
-/// and a bare `…` with no count (`read.rs:275-313`), and everything else is
-/// indented two columns and capped (`use_tool.rs:196-204`).
+/// and a bare `…` with no count (`read.rs:275-313`), ListDir is a panel listing,
+/// Search is grouped match rows, Edit is a reconstructed `-/+` listing, Other
+/// shows every line after a blank separator, and only MCP (`use_tool.rs`) is
+/// indented two columns and capped.
 ///
 /// Upstream's "press Enter to view" names a key Wizard does not bind; the hint
 /// here names the one that works, because a hint that names the wrong key is
 /// worse than none.
-fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16) -> Vec<Row> {
+fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode: Mode) -> Vec<Row> {
     let text = match tool.output.as_ref() {
         Some(out) => out.content.as_str(),
         None if !tool.progress.is_empty() => tool.progress.as_str(),
@@ -1243,10 +1248,11 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16) -> Ve
     };
     if text.trim().is_empty() {
         return match kind {
-            ToolKind::Search => vec![Row::plain(indented("(no results)", super::dim()))],
-            ToolKind::Fetch | ToolKind::WebSearch => {
-                vec![Row::plain(indented("(no content)", super::dim()))]
-            }
+            ToolKind::Search => search_empty(tool),
+            ToolKind::Fetch | ToolKind::WebSearch => vec![
+                Row::plain(Line::from("")),
+                Row::plain(indented("(no content)", super::dim())),
+            ],
             _ => Vec::new(),
         };
     }
@@ -1255,6 +1261,64 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16) -> Ve
     let lines: Vec<&str> = text.lines().collect();
 
     match kind {
+        ToolKind::ListDir => {
+            // `list_dir.rs:164-186`: a blank separator, then each entry two
+            // spaces in on the terminal-bg panel. Truncated and Expanded
+            // paint the same body.
+            let mut rows = vec![Row::plain(Line::from(""))];
+            rows.extend(
+                lines
+                    .iter()
+                    .map(|line| Row::panel(indented(line, theme::style(Token::Text)))),
+            );
+            rows
+        }
+        ToolKind::Search => search_body(tool, text),
+        ToolKind::Edit => edit_body(tool, text, width),
+        ToolKind::Fetch | ToolKind::WebSearch => {
+            let mut rows = vec![Row::plain(Line::from(""))];
+            rows.extend(wrap_indented_muted(text, width));
+            rows
+        }
+        ToolKind::Other if is_mcp(&tool.name) => {
+            // `use_tool.rs:167-184`: blank separator, empty panel row, then
+            // a 3-line Truncated / 10-line Expanded cap on the panel.
+            let cap = if mode == Mode::Expanded {
+                MAX_INLINE
+            } else {
+                TRUNCATED_INLINE
+            };
+            let shown = cap.min(lines.len());
+            let mut rows = vec![Row::plain(Line::from("")), Row::panel(Line::from(""))];
+            rows.extend(
+                lines[..shown]
+                    .iter()
+                    .map(|line| Row::panel(indented(line, body))),
+            );
+            if lines.len() > shown {
+                rows.push(Row::panel(indented(
+                    &format!("... ({} more lines, ctrl+t to expand)", lines.len() - shown),
+                    marker,
+                )));
+            }
+            rows
+        }
+        ToolKind::Other => {
+            // `other.rs:167-184`: blank separator, then every line, muted,
+            // no cap. The MCP 10/3 window is not this block.
+            let mut rows = vec![Row::plain(Line::from(""))];
+            let inner = (width as usize).max(1);
+            for line in super::wrap_all(
+                lines
+                    .iter()
+                    .map(|line| Line::from(Span::styled((*line).to_string(), body)))
+                    .collect(),
+                inner,
+            ) {
+                rows.push(Row::plain(line));
+            }
+            rows
+        }
         ToolKind::Execute => {
             // Flush left inside the block, on a panel band, wrapped two columns
             // short of the content width (`execute.rs:567`).
@@ -1316,30 +1380,177 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16) -> Ve
             }
             rows
         }
-        _ => {
-            let shown = if lines.len() > MAX_INLINE {
-                TRUNCATED_INLINE
-            } else {
-                lines.len()
-            };
-            let mut rows: Vec<Row> = lines[..shown]
-                .iter()
-                .map(|line| Row::plain(indented(line, body)))
-                .collect();
-            if lines.len() > shown {
-                rows.push(Row::plain(indented(
-                    &format!("... ({} more lines, ctrl+t to expand)", lines.len() - shown),
-                    marker,
-                )));
-            }
-            rows
-        }
     }
 }
 
 /// A two-column indented output row (`use_tool.rs`, `search.rs:447`).
 fn indented(text: &str, style: Style) -> Line<'static> {
     Line::from(vec![Span::raw("  "), Span::styled(text.to_string(), style)])
+}
+
+/// MCP tools are named `server__tool`. The 10/3 inline cap lives only on
+/// that path (`use_tool.rs`); a generic Other tool shows everything.
+fn is_mcp(name: &str) -> bool {
+    name.contains("__")
+}
+
+fn wrap_indented_muted(text: &str, width: u16) -> Vec<Row> {
+    let inner = (width as usize).saturating_sub(2).max(1);
+    super::wrap_all(
+        text.lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), super::muted())))
+            .collect(),
+        inner,
+    )
+    .into_iter()
+    .map(|line| {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(line.spans);
+        Row::plain(Line::from(spans))
+    })
+    .collect()
+}
+
+fn search_empty(tool: &ToolItem) -> Vec<Row> {
+    vec![
+        Row::plain(Line::from("")),
+        Row::plain(Line::from(Span::styled(
+            search_metadata(tool),
+            super::muted(),
+        ))),
+        Row::plain(Line::from("")),
+        Row::plain(indented("(no results)", super::dim())),
+    ]
+}
+
+fn search_metadata(tool: &ToolItem) -> String {
+    let arg = |key: &str| {
+        tool.args
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+    };
+    let mut line = format!("  content: {}", arg("pattern"));
+    let path = arg("path");
+    if !path.is_empty() {
+        line.push_str("  path: ");
+        line.push_str(path);
+    }
+    let glob = arg("glob");
+    if !glob.is_empty() {
+        line.push_str("  glob: ");
+        line.push_str(glob);
+    }
+    line
+}
+
+/// `search.rs:370-447`: blank separator, a metadata line, then per-file
+/// groups of `    {line}  {content}` under a bold path.
+fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
+    let groups = parse_search_hits(text);
+    if groups.is_empty() {
+        let mut rows = vec![
+            Row::plain(Line::from("")),
+            Row::plain(Line::from(Span::styled(
+                search_metadata(tool),
+                super::muted(),
+            ))),
+        ];
+        rows.extend(wrap_indented_muted(text, 80));
+        return rows;
+    }
+    let mut rows = vec![
+        Row::plain(Line::from("")),
+        Row::plain(Line::from(Span::styled(
+            search_metadata(tool),
+            super::muted(),
+        ))),
+    ];
+    for (path, hits) in groups {
+        rows.push(Row::plain(Line::from("")));
+        rows.push(Row::plain(Line::from(Span::styled(
+            path,
+            theme::style(Token::Text).bold(),
+        ))));
+        let pad = hits.iter().map(|(num, _)| num.len()).max().unwrap_or(1);
+        for (num, content) in hits {
+            rows.push(Row::plain(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{num:>pad$}"), super::dim()),
+                Span::raw("  "),
+                Span::styled(content, super::muted()),
+            ])));
+        }
+    }
+    rows
+}
+
+fn parse_search_hits(text: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((path, rest)) = line.split_once(':') else {
+            return Vec::new();
+        };
+        let Some((num, content)) = rest.split_once(':') else {
+            return Vec::new();
+        };
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            return Vec::new();
+        }
+        match groups.last_mut() {
+            Some((current, hits)) if current == path => {
+                hits.push((num.to_string(), content.to_string()));
+            }
+            _ => groups.push((
+                path.to_string(),
+                vec![(num.to_string(), content.to_string())],
+            )),
+        }
+    }
+    groups
+}
+
+/// Reconstruct the change from the arguments the model sent. Failed edits
+/// keep the error text. `edit.rs` paints a syntax-highlighted hunk with
+/// line numbers; we have the old/new strings, not a parsed patch, so the
+/// body is a two-column `-/+` listing in the diff tokens.
+fn edit_body(tool: &ToolItem, text: &str, width: u16) -> Vec<Row> {
+    let mut rows = vec![Row::plain(Line::from(""))];
+    if tool.output.as_ref().is_some_and(|out| out.is_error) {
+        rows.extend(wrap_indented_muted(text, width));
+        return rows;
+    }
+    let arg = |key: &str| tool.args.get(key).and_then(serde_json::Value::as_str);
+    let (old, new) = match tool.name.as_str() {
+        "edit_file" => match (arg("old_string"), arg("new_string")) {
+            (Some(old), Some(new)) => (old, new),
+            _ => {
+                rows.extend(wrap_indented_muted(text, width));
+                return rows;
+            }
+        },
+        "write_file" => ("", arg("content").unwrap_or("")),
+        _ => {
+            rows.extend(wrap_indented_muted(text, width));
+            return rows;
+        }
+    };
+    for line in old.lines() {
+        rows.push(Row::plain(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("-{line}"), theme::style(Token::DiffDel)),
+        ])));
+    }
+    for line in new.lines() {
+        rows.push(Row::plain(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("+{line}"), theme::style(Token::DiffAdd)),
+        ])));
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -4129,7 +4340,7 @@ mod tests {
             progress: String::new(),
             timing: crate::transcript::ToolTiming::default(),
         };
-        let rows = tool_output(&command, ToolKind::Execute, false, 60);
+        let rows = tool_output(&command, ToolKind::Execute, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
         assert_eq!(joined.len(), EXECUTE_FIRST + 1 + EXECUTE_LAST, "{joined:?}");
         assert_eq!(joined[EXECUTE_FIRST], "\u{2026} +7 lines");
@@ -4149,7 +4360,7 @@ mod tests {
             progress: String::new(),
             timing: crate::transcript::ToolTiming::default(),
         };
-        let rows = tool_output(&file, ToolKind::Read, false, 60);
+        let rows = tool_output(&file, ToolKind::Read, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
         // A bare `…` with no count: the line-number gutter says how much is gone.
         assert_eq!(joined[READ_FIRST], "\u{2026}", "{joined:?}");
@@ -4160,6 +4371,108 @@ mod tests {
             "{joined:?}"
         );
         assert!(!rows[0].panel, "a file read has no panel band");
+    }
+
+    fn sample_tool(name: &str, args: serde_json::Value, content: &str) -> ToolItem {
+        ToolItem {
+            name: name.into(),
+            args,
+            call_id: String::new(),
+            output: Some(crate::transcript::ToolItemOutput {
+                content: content.into(),
+                is_error: false,
+            }),
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        }
+    }
+
+    #[test]
+    fn list_dir_sits_on_a_panel_after_a_blank_separator() {
+        let tool = sample_tool(
+            "list_files",
+            serde_json::json!({ "path": "src" }),
+            "app/\nui/\ngrok.rs",
+        );
+        let entry = tool_entry(&tool, &app(), false, 0, 60);
+        assert_eq!(entry.mode, Mode::Truncated);
+        let rows = tool_output(&tool, ToolKind::ListDir, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "  app/", "  ui/", "  grok.rs"]);
+        assert!(!rows[0].panel, "the separator is not a band");
+        assert!(rows[1].panel && rows[2].panel && rows[3].panel);
+    }
+
+    #[test]
+    fn search_groups_hits_under_the_file_and_a_metadata_line() {
+        let tool = sample_tool(
+            "search_files",
+            serde_json::json!({ "pattern": "todo", "path": "src" }),
+            "src/a.rs:1:todo\nsrc/a.rs:9:todo again\nsrc/b.rs:2:todo",
+        );
+        let rows = tool_output(&tool, ToolKind::Search, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            joined,
+            [
+                "",
+                "  content: todo  path: src",
+                "",
+                "src/a.rs",
+                "    1  todo",
+                "    9  todo again",
+                "",
+                "src/b.rs",
+                "    2  todo",
+            ]
+        );
+        assert!(rows.iter().all(|row| !row.panel));
+    }
+
+    #[test]
+    fn edit_reconstructs_the_change_after_a_blank_separator() {
+        let tool = sample_tool(
+            "edit_file",
+            serde_json::json!({
+                "path": "src/x.rs",
+                "old_string": "let a = 1;",
+                "new_string": "let a = 2;\nlet b = 3;",
+            }),
+            "Edited src/x.rs: replaced 1 occurrence",
+        );
+        let rows = tool_output(&tool, ToolKind::Edit, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            joined,
+            ["", "  -let a = 1;", "  +let a = 2;", "  +let b = 3;"]
+        );
+        assert!(rows.iter().all(|row| !row.panel));
+    }
+
+    #[test]
+    fn other_shows_every_line_and_mcp_stays_capped() {
+        let many: String = (1..=15)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let other = sample_tool("memory", serde_json::json!({}), &many);
+        let rows = tool_output(&other, ToolKind::Other, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined.len(), 16, "{joined:?}");
+        assert_eq!(joined[0], "");
+        assert_eq!(joined[15], "line 15");
+        assert!(joined.iter().all(|line| !line.contains("more lines")));
+        assert!(rows.iter().all(|row| !row.panel));
+
+        let mcp = sample_tool("brave__browser_click", serde_json::json!({}), &many);
+        let rows = tool_output(&mcp, ToolKind::Other, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined[0], "");
+        assert_eq!(joined[1], "");
+        assert_eq!(joined[2], "  line 1");
+        assert_eq!(joined[4], "  line 3");
+        assert!(joined[5].contains("12 more lines"), "{joined:?}");
+        assert!(rows[1].panel && rows[2].panel);
     }
 
     // ── the screen ──────────────────────────────────────────────────────────
