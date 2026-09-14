@@ -1448,29 +1448,15 @@ fn search_empty(tool: &ToolItem) -> Vec<Row> {
     ]
 }
 
-fn search_metadata(tool: &ToolItem) -> String {
-    let arg = |key: &str| {
-        tool.args
-            .get(key)
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-    };
-    let mut line = format!("  content: {}", arg("pattern"));
-    let path = arg("path");
-    if !path.is_empty() {
-        line.push_str("  path: ");
-        line.push_str(path);
-    }
-    let glob = arg("glob");
-    if !glob.is_empty() {
-        line.push_str("  glob: ");
-        line.push_str(glob);
-    }
-    line
+fn search_metadata(_tool: &ToolItem) -> String {
+    // `search.rs` metadata_line: always `mode: {mode}`, then optional flags.
+    // Wizard's search_files is content search only, so the mode is pattern.
+    // Path and glob live on the header, never here.
+    "  mode: pattern".to_string()
 }
 
 /// `search.rs:370-447`: blank separator, a metadata line, then per-file
-/// groups of `    {line}  {content}` under a bold path.
+/// groups of `    {line}  {content}` under a two-space path.
 fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     let groups = parse_search_hits(text);
     if groups.is_empty() {
@@ -1493,17 +1479,17 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     ];
     for (path, hits) in groups {
         rows.push(Row::plain(Line::from("")));
-        rows.push(Row::panel(Line::from(Span::styled(
-            path,
-            theme::style(Token::Text).bold(),
-        ))));
+        rows.push(Row::panel(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(path, theme::style(Token::Code)),
+        ])));
         let pad = hits.iter().map(|(num, _)| num.len()).max().unwrap_or(1);
         for (num, content) in hits {
             rows.push(Row::panel(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(format!("{num:>pad$}"), super::dim()),
                 Span::raw("  "),
-                Span::styled(content, super::muted()),
+                Span::styled(content, theme::style(Token::Text)),
             ])));
         }
     }
@@ -4497,13 +4483,13 @@ mod tests {
             joined,
             [
                 "",
-                "  content: todo  path: src",
+                "  mode: pattern",
                 "",
-                "src/a.rs",
+                "  src/a.rs",
                 "    1  todo",
                 "    9  todo again",
                 "",
-                "src/b.rs",
+                "  src/b.rs",
                 "    2  todo",
             ]
         );
