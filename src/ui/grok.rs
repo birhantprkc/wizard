@@ -1390,7 +1390,7 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
             let emit = |range: std::ops::Range<usize>, rows: &mut Vec<Row>| {
                 for (offset, line) in lines[range.clone()].iter().enumerate() {
                     let number = range.start + offset + 1;
-                    rows.push(Row::plain(Line::from(vec![
+                    rows.push(Row::panel(Line::from(vec![
                         Span::styled(format!("{number:>gutter$}  "), marker),
                         Span::styled((*line).to_string(), body),
                     ])));
@@ -1398,7 +1398,7 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
             };
             if lines.len() > READ_FIRST + READ_LAST {
                 emit(0..READ_FIRST, &mut rows);
-                rows.push(Row::plain(Line::from(Span::styled("\u{2026}", marker))));
+                rows.push(Row::panel(Line::from(Span::styled("\u{2026}", marker))));
                 emit(lines.len() - READ_LAST..lines.len(), &mut rows);
             } else {
                 emit(0..lines.len(), &mut rows);
@@ -1493,13 +1493,13 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     ];
     for (path, hits) in groups {
         rows.push(Row::plain(Line::from("")));
-        rows.push(Row::plain(Line::from(Span::styled(
+        rows.push(Row::panel(Line::from(Span::styled(
             path,
             theme::style(Token::Text).bold(),
         ))));
         let pad = hits.iter().map(|(num, _)| num.len()).max().unwrap_or(1);
         for (num, content) in hits {
-            rows.push(Row::plain(Line::from(vec![
+            rows.push(Row::panel(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(format!("{num:>pad$}"), super::dim()),
                 Span::raw("  "),
@@ -4448,7 +4448,10 @@ mod tests {
             joined[READ_FIRST + 1].starts_with("10  line 10"),
             "{joined:?}"
         );
-        assert!(!rows[0].panel, "a file read has no panel band");
+        assert!(
+            rows.iter().all(|row| row.panel),
+            "a file read sits on bg_dark"
+        );
     }
 
     fn sample_tool(name: &str, args: serde_json::Value, content: &str) -> ToolItem {
@@ -4504,7 +4507,10 @@ mod tests {
                 "    2  todo",
             ]
         );
-        assert!(rows.iter().all(|row| !row.panel));
+        assert!(!rows[0].panel && !rows[1].panel && !rows[2].panel);
+        assert!(rows[3].panel && rows[4].panel && rows[5].panel);
+        assert!(!rows[6].panel);
+        assert!(rows[7].panel && rows[8].panel);
     }
 
     #[test]
