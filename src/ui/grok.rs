@@ -1194,14 +1194,26 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>
             ));
         }
         ToolKind::Other => {
-            spans.push(Span::styled(tool.name.clone(), verb));
-            let summary = other_summary(tool);
-            if !summary.is_empty() {
-                // Two spaces, as upstream (`other.rs:169`).
-                spans.push(Span::styled(
-                    format!("  {}", super::truncate_width(&summary, SUMMARY_WIDTH)),
-                    detail,
-                ));
+            if is_mcp(&tool.name) {
+                // `use_tool.rs` header_line: **Server** `Action`, each segment
+                // titleized on `_`.
+                let (server, action) = mcp_header_parts(&tool.name);
+                if server.is_empty() {
+                    spans.push(Span::styled(action, verb));
+                } else {
+                    spans.push(Span::styled(format!("{server} "), verb));
+                    spans.push(Span::styled(action, operand));
+                }
+            } else {
+                spans.push(Span::styled(tool.name.clone(), verb));
+                let summary = other_summary(tool);
+                if !summary.is_empty() {
+                    // Two spaces, as upstream (`other.rs:169`).
+                    spans.push(Span::styled(
+                        format!("  {}", super::truncate_width(&summary, SUMMARY_WIDTH)),
+                        detail,
+                    ));
+                }
             }
         }
     }
@@ -1418,6 +1430,27 @@ fn indented(text: &str, style: Style) -> Line<'static> {
 /// that path (`use_tool.rs`); a generic Other tool shows everything.
 fn is_mcp(name: &str) -> bool {
     name.contains("__")
+}
+
+/// `use_tool.rs` `split_name`: title-case each `_`-separated word.
+fn mcp_titleize_segment(name: &str) -> String {
+    name.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mcp_header_parts(name: &str) -> (String, String) {
+    match name.split_once("__") {
+        Some((server, action)) => (mcp_titleize_segment(server), mcp_titleize_segment(action)),
+        None => (String::new(), mcp_titleize_segment(name)),
+    }
 }
 
 fn wrap_indented_muted(text: &str, width: u16) -> Vec<Row> {
@@ -4385,6 +4418,21 @@ mod tests {
         )));
         // The pattern is Rust-debug-quoted, exactly as upstream prints it.
         assert_eq!(header, "Search \"todo\" in src (3 matches in 2 files)");
+
+        let mcp = ToolItem {
+            name: "linear__save_issue".into(),
+            args: serde_json::json!({}),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &mcp,
+            ToolKind::Other,
+            Mode::Truncated,
+        )));
+        assert_eq!(header, "Linear Save Issue");
     }
 
     #[test]
