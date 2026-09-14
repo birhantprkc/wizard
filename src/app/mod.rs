@@ -427,7 +427,8 @@ pub struct App {
     pub btw_inflight: bool,
     /// The standing goal a critic-gated `/goal` loop is pursuing, or `None`
     /// when no loop is active. Set by `/goal`, cleared when the critic returns
-    /// `OURS` or a second `PLATEAU`, or when the user interrupts.
+    /// `ACHIEVED`, when a goal turn is stopped or fails, or when the builder
+    /// idles for [`crate::agent::critic::GOAL_IDLE_LIMIT`] turns.
     pub active_goal: Option<String>,
     /// The exact next prompt that counts as a goal turn (the kickoff or a
     /// rework). When [`start_agent_turn`](crate::app::runtime) starts a turn on
@@ -440,8 +441,8 @@ pub struct App {
     pub goal_turn_running: bool,
     /// True while that critic is judging, so nothing else starts a second one.
     pub goal_inflight: bool,
-    /// Consecutive `PLATEAU` verdicts in this loop; two in a row stop it.
-    pub goal_plateaus: u32,
+    /// Goal turns in a row that neither claimed the goal nor did any work.
+    pub goal_idle_turns: u32,
     /// The request the in-flight turn is answering, kept for the completion
     /// review. The user's own words, not a summary of them: the agent's
     /// reading of the request is the thing under review.
@@ -615,7 +616,7 @@ impl App {
             review_rounds: 0,
             review_effects_mark: 0,
             goal_inflight: false,
-            goal_plateaus: 0,
+            goal_idle_turns: 0,
             pending_fork: None,
             mcp_merge_pending: false,
             pending_agent_commands: Vec::new(),
@@ -3879,28 +3880,21 @@ impl App {
     }
 
     /// Queue the first working turn for a freshly set `/goal`, and arm the
-    /// critic-gated loop: the goal becomes the standing one, and when this
-    /// turn finishes an independent critic judges it (see
-    /// [`crate::agent::critic`]). The prompt lands in the transcript and
-    /// the message queue, so the main loop's post-command drain starts it when
-    /// the agent is idle, or right after the current turn otherwise.
+    /// critic-gated loop: the goal becomes the standing one, the loop keeps
+    /// queuing turns until the builder claims it achieved, and each claim is
+    /// judged by an independent critic (see [`crate::agent::critic`]). The
+    /// prompt lands in the transcript and the message queue, so the main loop's
+    /// post-command drain starts it when the agent is idle, or right after the
+    /// current turn otherwise.
     pub fn queue_goal_kickoff(&mut self, goal: &str) {
-        let kickoff = format!(
-            "A standing goal was just set for this project:\n\n{goal}\n\n\
-             Start working toward it now: break it into concrete steps and \
-             begin executing them. Keep going until you reach a natural \
-             checkpoint, then stop and summarize the progress made and what \
-             remains. Do not declare the goal complete yourself — an independent \
-             critic decides that."
-        );
         self.active_goal = Some(goal.to_string());
-        self.goal_plateaus = 0;
-        self.queue_goal_turn(kickoff);
+        self.goal_idle_turns = 0;
+        self.queue_goal_turn(crate::agent::critic::goal_kickoff_prompt(goal));
     }
 
-    /// Queue the next turn of an active `/goal` loop (a rework the critic
-    /// asked for), arming the same post-turn critique. No-op with a warning if
-    /// the queue is full, so a rework is never silently lost.
+    /// Queue the next turn of an active `/goal` loop (a continuation, or a
+    /// rework the critic asked for), arming the same post-turn handling. No-op
+    /// with a warning if the queue is full, so a turn is never silently lost.
     pub fn queue_goal_turn(&mut self, prompt: String) {
         if self.message_queue.len() >= MESSAGE_QUEUE_CAP {
             self.notice(format!(

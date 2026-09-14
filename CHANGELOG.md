@@ -4,6 +4,23 @@ Notable changes, newest first. The format follows [Keep a Changelog](https://kee
 
 Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are on their [GitHub release pages](https://github.com/teddytennant/wizard/releases).
 
+## [Unreleased]
+
+### Changed
+
+- **`/goal` keeps working until a critic agrees the goal is achieved.** The old
+  loop ran the critic after every turn, told the agent to stop at checkpoints,
+  and gave up after two `PLATEAU` verdicts, so a goal could end without being
+  met. A cooperative Ctrl-C also went to the critic instead of stopping the loop.
+  Now a turn that stops without a claim just gets another turn. The agent claims
+  the goal by ending a reply with `GOAL ACHIEVED`, and only then does a fresh
+  critic check it. The critic is told to assume the claim is wrong, can run the
+  build and tests (it was read-only and could not), and answers `ACHIEVED` or
+  `NOT ACHIEVED` plus everything it wants changed, which goes back to the agent
+  whole instead of one 600-character gap. The loop ends on `ACHIEVED`, a stopped
+  or failed turn, or three turns in a row that did nothing and claimed nothing.
+  `--continuous` uses the same critic and no longer stops on `PLATEAU`.
+
 ## [3.2.0] - 2026-09-13
 
 ### Added

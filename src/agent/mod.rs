@@ -111,13 +111,15 @@ impl CritiqueContext {
             .run(
                 critic::critic_config(),
                 critic::critic_task(goal, &self.ctx.cwd),
-                subagent::RunScope::ReadOnly,
+                subagent::RunScope::Inspect,
                 None,
             )
             .await?;
         Ok(critic::parse_verdict(&output).unwrap_or_else(|| {
-            critic::GoalVerdict::Bar(
-                "the critic did not return a clear OURS/BAR/PLATEAU verdict; judge the goal again"
+            critic::GoalVerdict::NotAchieved(
+                "the critic did not return a clear ACHIEVED / NOT ACHIEVED verdict, so nothing \
+                 has been verified; check every requirement of the goal and run the tests \
+                 yourself before claiming it again"
                     .to_string(),
             )
         }))
@@ -1474,9 +1476,9 @@ impl Agent {
     ///
     /// The critic is spawned with no inherited history, so it cannot see the
     /// builder's turn: the independence the verdict rests on is structural, not
-    /// a promise in a prompt. It is read-only — it inspects and rules, it does
-    /// not touch the tree. An unclear reply is read as "judge again"
-    /// ([`critic::GoalVerdict::Bar`]), never as a pass, so a critic that
+    /// a promise in a prompt. It can read and run commands (the build, the
+    /// tests) but has no tool that writes. An unclear reply is
+    /// [`critic::GoalVerdict::NotAchieved`], never a pass, so a critic that
     /// mumbles cannot wave work through.
     pub async fn critique_goal(&self, goal: &str) -> Result<critic::GoalVerdict> {
         self.critique_context(None).critique(goal).await

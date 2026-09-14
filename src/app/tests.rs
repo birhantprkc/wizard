@@ -2625,7 +2625,13 @@ fn goal_kickoff_arms_the_critic_loop() {
         app.active_goal.as_deref(),
         Some("rewrite spore in assembly")
     );
-    assert_eq!(app.goal_plateaus, 0);
+    assert_eq!(app.goal_idle_turns, 0);
+    assert!(
+        app.message_queue[0]
+            .text
+            .contains(crate::agent::critic::GOAL_ACHIEVED_MARKER),
+        "the kickoff tells the builder how to claim the goal"
+    );
     // The exact queued prompt is armed so the turn that runs it is recognized
     // as a goal turn (and a user message queued ahead is not).
     assert_eq!(

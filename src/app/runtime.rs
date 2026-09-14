@@ -575,29 +575,22 @@ pub async fn run_tui(
             continue;
         }
 
-        // The independent goal critic returned its verdict. Act on it: `OURS`
-        // ends the loop, `BAR`/first `PLATEAU` queues one more rework turn
-        // (drained below), a second `PLATEAU` stops and reports. The verdict
-        // summary was already shown as a notice by the critic task.
+        // The independent goal critic returned its verdict on a claim of
+        // done. `ACHIEVED` ends the loop; `NOT ACHIEVED` queues a turn carrying
+        // the critic's feedback (drained below). The verdict summary was
+        // already shown as a notice by the critic task.
         if let Event::GoalCritiqued(verdict) = event {
             app.goal_inflight = false;
-            app.goal_plateaus = match &verdict {
-                crate::agent::critic::GoalVerdict::Plateau => app.goal_plateaus + 1,
-                _ => 0,
-            };
-            match crate::agent::critic::plan_after_verdict(&verdict, app.goal_plateaus) {
-                crate::agent::critic::CriticAction::Accept => {
-                    app.notice("goal met: the independent critic signed off.");
-                    app.active_goal = None;
-                }
-                crate::agent::critic::CriticAction::Rework(prompt) => {
-                    if app.active_goal.is_some() {
+            // The user may have stopped the loop while the critic was out.
+            if let Some(goal) = app.active_goal.clone() {
+                match crate::agent::critic::plan_after_verdict(&goal, &verdict) {
+                    crate::agent::critic::CriticAction::Accept => {
+                        app.notice("goal achieved: the independent critic signed off.");
+                        app.active_goal = None;
+                    }
+                    crate::agent::critic::CriticAction::Rework(prompt) => {
                         app.queue_goal_turn(prompt);
                     }
-                }
-                crate::agent::critic::CriticAction::Stop(why) => {
-                    app.notice(format!("goal loop stopped: {why}"));
-                    app.active_goal = None;
                 }
             }
             continue;
@@ -693,7 +686,11 @@ pub async fn run_tui(
             continue;
         }
 
-        let turn_done = matches!(&event, Event::Agent(AgentEvent::Done { .. }));
+        let done_reason = match &event {
+            Event::Agent(AgentEvent::Done { reason }) => Some(*reason),
+            _ => None,
+        };
+        let turn_done = done_reason.is_some();
 
         // An event handler that fails is a failure to react to one keystroke.
         // Propagating it here would unwind out of `run_tui` and end the
@@ -1035,26 +1032,55 @@ pub async fn run_tui(
                     // mid-turn snapshots so a follow-up `/btw` or `/fork` sees it.
                     side_question_snapshot = Some(agent.side_question_context());
                     fork_snapshot = Some(agent.fork_context());
-                    // A goal turn just finished: judge it with an independent
-                    // critic before the loop trusts it. Runs off the event loop
-                    // (a model call must not freeze the TUI), reporting back via
-                    // `Event::GoalCritiqued`. The verdict, not the builder's own
-                    // say-so, decides whether the goal is met.
+                    // A goal turn just finished. If the builder claimed the
+                    // goal, a fresh critic judges the claim off the event loop
+                    // (a model call must not freeze the TUI) and reports back
+                    // via `Event::GoalCritiqued`. If it stopped without
+                    // claiming, the loop keeps it working. The critic, not the
+                    // builder's say-so, decides whether the goal is met.
+                    let was_goal_turn = app.goal_turn_running;
                     if app.goal_turn_running && !app.goal_inflight {
                         app.goal_turn_running = false;
                         if let Some(goal) = app.active_goal.clone() {
-                            app.goal_inflight = true;
-                            let ctx = agent.critique_context(None);
-                            let notify = events.sender();
-                            spawn_answering(
+                            use crate::agent::critic;
+                            let claimed = critic::last_reply(agent.history())
+                                .is_some_and(|reply| critic::claims_goal_achieved(&reply));
+                            let did_work = agent.effects() > app.review_effects_mark;
+                            app.goal_idle_turns = if claimed || did_work {
+                                0
+                            } else {
+                                app.goal_idle_turns.saturating_add(1)
+                            };
+                            match critic::plan_after_goal_turn(
+                                &goal,
+                                done_reason.unwrap_or(DoneReason::Stopped),
+                                claimed,
+                                app.goal_idle_turns,
+                            ) {
+                                critic::GoalStep::Continue(prompt) => app.queue_goal_turn(prompt),
+                                critic::GoalStep::Stop(why) => {
+                                    app.notice(format!("goal loop stopped: {why}"));
+                                    app.active_goal = None;
+                                }
+                                critic::GoalStep::Critique => {
+                                    app.goal_inflight = true;
+                                    app.notice(
+                                        "goal claimed: an independent critic is checking it",
+                                    );
+                                    let ctx = agent.critique_context(None);
+                                    let notify = events.sender();
+                                    spawn_answering(
                                 notify.clone(),
-                                Event::GoalCritiqued(crate::agent::critic::GoalVerdict::Bar(
-                                    "the goal critic crashed; judge the goal again".to_string(),
+                                Event::GoalCritiqued(critic::GoalVerdict::NotAchieved(
+                                    "the goal critic crashed before it could check anything; \
+                                     verify the work yourself and claim again"
+                                        .to_string(),
                                 )),
                                 async move {
                                     let verdict = ctx.critique(&goal).await.unwrap_or_else(|err| {
-                                        crate::agent::critic::GoalVerdict::Bar(format!(
-                                            "the goal critic could not run ({err:#}); judge again"
+                                        critic::GoalVerdict::NotAchieved(format!(
+                                            "the goal critic could not run ({err:#}); verify the \
+                                             work yourself and claim again"
                                         ))
                                     });
                                     let _ = notify
@@ -1066,14 +1092,19 @@ pub async fn run_tui(
                                     Some(Event::GoalCritiqued(verdict))
                                 },
                             );
+                                }
+                            }
                         }
                     }
                     // Off in the TUI unless asked for: the user is reading
                     // the claim as it arrives and can say so themselves, and
                     // an extra model call per turn is their time and their
                     // money. `completion_review = true` turns it on, and then
-                    // it works exactly as it does headless.
-                    maybe_review_completion(&mut app, &agent, &events);
+                    // it works exactly as it does headless. A goal turn is the
+                    // goal loop's to judge, never both.
+                    if !was_goal_turn {
+                        maybe_review_completion(&mut app, &agent, &events);
+                    }
                     agent_slot = Some(agent);
                     // The provider just served a turn, so any earlier health
                     // warning was transient — drop it so it self-heals.

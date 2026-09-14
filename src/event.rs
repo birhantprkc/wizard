@@ -75,11 +75,10 @@ pub enum Event {
     /// already sent as [`Event::Notice`]; this only clears the in-flight flag
     /// so another `/btw` can run.
     BtwFinished,
-    /// The independent goal critic finished judging the artifact after a
-    /// goal-driven turn. The main loop clears the in-flight flag, then acts on
-    /// the verdict: `OURS` ends the goal loop, `BAR`/first `PLATEAU` queues a
-    /// rework turn, a second `PLATEAU` stops and reports. See
-    /// [`crate::agent::critic`].
+    /// The independent goal critic finished judging a claim that the goal is
+    /// achieved. The main loop clears the in-flight flag, then acts on the
+    /// verdict: `ACHIEVED` ends the goal loop, `NOT ACHIEVED` queues a turn
+    /// carrying the critic's feedback. See [`crate::agent::critic`].
     GoalCritiqued(crate::agent::critic::GoalVerdict),
     /// The completion review finished judging a turn's claim of done. Off by
     /// default in the TUI; `completion_review = true` turns it on. `PASS` is

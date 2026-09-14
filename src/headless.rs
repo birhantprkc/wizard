@@ -871,11 +871,6 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // one that landed. Mirrored into the mission so it is visible from outside
     // the process; the local copy is what the bound is checked against.
     let mut failure_streak: u32 = 0;
-    // Consecutive `PLATEAU` verdicts from the goal critic. Two in a row end a
-    // continuous run: the critic can name no gap another round would close, so
-    // there is nothing left for the loop to do but report it (see
-    // `crate::agent::critic`).
-    let mut plateau_streak: u32 = 0;
     // Raised by SIGTERM/SIGHUP/SIGINT. The handler also cancels the turn in
     // flight, so this is read at the boundary to stop the *next* cycle from
     // starting — a signal that lands between cycles has no turn to cancel, and
@@ -1111,14 +1106,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     verdict.summary()
                                                 ));
                                             }
-                                            plateau_streak = match &verdict {
-                                                critic::GoalVerdict::Plateau => plateau_streak + 1,
-                                                _ => 0,
-                                            };
-                                            match critic::plan_after_verdict(
-                                                &verdict,
-                                                plateau_streak,
-                                            ) {
+                                            match critic::plan_after_verdict(&goal, &verdict) {
                                                 critic::CriticAction::Accept => {
                                                     // Verified done: record the
                                                     // cycle and self-direct the
@@ -1133,12 +1121,12 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     let cycles = match mission_state.as_mut() {
                                                         Some(mission) => {
                                                             mission.record_cycle(Some(
-                                                                "cycle done: critic returned OURS"
+                                                                "cycle done: critic returned ACHIEVED"
                                                                     .to_string(),
                                                             ));
                                                             mission.stamp(format!(
                                                                 "cycle {iteration}: completed \
-                                                                 (critic OURS)"
+                                                                 (critic ACHIEVED)"
                                                             ));
                                                             persist(mission, &project_root);
                                                             mission.cycles
@@ -1172,20 +1160,6 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                         ),
                                                     );
                                                     input = prompt;
-                                                }
-                                                critic::CriticAction::Stop(why) => {
-                                                    if text_mode {
-                                                        spinner.println(&format!(
-                                                            "[goal loop stopping: {why}]"
-                                                        ));
-                                                    }
-                                                    stamp(
-                                                        mission_state.as_mut(),
-                                                        &project_root,
-                                                        format!("cycle {iteration}: {why}"),
-                                                    );
-                                                    final_reason = DoneReason::Completed;
-                                                    break;
                                                 }
                                             }
                                         }

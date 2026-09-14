@@ -10,12 +10,16 @@
 //!
 //! # The goal critic
 //!
-//! Mission scope, for the continuous goal loop: *is the standing goal met?*
-//! Binary on purpose. A score out of ten drifts up over rounds until every
-//! artifact is a nine; `OURS` / `BAR` / `PLATEAU` cannot. `BAR` carries the one
-//! gap worth another round, and two `PLATEAU`s in a row mean the critic cannot
-//! name a gap another round would close, which is the loop's cue to stop rather
-//! than churn. [`crate::agent::Agent::critique_goal`] runs it.
+//! Mission scope, for `/goal` and the continuous loop: *is the standing goal
+//! achieved?* The builder keeps working until it says so, by ending a reply
+//! with [`GOAL_ACHIEVED_MARKER`]. A turn that stops without that line is not a
+//! claim and gets a "keep going" turn, no critic. A turn that makes the claim
+//! gets a harsh critic that can read the tree and run commands but not write,
+//! and its verdict is binary: `ACHIEVED` ends the loop, `NOT ACHIEVED` sends
+//! the critic's own account of what to do differently back to the builder.
+//! There is no third verdict that lets the loop give up. The loop stops when
+//! the critic signs off, the user interrupts, or the turn itself fails.
+//! [`crate::agent::Agent::critique_goal`] runs it.
 //!
 //! # The completion review
 //!
@@ -29,38 +33,48 @@
 //!
 //! Both verdict parsers and both decision functions are pure and tested here.
 
+use crate::agent::DoneReason;
 use crate::agent::subagent::SubagentConfig;
 use crate::config::StepBudget;
+use crate::llm::{ChatMessage, Role};
 use std::path::Path;
 
-/// How many steps the critic may take: enough to read the files and run a quick
-/// look, not enough to wander. It is read-only, so it cannot do harm with them.
-const CRITIC_MAX_STEPS: u32 = 20;
+/// How many steps the goal critic may take. Enough to read the deliverables,
+/// build, run the test suite and poke at an edge case or two. It cannot write,
+/// so the steps can only be spent looking.
+const CRITIC_MAX_STEPS: u32 = 40;
 
-/// Longest gap text carried back to the builder. A critic that writes an essay
-/// still hands the loop one actionable line, not a wall.
+/// Longest gap text the completion review carries back.
 const MAX_GAP_CHARS: usize = 600;
 
-/// A critic's binary judgement of whether the goal is met.
+/// Longest critic feedback carried back to the builder. The goal critic is
+/// asked for a list of what to change, not one line, so it gets more room.
+const MAX_FEEDBACK_CHARS: usize = 4000;
+
+/// The line the builder ends its reply with to claim the goal is achieved.
+/// Only this line summons the critic; anything else is a turn still working.
+pub const GOAL_ACHIEVED_MARKER: &str = "GOAL ACHIEVED";
+
+/// Turns in a row that neither did any work nor claimed the goal before the
+/// loop decides the builder is stuck and stops. A turn that wrote a file or
+/// ran a command resets it, so an honest long grind never trips it.
+pub const GOAL_IDLE_LIMIT: u32 = 3;
+
+/// The critic's verdict on whether the goal is achieved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalVerdict {
-    /// The artifact meets the goal (beats the bar, if one was fetched).
-    Ours,
-    /// It does not yet. The single biggest gap to close before judging again.
-    Bar(String),
-    /// The critic cannot name a gap another round would close.
-    Plateau,
+    /// The critic checked and signed off.
+    Achieved,
+    /// It is not achieved. The critic's feedback on what to do differently.
+    NotAchieved(String),
 }
 
 impl GoalVerdict {
     /// A one-line description for a notice or a mission note.
     pub fn summary(&self) -> String {
         match self {
-            Self::Ours => "OURS — the critic signed off on the current artifact".to_string(),
-            Self::Bar(gap) => format!("BAR — {gap}"),
-            Self::Plateau => {
-                "PLATEAU — the critic can name no gap another round would close".to_string()
-            }
+            Self::Achieved => "ACHIEVED: the critic signed off".to_string(),
+            Self::NotAchieved(feedback) => format!("NOT ACHIEVED: {feedback}"),
         }
     }
 }
@@ -69,31 +83,43 @@ impl GoalVerdict {
 /// spawned with a fresh context and no history, so it physically cannot see the
 /// builder's turn, and this prompt tells it not to reconstruct one.
 const CRITIC_SYSTEM_PROMPT: &str = "\
-You are an independent critic for a goal-driven agent. You have never seen the \
-builder and you get none of its reasoning, reports, or claims — only the goal \
-and the project on disk. Do not imagine what the builder intended; judge what \
-is actually there.\n\
+You are a harsh, independent critic. An agent working toward a goal claims the \
+goal is achieved. You never saw it work and you get none of its reasoning, \
+summary or claims: only the goal and the project on disk. Your default \
+position is that the claim is wrong, and your job is to find out how.\n\
 \n\
-Inspect the real files, not a summary of them. If a quality bar has been \
-fetched under `.gauntlet/bar/`, compare the artifact against it; otherwise \
-judge the artifact against the goal's own success criteria. If the goal is \
-code, its tests passing is part of meeting it.\n\
+Check the real thing, not a description of it.\n\
+1. Restate the goal and list every requirement it states or clearly implies.\n\
+2. Check each one on disk. A missing file, a stub, a TODO, a placeholder, a \
+hardcoded answer, a disabled or deleted test, or a feature that only handles \
+the happy path is a failure.\n\
+3. Build it and run its tests, and any command the goal says the result will \
+be checked with, exactly as written. Code that does not build or tests that \
+fail mean NOT ACHIEVED.\n\
+4. Try at least one input or case the agent probably did not try.\n\
+If `.gauntlet/bar/` exists, it is a quality bar the work must beat.\n\
 \n\
-Return your verdict as the FIRST line of your reply, exactly one of:\n\
-  OURS      — the artifact meets the goal (beats the bar, if there is one)\n\
-  BAR       — it does not; on the next line, name the SINGLE biggest gap\n\
-  PLATEAU   — you cannot name a gap another round would close\n\
+You judge, you do not build. Do not write, edit or delete anything.\n\
 \n\
-No scores out of ten. No praise. No advice beyond the one gap. If you are \
-unsure whether a round could close the distance, that is PLATEAU, not OURS.";
+The FIRST line of your reply is your verdict, exactly one of:\n\
+  ACHIEVED       every requirement holds and you ran something that shows it\n\
+  NOT ACHIEVED   anything less\n\
+\n\
+After NOT ACHIEVED, tell the agent what to do differently: each concrete \
+problem you found, the evidence (a path, a command and its output), and what \
+has to change. Most important first. No praise, no scores, no summary of what \
+is fine. If you could not verify something, that is NOT ACHIEVED, and say \
+what stopped you. When in doubt, it is NOT ACHIEVED.";
 
-/// The critic subagent's definition. Read-only is enforced by the spawn
-/// options, not here, so this stays a plain description; `tool_scope` is left
-/// open so the read-only registry keeps every inspection tool the install has.
+/// The critic subagent's definition. Write access is removed by the spawn
+/// scope ([`crate::agent::subagent::RunScope::Inspect`]), not here, so the
+/// critic keeps every inspection tool the install has plus `execute`.
 pub fn critic_config() -> SubagentConfig {
     SubagentConfig {
         name: "goal-critic".to_string(),
-        description: "Independent critic that judges whether the standing goal is met and returns a binary OURS/BAR/PLATEAU verdict.".to_string(),
+        description: "Harsh independent critic that checks whether the standing goal is achieved \
+                      and returns ACHIEVED or NOT ACHIEVED with what to change."
+            .to_string(),
         system_prompt: CRITIC_SYSTEM_PROMPT.to_string(),
         tool_scope: None,
         max_steps: StepBudget::new(CRITIC_MAX_STEPS),
@@ -101,12 +127,11 @@ pub fn critic_config() -> SubagentConfig {
 }
 
 /// The task handed to the critic: the goal and where to look. Deliberately
-/// spare — the critic forms its own view from the files, not from a briefing.
+/// spare: the critic forms its own view from the files, not from a briefing.
 pub fn critic_task(goal: &str, project_root: &Path) -> String {
     format!(
-        "The standing goal is:\n\n{goal}\n\nThe project is at {root}. Inspect the real \
-         artifact there and judge whether the goal is met. If `.gauntlet/bar/` exists, that \
-         is the quality bar to beat. Return your verdict now.",
+        "The goal, verbatim between the markers:\n\n<goal>\n{goal}\n</goal>\n\nThe agent claims \
+         it is achieved. The project is at {root}. Check it and return your verdict now.",
         root = project_root.display()
     )
 }
@@ -119,35 +144,71 @@ fn starts_with_token(upper: &str, token: &str) -> bool {
         .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_ascii_alphabetic()))
 }
 
-/// Parse a critic's reply into a verdict. `None` when it named none — the
-/// caller decides what an unclear critic means (the loop treats it as "judge
-/// again", never as a pass).
+/// Parse the critic's reply. Only the first non-empty line is read for the
+/// verdict, so "achieved most of it" further down cannot pass anything.
+/// `None` when that line names no verdict; every caller reads that as not
+/// achieved.
 pub fn parse_verdict(output: &str) -> Option<GoalVerdict> {
     let lines: Vec<&str> = output.lines().collect();
-    for (idx, line) in lines.iter().enumerate() {
-        // Ignore leading markdown / bullet punctuation the model may prepend.
-        let stripped = line
-            .trim()
-            .trim_start_matches(|c: char| !c.is_ascii_alphabetic());
-        let upper = stripped.to_ascii_uppercase();
-        if starts_with_token(&upper, "OURS") {
-            return Some(GoalVerdict::Ours);
-        }
-        if starts_with_token(&upper, "PLATEAU") {
-            return Some(GoalVerdict::Plateau);
-        }
-        if starts_with_token(&upper, "BAR") {
-            return Some(GoalVerdict::Bar(gap_after(
-                &lines,
-                idx,
-                stripped,
-                "BAR".len(),
-                "the critic returned BAR without naming a gap; identify the biggest gap and \
-                 close it",
+    let idx = lines.iter().position(|line| !line.trim().is_empty())?;
+    let stripped = lines[idx]
+        .trim()
+        .trim_start_matches(|c: char| !c.is_ascii_alphabetic());
+    let upper = stripped.to_ascii_uppercase();
+    for token in ["NOT ACHIEVED", "NOT_ACHIEVED", "NOT-ACHIEVED"] {
+        if starts_with_token(&upper, token) {
+            let rest = stripped[token.len()..]
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '`' && c != '/')
+                .trim();
+            let mut feedback = rest.to_string();
+            for line in &lines[idx + 1..] {
+                if !feedback.is_empty() {
+                    feedback.push('\n');
+                }
+                feedback.push_str(line.trim_end());
+            }
+            let feedback = feedback.trim();
+            let feedback = if feedback.is_empty() {
+                "the critic returned NOT ACHIEVED without saying why; re-check every requirement \
+                 of the goal yourself, run the tests, and fix what fails"
+            } else {
+                feedback
+            };
+            return Some(GoalVerdict::NotAchieved(brief(
+                feedback,
+                MAX_FEEDBACK_CHARS,
             )));
         }
     }
+    if starts_with_token(&upper, "ACHIEVED") {
+        return Some(GoalVerdict::Achieved);
+    }
     None
+}
+
+/// The text of the builder's last reply, if its last message has any.
+///
+/// Only the final assistant message counts. A claim from an earlier turn
+/// must not be read as this turn's.
+pub fn last_reply(history: &[ChatMessage]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .map(ChatMessage::text)
+}
+
+/// Does this reply claim the goal is achieved? True when some line is the
+/// marker on its own, give or take markdown and punctuation around it. The
+/// marker inside a sentence ("I will write GOAL ACHIEVED when done") is not a
+/// claim.
+pub fn claims_goal_achieved(reply: &str) -> bool {
+    reply.lines().any(|line| {
+        let bare = line.trim().trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '*' | '_' | '`' | '#' | '>' | '.' | '!' | ':' | '-')
+        });
+        bare.eq_ignore_ascii_case(GOAL_ACHIEVED_MARKER)
+    })
 }
 
 /// The gap text after a verdict token: whatever follows it on its own line,
@@ -198,43 +259,94 @@ fn brief(text: &str, max: usize) -> String {
     out
 }
 
-/// What the loop should do next, given a verdict and how many `PLATEAU`s have
-/// come in a row. Pure so the loop's control flow can be tested without a model.
+/// How the builder is told to claim the goal. Shared by every goal prompt so
+/// the instruction cannot drift between them.
+fn claim_instruction() -> String {
+    format!(
+        "Do not stop at a checkpoint to report progress; keep going. When, and only when, you \
+         have verified the goal is fully achieved, end your reply with a line containing \
+         exactly `{GOAL_ACHIEVED_MARKER}`. An independent critic then checks the project, and \
+         if it disagrees you get its feedback and keep working."
+    )
+}
+
+/// The first turn of a freshly set goal.
+pub fn goal_kickoff_prompt(goal: &str) -> String {
+    format!(
+        "A standing goal was just set for this project:\n\n{goal}\n\nWork toward it now until it \
+         is achieved. {}",
+        claim_instruction()
+    )
+}
+
+/// The turn after one that stopped without claiming the goal.
+pub fn goal_continue_prompt(goal: &str) -> String {
+    format!(
+        "You stopped, but you have not claimed the goal achieved, so the goal loop is still \
+         running. The goal:\n\n{goal}\n\nKeep working on what remains. {}",
+        claim_instruction()
+    )
+}
+
+/// What the loop does after a goal turn ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CriticAction {
-    /// The goal is met: let the cycle land.
-    Accept,
-    /// Not yet: send this prompt back to the builder for another round.
-    Rework(String),
-    /// Plateaued twice: stop the loop and report `reason`.
+pub enum GoalStep {
+    /// The builder claimed the goal: run the critic.
+    Critique,
+    /// It stopped without claiming: send this prompt and keep going.
+    Continue(String),
+    /// End the loop and report why.
     Stop(String),
 }
 
-/// Plateaus in a row that mean "stop", not "try once more".
-pub const PLATEAU_LIMIT: u32 = 2;
+/// Decide the next move after a goal turn. `idle_turns` counts turns in a row,
+/// this one included, that neither claimed the goal nor did any work.
+pub fn plan_after_goal_turn(
+    goal: &str,
+    reason: DoneReason,
+    claimed: bool,
+    idle_turns: u32,
+) -> GoalStep {
+    match reason {
+        DoneReason::Completed | DoneReason::MaxSteps if claimed => GoalStep::Critique,
+        DoneReason::Completed | DoneReason::MaxSteps if idle_turns >= GOAL_IDLE_LIMIT => {
+            GoalStep::Stop(format!(
+                "{idle_turns} turns in a row did no work and did not claim the goal; send a \
+                 message or `/goal` again to resume"
+            ))
+        }
+        DoneReason::Completed | DoneReason::MaxSteps => {
+            GoalStep::Continue(goal_continue_prompt(goal))
+        }
+        DoneReason::Stopped => GoalStep::Stop("the turn was stopped".to_string()),
+        DoneReason::TimeLimit => GoalStep::Stop("the time limit was reached".to_string()),
+        DoneReason::CircuitBreaker => {
+            GoalStep::Stop("the circuit breaker tripped on repeated failures".to_string())
+        }
+    }
+}
 
-/// Decide the loop's next move from a verdict. `plateau_streak` is the count
-/// *including* this verdict when it is `Plateau` (the caller bumps it first).
-pub fn plan_after_verdict(verdict: &GoalVerdict, plateau_streak: u32) -> CriticAction {
+/// What the loop should do with a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CriticAction {
+    /// The goal is achieved: let the cycle land.
+    Accept,
+    /// Not yet: send this prompt back to the builder.
+    Rework(String),
+}
+
+/// Decide the loop's next move from a verdict. Pure so the loop's control flow
+/// can be tested without a model.
+pub fn plan_after_verdict(goal: &str, verdict: &GoalVerdict) -> CriticAction {
     match verdict {
-        GoalVerdict::Ours => CriticAction::Accept,
-        GoalVerdict::Bar(gap) => CriticAction::Rework(format!(
-            "An independent critic judged the goal NOT yet met and named one gap to close:\n\n\
-             {gap}\n\n\
-             Close exactly this gap, then stop and let the critic judge again. Do not declare \
-             the goal done yourself — the critic decides."
+        GoalVerdict::Achieved => CriticAction::Accept,
+        GoalVerdict::NotAchieved(feedback) => CriticAction::Rework(format!(
+            "You claimed the goal is achieved. An independent critic checked the project and \
+             says it is NOT. What it says to do differently:\n\n{feedback}\n\nThe goal:\n\n\
+             {goal}\n\nAddress every point, not just the first. Run the build and tests \
+             yourself. The critic decides whether the goal is met, not you. {}",
+            claim_instruction()
         )),
-        GoalVerdict::Plateau if plateau_streak >= PLATEAU_LIMIT => CriticAction::Stop(
-            "the critic returned PLATEAU twice: it can name no gap another round would close"
-                .to_string(),
-        ),
-        GoalVerdict::Plateau => CriticAction::Rework(
-            "An independent critic returned PLATEAU: it could not name a gap another round \
-             would close. Take a genuinely different approach — a different angle, tool, or \
-             decomposition — then let the critic judge again. If there is truly nothing more \
-             to try, say so plainly."
-                .to_string(),
-        ),
     }
 }
 
@@ -472,101 +584,185 @@ mod tests {
 
     #[test]
     fn parses_a_bare_verdict() {
-        assert_eq!(parse_verdict("OURS"), Some(GoalVerdict::Ours));
-        assert_eq!(parse_verdict("PLATEAU"), Some(GoalVerdict::Plateau));
+        assert_eq!(parse_verdict("ACHIEVED"), Some(GoalVerdict::Achieved));
+        assert_eq!(parse_verdict("**ACHIEVED**"), Some(GoalVerdict::Achieved));
+        assert!(matches!(
+            parse_verdict("NOT ACHIEVED"),
+            Some(GoalVerdict::NotAchieved(_))
+        ));
     }
 
     #[test]
-    fn parses_ours_with_trailing_prose() {
-        assert_eq!(
-            parse_verdict("OURS\nThe tests pass and it matches the bar."),
-            Some(GoalVerdict::Ours)
+    fn not_achieved_is_never_read_as_achieved() {
+        assert!(matches!(
+            parse_verdict("**NOT ACHIEVED**\n- tests fail"),
+            Some(GoalVerdict::NotAchieved(_))
+        ));
+    }
+
+    #[test]
+    fn not_achieved_carries_all_of_the_feedback() {
+        let reply = "NOT ACHIEVED\n1. `cargo test` fails: 3 failed in parser.rs\n\n\
+                     2. src/retry.rs has no backoff, so a flapping host is hammered.";
+        let Some(GoalVerdict::NotAchieved(feedback)) = parse_verdict(reply) else {
+            panic!("expected NOT ACHIEVED");
+        };
+        assert!(feedback.contains("3 failed in parser.rs"), "{feedback}");
+        assert!(
+            feedback.contains("no backoff"),
+            "past a blank line: {feedback}"
         );
     }
 
     #[test]
-    fn bar_captures_the_gap_on_the_next_line() {
+    fn feedback_on_the_verdict_line_is_kept() {
         assert_eq!(
-            parse_verdict("BAR\nThe retry path has no backoff, so a flapping host is hammered."),
-            Some(GoalVerdict::Bar(
-                "The retry path has no backoff, so a flapping host is hammered.".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn bar_captures_the_gap_on_the_same_line() {
-        assert_eq!(
-            parse_verdict("BAR: missing the error path for a closed socket"),
-            Some(GoalVerdict::Bar(
+            parse_verdict("NOT ACHIEVED: missing the error path for a closed socket"),
+            Some(GoalVerdict::NotAchieved(
                 "missing the error path for a closed socket".to_string()
             ))
         );
     }
 
     #[test]
-    fn ignores_leading_markdown() {
-        assert_eq!(parse_verdict("**OURS**"), Some(GoalVerdict::Ours));
-        assert_eq!(parse_verdict("- PLATEAU"), Some(GoalVerdict::Plateau));
-    }
-
-    #[test]
-    fn does_not_read_barely_as_bar() {
-        // No verdict token present at all.
-        assert_eq!(parse_verdict("Barely acceptable, but fine."), None);
-    }
-
-    #[test]
-    fn unclear_reply_has_no_verdict() {
-        assert_eq!(parse_verdict("I think it looks pretty good overall."), None);
-    }
-
-    #[test]
-    fn bar_without_a_gap_still_names_one() {
-        let GoalVerdict::Bar(gap) = parse_verdict("BAR").unwrap() else {
-            panic!("expected BAR");
-        };
-        assert!(!gap.is_empty());
-    }
-
-    #[test]
-    fn a_long_gap_is_trimmed() {
-        let huge = format!("BAR\n{}", "x".repeat(MAX_GAP_CHARS + 200));
-        let GoalVerdict::Bar(gap) = parse_verdict(&huge).unwrap() else {
-            panic!("expected BAR");
-        };
-        assert!(gap.chars().count() <= MAX_GAP_CHARS + 1); // +1 for the ellipsis
-    }
-
-    #[test]
-    fn ours_accepts() {
+    fn only_the_first_line_is_the_verdict() {
+        // Prose that happens to start a later line with the word cannot pass.
+        assert_eq!(parse_verdict("Looking at it.\nACHIEVED"), None);
         assert_eq!(
-            plan_after_verdict(&GoalVerdict::Ours, 0),
+            parse_verdict("\n\nACHIEVED\nall tests pass"),
+            Some(GoalVerdict::Achieved)
+        );
+        assert_eq!(parse_verdict("Achievedness is unclear"), None);
+    }
+
+    #[test]
+    fn not_achieved_without_feedback_still_says_something() {
+        let Some(GoalVerdict::NotAchieved(feedback)) = parse_verdict("NOT ACHIEVED") else {
+            panic!("expected NOT ACHIEVED");
+        };
+        assert!(!feedback.is_empty());
+    }
+
+    #[test]
+    fn long_feedback_is_trimmed() {
+        let huge = format!("NOT ACHIEVED\n{}", "x".repeat(MAX_FEEDBACK_CHARS + 200));
+        let Some(GoalVerdict::NotAchieved(feedback)) = parse_verdict(&huge) else {
+            panic!("expected NOT ACHIEVED");
+        };
+        assert!(feedback.chars().count() <= MAX_FEEDBACK_CHARS + 1);
+    }
+
+    #[test]
+    fn a_claim_is_the_marker_on_its_own_line() {
+        assert!(claims_goal_achieved(
+            "All done, tests pass.\n\nGOAL ACHIEVED"
+        ));
+        assert!(claims_goal_achieved("**GOAL ACHIEVED**"));
+        assert!(claims_goal_achieved("`GOAL ACHIEVED`\n"));
+        assert!(!claims_goal_achieved(
+            "Parser is half done. I will say GOAL ACHIEVED when it is finished."
+        ));
+        assert!(!claims_goal_achieved("Progress so far: the lexer works."));
+    }
+
+    #[test]
+    fn only_the_last_assistant_message_is_the_reply() {
+        let history = vec![
+            ChatMessage::new(
+                Role::Assistant,
+                vec![crate::llm::ContentBlock::text("GOAL ACHIEVED")],
+            ),
+            ChatMessage::new(
+                Role::User,
+                vec![crate::llm::ContentBlock::text("keep going")],
+            ),
+            ChatMessage::new(
+                Role::Assistant,
+                vec![crate::llm::ContentBlock::text("still on it")],
+            ),
+        ];
+        let reply = last_reply(&history).unwrap();
+        assert!(!claims_goal_achieved(&reply));
+    }
+
+    #[test]
+    fn a_claim_goes_to_the_critic() {
+        assert_eq!(
+            plan_after_goal_turn("g", DoneReason::Completed, true, 0),
+            GoalStep::Critique
+        );
+        assert_eq!(
+            plan_after_goal_turn("g", DoneReason::MaxSteps, true, 0),
+            GoalStep::Critique
+        );
+    }
+
+    #[test]
+    fn stopping_without_a_claim_keeps_working() {
+        for reason in [DoneReason::Completed, DoneReason::MaxSteps] {
+            let GoalStep::Continue(prompt) =
+                plan_after_goal_turn("ship the parser", reason, false, 1)
+            else {
+                panic!("expected continue on {reason:?}");
+            };
+            assert!(prompt.contains("ship the parser"));
+            assert!(prompt.contains(GOAL_ACHIEVED_MARKER));
+        }
+    }
+
+    #[test]
+    fn an_idle_builder_is_stopped() {
+        assert!(matches!(
+            plan_after_goal_turn("g", DoneReason::Completed, false, GOAL_IDLE_LIMIT),
+            GoalStep::Stop(_)
+        ));
+        assert!(matches!(
+            plan_after_goal_turn("g", DoneReason::Completed, false, GOAL_IDLE_LIMIT - 1),
+            GoalStep::Continue(_)
+        ));
+    }
+
+    #[test]
+    fn an_interrupted_or_failed_turn_ends_the_loop_without_a_critic() {
+        for reason in [
+            DoneReason::Stopped,
+            DoneReason::TimeLimit,
+            DoneReason::CircuitBreaker,
+        ] {
+            // Even with a claim: nobody should be judging a turn the user stopped.
+            assert!(matches!(
+                plan_after_goal_turn("g", reason, true, 0),
+                GoalStep::Stop(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn achieved_accepts() {
+        assert_eq!(
+            plan_after_verdict("g", &GoalVerdict::Achieved),
             CriticAction::Accept
         );
     }
 
     #[test]
-    fn bar_reworks_with_the_gap_in_the_prompt() {
-        let CriticAction::Rework(prompt) =
-            plan_after_verdict(&GoalVerdict::Bar("no backoff".into()), 0)
-        else {
+    fn not_achieved_sends_the_critics_feedback_back() {
+        let CriticAction::Rework(prompt) = plan_after_verdict(
+            "ship the parser",
+            &GoalVerdict::NotAchieved("parser.rs panics on empty input".into()),
+        ) else {
             panic!("expected rework");
         };
-        assert!(prompt.contains("no backoff"));
-        assert!(prompt.contains("critic decides"));
+        assert!(prompt.contains("parser.rs panics on empty input"));
+        assert!(prompt.contains("ship the parser"));
+        assert!(prompt.contains(GOAL_ACHIEVED_MARKER));
     }
 
     #[test]
-    fn first_plateau_reworks_second_stops() {
-        assert!(matches!(
-            plan_after_verdict(&GoalVerdict::Plateau, 1),
-            CriticAction::Rework(_)
-        ));
-        assert!(matches!(
-            plan_after_verdict(&GoalVerdict::Plateau, PLATEAU_LIMIT),
-            CriticAction::Stop(_)
-        ));
+    fn kickoff_tells_the_builder_how_to_claim() {
+        let prompt = goal_kickoff_prompt("rewrite spore in assembly");
+        assert!(prompt.contains("rewrite spore in assembly"));
+        assert!(prompt.contains(GOAL_ACHIEVED_MARKER));
     }
 
     // --- the completion review ---------------------------------------------

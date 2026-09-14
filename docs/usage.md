@@ -30,7 +30,7 @@ inline hints.
 | `/agents` | Browse the subagent roster; Enter pre-fills a delegation request |
 | `/dashboard` | Toggle the machine-wide session manager, same view as `wizard agents` (below) |
 | `/bashes` | List background tasks (`execute` with `run_in_background`), running and finished ([tasks.md](tasks.md)) |
-| `/goal [text]` | Show or set the standing mission goal, then work toward it under an independent critic: after each turn a fresh critic (never shown the builder's work) returns OURS/BAR/PLATEAU, and the loop reworks the one named gap until OURS or a second PLATEAU. Persists to `.wizard/mission.toml`; also drives sovereign/continuous mode |
+| `/goal [text]` | Show or set the standing mission goal, then keep working toward it. The agent keeps getting turns until it ends a reply with `GOAL ACHIEVED`; each claim spawns a harsh critic that never saw the work, can run the build and tests but cannot write, and returns ACHIEVED or NOT ACHIEVED. NOT ACHIEVED sends its feedback back and the loop continues. Ctrl-C stops it. Persists to `.wizard/mission.toml`; also drives sovereign/continuous mode |
 | `/diff` | Toggle the git diff sidebar |
 | `/todos` | Toggle the todo list above the input |
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
