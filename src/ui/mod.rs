@@ -3520,15 +3520,35 @@ fn syntect_style(style: syntect::highlighting::Style) -> Style {
 /// painted in the palette it was highlighted under, and a stale cache is a
 /// silent failure.
 fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
+    highlight_with(lang, None, code, muted())
+}
+
+/// Highlight a file body the way a Read card does: syntax by path, else
+/// `fallback` (primary, not muted). Chat fences keep calling
+/// [`highlight_code_block`], which still falls back to muted.
+pub(super) fn highlight_source(path: &str, code: &str, fallback: Style) -> Vec<Line<'static>> {
+    highlight_with("", Some(path), code, fallback)
+}
+
+fn highlight_with(
+    lang: &str,
+    path: Option<&str>,
+    code: &str,
+    fallback: Style,
+) -> Vec<Line<'static>> {
     static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     let active = theme::active();
     let mut hasher = std::hash::DefaultHasher::new();
     lang.hash(&mut hasher);
+    path.hash(&mut hasher);
     code.hash(&mut hasher);
     active.name.hash(&mut hasher);
     active.depth().hash(&mut hasher);
+    // Two call sites, two fallbacks. Hashing the debug form keeps the cache
+    // from serving a muted chat fence as a primary Read body.
+    format!("{fallback:?}").hash(&mut hasher);
     let key = hasher.finish();
     if let Ok(guard) = cache.lock()
         && let Some(lines) = guard.get(&key)
@@ -3537,10 +3557,20 @@ fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
     }
 
     let (syntaxes, syntax_theme) = syntect_assets();
-    let syntax = if lang.is_empty() {
-        None
-    } else {
-        syntaxes.find_syntax_by_token(lang)
+    let syntax = {
+        let from_path = path.and_then(|p| {
+            let name = p.rsplit(['/', '\\']).next().unwrap_or(p);
+            name.rsplit_once('.')
+                .and_then(|(_, ext)| syntaxes.find_syntax_by_extension(ext))
+                .or_else(|| syntaxes.find_syntax_by_token(name))
+        });
+        from_path.or_else(|| {
+            if lang.is_empty() {
+                None
+            } else {
+                syntaxes.find_syntax_by_token(lang)
+            }
+        })
     };
     let lines: Vec<Line<'static>> = match (syntax, syntax_theme.as_ref()) {
         (Some(syntax), Some(syntax_theme)) => {
@@ -3560,14 +3590,14 @@ fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
                     ),
                     Err(_) => Line::from(Span::styled(
                         line.trim_end_matches('\n').to_string(),
-                        muted(),
+                        fallback,
                     )),
                 })
                 .collect()
         }
         _ => code
             .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), muted())))
+            .map(|line| Line::from(Span::styled(line.to_string(), fallback)))
             .collect(),
     };
 

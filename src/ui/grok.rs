@@ -1368,14 +1368,10 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
         ToolKind::Execute => {
             // `execute.rs:510-567`: a blank separator, wrap the whole body, then
             // a first/last window on the *wrapped* count (`execute.rs:521-567`).
+            // Body is `theme.primary()` (`execute.rs:554`); ANSI SGR maps through
+            // tokens so a cargo-test dump still reads red/green.
             let inner = content_width(width).saturating_sub(2).max(20) as usize;
-            let wrapped = super::wrap_all(
-                lines
-                    .iter()
-                    .map(|line| Line::from(Span::styled((*line).to_string(), body)))
-                    .collect(),
-                inner,
-            );
+            let wrapped = super::wrap_all(terminal_lines(text, theme::style(Token::Text)), inner);
             let mut rows = vec![Row::plain(Line::from(""))];
             let emit = |slice: &[Line<'static>], rows: &mut Vec<Row>| {
                 for line in slice {
@@ -1414,15 +1410,22 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
             let last = base + lines.len().saturating_sub(1);
             let gutter = last.max(1).to_string().len();
             let inner = (width as usize).saturating_sub(gutter + 2).max(20);
+            // Body is `theme.primary()` plus syntect (`read.rs:256-273`); only
+            // the gutter and the `…` stay dim.
+            let path = tool.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let highlighted = super::highlight_source(path, text, theme::style(Token::Text));
             let styled: Vec<Line<'static>> = lines
                 .iter()
                 .enumerate()
                 .map(|(offset, line)| {
                     let number = base + offset;
-                    Line::from(vec![
-                        Span::styled(format!("{number:>gutter$}  "), marker),
-                        Span::styled((*line).to_string(), body),
-                    ])
+                    let mut spans = vec![Span::styled(format!("{number:>gutter$}  "), marker)];
+                    if let Some(hl) = highlighted.get(offset) {
+                        spans.extend(hl.spans.iter().cloned());
+                    } else {
+                        spans.push(Span::styled((*line).to_string(), theme::style(Token::Text)));
+                    }
+                    Line::from(spans)
                 })
                 .collect();
             let wrapped = super::wrap_all(styled, inner);
@@ -1455,6 +1458,126 @@ fn read_base_line(tool: &ToolItem) -> usize {
         .and_then(|value| value.as_u64())
         .filter(|&n| n > 0)
         .unwrap_or(1) as usize
+}
+
+/// SGR-aware Execute body. grok-build uses a stream emulator
+/// (`render_terminal_lines`); we keep CSI text off the card and map the 16
+/// ANSI colors through tokens so this file still never names a hue.
+fn terminal_lines(raw: &str, base: Style) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut style = base;
+    let mut chars = raw.chars().peekable();
+
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>, style: Style| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(std::mem::take(buf), style));
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            flush(&mut buf, &mut spans, style);
+            match chars.next() {
+                Some('[') => {
+                    let mut seq = String::new();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c.is_ascii_alphabetic() {
+                            if c == 'm' {
+                                style = apply_sgr(&seq, style, base);
+                            }
+                            break;
+                        }
+                        seq.push(c);
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        if ch == '\n' {
+            flush(&mut buf, &mut spans, style);
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            continue;
+        }
+        if ch == '\r' {
+            flush(&mut buf, &mut spans, style);
+            spans.clear();
+            continue;
+        }
+        buf.push(ch);
+    }
+    flush(&mut buf, &mut spans, style);
+    if !spans.is_empty() || lines.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn apply_sgr(seq: &str, mut style: Style, base: Style) -> Style {
+    if seq.is_empty() {
+        return base;
+    }
+    let mut nums = seq.split(';').map(|p| p.parse::<u16>().unwrap_or(0));
+    while let Some(code) = nums.next() {
+        match code {
+            0 => style = base,
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            30..=37 => style = style.fg(theme::color(ansi_token(code - 30))),
+            90..=97 => {
+                style = style
+                    .fg(theme::color(ansi_token(code - 90)))
+                    .add_modifier(Modifier::BOLD)
+            }
+            39 => style.fg = base.fg,
+            38 | 48 => match nums.next() {
+                Some(5) => {
+                    let _ = nums.next();
+                }
+                Some(2) => {
+                    let _ = nums.next();
+                    let _ = nums.next();
+                    let _ = nums.next();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    style
+}
+
+fn ansi_token(n: u16) -> Token {
+    match n {
+        0 => Token::Muted,
+        1 => Token::Error,
+        2 => Token::Success,
+        3 => Token::Warning,
+        4 => Token::Accent,
+        5 => Token::Heading,
+        6 => Token::Link,
+        7 => Token::Text,
+        _ => Token::Text,
+    }
 }
 
 /// MCP tools are named `server__tool`. The 10/3 inline cap lives only on
@@ -4590,6 +4713,80 @@ mod tests {
             joined.iter().any(|s| s == "\u{2026}"),
             "wrap-then-truncate must window a long file, got {joined:?}"
         );
+    }
+
+    #[test]
+    fn execute_and_read_bodies_are_primary_on_the_panel() {
+        let primary = theme::style(Token::Text).fg;
+        let muted = theme::style(Token::Muted).fg;
+        assert_ne!(primary, muted, "the test needs Text and Muted to differ");
+
+        let command = sample_tool(
+            "execute",
+            serde_json::json!({ "command": "echo" }),
+            "hello from the shell",
+        );
+        let rows = tool_output(&command, ToolKind::Execute, false, 60, Mode::Truncated);
+        let content = &rows[1].line;
+        assert!(
+            content.spans.iter().any(|s| s.style.fg == primary),
+            "execute body should be primary, got {:?}",
+            content.spans
+        );
+        assert!(
+            content
+                .spans
+                .iter()
+                .filter(|s| !s.content.trim().is_empty())
+                .all(|s| s.style.fg != muted),
+            "execute body should not sit in muted, got {:?}",
+            content.spans
+        );
+
+        let file = sample_tool(
+            "read_file",
+            serde_json::json!({ "path": "a.rs" }),
+            "fn foo() {}",
+        );
+        let rows = tool_output(&file, ToolKind::Read, false, 60, Mode::Truncated);
+        let line = &rows[1].line;
+        assert_eq!(
+            line.spans[0].style.fg,
+            theme::style(Token::Faint).fg,
+            "gutter stays dim"
+        );
+        assert!(
+            line.spans
+                .iter()
+                .skip(1)
+                .filter(|s| !s.content.is_empty())
+                .all(|s| s.style.fg != muted),
+            "read body should not sit in muted, got {:?}",
+            line.spans
+        );
+    }
+
+    #[test]
+    fn execute_keeps_sgr_text_and_maps_red_through_error() {
+        let command = sample_tool(
+            "execute",
+            serde_json::json!({ "command": "cargo test" }),
+            "\u{1b}[31mFAIL\u{1b}[0m ok",
+        );
+        let rows = tool_output(&command, ToolKind::Execute, false, 60, Mode::Truncated);
+        let joined = text(&rows[1].line);
+        assert_eq!(joined, "FAIL ok");
+        assert!(
+            !joined.contains('\u{1b}'),
+            "CSI must not leak onto the card"
+        );
+        let fail = rows[1]
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("FAIL"))
+            .expect("FAIL span");
+        assert_eq!(fail.style.fg, theme::style(Token::Error).fg);
     }
 
     fn sample_tool(name: &str, args: serde_json::Value, content: &str) -> ToolItem {
