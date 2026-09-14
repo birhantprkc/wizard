@@ -1731,20 +1731,55 @@ fn wrap_indented_muted(text: &str, width: u16) -> Vec<Row> {
 fn search_empty(tool: &ToolItem) -> Vec<Row> {
     vec![
         Row::plain(Line::from("")),
-        Row::plain(Line::from(Span::styled(
-            search_metadata(tool),
-            super::muted(),
-        ))),
+        Row::plain(search_metadata(tool)),
         Row::plain(Line::from("")),
         Row::plain(indented("(no results)", super::dim())),
     ]
 }
 
-fn search_metadata(_tool: &ToolItem) -> String {
-    // `search.rs` metadata_line: always `mode: {mode}`, then optional flags.
-    // Wizard's search_files is content search only, so the mode is pattern.
-    // Path and glob live on the header, never here.
-    "  mode: pattern".to_string()
+/// `search.rs` metadata_line: muted labels, primary values. Always
+/// `mode: pattern` (Wizard's search is content mode). Optional flags from args.
+fn search_metadata(tool: &ToolItem) -> Line<'static> {
+    let label = super::muted();
+    let value = theme::style(Token::Text);
+    let mode = match tool
+        .args
+        .get("output_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("content")
+    {
+        "files_with_matches" => "files",
+        "count" => "count",
+        _ => "pattern",
+    };
+    let mut spans = vec![
+        Span::styled("  ", label),
+        Span::styled("mode: ", label),
+        Span::styled(mode, value),
+    ];
+    let flag = |key: &str| {
+        tool.args.get(key).and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_bool().filter(|b| *b).map(|_| "true".to_string()))
+        })
+    };
+    if let Some(ft) = flag("file_type").or_else(|| flag("type")) {
+        spans.push(Span::styled(", ", label));
+        spans.push(Span::styled("type: ", label));
+        spans.push(Span::styled(ft, value));
+    }
+    if flag("case_insensitive").is_some() {
+        spans.push(Span::styled(", ", label));
+        spans.push(Span::styled("case-insensitive: ", label));
+        spans.push(Span::styled("true", value));
+    }
+    if flag("multiline").is_some() {
+        spans.push(Span::styled(", ", label));
+        spans.push(Span::styled("multiline: ", label));
+        spans.push(Span::styled("true", value));
+    }
+    Line::from(spans)
 }
 
 /// `search.rs:370-447`: blank separator, a metadata line, then per-file
@@ -1754,33 +1789,29 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     if groups.is_empty() {
         let mut rows = vec![
             Row::plain(Line::from("")),
-            Row::plain(Line::from(Span::styled(
-                search_metadata(tool),
-                super::muted(),
-            ))),
+            Row::plain(search_metadata(tool)),
         ];
         rows.extend(wrap_indented_muted(text, 80));
         return rows;
     }
     let mut rows = vec![
         Row::plain(Line::from("")),
-        Row::plain(Line::from(Span::styled(
-            search_metadata(tool),
-            super::muted(),
-        ))),
+        Row::plain(search_metadata(tool)),
     ];
     for (path, hits) in groups {
         rows.push(Row::plain(Line::from("")));
         rows.push(Row::panel(Line::from(vec![
             Span::raw("  "),
-            Span::styled(path, theme::style(Token::Code)),
+            // grok-build `theme.path`. Wizard has no Path token; Link is the
+            // location color, Code was the miss the critic named.
+            Span::styled(path, theme::style(Token::Link)),
         ])));
-        let pad = hits.iter().map(|(num, _)| num.len()).max().unwrap_or(1);
         for (num, content) in hits {
+            let n: usize = num.parse().unwrap_or(0);
             rows.push(Row::panel(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(format!("{num:>pad$}"), super::dim()),
-                Span::raw("  "),
+                Span::styled("    ", theme::style(Token::Text)),
+                Span::styled(format!("{n:>4}"), super::muted()),
+                Span::styled("  ", theme::style(Token::Text)),
                 Span::styled(content, theme::style(Token::Text)),
             ])));
         }
@@ -4991,17 +5022,28 @@ mod tests {
                 "  mode: pattern",
                 "",
                 "  src/a.rs",
-                "    1  todo",
-                "    9  todo again",
+                "       1  todo",
+                "       9  todo again",
                 "",
                 "  src/b.rs",
-                "    2  todo",
+                "       2  todo",
             ]
         );
         assert!(!rows[0].panel && !rows[1].panel && !rows[2].panel);
         assert!(rows[3].panel && rows[4].panel && rows[5].panel);
         assert!(!rows[6].panel);
         assert!(rows[7].panel && rows[8].panel);
+        let meta = &rows[1].line.spans;
+        assert_eq!(meta[1].content.as_ref(), "mode: ");
+        assert_eq!(meta[1].style.fg, theme::style(Token::Muted).fg);
+        assert_eq!(meta[2].content.as_ref(), "pattern");
+        assert_eq!(meta[2].style.fg, theme::style(Token::Text).fg);
+        assert_eq!(rows[3].line.spans[1].style.fg, theme::style(Token::Link).fg);
+        assert_eq!(rows[4].line.spans[1].content.as_ref(), "   1");
+        assert_eq!(
+            rows[4].line.spans[1].style.fg,
+            theme::style(Token::Muted).fg
+        );
     }
 
     #[test]
