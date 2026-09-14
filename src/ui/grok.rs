@@ -55,6 +55,7 @@
 //! reserved and nothing is overlaid: a wrong timestamp is worse than none, and
 //! the alternative needs a field on the transcript model, not on this file.
 
+use std::path::Path;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -949,7 +950,8 @@ fn notice_entry(message: &str, width: u16) -> Entry {
 /// mapping of Wizard's tool names onto those headers, not onto a generic one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
-    /// `read_file` → `Read <path> (1-120)`.
+    /// `read_file` → `Read <basename>` collapsed, cwd-relative expanded,
+    /// with `(1-120)` or `(1-120 of 400)`.
     Read,
     /// `write_file` / `edit_file` → `Creating <path>` / `Edit <path>`.
     Edit,
@@ -1031,7 +1033,7 @@ fn tool_entry(tool: &ToolItem, app: &App, folded: bool, index: usize, width: u16
         execute_header_rows(tool, mode, header_width)
     } else {
         vec![Row::plain(super::truncate_line(
-            Line::from(tool_header(tool, kind, mode)),
+            Line::from(tool_header(tool, kind, mode, &app.project_root)),
             header_width,
         ))]
     };
@@ -1106,7 +1108,7 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 /// `theme.command` (yellow). Wizard has no token for either, and inventing one
 /// would put two more hues in the palette contract for one skin; both are
 /// literal code, so both ask for [`Token::Code`].
-fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>> {
+fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
         theme::style(Token::Muted)
@@ -1132,13 +1134,11 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>
     match kind {
         ToolKind::Read => {
             spans.push(Span::styled("Read ", verb));
-            spans.push(Span::styled(arg("path"), operand));
-            let range = match (tool.args.get("start_line"), tool.args.get("end_line")) {
-                (Some(start), Some(end)) => format!(" ({start}-{end})"),
-                (Some(start), None) => format!(" ({start}-)"),
-                _ => String::new(),
-            };
-            spans.push(Span::styled(range, detail));
+            spans.push(Span::styled(
+                read_header_path(&arg("path"), cwd, collapsed),
+                operand,
+            ));
+            spans.push(Span::styled(read_range_suffix(tool), detail));
         }
         ToolKind::Edit => {
             spans.push(Span::styled(
@@ -1235,6 +1235,65 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>
         }
     }
     spans
+}
+
+/// Collapsed: basename. Truncated/Expanded: cwd-relative. `read.rs:174-176`.
+fn read_header_path(path: &str, cwd: &Path, collapsed: bool) -> String {
+    if collapsed {
+        return path
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path)
+            .to_string();
+    }
+    match Path::new(path).strip_prefix(cwd) {
+        Ok(rel) => {
+            let rel = rel.to_string_lossy();
+            if rel.is_empty() {
+                path.to_string()
+            } else {
+                rel.into_owned()
+            }
+        }
+        Err(_) => path.to_string(),
+    }
+}
+
+/// `(start-end)` or `(start-end of total)` when the file is larger than the
+/// slice (`read.rs:177-187`).
+fn read_range_suffix(tool: &ToolItem) -> String {
+    let Some(start) = arg_line(tool, "start_line") else {
+        return String::new();
+    };
+    let Some(end) = arg_line(tool, "end_line") else {
+        return String::new();
+    };
+    let range_size = end.saturating_sub(start).saturating_add(1);
+    match read_file_total_lines(tool) {
+        Some(total) if total > range_size => format!(" ({start}-{end} of {total})"),
+        _ => format!(" ({start}-{end})"),
+    }
+}
+
+fn arg_line(tool: &ToolItem, key: &str) -> Option<usize> {
+    let value = tool.args.get(key)?;
+    value
+        .as_u64()
+        .map(|n| n as usize)
+        .or_else(|| value.as_str()?.parse().ok())
+}
+
+fn read_file_total_lines(tool: &ToolItem) -> Option<usize> {
+    let text = tool.output.as_ref()?.content.as_str();
+    let marker = "; total ";
+    let rest = text.get(text.rfind(marker)? + marker.len()..)?;
+    let n_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if n_str.is_empty() || !rest[n_str.len()..].starts_with(" lines") {
+        return None;
+    }
+    n_str.parse().ok()
 }
 
 fn execute_header_spans(
@@ -4696,8 +4755,9 @@ mod tests {
             &read,
             ToolKind::Read,
             Mode::Collapsed,
+            Path::new("/workspace"),
         )));
-        assert_eq!(header, "Read src/app/cli.rs (1-120)");
+        assert_eq!(header, "Read cli.rs (1-120)");
 
         let search = ToolItem {
             name: "search_files".into(),
@@ -4714,6 +4774,7 @@ mod tests {
             &search,
             ToolKind::Search,
             Mode::Collapsed,
+            Path::new("/workspace"),
         )));
         // The pattern is Rust-debug-quoted, exactly as upstream prints it.
         assert_eq!(header, "Search \"todo\" in src (3 matches in 2 files)");
@@ -4730,6 +4791,7 @@ mod tests {
             &mcp,
             ToolKind::Other,
             Mode::Truncated,
+            Path::new("/workspace"),
         )));
         assert_eq!(header, "Linear Save Issue");
 
@@ -4745,8 +4807,53 @@ mod tests {
             &empty,
             ToolKind::Execute,
             Mode::Truncated,
+            Path::new("/workspace"),
         )));
         assert_eq!(header, "Run \u{2026}");
+    }
+
+    #[test]
+    fn read_header_collapses_the_path_and_names_the_range() {
+        let cwd = Path::new("/workspace");
+        let mut read = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({
+                "path": "/workspace/src/app/cli.rs",
+                "start_line": 1,
+                "end_line": 120
+            }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = text(&Line::from(tool_header(
+            &read,
+            ToolKind::Read,
+            Mode::Collapsed,
+            cwd,
+        )));
+        assert_eq!(collapsed, "Read cli.rs (1-120)");
+
+        let expanded = text(&Line::from(tool_header(
+            &read,
+            ToolKind::Read,
+            Mode::Truncated,
+            cwd,
+        )));
+        assert_eq!(expanded, "Read src/app/cli.rs (1-120)");
+
+        read.output = Some(crate::transcript::ToolItemOutput {
+            content: "... [showing 2000 of 120 requested lines; total 400 lines — use start_line/end_line to read more]".into(),
+            is_error: false,
+        });
+        let ranged = text(&Line::from(tool_header(
+            &read,
+            ToolKind::Read,
+            Mode::Collapsed,
+            cwd,
+        )));
+        assert_eq!(ranged, "Read cli.rs (1-120 of 400)");
     }
 
     #[test]
