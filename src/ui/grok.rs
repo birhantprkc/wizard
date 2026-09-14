@@ -2566,6 +2566,53 @@ fn session_title(app: &App) -> String {
         .unwrap_or_default()
 }
 
+/// In-box slash preview: grok-build's `paint_slash_token_highlight` plus the
+/// remainder/args ghost (`P/src/views/prompt_widget/mod.rs:3092-3175`).
+///
+/// Recolor `/name`; ghost the rest of the name after the token and the args
+/// placeholder after the cursor. Ghost is muted, not italic. Command names
+/// stay Wizard's.
+struct SlashPreview {
+    /// Exclusive char index of the `/name` token.
+    cmd_end: usize,
+    remainder: String,
+    args: String,
+}
+
+fn slash_preview(app: &App) -> Option<SlashPreview> {
+    if app.suggestions.is_empty() {
+        return None;
+    }
+    if app.input.chars().next() != Some('/') {
+        return None;
+    }
+    let name: String = app
+        .input
+        .chars()
+        .skip(1)
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    let cmd_end = 1 + name.chars().count();
+    let spec = &app.suggestions[app.suggestion_index.min(app.suggestions.len() - 1)];
+    let remainder = spec
+        .name
+        .strip_prefix(name.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args_started = app.input.chars().count() > cmd_end;
+    let args = if !args_started && remainder.is_empty() && spec.takes_args && !spec.args.is_empty()
+    {
+        format!(" {}", spec.args)
+    } else {
+        String::new()
+    };
+    Some(SlashPreview {
+        cmd_end,
+        remainder,
+        args,
+    })
+}
+
 /// The draft itself, plus the `❯ ` prefix and the caret.
 fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
     if inner.width < 4 || inner.height == 0 {
@@ -2575,6 +2622,7 @@ fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
     let chars = super::composer_chars(app);
     let cursor = app.cursor.min(chars.len());
     let normal = app.vim.is_normal();
+    let preview = slash_preview(app);
     let rows = super::wrap_rows(&chars, budget);
     let (crow, ccol) = super::cursor_visual(&rows, cursor);
 
@@ -2599,6 +2647,8 @@ fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
             Span::styled("\u{25b6} ", super::warning().bold())
         } else if app.plan_mode || app.omakase {
             Span::styled(PROMPT_ARROW, theme::style(Token::Warning))
+        } else if !focused {
+            Span::styled(PROMPT_ARROW, theme::style(Token::Faint))
         } else {
             Span::styled(PROMPT_ARROW, super::accent())
         };
@@ -2613,10 +2663,55 @@ fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
                 spans.push(Span::styled(" ", block));
             }
         } else {
-            spans.push(Span::styled(
-                row.iter().collect::<String>(),
-                theme::style(Token::Text),
-            ));
+            let highlight = preview
+                .as_ref()
+                .map(|p| {
+                    if p.cmd_end <= start {
+                        0
+                    } else {
+                        p.cmd_end.min(end) - start
+                    }
+                })
+                .unwrap_or(0);
+            if highlight > 0 {
+                spans.push(Span::styled(
+                    row[..highlight].iter().collect::<String>(),
+                    theme::style(Token::Heading),
+                ));
+            }
+            if highlight < row.len() {
+                spans.push(Span::styled(
+                    row[highlight..].iter().collect::<String>(),
+                    theme::style(Token::Text),
+                ));
+            }
+            if let Some(preview) = &preview {
+                let row_width: usize = row
+                    .iter()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0))
+                    .sum();
+                let room = budget.saturating_sub(row_width);
+                let ghost = if preview.cmd_end > start
+                    && preview.cmd_end <= end
+                    && !preview.remainder.is_empty()
+                {
+                    Some(preview.remainder.as_str())
+                } else if preview.remainder.is_empty()
+                    && !preview.args.is_empty()
+                    && cursor == chars.len()
+                    && end == chars.len()
+                {
+                    Some(preview.args.as_str())
+                } else {
+                    None
+                };
+                if let Some(ghost) = ghost
+                    && room > 0
+                {
+                    let shown: String = ghost.chars().take(room).collect();
+                    spans.push(Span::styled(shown, theme::style(Token::Muted)));
+                }
+            }
             if index == crow && !normal {
                 let used: usize = row[..ccol.min(row.len())]
                     .iter()
@@ -2633,7 +2728,7 @@ fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
     // own invitation, because the placeholder is copy, not chrome.
     if chars.is_empty() && !focused {
         lines = vec![Line::from(vec![
-            Span::styled(PROMPT_ARROW, super::accent()),
+            Span::styled(PROMPT_ARROW, theme::style(Token::Faint)),
             Span::styled("type a message", theme::style(Token::Muted)),
         ])];
     }
@@ -3496,13 +3591,7 @@ mod tests {
 
     /// Render at `width`×`height` under the `grok` skin, one string per row.
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
-        let _pinned = crate::skin::pin(Skin::Grok);
-        let backend = ratatui::backend::TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| super::super::draw(frame, app))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_buffer(app, width, height);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -3510,6 +3599,16 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn render_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let _pinned = crate::skin::pin(Skin::Grok);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(frame, app))
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     fn text(line: &Line<'_>) -> String {
@@ -4254,6 +4353,100 @@ mod tests {
         assert!(
             inner > 1,
             "wrapped description made the popup taller than one item:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn slash_preview_ghosts_the_rest_of_the_name() {
+        let mut app = slash_app(&[("help", "show help")]);
+        app.input = "/he".into();
+        let preview = super::slash_preview(&app).expect("slash");
+        assert_eq!(preview.cmd_end, 3);
+        assert_eq!(preview.remainder, "lp");
+        assert!(preview.args.is_empty());
+    }
+
+    #[test]
+    fn slash_preview_ghosts_the_args_placeholder() {
+        let mut app = slash_app(&[("model", "pick a model")]);
+        app.suggestions[0].takes_args = true;
+        app.suggestions[0].args = "<name>".into();
+        app.input = "/model".into();
+        let preview = super::slash_preview(&app).expect("slash");
+        assert_eq!(preview.remainder, "");
+        assert_eq!(preview.args, " <name>");
+    }
+
+    #[test]
+    fn slash_preview_drops_the_args_ghost_once_the_user_types_a_space() {
+        let mut app = slash_app(&[("model", "pick a model")]);
+        app.suggestions[0].takes_args = true;
+        app.suggestions[0].args = "<name>".into();
+        app.input = "/model ".into();
+        let preview = super::slash_preview(&app).expect("slash");
+        assert!(preview.args.is_empty());
+    }
+
+    #[test]
+    fn the_composer_ghosts_the_rest_of_a_partial_slash_command() {
+        let mut app = slash_app(&[("help", "show help")]);
+        app.input = "/he".into();
+        app.cursor = 3;
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let composer = rows
+            .iter()
+            .rfind(|row| row.contains('\u{276f}') && row.contains("/help"))
+            .unwrap_or_else(|| panic!("composer should show /he plus ghost lp:\n{dump}"));
+        assert!(
+            composer.contains("/help"),
+            "remainder lp sits after /he:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn the_composer_recolors_the_slash_command_token() {
+        let _theme = grok_theme();
+        let mut app = slash_app(&[("help", "show help")]);
+        app.input = "/he".into();
+        app.cursor = 3;
+        let buffer = render_buffer(&app, 80, 24);
+        let mut found = None;
+        for y in (0..24u16).rev() {
+            for x in 0..80u16 {
+                if buffer[(x, y)].symbol() == "/"
+                    && x + 1 < 80
+                    && buffer[(x + 1, y)].symbol() == "h"
+                    && x + 2 < 80
+                    && buffer[(x + 2, y)].symbol() == "e"
+                {
+                    found = Some((x, y));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (x, y) = found.expect("the /he token is on screen");
+        let heading = crate::theme::color(Token::Heading);
+        let muted = crate::theme::color(Token::Muted);
+        assert_eq!(
+            buffer[(x, y)].fg,
+            heading,
+            "/ should be the command token colour"
+        );
+        assert_eq!(buffer[(x + 1, y)].fg, heading, "h should match /");
+        assert_eq!(buffer[(x + 2, y)].fg, heading, "e should match /");
+        assert_eq!(
+            buffer[(x + 3, y)].fg,
+            muted,
+            "ghost l should be muted, not italic"
+        );
+        assert!(
+            !buffer[(x + 3, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::ITALIC)
         );
     }
 
