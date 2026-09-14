@@ -1026,10 +1026,15 @@ fn tool_entry(tool: &ToolItem, app: &App, folded: bool, index: usize, width: u16
         Mode::Truncated
     };
 
-    let mut rows = vec![Row::plain(super::truncate_line(
-        Line::from(tool_header(tool, kind, mode)),
-        bulleted_width(width) as usize,
-    ))];
+    let header_width = bulleted_width(width) as usize;
+    let mut rows = if kind == ToolKind::Execute {
+        execute_header_rows(tool, mode, header_width)
+    } else {
+        vec![Row::plain(super::truncate_line(
+            Line::from(tool_header(tool, kind, mode)),
+            header_width,
+        ))]
+    };
     if mode != Mode::Collapsed {
         rows.extend(tool_output(tool, kind, running, width, mode));
     }
@@ -1147,9 +1152,13 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>
             spans.push(Span::styled(arg("path"), operand));
         }
         ToolKind::Execute => {
-            spans.push(Span::styled("Run ", verb));
-            spans.push(Span::styled(
-                super::truncate_width(arg("command").trim(), SUMMARY_WIDTH),
+            // `execute.rs` Label: `Run ` hang-wraps the command with bash
+            // highlight. Empty command is `…`. Truncation is the hang wrap, not
+            // SUMMARY_WIDTH.
+            spans.extend(execute_header_spans(
+                &arg("command"),
+                verb,
+                collapsed,
                 operand,
             ));
         }
@@ -1226,6 +1235,101 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode) -> Vec<Span<'static>
         }
     }
     spans
+}
+
+fn execute_header_spans(
+    command: &str,
+    verb: Style,
+    collapsed: bool,
+    fallback: Style,
+) -> Vec<Span<'static>> {
+    let command = command
+        .trim()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut spans = vec![Span::styled("Run ", verb)];
+    if command.is_empty() {
+        spans.push(Span::styled("\u{2026}", fallback));
+        return spans;
+    }
+    if collapsed {
+        spans.push(Span::styled(command, fallback));
+        return spans;
+    }
+    let highlighted = super::highlight_source("cmd.sh", &command, fallback);
+    match highlighted.into_iter().next() {
+        Some(line) if !line.spans.is_empty() => spans.extend(line.spans),
+        _ => spans.push(Span::styled(command, fallback)),
+    }
+    spans
+}
+
+fn execute_header_rows(tool: &ToolItem, mode: Mode, width: usize) -> Vec<Row> {
+    let command = tool
+        .args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let collapsed = mode == Mode::Collapsed;
+    let verb = if collapsed {
+        theme::style(Token::Muted)
+    } else {
+        theme::style(Token::Text).bold()
+    };
+    let fallback = if collapsed {
+        theme::style(Token::Muted)
+    } else {
+        theme::style(Token::Code)
+    };
+    let spans = execute_header_spans(command, verb, collapsed, fallback);
+    let line = Line::from(spans);
+    if collapsed {
+        return vec![Row::plain(super::truncate_line(line, width))];
+    }
+    hang_wrap_header(line, "Run ".len(), width)
+        .into_iter()
+        .map(Row::plain)
+        .collect()
+}
+
+fn hang_wrap_header(line: Line<'static>, hang: usize, width: usize) -> Vec<Line<'static>> {
+    if line.spans.is_empty() {
+        return vec![line];
+    }
+    let hang = hang.min(width.saturating_sub(1));
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let mut seen = 0usize;
+    for span in line.spans {
+        if seen < hang {
+            let w = UnicodeWidthStr::width(span.content.as_ref());
+            prefix.push(span);
+            seen = seen.saturating_add(w);
+        } else {
+            body.push(span);
+        }
+    }
+    let inner = width.saturating_sub(hang).max(1);
+    let wrapped = super::wrap_all(vec![Line::from(body)], inner);
+    if wrapped.is_empty() {
+        return vec![Line::from(prefix)];
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut spans = if i == 0 {
+                prefix.clone()
+            } else {
+                vec![Span::raw(" ".repeat(hang))]
+            };
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The one obvious argument of a tool that has one, else its JSON.
@@ -4597,6 +4701,58 @@ mod tests {
             Mode::Truncated,
         )));
         assert_eq!(header, "Linear Save Issue");
+
+        let empty = ToolItem {
+            name: "execute".into(),
+            args: serde_json::json!({ "command": "  " }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &empty,
+            ToolKind::Execute,
+            Mode::Truncated,
+        )));
+        assert_eq!(header, "Run \u{2026}");
+    }
+
+    #[test]
+    fn execute_header_hang_wraps_under_run() {
+        let command = "echo one two three four five six seven eight nine ten";
+        let tool = ToolItem {
+            name: "execute".into(),
+            args: serde_json::json!({ "command": command }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let entry = tool_entry(&tool, &app(), false, 0, 24);
+        let headers: Vec<String> = entry
+            .rows
+            .iter()
+            .map(|row| text(&row.line))
+            .take_while(|s| !s.is_empty())
+            .collect();
+        assert!(
+            headers[0].starts_with("Run "),
+            "first hang line starts with Run, got {headers:?}"
+        );
+        assert!(
+            headers.len() > 1,
+            "a command longer than the card must hang-wrap, got {headers:?}"
+        );
+        assert!(
+            headers[1].starts_with("    "),
+            "continuation hangs under Run, got {headers:?}"
+        );
+        let joined = headers.concat();
+        assert!(
+            joined.contains("echo") && joined.contains("ten"),
+            "hang wrap must keep the whole command, got {headers:?}"
+        );
     }
 
     #[test]
