@@ -102,6 +102,58 @@ pub fn indexed_to_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
+/// Nearest of the 6×6×6 cube and the grayscale ramp. Grok-build `recede.rs`
+/// `nearest_indexed`: Indexed inputs stay Indexed so a 256-color theme does
+/// not jump to truecolor mid-blend.
+pub fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
+    const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let channel = |v: u8| {
+        let mut best = 0u8;
+        let mut best_d = v.abs_diff(CUBE[0]) as u16;
+        for i in 1..6u8 {
+            let d = v.abs_diff(CUBE[i as usize]) as u16;
+            if d < best_d {
+                best = i;
+                best_d = d;
+            }
+        }
+        best
+    };
+    let dist = |r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8| {
+        let dr = r1 as i32 - r2 as i32;
+        let dg = g1 as i32 - g2 as i32;
+        let db = b1 as i32 - b2 as i32;
+        (dr * dr + dg * dg + db * db) as u32
+    };
+    let ri = channel(r);
+    let gi = channel(g);
+    let bi = channel(b);
+    let cube_idx = 16 + 36 * ri as u16 + 6 * gi as u16 + bi as u16;
+    let cube_dist = dist(
+        r,
+        g,
+        b,
+        CUBE[ri as usize],
+        CUBE[gi as usize],
+        CUBE[bi as usize],
+    );
+    let lum = (r as u16 + g as u16 + b as u16) / 3;
+    let gray_step = if lum <= 3 {
+        0u8
+    } else if lum >= 243 {
+        23
+    } else {
+        ((lum as i16 - 8 + 5) / 10).clamp(0, 23) as u8
+    };
+    let gv = (8 + gray_step as u16 * 10) as u8;
+    let gray_dist = dist(r, g, b, gv, gv, gv);
+    if gray_dist < cube_dist {
+        232 + gray_step
+    } else {
+        cube_idx as u8
+    }
+}
+
 /// Is this background a light one? Rec. 601 luma against the midpoint.
 ///
 /// Ported from `codex-rs/tui/src/color.rs` (openai/codex, Apache-2.0).
@@ -239,6 +291,15 @@ mod tests {
         assert_eq!(indexed_to_rgb(16), (0, 0, 0));
         assert_eq!(indexed_to_rgb(231), (255, 255, 255));
         assert_eq!(indexed_to_rgb(232), (8, 8, 8));
+    }
+
+    #[test]
+    fn nearest_indexed_hits_the_cube_and_the_gray_ramp() {
+        assert_eq!(nearest_indexed(0, 0, 0), 16);
+        assert_eq!(nearest_indexed(255, 255, 255), 231);
+        assert_eq!(nearest_indexed(95, 135, 215), 68);
+        let gray = nearest_indexed(128, 128, 128);
+        assert!((232..=255).contains(&gray));
     }
 
     #[test]

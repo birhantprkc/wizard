@@ -273,7 +273,15 @@ fn recede_area(buf: &mut Buffer, area: Rect, toward: Color) {
             };
             if let (Some(bg), Some(fg)) = (base, rgb(cell.fg)) {
                 let (r, g, b) = blend::blend(fg, bg, OPACITY);
-                cell.set_fg(Color::Rgb(r, g, b));
+                // Indexed in, Indexed out (`recede.rs` `blend_color`): TokyoNight
+                // 256 must not become truecolor because a cell receded.
+                let indexed =
+                    matches!(toward, Color::Indexed(_)) || matches!(cell.fg, Color::Indexed(_));
+                cell.set_fg(if indexed {
+                    Color::Indexed(blend::nearest_indexed(r, g, b))
+                } else {
+                    Color::Rgb(r, g, b)
+                });
             } else {
                 cell.modifier.insert(Modifier::DIM);
                 cell.modifier.remove(Modifier::BOLD);
@@ -4006,6 +4014,11 @@ mod tests {
         recede_area(&mut buf, Rect::new(0, 0, 1, 1), Color::Rgb(0, 0, 0));
         let cell = buf.cell((0, 0)).unwrap();
         assert!(!cell.modifier.contains(Modifier::DIM));
+        assert!(
+            matches!(cell.fg, Color::Indexed(_)),
+            "Indexed recede stays in the 256 palette, got {:?}",
+            cell.fg
+        );
         assert_ne!(cell.fg, Color::Indexed(255));
     }
 
