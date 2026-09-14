@@ -58,6 +58,7 @@
 use std::time::Duration;
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -255,6 +256,30 @@ fn fade(token: Token, amount: f32) -> Style {
             Style::default().fg(Color::Rgb(r, g, b))
         }
         None => Style::default().fg(color).add_modifier(Modifier::DIM),
+    }
+}
+
+/// Dim a painted region toward `toward`. Ported from grok-build
+/// `recede_area` (`xai-grok-pager-render/.../color.rs:242`): blend when both
+/// ends are RGB, otherwise DIM and drop BOLD. TokyoNight 256 almost always
+/// takes the DIM path; that is the same fallback grok-build uses when the
+/// prompt bg is not expressible as RGB.
+fn recede_area(buf: &mut Buffer, area: Rect, toward: Color) {
+    const OPACITY: f32 = 0.66;
+    let base = rgb(toward);
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let Some(cell) = buf.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
+            if let (Some(bg), Some(fg)) = (base, rgb(cell.fg)) {
+                let (r, g, b) = blend::blend(fg, bg, OPACITY);
+                cell.set_fg(Color::Rgb(r, g, b));
+            } else {
+                cell.modifier.insert(Modifier::DIM);
+                cell.modifier.remove(Modifier::BOLD);
+            }
+        }
     }
 }
 
@@ -2756,6 +2781,23 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     let bottom = area.bottom() - 1;
     {
         let buf = frame.buffer_mut();
+        // grok-build fills the prompt rect with `bg_base` before the
+        // chrome (`prompt_widget/mod.rs:2964`). We do not have that token;
+        // the terminal background is the honest analog, and nothing is
+        // filled when it is unknown.
+        if let Some((r, g, b)) = blend::terminal_bg() {
+            let bg = Color::Rgb(r, g, b);
+            let fg = theme::color(Token::Text);
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                        cell.set_symbol(" ");
+                        cell.set_fg(fg);
+                        cell.set_bg(bg);
+                    }
+                }
+            }
+        }
         for x in area.x..area.right() {
             let (top_glyph, bottom_glyph) = if x == left {
                 ("\u{256d}", "\u{2570}") // ╭ ╰
@@ -2814,6 +2856,20 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
         },
         focused,
     );
+    if !focused {
+        // Interior only: skip the `╭╮╰╯│─` chrome. grok-build also keeps
+        // the info-block row out of the recede (`mod.rs:3336-3346`).
+        let interior = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let toward = blend::terminal_bg()
+            .map(|(r, g, b)| Color::Rgb(r, g, b))
+            .unwrap_or(Color::Reset);
+        recede_area(frame.buffer_mut(), interior, toward);
+    }
 }
 
 /// The caption style shared by the session title and the info line's model
@@ -3876,6 +3932,28 @@ mod tests {
         crate::theme::pin(std::sync::Arc::new(
             crate::theme::load("grok").expect("the grok theme ships"),
         ))
+    }
+
+    #[test]
+    fn recede_area_dims_when_the_bg_is_not_rgb() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buf.cell_mut((0, 0)).unwrap().modifier = Modifier::BOLD;
+        recede_area(&mut buf, Rect::new(0, 0, 2, 1), Color::Reset);
+        let cell = buf.cell((0, 0)).unwrap();
+        assert!(cell.modifier.contains(Modifier::DIM));
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn recede_area_blends_rgb_fg_toward_rgb_bg() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf.cell_mut((0, 0))
+            .unwrap()
+            .set_fg(Color::Rgb(200, 200, 200));
+        recede_area(&mut buf, Rect::new(0, 0, 1, 1), Color::Rgb(0, 0, 0));
+        let cell = buf.cell((0, 0)).unwrap();
+        assert_ne!(cell.fg, Color::Rgb(200, 200, 200));
+        assert!(!cell.modifier.contains(Modifier::DIM));
     }
 
     /// Render at `width`×`height` under the `grok` skin, one string per row.
