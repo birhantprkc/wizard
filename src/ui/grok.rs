@@ -154,11 +154,6 @@ const SPINNER: [&str; 8] = [
 /// Ported from `R/src/glyphs.rs:149`.
 const MONITOR: [&str; 4] = ["\u{25cb}", "\u{25ce}", "\u{25c9}", "\u{25ce}"];
 
-/// The background-task chip's spinner on the top status bar.
-///
-/// Ported from `R/src/glyphs.rs:247-249`.
-const DOTS: [&str; 4] = ["\u{22c5}", ":", "\u{2e2c}", "\u{2059}"];
-
 // ---------------------------------------------------------------------------
 // Animation
 // ---------------------------------------------------------------------------
@@ -1547,6 +1542,40 @@ fn format_tokens_short(tokens: u64) -> String {
     }
 }
 
+/// `999` / `1.2K` / `10K` / `1.2M` / `12M`.
+///
+/// Ported from `P/src/views/context_bar.rs:33-44`. The context chip uses this
+/// uppercase form; the turn-status token count keeps [`format_tokens_short`].
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else if n < 1_000_000 {
+        format!("{}K", n / 1_000)
+    } else if n < 10_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{}M", n / 1_000_000)
+    }
+}
+
+/// Token for the context chip. Grok Build blends RGB across usage breakpoints;
+/// Wizard maps the same cuts onto tokens so hue still comes from the theme.
+fn context_chip_token(used: u64, total: u64) -> Token {
+    if total == 0 {
+        return Token::Muted;
+    }
+    let pct = used as f64 / total as f64;
+    if pct >= 0.95 {
+        Token::Error
+    } else if pct >= 0.85 {
+        Token::Warning
+    } else {
+        Token::Muted
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Screen layout
 // ---------------------------------------------------------------------------
@@ -1787,9 +1816,7 @@ fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect)
     if inner == 0 {
         return;
     }
-    let height = (inner + 2)
-        .min(bottom.saturating_sub(area.y))
-        .max(3);
+    let height = (inner + 2).min(bottom.saturating_sub(area.y)).max(3);
     if height < 3 {
         return;
     }
@@ -1839,8 +1866,7 @@ fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect)
         width: items_w,
         height: panel.height.saturating_sub(2),
     };
-    let label_col_w =
-        slash_label_column_w(&app.suggestions, items.width as usize - SLASH_PREFIX_W);
+    let label_col_w = slash_label_column_w(&app.suggestions, items.width as usize - SLASH_PREFIX_W);
     let desc_w = slash_desc_width(items.width as usize, label_col_w);
     let desc_indent = SLASH_PREFIX_W + label_col_w + SLASH_LABEL_DESC_GAP;
     let selected = app
@@ -1889,11 +1915,7 @@ fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect)
         }
         let (is_sel, is_cont, ref label, ref desc) = flat[line_idx];
         let y = items.y + vis as u16;
-        let row_bg = if is_sel {
-            Some(selected_bg)
-        } else {
-            raised
-        };
+        let row_bg = if is_sel { Some(selected_bg) } else { raised };
         let base = {
             let mut style = if is_sel {
                 text_style.add_modifier(Modifier::BOLD)
@@ -1935,8 +1957,8 @@ fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect)
                 buf.set_stringn(lx, y, label, room as usize, base);
             }
             if !desc.is_empty() {
-                let dx = items.x
-                    + (SLASH_PREFIX_W + label_col_w + 1).min(items.width as usize) as u16;
+                let dx =
+                    items.x + (SLASH_PREFIX_W + label_col_w + 1).min(items.width as usize) as u16;
                 let room = items.right().saturating_sub(dx);
                 if room > 0 {
                     let mut style = muted;
@@ -2172,7 +2194,7 @@ fn turn_status(app: &App) -> Option<TurnStatus> {
             // Parked never falls through to the running-turn chrome: the wait
             // ends the moment the user acts, so a running clock and a `[stop]`
             // would both be lying.
-            right: String::new(),
+            right: Vec::new(),
         });
     }
 
@@ -2186,7 +2208,7 @@ fn turn_status(app: &App) -> Option<TurnStatus> {
                 Span::styled(format!("{frame} "), theme::style(Token::Heading)),
                 Span::styled(still, gray),
             ],
-            right: String::new(),
+            right: Vec::new(),
         });
     }
 
@@ -2219,27 +2241,27 @@ fn turn_status(app: &App) -> Option<TurnStatus> {
         ));
     }
 
-    // Right-hand side: the turn timer, the token count, and `[stop]`.
-    //
-    // Upstream also carries a *phase* timer on the left — how long this one
-    // activity has been going, separately from the turn. Wizard clocks only the
-    // turn (`App::turn_started`), and printing the same number in both places
-    // is all that would come of carrying both, so the one clock goes where
-    // upstream's turn timer is.
+    // Right-hand side: the turn timer, the token count, and `[stop]` as its
+    // own span (`P/src/views/turn_status.rs`). Timer and tokens stay dim; the
+    // stop label is faint so it reads as a chip rather than more of the clock.
     let tokens = app.status.prompt_tokens + app.status.completion_tokens;
-    let mut right = match app.turn_started {
-        Some(started) => format_duration(started.elapsed()),
-        None => String::new(),
-    };
+    let mut right = Vec::new();
+    if let Some(started) = app.turn_started {
+        right.push(Span::styled(format_duration(started.elapsed()), gray));
+    }
     if tokens > 0 {
-        right.push_str(&format!(" {TOKEN_ARROW}{}", format_tokens_short(tokens)));
+        let prefix = if right.is_empty() { "" } else { " " };
+        right.push(Span::styled(
+            format!("{prefix}{TOKEN_ARROW}{}", format_tokens_short(tokens)),
+            gray,
+        ));
     }
     // `[stop]` is upstream's cancel affordance and there is deliberately no
     // "esc to interrupt" string anywhere in Grok Build. Wizard's hit map lives
     // in `App` and this renderer must not add to it, so the button is a label
     // rather than a target — the shortcuts bar directly below names the key
     // that does it.
-    right.push_str(" [stop]");
+    right.push(Span::styled(" [stop]", theme::style(Token::Faint)));
     Some(TurnStatus { left, right })
 }
 
@@ -2248,13 +2270,14 @@ fn turn_status(app: &App) -> Option<TurnStatus> {
 /// whatever is left (`P/src/views/turn_status.rs:371-412`).
 struct TurnStatus {
     left: Vec<Span<'static>>,
-    right: String,
+    right: Vec<Span<'static>>,
 }
 
 impl TurnStatus {
     /// Lay the two halves out across `width`.
     fn line(self, width: usize) -> Line<'static> {
-        let right_width = self.right.width();
+        let right = Line::from(self.right);
+        let right_width = right.width();
         let mut left = super::truncate_line(
             Line::from(self.left),
             width.saturating_sub(right_width + 1).max(1),
@@ -2262,7 +2285,7 @@ impl TurnStatus {
         if right_width > 0 {
             let gap = width.saturating_sub(left.width() + right_width);
             left.spans.push(Span::raw(" ".repeat(gap)));
-            left.spans.push(Span::styled(self.right, super::dim()));
+            left.spans.extend(right.spans);
         }
         left
     }
@@ -2374,40 +2397,90 @@ fn still_running(app: &App) -> Option<String> {
 // The top status bar
 // ---------------------------------------------------------------------------
 
-/// The right-aligned status bar above the scrollback.
+/// Status bar: cwd and git on the left, chips on the right.
 ///
-/// Ported from `P/src/views/agent_status.rs:70-77` and the push order at
-/// `P/src/app/agent_view/render.rs:1448-1560`: items joined by `" │ "` in
-/// `gray_dim`, right-aligned, most transient first. The items themselves are
-/// Wizard's, because this is Wizard's session — the background-task chip, the
-/// context meter and the queue counter map straight onto upstream's; the mode
-/// word, the provider warning and the vim indicator have no upstream
-/// equivalent and are not dropped for looking foreign.
+/// Ported from `P/src/app/agent_view/render.rs:1485-1608` and
+/// `P/src/views/agent_status.rs:70-77`. The row is filled with `BgRaised` so
+/// leftover cells cannot ghost. Chips join with `" │ "` in dim, right-aligned.
+/// Task counts use a static diamond (`task_status_line`), MCP connecting is
+/// gray `MCP` rather than a running-tool spinner, plan is an Accent chip, and
+/// the context meter is `used / total` with [`fmt_tokens`].
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width < 8 {
         return;
     }
+    frame.render_widget(
+        Paragraph::new("").style(theme::style(Token::BgRaised)),
+        area,
+    );
+
+    let chips_line = Line::from(status_chip_spans(app));
+    let chips_w = chips_line.width() as u16;
+
+    let mut left: Vec<Span<'static>> = Vec::new();
+    let mut git_w = 0usize;
+    if let Some(branch) = super::git_branch(&app.project_root) {
+        let label = if branch.is_empty() {
+            format!("{BRANCH_ICON} detached")
+        } else {
+            format!("{BRANCH_ICON} {branch}")
+        };
+        git_w = label.width() + 2;
+        left.push(Span::styled(label, super::dim()));
+        left.push(Span::raw("  "));
+    }
+    let reserve = if chips_w > 0 { chips_w as usize + 2 } else { 0 };
+    let cwd_max = (area.width as usize).saturating_sub(reserve + git_w).max(4);
+    left.push(Span::styled(
+        super::format_cwd(&app.project_root, cwd_max),
+        super::dim(),
+    ));
+    let left_line = Line::from(left);
+    let left_w = left_line.width() as u16;
+    frame.render_widget(Paragraph::new(left_line), area);
+
+    if chips_w > 0 && chips_w < area.width {
+        let rx = area.x + area.width.saturating_sub(chips_w);
+        if rx >= area.x.saturating_add(left_w).saturating_add(1) {
+            frame.render_widget(
+                Paragraph::new(chips_line),
+                Rect {
+                    x: rx,
+                    y: area.y,
+                    width: chips_w,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+/// Fallback git branch glyph when nerd fonts are not in play
+/// (`P/src/git_info.rs:348`).
+const BRANCH_ICON: &str = "\u{2387}";
+
+/// Right-hand status chips in grok-build push order, plus Wizard-only extras.
+fn status_chip_spans(app: &App) -> Vec<Span<'static>> {
     let mut chips: Vec<Vec<Span<'static>>> = Vec::new();
-    let dot = DOTS[(app.tick / SPINNER_DIVISOR) as usize % DOTS.len()];
     let spinner = SPINNER[(app.tick / SPINNER_DIVISOR) as usize % SPINNER.len()];
 
     if app.status.background_tasks > 0 {
         chips.push(vec![Span::styled(
-            format!("{dot} {}", app.status.background_tasks),
+            format!("{DIAMOND} {}", app.status.background_tasks),
             theme::style(Token::ToolRunning),
         )]);
     }
     if app.status.background_subagents > 0 {
         chips.push(vec![Span::styled(
-            format!("{dot} {} sub", app.status.background_subagents),
+            format!("{DIAMOND} {} sub", app.status.background_subagents),
             theme::style(Token::ToolRunning),
         )]);
     }
+    if app.plan_mode {
+        chips.push(vec![Span::styled("plan", theme::style(Token::Accent))]);
+    }
     if app.mcp_connecting {
-        chips.push(vec![Span::styled(
-            format!("{spinner} tools"),
-            theme::style(Token::ToolRunning),
-        )]);
+        chips.push(vec![Span::styled(format!("{spinner} MCP"), super::dim())]);
     }
     if app.provider_health_error.is_some() {
         chips.push(vec![Span::styled(
@@ -2418,16 +2491,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(label) = app.vim.label() {
         chips.push(vec![Span::styled(label, super::dim())]);
     }
+    let used = app.status.context_tokens as u64;
+    let total = app.config.max_context_tokens as u64;
     chips.push(vec![Span::styled(
-        super::format_cwd(&app.project_root, 28),
-        super::dim(),
+        format!("{} / {}", fmt_tokens(used), fmt_tokens(total)),
+        theme::style(context_chip_token(used, total)),
     )]);
-    if app.status.context_tokens > 0 {
-        chips.push(vec![Span::styled(
-            format_tokens_short(app.status.context_tokens),
-            super::dim(),
-        )]);
-    }
     if !app.message_queue.is_empty() {
         chips.push(vec![Span::styled(
             format!("+{}", app.message_queue.len()),
@@ -2442,11 +2511,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         spans.extend(chip);
     }
-    frame.render_widget(
-        Paragraph::new(super::truncate_line(Line::from(spans), area.width as usize))
-            .alignment(Alignment::Right),
-        area,
-    );
+    spans
 }
 
 // ---------------------------------------------------------------------------
@@ -2764,16 +2829,10 @@ fn draw_info_line(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         caption_style(focused),
     ));
 
-    // Flags, in upstream's precedence: plan first, then the rest. These are
-    // Wizard's own modes — the skin borrows a shape, never a feature set — so
-    // fusion and ultra keep their names and their loudness.
-    let flag = |bold: bool| {
-        if bold {
-            theme::style(Token::Accent).bold()
-        } else {
-            fade(Token::Muted, if focused { 0.75 } else { 0.5 })
-        }
-    };
+    // Flags, in upstream's precedence: plan first, then the rest. Fusion and
+    // ULTRA keep their names (Wizard-only text) but sit in the muted flag
+    // style, matching grok-build's dim mode chips rather than Accent.bold.
+    let muted_flag = fade(Token::Muted, if focused { 0.75 } else { 0.5 });
     if app.omakase {
         left.push(sep());
         left.push(Span::styled("omakase", theme::style(Token::Warning)));
@@ -2783,13 +2842,13 @@ fn draw_info_line(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
     }
     if app.fusion_active {
         left.push(sep());
-        left.push(Span::styled("fusion", flag(true)));
+        left.push(Span::styled("fusion", muted_flag));
     }
     if let Some(ultra) = &app.ultra {
         left.push(sep());
         left.push(Span::styled(
             format!("ULTRA \u{00d7}{}", ultra.candidates()),
-            flag(true),
+            muted_flag,
         ));
     }
     left.push(sep());
@@ -3249,11 +3308,13 @@ fn todo_row(item: &TodoItem, width: usize) -> Line<'static> {
 
 /// The row below the composer: `key:label` pairs separated by `"  │  "`.
 ///
-/// Ported from `P/src/views/shortcuts_bar.rs:212-320`: keys in
+/// Ported from `P/src/views/shortcuts_bar.rs:175-320` and the agent pane's
+/// `compact(5, help_hint)` (`P/src/app/agent_view/render.rs:3390-3424`). Keys in
 /// `text_secondary` + bold, labels and separator in `gray` (the separator
-/// additionally dim). The pairs are contextual, and `send` becomes `queue`
-/// while a turn is running exactly as upstream does (`P/src/views/agent.rs:999`)
-/// — which is also true of Wizard's Enter, so the swap is not cosmetic.
+/// additionally dim). The row is filled so leftover cells cannot ghost. Idle
+/// drops `Ctrl+t:expand`; both idle and busy keep `Shift+Tab:mode` and pin
+/// `?:help` as the last compact item. `send` becomes `queue` while a turn is
+/// running (`P/src/views/agent.rs:999`).
 ///
 /// The key *names* are `KeyShortcut::display()`'s
 /// (`P/src/input/key.rs:80-140`), which is where the casing comes from and why
@@ -3266,52 +3327,11 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width < 8 {
         return;
     }
-    let pairs: &[(&str, &str)] = if app.plan_review.is_some() {
-        &[
-            ("y", "approve"),
-            ("n", "reject"),
-            ("\u{2191}\u{2193}", "scroll"),
-            ("Esc", "back"),
-        ]
-    } else if app.interview.is_some() {
-        &[("1-9", "pick"), ("Enter", "next"), ("Esc", "skip")]
-    } else if app.picker.is_some() {
-        &[
-            ("\u{2191}\u{2193}", "move"),
-            ("Enter", "select"),
-            ("Esc", "cancel"),
-        ]
-    } else if !app.suggestions.is_empty() {
-        &[
-            ("\u{2191}\u{2193}", "select"),
-            ("Tab", "complete"),
-            ("Enter", "run"),
-        ]
-    } else if app.diff.is_some() {
-        &[("PgUp/PgDn", "diff"), ("Esc", "close")]
-    } else if app.console.is_some() {
-        &[
-            ("Enter", "command"),
-            ("Ctrl+d", "end input"),
-            ("Esc", "detach"),
-            ("Ctrl+c", "stop"),
-        ]
-    } else if app.status.busy {
-        &[
-            ("Enter", "queue"),
-            ("Shift+Enter", "newline"),
-            ("Ctrl+c", "stop"),
-            ("PgUp/PgDn", "scroll"),
-        ]
-    } else {
-        &[
-            ("Enter", "send"),
-            ("Shift+Enter", "newline"),
-            ("/", "commands"),
-            ("Ctrl+t", "expand"),
-            ("Shift+Tab", "mode"),
-        ]
-    };
+    frame.render_widget(
+        Paragraph::new("").style(theme::style(Token::BgRaised)),
+        area,
+    );
+    let pairs = compact_shortcut_pairs(&shortcut_pairs(app), Some(("?", "help")), 5);
 
     let key = theme::style(Token::Muted).bold();
     let label = super::dim();
@@ -3331,6 +3351,71 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(super::truncate_line(Line::from(spans), area.width as usize)),
         area,
     );
+}
+
+fn shortcut_pairs(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.plan_review.is_some() {
+        vec![
+            ("y", "approve"),
+            ("n", "reject"),
+            ("\u{2191}\u{2193}", "scroll"),
+            ("Esc", "back"),
+        ]
+    } else if app.interview.is_some() {
+        vec![("1-9", "pick"), ("Enter", "next"), ("Esc", "skip")]
+    } else if app.picker.is_some() {
+        vec![
+            ("\u{2191}\u{2193}", "move"),
+            ("Enter", "select"),
+            ("Esc", "cancel"),
+        ]
+    } else if !app.suggestions.is_empty() {
+        vec![
+            ("\u{2191}\u{2193}", "select"),
+            ("Tab", "complete"),
+            ("Enter", "run"),
+        ]
+    } else if app.diff.is_some() {
+        vec![("PgUp/PgDn", "diff"), ("Esc", "close")]
+    } else if app.console.is_some() {
+        vec![
+            ("Enter", "command"),
+            ("Ctrl+d", "end input"),
+            ("Esc", "detach"),
+            ("Ctrl+c", "stop"),
+        ]
+    } else if app.status.busy {
+        vec![
+            ("Enter", "queue"),
+            ("Shift+Enter", "newline"),
+            ("Ctrl+c", "stop"),
+            ("PgUp/PgDn", "scroll"),
+            ("Shift+Tab", "mode"),
+        ]
+    } else {
+        vec![
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("/", "commands"),
+            ("Shift+Tab", "mode"),
+        ]
+    }
+}
+
+/// First `max_visible` hints, then the pinned help item
+/// (`P/src/views/shortcuts_bar.rs:175-184`).
+fn compact_shortcut_pairs(
+    pairs: &[(&'static str, &'static str)],
+    help: Option<(&'static str, &'static str)>,
+    max_visible: usize,
+) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<_> = pairs.iter().copied().take(max_visible).collect();
+    if let Some(help) = help
+        && !out.iter().any(|&(k, _)| k == help.0)
+    {
+        out.push(help);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -4171,6 +4256,102 @@ mod tests {
         // Subagents 1` header over a capitalized persona row.
         assert!(screen.contains("Subagents 1"), "the tasks pane groups them");
         assert!(screen.contains("Researcher"), "and names the run");
+        assert!(
+            screen.contains("8.5K / 150K"),
+            "context chip is used / total: {screen}"
+        );
+        assert!(
+            screen.contains(&format!("{DIAMOND} 1 sub")),
+            "task chip is a static diamond: {screen}"
+        );
+        assert!(
+            !screen.contains("Ctrl+t"),
+            "idle expand is not a grok-build shortcut: {screen}"
+        );
+    }
+
+    #[test]
+    fn fmt_tokens_matches_grok_builds_uppercase_form() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0K");
+        assert_eq!(fmt_tokens(8_500), "8.5K");
+        assert_eq!(fmt_tokens(10_000), "10K");
+        assert_eq!(fmt_tokens(150_000), "150K");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
+        assert_eq!(fmt_tokens(12_000_000), "12M");
+    }
+
+    #[test]
+    fn compact_shortcuts_keep_the_first_five_and_pin_help() {
+        let pairs = [
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("/", "commands"),
+            ("Shift+Tab", "mode"),
+            ("Ctrl+c", "quit"),
+            ("PgUp/PgDn", "scroll"),
+        ];
+        assert_eq!(
+            compact_shortcut_pairs(&pairs, Some(("?", "help")), 5),
+            vec![
+                ("Enter", "send"),
+                ("Shift+Enter", "newline"),
+                ("/", "commands"),
+                ("Shift+Tab", "mode"),
+                ("Ctrl+c", "quit"),
+                ("?", "help"),
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_shortcuts_pin_help_and_busy_ones_keep_mode() {
+        let idle = app();
+        let idle_pairs = compact_shortcut_pairs(&shortcut_pairs(&idle), Some(("?", "help")), 5);
+        assert!(idle_pairs.contains(&("?", "help")), "{idle_pairs:?}");
+        assert!(
+            idle_pairs.contains(&("Shift+Tab", "mode")),
+            "{idle_pairs:?}"
+        );
+        assert!(
+            !idle_pairs.iter().any(|&(k, _)| k == "Ctrl+t"),
+            "{idle_pairs:?}"
+        );
+
+        let mut busy = app();
+        busy.status.busy = true;
+        let busy_pairs = compact_shortcut_pairs(&shortcut_pairs(&busy), Some(("?", "help")), 5);
+        assert!(busy_pairs.contains(&("Enter", "queue")), "{busy_pairs:?}");
+        assert!(
+            busy_pairs.contains(&("Shift+Tab", "mode")),
+            "{busy_pairs:?}"
+        );
+        assert!(busy_pairs.contains(&("?", "help")), "{busy_pairs:?}");
+    }
+
+    #[test]
+    fn the_status_bar_chips_plan_and_mcp_in_grok_builds_order() {
+        let mut app = app();
+        app.plan_mode = true;
+        app.mcp_connecting = true;
+        app.status.background_tasks = 2;
+        app.status.context_tokens = 8_500;
+        let spans = status_chip_spans(&app);
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains(&format!("{DIAMOND} 2")), "{rendered}");
+        assert!(rendered.contains("plan"), "{rendered}");
+        assert!(rendered.contains("MCP"), "{rendered}");
+        assert!(rendered.contains("8.5K / 150K"), "{rendered}");
+        assert!(!rendered.contains("tools"), "{rendered}");
+        let diamond_at = rendered.find(&format!("{DIAMOND} 2")).expect("tasks");
+        let plan_at = rendered.find("plan").expect("plan");
+        let mcp_at = rendered.find("MCP").expect("mcp");
+        let ctx_at = rendered.find("8.5K / 150K").expect("context");
+        assert!(
+            diamond_at < plan_at && plan_at < mcp_at && mcp_at < ctx_at,
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -4271,11 +4452,11 @@ mod tests {
         ]);
         let dump = render(&app, 80, 24).join("\n");
         let corners = dump.matches('\u{256d}').count();
-        assert_eq!(
-            corners, 1,
-            "only the composer is a rounded box:\n{dump}"
+        assert_eq!(corners, 1, "only the composer is a rounded box:\n{dump}");
+        assert!(
+            dump.contains('\u{2500}'),
+            "the dropdown has hairlines:\n{dump}"
         );
-        assert!(dump.contains('\u{2500}'), "the dropdown has hairlines:\n{dump}");
     }
 
     #[test]
@@ -4325,10 +4506,7 @@ mod tests {
             .iter()
             .find(|row| row.contains("/help"))
             .expect("/help");
-        assert!(
-            init.contains('\u{276f}'),
-            "selected row carries ❯:\n{dump}"
-        );
+        assert!(init.contains('\u{276f}'), "selected row carries ❯:\n{dump}");
         assert!(
             !help.contains('\u{276f}'),
             "unselected row does not:\n{dump}"
@@ -4345,7 +4523,10 @@ mod tests {
             .iter()
             .find(|row| row.contains("/help"))
             .expect("/help");
-        assert!(!init.contains('\u{276f}'), "index 1 leaves /init bare:\n{dump}");
+        assert!(
+            !init.contains('\u{276f}'),
+            "index 1 leaves /init bare:\n{dump}"
+        );
         assert!(help.contains('\u{276f}'), "index 1 marks /help:\n{dump}");
     }
 
