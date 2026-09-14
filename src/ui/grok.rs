@@ -115,6 +115,18 @@ const OUTER_HPAD: u16 = 2;
 /// composer squeezed out of existence is worse than an unbalanced margin.
 const COMPACT_HEIGHT: u16 = 14;
 
+/// Inner item rows the slash dropdown will show, hairlines excluded.
+///
+/// Ported from `P/src/views/slash_dropdown.rs` (`MAX_DROPDOWN_ROWS`).
+const SLASH_MAX_ROWS: u16 = 8;
+const SLASH_LABEL_CAP: usize = 40;
+const SLASH_LABEL_DESC_GAP: usize = 2;
+const SLASH_PREFIX_W: usize = 2;
+/// Columns between the composer left edge and the first character of a row.
+///
+/// Ported from `P/src/app/agent_view/mod.rs` `dropdown_content_inset`.
+const SLASH_CONTENT_INSET: u16 = 2;
+
 // ---------------------------------------------------------------------------
 // Glyphs
 // ---------------------------------------------------------------------------
@@ -1644,6 +1656,307 @@ fn composer_budget(width: u16) -> usize {
         .max(1)
 }
 
+/// Clamped name width, then the 60% budget. A short sibling cannot collapse
+/// an overlong name.
+///
+/// Ported from `P/src/views/slash_dropdown.rs` `compute_label_column_w`.
+fn slash_label_column_w(items: &[crate::app::Suggestion], content_w: usize) -> usize {
+    let budget = (content_w * 3 / 5).min(SLASH_LABEL_CAP);
+    items
+        .iter()
+        .map(|s| format!("/{}", s.name).width().min(SLASH_LABEL_CAP))
+        .max()
+        .unwrap_or(0)
+        .min(budget)
+}
+
+fn slash_desc_width(row_w: usize, label_col_w: usize) -> usize {
+    row_w.saturating_sub(SLASH_PREFIX_W + label_col_w + SLASH_LABEL_DESC_GAP)
+}
+
+/// Simple word-wrap. Breaks at spaces when they fit, hard-breaks otherwise.
+///
+/// Ported from `P/src/views/slash_dropdown.rs` `simple_word_wrap`.
+fn slash_word_wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let normalized = text.replace('\n', " ");
+    let mut remaining = normalized.as_str();
+    while !remaining.is_empty() {
+        if remaining.width() <= width {
+            lines.push(remaining.to_string());
+            break;
+        }
+        let break_at = {
+            let mut last_space = None;
+            let mut w = 0;
+            for (i, ch) in remaining.char_indices() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w + cw > width {
+                    break;
+                }
+                w += cw;
+                if ch == ' ' {
+                    last_space = Some(i);
+                }
+            }
+            last_space.map(|i| i + 1).unwrap_or_else(|| {
+                remaining
+                    .char_indices()
+                    .scan(0usize, |w, (i, ch)| {
+                        *w += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if *w > width {
+                            None
+                        } else {
+                            Some(i + ch.len_utf8())
+                        }
+                    })
+                    .last()
+                    .unwrap_or(remaining.len())
+            })
+        };
+        let (chunk, rest) = remaining.split_at(break_at);
+        lines.push(chunk.trim_end().to_string());
+        remaining = rest.trim_start();
+    }
+    lines
+}
+
+fn slash_item_lines(item: &crate::app::Suggestion, row_w: usize, label_col_w: usize) -> usize {
+    if item.description.is_empty() {
+        1
+    } else {
+        slash_word_wrap(&item.description, slash_desc_width(row_w, label_col_w))
+            .len()
+            .max(1)
+    }
+}
+
+fn slash_flat_line_count(items: &[crate::app::Suggestion], row_w: usize, cap: usize) -> usize {
+    let label_col_w = slash_label_column_w(items, row_w.saturating_sub(SLASH_PREFIX_W));
+    let mut lines = 0usize;
+    for item in items {
+        lines += slash_item_lines(item, row_w, label_col_w);
+        if lines >= cap {
+            return cap;
+        }
+    }
+    lines
+}
+
+fn slash_desired_item_rows(items: &[crate::app::Suggestion], items_width: u16) -> u16 {
+    if items.is_empty() {
+        return 0;
+    }
+    slash_flat_line_count(items, items_width as usize, SLASH_MAX_ROWS as usize) as u16
+}
+
+fn slash_truncate(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > width {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// The slash-command dropdown sitting on the composer: a raised band with
+/// only top and bottom hairlines, the match count on the top rule, wrapped
+/// descriptions, a `❯` on the selected row.
+///
+/// Ported from `P/src/views/slash_dropdown.rs` and
+/// `P/src/app/agent_view/mod.rs` `render_dropdown_chrome` (non-embedded).
+/// Tags, fuzzy spans, hover, provenance badges, and the overflow scrollbar
+/// are skipped: Wizard `Suggestion` has none of those fields.
+fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect) {
+    if app.suggestions.is_empty() {
+        return;
+    }
+    let bottom = composer.y.saturating_sub(1);
+    if bottom < area.y.saturating_add(3) {
+        return;
+    }
+    let items_w = composer.width.saturating_sub(SLASH_CONTENT_INSET);
+    if items_w < 4 {
+        return;
+    }
+    let inner = slash_desired_item_rows(&app.suggestions, items_w);
+    if inner == 0 {
+        return;
+    }
+    let height = (inner + 2)
+        .min(bottom.saturating_sub(area.y))
+        .max(3);
+    if height < 3 {
+        return;
+    }
+    let panel = Rect {
+        x: composer.x,
+        y: bottom.saturating_sub(height),
+        width: composer.width,
+        height,
+    };
+    frame.render_widget(Clear, panel);
+
+    let buf = frame.buffer_mut();
+    let raised = Tint::Raised.resolve();
+    let hairline = theme::style(Token::Faint);
+    let muted = theme::style(Token::Muted);
+    let text_style = theme::style(Token::Text);
+    let selected_bg = theme::color(Token::Border);
+
+    for y in panel.y.saturating_add(1)..panel.bottom().saturating_sub(1) {
+        for x in panel.x..panel.right() {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_symbol(" ");
+                if let Some(bg) = raised {
+                    cell.set_bg(bg);
+                }
+            }
+        }
+    }
+    for y in [panel.y, panel.bottom().saturating_sub(1)] {
+        for x in panel.x..panel.right() {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_symbol("\u{2500}");
+                cell.set_style(hairline);
+            }
+        }
+    }
+    let hint = app.suggestions.len().to_string();
+    let hint_w = hint.width() as u16;
+    if hint_w + 1 < panel.width {
+        let hx = panel.x + panel.width.saturating_sub(hint_w + 1);
+        buf.set_stringn(hx, panel.y, &hint, hint_w as usize, muted);
+    }
+
+    let items = Rect {
+        x: composer.x.saturating_add(SLASH_CONTENT_INSET),
+        y: panel.y.saturating_add(1),
+        width: items_w,
+        height: panel.height.saturating_sub(2),
+    };
+    let label_col_w =
+        slash_label_column_w(&app.suggestions, items.width as usize - SLASH_PREFIX_W);
+    let desc_w = slash_desc_width(items.width as usize, label_col_w);
+    let desc_indent = SLASH_PREFIX_W + label_col_w + SLASH_LABEL_DESC_GAP;
+    let selected = app
+        .suggestion_index
+        .min(app.suggestions.len().saturating_sub(1));
+
+    let mut flat: Vec<(bool, bool, String, String)> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    for (idx, item) in app.suggestions.iter().enumerate() {
+        starts.push(flat.len());
+        let is_sel = idx == selected;
+        let label = slash_truncate(&format!("/{}", item.name), label_col_w);
+        let pad = " ".repeat(label_col_w.saturating_sub(label.width()));
+        let desc_lines = if item.description.is_empty() {
+            vec![String::new()]
+        } else {
+            let wrapped = slash_word_wrap(&item.description, desc_w);
+            if wrapped.is_empty() {
+                vec![String::new()]
+            } else {
+                wrapped
+            }
+        };
+        let first_desc = desc_lines[0].clone();
+        flat.push((is_sel, false, format!("{label}{pad}"), first_desc));
+        for line in desc_lines.into_iter().skip(1) {
+            flat.push((is_sel, true, String::new(), line));
+        }
+    }
+
+    let visible = items.height as usize;
+    let selected_start = starts.get(selected).copied().unwrap_or(0);
+    let total = flat.len();
+    let scroll = if total <= visible || selected_start < visible / 2 {
+        0
+    } else if selected_start + visible / 2 >= total {
+        total.saturating_sub(visible)
+    } else {
+        selected_start.saturating_sub(visible / 2)
+    };
+
+    for vis in 0..visible {
+        let line_idx = scroll + vis;
+        if line_idx >= flat.len() {
+            break;
+        }
+        let (is_sel, is_cont, ref label, ref desc) = flat[line_idx];
+        let y = items.y + vis as u16;
+        let row_bg = if is_sel {
+            Some(selected_bg)
+        } else {
+            raised
+        };
+        let base = {
+            let mut style = if is_sel {
+                text_style.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            if let Some(bg) = row_bg {
+                style = style.bg(bg);
+            }
+            style
+        };
+        for x in items.x..items.right() {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_symbol(" ");
+                cell.set_style(base);
+            }
+        }
+        let prefix = if is_sel && !is_cont {
+            PROMPT_ARROW
+        } else {
+            "  "
+        };
+        buf.set_stringn(items.x, y, prefix, 2, base);
+        if is_cont {
+            let indent = desc_indent.min(items.width as usize);
+            let dx = items.x + indent as u16;
+            let room = items.right().saturating_sub(dx);
+            if room > 0 {
+                let mut style = muted;
+                if let Some(bg) = row_bg {
+                    style = style.bg(bg);
+                }
+                buf.set_stringn(dx, y, desc, room as usize, style);
+            }
+        } else {
+            let lx = items.x.saturating_add(SLASH_PREFIX_W as u16);
+            let room = items.right().saturating_sub(lx);
+            if room > 0 {
+                buf.set_stringn(lx, y, label, room as usize, base);
+            }
+            if !desc.is_empty() {
+                let dx = items.x
+                    + (SLASH_PREFIX_W + label_col_w + 1).min(items.width as usize) as u16;
+                let room = items.right().saturating_sub(dx);
+                if room > 0 {
+                    let mut style = muted;
+                    if let Some(bg) = row_bg {
+                        style = style.bg(bg);
+                    }
+                    buf.set_stringn(dx, y, desc, room as usize, style);
+                }
+            }
+        }
+    }
+}
+
 /// Render one frame in Grok Build's chrome.
 pub(super) fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -1683,7 +1996,7 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
     draw_shortcuts(frame, app, layout.shortcuts);
 
     if !super::overlay_open(app) {
-        super::draw_suggestions(frame, app, layout.composer);
+        draw_slash_dropdown(frame, app, layout.composer, area);
     }
     if app.picker.is_some() {
         super::draw_picker(frame, app);
@@ -3783,6 +4096,164 @@ mod tests {
             rows.iter().any(|row| row.contains('\u{276f}')),
             "the prompt survives:\n{}",
             rows.join("\n")
+        );
+    }
+
+    fn slash_app(items: &[(&str, &str)]) -> App {
+        let mut app = app();
+        app.suggestions = items
+            .iter()
+            .map(|(name, desc)| crate::app::Suggestion {
+                name: (*name).to_string(),
+                args: String::new(),
+                description: (*desc).to_string(),
+                takes_args: false,
+            })
+            .collect();
+        app.suggestion_index = 0;
+        app
+    }
+
+    #[test]
+    fn the_slash_popup_is_not_a_rounded_box() {
+        let app = slash_app(&[
+            ("init", "set up the project"),
+            ("help", "show commands"),
+            ("quit", "leave"),
+        ]);
+        let dump = render(&app, 80, 24).join("\n");
+        let corners = dump.matches('\u{256d}').count();
+        assert_eq!(
+            corners, 1,
+            "only the composer is a rounded box:\n{dump}"
+        );
+        assert!(dump.contains('\u{2500}'), "the dropdown has hairlines:\n{dump}");
+    }
+
+    #[test]
+    fn the_slash_popup_puts_the_item_count_on_the_top_rule() {
+        let app = slash_app(&[
+            ("init", "set up the project"),
+            ("help", "show commands"),
+            ("quit", "leave"),
+        ]);
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let item = rows
+            .iter()
+            .position(|row| row.contains("/init"))
+            .expect("/init is on screen");
+        assert!(item > 0, "there is a row above /init:\n{dump}");
+        let rule = &rows[item - 1];
+        assert!(
+            rule.contains('\u{2500}'),
+            "the row above /init is a hairline:\n{dump}"
+        );
+        assert!(
+            rule.contains('3'),
+            "the match count sits on the top rule:\n{dump}"
+        );
+        let bottom = rows
+            .iter()
+            .skip(item + 1)
+            .find(|row| row.contains('\u{2500}') && !row.contains('\u{256d}'))
+            .expect("bottom hairline");
+        assert!(
+            !bottom.contains('3'),
+            "the count is not on the bottom rule:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn the_slash_popup_marks_the_selected_row_with_the_prompt_arrow() {
+        let mut app = slash_app(&[("init", "set up"), ("help", "show commands")]);
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let init = rows
+            .iter()
+            .find(|row| row.contains("/init"))
+            .expect("/init");
+        let help = rows
+            .iter()
+            .find(|row| row.contains("/help"))
+            .expect("/help");
+        assert!(
+            init.contains('\u{276f}'),
+            "selected row carries ❯:\n{dump}"
+        );
+        assert!(
+            !help.contains('\u{276f}'),
+            "unselected row does not:\n{dump}"
+        );
+
+        app.suggestion_index = 1;
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let init = rows
+            .iter()
+            .find(|row| row.contains("/init"))
+            .expect("/init");
+        let help = rows
+            .iter()
+            .find(|row| row.contains("/help"))
+            .expect("/help");
+        assert!(!init.contains('\u{276f}'), "index 1 leaves /init bare:\n{dump}");
+        assert!(help.contains('\u{276f}'), "index 1 marks /help:\n{dump}");
+    }
+
+    #[test]
+    fn the_slash_popup_wraps_a_long_description_onto_the_next_row() {
+        let app = slash_app(&[(
+            "init",
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour twentyfive",
+        )]);
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let start = rows
+            .iter()
+            .position(|row| row.contains("/init"))
+            .expect("/init");
+        assert!(
+            rows[start].contains("/init"),
+            "the name is on the first row:\n{dump}"
+        );
+        assert!(
+            start + 1 < rows.len(),
+            "there is a row under /init:\n{dump}"
+        );
+        let cont = &rows[start + 1];
+        assert!(
+            !cont.contains('\u{276f}'),
+            "the wrap row has no second arrow:\n{dump}"
+        );
+        assert!(
+            cont.contains("twenty") || cont.contains("fifteen") || cont.contains("sixteen"),
+            "a later word landed on the wrap row:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn the_slash_popup_grows_taller_than_the_item_count_when_a_description_wraps() {
+        let app = slash_app(&[(
+            "init",
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour twentyfive",
+        )]);
+        let rows = render(&app, 80, 24);
+        let dump = rows.join("\n");
+        let start = rows
+            .iter()
+            .position(|row| row.contains("/init"))
+            .expect("/init");
+        let mut inner = 1usize;
+        for row in rows.iter().skip(start + 1) {
+            if row.contains('\u{2500}') || row.contains('\u{256d}') {
+                break;
+            }
+            inner += 1;
+        }
+        assert!(
+            inner > 1,
+            "wrapped description made the popup taller than one item:\n{dump}"
         );
     }
 
