@@ -1358,66 +1358,78 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
             rows
         }
         ToolKind::Execute => {
-            // Flush left inside the block, on a panel band, wrapped two columns
-            // short of the content width (`execute.rs:567`).
+            // `execute.rs:510-567`: a blank separator, wrap the whole body, then
+            // a first/last window on the *wrapped* count (`execute.rs:521-567`).
             let inner = content_width(width).saturating_sub(2).max(20) as usize;
-            let mut rows: Vec<Row> = Vec::new();
-            let emit = |slice: &[&str], rows: &mut Vec<Row>| {
+            let wrapped = super::wrap_all(
+                lines
+                    .iter()
+                    .map(|line| Line::from(Span::styled((*line).to_string(), body)))
+                    .collect(),
+                inner,
+            );
+            let mut rows = vec![Row::plain(Line::from(""))];
+            let emit = |slice: &[Line<'static>], rows: &mut Vec<Row>| {
                 for line in slice {
-                    for wrapped in super::wrap_lines(
-                        Text::from(vec![Line::from(Span::styled((*line).to_string(), body))]),
-                        inner,
-                    ) {
-                        rows.push(Row::panel(wrapped));
-                    }
+                    rows.push(Row::panel(line.clone()));
                 }
             };
-            if lines.len() > EXECUTE_FIRST + EXECUTE_LAST && !running {
-                let hidden = lines.len() - EXECUTE_FIRST - EXECUTE_LAST;
-                emit(&lines[..EXECUTE_FIRST], &mut rows);
+            if running {
+                // A command still running is read from its tail: the line it is
+                // waiting on is the last one.
+                let shown = wrapped.len().min(MAX_INLINE);
+                if wrapped.len() > shown {
+                    rows.push(Row::panel(Line::from(Span::styled(
+                        format!("\u{2026} +{} earlier lines", wrapped.len() - shown),
+                        marker,
+                    ))));
+                }
+                emit(&wrapped[wrapped.len() - shown..], &mut rows);
+            } else if mode != Mode::Expanded && wrapped.len() > EXECUTE_FIRST + EXECUTE_LAST {
+                let hidden = wrapped.len() - EXECUTE_FIRST - EXECUTE_LAST;
+                emit(&wrapped[..EXECUTE_FIRST], &mut rows);
                 rows.push(Row::panel(Line::from(Span::styled(
                     format!("\u{2026} +{hidden} lines"),
                     marker,
                 ))));
-                emit(&lines[lines.len() - EXECUTE_LAST..], &mut rows);
+                emit(&wrapped[wrapped.len() - EXECUTE_LAST..], &mut rows);
             } else {
-                // A command still running is read from its tail: the line it is
-                // waiting on is the last one.
-                let shown = lines.len().min(MAX_INLINE);
-                if lines.len() > shown {
-                    rows.push(Row::panel(Line::from(Span::styled(
-                        format!("\u{2026} +{} earlier lines", lines.len() - shown),
-                        marker,
-                    ))));
-                }
-                emit(&lines[lines.len() - shown..], &mut rows);
+                emit(&wrapped, &mut rows);
             }
             rows
         }
         ToolKind::Read => {
-            // A right-aligned line-number gutter with two trailing spaces
-            // (`read.rs:260-277`). Numbers are the file range, not 1..n of the
-            // preview, so a `start_line` of 50 paints 50 not 1. Bare `…` for
-            // the elision (`read.rs:313`).
+            // `read.rs:211-313`: a blank separator, gutter on each raw line,
+            // wrap, then a first/last window on the wrapped count. Numbers are
+            // the file range, not 1..n of the preview. Bare `…` for the elision.
             let base = read_base_line(tool);
             let last = base + lines.len().saturating_sub(1);
             let gutter = last.max(1).to_string().len();
-            let mut rows: Vec<Row> = Vec::new();
-            let emit = |range: std::ops::Range<usize>, rows: &mut Vec<Row>| {
-                for (offset, line) in lines[range.clone()].iter().enumerate() {
-                    let number = base + range.start + offset;
-                    rows.push(Row::panel(Line::from(vec![
+            let inner = (width as usize).saturating_sub(gutter + 2).max(20);
+            let styled: Vec<Line<'static>> = lines
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| {
+                    let number = base + offset;
+                    Line::from(vec![
                         Span::styled(format!("{number:>gutter$}  "), marker),
                         Span::styled((*line).to_string(), body),
-                    ])));
+                    ])
+                })
+                .collect();
+            let wrapped = super::wrap_all(styled, inner);
+            let mut rows = vec![Row::plain(Line::from(""))];
+            let emit = |slice: &[Line<'static>], rows: &mut Vec<Row>| {
+                for line in slice {
+                    rows.push(Row::panel(line.clone()));
                 }
             };
-            if lines.len() > READ_FIRST + READ_LAST {
-                emit(0..READ_FIRST, &mut rows);
+            if mode != Mode::Expanded && wrapped.len() > READ_FIRST + READ_LAST {
+                emit(&wrapped[..READ_FIRST], &mut rows);
                 rows.push(Row::panel(Line::from(Span::styled("\u{2026}", marker))));
-                emit(lines.len() - READ_LAST..lines.len(), &mut rows);
+                emit(&wrapped[wrapped.len() - READ_LAST..], &mut rows);
             } else {
-                emit(0..lines.len(), &mut rows);
+                emit(&wrapped, &mut rows);
             }
             rows
         }
@@ -4230,23 +4242,28 @@ mod tests {
             text(&rows[0])
         );
         assert!(
-            rows[1]
+            rows[1].spans.iter().all(|span| span.style.bg.is_none()),
+            "the separator is unbanded: {:?}",
+            text(&rows[1])
+        );
+        assert!(
+            rows[2]
                 .spans
                 .iter()
                 .any(|span| span.style.bg == Some(sunken)),
             "the output is banded: {:?}",
-            text(&rows[1])
+            text(&rows[2])
         );
-        let last = rows[1].spans.last().expect("right pad");
+        let last = rows[2].spans.last().expect("right pad");
         assert_eq!(last.style.bg, Some(sunken), "right pad sits on the panel");
         assert_eq!(
-            rows[1].width() as u16,
+            rows[2].width() as u16,
             60,
             "panel row runs to the block edge"
         );
         // Rail and left pad stay off the panel.
         assert!(
-            rows[1].spans[0].style.bg.is_none(),
+            rows[2].spans[0].style.bg.is_none(),
             "the rail stays off the panel"
         );
     }
@@ -4476,9 +4493,18 @@ mod tests {
         };
         let rows = tool_output(&command, ToolKind::Execute, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
-        assert_eq!(joined.len(), EXECUTE_FIRST + 1 + EXECUTE_LAST, "{joined:?}");
-        assert_eq!(joined[EXECUTE_FIRST], "\u{2026} +7 lines");
-        assert!(rows.iter().all(|row| row.panel), "output sits on a band");
+        assert_eq!(joined[0], "");
+        assert!(!rows[0].panel, "the separator is not a band");
+        assert_eq!(
+            joined.len(),
+            1 + EXECUTE_FIRST + 1 + EXECUTE_LAST,
+            "{joined:?}"
+        );
+        assert_eq!(joined[1 + EXECUTE_FIRST], "\u{2026} +7 lines");
+        assert!(
+            rows[1..].iter().all(|row| row.panel),
+            "output sits on a band"
+        );
 
         let file = ToolItem {
             name: "read_file".into(),
@@ -4496,16 +4522,18 @@ mod tests {
         };
         let rows = tool_output(&file, ToolKind::Read, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined[0], "");
+        assert!(!rows[0].panel, "the separator is not a band");
         // A bare `…` with no count: the line-number gutter says how much is gone.
-        assert_eq!(joined[READ_FIRST], "\u{2026}", "{joined:?}");
+        assert_eq!(joined[1 + READ_FIRST], "\u{2026}", "{joined:?}");
         // The gutter is right-aligned to the width of the largest number.
-        assert!(joined[0].starts_with(" 1  line 1"), "{joined:?}");
+        assert!(joined[1].starts_with(" 1  line 1"), "{joined:?}");
         assert!(
-            joined[READ_FIRST + 1].starts_with("10  line 10"),
+            joined[1 + READ_FIRST + 1].starts_with("10  line 10"),
             "{joined:?}"
         );
         assert!(
-            rows.iter().all(|row| row.panel),
+            rows[1..].iter().all(|row| row.panel),
             "a file read sits on bg_dark"
         );
 
@@ -4522,8 +4550,33 @@ mod tests {
         };
         let rows = tool_output(&ranged, ToolKind::Read, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
-        assert!(joined[0].starts_with("50  "), "{joined:?}");
-        assert!(joined[2].starts_with("52  "), "{joined:?}");
+        assert_eq!(joined[0], "");
+        assert!(joined[1].starts_with("50  "), "{joined:?}");
+        assert!(joined[3].starts_with("52  "), "{joined:?}");
+    }
+
+    #[test]
+    fn execute_and_read_window_on_wrapped_count_not_raw_lines() {
+        // One raw line that wraps past first+last must still window: grok-build
+        // wraps the body, then takes the first/last *wrapped* rows.
+        let long = "x".repeat(400);
+        let command = sample_tool("execute", serde_json::json!({ "command": "echo" }), &long);
+        let rows = tool_output(&command, ToolKind::Execute, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined[0], "");
+        assert!(
+            joined.iter().any(|s| s.contains('\u{2026}')),
+            "wrap-then-truncate must window a long command, got {joined:?}"
+        );
+
+        let file = sample_tool("read_file", serde_json::json!({ "path": "a.rs" }), &long);
+        let rows = tool_output(&file, ToolKind::Read, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined[0], "");
+        assert!(
+            joined.iter().any(|s| s == "\u{2026}"),
+            "wrap-then-truncate must window a long file, got {joined:?}"
+        );
     }
 
     fn sample_tool(name: &str, args: serde_json::Value, content: &str) -> ToolItem {
