@@ -1396,13 +1396,16 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
         }
         ToolKind::Read => {
             // A right-aligned line-number gutter with two trailing spaces
-            // (`read.rs:275`), and a bare `…` with no count for the elision
-            // (`read.rs:313`) — the file's own numbering says how much is gone.
-            let gutter = lines.len().to_string().len();
+            // (`read.rs:260-277`). Numbers are the file range, not 1..n of the
+            // preview, so a `start_line` of 50 paints 50 not 1. Bare `…` for
+            // the elision (`read.rs:313`).
+            let base = read_base_line(tool);
+            let last = base + lines.len().saturating_sub(1);
+            let gutter = last.max(1).to_string().len();
             let mut rows: Vec<Row> = Vec::new();
             let emit = |range: std::ops::Range<usize>, rows: &mut Vec<Row>| {
                 for (offset, line) in lines[range.clone()].iter().enumerate() {
-                    let number = range.start + offset + 1;
+                    let number = base + range.start + offset;
                     rows.push(Row::panel(Line::from(vec![
                         Span::styled(format!("{number:>gutter$}  "), marker),
                         Span::styled((*line).to_string(), body),
@@ -1424,6 +1427,14 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
 /// A two-column indented output row (`use_tool.rs`, `search.rs:447`).
 fn indented(text: &str, style: Style) -> Line<'static> {
     Line::from(vec![Span::raw("  "), Span::styled(text.to_string(), style)])
+}
+
+fn read_base_line(tool: &ToolItem) -> usize {
+    tool.args
+        .get("start_line")
+        .and_then(|value| value.as_u64())
+        .filter(|&n| n > 0)
+        .unwrap_or(1) as usize
 }
 
 /// MCP tools are named `server__tool`. The 10/3 inline cap lives only on
@@ -4497,6 +4508,22 @@ mod tests {
             rows.iter().all(|row| row.panel),
             "a file read sits on bg_dark"
         );
+
+        let ranged = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({ "path": "a.rs", "start_line": 50 }),
+            call_id: String::new(),
+            output: Some(crate::transcript::ToolItemOutput {
+                content: "fn foo() {}\nfn bar() {}\nfn baz() {}".into(),
+                is_error: false,
+            }),
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let rows = tool_output(&ranged, ToolKind::Read, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert!(joined[0].starts_with("50  "), "{joined:?}");
+        assert!(joined[2].starts_with("52  "), "{joined:?}");
     }
 
     fn sample_tool(name: &str, args: serde_json::Value, content: &str) -> ToolItem {
