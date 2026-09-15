@@ -1106,9 +1106,10 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 /// stays bold on muted (`muted().add_modifier(BOLD)` in read/execute/use_tool).
 ///
 /// Upstream paints paths in `theme.path` (orange) and commands in
-/// `theme.command` (yellow). Wizard has no Path token; Read header paths
-/// and Skill titles use [`Token::Link`] (the location color, same as Search
-/// bodies). Commands stay [`Token::Code`].
+/// `theme.command` (yellow). Wizard has no Path token; Read/Search header
+/// paths and Skill titles use [`Token::Link`]. Search patterns use
+/// [`Token::Accent`] (`theme.accent_success` in grok-build). Commands stay
+/// [`Token::Code`].
 fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
@@ -1182,14 +1183,31 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
         }
         ToolKind::Search => {
             spans.push(Span::styled("Search ", verb));
+            // `search.rs:216-230,242-266`: accent pattern, primary ` in `,
+            // path color. Collapsed mutes all three.
+            let pattern_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Accent)
+            };
             // Rust-debug-quoted, exactly as upstream renders it
-            // (`search.rs:246`): a pattern with a space or a quote in it has to
+            // (`search.rs:242`): a pattern with a space or a quote in it has to
             // read as one token.
-            spans.push(Span::styled(format!("{:?}", arg("pattern")), operand));
+            spans.push(Span::styled(format!("{:?}", arg("pattern")), pattern_style));
             let path = arg("path");
             if !path.is_empty() {
-                spans.push(Span::styled(" in ", detail));
-                spans.push(Span::styled(path, operand));
+                let in_style = if collapsed {
+                    theme::style(Token::Muted)
+                } else {
+                    theme::style(Token::Text)
+                };
+                let path_style = if collapsed {
+                    theme::style(Token::Muted)
+                } else {
+                    theme::style(Token::Link)
+                };
+                spans.push(Span::styled(" in ", in_style));
+                spans.push(Span::styled(path, path_style));
             }
             if let Some(text) = output {
                 spans.push(Span::styled(format!(" {}", match_summary(text)), detail));
@@ -5331,6 +5349,35 @@ mod tests {
         let expanded = tool_header(&read, ToolKind::Read, Mode::Truncated, cwd);
         assert_eq!(expanded[1].content.as_ref(), "src/app/cli.rs");
         assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
+    }
+
+    #[test]
+    fn search_header_paints_accent_pattern_primary_in_and_link_path() {
+        let cwd = Path::new("/workspace");
+        let search = ToolItem {
+            name: "search_files".into(),
+            args: serde_json::json!({ "pattern": "todo", "path": "src" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = tool_header(&search, ToolKind::Search, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[0].content.as_ref(), "Search ");
+        assert_eq!(collapsed[1].content.as_ref(), "\"todo\"");
+        assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
+        assert_eq!(collapsed[2].content.as_ref(), " in ");
+        assert_eq!(collapsed[2].style.fg, theme::style(Token::Muted).fg);
+        assert_eq!(collapsed[3].content.as_ref(), "src");
+        assert_eq!(collapsed[3].style.fg, theme::style(Token::Muted).fg);
+
+        let expanded = tool_header(&search, ToolKind::Search, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "\"todo\"");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Accent).fg);
+        assert_eq!(expanded[2].content.as_ref(), " in ");
+        assert_eq!(expanded[2].style.fg, theme::style(Token::Text).fg);
+        assert_eq!(expanded[3].content.as_ref(), "src");
+        assert_eq!(expanded[3].style.fg, theme::style(Token::Link).fg);
     }
 
     #[test]
