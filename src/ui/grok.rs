@@ -1152,9 +1152,9 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
             spans.push(Span::styled(arg("path"), operand));
         }
         ToolKind::Execute => {
-            // `execute.rs` Label: `Run ` hang-wraps the command with bash
-            // highlight. Empty command is `…`. Truncation is the hang wrap, not
-            // SUMMARY_WIDTH.
+            // `execute.rs` Label: `Run ` plus the command. Expanded cards wrap
+            // at bash operators/quotes; empty is `…`. Truncation is that wrap,
+            // not SUMMARY_WIDTH.
             spans.extend(execute_header_spans(
                 &arg("command"),
                 verb,
@@ -1343,52 +1343,378 @@ fn execute_header_rows(tool: &ToolItem, mode: Mode, width: usize) -> Vec<Row> {
     } else {
         theme::style(Token::Code)
     };
-    let spans = execute_header_spans(command, verb, collapsed, fallback);
-    let line = Line::from(spans);
-    if collapsed {
-        return vec![Row::plain(super::truncate_line(line, width))];
-    }
-    hang_wrap_header(line, "Run ".len(), width)
-        .into_iter()
-        .map(Row::plain)
-        .collect()
-}
-
-fn hang_wrap_header(line: Line<'static>, hang: usize, width: usize) -> Vec<Line<'static>> {
-    if line.spans.is_empty() {
-        return vec![line];
-    }
-    let hang = hang.min(width.saturating_sub(1));
-    let mut prefix = Vec::new();
-    let mut body = Vec::new();
-    let mut seen = 0usize;
-    for span in line.spans {
-        if seen < hang {
-            let w = UnicodeWidthStr::width(span.content.as_ref());
-            prefix.push(span);
-            seen = seen.saturating_add(w);
-        } else {
-            body.push(span);
+    if collapsed || command.trim().is_empty() {
+        let spans = execute_header_spans(command, verb, collapsed, fallback);
+        let line = Line::from(spans);
+        if collapsed {
+            return vec![Row::plain(super::truncate_line(line, width))];
         }
+        return vec![Row::plain(line)];
     }
-    let inner = width.saturating_sub(hang).max(1);
-    let wrapped = super::wrap_all(vec![Line::from(body)], inner);
-    if wrapped.is_empty() {
-        return vec![Line::from(prefix)];
+    // `execute.rs` `push_command_soft_wrap`: `Run ` on the first row,
+    // hang-indent under it, wrap at bash operators/quotes.
+    let hang = "Run ".len();
+    let cmd_width = width.saturating_sub(hang).max(1);
+    let cmd_rows = bash_command_display_lines(command, cmd_width, fallback);
+    if cmd_rows.is_empty() {
+        return vec![Row::plain(Line::from(execute_header_spans(
+            command, verb, collapsed, fallback,
+        )))];
     }
-    wrapped
+    cmd_rows
         .into_iter()
         .enumerate()
-        .map(|(i, line)| {
+        .map(|(i, row)| {
             let mut spans = if i == 0 {
-                prefix.clone()
+                vec![Span::styled("Run ", verb)]
             } else {
                 vec![Span::raw(" ".repeat(hang))]
             };
-            spans.extend(line.spans);
-            Line::from(spans)
+            spans.extend(row.spans);
+            Row::plain(Line::from(spans))
         })
         .collect()
+}
+
+/// Grok-build `permission_view.rs` `render_bash_command_display_lines`.
+fn bash_command_display_lines(
+    command: &str,
+    content_width: usize,
+    fallback: Style,
+) -> Vec<Line<'static>> {
+    let text = prepare_bash_display_text(command);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let full_breaks = soft_break_offsets_after_operators(&text);
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for (idx, physical) in text.split('\n').enumerate() {
+        if idx > 0 {
+            offset += 1;
+        }
+        if physical.is_empty() {
+            out.push(Line::default());
+            offset += physical.len();
+            continue;
+        }
+        let spans = super::highlight_source("cmd.sh", physical, fallback)
+            .into_iter()
+            .next()
+            .map(|line| line.spans)
+            .unwrap_or_else(|| vec![Span::styled(physical.to_owned(), fallback)]);
+        for row in soft_wrap_row_texts(physical, offset, &full_breaks, content_width) {
+            let start = (row.as_ptr() as usize) - (physical.as_ptr() as usize);
+            out.push(Line::from(slice_highlighted_spans(
+                &spans,
+                start,
+                start + row.len(),
+            )));
+        }
+        offset += physical.len();
+    }
+    out
+}
+
+fn prepare_bash_display_text(command: &str) -> String {
+    let mut lines: Vec<&str> = command.split('\n').map(|line| line.trim_end()).collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn soft_break_offsets_after_operators(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut breaks = Vec::new();
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                i += 2;
+                breaks.push(i);
+            }
+            b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                i += 2;
+                breaks.push(i);
+            }
+            b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                i += 2;
+                breaks.push(i);
+            }
+            b'|' => {
+                i += 1;
+                breaks.push(i);
+            }
+            b';' => {
+                i += 1;
+                breaks.push(i);
+            }
+            _ => i += 1,
+        }
+    }
+    breaks
+}
+
+fn soft_wrap_row_texts<'a>(
+    line: &'a str,
+    line_start: usize,
+    full_breaks: &[usize],
+    content_width: usize,
+) -> Vec<&'a str> {
+    if content_width == 0 || line.len() <= content_width {
+        return vec![line];
+    }
+    let line_end = line_start + line.len();
+    let first_inside = full_breaks.partition_point(|&b| b <= line_start);
+    let mut bounds = full_breaks[first_inside..]
+        .iter()
+        .copied()
+        .take_while(|&b| b < line_end)
+        .map(|b| b - line_start)
+        .filter(|&b| line.is_char_boundary(b))
+        .chain(std::iter::once(line.len()))
+        .peekable();
+    if bounds.peek().copied() == Some(line.len()) {
+        return bash_quote_aware_wrap(line, content_width);
+    }
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut pos = 0usize;
+    let mut first_row = true;
+    while pos < line.len() {
+        let mut start = pos;
+        if !first_row {
+            while start < line.len() && line.as_bytes()[start].is_ascii_whitespace() {
+                start += 1;
+            }
+            while bounds.peek().is_some_and(|&b| b <= start) {
+                bounds.next();
+            }
+            if start >= line.len() {
+                break;
+            }
+        }
+        first_row = false;
+        let Some(mut end) = bounds.next() else {
+            break;
+        };
+        if UnicodeWidthStr::width(&line[start..end]) <= content_width {
+            while let Some(&next_end) = bounds.peek() {
+                if UnicodeWidthStr::width(&line[start..next_end]) <= content_width {
+                    end = next_end;
+                    bounds.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(line[start..end].trim_end());
+        } else {
+            let row = line[start..end].trim_end();
+            if UnicodeWidthStr::width(row) <= content_width {
+                out.push(row);
+            } else {
+                out.extend(bash_quote_aware_wrap(row, content_width));
+            }
+        }
+        pos = end;
+    }
+    out
+}
+
+fn bash_quote_aware_wrap(line: &str, width: usize) -> Vec<&str> {
+    if width == 0 || line.len() <= width {
+        return vec![line];
+    }
+    let mut break_points = QuoteAwareBreakPoints::new(line).peekable();
+    if break_points.peek().is_none() {
+        return vec![line];
+    }
+    let mut rows: Vec<&str> = Vec::new();
+    let mut row_start = 0usize;
+    let mut last_break = 0usize;
+    let candidates = break_points.chain(std::iter::once(line.len()));
+    for b in candidates {
+        if b <= row_start {
+            continue;
+        }
+        let candidate = line[row_start..b].trim_end();
+        if UnicodeWidthStr::width(candidate) <= width {
+            last_break = b;
+            continue;
+        }
+        if last_break > row_start {
+            let row = line[row_start..last_break].trim_end();
+            if !row.is_empty() {
+                rows.push(row);
+            }
+            row_start = last_break;
+            while row_start < line.len() && line.as_bytes()[row_start].is_ascii_whitespace() {
+                row_start += 1;
+            }
+            last_break = row_start;
+            if b > row_start {
+                let candidate = line[row_start..b].trim_end();
+                if UnicodeWidthStr::width(candidate) <= width {
+                    last_break = b;
+                } else {
+                    let row = line[row_start..b].trim_end();
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                    row_start = b;
+                    while row_start < line.len() && line.as_bytes()[row_start].is_ascii_whitespace()
+                    {
+                        row_start += 1;
+                    }
+                    last_break = row_start;
+                }
+            }
+        } else {
+            let row = line[row_start..b].trim_end();
+            if !row.is_empty() {
+                rows.push(row);
+            }
+            row_start = b;
+            while row_start < line.len() && line.as_bytes()[row_start].is_ascii_whitespace() {
+                row_start += 1;
+            }
+            last_break = row_start;
+        }
+    }
+    if row_start < line.len() {
+        let row = line[row_start..].trim_end();
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() { vec![line] } else { rows }
+}
+
+struct QuoteAwareBreakPoints<'a> {
+    bytes: &'a [u8],
+    i: usize,
+    in_single: bool,
+    in_double: bool,
+}
+
+impl<'a> QuoteAwareBreakPoints<'a> {
+    fn new(line: &'a str) -> Self {
+        Self {
+            bytes: line.as_bytes(),
+            i: 0,
+            in_single: false,
+            in_double: false,
+        }
+    }
+}
+
+impl Iterator for QuoteAwareBreakPoints<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        while self.i < self.bytes.len() {
+            let c = self.bytes[self.i];
+            if self.in_single {
+                if c == b'\'' {
+                    self.in_single = false;
+                }
+                self.i += 1;
+                continue;
+            }
+            if self.in_double {
+                if c == b'\\' && self.i + 1 < self.bytes.len() {
+                    self.i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    self.in_double = false;
+                }
+                self.i += 1;
+                continue;
+            }
+            match c {
+                b'\'' => {
+                    self.in_single = true;
+                    self.i += 1;
+                }
+                b'"' => {
+                    self.in_double = true;
+                    self.i += 1;
+                }
+                b if b.is_ascii_whitespace() => {
+                    let start = self.i;
+                    while self.i < self.bytes.len() && self.bytes[self.i].is_ascii_whitespace() {
+                        self.i += 1;
+                    }
+                    if start > 0 {
+                        return Some(start);
+                    }
+                }
+                _ => self.i += 1,
+            }
+        }
+        None
+    }
+}
+
+fn slice_highlighted_spans(
+    spans: &[Span<'static>],
+    start: usize,
+    end: usize,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for span in spans {
+        let span_start = pos;
+        let span_end = pos + span.content.len();
+        pos = span_end;
+        if span_end <= start {
+            continue;
+        }
+        if span_start >= end {
+            break;
+        }
+        let lo = start.max(span_start) - span_start;
+        let hi = end.min(span_end) - span_start;
+        if lo >= hi {
+            continue;
+        }
+        let Some(slice) = span.content.get(lo..hi) else {
+            continue;
+        };
+        out.push(Span::styled(slice.to_owned(), span.style));
+    }
+    out
 }
 
 /// The one obvious argument of a tool that has one, else its JSON.
@@ -4890,6 +5216,67 @@ mod tests {
         assert!(
             joined.contains("echo") && joined.contains("ten"),
             "hang wrap must keep the whole command, got {headers:?}"
+        );
+    }
+
+    #[test]
+    fn execute_header_soft_wraps_at_bash_operators() {
+        let _theme = grok_theme();
+        let command = "git status --short --branch && cargo test --workspace --all-features";
+        let tool = ToolItem {
+            name: "execute".into(),
+            args: serde_json::json!({ "command": command }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let rows = execute_header_rows(&tool, Mode::Truncated, 40);
+        let texts: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert!(
+            texts.len() >= 2,
+            "operator wrap needs more than one row at width 40: {texts:?}"
+        );
+        assert!(
+            texts[0].starts_with("Run "),
+            "first row keeps the verb: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("&&"),
+            "first row keeps the operator: {texts:?}"
+        );
+        assert!(
+            !texts[0].contains("cargo"),
+            "first row does not pack past &&: {texts:?}"
+        );
+        assert!(
+            texts[1].starts_with("    cargo"),
+            "continuation hangs under Run and starts at the next command: {texts:?}"
+        );
+        assert_eq!(texts.join(" ").split_whitespace().collect::<Vec<_>>(), {
+            let mut expected = vec!["Run"];
+            expected.extend(command.split_whitespace());
+            expected
+        });
+    }
+
+    #[test]
+    fn execute_header_keeps_physical_command_lines() {
+        let _theme = grok_theme();
+        let tool = ToolItem {
+            name: "execute".into(),
+            args: serde_json::json!({ "command": "echo one\necho two" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let rows = execute_header_rows(&tool, Mode::Truncated, 80);
+        let texts: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            texts,
+            vec!["Run echo one".to_string(), "    echo two".to_string()],
+            "physical newlines stay rows instead of flattening onto one hang-wrap"
         );
     }
 
