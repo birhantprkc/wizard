@@ -45,9 +45,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use syntect::easy::HighlightLines;
+use syntect::easy::{HighlightLines, ScopeRegionIterator};
 use syntect::highlighting::{FontStyle, Theme as SyntectTheme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -3520,14 +3520,15 @@ fn syntect_style(style: syntect::highlighting::Style) -> Style {
 /// painted in the palette it was highlighted under, and a stale cache is a
 /// silent failure.
 fn highlight_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
-    highlight_with(lang, None, code, muted())
+    highlight_with(lang, None, code, muted(), false)
 }
 
-/// Highlight a file body the way a Read card does: syntax by path, else
+/// Highlight a file body the way a Read card does: syntect scopes mapped
+/// onto theme tokens (keyword → Accent, string → Success, …), else
 /// `fallback` (primary, not muted). Chat fences keep calling
-/// [`highlight_code_block`], which still falls back to muted.
+/// [`highlight_code_block`], which still uses the grayscale ramp.
 pub(super) fn highlight_source(path: &str, code: &str, fallback: Style) -> Vec<Line<'static>> {
-    highlight_with("", Some(path), code, fallback)
+    highlight_with("", Some(path), code, fallback, true)
 }
 
 fn highlight_with(
@@ -3535,6 +3536,7 @@ fn highlight_with(
     path: Option<&str>,
     code: &str,
     fallback: Style,
+    colored: bool,
 ) -> Vec<Line<'static>> {
     static CACHE: OnceLock<Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -3544,6 +3546,7 @@ fn highlight_with(
     lang.hash(&mut hasher);
     path.hash(&mut hasher);
     code.hash(&mut hasher);
+    colored.hash(&mut hasher);
     active.name.hash(&mut hasher);
     active.depth().hash(&mut hasher);
     // Two call sites, two fallbacks. Hashing the debug form keeps the cache
@@ -3572,33 +3575,43 @@ fn highlight_with(
             }
         })
     };
-    let lines: Vec<Line<'static>> = match (syntax, syntax_theme.as_ref()) {
-        (Some(syntax), Some(syntax_theme)) => {
-            let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-            LinesWithEndings::from(code)
-                .map(|line| match highlighter.highlight_line(line, syntaxes) {
-                    Ok(ranges) => Line::from(
-                        ranges
-                            .into_iter()
-                            .map(|(style, content)| {
-                                Span::styled(
-                                    content.trim_end_matches('\n').to_string(),
-                                    syntect_style(style),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    Err(_) => Line::from(Span::styled(
-                        line.trim_end_matches('\n').to_string(),
-                        fallback,
-                    )),
-                })
-                .collect()
+    let lines: Vec<Line<'static>> = if colored {
+        match syntax {
+            Some(syntax) => highlight_scopes(syntax, syntaxes, code, fallback),
+            None => code
+                .lines()
+                .map(|line| Line::from(Span::styled(line.to_string(), fallback)))
+                .collect(),
         }
-        _ => code
-            .lines()
-            .map(|line| Line::from(Span::styled(line.to_string(), fallback)))
-            .collect(),
+    } else {
+        match (syntax, syntax_theme.as_ref()) {
+            (Some(syntax), Some(syntax_theme)) => {
+                let mut highlighter = HighlightLines::new(syntax, syntax_theme);
+                LinesWithEndings::from(code)
+                    .map(|line| match highlighter.highlight_line(line, syntaxes) {
+                        Ok(ranges) => Line::from(
+                            ranges
+                                .into_iter()
+                                .map(|(style, content)| {
+                                    Span::styled(
+                                        content.trim_end_matches('\n').to_string(),
+                                        syntect_style(style),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        Err(_) => Line::from(Span::styled(
+                            line.trim_end_matches('\n').to_string(),
+                            fallback,
+                        )),
+                    })
+                    .collect()
+            }
+            _ => code
+                .lines()
+                .map(|line| Line::from(Span::styled(line.to_string(), fallback)))
+                .collect(),
+        }
     };
 
     if let Ok(mut guard) = cache.lock() {
@@ -3608,6 +3621,75 @@ fn highlight_with(
         guard.insert(key, lines.clone());
     }
     lines
+}
+
+/// grok-build `R/src/syntax.rs` `highlight_line`, with syntect scopes mapped
+/// onto theme tokens instead of RGB. Innermost matching TextMate prefix wins;
+/// unmatched regions keep `fallback` so a Read body stays primary, not muted.
+fn highlight_scopes(
+    syntax: &syntect::parsing::SyntaxReference,
+    syntaxes: &SyntaxSet,
+    code: &str,
+    fallback: Style,
+) -> Vec<Line<'static>> {
+    let mut parse_state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    LinesWithEndings::from(code)
+        .map(|line| match parse_state.parse_line(line, syntaxes) {
+            Ok(ops) => {
+                let mut spans = Vec::new();
+                for (text, op) in ScopeRegionIterator::new(&ops, line) {
+                    let _ = stack.apply(op);
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let style = match token_for_scopes(&stack) {
+                        Some(token) => theme::style(token),
+                        None => fallback,
+                    };
+                    spans.push(Span::styled(text.to_string(), style));
+                }
+                Line::from(spans)
+            }
+            Err(_) => Line::from(Span::styled(
+                line.trim_end_matches('\n').to_string(),
+                fallback,
+            )),
+        })
+        .collect()
+}
+
+fn token_for_scopes(stack: &ScopeStack) -> Option<Token> {
+    for scope in stack.as_slice().iter().rev() {
+        if let Some(token) = token_for_scope(&scope.build_string()) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn token_for_scope(name: &str) -> Option<Token> {
+    if name.starts_with("comment") {
+        Some(Token::Muted)
+    } else if name.starts_with("string") {
+        Some(Token::Success)
+    } else if name.starts_with("constant") {
+        Some(Token::Warning)
+    } else if name.starts_with("keyword") || name.starts_with("storage") {
+        Some(Token::Accent)
+    } else if name.starts_with("entity.name.function") || name.starts_with("support.function") {
+        Some(Token::Heading)
+    } else if name.starts_with("entity.name")
+        || name.starts_with("support.class")
+        || name.starts_with("support.type")
+    {
+        Some(Token::Link)
+    } else if name.starts_with("invalid") {
+        Some(Token::Error)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

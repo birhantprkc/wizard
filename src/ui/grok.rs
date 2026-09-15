@@ -1958,8 +1958,9 @@ fn tool_output(
             let last = base + lines.len().saturating_sub(1);
             let gutter = last.max(1).to_string().len();
             let inner = (width as usize).saturating_sub(gutter + 2).max(20);
-            // Body is `theme.primary()` plus syntect (`read.rs:256-273`); only
-            // the gutter and the `…` stay dim.
+            // Body is grok-build `highlight_line` (`read.rs:256-273`): syntect
+            // scopes onto tokens, not the chat-fence grayscale ramp. Only the
+            // gutter and the `…` stay dim.
             let path = tool.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let highlighted = super::highlight_source(path, text, theme::style(Token::Text));
             let styled: Vec<Line<'static>> = lines
@@ -5663,6 +5664,33 @@ mod tests {
                 .all(|s| s.style.fg != muted),
             "read body should not sit in muted, got {:?}",
             line.spans
+        );
+    }
+
+    #[test]
+    fn read_body_maps_syntect_scopes_onto_tokens() {
+        let _theme = grok_theme();
+        let file = sample_tool(
+            "read_file",
+            serde_json::json!({ "path": "a.rs" }),
+            "fn foo() { let x = \"hi\"; }",
+        );
+        let rows = tool_output(&file, ToolKind::Read, false, 80, Mode::Truncated);
+        let line = &rows[1].line;
+        let body: Vec<_> = line
+            .spans
+            .iter()
+            .skip(1)
+            .filter(|s| !s.content.is_empty())
+            .collect();
+        let fg_of = |token: Token| theme::style(token).fg;
+        assert!(
+            body.iter().any(|s| s.style.fg == fg_of(Token::Accent)),
+            "keyword scope maps to Accent, got {body:?}"
+        );
+        assert!(
+            body.iter().any(|s| s.style.fg == fg_of(Token::Success)),
+            "string scope maps to Success, got {body:?}"
         );
     }
 
