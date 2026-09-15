@@ -1966,7 +1966,12 @@ fn tool_output(
             let base = read_base_line(tool);
             let last = base + lines.len().saturating_sub(1);
             let gutter = last.max(1).to_string().len();
-            let inner = (width as usize).saturating_sub(gutter + 2).max(20);
+            // grok-build `read.rs:263-264`: wrap the guttered line at
+            // ctx.width minus gutter+2. Wizard's `width` still includes
+            // chrome, so `content_width` is that ctx.width.
+            let inner = (content_width(width) as usize)
+                .saturating_sub(gutter + 2)
+                .max(20);
             // Body is grok-build `highlight_line` (`read.rs:256-273`): syntect
             // scopes onto tokens, not the chat-fence grayscale ramp. Only the
             // gutter and the `…` stay dim.
@@ -5776,6 +5781,23 @@ mod tests {
         assert!(
             body.iter().any(|s| s.style.fg == fg_of(Token::Success)),
             "string scope maps to Success, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn read_body_wraps_at_content_width_minus_gutter() {
+        let _theme = grok_theme();
+        let file = sample_tool(
+            "read_file",
+            serde_json::json!({ "path": "a.rs" }),
+            &"a".repeat(53),
+        );
+        let rows = tool_output(&file, ToolKind::Read, false, 60, Mode::Truncated);
+        let panel: Vec<_> = rows.iter().filter(|row| row.panel).collect();
+        assert!(
+            panel.len() >= 2,
+            "53-col source at width 60 wraps after content_width minus gutter, got {}",
+            panel.len()
         );
     }
 
