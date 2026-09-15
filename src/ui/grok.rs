@@ -2196,8 +2196,10 @@ fn search_empty(tool: &ToolItem) -> Vec<Row> {
     ]
 }
 
-/// `search.rs` metadata_line: muted labels, primary values. Always
-/// `mode: pattern` (Wizard's search is content mode). Optional flags from args.
+/// `search.rs` metadata_line: muted labels, primary values, comma-separated
+/// parts. Always `mode:` plus pattern/files/count. Optional `type`,
+/// `case-insensitive`, `multiline`. The regex itself stays in the header;
+/// never a `pattern:` field. Glob is never shown here.
 fn search_metadata(tool: &ToolItem) -> Line<'static> {
     let label = super::muted();
     let value = theme::style(Token::Text);
@@ -2211,32 +2213,46 @@ fn search_metadata(tool: &ToolItem) -> Line<'static> {
         "count" => "count",
         _ => "pattern",
     };
-    let mut spans = vec![
-        Span::styled("  ", label),
+    let mut parts: Vec<Vec<Span<'static>>> = vec![vec![
         Span::styled("mode: ", label),
         Span::styled(mode, value),
-    ];
+    ]];
+    let file_type = tool
+        .args
+        .get("file_type")
+        .or_else(|| tool.args.get("type"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if let Some(ft) = file_type {
+        parts.push(vec![
+            Span::styled("type: ", label),
+            Span::styled(ft.to_string(), value),
+        ]);
+    }
     let flag = |key: &str| {
-        tool.args.get(key).and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_bool().filter(|b| *b).map(|_| "true".to_string()))
-        })
+        tool.args
+            .get(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     };
-    if let Some(ft) = flag("file_type").or_else(|| flag("type")) {
-        spans.push(Span::styled(", ", label));
-        spans.push(Span::styled("type: ", label));
-        spans.push(Span::styled(ft, value));
+    if flag("case_insensitive") {
+        parts.push(vec![
+            Span::styled("case-insensitive: ", label),
+            Span::styled("true", value),
+        ]);
     }
-    if flag("case_insensitive").is_some() {
-        spans.push(Span::styled(", ", label));
-        spans.push(Span::styled("case-insensitive: ", label));
-        spans.push(Span::styled("true", value));
+    if flag("multiline") {
+        parts.push(vec![
+            Span::styled("multiline: ", label),
+            Span::styled("true", value),
+        ]);
     }
-    if flag("multiline").is_some() {
-        spans.push(Span::styled(", ", label));
-        spans.push(Span::styled("multiline: ", label));
-        spans.push(Span::styled("true", value));
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("  ".to_string(), label)];
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(", ", label));
+        }
+        spans.extend(part);
     }
     Line::from(spans)
 }
@@ -5891,6 +5907,40 @@ mod tests {
         assert_eq!(
             rows[4].line.spans[1].style.fg,
             theme::style(Token::Muted).fg
+        );
+    }
+
+    #[test]
+    fn search_metadata_joins_optional_fields_with_commas() {
+        let tool = sample_tool(
+            "search_files",
+            serde_json::json!({
+                "pattern": "todo",
+                "file_type": "rs",
+                "case_insensitive": true,
+                "multiline": true
+            }),
+            "src/a.rs:1:todo",
+        );
+        let rows = tool_output(&tool, ToolKind::Search, false, 80, Mode::Truncated);
+        let meta = text(&rows[1].line);
+        assert_eq!(
+            meta,
+            "  mode: pattern, type: rs, case-insensitive: true, multiline: true"
+        );
+        assert!(
+            !rows[1]
+                .line
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "pattern: "),
+            "pattern is the mode value, not a field: {:?}",
+            rows[1]
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>()
         );
     }
 
