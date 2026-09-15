@@ -143,6 +143,14 @@ const DIAMOND: &str = "\u{25c6}"; // ◆  diamond_filled()
 const PROMPT_ARROW: &str = "\u{276f} "; // ❯  prompt_arrow(), width 2
 const TOKEN_ARROW: &str = "\u{21e3}"; // ⇣  token_arrow()
 
+/// grok-build `PromptStyle::accent_color` for the default prompt: `accent_user`
+/// when focused, `gray_dim` when not. `accent_user` is GrokNight `FG_DARK`
+/// (`groknight.rs`), which this palette maps to Token::Muted. Token::Accent is
+/// the agent's rail (`accent_assistant`), not the user's arrow.
+fn user_arrow_style(focused: bool) -> Style {
+    theme::style(if focused { Token::Muted } else { Token::Faint })
+}
+
 /// The turn spinner. Upstream's braille wheel, *not* the four half-circles the
 /// skin table carries for `grok` — that table is shared with the parts of the
 /// TUI this file does not own, and it is not editable from here.
@@ -782,7 +790,7 @@ fn flatten(entries: &[Entry], width: u16, tick: u64, blocks: Vec<ImageBlock>) ->
 /// Wizard has no such key, so the prompt is rendered whole: silently hiding
 /// what the user typed, with no way to get it back, is not a fold.
 fn user_entry(text: &str, width: u16) -> Entry {
-    let prefix = theme::style(Token::Accent);
+    let prefix = user_arrow_style(true);
     let body = theme::style(Token::Text);
     let command = theme::style(Token::Heading);
     let inner = content_width(width).saturating_sub(2).max(1) as usize;
@@ -3934,16 +3942,18 @@ fn draw_draft(frame: &mut Frame, app: &App, inner: Rect, focused: bool) {
         // Only the draft's *first* row carries it; wrapped and hard-broken
         // continuations indent to match, which is what keeps the text in one
         // column.
+        //
+        // The default focused prefix is grok-build `theme.accent_user`
+        // (`PromptStyle::accent_color`), not Token::Accent. That token is the
+        // agent's magenta rail; the user's arrow is gray.
         let prefix = if index > 0 {
             Span::raw("  ")
         } else if app.console.is_some() {
             Span::styled("\u{25b6} ", super::warning().bold())
         } else if app.plan_mode || app.omakase {
             Span::styled(PROMPT_ARROW, theme::style(Token::Warning))
-        } else if !focused {
-            Span::styled(PROMPT_ARROW, theme::style(Token::Faint))
         } else {
-            Span::styled(PROMPT_ARROW, super::accent())
+            Span::styled(PROMPT_ARROW, user_arrow_style(focused))
         };
         let mut spans = vec![prefix];
         if normal && index == crow {
@@ -4921,6 +4931,18 @@ mod tests {
         let buf = render_buffer(&app(), 80, 24);
         assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Indexed(233));
         assert_eq!(buf.cell((40, 8)).unwrap().bg, Color::Indexed(233));
+    }
+
+    #[test]
+    fn the_user_prompt_arrow_is_accent_user_not_the_agent_rail() {
+        let _theme = grok_theme();
+        let entry = user_entry("hello", 40);
+        let prefix = &entry.rows[0].line.spans[0];
+        assert_eq!(prefix.content.as_ref(), PROMPT_ARROW);
+        assert_eq!(prefix.style.fg, user_arrow_style(true).fg);
+        assert_ne!(prefix.style.fg, theme::style(Token::Accent).fg);
+        assert_eq!(user_arrow_style(true).fg, theme::style(Token::Muted).fg);
+        assert_eq!(user_arrow_style(false).fg, theme::style(Token::Faint).fg);
     }
 
     #[test]
