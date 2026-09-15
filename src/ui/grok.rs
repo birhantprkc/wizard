@@ -2254,7 +2254,12 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
             .unwrap_or("content");
         if mode == "files_with_matches" || mode == "count" {
             let is_count = mode == "count";
-            for path in text.lines().filter(|line| !line.is_empty()) {
+            let paths: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+            if !paths.is_empty() {
+                // `search.rs:400-401`: blank after metadata when there are results.
+                rows.push(Row::plain(Line::from("")));
+            }
+            for path in paths {
                 if is_count {
                     if let Some(colon) = path.rfind(':') {
                         rows.push(Row::panel(Line::from(vec![
@@ -5876,11 +5881,14 @@ mod tests {
         );
         let rows = tool_output(&tool, ToolKind::Search, false, 60, Mode::Truncated);
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
-        assert_eq!(joined, ["", "  mode: files", "  src/a.rs", "  src/b.rs"]);
-        assert!(!rows[0].panel && !rows[1].panel);
-        assert!(rows[2].panel && rows[3].panel);
-        assert_eq!(rows[2].line.spans[1].style.fg, theme::style(Token::Link).fg);
+        assert_eq!(
+            joined,
+            ["", "  mode: files", "", "  src/a.rs", "  src/b.rs"]
+        );
+        assert!(!rows[0].panel && !rows[1].panel && !rows[2].panel);
+        assert!(rows[3].panel && rows[4].panel);
         assert_eq!(rows[3].line.spans[1].style.fg, theme::style(Token::Link).fg);
+        assert_eq!(rows[4].line.spans[1].style.fg, theme::style(Token::Link).fg);
     }
 
     #[test]
@@ -5894,11 +5902,11 @@ mod tests {
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
         assert_eq!(
             joined,
-            ["", "  mode: count", "  src/a.rs:3", "  src/b.rs:1"]
+            ["", "  mode: count", "", "  src/a.rs:3", "  src/b.rs:1"]
         );
-        assert!(!rows[0].panel && !rows[1].panel);
-        assert!(rows[2].panel && rows[3].panel);
-        let spans = &rows[2].line.spans;
+        assert!(!rows[0].panel && !rows[1].panel && !rows[2].panel);
+        assert!(rows[3].panel && rows[4].panel);
+        let spans = &rows[3].line.spans;
         assert_eq!(spans[1].content.as_ref(), "src/a.rs");
         assert_eq!(spans[1].style.fg, theme::style(Token::Link).fg);
         assert_eq!(spans[2].content.as_ref(), ":3");
