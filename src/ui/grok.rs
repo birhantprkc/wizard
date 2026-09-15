@@ -1183,29 +1183,38 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
         }
         ToolKind::Search => {
             spans.push(Span::styled("Search ", verb));
-            // `search.rs:216-230,242-266`: accent pattern, primary ` in `,
-            // path color. Collapsed mutes all three.
+            // `search.rs:234-267`: trivial pattern + glob is the unquoted
+            // term; otherwise quoted pattern, then `in glob` (accent, not
+            // path), then `in path`. Collapsed mutes all three.
             let pattern_style = if collapsed {
                 theme::style(Token::Muted)
             } else {
                 theme::style(Token::Accent)
             };
-            // Rust-debug-quoted, exactly as upstream renders it
-            // (`search.rs:242`): a pattern with a space or a quote in it has to
-            // read as one token.
-            spans.push(Span::styled(format!("{:?}", arg("pattern")), pattern_style));
+            let in_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Text)
+            };
+            let path_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Link)
+            };
+            let pattern = arg("pattern");
+            let glob = arg("glob");
             let path = arg("path");
+            let trivial = pattern.is_empty() || pattern == ".";
+            if trivial && !glob.is_empty() {
+                spans.push(Span::styled(glob, pattern_style));
+            } else {
+                spans.push(Span::styled(format!("{pattern:?}"), pattern_style));
+                if !glob.is_empty() {
+                    spans.push(Span::styled(" in ", in_style));
+                    spans.push(Span::styled(glob, pattern_style));
+                }
+            }
             if !path.is_empty() {
-                let in_style = if collapsed {
-                    theme::style(Token::Muted)
-                } else {
-                    theme::style(Token::Text)
-                };
-                let path_style = if collapsed {
-                    theme::style(Token::Muted)
-                } else {
-                    theme::style(Token::Link)
-                };
                 spans.push(Span::styled(" in ", in_style));
                 spans.push(Span::styled(path, path_style));
             }
@@ -5378,6 +5387,64 @@ mod tests {
         assert_eq!(expanded[2].style.fg, theme::style(Token::Text).fg);
         assert_eq!(expanded[3].content.as_ref(), "src");
         assert_eq!(expanded[3].style.fg, theme::style(Token::Link).fg);
+    }
+
+    #[test]
+    fn search_header_paints_glob_as_term_when_pattern_is_trivial() {
+        let cwd = Path::new("/workspace");
+        let search = ToolItem {
+            name: "search_files".into(),
+            args: serde_json::json!({ "pattern": ".", "glob": "**/*.rs", "path": "src" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &search,
+            ToolKind::Search,
+            Mode::Truncated,
+            cwd,
+        )));
+        assert_eq!(header, "Search **/*.rs in src");
+
+        let expanded = tool_header(&search, ToolKind::Search, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "**/*.rs");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Accent).fg);
+        assert_eq!(expanded[2].content.as_ref(), " in ");
+        assert_eq!(expanded[2].style.fg, theme::style(Token::Text).fg);
+        assert_eq!(expanded[3].content.as_ref(), "src");
+        assert_eq!(expanded[3].style.fg, theme::style(Token::Link).fg);
+    }
+
+    #[test]
+    fn search_header_paints_in_glob_before_path_when_pattern_is_real() {
+        let cwd = Path::new("/workspace");
+        let search = ToolItem {
+            name: "search_files".into(),
+            args: serde_json::json!({ "pattern": "todo", "glob": "**/*.rs", "path": "src" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &search,
+            ToolKind::Search,
+            Mode::Truncated,
+            cwd,
+        )));
+        assert_eq!(header, "Search \"todo\" in **/*.rs in src");
+
+        let expanded = tool_header(&search, ToolKind::Search, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "\"todo\"");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Accent).fg);
+        assert_eq!(expanded[2].content.as_ref(), " in ");
+        assert_eq!(expanded[3].content.as_ref(), "**/*.rs");
+        assert_eq!(expanded[3].style.fg, theme::style(Token::Accent).fg);
+        assert_eq!(expanded[4].content.as_ref(), " in ");
+        assert_eq!(expanded[5].content.as_ref(), "src");
+        assert_eq!(expanded[5].style.fg, theme::style(Token::Link).fg);
     }
 
     #[test]
