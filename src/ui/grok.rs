@@ -1951,7 +1951,7 @@ fn tool_output(
                 emit(&wrapped[..EXECUTE_FIRST], &mut rows);
                 rows.push(Row::panel(Line::from(Span::styled(
                     format!("\u{2026} +{hidden} lines"),
-                    marker,
+                    super::muted(),
                 ))));
                 emit(&wrapped[wrapped.len() - EXECUTE_LAST..], &mut rows);
             } else {
@@ -5595,6 +5595,7 @@ mod tests {
 
     #[test]
     fn a_commands_output_is_windowed_with_a_count_and_a_files_is_not() {
+        let _theme = grok_theme();
         let command = ToolItem {
             name: "execute".into(),
             args: serde_json::json!({ "command": "cargo test" }),
@@ -5619,12 +5620,16 @@ mod tests {
             "{joined:?}"
         );
         assert_eq!(joined[1 + EXECUTE_FIRST], "\u{2026} +7 lines");
+        assert_eq!(
+            rows[1 + EXECUTE_FIRST].line.spans[0].style.fg,
+            theme::style(Token::Muted).fg,
+            "execute.rs:553 paints the truncation line muted, not dim"
+        );
         assert!(
             rows[1..].iter().all(|row| row.panel),
             "output sits on a band"
         );
 
-        let _theme = grok_theme();
         let file = ToolItem {
             name: "read_file".into(),
             args: serde_json::json!({ "path": "a.rs" }),
