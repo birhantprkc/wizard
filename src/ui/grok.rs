@@ -1106,8 +1106,8 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 /// stays bold on muted (`muted().add_modifier(BOLD)` in read/execute/use_tool).
 ///
 /// Upstream paints paths in `theme.path` (orange) and commands in
-/// `theme.command` (yellow). Wizard has no Path token; Read/Search header
-/// paths and Skill titles use [`Token::Link`]. Search patterns use
+/// `theme.command` (yellow). Wizard has no Path token; Read/Search/Edit/ListDir
+/// header paths and Skill titles use [`Token::Link`]. Search patterns use
 /// [`Token::Accent`] (`theme.accent_success` in grok-build). Commands stay
 /// [`Token::Code`].
 fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
@@ -1168,7 +1168,12 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
                 },
                 verb,
             ));
-            spans.push(Span::styled(arg("path"), operand));
+            let path_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Link)
+            };
+            spans.push(Span::styled(arg("path"), path_style));
         }
         ToolKind::Execute => {
             // Single-line flatten for the generic header helper. Expanded
@@ -1224,13 +1229,18 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
         ToolKind::ListDir => {
             spans.push(Span::styled("List ", verb));
             let path = arg("path");
+            let path_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Link)
+            };
             spans.push(Span::styled(
                 if path.is_empty() {
                     ".".to_string()
                 } else {
                     path
                 },
-                operand,
+                path_style,
             ));
             if let Some(text) = output {
                 let n = text.lines().filter(|line| !line.trim().is_empty()).count();
@@ -5428,6 +5438,38 @@ mod tests {
 
         let expanded = tool_header(&read, ToolKind::Read, Mode::Truncated, cwd);
         assert_eq!(expanded[1].content.as_ref(), "src/app/cli.rs");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
+    }
+
+    #[test]
+    fn edit_and_listdir_headers_paint_the_path_as_link() {
+        let cwd = Path::new("/workspace");
+        let edit = ToolItem {
+            name: "edit_file".into(),
+            args: serde_json::json!({ "path": "src/ui/grok.rs" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = tool_header(&edit, ToolKind::Edit, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[1].content.as_ref(), "src/ui/grok.rs");
+        assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
+        let expanded = tool_header(&edit, ToolKind::Edit, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
+
+        let list = ToolItem {
+            name: "list_files".into(),
+            args: serde_json::json!({ "path": "src" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = tool_header(&list, ToolKind::ListDir, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
+        let expanded = tool_header(&list, ToolKind::ListDir, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "src");
         assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
     }
 
