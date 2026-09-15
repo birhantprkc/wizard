@@ -1101,9 +1101,9 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 /// `P/src/scrollback/blocks/tool/` (the table at §4.1 of the port notes:
 /// `read.rs:184`, `edit.rs:846-865`, `execute.rs:212`, `search.rs:259`,
 /// `list_dir.rs:114`, `web_fetch.rs:117`, `web_search.rs:115`,
-/// `other.rs:153-169`). A collapsed header is muted throughout
-/// (`ToolConfig { muted_collapsed: true, dim_details: true }`,
-/// `R/src/appearance/config.rs:617-621`).
+/// `other.rs:153-169`). A collapsed header mutes operand and detail
+/// (`ToolConfig { muted_collapsed: true, dim_details: true }`). The verb
+/// stays bold on muted (`muted().add_modifier(BOLD)` in read/execute/use_tool).
 ///
 /// Upstream paints paths in `theme.path` (orange) and commands in
 /// `theme.command` (yellow). Wizard has no Path token; Read header paths
@@ -1112,7 +1112,7 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
-        theme::style(Token::Muted)
+        theme::style(Token::Muted).bold()
     } else {
         theme::style(Token::Text).bold()
     };
@@ -1404,7 +1404,7 @@ fn execute_header_rows(tool: &ToolItem, mode: Mode, width: usize) -> Vec<Row> {
         .unwrap_or("");
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
-        theme::style(Token::Muted)
+        theme::style(Token::Muted).bold()
     } else {
         theme::style(Token::Text).bold()
     };
@@ -5294,6 +5294,7 @@ mod tests {
             timing: crate::transcript::ToolTiming::default(),
         };
         let collapsed = tool_header(&read, ToolKind::Read, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[0].style, theme::style(Token::Muted).bold());
         assert_eq!(collapsed[1].content.as_ref(), "cli.rs");
         assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
 
@@ -5378,7 +5379,7 @@ mod tests {
         let collapsed = tool_header(&mcp, ToolKind::Other, Mode::Collapsed, cwd);
         assert_eq!(collapsed[0].content.as_ref(), "Linear ");
         assert_eq!(collapsed[1].content.as_ref(), "Save Issue");
-        assert_eq!(collapsed[0].style, theme::style(Token::Muted));
+        assert_eq!(collapsed[0].style, theme::style(Token::Muted).bold());
         assert_eq!(collapsed[1].style, theme::style(Token::Muted));
 
         let expanded = tool_header(&mcp, ToolKind::Other, Mode::Truncated, cwd);
