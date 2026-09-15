@@ -4506,7 +4506,9 @@ fn todo_row(item: &TodoItem, width: usize) -> Line<'static> {
 /// Ported from `P/src/views/shortcuts_bar.rs:175-320` and the agent pane's
 /// `compact(5, help_hint)` (`P/src/app/agent_view/render.rs:3390-3424`). Keys in
 /// `text_secondary` + bold, labels and separator in `gray` (the separator
-/// additionally dim). The row is filled so leftover cells cannot ghost. Idle
+/// additionally dim). grok-build fills with `bg_base`; we have no such token,
+/// so the fill is the terminal background, same analog as the composer.
+/// Idle
 /// drops `Ctrl+t:expand`; both idle and busy keep `Shift+Tab:mode` and pin
 /// `?:help` as the last compact item. `send` becomes `queue` while a turn is
 /// running (`P/src/views/agent.rs:999`).
@@ -4522,20 +4524,26 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width < 8 {
         return;
     }
-    frame.render_widget(
-        Paragraph::new("").style(theme::style(Token::BgRaised)),
-        area,
-    );
+    let base_bg = blend::terminal_bg().map(|(r, g, b)| Color::Rgb(r, g, b));
+    if let Some(bg) = base_bg {
+        frame.render_widget(Paragraph::new("").style(Style::default().bg(bg)), area);
+    }
     let pairs = compact_shortcut_pairs(&shortcut_pairs(app), Some(("?", "help")), 5);
 
-    let key = theme::style(Token::Muted).bold();
-    let label = super::dim();
+    let key = match base_bg {
+        Some(bg) => theme::style(Token::Text).bold().bg(bg),
+        None => theme::style(Token::Text).bold(),
+    };
+    let label = match base_bg {
+        Some(bg) => super::dim().bg(bg),
+        None => super::dim(),
+    };
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (index, (name, what)) in pairs.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(
                 "  \u{2502}  ",
-                super::dim().add_modifier(Modifier::DIM),
+                label.add_modifier(Modifier::DIM),
             ));
         }
         spans.push(Span::styled(*name, key));
