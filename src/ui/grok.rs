@@ -1912,7 +1912,12 @@ fn tool_output(
     let text = match tool.output.as_ref() {
         Some(out) => out.content.as_str(),
         None if !tool.progress.is_empty() => tool.progress.as_str(),
-        None => return Vec::new(),
+        None => {
+            if kind == ToolKind::Other && is_mcp(&tool.name) {
+                return mcp_body(tool, "", mode);
+            }
+            return Vec::new();
+        }
     };
     if text.trim().is_empty() {
         return match kind {
@@ -1921,6 +1926,7 @@ fn tool_output(
                 Row::plain(Line::from("")),
                 Row::plain(indented("(no content)", super::dim())),
             ],
+            ToolKind::Other if is_mcp(&tool.name) => mcp_body(tool, "", mode),
             _ => Vec::new(),
         };
     }
@@ -1948,29 +1954,7 @@ fn tool_output(
             rows.extend(wrap_indented_muted(text, width));
             rows
         }
-        ToolKind::Other if is_mcp(&tool.name) => {
-            // `use_tool.rs:167-184`: blank separator, empty panel row, then
-            // a 3-line Truncated / 10-line Expanded cap on the panel.
-            let cap = if mode == Mode::Expanded {
-                MAX_INLINE
-            } else {
-                TRUNCATED_INLINE
-            };
-            let shown = cap.min(lines.len());
-            let mut rows = vec![Row::plain(Line::from("")), Row::panel(Line::from(""))];
-            rows.extend(
-                lines[..shown]
-                    .iter()
-                    .map(|line| Row::panel(indented(line, body))),
-            );
-            if lines.len() > shown {
-                rows.push(Row::panel(indented(
-                    &format!("... ({} more lines, ctrl+t to expand)", lines.len() - shown),
-                    marker,
-                )));
-            }
-            rows
-        }
+        ToolKind::Other if is_mcp(&tool.name) => mcp_body(tool, text, mode),
         ToolKind::Other => {
             // `other.rs:167-184`: blank separator, then every line, muted,
             // no cap. The MCP 10/3 window is not this block.
@@ -2228,6 +2212,63 @@ fn mcp_header_parts(name: &str) -> (String, String) {
         Some((server, action)) => (mcp_titleize_segment(server), mcp_titleize_segment(action)),
         None => (String::new(), mcp_titleize_segment(name)),
     }
+}
+
+/// Grok-build `use_tool.rs` `input_args`: blank separator, then `  key: val`.
+fn mcp_input_args(tool: &ToolItem) -> Vec<(String, String)> {
+    let Some(obj) = tool.args.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .map(|(k, v)| {
+            let display = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => "null".to_owned(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            };
+            (k.clone(), display)
+        })
+        .collect()
+}
+
+fn mcp_body(tool: &ToolItem, text: &str, mode: Mode) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let args = mcp_input_args(tool);
+    if !args.is_empty() {
+        rows.push(Row::plain(Line::from("")));
+        for (key, val) in args {
+            rows.push(Row::plain(Line::from(vec![
+                Span::styled(format!("  {key}: "), super::muted()),
+                Span::styled(val, theme::style(Token::Text)),
+            ])));
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if text.trim().is_empty() {
+        return rows;
+    }
+    let cap = if mode == Mode::Expanded {
+        MAX_INLINE
+    } else {
+        TRUNCATED_INLINE
+    };
+    let shown = cap.min(lines.len());
+    rows.push(Row::plain(Line::from("")));
+    rows.push(Row::panel(Line::from("")));
+    rows.extend(
+        lines[..shown]
+            .iter()
+            .map(|line| Row::panel(indented(line, super::muted()))),
+    );
+    if lines.len() > shown {
+        rows.push(Row::panel(indented(
+            &format!("... ({} more lines, ctrl+t to expand)", lines.len() - shown),
+            super::dim(),
+        )));
+    }
+    rows
 }
 
 fn wrap_indented_muted(text: &str, width: u16) -> Vec<Row> {
@@ -6234,6 +6275,41 @@ mod tests {
         assert_eq!(joined[4], "  line 3");
         assert!(joined[5].contains("12 more lines"), "{joined:?}");
         assert!(rows[1].panel && rows[2].panel);
+    }
+
+    #[test]
+    fn mcp_shows_key_val_input_rows_before_the_output_panel() {
+        let mcp = sample_tool(
+            "linear__save_issue",
+            serde_json::json!({ "title": "Bug", "id": 7 }),
+            "ok\ndone",
+        );
+        let rows = tool_output(&mcp, ToolKind::Other, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            joined,
+            ["", "  title: Bug", "  id: 7", "", "", "  ok", "  done"]
+        );
+        assert!(!rows[0].panel && !rows[1].panel && !rows[2].panel);
+        assert!(!rows[3].panel && rows[4].panel && rows[5].panel);
+        assert_eq!(
+            rows[1].line.spans[0].style.fg,
+            theme::style(Token::Muted).fg
+        );
+        assert_eq!(rows[1].line.spans[1].style.fg, theme::style(Token::Text).fg);
+
+        let pending = ToolItem {
+            name: "linear__save_issue".into(),
+            args: serde_json::json!({ "title": "Bug" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let rows = tool_output(&pending, ToolKind::Other, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "  title: Bug"]);
+        assert!(rows.iter().all(|row| !row.panel));
     }
 
     // ── the screen ──────────────────────────────────────────────────────────
