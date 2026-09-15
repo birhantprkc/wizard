@@ -1106,9 +1106,9 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 /// `R/src/appearance/config.rs:617-621`).
 ///
 /// Upstream paints paths in `theme.path` (orange) and commands in
-/// `theme.command` (yellow). Wizard has no token for either, and inventing one
-/// would put two more hues in the palette contract for one skin; both are
-/// literal code, so both ask for [`Token::Code`].
+/// `theme.command` (yellow). Wizard has no Path token; Read header paths
+/// use [`Token::Link`] (the location color, same as Search bodies). Commands
+/// stay [`Token::Code`].
 fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
@@ -1141,9 +1141,16 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
                 spans.push(Span::styled(skill.to_string(), operand));
             } else {
                 spans.push(Span::styled("Read ", verb));
+                // grok-build `theme.path`. Wizard has no Path token; Link is the
+                // location color, Code was the miss the critic named.
+                let path_style = if collapsed {
+                    theme::style(Token::Muted)
+                } else {
+                    theme::style(Token::Link)
+                };
                 spans.push(Span::styled(
                     read_header_path(&path, cwd, collapsed),
-                    operand,
+                    path_style,
                 ));
                 let mut suffix = read_range_suffix(tool);
                 suffix.push_str(&read_extra_suffix(&path, output));
@@ -5267,6 +5274,30 @@ mod tests {
             cwd,
         )));
         assert_eq!(ranged, "Read cli.rs (1-120 of 400)");
+    }
+
+    #[test]
+    fn read_header_paints_the_path_as_link() {
+        let cwd = Path::new("/workspace");
+        let read = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({
+                "path": "/workspace/src/app/cli.rs",
+                "start_line": 1,
+                "end_line": 120
+            }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = tool_header(&read, ToolKind::Read, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[1].content.as_ref(), "cli.rs");
+        assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
+
+        let expanded = tool_header(&read, ToolKind::Read, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "src/app/cli.rs");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
     }
 
     #[test]
