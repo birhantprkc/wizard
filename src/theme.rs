@@ -135,11 +135,14 @@ pub enum Token {
     /// The slab behind a block a skin *sinks* into the background: Grok
     /// Build's tool-output panels. `reset` means no slab.
     BgSunken,
+    /// The page grok-build fills with `bg_base`. `reset` means do not fill,
+    /// so empty cells stay the terminal's own background (the house look).
+    BgBase,
 }
 
 impl Token {
     /// Every token, in discriminant order.
-    pub const ALL: [Token; 21] = [
+    pub const ALL: [Token; 22] = [
         Token::Text,
         Token::Muted,
         Token::Faint,
@@ -161,6 +164,7 @@ impl Token {
         Token::DiffHunk,
         Token::BgRaised,
         Token::BgSunken,
+        Token::BgBase,
     ];
 
     /// The key this token has in a theme file.
@@ -187,6 +191,7 @@ impl Token {
             Token::DiffHunk => "diff.hunk",
             Token::BgRaised => "bg.raised",
             Token::BgSunken => "bg.sunken",
+            Token::BgBase => "bg.base",
         }
     }
 

@@ -53,6 +53,7 @@ success = "green"
 
 # Backgrounds. `reset` is the house rule: this UI paints on the terminal’s
 # own background so transparency and the user’s colour scheme survive. The
-# skins that want a slab declare one; these two never do.
+# skins that want a slab or a page declare one; these two never do.
+"bg.base" = "reset"
 "bg.raised" = "reset"
 "bg.sunken" = "reset"

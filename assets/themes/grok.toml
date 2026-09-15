@@ -50,8 +50,10 @@ success = 149
 "diff.meta" = 242
 "diff.hunk" = 111
 
-# GrokNight’s `bg_light` (the prompt band) and `bg_dark` (tool-output panels),
-# approximated on the 24-step grey ramp. `blend.rs` recomputes both against the
-# terminal’s real background when that is knowable.
+# GrokNight’s page (`bg_base` #141414), prompt band (`bg_light`), and
+# tool-output panels (`bg_dark`), on the 24-step grey ramp. `blend.rs`
+# recomputes the slabs against the real background when that is knowable;
+# the page is painted as-declared so empty cells are not the terminal.
+"bg.base" = 233
 "bg.raised" = 236
 "bg.sunken" = 234

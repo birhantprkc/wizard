@@ -56,6 +56,7 @@ success = "green"
 # The slab behind a user message. Declared, so it renders on any terminal;
 # `blend.rs` recomputes it against the real background when that is knowable,
 # which is strictly better when it is and harmless when it is not. Codex has
-# no sunken slab, but a theme must name every token, so it gets a neutral one.
+# no page fill and no sunken slab, but a theme must name every token.
+"bg.base" = "reset"
 "bg.raised" = 235
 "bg.sunken" = 234

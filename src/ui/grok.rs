@@ -31,8 +31,9 @@
 //!    glyph changes ([`tool_bullet`]). Wizard keeps `✗` for failure, so a
 //!    16-colour terminal and `NO_COLOR` still say which call broke.
 //! 2. *Tokens, never colours.* Nothing here names a [`ratatui::style::Color`];
-//!    every hue is a [`Token`] the active theme resolves. The exception the
-//!    house rules already carve out is [`crate::skin::blend`], whose [`Tint`]
+//!    every hue is a [`Token`] the active theme resolves. The page is
+//!    [`Token::BgBase`] (grok-build's `bg_base`). The exception the house
+//!    rules already carve out is [`crate::skin::blend`], whose [`Tint`]
 //!    blends against the terminal's own background when the environment
 //!    reports one and otherwise reads `bg.raised` / `bg.sunken` off the theme —
 //!    that is what the prompt band and the tool-output panels are made of.
@@ -236,8 +237,8 @@ const SUMMARY_WIDTH: usize = 64;
 // Colour helpers
 // ---------------------------------------------------------------------------
 
-/// `token`'s colour blended `amount` of the way toward the terminal's own
-/// background — upstream's `blend_color(bg, color, 1.0 - amount)`.
+/// `token`'s colour blended `amount` of the way toward the page —
+/// upstream's `blend_color(bg, color, 1.0 - amount)`.
 ///
 /// Ported in spirit from `R/src/render/color.rs:198-206`, which likewise gives
 /// up and returns the colour unchanged when either end is not RGB (an indexed
@@ -249,7 +250,7 @@ const SUMMARY_WIDTH: usize = 64;
 fn fade(token: Token, amount: f32) -> Style {
     let color = theme::color(token);
     let ends = (theme::active().depth() == ColorDepth::TrueColor)
-        .then(|| Some((rgb(color)?, blend::terminal_bg()?)))
+        .then(|| Some((rgb(color)?, page_rgb()?)))
         .flatten();
     match ends {
         Some((fg, bg)) => {
@@ -299,6 +300,20 @@ fn rgb(color: Color) -> Option<(u8, u8, u8)> {
         Color::Indexed(n) => Some(blend::indexed_to_rgb(n)),
         _ => None,
     }
+}
+
+/// grok-build's `theme.bg_base` (`P/src/views/agent.rs:494`). The grok
+/// theme names it as `bg.base`; Reset falls back to the terminal, which
+/// is what the other skins do.
+fn page_bg() -> Option<Color> {
+    match theme::color(Token::BgBase) {
+        Color::Reset => blend::terminal_bg().map(|(r, g, b)| Color::Rgb(r, g, b)),
+        color => Some(color),
+    }
+}
+
+fn page_rgb() -> Option<(u8, u8, u8)> {
+    page_bg().and_then(rgb)
 }
 
 /// `style` with a background, when the block has one.
@@ -3163,6 +3178,12 @@ fn draw_slash_dropdown(frame: &mut Frame, app: &App, composer: Rect, area: Rect)
 /// Render one frame in Grok Build's chrome.
 pub(super) fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    // grok-build `fill_background` (`P/src/views/agent.rs:487-504`): the
+    // whole pane is `theme.bg_base` so empty cells are the page, not the
+    // terminal.
+    if let Some(bg) = page_bg() {
+        frame.render_widget(Paragraph::new("").style(Style::default().bg(bg)), area);
+    }
     let status = turn_status(app);
     let content_width = area.width.saturating_sub(OUTER_HPAD * 2);
     let rows = composer_rows(app, content_width);
@@ -3734,11 +3755,8 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     {
         let buf = frame.buffer_mut();
         // grok-build fills the prompt rect with `bg_base` before the
-        // chrome (`prompt_widget/mod.rs:2964`). We do not have that token;
-        // the terminal background is the honest analog, and nothing is
-        // filled when it is unknown.
-        if let Some((r, g, b)) = blend::terminal_bg() {
-            let bg = Color::Rgb(r, g, b);
+        // chrome (`prompt_widget/mod.rs:2964`).
+        if let Some(bg) = page_bg() {
             let fg = theme::color(Token::Text);
             for y in area.y..area.bottom() {
                 for x in area.x..area.right() {
@@ -3817,9 +3835,7 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(2),
         };
-        let toward = blend::terminal_bg()
-            .map(|(r, g, b)| Color::Rgb(r, g, b))
-            .unwrap_or(Color::Reset);
+        let toward = page_bg().unwrap_or(Color::Reset);
         recede_area(frame.buffer_mut(), interior, toward);
     }
 }
@@ -4530,8 +4546,7 @@ fn todo_row(item: &TodoItem, width: usize) -> Line<'static> {
 /// Ported from `P/src/views/shortcuts_bar.rs:175-320` and the agent pane's
 /// `compact(5, help_hint)` (`P/src/app/agent_view/render.rs:3390-3424`). Keys in
 /// `text_secondary` + bold, labels and separator in `gray` (the separator
-/// additionally dim). grok-build fills with `bg_base`; we have no such token,
-/// so the fill is the terminal background, same analog as the composer.
+/// additionally dim). grok-build fills with `bg_base`.
 /// Idle
 /// drops `Ctrl+t:expand`; both idle and busy keep `Shift+Tab:mode` and pin
 /// `?:help` as the last compact item. `send` becomes `queue` while a turn is
@@ -4548,7 +4563,7 @@ fn draw_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width < 8 {
         return;
     }
-    let base_bg = blend::terminal_bg().map(|(r, g, b)| Color::Rgb(r, g, b));
+    let base_bg = page_bg();
     if let Some(bg) = base_bg {
         frame.render_widget(Paragraph::new("").style(Style::default().bg(bg)), area);
     }
@@ -4892,6 +4907,20 @@ mod tests {
         crate::theme::pin(std::sync::Arc::new(
             crate::theme::load("grok").expect("the grok theme ships"),
         ))
+    }
+
+    #[test]
+    fn page_bg_is_grok_builds_bg_base() {
+        let _theme = grok_theme();
+        assert_eq!(page_bg(), Some(Color::Indexed(233)));
+    }
+
+    #[test]
+    fn empty_cells_are_the_page_not_the_terminal() {
+        let _theme = grok_theme();
+        let buf = render_buffer(&app(), 80, 24);
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Indexed(233));
+        assert_eq!(buf.cell((40, 8)).unwrap().bg, Color::Indexed(233));
     }
 
     #[test]
