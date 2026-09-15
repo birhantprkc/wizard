@@ -1775,7 +1775,13 @@ fn match_summary(output: &str) -> String {
 /// Upstream's "press Enter to view" names a key Wizard does not bind; the hint
 /// here names the one that works, because a hint that names the wrong key is
 /// worse than none.
-fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode: Mode) -> Vec<Row> {
+fn tool_output(
+    tool: &ToolItem,
+    kind: ToolKind,
+    _running: bool,
+    width: u16,
+    mode: Mode,
+) -> Vec<Row> {
     let text = match tool.output.as_ref() {
         Some(out) => out.content.as_str(),
         None if !tool.progress.is_empty() => tool.progress.as_str(),
@@ -1867,18 +1873,10 @@ fn tool_output(tool: &ToolItem, kind: ToolKind, running: bool, width: u16, mode:
                     rows.push(Row::panel(line.clone()));
                 }
             };
-            if running {
-                // A command still running is read from its tail: the line it is
-                // waiting on is the last one.
-                let shown = wrapped.len().min(MAX_INLINE);
-                if wrapped.len() > shown {
-                    rows.push(Row::panel(Line::from(Span::styled(
-                        format!("\u{2026} +{} earlier lines", wrapped.len() - shown),
-                        marker,
-                    ))));
-                }
-                emit(&wrapped[wrapped.len() - shown..], &mut rows);
-            } else if mode != Mode::Expanded && wrapped.len() > EXECUTE_FIRST + EXECUTE_LAST {
+            // Truncated (and a live stream, which rests Truncated) is first two
+            // plus last three of the wrapped body (`execute.rs:650-653`). Not a
+            // tail window.
+            if mode != Mode::Expanded && wrapped.len() > EXECUTE_FIRST + EXECUTE_LAST {
                 let hidden = wrapped.len() - EXECUTE_FIRST - EXECUTE_LAST;
                 emit(&wrapped[..EXECUTE_FIRST], &mut rows);
                 rows.push(Row::panel(Line::from(Span::styled(
@@ -5370,6 +5368,35 @@ mod tests {
         assert_eq!(joined[0], "");
         assert!(joined[1].starts_with("50  "), "{joined:?}");
         assert!(joined[3].starts_with("52  "), "{joined:?}");
+    }
+
+    #[test]
+    fn a_running_command_uses_the_first_last_window() {
+        let streaming = ToolItem {
+            name: "execute".into(),
+            args: serde_json::json!({ "command": "cargo test" }),
+            call_id: String::new(),
+            output: None,
+            progress: (1..=12)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let rows = tool_output(&streaming, ToolKind::Execute, true, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            joined.len(),
+            1 + EXECUTE_FIRST + 1 + EXECUTE_LAST,
+            "{joined:?}"
+        );
+        assert_eq!(joined[1], "line 1");
+        assert_eq!(joined[2], "line 2");
+        assert_eq!(joined[1 + EXECUTE_FIRST], "\u{2026} +7 lines");
+        assert_eq!(
+            &joined[joined.len() - EXECUTE_LAST..],
+            ["line 10", "line 11", "line 12"]
+        );
     }
 
     #[test]
