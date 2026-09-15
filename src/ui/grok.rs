@@ -1171,10 +1171,9 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
             spans.push(Span::styled(arg("path"), operand));
         }
         ToolKind::Execute => {
-            // `execute.rs` Label: `Run ` plus the command. Expanded cards wrap
-            // at bash operators/quotes; empty is `…`. Truncation is that wrap,
-            // not SUMMARY_WIDTH.
-            spans.extend(execute_header_spans(
+            // Single-line flatten for the generic header helper. Expanded
+            // cards wrap in `execute_header_spans` (`push_command_soft_wrap`).
+            spans.extend(execute_header_flat_spans(
                 &arg("command"),
                 verb,
                 collapsed,
@@ -1393,7 +1392,7 @@ fn read_file_total_lines(tool: &ToolItem) -> Option<usize> {
     n_str.parse().ok()
 }
 
-fn execute_header_spans(
+fn execute_header_flat_spans(
     command: &str,
     verb: Style,
     collapsed: bool,
@@ -1423,6 +1422,47 @@ fn execute_header_spans(
     spans
 }
 
+/// Grok-build `execute.rs` `push_command_soft_wrap` for Label: `Run ` plus
+/// operator/quote wrap. Collapsed and empty stay one flattened line.
+fn execute_header_spans(
+    command: &str,
+    verb: Style,
+    collapsed: bool,
+    fallback: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if collapsed || command.trim().is_empty() {
+        let line = Line::from(execute_header_flat_spans(
+            command, verb, collapsed, fallback,
+        ));
+        if collapsed {
+            return vec![super::truncate_line(line, width)];
+        }
+        return vec![line];
+    }
+    let hang = "Run ".len();
+    let cmd_width = width.saturating_sub(hang).max(1);
+    let cmd_rows = bash_command_display_lines(command, cmd_width, fallback);
+    if cmd_rows.is_empty() {
+        return vec![Line::from(execute_header_flat_spans(
+            command, verb, collapsed, fallback,
+        ))];
+    }
+    cmd_rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = if i == 0 {
+                vec![Span::styled("Run ", verb)]
+            } else {
+                vec![Span::raw(" ".repeat(hang))]
+            };
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn execute_header_rows(tool: &ToolItem, mode: Mode, width: usize) -> Vec<Row> {
     let command = tool
         .args
@@ -1440,36 +1480,9 @@ fn execute_header_rows(tool: &ToolItem, mode: Mode, width: usize) -> Vec<Row> {
     } else {
         theme::style(Token::Code)
     };
-    if collapsed || command.trim().is_empty() {
-        let spans = execute_header_spans(command, verb, collapsed, fallback);
-        let line = Line::from(spans);
-        if collapsed {
-            return vec![Row::plain(super::truncate_line(line, width))];
-        }
-        return vec![Row::plain(line)];
-    }
-    // `execute.rs` `push_command_soft_wrap`: `Run ` on the first row,
-    // hang-indent under it, wrap at bash operators/quotes.
-    let hang = "Run ".len();
-    let cmd_width = width.saturating_sub(hang).max(1);
-    let cmd_rows = bash_command_display_lines(command, cmd_width, fallback);
-    if cmd_rows.is_empty() {
-        return vec![Row::plain(Line::from(execute_header_spans(
-            command, verb, collapsed, fallback,
-        )))];
-    }
-    cmd_rows
+    execute_header_spans(command, verb, collapsed, fallback, width)
         .into_iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let mut spans = if i == 0 {
-                vec![Span::styled("Run ", verb)]
-            } else {
-                vec![Span::raw(" ".repeat(hang))]
-            };
-            spans.extend(row.spans);
-            Row::plain(Line::from(spans))
-        })
+        .map(Row::plain)
         .collect()
 }
 
@@ -1514,11 +1527,28 @@ fn bash_command_display_lines(
 }
 
 fn prepare_bash_display_text(command: &str) -> String {
-    let mut lines: Vec<&str> = command.split('\n').map(|line| line.trim_end()).collect();
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
+    let normalized = command.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    for (i, line) in normalized.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end());
     }
-    lines.join("\n")
+    while out.ends_with('\n') {
+        let without = &out[..out.len() - 1];
+        if without.ends_with('\\') {
+            out.pop();
+            break;
+        }
+        if without.is_empty() || without.ends_with('\n') {
+            out.pop();
+            continue;
+        }
+        out.pop();
+        break;
+    }
+    out
 }
 
 fn soft_break_offsets_after_operators(text: &str) -> Vec<usize> {
@@ -5673,6 +5703,38 @@ mod tests {
             expected.extend(command.split_whitespace());
             expected
         });
+    }
+
+    #[test]
+    fn execute_header_does_not_wrap_inside_quoted_and() {
+        let _theme = grok_theme();
+        let command = r#"echo "keep && together" && echo next"#;
+        let breaks = soft_break_offsets_after_operators(command);
+        assert_eq!(breaks.len(), 1, "breaks={breaks:?}");
+        let width = 28;
+        assert!(UnicodeWidthStr::width(command) > width);
+        let rows = soft_wrap_row_texts(command, 0, &breaks, width);
+        let first = rows[0];
+        assert!(
+            first.contains(r#""keep && together""#),
+            "quoted && must stay on the first row: {first:?}"
+        );
+        assert!(
+            first.contains("&&"),
+            "real operator stays with first row: {first:?}"
+        );
+        let header = execute_header_spans(
+            command,
+            theme::style(Token::Text).bold(),
+            false,
+            theme::style(Token::Code),
+            width + "Run ".len(),
+        );
+        let texts: Vec<String> = header.iter().map(text).collect();
+        assert!(
+            texts[0].contains(r#""keep && together""#),
+            "expanded Run header must not wrap inside quotes: {texts:?}"
+        );
     }
 
     #[test]
