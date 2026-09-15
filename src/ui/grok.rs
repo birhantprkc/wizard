@@ -1973,8 +1973,8 @@ fn tool_output(
                 .saturating_sub(gutter + 2)
                 .max(20);
             // Body is grok-build `highlight_line` (`read.rs:256-273`): syntect
-            // scopes onto tokens, not the chat-fence grayscale ramp. Only the
-            // gutter and the `…` stay dim.
+            // scopes onto tokens, not the chat-fence grayscale ramp. The gutter
+            // stays dim (`read.rs:267`); the `…` is muted (`read.rs:305`).
             let path = tool.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let highlighted = super::highlight_source(path, text, theme::style(Token::Text));
             let styled: Vec<Line<'static>> = lines
@@ -2000,7 +2000,10 @@ fn tool_output(
             };
             if mode != Mode::Expanded && wrapped.len() > READ_FIRST + READ_LAST {
                 emit(&wrapped[..READ_FIRST], &mut rows);
-                rows.push(Row::panel(Line::from(Span::styled("\u{2026}", marker))));
+                rows.push(Row::panel(Line::from(Span::styled(
+                    "\u{2026}",
+                    super::muted(),
+                ))));
                 emit(&wrapped[wrapped.len() - READ_LAST..], &mut rows);
             } else {
                 emit(&wrapped, &mut rows);
@@ -5620,6 +5623,7 @@ mod tests {
             "output sits on a band"
         );
 
+        let _theme = grok_theme();
         let file = ToolItem {
             name: "read_file".into(),
             args: serde_json::json!({ "path": "a.rs" }),
@@ -5640,6 +5644,11 @@ mod tests {
         assert!(!rows[0].panel, "the separator is not a band");
         // A bare `…` with no count: the line-number gutter says how much is gone.
         assert_eq!(joined[1 + READ_FIRST], "\u{2026}", "{joined:?}");
+        assert_eq!(
+            rows[1 + READ_FIRST].line.spans[0].style.fg,
+            theme::style(Token::Muted).fg,
+            "read.rs:305 paints the ellipsis muted, not dim like the gutter"
+        );
         // The gutter is right-aligned to the width of the largest number.
         assert!(joined[1].starts_with(" 1  line 1"), "{joined:?}");
         assert!(
