@@ -1230,18 +1230,15 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
         }
         ToolKind::Other => {
             if is_mcp(&tool.name) {
-                // `use_tool.rs` header_line: muted server, bold action, each
-                // segment titleized on `_`. Verb+Code was the miss the critic
-                // named.
+                // `use_tool.rs` header_line: **Server** `Action`. Server is
+                // always bold (muted when collapsed). Action is command color
+                // (`Token::Code`) when expanded, muted when collapsed.
                 let (server, action) = mcp_header_parts(&tool.name);
                 if server.is_empty() {
                     spans.push(Span::styled(action, verb));
                 } else {
-                    spans.push(Span::styled(
-                        format!("{server} "),
-                        theme::style(Token::Muted),
-                    ));
-                    spans.push(Span::styled(action, verb));
+                    spans.push(Span::styled(format!("{server} "), verb));
+                    spans.push(Span::styled(action, operand));
                 }
             } else {
                 spans.push(Span::styled(tool.name.clone(), verb));
@@ -5368,7 +5365,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_header_paints_muted_server_and_bold_action() {
+    fn mcp_header_paints_bold_server_and_command_action() {
         let cwd = Path::new("/workspace");
         let mcp = ToolItem {
             name: "linear__save_issue".into(),
@@ -5387,8 +5384,8 @@ mod tests {
         let expanded = tool_header(&mcp, ToolKind::Other, Mode::Truncated, cwd);
         assert_eq!(expanded[0].content.as_ref(), "Linear ");
         assert_eq!(expanded[1].content.as_ref(), "Save Issue");
-        assert_eq!(expanded[0].style, theme::style(Token::Muted));
-        assert_eq!(expanded[1].style, theme::style(Token::Text).bold());
+        assert_eq!(expanded[0].style, theme::style(Token::Text).bold());
+        assert_eq!(expanded[1].style, theme::style(Token::Code));
     }
 
     #[test]
