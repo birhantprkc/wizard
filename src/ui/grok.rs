@@ -2195,7 +2195,7 @@ fn search_empty(tool: &ToolItem) -> Vec<Row> {
         Row::plain(Line::from("")),
         Row::plain(search_metadata(tool)),
         Row::plain(Line::from("")),
-        Row::plain(indented("(no results)", super::dim())),
+        Row::plain(indented("(no results)", super::muted())),
     ]
 }
 
@@ -2267,10 +2267,6 @@ fn search_metadata(tool: &ToolItem) -> Line<'static> {
 fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     let groups = parse_search_hits(text);
     if groups.is_empty() {
-        let mut rows = vec![
-            Row::plain(Line::from("")),
-            Row::plain(search_metadata(tool)),
-        ];
         let mode = tool
             .args
             .get("output_mode")
@@ -2279,10 +2275,16 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
         if mode == "files_with_matches" || mode == "count" {
             let is_count = mode == "count";
             let paths: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-            if !paths.is_empty() {
-                // `search.rs:400-401`: blank after metadata when there are results.
-                rows.push(Row::plain(Line::from("")));
+            if paths.is_empty() {
+                // `search.rs:402-408`: muted (no results) after metadata.
+                return search_empty(tool);
             }
+            let mut rows = vec![
+                Row::plain(Line::from("")),
+                Row::plain(search_metadata(tool)),
+                // `search.rs:400-401`: blank after metadata when there are results.
+                Row::plain(Line::from("")),
+            ];
             for path in paths {
                 if is_count {
                     if let Some(colon) = path.rfind(':') {
@@ -2299,10 +2301,9 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
                     Span::styled(path.to_string(), theme::style(Token::Link)),
                 ])));
             }
-        } else {
-            rows.extend(wrap_indented_muted(text, 80));
+            return rows;
         }
-        return rows;
+        return search_empty(tool);
     }
     let mut rows = vec![
         Row::plain(Line::from("")),
@@ -5916,6 +5917,20 @@ mod tests {
         assert_eq!(
             rows[4].line.spans[1].style.fg,
             theme::style(Token::Muted).fg
+        );
+    }
+
+    #[test]
+    fn search_body_paints_muted_no_results_after_metadata() {
+        let _theme = grok_theme();
+        let tool = sample_tool("search_files", serde_json::json!({ "pattern": "todo" }), "");
+        let rows = tool_output(&tool, ToolKind::Search, false, 80, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "  mode: pattern", "", "  (no results)"]);
+        assert_eq!(
+            rows[3].line.spans.last().unwrap().style.fg,
+            theme::style(Token::Muted).fg,
+            "search.rs:406 paints (no results) muted"
         );
     }
 
