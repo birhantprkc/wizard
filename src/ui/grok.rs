@@ -1107,8 +1107,8 @@ fn tool_bullet(running: bool, failed: bool) -> (&'static str, Token) {
 ///
 /// Upstream paints paths in `theme.path` (orange) and commands in
 /// `theme.command` (yellow). Wizard has no Path token; Read header paths
-/// use [`Token::Link`] (the location color, same as Search bodies). Commands
-/// stay [`Token::Code`].
+/// and Skill titles use [`Token::Link`] (the location color, same as Search
+/// bodies). Commands stay [`Token::Code`].
 fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<Span<'static>> {
     let collapsed = mode == Mode::Collapsed;
     let verb = if collapsed {
@@ -1135,19 +1135,20 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
     match kind {
         ToolKind::Read => {
             let path = arg("path");
+            // grok-build `theme.path`. Wizard has no Path token; Link is the
+            // location color, Code was the miss the critic named. Skill names
+            // use the same style (`read.rs:173-179`).
+            let path_style = if collapsed {
+                theme::style(Token::Muted)
+            } else {
+                theme::style(Token::Link)
+            };
             if let Some(skill) = skill_name_from_path(&path) {
                 // Skill reads replace the whole header. `read.rs:173-179`.
                 spans.push(Span::styled("Skill ", verb));
-                spans.push(Span::styled(skill.to_string(), operand));
+                spans.push(Span::styled(skill.to_string(), path_style));
             } else {
                 spans.push(Span::styled("Read ", verb));
-                // grok-build `theme.path`. Wizard has no Path token; Link is the
-                // location color, Code was the miss the critic named.
-                let path_style = if collapsed {
-                    theme::style(Token::Muted)
-                } else {
-                    theme::style(Token::Link)
-                };
                 spans.push(Span::styled(
                     read_header_path(&path, cwd, collapsed),
                     path_style,
@@ -5338,6 +5339,28 @@ mod tests {
             cwd,
         )));
         assert_eq!(header, "Read README.md");
+    }
+
+    #[test]
+    fn read_header_paints_skill_title_as_link() {
+        let cwd = Path::new("/workspace");
+        let read = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({
+                "path": "/home/user/.grok/skills/deploy/SKILL.md"
+            }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let collapsed = tool_header(&read, ToolKind::Read, Mode::Collapsed, cwd);
+        assert_eq!(collapsed[1].content.as_ref(), "deploy");
+        assert_eq!(collapsed[1].style.fg, theme::style(Token::Muted).fg);
+
+        let expanded = tool_header(&read, ToolKind::Read, Mode::Truncated, cwd);
+        assert_eq!(expanded[1].content.as_ref(), "deploy");
+        assert_eq!(expanded[1].style.fg, theme::style(Token::Link).fg);
     }
 
     #[test]
