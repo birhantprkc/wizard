@@ -1905,9 +1905,10 @@ fn match_summary(output: &str) -> String {
 /// output is flush left on a `bg_dark` panel band with a two-sided window
 /// (`execute.rs:567-590`), a file read gets a right-aligned line-number gutter
 /// and a bare `…` with no count (`read.rs:275-313`), ListDir is a panel listing,
-/// Search is grouped match rows, Edit is a reconstructed `-/+` listing, Other
-/// shows every line after a blank separator, and only MCP (`use_tool.rs`) is
-/// indented two columns and capped.
+/// Search is grouped match rows, Edit is a reconstructed `-/+` listing, Fetch
+/// and Web Search sit in a `bg_dark` content box (`web_fetch.rs:231-266`,
+/// `web_search.rs:257-290`), Other shows every line after a blank separator,
+/// and only MCP (`use_tool.rs`) is indented two columns and capped.
 ///
 /// Upstream's "press Enter to view" names a key Wizard does not bind; the hint
 /// here names the one that works, because a hint that names the wrong key is
@@ -1934,7 +1935,7 @@ fn tool_output(
             ToolKind::Search => search_empty(tool),
             ToolKind::Fetch | ToolKind::WebSearch => vec![
                 Row::plain(Line::from("")),
-                Row::plain(indented("(no content)", super::dim())),
+                Row::plain(indented("(no content)", super::muted())),
             ],
             ToolKind::Other if is_mcp(&tool.name) => mcp_body(tool, "", mode),
             _ => Vec::new(),
@@ -1959,11 +1960,7 @@ fn tool_output(
         }
         ToolKind::Search => search_body(tool, text),
         ToolKind::Edit => edit_body(tool, text, width),
-        ToolKind::Fetch | ToolKind::WebSearch => {
-            let mut rows = vec![Row::plain(Line::from(""))];
-            rows.extend(wrap_indented_muted(text, width));
-            rows
-        }
+        ToolKind::Fetch | ToolKind::WebSearch => fetch_web_body(text, mode),
         ToolKind::Other if is_mcp(&tool.name) => mcp_body(tool, text, mode),
         ToolKind::Other => {
             // `other.rs:167-184`: blank separator, then every line, muted,
@@ -2241,6 +2238,33 @@ fn mcp_input_args(tool: &ToolItem) -> Vec<(String, String)> {
             (k.clone(), display)
         })
         .collect()
+}
+
+/// `web_fetch.rs:231-266` / `web_search.rs:257-290`: blank separator, then a
+/// `bg_dark` content box (empty pad, primary body, empty pad). Capped the same
+/// way as MCP. The more-lines hint names Wizard's key, not grok-build's.
+fn fetch_web_body(text: &str, mode: Mode) -> Vec<Row> {
+    let lines: Vec<&str> = text.lines().collect();
+    let cap = if mode == Mode::Expanded {
+        MAX_INLINE
+    } else {
+        TRUNCATED_INLINE
+    };
+    let shown = cap.min(lines.len());
+    let mut rows = vec![Row::plain(Line::from("")), Row::panel(Line::from(""))];
+    rows.extend(
+        lines[..shown]
+            .iter()
+            .map(|line| Row::panel(indented(line, theme::style(Token::Text)))),
+    );
+    if lines.len() > shown {
+        rows.push(Row::panel(indented(
+            &format!("... ({} more lines, ctrl+t to expand)", lines.len() - shown),
+            super::dim(),
+        )));
+    }
+    rows.push(Row::panel(Line::from("")));
+    rows
 }
 
 fn mcp_body(tool: &ToolItem, text: &str, mode: Mode) -> Vec<Row> {
@@ -6360,6 +6384,56 @@ mod tests {
         let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
         assert_eq!(joined, ["", "  title: Bug"]);
         assert!(rows.iter().all(|row| !row.panel));
+    }
+
+    #[test]
+    fn fetch_and_web_search_sit_in_a_primary_content_box() {
+        let primary = theme::style(Token::Text).fg;
+        let muted = theme::style(Token::Muted).fg;
+        assert_ne!(primary, muted, "the test needs Text and Muted to differ");
+
+        let empty = sample_tool(
+            "web_fetch",
+            serde_json::json!({ "url": "https://x.com" }),
+            "",
+        );
+        let rows = tool_output(&empty, ToolKind::Fetch, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "  (no content)"]);
+        assert!(rows.iter().all(|row| !row.panel));
+        assert_eq!(rows[1].line.spans.last().unwrap().style.fg, muted);
+
+        let many: String = (1..=15)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fetch = sample_tool(
+            "web_fetch",
+            serde_json::json!({ "url": "https://x.com" }),
+            &many,
+        );
+        let rows = tool_output(&fetch, ToolKind::Fetch, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined[0], "");
+        assert_eq!(joined[1], "");
+        assert_eq!(joined[2], "  line 1");
+        assert_eq!(joined[4], "  line 3");
+        assert!(joined[5].contains("12 more lines"), "{joined:?}");
+        assert_eq!(joined[6], "");
+        assert!(!rows[0].panel);
+        assert!(rows[1].panel && rows[2].panel && rows[5].panel && rows[6].panel);
+        assert_eq!(rows[2].line.spans.last().unwrap().style.fg, primary);
+
+        let search = sample_tool(
+            "web_search",
+            serde_json::json!({ "query": "grok" }),
+            "hello\nworld",
+        );
+        let rows = tool_output(&search, ToolKind::WebSearch, false, 60, Mode::Expanded);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "", "  hello", "  world", ""]);
+        assert!(!rows[0].panel && rows[1].panel && rows[4].panel);
+        assert_eq!(rows[2].line.spans.last().unwrap().style.fg, primary);
     }
 
     // ── the screen ──────────────────────────────────────────────────────────
