@@ -951,7 +951,8 @@ fn notice_entry(message: &str, width: u16) -> Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
     /// `read_file` → `Read <basename>` collapsed, cwd-relative expanded,
-    /// with `(1-120)` or `(1-120 of 400)`.
+    /// with `(1-120)` or `(1-120 of 400)`, plus `(empty)` / `(image)` /
+    /// `(N pages)`. A `SKILL.md` read paints `Skill {name}` instead.
     Read,
     /// `write_file` / `edit_file` → `Creating <path>` / `Edit <path>`.
     Edit,
@@ -1133,12 +1134,21 @@ fn tool_header(tool: &ToolItem, kind: ToolKind, mode: Mode, cwd: &Path) -> Vec<S
     let mut spans = Vec::new();
     match kind {
         ToolKind::Read => {
-            spans.push(Span::styled("Read ", verb));
-            spans.push(Span::styled(
-                read_header_path(&arg("path"), cwd, collapsed),
-                operand,
-            ));
-            spans.push(Span::styled(read_range_suffix(tool), detail));
+            let path = arg("path");
+            if let Some(skill) = skill_name_from_path(&path) {
+                // Skill reads replace the whole header. `read.rs:173-179`.
+                spans.push(Span::styled("Skill ", verb));
+                spans.push(Span::styled(skill.to_string(), operand));
+            } else {
+                spans.push(Span::styled("Read ", verb));
+                spans.push(Span::styled(
+                    read_header_path(&path, cwd, collapsed),
+                    operand,
+                ));
+                let mut suffix = read_range_suffix(tool);
+                suffix.push_str(&read_extra_suffix(&path, output));
+                spans.push(Span::styled(suffix, detail));
+            }
         }
         ToolKind::Edit => {
             spans.push(Span::styled(
@@ -1259,6 +1269,57 @@ fn read_header_path(path: &str, cwd: &Path, collapsed: bool) -> String {
         }
         Err(_) => path.to_string(),
     }
+}
+
+/// Skill name when this read targets a skill definition (`SKILL.md`).
+/// Ported from grok-build `skill_name_from_path`.
+fn skill_name_from_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches(['/', '\\']);
+    let (parent, filename) = path.rsplit_once(['/', '\\'])?;
+    if filename != "SKILL.md" {
+        return None;
+    }
+    parent
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+/// `(empty)` / `(image)` / `(N pages)` after the range. `read.rs:194-203`.
+fn read_extra_suffix(path: &str, content: Option<&str>) -> String {
+    if content.is_some_and(|c| c.is_empty() || c == "(empty file)") {
+        return " (empty)".to_string();
+    }
+    if content.is_none() {
+        return String::new();
+    }
+    if crate::commands::is_image_path(Path::new(path)) {
+        return " (image)".to_string();
+    }
+    if let Some(pages) = read_pdf_pages(path, content) {
+        return format!(" ({pages} pages)");
+    }
+    String::new()
+}
+
+/// grok-build paints this when the read produced PDF page images.
+/// Wizard's read_file does not render PDFs; a `.pdf` path with no page
+/// count stays a plain Read.
+fn read_pdf_pages(path: &str, content: Option<&str>) -> Option<usize> {
+    let is_pdf = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return None;
+    }
+    let content = content?;
+    // `/Type /Pages` also matches the `/Type /Page` prefix, so subtract the tree nodes.
+    let pages = content
+        .matches("/Type /Page")
+        .count()
+        .saturating_sub(content.matches("/Type /Pages").count());
+    (pages > 0).then_some(pages)
 }
 
 /// `(start-end)` or `(start-end of total)` when the file is larger than the
@@ -5178,6 +5239,110 @@ mod tests {
             cwd,
         )));
         assert_eq!(ranged, "Read cli.rs (1-120 of 400)");
+    }
+
+    #[test]
+    fn read_header_paints_skill_title_instead_of_path() {
+        let cwd = Path::new("/workspace");
+        let read = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({
+                "path": "/home/user/.grok/skills/deploy/SKILL.md",
+                "start_line": 1,
+                "end_line": 80
+            }),
+            call_id: String::new(),
+            output: Some(crate::transcript::ToolItemOutput {
+                content: String::new(),
+                is_error: false,
+            }),
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        for mode in [Mode::Collapsed, Mode::Truncated] {
+            let header = text(&Line::from(tool_header(&read, ToolKind::Read, mode, cwd)));
+            assert_eq!(header, "Skill deploy", "{mode:?}");
+        }
+
+        let not_skill = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({ "path": "/x/skills/deploy/README.md" }),
+            call_id: String::new(),
+            output: None,
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &not_skill,
+            ToolKind::Read,
+            Mode::Collapsed,
+            cwd,
+        )));
+        assert_eq!(header, "Read README.md");
+    }
+
+    #[test]
+    fn read_header_appends_empty_image_and_pdf_suffix() {
+        let cwd = Path::new("/workspace");
+        let header = |path: &str, output: Option<&str>| {
+            let read = ToolItem {
+                name: "read_file".into(),
+                args: serde_json::json!({ "path": path }),
+                call_id: String::new(),
+                output: output.map(|c| crate::transcript::ToolItemOutput {
+                    content: c.into(),
+                    is_error: false,
+                }),
+                progress: String::new(),
+                timing: crate::transcript::ToolTiming::default(),
+            };
+            text(&Line::from(tool_header(
+                &read,
+                ToolKind::Read,
+                Mode::Collapsed,
+                cwd,
+            )))
+        };
+        assert_eq!(header("notes.txt", Some("")), "Read notes.txt (empty)");
+        assert_eq!(
+            header("notes.txt", Some("(empty file)")),
+            "Read notes.txt (empty)"
+        );
+        assert_eq!(header("notes.txt", None), "Read notes.txt");
+        assert_eq!(
+            header("shot.png", Some("shot.png: 8x8 PNG, 32 bytes")),
+            "Read shot.png (image)"
+        );
+        assert_eq!(header("shot.png", None), "Read shot.png");
+        assert_eq!(
+            header("doc.pdf", Some("/Type /Pages /Type /Page /Type /Page")),
+            "Read doc.pdf (2 pages)"
+        );
+        assert_eq!(header("doc.pdf", Some("%PDF-1.4")), "Read doc.pdf");
+        assert_eq!(header("doc.pdf", None), "Read doc.pdf");
+
+        let ranged_empty = ToolItem {
+            name: "read_file".into(),
+            args: serde_json::json!({
+                "path": "notes.txt",
+                "start_line": 1,
+                "end_line": 10
+            }),
+            call_id: String::new(),
+            output: Some(crate::transcript::ToolItemOutput {
+                content: "(empty file)".into(),
+                is_error: false,
+            }),
+            progress: String::new(),
+            timing: crate::transcript::ToolTiming::default(),
+        };
+        let header = text(&Line::from(tool_header(
+            &ranged_empty,
+            ToolKind::Read,
+            Mode::Collapsed,
+            cwd,
+        )));
+        assert_eq!(header, "Read notes.txt (1-10) (empty)");
     }
 
     #[test]
