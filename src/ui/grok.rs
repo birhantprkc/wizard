@@ -2226,8 +2226,10 @@ fn search_metadata(tool: &ToolItem) -> Line<'static> {
     Line::from(spans)
 }
 
-/// `search.rs:370-447`: blank separator, a metadata line, then per-file
-/// groups of `    {line}  {content}` under a two-space path.
+/// `search.rs:370-479`: blank separator, a metadata line, then per-file
+/// groups of `    {line}  {content}` under a two-space path. Path-only
+/// (`files_with_matches`) and `path:N` (`count`) paint indented path-colored
+/// panel rows, splitting `:N` on count.
 fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
     let groups = parse_search_hits(text);
     if groups.is_empty() {
@@ -2235,7 +2237,32 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
             Row::plain(Line::from("")),
             Row::plain(search_metadata(tool)),
         ];
-        rows.extend(wrap_indented_muted(text, 80));
+        let mode = tool
+            .args
+            .get("output_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("content");
+        if mode == "files_with_matches" || mode == "count" {
+            let is_count = mode == "count";
+            for path in text.lines().filter(|line| !line.is_empty()) {
+                if is_count {
+                    if let Some(colon) = path.rfind(':') {
+                        rows.push(Row::panel(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(path[..colon].to_string(), theme::style(Token::Link)),
+                            Span::styled(path[colon..].to_string(), theme::style(Token::Text)),
+                        ])));
+                        continue;
+                    }
+                }
+                rows.push(Row::panel(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(path.to_string(), theme::style(Token::Link)),
+                ])));
+            }
+        } else {
+            rows.extend(wrap_indented_muted(text, 80));
+        }
         return rows;
     }
     let mut rows = vec![
@@ -5730,6 +5757,44 @@ mod tests {
             rows[4].line.spans[1].style.fg,
             theme::style(Token::Muted).fg
         );
+    }
+
+    #[test]
+    fn search_files_with_matches_are_indented_path_panel_rows() {
+        let tool = sample_tool(
+            "search_files",
+            serde_json::json!({ "pattern": "todo", "output_mode": "files_with_matches" }),
+            "src/a.rs\nsrc/b.rs",
+        );
+        let rows = tool_output(&tool, ToolKind::Search, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(joined, ["", "  mode: files", "  src/a.rs", "  src/b.rs"]);
+        assert!(!rows[0].panel && !rows[1].panel);
+        assert!(rows[2].panel && rows[3].panel);
+        assert_eq!(rows[2].line.spans[1].style.fg, theme::style(Token::Link).fg);
+        assert_eq!(rows[3].line.spans[1].style.fg, theme::style(Token::Link).fg);
+    }
+
+    #[test]
+    fn search_count_splits_the_colon_n_on_path_panel_rows() {
+        let tool = sample_tool(
+            "search_files",
+            serde_json::json!({ "pattern": "todo", "output_mode": "count" }),
+            "src/a.rs:3\nsrc/b.rs:1",
+        );
+        let rows = tool_output(&tool, ToolKind::Search, false, 60, Mode::Truncated);
+        let joined: Vec<String> = rows.iter().map(|row| text(&row.line)).collect();
+        assert_eq!(
+            joined,
+            ["", "  mode: count", "  src/a.rs:3", "  src/b.rs:1"]
+        );
+        assert!(!rows[0].panel && !rows[1].panel);
+        assert!(rows[2].panel && rows[3].panel);
+        let spans = &rows[2].line.spans;
+        assert_eq!(spans[1].content.as_ref(), "src/a.rs");
+        assert_eq!(spans[1].style.fg, theme::style(Token::Link).fg);
+        assert_eq!(spans[2].content.as_ref(), ":3");
+        assert_eq!(spans[2].style.fg, theme::style(Token::Text).fg);
     }
 
     #[test]
