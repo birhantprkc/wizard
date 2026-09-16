@@ -6,6 +6,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-16
+
 ### Changed
 
 - **`/goal` keeps working until a critic agrees the goal is achieved.** The old
@@ -20,6 +22,14 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   whole instead of one 600-character gap. The loop ends on `ACHIEVED`, a stopped
   or failed turn, or three turns in a row that did nothing and claimed nothing.
   `--continuous` uses the same critic and no longer stops on `PLATEAU`.
+- **The grok skin follows grok-build's chrome.** Empty cells are GrokNight's
+  page (indexed 233) instead of the terminal's reset. Fetch and Web Search sit
+  in a primary content box. Read, Search, Execute, MCP, ListDir and Edit cards
+  match grok-build headers, bodies, gutters, and wrap. The slash dropdown,
+  composer recede, shortcuts bar, and status chips do too. The user prompt
+  arrow is `accent_user` (gray), not the agent's magenta rail. TokyoNight 256
+  tokens stay; timestamps, fold chrome, and the dock/dashboard/timeline/queue/
+  welcome bar stay out.
 
 ## [3.2.0] - 2026-09-13
 
