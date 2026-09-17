@@ -2441,15 +2441,13 @@ fn search_body(tool: &ToolItem, text: &str) -> Vec<Row> {
                 Row::plain(Line::from("")),
             ];
             for path in paths {
-                if is_count {
-                    if let Some(colon) = path.rfind(':') {
-                        rows.push(Row::panel(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(path[..colon].to_string(), theme::style(Token::Link)),
-                            Span::styled(path[colon..].to_string(), theme::style(Token::Text)),
-                        ])));
-                        continue;
-                    }
+                if is_count && let Some(colon) = path.rfind(':') {
+                    rows.push(Row::panel(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(path[..colon].to_string(), theme::style(Token::Link)),
+                        Span::styled(path[colon..].to_string(), theme::style(Token::Text)),
+                    ])));
+                    continue;
                 }
                 rows.push(Row::panel(Line::from(vec![
                     Span::raw("  "),
