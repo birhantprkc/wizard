@@ -583,7 +583,10 @@ pub async fn run_tui(
             app.goal_inflight = false;
             // The user may have stopped the loop while the critic was out.
             if let Some(goal) = app.active_goal.clone() {
-                match crate::agent::critic::plan_after_verdict(&goal, &verdict) {
+                match crate::agent::critic::plan_after_verdict(
+                    crate::agent::critic::Claim::Finished(&goal),
+                    &verdict,
+                ) {
                     crate::agent::critic::CriticAction::Accept => {
                         app.notice("goal achieved: the independent critic signed off.");
                         app.active_goal = None;
@@ -598,7 +601,13 @@ pub async fn run_tui(
 
         if let Event::CompletionReviewed(verdict) = event {
             app.review_inflight = false;
-            match crate::agent::critic::plan_after_review(&verdict, app.review_rounds) {
+            match crate::agent::critic::plan_after_review(
+                crate::agent::critic::Claim::Finished(
+                    app.review_request.as_deref().unwrap_or_default(),
+                ),
+                &verdict,
+                app.review_rounds,
+            ) {
                 crate::agent::critic::ReviewAction::Accept => {
                     // Either it passed, or the rework round is spent and the
                     // claim stands. Both were announced by the notice the
@@ -1077,7 +1086,7 @@ pub async fn run_tui(
                                         .to_string(),
                                 )),
                                 async move {
-                                    let verdict = ctx.critique(&goal).await.unwrap_or_else(|err| {
+                                    let verdict = ctx.critique(critic::Claim::Finished(&goal)).await.unwrap_or_else(|err| {
                                         critic::GoalVerdict::NotAchieved(format!(
                                             "the goal critic could not run ({err:#}); verify the \
                                              work yourself and claim again"
@@ -1404,7 +1413,7 @@ fn maybe_review_completion(app: &mut App, agent: &Agent, events: &EventLoop) {
         notify.clone(),
         Event::CompletionReviewed(critic::ReviewVerdict::Pass),
         async move {
-            let verdict = match ctx.review(&request, None).await {
+            let verdict = match ctx.review(critic::Claim::Finished(&request), None).await {
                 Ok(verdict) => verdict,
                 Err(err) => {
                     let _ = notify

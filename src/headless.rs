@@ -449,7 +449,7 @@ fn stamp(mission: Option<&mut mission::Mission>, project_root: &Path, phase: imp
 /// standing a run with no review configured has.
 async fn run_completion_review(
     agent: &Agent,
-    request: &str,
+    claim: critic::Claim<'_>,
     rounds_used: u32,
     budget: Option<Duration>,
     events: &mpsc::Sender<AgentEvent>,
@@ -457,7 +457,7 @@ async fn run_completion_review(
     let notice = |message: String| async move {
         let _ = events.send(AgentEvent::Notice(message)).await;
     };
-    let verdict = match agent.review_completion(request, budget).await {
+    let verdict = match agent.review_completion(claim, budget).await {
         Ok(verdict) => verdict,
         Err(err) => {
             tracing::warn!("completion review could not run: {err:#}");
@@ -469,7 +469,7 @@ async fn run_completion_review(
         }
     };
     notice(format!("review: {}", verdict.summary())).await;
-    match critic::plan_after_review(&verdict, rounds_used) {
+    match critic::plan_after_review(claim, &verdict, rounds_used) {
         critic::ReviewAction::Rework(prompt) => Some(prompt),
         critic::ReviewAction::Accept => {
             // Out of rounds with the review still unhappy. The work lands
@@ -1046,6 +1046,15 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                 // for: nothing runs a gate for "serve this
                                 // repo over HTTP". That is this review's
                                 // question, and it is asked once.
+                                //
+                                // In continuous mode the turn ending is not a
+                                // claim the mission is finished, so both
+                                // verifiers judge what the turn reported
+                                // instead of the whole mission.
+                                let report =
+                                    critic::last_reply(agent.history()).unwrap_or_default();
+                                let claim =
+                                    critic::Claim::for_run(config.continuous, &goal, &report);
                                 let rework = match critic::plan_review(
                                     review_on,
                                     agent.effects().saturating_sub(effects_mark),
@@ -1068,7 +1077,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                         );
                                         run_completion_review(
                                             &agent,
-                                            &goal,
+                                            claim,
                                             review_rounds,
                                             secs_left(deadline).map(Duration::from_secs),
                                             &tx,
@@ -1098,7 +1107,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                             "cycle {iteration}: verifying with an independent critic"
                                         ),
                                     );
-                                    match agent.critique_goal(&goal).await {
+                                    match agent.critique_goal(claim).await {
                                         Ok(verdict) => {
                                             if text_mode {
                                                 spinner.println(&format!(
@@ -1106,7 +1115,7 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
                                                     verdict.summary()
                                                 ));
                                             }
-                                            match critic::plan_after_verdict(&goal, &verdict) {
+                                            match critic::plan_after_verdict(claim, &verdict) {
                                                 critic::CriticAction::Accept => {
                                                     // Verified done: record the
                                                     // cycle and self-direct the
@@ -1622,6 +1631,15 @@ mod tests {
         assert!(
             production.contains("run_completion_review("),
             "a planned review that is never run checks nothing"
+        );
+        assert!(
+            production.contains("critic::Claim::for_run(config.continuous, &goal, &report)"),
+            "a continuous cycle is judged on its report, not on the whole mission"
+        );
+        assert!(
+            production.contains("agent.critique_goal(claim)")
+                && !production.contains("agent.critique_goal(&goal)"),
+            "the cycle critic has to judge the same claim the review did"
         );
         assert!(
             production.contains("agent.effects().saturating_sub(effects_mark)"),

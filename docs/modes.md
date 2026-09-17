@@ -203,9 +203,14 @@ less than the first pass did; whatever survives one round of specific feedback
 is not going to fall to another round of the same prompt.
 
 In continuous mode it runs per cycle and before the goal critic, which is the
-cheaper order: a cycle whose deliverable is missing is sent back without the
-critic being asked whether the mission goal is met. The two questions are
-different, and the review is the one that fails fast.
+cheaper order: a cycle whose report is false is sent back without the critic
+being called. The end of a cycle is not a claim that the mission is finished, so
+neither of them judges the mission. Both get the mission and the report the cycle
+ended with, and check whether the report is true: the commits it names exist,
+the tests it says pass do pass, a result it quotes was really produced. A cycle
+that says "merged A1, 283 tests pass, V stages not started" passes when that is
+what is on the machine, however far the mission has to go. A cycle that says
+tests pass when they fail, or that the mission is done when it is not, fails.
 
 Three things skip the review outright, so it never costs a call it cannot repay:
 
@@ -257,14 +262,16 @@ below keep it safe.
 
 ### What makes it run forever
 
-- **A cycle's "done" is verified, not trusted.** When the builder reports the goal
-  complete and any [quality gates](#quality-gates) pass, a *fresh* critic subagent,
-  one that never saw the builder's turn, checks the real project. It can read files and
-  run the build and tests but has no tool that writes. Its verdict is `ACHIEVED` or
-  `NOT ACHIEVED` followed by what to do differently. `ACHIEVED` lets the cycle land;
-  `NOT ACHIEVED` sends the critic's feedback back to the builder and the cycle does not
-  count. A critic that cannot run is treated as a failed cycle, never as a pass. See
-  `src/agent/critic.rs`.
+- **A cycle's report is verified, not trusted.** When a cycle ends and any
+  [quality gates](#quality-gates) pass, a *fresh* critic subagent, one that never saw
+  the builder's turn, gets the mission and the cycle's final report and checks the
+  report against the real project. It judges whether what the cycle says it did is
+  true, not whether the whole mission is finished. It can read files and run the build
+  and tests but has no tool that writes. Its verdict is `ACHIEVED` (every claim holds)
+  or `NOT ACHIEVED` followed by the claims that are false. `ACHIEVED` lets the cycle
+  land; `NOT ACHIEVED` sends the critic's feedback back to the builder and the cycle
+  does not count. A critic that cannot run is treated as a failed cycle, never as a
+  pass. See `src/agent/critic.rs`.
 - **Durable mission.** The goal is persisted to `<project>/.wizard/mission.toml` along
   with a cycle count, a rolling progress log, and a liveness stamp (see
   [Watching a run](#watching-a-run)). It survives restarts and binary self-replacement:

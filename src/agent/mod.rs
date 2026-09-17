@@ -104,16 +104,12 @@ pub struct CritiqueContext {
 
 impl CritiqueContext {
     /// Run a fresh critic over the current artifact and return its verdict on
-    /// `goal`. See [`Agent::critique_goal`] for the semantics; this is the
+    /// `claim`. See [`Agent::critique_goal`] for the semantics; this is the
     /// snapshot form for callers that are out of the agent's slot.
-    pub async fn critique(&self, goal: &str) -> Result<critic::GoalVerdict> {
+    pub async fn critique(&self, claim: critic::Claim<'_>) -> Result<critic::GoalVerdict> {
+        let (config, task) = critic::critic_run(claim, &self.ctx.cwd);
         let output = self
-            .run(
-                critic::critic_config(),
-                critic::critic_task(goal, &self.ctx.cwd),
-                subagent::RunScope::Inspect,
-                None,
-            )
+            .run(config, task, subagent::RunScope::Inspect, None)
             .await?;
         Ok(critic::parse_verdict(&output).unwrap_or_else(|| {
             critic::GoalVerdict::NotAchieved(
@@ -125,7 +121,7 @@ impl CritiqueContext {
         }))
     }
 
-    /// Run one completion review over `request` and return its verdict.
+    /// Run one completion review over `claim` and return its verdict.
     ///
     /// Same independence as the critic and one more capability: the reviewer
     /// gets `execute` as well as the read-only tools, because re-running the
@@ -134,16 +130,12 @@ impl CritiqueContext {
     /// reason a run reports success.
     pub async fn review(
         &self,
-        request: &str,
+        claim: critic::Claim<'_>,
         budget: Option<Duration>,
     ) -> Result<critic::ReviewVerdict> {
+        let (config, task) = critic::review_run(claim, &self.ctx.cwd);
         let output = self
-            .run(
-                critic::review_config(),
-                critic::review_task(request, &self.ctx.cwd),
-                subagent::RunScope::Inspect,
-                budget,
-            )
+            .run(config, task, subagent::RunScope::Inspect, budget)
             .await?;
         Ok(critic::parse_review(&output).unwrap_or_else(|| {
             critic::ReviewVerdict::Fail(
@@ -1472,7 +1464,8 @@ impl Agent {
     }
 
     /// Run a fresh, independent critic over the current artifact and return its
-    /// binary verdict on the standing `goal`.
+    /// binary verdict on `claim`: the standing goal, or on a continuous cycle
+    /// the report that cycle ended with.
     ///
     /// The critic is spawned with no inherited history, so it cannot see the
     /// builder's turn: the independence the verdict rests on is structural, not
@@ -1480,12 +1473,12 @@ impl Agent {
     /// tests) but has no tool that writes. An unclear reply is
     /// [`critic::GoalVerdict::NotAchieved`], never a pass, so a critic that
     /// mumbles cannot wave work through.
-    pub async fn critique_goal(&self, goal: &str) -> Result<critic::GoalVerdict> {
-        self.critique_context(None).critique(goal).await
+    pub async fn critique_goal(&self, claim: critic::Claim<'_>) -> Result<critic::GoalVerdict> {
+        self.critique_context(None).critique(claim).await
     }
 
-    /// Run one completion review over the request this run was given, and
-    /// return its verdict.
+    /// Run one completion review over `claim`, the request this run was given
+    /// or a continuous cycle's report, and return its verdict.
     ///
     /// The claim under review is the agent's own "done", so the reviewer is
     /// spawned with none of its history: it reads the request and the machine,
@@ -1494,10 +1487,10 @@ impl Agent {
     /// outlive the run it is reviewing.
     pub async fn review_completion(
         &self,
-        request: &str,
+        claim: critic::Claim<'_>,
         budget: Option<Duration>,
     ) -> Result<critic::ReviewVerdict> {
-        self.critique_context(None).review(request, budget).await
+        self.critique_context(None).review(claim, budget).await
     }
 
     /// Tool calls this session has made that wrote a file or ran a command.

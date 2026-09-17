@@ -10,8 +10,7 @@
 //!
 //! # The goal critic
 //!
-//! Mission scope, for `/goal` and the continuous loop: *is the standing goal
-//! achieved?* The builder keeps working until it says so, by ending a reply
+//! Mission scope, for `/goal`: *is the standing goal achieved?* The builder keeps working until it says so, by ending a reply
 //! with [`GOAL_ACHIEVED_MARKER`]. A turn that stops without that line is not a
 //! claim and gets a "keep going" turn, no critic. A turn that makes the claim
 //! gets a harsh critic that can read the tree and run commands but not write,
@@ -30,6 +29,17 @@
 //! it is told to do: restate the request, check that everything the request
 //! named exists and is not empty, re-run the acceptance path the request states,
 //! and ask whether the answer survives a change of input. See [`review_config`].
+//!
+//! # Continuous cycles
+//!
+//! A continuous run's cycle ending is not a claim that the mission is done. A
+//! mission can run for months, and the honest report at the end of a cycle is
+//! "merged these, tests pass, this is what remains". Judging that against the
+//! whole mission fails every cycle, and a builder told over and over that it
+//! claimed a finish it never claimed learns to fake one. So both verifiers take
+//! a [`Claim`]: [`Claim::Finished`] for a run meant to finish, judged as above,
+//! and [`Claim::Cycle`] for a continuous cycle, where the verifier gets the
+//! cycle's report and judges whether what it says is true.
 //!
 //! Both verdict parsers and both decision functions are pure and tested here.
 
@@ -326,6 +336,157 @@ pub fn plan_after_goal_turn(
     }
 }
 
+/// What a verifier is asked to judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim<'a> {
+    /// The work was meant to finish. The text is the request or the goal, and
+    /// the verifier judges whether it is satisfied.
+    Finished(&'a str),
+    /// One cycle of a continuous mission ended. The verifier judges whether
+    /// `report`, the cycle's last reply, is true, using `mission` to know what
+    /// the claims mean, not as a list the cycle had to finish.
+    Cycle {
+        /// The standing mission, verbatim.
+        mission: &'a str,
+        /// What the cycle said it did.
+        report: &'a str,
+    },
+}
+
+impl<'a> Claim<'a> {
+    /// The claim a headless run makes when a turn ends: the whole `goal` for a
+    /// run meant to finish, the turn's `report` for a continuous one.
+    pub fn for_run(continuous: bool, goal: &'a str, report: &'a str) -> Self {
+        if continuous {
+            Self::Cycle {
+                mission: goal,
+                report,
+            }
+        } else {
+            Self::Finished(goal)
+        }
+    }
+}
+
+/// What both verifiers check on a continuous cycle. One text, so the review
+/// and the critic cannot drift apart on what an honest partial report is.
+const CYCLE_CHECK: &str = "\
+The agent is working through a long standing mission in cycles. The end of a \
+cycle is not a claim that the mission is finished. Most cycles finish one \
+piece of it and say what remains, and that is what an honest report looks \
+like. Do not judge whether the mission is done. Judge whether the report is \
+true.\n\
+\n\
+1. List every concrete claim the report makes: work committed or merged, files \
+and directories that exist, tests or commands that pass, numbers it quotes, \
+results it says it produced, and any claim that the mission or a named part of \
+it is complete.\n\
+2. Check each one on the machine. Run the tests and commands it says pass. Read \
+what it says it wrote. A false claim is a failure, and so is a stub or \
+placeholder presented as working, a hardcoded or faked result, or a test or \
+check weakened so that it passes.\n\
+3. Work the report says is unfinished is not a failure. Unfinished work fails \
+only when the report says it is done.\n\
+\n\
+Use the mission to understand what the claims mean and what a real result \
+looks like, not as a checklist this cycle had to complete.";
+
+/// The critic's system prompt for a continuous cycle.
+fn cycle_critic_system_prompt() -> String {
+    format!(
+        "You are a harsh, independent critic. An agent on a long mission just ended a cycle \
+         and reported what it did. You never saw it work and you get none of its reasoning: \
+         only the mission, its report, and the project on disk. Your default position is that \
+         something in the report is wrong, and your job is to find out what.\n\n{CYCLE_CHECK}\n\
+         4. For at least one thing the report says works, try an input or case the agent \
+         probably did not try.\n\n\
+         You judge, you do not build. Do not write, edit or delete anything.\n\n\
+         The FIRST line of your reply is your verdict, exactly one of:\n  \
+         ACHIEVED       every claim in the report holds and you ran something that shows it\n  \
+         NOT ACHIEVED   anything less\n\n\
+         After NOT ACHIEVED, say which claims are false: each one, the evidence (a path, a \
+         command and its output), and what has to change. Most important first. No praise, no \
+         summary of what is fine, and nothing about work the report already says is not done."
+    )
+}
+
+/// The reviewer's system prompt for a continuous cycle.
+fn cycle_review_system_prompt() -> String {
+    format!(
+        "You are reviewing one cycle of a continuous autonomous run. You never saw the agent \
+         work and you get none of its reasoning: only the mission, the report it ended the \
+         cycle with, and the machine it left behind.\n\n{CYCLE_CHECK}\n\n\
+         Judge, do not build. Do not write, edit, or delete anything, and do not finish the \
+         work yourself.\n\n\
+         The FIRST line of your reply is your verdict, exactly one of:\n  \
+         PASS   what the report claims is true, and you ran something that shows it\n  \
+         FAIL   it is not; on the next line, say which claim is false and quote the command \
+         output that shows it, in one or two sentences\n\n\
+         No praise, no summary of the agent's work. If you could not check a claim at all, \
+         that is FAIL, and say what stopped you."
+    )
+}
+
+/// The task handed to either verifier on a continuous cycle.
+fn cycle_task(mission: &str, report: &str, project_root: &Path) -> String {
+    let report = if report.trim().is_empty() {
+        "(no report: the cycle ended without saying what it did. Check what it changed and \
+         that the project still builds and its tests still pass.)"
+    } else {
+        report
+    };
+    format!(
+        "The standing mission, verbatim between the markers:\n\n<mission>\n{mission}\n</mission>\
+         \n\nThe report the agent ended this cycle with, verbatim between the markers:\n\n\
+         <report>\n{report}\n</report>\n\nIt ran in {root}. Check whether the report is true \
+         and return your verdict now.",
+        root = project_root.display()
+    )
+}
+
+/// The critic's definition and task for `claim`.
+pub fn critic_run(claim: Claim<'_>, project_root: &Path) -> (SubagentConfig, String) {
+    match claim {
+        Claim::Finished(goal) => (critic_config(), critic_task(goal, project_root)),
+        Claim::Cycle { mission, report } => (
+            SubagentConfig {
+                system_prompt: cycle_critic_system_prompt(),
+                ..critic_config()
+            },
+            cycle_task(mission, report, project_root),
+        ),
+    }
+}
+
+/// The reviewer's definition and task for `claim`.
+pub fn review_run(claim: Claim<'_>, project_root: &Path) -> (SubagentConfig, String) {
+    match claim {
+        Claim::Finished(request) => (review_config(), review_task(request, project_root)),
+        Claim::Cycle { mission, report } => (
+            SubagentConfig {
+                system_prompt: cycle_review_system_prompt(),
+                ..review_config()
+            },
+            cycle_task(mission, report, project_root),
+        ),
+    }
+}
+
+/// The turn after a verifier found a cycle's report untrue. It names the
+/// false claims and says plainly that partial progress is not the problem,
+/// because "you said it was done and it is not" is what taught a builder to
+/// fake a finished mission.
+fn cycle_rework(found: &str) -> String {
+    format!(
+        "An independent check of this cycle's report found claims in it that are not true:\n\n\
+         {found}\n\n\
+         Fix the work so those claims hold, or correct the report to say what is actually \
+         done. You are not expected to finish the mission in one cycle, and a report of honest \
+         partial progress passes. Do not weaken a test or a check, or hardcode a result, to \
+         make a claim pass."
+    )
+}
+
 /// What the loop should do with a verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CriticAction {
@@ -337,16 +498,21 @@ pub enum CriticAction {
 
 /// Decide the loop's next move from a verdict. Pure so the loop's control flow
 /// can be tested without a model.
-pub fn plan_after_verdict(goal: &str, verdict: &GoalVerdict) -> CriticAction {
-    match verdict {
-        GoalVerdict::Achieved => CriticAction::Accept,
-        GoalVerdict::NotAchieved(feedback) => CriticAction::Rework(format!(
-            "You claimed the goal is achieved. An independent critic checked the project and \
+pub fn plan_after_verdict(claim: Claim<'_>, verdict: &GoalVerdict) -> CriticAction {
+    match (verdict, claim) {
+        (GoalVerdict::Achieved, _) => CriticAction::Accept,
+        (GoalVerdict::NotAchieved(feedback), Claim::Cycle { .. }) => {
+            CriticAction::Rework(cycle_rework(feedback))
+        }
+        (GoalVerdict::NotAchieved(feedback), Claim::Finished(goal)) => {
+            CriticAction::Rework(format!(
+                "You claimed the goal is achieved. An independent critic checked the project and \
              says it is NOT. What it says to do differently:\n\n{feedback}\n\nThe goal:\n\n\
              {goal}\n\nAddress every point, not just the first. Run the build and tests \
              yourself. The critic decides whether the goal is met, not you. {}",
-            claim_instruction()
-        )),
+                claim_instruction()
+            ))
+        }
     }
 }
 
@@ -500,12 +666,19 @@ pub enum ReviewAction {
 
 /// Decide the loop's next move from a review verdict. `rounds_used` counts the
 /// reviews already spent on this claim, including this one.
-pub fn plan_after_review(verdict: &ReviewVerdict, rounds_used: u32) -> ReviewAction {
+pub fn plan_after_review(
+    claim: Claim<'_>,
+    verdict: &ReviewVerdict,
+    rounds_used: u32,
+) -> ReviewAction {
     match verdict {
         ReviewVerdict::Pass => ReviewAction::Accept,
         // Out of rounds: the run ends with the failure reported rather than
         // argued. The caller is expected to say so on its way out.
         ReviewVerdict::Fail(_) if rounds_used > REVIEW_MAX_ROUNDS => ReviewAction::Accept,
+        ReviewVerdict::Fail(why) if matches!(claim, Claim::Cycle { .. }) => {
+            ReviewAction::Rework(cycle_rework(why))
+        }
         ReviewVerdict::Fail(why) => ReviewAction::Rework(format!(
             "You reported this done. An independent review checked the machine and it is not:\n\n\
              {why}\n\n\
@@ -740,7 +913,7 @@ mod tests {
     #[test]
     fn achieved_accepts() {
         assert_eq!(
-            plan_after_verdict("g", &GoalVerdict::Achieved),
+            plan_after_verdict(Claim::Finished("g"), &GoalVerdict::Achieved),
             CriticAction::Accept
         );
     }
@@ -748,7 +921,7 @@ mod tests {
     #[test]
     fn not_achieved_sends_the_critics_feedback_back() {
         let CriticAction::Rework(prompt) = plan_after_verdict(
-            "ship the parser",
+            Claim::Finished("ship the parser"),
             &GoalVerdict::NotAchieved("parser.rs panics on empty input".into()),
         ) else {
             panic!("expected rework");
@@ -756,6 +929,133 @@ mod tests {
         assert!(prompt.contains("parser.rs panics on empty input"));
         assert!(prompt.contains("ship the parser"));
         assert!(prompt.contains(GOAL_ACHIEVED_MARKER));
+    }
+
+    // --- continuous cycles --------------------------------------------------
+
+    const MISSION: &str = "write all S1/S2 code and pass V0 to V10 by 2026-12-31";
+    const REPORT: &str = "Merged A1, B1, B5 and F3 at 085c625. pytest: 283 passed. \
+                          V stages not started.";
+
+    #[test]
+    fn a_continuous_turn_claims_its_report_and_a_finite_run_claims_the_goal() {
+        assert_eq!(
+            Claim::for_run(true, MISSION, REPORT),
+            Claim::Cycle {
+                mission: MISSION,
+                report: REPORT
+            }
+        );
+        assert_eq!(
+            Claim::for_run(false, MISSION, REPORT),
+            Claim::Finished(MISSION)
+        );
+    }
+
+    #[test]
+    fn a_finished_claim_gets_exactly_the_verifiers_it_always_had() {
+        let root = Path::new("/work");
+        let (config, task) = review_run(Claim::Finished("serve it on :8080"), root);
+        assert_eq!(config.system_prompt, review_config().system_prompt);
+        assert_eq!(task, review_task("serve it on :8080", root));
+        let (config, task) = critic_run(Claim::Finished("ship the parser"), root);
+        assert_eq!(config.system_prompt, critic_config().system_prompt);
+        assert_eq!(task, critic_task("ship the parser", root));
+    }
+
+    #[test]
+    fn a_cycle_is_judged_on_its_report_not_on_the_whole_mission() {
+        let root = Path::new("/work");
+        let claim = Claim::Cycle {
+            mission: MISSION,
+            report: REPORT,
+        };
+        for (config, task, finished_prompt) in [
+            {
+                let (c, t) = review_run(claim, root);
+                (c, t, review_config().system_prompt)
+            },
+            {
+                let (c, t) = critic_run(claim, root);
+                (c, t, critic_config().system_prompt)
+            },
+        ] {
+            // The report is what is under review, so it has to reach the
+            // verifier whole; the mission rides along as context.
+            assert!(
+                task.contains(&format!("<report>\n{REPORT}\n</report>")),
+                "{task}"
+            );
+            assert!(task.contains(MISSION), "{task}");
+            assert!(!task.contains("claims it is achieved"), "{task}");
+            assert!(!task.contains("reported it complete"), "{task}");
+            assert_ne!(config.system_prompt, finished_prompt);
+            assert!(config.system_prompt.contains(CYCLE_CHECK));
+        }
+        // Same budgets and names as the finished-run verifiers: only the
+        // question changes.
+        assert_eq!(
+            review_run(claim, root).0.max_steps,
+            review_config().max_steps
+        );
+        assert_eq!(critic_run(claim, root).0.name, critic_config().name);
+    }
+
+    #[test]
+    fn a_cycle_that_ends_without_a_report_still_gets_something_to_check() {
+        let (_, task) = review_run(
+            Claim::Cycle {
+                mission: MISSION,
+                report: "  \n",
+            },
+            Path::new("/work"),
+        );
+        assert!(task.contains("no report"), "{task}");
+    }
+
+    #[test]
+    fn a_false_cycle_report_is_sent_back_without_calling_it_a_finished_mission() {
+        let claim = Claim::Cycle {
+            mission: MISSION,
+            report: REPORT,
+        };
+        let why = "`pytest` shows 3 failed, not 283 passed";
+        let ReviewAction::Rework(review) =
+            plan_after_review(claim, &ReviewVerdict::Fail(why.into()), REVIEW_MAX_ROUNDS)
+        else {
+            panic!("a failed cycle review sends it back");
+        };
+        let CriticAction::Rework(critic) =
+            plan_after_verdict(claim, &GoalVerdict::NotAchieved(why.into()))
+        else {
+            panic!("a failed cycle critique sends it back");
+        };
+        for prompt in [review, critic] {
+            assert!(prompt.contains(why), "{prompt}");
+            assert!(prompt.contains("partial progress passes"), "{prompt}");
+            // The phrasing that sent the builder hunting for a finish line.
+            assert!(!prompt.contains("report done again"), "{prompt}");
+            assert!(!prompt.contains("request's own check"), "{prompt}");
+            assert!(!prompt.contains("claimed the goal is achieved"), "{prompt}");
+            assert!(!prompt.contains(GOAL_ACHIEVED_MARKER), "{prompt}");
+        }
+        // A true report lands, and a cycle review still gets only its one round.
+        assert_eq!(
+            plan_after_review(claim, &ReviewVerdict::Pass, 1),
+            ReviewAction::Accept
+        );
+        assert_eq!(
+            plan_after_verdict(claim, &GoalVerdict::Achieved),
+            CriticAction::Accept
+        );
+        assert_eq!(
+            plan_after_review(
+                claim,
+                &ReviewVerdict::Fail(why.into()),
+                REVIEW_MAX_ROUNDS + 1
+            ),
+            ReviewAction::Accept
+        );
     }
 
     #[test]
@@ -807,7 +1107,7 @@ mod tests {
     #[test]
     fn a_passing_review_lets_the_run_finish() {
         assert_eq!(
-            plan_after_review(&ReviewVerdict::Pass, 1),
+            plan_after_review(Claim::Finished("r"), &ReviewVerdict::Pass, 1),
             ReviewAction::Accept
         );
     }
@@ -815,14 +1115,16 @@ mod tests {
     #[test]
     fn a_failing_review_buys_exactly_one_rework() {
         let verdict = ReviewVerdict::Fail("/app/out.txt is missing".to_string());
-        let ReviewAction::Rework(prompt) = plan_after_review(&verdict, REVIEW_MAX_ROUNDS) else {
+        let ReviewAction::Rework(prompt) =
+            plan_after_review(Claim::Finished("r"), &verdict, REVIEW_MAX_ROUNDS)
+        else {
             panic!("the first failed review sends it back");
         };
         assert!(prompt.contains("/app/out.txt is missing"));
         assert!(prompt.contains("report done again"));
         // The round after that is an argument, not a check.
         assert_eq!(
-            plan_after_review(&verdict, REVIEW_MAX_ROUNDS + 1),
+            plan_after_review(Claim::Finished("r"), &verdict, REVIEW_MAX_ROUNDS + 1),
             ReviewAction::Accept
         );
     }
