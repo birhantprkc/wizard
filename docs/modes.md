@@ -307,7 +307,9 @@ below keep it safe.
   notice says so.
 - **Context compaction.** When the conversation grows past `compact_threshold_bytes`,
   older history is summarized into a compact progress note so a run can continue
-  indefinitely without overflowing the model's context window. Well before that,
+  indefinitely without overflowing the model's context window. The mission itself is
+  pinned verbatim in the system prompt, which compaction never summarizes, so its
+  exact wording survives every pass. Well before that,
   past `prune_after_tokens`, old tool results stop being re-sent whole; that pass
   costs no model call. The agent is also
   taught to compact deliberately (and to save durable facts with `memory` when the

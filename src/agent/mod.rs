@@ -792,6 +792,9 @@ pub struct Agent {
     /// Whether the omakase instruction block is currently baked into the
     /// system prompt; refreshed on mismatch alongside the plan block.
     omakase_prompt_on: bool,
+    /// The standing mission of a continuous run, pinned verbatim into the
+    /// system prompt. See [`Agent::pin_mission`].
+    mission: Option<String>,
     /// Token counters fed from `ChatChunk` eval counts during streaming.
     /// Shared into the tool context (`ToolContext::usage`) so a subagent's
     /// model calls — `spawn_subagent`, and every `/ultra` candidate and judge —
@@ -1020,6 +1023,7 @@ impl Agent {
             plan_prompt_on: false,
             omakase,
             omakase_prompt_on: false,
+            mission: None,
             usage,
             usage_log: crate::usage::default_log_path(),
             checkpoints,
@@ -1605,6 +1609,19 @@ impl Agent {
         self.ultra.is_some()
     }
 
+    /// Pin a continuous run's mission into the system prompt, verbatim.
+    ///
+    /// The mission arrives as the first user message, and compaction folds
+    /// everything after the system prompt into a model-written summary, the
+    /// mission included. A months-long run compacts dozens of times, and each
+    /// pass loses a little of the wording, until the rules the mission set are
+    /// a paraphrase the builder goes looking for elsewhere. The system prompt
+    /// is the one message compaction never touches.
+    pub fn pin_mission(&mut self, mission: &str) {
+        self.mission = Some(mission.to_string());
+        self.refresh_system_prompt();
+    }
+
     /// Re-compose the system prompt when the plan-mode or omakase flag changed
     /// since it was last baked in. Either flag can flip mid-turn (exit_plan
     /// approval clears plan mode), so the turn loop calls this before every
@@ -1697,6 +1714,10 @@ impl Agent {
         // rather than wait for the window to overflow.
         prompt.push_str("\n\n");
         prompt.push_str(prompts::CONTEXT_PROMPT);
+        if let Some(mission) = &self.mission {
+            prompt.push_str("\n\n");
+            prompt.push_str(&prompts::mission_section(mission));
+        }
         if self.plan_mode() {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::PLAN_MODE_PROMPT);

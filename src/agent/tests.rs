@@ -2094,6 +2094,45 @@ async fn a_compaction_pass_bills_itself_to_the_usage_log() {
 }
 
 #[tokio::test]
+async fn a_pinned_mission_survives_compaction_verbatim() {
+    let (mut agent, _provider, _tmp) = test_agent(vec![vec![final_chunk("did some work")]]);
+    let mission = "Write all S1/S2 code.\nRule 7: never edit spec/.\nPass V0 to V10.";
+    agent.history.push(ChatMessage::user(mission));
+    agent.pin_mission(mission);
+    for i in 0..KEEP_RECENT + 5 {
+        agent.history.push(ChatMessage::user(format!("msg {i}")));
+    }
+
+    let outcome = agent.compact_now().await;
+
+    assert!(matches!(outcome, CompactOutcome::Summarized(_)));
+    // The first user message was the mission and it is gone into the summary.
+    assert!(
+        !agent.history[1..]
+            .iter()
+            .any(|m| m.role == Role::User && m.text() == mission),
+        "the test has to compact the mission's own message away to prove anything"
+    );
+    assert_eq!(agent.history[0].role, Role::System);
+    assert!(
+        agent.history[0]
+            .text()
+            .contains(&format!("<mission>\n{mission}\n</mission>")),
+        "{}",
+        agent.history[0].text()
+    );
+    // And a later rebuild of the system prompt keeps it.
+    agent.set_plan_mode(true);
+    assert!(agent.history[0].text().contains(mission));
+}
+
+#[tokio::test]
+async fn an_agent_without_a_mission_has_no_mission_section() {
+    let (agent, _provider, _tmp) = test_agent(vec![]);
+    assert!(!agent.history[0].text().contains("## Standing mission"));
+}
+
+#[tokio::test]
 async fn compact_now_force_summarizes_and_keeps_the_recent_tail() {
     // One scripted response: the summarization call.
     let (mut agent, _provider, _tmp) = test_agent(vec![vec![final_chunk("a terse progress note")]]);

@@ -109,6 +109,16 @@ full list up front (action \"write\" replaces the entire list), keep exactly \
 one item in_progress while you work on it, and mark items completed as soon \
 as they are done. Skip the list for trivial single-step tasks.";
 
+/// The section that pins a continuous run's mission. See
+/// [`crate::agent::Agent::pin_mission`].
+pub fn mission_section(mission: &str) -> String {
+    format!(
+        "## Standing mission\n\nThis run is continuous. This is the mission it was started with, \
+         verbatim. Compaction never removes this section, so when a summary of earlier work \
+         leaves a rule or a requirement unclear, reread it here.\n\n<mission>\n{mission}\n</mission>"
+    )
+}
+
 /// Always appended: how the agent should steward its own context window.
 /// Single home for this guidance (not repeated in WIZARD.md).
 pub const CONTEXT_PROMPT: &str = "\

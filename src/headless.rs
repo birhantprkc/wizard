@@ -713,6 +713,12 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     if config.omakase {
         agent.set_omakase(true);
     }
+    // A continuous mission outlives many compactions, and compaction
+    // summarizes the first user message along with everything else. Pinned in
+    // the system prompt, the mission's own wording is still there on cycle 40.
+    if config.continuous {
+        agent.pin_mission(&goal);
+    }
 
     // Dashboard-dispatched background session (`--bg`): register in the session
     // registry and keep a heartbeat ticking so `/dashboard` shows it as a live
