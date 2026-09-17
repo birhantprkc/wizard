@@ -6,6 +6,16 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-09-16
+
+### Fixed
+
+- **`--continuous` judges each cycle on what it reported, not on the whole
+  mission.** The completion review and the goal critic now check that a cycle's
+  report is true, so honest partial progress on a long mission lands and a false
+  claim still goes back. The mission is also pinned verbatim in the system
+  prompt, so compaction can no longer paraphrase it away.
+
 ## [3.2.1] - 2026-09-16
 
 ### Changed
