@@ -4865,12 +4865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "loro-protocol"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9f1697b501f505f286c411c38b062a73f080028157c766cd75f12e243239454"
-
-[[package]]
 name = "loro-rle"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11898,14 +11892,12 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
- "uuid",
 ]
 
 [[package]]
 name = "zeron-rpc"
 version = "0.2.84"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
  "serde",
@@ -11916,7 +11908,6 @@ dependencies = [
  "tracing",
  "uuid",
  "zeron-doc",
- "zeron-proto",
  "zeron-sync",
 ]
 
@@ -11928,7 +11919,6 @@ dependencies = [
  "chrono",
  "futures",
  "loro",
- "loro-protocol",
  "reqwest",
  "rusqlite",
  "serde",
