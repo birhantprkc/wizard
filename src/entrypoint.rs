@@ -1,19 +1,18 @@
 //! CLI subcommands whose bodies ship in plugins.
 //!
-//! `wizard gui`, `wizard acp`, `wizard fleet`, `wizard mcp-serve` and the two
-//! gateway surfaces are parsed by core (they are `clap` variants in
-//! [`crate::cli`]) and run by plugins (the iced window behind
-//! `--features native`, the ACP server behind `acp`, the worktree fleet behind
+//! `wizard acp`, `wizard fleet`, `wizard mcp-serve` and the two gateway
+//! surfaces are parsed by core (they are `clap` variants in [`crate::cli`])
+//! and run by plugins (the ACP server behind `acp`, the worktree fleet behind
 //! `fleet`, the MCP server behind `mcp`, the Telegram bot and its service
 //! installer behind `gateway`). Something has to join those two halves without
 //! core naming the plugin, and this is it: the plugin `provide`s an
 //! [`Entrypoint`] under a well-known name, and the dispatch chain in
-//! [`crate::run`] `inject`s one instead of calling `native::run` /
-//! `acp::run` / `fleet::run` / `mcp::serve::run` / `gateway::run`.
+//! [`crate::run`] `inject`s one instead of calling `acp::run` /
+//! `fleet::run` / `mcp::serve::run` / `gateway::run`.
 //!
 //! # Two shapes, because two subcommands are shaped differently
 //!
-//! [`Entrypoint`] is `wizard gui`: no arguments, a [`Config`], and it does not
+//! [`Entrypoint`] is `wizard acp`: no arguments, a [`Config`], and it does not
 //! return until the surface closes. [`Subcommand`] is `wizard peers`: a whole
 //! clap subcommand *tree*, no config, and an exit code. Keeping them apart is
 //! cheaper than one type that is half-empty either way, and the difference is
@@ -28,15 +27,14 @@
 //! `String -> String` body that runs *inside a session*, on a surface that is
 //! already up, and `src/commands/plugin.rs` says why it deliberately cannot
 //! reach further than that. Every surface here is the opposite: they run
-//! before there is a session (the window builds its own
-//! [`TaskManager`](crate::plugins::gui::tasks::TaskManager) per chat, the ACP
-//! server builds one headless agent per `session/new`, a fleet run builds one
+//! before there is a session (the ACP server builds one headless agent per
+//! `session/new`, a fleet run builds one
 //! for planning and another for synthesis, and `wizard mcp-serve` builds no
 //! agent at all — it composes a tool registry and answers JSON-RPC), and none
-//! of them returns until the surface is finished — a window closing, an editor
-//! closing the pipe, every worker reaped, stdin at EOF. Registering any of them as a slash command would mean a
-//! `/gui` in the TUI palette that opens a second surface out from under the
-//! first, which is not a thing anybody asked for.
+//! of them returns until the surface is finished — an editor closing the pipe,
+//! every worker reaped, stdin at EOF. Registering any of them as a slash
+//! command would mean an `/acp` in the TUI palette that starts a second
+//! surface out from under the first, which is not a thing anybody asked for.
 //!
 //! # Why not just keep the `#[cfg]`-gated arms
 //!
@@ -45,7 +43,7 @@
 //! was exactly that: the dispatch chain naming a plugin's function, gated on
 //! the plugin's own cargo feature. It compiles either way, which is why it
 //! survived a year — but it means core pays one `#[cfg]` per plugin that owns
-//! a surface, and this module now has six names over five plugins. A name in
+//! a surface, and this module now has five names over four plugins. A name in
 //! a registry costs core one lookup, forever; the third registration cost this
 //! file one generic parameter and one constructor rather than a third arm's
 //! worth of `#[cfg]`, and the fifth and sixth cost nothing at all, which is
@@ -53,7 +51,7 @@
 //!
 //! # What core still holds
 //!
-//! The names (`"gui"`, `"acp"`, `"fleet"`, `"mcp-serve"`, `"gateway"`,
+//! The names (`"acp"`, `"fleet"`, `"mcp-serve"`, `"gateway"`,
 //! `"gateway-service"`) and the sentence printed when nothing answers to one.
 //! That is the same split [`crate::llm::registry`] makes for a provider `kind`: core may hold the *string* a user types, and
 //! the prose explaining how to get the thing behind it, as long as it never
@@ -83,23 +81,19 @@ use anyhow::Result;
 
 use crate::config::Config;
 
-/// The name the native window registers under, and the one [`crate::run`]
-/// looks up when it sees `wizard gui`.
+/// The name the mesh registers its `wizard peers` tree under.
+pub const PEERS: &str = "peers";
+/// The name the ACP server registers under, and the one [`crate::run`] looks
+/// up when it sees `wizard acp`.
 ///
 /// A `const` rather than a literal at both ends because the two ends are in
 /// different crates' worth of code — core's dispatch and a feature-gated
 /// plugin — and a typo in either would compile into a build where
-/// `wizard gui` reports that this binary has no window while the window sits
-/// in it, registered under a name nobody asks for.
-pub const GUI: &str = "gui";
-
-/// The name the mesh registers its `wizard peers` tree under.
-pub const PEERS: &str = "peers";
-/// The name the ACP server registers under. See [`GUI`] for why this is a
-/// constant.
+/// `wizard acp` reports that this binary has no ACP server while the server
+/// sits in it, registered under a name nobody asks for.
 pub const ACP: &str = "acp";
 
-/// The name the worktree fleet registers under. See [`GUI`] for why this is a
+/// The name the worktree fleet registers under. See [`ACP`] for why this is a
 /// constant.
 pub const FLEET: &str = "fleet";
 
@@ -188,7 +182,7 @@ pub struct Entrypoint<A = Config> {
 
 impl<A: 'static> Entrypoint<A> {
     /// Wrap an `async fn(A) -> Result<()>`: a surface whose only outcomes are
-    /// "it ran" and "it failed", which is both the window and the ACP server.
+    /// "it ran" and "it failed", which is the ACP server.
     ///
     /// Exiting 0 is this constructor's whole opinion, and it is core's to
     /// hold: a process that did what it was asked and has nothing to report
@@ -242,8 +236,7 @@ impl<A: 'static> Entrypoint<A> {
     }
 
     /// Run it, and hand back the process exit code. Returns when the surface
-    /// exits, which for a window is when the user closes it, for the ACP
-    /// server when the editor closes the pipe, and for a fleet run when every
+    /// exits, which for the ACP server is when the editor closes the pipe, and for a fleet run when every
     /// worker has been reaped and the synthesis turn is done.
     pub fn run(&self, arg: A) -> Pin<Box<dyn Future<Output = Result<i32>> + Send>> {
         (self.body)(arg)
@@ -441,13 +434,6 @@ pub fn description(name: &str) -> Option<&'static str> {
 /// the one thing worth saying is which flag puts it back. `detail` is the
 /// surface's own sentence about what it would have done, because "this build
 /// has no `acp`" tells somebody who typed it by mistake nothing at all.
-///
-/// `wizard gui` does **not** use this and keeps its own longer message. Its
-/// feature is off by default and the window ships as a separate release asset,
-/// so "rebuild with this flag" is only half of its answer — the other half is
-/// `install.sh WIZARD_NATIVE=1`, and a build flag offered as the sole route to
-/// a thing that is one `curl` away is how `wizard app` spent a year telling
-/// people to compile iced.
 pub fn absent(name: &str, feature: &str, detail: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "`wizard {name}` is not in this build — it was compiled without the `{feature}` \
@@ -470,8 +456,8 @@ mod tests {
     use super::*;
 
     /// The `None` arm is reachable and is not an error: a name nothing
-    /// registered answers nothing at all. This is the path a default build
-    /// takes for `"gui"`, and it has to work in a test binary too, where
+    /// registered answers nothing at all. This is the path a build without a
+    /// surface's feature takes, and it has to work in a test binary too, where
     /// `crate::run` is never entered.
     #[test]
     fn an_unregistered_entrypoint_is_absent_rather_than_a_failure() {
@@ -527,9 +513,6 @@ mod tests {
     #[test]
     fn a_registered_surface_describes_itself_for_the_subcommand_table() {
         let mut abouts: Vec<&str> = Vec::new();
-        if let Some(entry) = installed::<Config>(GUI) {
-            abouts.push(entry.about());
-        }
         if let Some(entry) = installed::<Config>(ACP) {
             abouts.push(entry.about());
         }
@@ -545,7 +528,6 @@ mod tests {
         assert_eq!(
             abouts.len(),
             [
-                cfg!(feature = "native"),
                 cfg!(feature = "acp"),
                 cfg!(feature = "fleet"),
                 cfg!(feature = "mcp"),
@@ -563,7 +545,7 @@ mod tests {
     }
 
     /// `wizard peers` is present exactly when the mesh is. The silent failure
-    /// this catches is the same one as the window's, one subcommand along: a
+    /// this catches is the same one as an unregistered entrypoint's: a
     /// `mesh` build whose tree did not register prints "this build has no
     /// mesh" while the whole transport sits in the binary.
     #[test]

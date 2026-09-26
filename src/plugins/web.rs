@@ -1679,11 +1679,7 @@ impl WebPlugin {
                 // Not in `pi` or `minimal`. Both are builds for a machine
                 // running one job on one key, and both of these tools reach a
                 // third-party search API that wants a second one.
-                profiles: vec![
-                    "server".to_string(),
-                    "default".to_string(),
-                    "full".to_string(),
-                ],
+                profiles: vec!["server".to_string(), "default".to_string()],
             },
         }
     }

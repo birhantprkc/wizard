@@ -968,11 +968,8 @@ fn the_help_subcommand_and_the_help_flag_print_the_same_thing_for_a_plugin_tree(
 /// could not start, in the present tense, and there was no build on which that
 /// text was wrong enough to notice.
 ///
-/// `gui` is the deliberate exception and is checked in both directions for
-/// that reason: it stays listed with core's own text when absent, because the
-/// window is a `curl` away rather than a rebuild, and switches to the
-/// plugin's when present — where core's sentence would be telling the reader
-/// to go and get something already in front of them.
+/// `gui` is not plugin-owned: it launches Wizard GUI, a separate app, so it is
+/// listed on every build.
 #[test]
 fn help_lists_a_plugin_subcommand_exactly_when_this_build_has_it() {
     let home = TempDir::new();
@@ -997,18 +994,8 @@ fn help_lists_a_plugin_subcommand_exactly_when_this_build_has_it() {
         assert_eq!(listed(name), compiled_in, "`{name}` in --help:\n{stdout}");
     }
 
-    // Always listed, and the two texts are distinguishable: core's names the
-    // feature flag, the plugin's does not.
+    // Core's own subcommand, listed on every build.
     assert!(listed("gui"), "{stdout}");
-    let gui_line = stdout
-        .lines()
-        .find(|line| line.trim_start().starts_with("gui "))
-        .expect("the gui row");
-    assert_eq!(
-        gui_line.contains("Needs a build with `--features native`"),
-        !cfg!(feature = "native"),
-        "{gui_line}"
-    );
 
     // A subcommand `--help` no longer lists still parses and still explains
     // itself, which is the whole reason dropping the row is acceptable.

@@ -969,11 +969,7 @@ impl ChatGptPlugin {
                 description: "ChatGPT subscription via account sign-in".to_string(),
                 capabilities: vec![Capability::Network],
                 optional_deps: Vec::new(),
-                profiles: vec![
-                    "server".to_string(),
-                    "default".to_string(),
-                    "full".to_string(),
-                ],
+                profiles: vec!["server".to_string(), "default".to_string()],
             },
         }
     }

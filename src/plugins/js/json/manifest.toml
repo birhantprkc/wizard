@@ -24,4 +24,4 @@ capabilities = []
 # the whole QuickJS backend (`tool-json = ["plugin-js"]`), and the two small
 # profiles are exactly the builds that drop a megabyte of engine rather than
 # carry it for one tool. See `src/plugins/profile.rs`.
-profiles = ["server", "default", "full"]
+profiles = ["server", "default"]

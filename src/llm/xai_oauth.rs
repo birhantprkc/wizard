@@ -133,43 +133,8 @@ struct Discovery {
 }
 
 /// Where the OpenID configuration is fetched from: [`DISCOVERY_URL`], always.
-#[cfg(not(test))]
 fn discovery_url() -> String {
     DISCOVERY_URL.to_string()
-}
-
-/// Under test, a caller may point discovery at a loopback stub instead — see
-/// [`use_test_discovery_url`]. The endpoints the stub names are still pinned to
-/// x.ai by [`validate_xai_https`], so the seam cannot smuggle a token endpoint
-/// past the check.
-#[cfg(test)]
-fn discovery_url() -> String {
-    TEST_DISCOVERY_URL
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .clone()
-        .unwrap_or_else(|| DISCOVERY_URL.to_string())
-}
-
-#[cfg(test)]
-static TEST_DISCOVERY_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// Serve xAI's OpenID discovery from `url` for the rest of the process, so a
-/// test can exercise the sign-in flow offline rather than reaching `auth.x.ai`.
-///
-/// Process-wide, like the flows it stands in for: a test that sets it takes
-/// [`oauth_callback::serial_callback_port`] first, which is the same lock the
-/// one fixed callback port already forces it to hold.
-///
-/// The only caller is `src/plugins/gui/oauth.rs`, which lives behind
-/// `--features native`: a default-feature test build compiles this seam and
-/// exercises none of it, which is not the same thing as it being unused.
-#[cfg(test)]
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
-pub(crate) fn use_test_discovery_url(url: &str) {
-    *TEST_DISCOVERY_URL
-        .lock()
-        .unwrap_or_else(|err| err.into_inner()) = Some(url.to_string());
 }
 
 /// Fetch and validate the OpenID configuration.

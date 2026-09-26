@@ -473,17 +473,8 @@ fn missing_text() {
 ///
 /// This is [`crate::entrypoint::absent`]'s rule generalised: a feature that is
 /// on by default is missing because somebody built it out, so the useful
-/// sentence is "a stock release has it". `native` is the one that is off by
-/// default, and telling its reader to rebuild without mentioning the release
-/// asset is how `wizard app` spent a year telling people to compile iced.
+/// sentence is "a stock release has it".
 fn how_to_get(entry: &catalogue::Entry) -> String {
-    if entry.feature == "native" {
-        return format!(
-            "cargo build --release --features {} — or `install.sh` with WIZARD_NATIVE=1, \
-             which installs a prebuilt `wizard-native` beside `wizard`",
-            entry.feature
-        );
-    }
     if entry.default_on {
         format!(
             "cargo build --release --features {} — or install a stock release binary, \
@@ -657,10 +648,6 @@ mod tests {
             assert!(advice.contains(entry.feature), "{advice}");
             assert!(advice.contains("cargo build"), "{advice}");
         }
-        assert!(
-            how_to_get(catalogue::feature("native").expect("native row"))
-                .contains("WIZARD_NATIVE=1")
-        );
     }
 
     /// The JSON is JSON, on whatever this build is.
