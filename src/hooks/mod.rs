@@ -602,7 +602,12 @@ impl HookEngine {
                     code: 0, stdout, ..
                 } => {
                     let stdout = stdout.trim();
-                    if capture && !stdout.is_empty() {
+                    // The same hook reached through two configs (user and
+                    // project both pointing at one script) prints the same
+                    // text twice; the model needs it once.
+                    let repeat = crate::token_profile::current().safe()
+                        && extra.iter().any(|seen| seen == stdout);
+                    if capture && !stdout.is_empty() && !repeat {
                         extra.push(stdout.to_string());
                         self.report(events, event, hook, HookOutcome::AppendedContext)
                             .await;
