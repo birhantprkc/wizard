@@ -6,7 +6,24 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-09-27
+
 ### Added
+
+- **Wizard GUI ships in `gui/`.**
+
+- **Token profiles.** `--token-profile`, `$WIZARD_TOKEN_PROFILE`, or
+  `token_profile` in config.toml pick how much harness each request carries:
+  `safe` (the default), `stock` (3.2.5's harness), `lean`, or `min`. The first
+  request drops from 15,517 prompt tokens to 10,087 under `safe` and 1,729
+  under `min`. On 8 tasks from a real project's history, two tries each,
+  `safe` used 16% fewer prompt tokens per task than `stock` with the same pass
+  rate. See [docs/token-profiles.md](docs/token-profiles.md).
+
+- **MCP tools load on first call.** Under `safe` and above, MCP tools are
+  listed by server prefix instead of sent with full schemas; one Playwright
+  server was 4,700 tokens on every request. A deferred tool runs when the model
+  calls it by name, and `tool_search` returns a schema when it wants one first.
 
 - **ACP clients can reopen past sessions.** `wizard acp` implements
   `session/list` (newest first, filtered to the client's working directory,
@@ -33,9 +50,24 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ### Changed
 
+- **Smaller requests by default (`safe`).** The subagent roster is one line
+  per name, with details on request. A continuous run's cycle prompt points at
+  the pinned mission instead of repeating it; one long session had carried 47
+  copies. An identical re-read of an unchanged file returns a stub. A
+  subagent's report is not repeated by `subagent_status` after its completion
+  note delivered it. Identical `session_start` hook output goes to the model
+  once.
+
 - **Model lists come newest first.** OpenAI-compatible providers (xAI,
   OpenAI, OpenRouter) now sort their `/models` answer by publish date, so
   `/model` and ACP clients show the latest model at the top.
+
+### Fixed
+
+- **Skill frontmatter is read as YAML.** Keys nested under `metadata` no longer
+  count as top-level, so a nested `always: true` stopped putting that skill's
+  whole body into every prompt, and folded (`>`) and literal (`|`)
+  descriptions are read in full instead of as the bare indicator.
 
 ## [3.2.5] - 2026-09-20
 
