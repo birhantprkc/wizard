@@ -14,6 +14,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod credentials;
+pub mod desktop_app;
 pub mod dispatch;
 pub mod doctor;
 pub mod entrypoint;
@@ -185,12 +186,9 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
     }
 
     // The desktop app is Wizard GUI, built from gui/ and shipped as its own
-    // release asset.
+    // release asset; this only starts it.
     if let Some(cli::Command::Gui { native: _ }) = &cli.command {
-        anyhow::bail!(
-            "the desktop app is Wizard GUI: download wizard-gui from \
-             https://github.com/teddytennant/wizard/releases/latest"
-        );
+        return desktop_app::open(cli.cwd.as_deref()).map(|()| 0);
     }
 
     // ACP server: an editor drives Wizard over stdin/stdout, so it must not
