@@ -499,6 +499,7 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         config::Config::load()?
     };
     config.apply_cli(&cli);
+    crate::token_profile::init(config.token_profile.as_deref());
 
     if let Some(dir) = &cli.cwd {
         std::env::set_current_dir(dir)?;

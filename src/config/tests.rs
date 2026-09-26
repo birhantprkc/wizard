@@ -245,6 +245,7 @@ fn full_file_round_trips() {
         gate_max_attempts: 4,
         gate_timeout_secs: 600,
         completion_review: Some(false),
+        token_profile: Some("lean".into()),
         compact_threshold_bytes: 96_000,
         max_context_tokens: 200_000,
         prune_after_tokens: 64_000,

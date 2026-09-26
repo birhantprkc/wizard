@@ -1864,7 +1864,10 @@ mod tests {
             "provider returned 503 eleven times",
             true,
         );
-        assert!(prompt.contains("harden it"), "the mission is restated");
+        assert!(
+            prompt.contains(&mission_ref("harden it")),
+            "the mission is restated, or pointed at where it is pinned"
+        );
         assert!(prompt.contains("a tripped circuit breaker"));
         assert!(prompt.contains("provider returned 503 eleven times"));
         assert!(prompt.contains("2 failed cycle(s) in a row"));
@@ -1893,7 +1896,7 @@ mod tests {
     fn the_happy_path_prompt_still_quotes_the_cycle_count() {
         let prompt = continuation_prompt("ship it", 42);
         assert!(prompt.contains("cycle 42"));
-        assert!(prompt.contains("ship it"));
+        assert!(prompt.contains(&mission_ref("ship it")));
         assert!(prompt.contains("stop calling tools"));
         assert!(prompt.contains("Do not poll"));
         assert!(

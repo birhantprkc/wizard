@@ -147,6 +147,13 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub harness_dir: Option<PathBuf>,
 
+    /// How much harness each request carries: `safe` (default), `stock` (the
+    /// 3.2 harness), `lean` or `min`. Sets `$WIZARD_TOKEN_PROFILE`, so it
+    /// beats the environment and the `token_profile` config key. See
+    /// docs/token-profiles.md.
+    #[arg(long, value_name = "PROFILE")]
+    pub token_profile: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

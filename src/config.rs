@@ -1030,6 +1030,11 @@ pub struct Config {
     /// money. Set it to `true` or `false` and that answer holds everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_review: Option<bool>,
+    /// Token profile when neither `--token-profile` nor
+    /// `$WIZARD_TOKEN_PROFILE` names one: `safe` (default), `stock`, `lean`
+    /// or `min`. See docs/token-profiles.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_profile: Option<String>,
     /// When the provider's context window is unknown and the serialized chat
     /// history exceeds this many bytes, compact older messages into a summary.
     /// With a known window, the reported prompt size governs instead.
@@ -1161,6 +1166,7 @@ impl Default for Config {
             gate_max_attempts: 3,
             gate_timeout_secs: 1_800,
             completion_review: None,
+            token_profile: None,
             compact_threshold_bytes: 48_000,
             time_wrap_up_at: default_wrap_up_at(),
             time_finish_at: default_finish_at(),

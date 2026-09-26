@@ -26,6 +26,12 @@ fn main() {
     if let Some(dir) = &cli.harness_dir {
         unsafe { std::env::set_var("WIZARD_HARNESS_DIR", dir) };
     }
+    // Same for `--token-profile`: subagents and fleet workers are wizard
+    // processes and inherit the profile through the environment.
+    // SAFETY: no other threads have been spawned yet.
+    if let Some(profile) = &cli.token_profile {
+        unsafe { std::env::set_var(wizard::token_profile::ENV, profile) };
+    }
 
     // Diagnostics before any surface starts. Every `tracing` event emitted
     // before the subscriber is installed is dropped, and the surfaces below
