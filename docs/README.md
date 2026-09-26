@@ -11,6 +11,7 @@ to do.
 | --- | --- |
 | [Getting started](getting-started.md) | Install, providers, model tiers, the first run and how long it takes |
 | [Usage](usage.md) | The TUI, slash commands, agent-managed context |
+| [Token profiles](token-profiles.md) | How much harness each request carries: `safe`, `stock`, `lean`, `min` |
 | [Commands](commands.md) | Every slash command, and what each surface allows |
 | [Modes](modes.md) | Genie, sovereign, `--continuous`, plan mode |
 | [Startup benchmark](../bench/startup/README.md) | Cold and warm start, memory and install size next to six other agents, and `run.sh` |
