@@ -918,7 +918,7 @@ pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
              stops it.]",
             detached.after, detached.id, detached.id, detached.id, detached.id
         ));
-        return ToolOutput::ok(truncate_output(content, MAX_OUTPUT_BYTES));
+        return ToolOutput::ok(truncate_output(content, execute_cap()));
     }
 
     if let Some(secs) = result.timed_out {
@@ -929,7 +929,7 @@ pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
             format!("command timed out after {secs}s and was killed; output above is partial")
         };
         content.push_str(&note);
-        return ToolOutput::error(truncate_output(content, MAX_OUTPUT_BYTES));
+        return ToolOutput::error(truncate_output(content, execute_cap()));
     }
 
     match result.code {
@@ -937,22 +937,34 @@ pub(crate) fn render_command_result(result: &CommandResult) -> ToolOutput {
             if content.is_empty() {
                 content.push_str("(command succeeded with no output)");
             }
-            ToolOutput::ok(truncate_output(content, MAX_OUTPUT_BYTES))
+            ToolOutput::ok(truncate_output(content, execute_cap()))
         }
         Some(code) => {
             if !content.is_empty() {
                 content.push('\n');
             }
             content.push_str(&format!("exit code: {code}"));
-            ToolOutput::error(truncate_output(content, MAX_OUTPUT_BYTES))
+            ToolOutput::error(truncate_output(content, execute_cap()))
         }
         None => {
             if !content.is_empty() {
                 content.push('\n');
             }
             content.push_str("terminated by signal");
-            ToolOutput::error(truncate_output(content, MAX_OUTPUT_BYTES))
+            ToolOutput::error(truncate_output(content, execute_cap()))
         }
+    }
+}
+
+/// Byte cap on one `execute` result. 12 KB under the `lean` token profile
+/// and above, where the rest goes to a spill file the result names; otherwise
+/// the shared [`MAX_OUTPUT_BYTES`]. `execute` is half of all result bytes in
+/// real sessions, and what a model uses from a long log is its head and tail.
+fn execute_cap() -> usize {
+    if crate::token_profile::current().lean() {
+        12_000
+    } else {
+        MAX_OUTPUT_BYTES
     }
 }
 
