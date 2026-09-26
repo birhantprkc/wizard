@@ -1510,7 +1510,7 @@ impl Host for TurnHost<'_> {
     }
 
     fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.agent.dispatcher.registry().specs()
+        self.agent.dispatcher.registry().advertised_specs()
     }
 
     fn history(&self) -> &[ChatMessage] {

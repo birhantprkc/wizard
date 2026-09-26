@@ -961,6 +961,7 @@ impl Agent {
         registry.register(Arc::new(crate::tools::interview::InterviewTool::new(
             Arc::clone(&omakase),
         )));
+        apply_tool_deferral(&mut registry, None);
 
         // The agent's token counters, shared into the tool context so a
         // subagent's model calls bill the parent (see `ToolContext::usage`).
@@ -1344,6 +1345,10 @@ impl Agent {
         registry.register(Arc::new(crate::tools::interview::InterviewTool::new(
             Arc::clone(&self.omakase),
         )));
+        apply_tool_deferral(
+            &mut registry,
+            self.dispatcher.registry().deferral().cloned(),
+        );
         // Stash `run_code` if this registry has one, and keep the old stash if
         // it does not: a registry built without code mode legitimately omits it,
         // and forgetting it there would mean `/model` back to a native-tool
@@ -1697,8 +1702,16 @@ impl Agent {
         if !self.native_tools {
             prompt.push_str("\n\n");
             prompt.push_str(&prompts::render_tool_protocol(
-                &self.dispatcher.registry().specs(),
+                &self.dispatcher.registry().advertised_specs(),
             ));
+        }
+        let deferrable = self.dispatcher.registry().deferrable_names();
+        if !deferrable.is_empty() {
+            prompt.push_str(
+                "\n\n## More tools\n\nLoad with `tool_search` (`select:name`) before first use: ",
+            );
+            prompt.push_str(&deferrable.join(", "));
+            prompt.push('.');
         }
         if self
             .dispatcher
@@ -2167,6 +2180,32 @@ pub async fn build_tool_registry(
         )));
     }
     Ok((registry, subagent_model))
+}
+
+/// Under the `lean` and `min` token profiles, advertise only the core tools
+/// in full and put the rest behind `tool_search`. `existing` carries a
+/// session's loaded set across a `/reload`. A no-op under `stock` and `safe`.
+fn apply_tool_deferral(
+    registry: &mut ToolRegistry,
+    existing: Option<Arc<crate::tools::registry::Deferral>>,
+) {
+    use crate::tools::tool_search::{self, ToolSearchTool};
+    let profile = crate::token_profile::current();
+    if !profile.lean() {
+        return;
+    }
+    let deferral = existing.unwrap_or_else(|| {
+        Arc::new(if profile.min() {
+            crate::tools::registry::Deferral::new(
+                tool_search::MIN_CORE,
+                tool_search::terse_core_specs(),
+            )
+        } else {
+            crate::tools::registry::Deferral::new(tool_search::LEAN_CORE, Vec::new())
+        })
+    });
+    registry.register(Arc::new(ToolSearchTool::new(Arc::clone(&deferral))));
+    registry.set_deferral(deferral);
 }
 
 /// Skills from the repo/bundled roots plus `~/.wizard/skills` (user shadowing).

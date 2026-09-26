@@ -1,9 +1,9 @@
 //! Unified tool registry: native + scripted + MCP tools behind one lookup,
 //! so the agent loop and the model treat all three identically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -33,6 +33,73 @@ use super::turing::TuringTool;
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    /// Tools advertised by name only until loaded (`lean` and `min` token
+    /// profiles). Shared by every snapshot, so loading a tool in one handle
+    /// loads it for the whole session.
+    deferral: Option<Arc<Deferral>>,
+}
+
+/// Which tools go out with a full schema on every request, and which ones the
+/// model has loaded through `tool_search` since.
+#[derive(Default)]
+pub struct Deferral {
+    /// Always advertised in full.
+    core: HashSet<String>,
+    /// Loaded this session, in load order, so a new load appends to the
+    /// request's `tools` array rather than reshuffling it.
+    loaded: RwLock<Vec<String>>,
+    /// Terse replacements for core tool specs (`min` profile).
+    terse: HashMap<String, ToolSpec>,
+    /// Full specs of every non-core tool, refreshed on each request so
+    /// `tool_search` sees the registry the model is actually talking to.
+    catalog: RwLock<Vec<ToolSpec>>,
+}
+
+impl Deferral {
+    pub fn new(core: &[&str], terse: Vec<ToolSpec>) -> Self {
+        Self {
+            core: core.iter().map(|name| name.to_string()).collect(),
+            loaded: RwLock::new(Vec::new()),
+            terse: terse
+                .into_iter()
+                .map(|spec| (spec.function.name.clone(), spec))
+                .collect(),
+            catalog: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Full specs of the non-core tools as of the last request.
+    pub fn catalog(&self) -> Vec<ToolSpec> {
+        self.catalog.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Whether `name` is loaded or core, i.e. callable without a lookup.
+    pub fn is_available(&self, name: &str) -> bool {
+        self.is_core(name) || self.is_loaded(name)
+    }
+
+    fn is_core(&self, name: &str) -> bool {
+        self.core.contains(name)
+    }
+
+    fn is_loaded(&self, name: &str) -> bool {
+        self.loaded
+            .read()
+            .map(|loaded| loaded.iter().any(|n| n == name))
+            .unwrap_or(false)
+    }
+
+    /// Mark `name` loaded. Returns false when it already was.
+    pub fn load(&self, name: &str) -> bool {
+        let Ok(mut loaded) = self.loaded.write() else {
+            return false;
+        };
+        if loaded.iter().any(|n| n == name) {
+            return false;
+        }
+        loaded.push(name.to_string());
+        true
+    }
 }
 
 impl Clone for ToolRegistry {
@@ -43,6 +110,7 @@ impl Clone for ToolRegistry {
         Self {
             tools: self.tools.clone(),
             order: self.order.clone(),
+            deferral: self.deferral.clone(),
         }
     }
 }
@@ -155,6 +223,88 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Defer every tool outside `deferral`'s core set: from here on
+    /// [`advertised_specs`](Self::advertised_specs) sends those by name only,
+    /// and calling one before `tool_search` loads it is refused with its
+    /// schema attached.
+    pub fn set_deferral(&mut self, deferral: Arc<Deferral>) {
+        self.deferral = Some(deferral);
+    }
+
+    /// The deferral state, if this registry defers anything.
+    pub fn deferral(&self) -> Option<&Arc<Deferral>> {
+        self.deferral.as_ref()
+    }
+
+    /// True when `name` is registered but deferred and not loaded yet.
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferral.as_ref().is_some_and(|deferral| {
+            self.tools.contains_key(name) && !deferral.is_core(name) && !deferral.is_loaded(name)
+        })
+    }
+
+    /// Names of every tool outside the core set, in registration order,
+    /// loaded or not. Stable for the session, so the system prompt that lists
+    /// them does not change when one is loaded.
+    pub fn deferrable_names(&self) -> Vec<String> {
+        let Some(deferral) = &self.deferral else {
+            return Vec::new();
+        };
+        self.order
+            .iter()
+            .filter(|name| !deferral.is_core(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Full spec for one registered tool, deferred or not.
+    pub fn spec_of(&self, name: &str) -> Option<ToolSpec> {
+        self.tools.get(name).map(|tool| tool.spec())
+    }
+
+    /// The specs a request advertises: every tool when nothing is deferred
+    /// (identical to [`specs`](Self::specs)), otherwise the core tools in
+    /// registration order followed by loaded tools in load order.
+    pub fn advertised_specs(&self) -> Vec<ToolSpec> {
+        let Some(deferral) = &self.deferral else {
+            return self.specs();
+        };
+        if let Ok(mut catalog) = deferral.catalog.write() {
+            *catalog = self
+                .order
+                .iter()
+                .filter(|name| !deferral.is_core(name))
+                .filter_map(|name| self.tools.get(name))
+                .map(|tool| tool.spec())
+                .collect();
+        }
+        let mut specs: Vec<ToolSpec> = self
+            .order
+            .iter()
+            .filter(|name| deferral.is_core(name))
+            .filter_map(|name| {
+                let tool = self.tools.get(name)?;
+                Some(
+                    deferral
+                        .terse
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| tool.spec()),
+                )
+            })
+            .collect();
+        if let Ok(loaded) = deferral.loaded.read() {
+            specs.extend(
+                loaded
+                    .iter()
+                    .filter(|name| !deferral.is_core(name))
+                    .filter_map(|name| self.tools.get(name))
+                    .map(|tool| tool.spec()),
+            );
+        }
+        specs
+    }
+
     /// Load every scripted tool manifest from `dir` (normally
     /// `~/.wizard/tools/`) and register them. Returns how many were added.
     /// A scripted tool may not take a native tool's name.
@@ -225,6 +375,20 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        if self.is_deferred(name)
+            && let Some(deferral) = &self.deferral
+        {
+            // Load it now and hand back the schema, so the retry is the only
+            // extra call and the model never has to guess the arguments.
+            deferral.load(name);
+            let schema = serde_json::to_string(&tool.spec().function).unwrap_or_default();
+            return Err(ToolError::InvalidArgs {
+                tool: name.to_string(),
+                message: format!(
+                    "{name} was not loaded. It is loaded now; check the schema and call it again.\n{schema}"
+                ),
+            });
+        }
         tool.execute(args, ctx).await
     }
 
@@ -710,5 +874,82 @@ mod tests {
             ToolAccess::Execute,
             "scripted tools keep the Execute default"
         );
+    }
+
+    /// A deferred tool is not advertised, a call to it is refused with its
+    /// schema (and loads it), and `tool_search` loads another so that it is
+    /// advertised and runs.
+    #[tokio::test]
+    async fn deferred_tools_load_through_tool_search() {
+        use crate::tools::tool_search::{TOOL_SEARCH_TOOL_NAME, ToolSearchTool};
+        let dir = std::env::temp_dir().join(format!("wizard-defer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hi").unwrap();
+        let ctx = ToolContext::new(&dir);
+
+        let mut registry = ToolRegistry::with_native_tools();
+        let deferral = Arc::new(Deferral::new(
+            &["read_file", TOOL_SEARCH_TOOL_NAME],
+            Vec::new(),
+        ));
+        registry.register(Arc::new(ToolSearchTool::new(Arc::clone(&deferral))));
+        registry.set_deferral(deferral);
+
+        let advertised = |r: &ToolRegistry| -> Vec<String> {
+            r.advertised_specs()
+                .into_iter()
+                .map(|s| s.function.name)
+                .collect()
+        };
+        assert_eq!(
+            advertised(&registry),
+            vec!["read_file", TOOL_SEARCH_TOOL_NAME]
+        );
+        assert!(
+            registry
+                .deferrable_names()
+                .contains(&"list_files".to_string())
+        );
+
+        let refused = registry
+            .execute("list_files", serde_json::json!({}), &ctx)
+            .await
+            .expect_err("a deferred tool is refused before it is loaded");
+        assert!(refused.to_string().contains("not loaded"), "{refused}");
+        assert!(
+            refused.to_string().contains("\"parameters\""),
+            "schema rides along"
+        );
+        let listed = registry
+            .execute("list_files", serde_json::json!({}), &ctx)
+            .await
+            .expect("and runs once loaded");
+        assert!(listed.content.contains("a.txt"));
+
+        let found = registry
+            .execute(
+                TOOL_SEARCH_TOOL_NAME,
+                serde_json::json!({ "query": "select:search_files" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            found.content.contains("\"name\":\"search_files\""),
+            "{}",
+            found.content
+        );
+        assert_eq!(
+            advertised(&registry),
+            vec![
+                "read_file",
+                TOOL_SEARCH_TOOL_NAME,
+                "list_files",
+                "search_files"
+            ],
+            "loaded tools follow the core set in load order"
+        );
+        assert!(!registry.is_deferred("search_files"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
