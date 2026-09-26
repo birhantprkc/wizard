@@ -157,9 +157,23 @@ pub(crate) fn brief(detail: &str, max_chars: usize) -> String {
     out
 }
 
+/// How a cycle prompt names the mission. A continuous run pins the mission in
+/// the system prompt (`Agent::pin_mission`), so under the `safe` token profile
+/// and above each cycle points at that copy instead of appending the whole
+/// text again: a months-long run otherwise carried one copy per cycle until
+/// the next compaction, 47 of them in one Prometheus session.
+fn mission_ref(goal: &str) -> String {
+    if crate::token_profile::current().safe() {
+        "the standing mission in your system prompt.".to_string()
+    } else {
+        goal.to_string()
+    }
+}
+
 /// The happy-path continuation prompt: a cycle reported its sub-task complete
 /// and the mission has not, so the agent picks its own next action.
 pub(crate) fn continuation_prompt(goal: &str, cycles: u64) -> String {
+    let goal = mission_ref(goal);
     format!(
         "You are operating CONTINUOUSLY and autonomously toward this standing mission:\n\n\
          {goal}\n\nYou just reported the current sub-task complete (cycle {cycles}). \
@@ -201,6 +215,7 @@ pub(crate) fn recovery_prompt(
         "The failed cycle's edits, if any, were left on disk in whatever half-finished state \
          it stopped in."
     };
+    let goal = mission_ref(goal);
     format!(
         "You are operating CONTINUOUSLY and autonomously toward this standing mission:\n\n\
          {goal}\n\nThe previous cycle did NOT complete. It ended in {why}: {detail}\n\
