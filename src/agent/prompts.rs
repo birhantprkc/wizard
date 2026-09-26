@@ -59,6 +59,42 @@ asking permission — just do the work and narrate briefly as you go.
 /// Sovereign: autonomous, end-to-end, tests and commits where appropriate.
 pub const SOVEREIGN_SYSTEM_PROMPT: &str = include_str!("sovereign_prompt.md");
 
+/// Personality under the `min` token profile: the rules that change what the
+/// model does, none of the ones it would follow anyway.
+const MIN_RULES: &str = "\
+Rules:
+- Read a file before you edit it. Keep changes minimal and in the existing style.
+- Verify with tests or by running the code. Never claim a result you did not see.
+- Never weaken, skip or edit tests to make them pass unless the task is the tests.
+- When something fails, find out why and change approach; do not repeat it verbatim.
+- Keep tool output short (head, tail, grep, wc). Do not dump whole files or logs.
+- Be terse. No em dashes.";
+
+fn min_personality(mode: Mode) -> String {
+    let lead = match mode {
+        Mode::Genie => {
+            "You are Wizard, a coding agent in the user's terminal. Tool calls are auto-approved. Ask only when blocked on a decision that is the user's to make."
+        }
+        Mode::Sovereign => {
+            "You are Wizard, an autonomous coding agent. Tool calls are auto-approved and nobody is watching: work the task to completion without asking questions, and commit when a coherent unit of work passes its tests."
+        }
+    };
+    format!("{lead}\n\n{MIN_RULES}")
+}
+
+/// `min` profile: the charter rules that govern every reply, plus where
+/// the rest lives.
+const MIN_CHARTER: &str = "\
+Wizard's charter is served by the `manual` tool; read the topic before acting on it.";
+
+/// `min` profile context guidance.
+pub const MIN_CONTEXT_PROMPT: &str = "\
+Context is finite. When a `[context pressure]` line says high or critical, call `compact` (load it with tool_search).";
+
+/// `min` profile memory guidance.
+const MIN_MEMORY_PROMPT: &str = "\
+Persistent memory: the `memory` tool (read, save, delete). Read `manual` topic `memory` before saving.";
+
 /// Appended to the system prompt while plan mode is active (the agent
 /// re-composes the prompt whenever the flag flips, so this block disappears
 /// once a plan is approved).
@@ -547,10 +583,15 @@ fn base_system_prompt(mode: Mode) -> String {
         Mode::Genie => GENIE_SYSTEM_PROMPT,
         Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
     };
+    let default = if crate::token_profile::current().min() {
+        min_personality(mode)
+    } else {
+        default.to_string()
+    };
     override_path()
         .as_deref()
         .and_then(read_prompt_override)
-        .unwrap_or_else(|| default.to_string())
+        .unwrap_or(default)
 }
 
 /// The path an override would live at, if any: the harness bundle's
@@ -644,6 +685,9 @@ fn sections_from_base(
     agents_md: Option<&str>,
     memory_index: Option<&str>,
 ) -> Vec<PromptSection> {
+    if crate::token_profile::current().min() {
+        return min_sections(base, skills, agents_md, memory_index);
+    }
     let mut sections = vec![
         PromptSection {
             name: "personality",
@@ -697,6 +741,67 @@ fn sections_from_base(
         });
     }
 
+    sections
+}
+
+/// [`sections_from_base`] for the `min` token profile: same section names
+/// and order, each one cut to what changes the model's behavior. Skills are
+/// listed by name and path; their descriptions and bodies stay on disk.
+fn min_sections(
+    base: String,
+    skills: &[Skill],
+    agents_md: Option<&str>,
+    memory_index: Option<&str>,
+) -> Vec<PromptSection> {
+    let mut sections = vec![
+        PromptSection {
+            name: "personality",
+            text: base,
+        },
+        PromptSection {
+            name: "charter",
+            text: MIN_CHARTER.to_string(),
+        },
+        PromptSection {
+            name: "environment",
+            text: format!(
+                "Shell: {}. OS: {} ({}).",
+                crate::platform::shell::name(),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        },
+    ];
+    let visible: Vec<String> = skills
+        .iter()
+        .filter(|s| crate::skills::skill_visible(s))
+        .map(|s| format!("{} ({})", s.name, s.path.display()))
+        .collect();
+    if !visible.is_empty() {
+        sections.push(PromptSection {
+            name: "skills",
+            text: format!(
+                "Skills (read the file before using one): {}.",
+                visible.join(", ")
+            ),
+        });
+    }
+    if let Some(filtered) = agents_md.and_then(|raw| filter_charter_dupes(raw, WIZARD_CHARTER)) {
+        sections.push(PromptSection {
+            name: "instructions",
+            text: format!("## Project instructions\n\n{filtered}"),
+        });
+    }
+    sections.push(PromptSection {
+        name: "memory",
+        text: MIN_MEMORY_PROMPT.to_string(),
+    });
+    if let Some(index) = memory_index {
+        sections.push(PromptSection {
+            name: "memory-index",
+            text: format!("Memory index:\n{index}"),
+        });
+    }
     sections
 }
 

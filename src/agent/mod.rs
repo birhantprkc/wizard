@@ -1713,11 +1713,13 @@ impl Agent {
             prompt.push_str(&deferrable.join(", "));
             prompt.push('.');
         }
-        if self
-            .dispatcher
-            .registry()
-            .get(crate::tools::todo::TODO_TOOL_NAME)
-            .is_some()
+        let min = crate::token_profile::current().min();
+        if !min
+            && self
+                .dispatcher
+                .registry()
+                .get(crate::tools::todo::TODO_TOOL_NAME)
+                .is_some()
         {
             prompt.push_str("\n\n");
             prompt.push_str(prompts::TODO_PROMPT);
@@ -1726,7 +1728,11 @@ impl Agent {
         // are always on, and the agent should compact / reset deliberately
         // rather than wait for the window to overflow.
         prompt.push_str("\n\n");
-        prompt.push_str(prompts::CONTEXT_PROMPT);
+        prompt.push_str(if min {
+            prompts::MIN_CONTEXT_PROMPT
+        } else {
+            prompts::CONTEXT_PROMPT
+        });
         if let Some(mission) = &self.mission {
             prompt.push_str("\n\n");
             prompt.push_str(&prompts::mission_section(mission));
