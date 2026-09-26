@@ -68,6 +68,7 @@ Rules:
 - Never weaken, skip or edit tests to make them pass unless the task is the tests.
 - When something fails, find out why and change approach; do not repeat it verbatim.
 - Keep tool output short (head, tail, grep, wc). Do not dump whole files or logs.
+- Batch independent work: when you need several files, searches or commands, request them all in one response.
 - Be terse. No em dashes.";
 
 fn min_personality(mode: Mode) -> String {
@@ -85,7 +86,7 @@ fn min_personality(mode: Mode) -> String {
 /// `min` profile: the charter rules that govern every reply, plus where
 /// the rest lives.
 const MIN_CHARTER: &str = "\
-Wizard's charter is served by the `manual` tool; read the topic before acting on it.";
+Deferred tools can be called by name directly; `tool_search` shows a schema when you need one.";
 
 /// `min` profile context guidance.
 pub const MIN_CONTEXT_PROMPT: &str = "\
@@ -93,7 +94,7 @@ Context is finite. When a `[context pressure]` line says high or critical, call 
 
 /// `min` profile memory guidance.
 const MIN_MEMORY_PROMPT: &str = "\
-Persistent memory: the `memory` tool (read, save, delete). Read `manual` topic `memory` before saving.";
+Persistent memory: the `memory` tool. Save only facts that will matter after this task.";
 
 /// Appended to the system prompt while plan mode is active (the agent
 /// re-composes the prompt whenever the flag flips, so this block disappears
@@ -776,7 +777,7 @@ fn min_skills_line(skills: &[Skill]) -> String {
         return String::new();
     }
     format!(
-        "Skills, read the file before using one: {}.",
+        "Skills, read one only when the task calls for it: {}.",
         parts.join("; ")
     )
 }
