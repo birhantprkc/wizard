@@ -6,9 +6,19 @@
 use anyhow::bail;
 use zeron_update::{InstallKind, current_version, version_newer};
 
+const RELEASES_PAGE: &str = "https://github.com/teddytennant/wizard/releases/latest";
+
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
+    // Without an explicit feed the manifest would come from Zeron's own
+    // release bucket, and applying it would replace this build with upstream.
+    if std::env::var_os("ZERON_RELEASES_URL").is_none_or(|url| url.is_empty()) {
+        bail!(
+            "this build has no update feed. Download the latest Wizard GUI from\n\
+             {RELEASES_PAGE}"
+        );
+    }
     let manifest = zeron_update::fetch_latest(edge_url).await?;
     let current = current_version();
     if !version_newer(&manifest.version, current) {
@@ -68,9 +78,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Zeron.app dmg, or rebuild from source.\n\
-                 Windows: use an update-enabled portable package, or rebuild from source."
+                 Download the latest Wizard GUI from {RELEASES_PAGE}, or rebuild from source."
             )
         }
     }
