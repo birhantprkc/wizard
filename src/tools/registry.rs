@@ -53,6 +53,9 @@ pub struct Deferral {
     /// Full specs of every non-core tool, refreshed on each request so
     /// `tool_search` sees the registry the model is actually talking to.
     catalog: RwLock<Vec<ToolSpec>>,
+    /// Defer MCP tools only and keep every other tool core, whatever is
+    /// registered later (the default `safe` profile). `core` is unused then.
+    mcp_only: bool,
 }
 
 impl Deferral {
@@ -65,6 +68,15 @@ impl Deferral {
                 .map(|spec| (spec.function.name.clone(), spec))
                 .collect(),
             catalog: RwLock::new(Vec::new()),
+            mcp_only: false,
+        }
+    }
+
+    /// Defer MCP tools and nothing else.
+    pub fn mcp_only() -> Self {
+        Self {
+            mcp_only: true,
+            ..Self::default()
         }
     }
 
@@ -75,6 +87,13 @@ impl Deferral {
 
     /// Whether `name` is loaded or core, i.e. callable without a lookup.
     pub fn is_available(&self, name: &str) -> bool {
+        if self.mcp_only {
+            let deferred = self
+                .catalog
+                .read()
+                .is_ok_and(|c| c.iter().any(|spec| spec.function.name == name));
+            return !deferred || self.is_loaded(name);
+        }
         self.is_core(name) || self.is_loaded(name)
     }
 
@@ -236,10 +255,30 @@ impl ToolRegistry {
         self.deferral.as_ref()
     }
 
+    /// Whether any registered tool is served by an MCP server.
+    pub fn has_mcp_tools(&self) -> bool {
+        self.tools
+            .values()
+            .any(|tool| tool.kind() == super::ToolKind::Mcp)
+    }
+
+    /// Whether `name` goes out with its full schema on every request.
+    fn is_core_tool(&self, deferral: &Deferral, name: &str) -> bool {
+        if deferral.mcp_only {
+            return self
+                .tools
+                .get(name)
+                .is_none_or(|tool| tool.kind() != super::ToolKind::Mcp);
+        }
+        deferral.is_core(name)
+    }
+
     /// True when `name` is registered but deferred and not loaded yet.
     pub fn is_deferred(&self, name: &str) -> bool {
         self.deferral.as_ref().is_some_and(|deferral| {
-            self.tools.contains_key(name) && !deferral.is_core(name) && !deferral.is_loaded(name)
+            self.tools.contains_key(name)
+                && !self.is_core_tool(deferral, name)
+                && !deferral.is_loaded(name)
         })
     }
 
@@ -252,7 +291,7 @@ impl ToolRegistry {
         };
         self.order
             .iter()
-            .filter(|name| !deferral.is_core(name))
+            .filter(|name| !self.is_core_tool(deferral, name))
             .cloned()
             .collect()
     }
@@ -273,7 +312,7 @@ impl ToolRegistry {
             *catalog = self
                 .order
                 .iter()
-                .filter(|name| !deferral.is_core(name))
+                .filter(|name| !self.is_core_tool(deferral, name))
                 .filter_map(|name| self.tools.get(name))
                 .map(|tool| tool.spec())
                 .collect();
@@ -281,7 +320,7 @@ impl ToolRegistry {
         let mut specs: Vec<ToolSpec> = self
             .order
             .iter()
-            .filter(|name| deferral.is_core(name))
+            .filter(|name| self.is_core_tool(deferral, name))
             .filter_map(|name| {
                 let tool = self.tools.get(name)?;
                 Some(
@@ -297,7 +336,7 @@ impl ToolRegistry {
             specs.extend(
                 loaded
                     .iter()
-                    .filter(|name| !deferral.is_core(name))
+                    .filter(|name| !self.is_core_tool(deferral, name))
                     .filter_map(|name| self.tools.get(name))
                     .map(|tool| tool.spec()),
             );
@@ -879,6 +918,77 @@ mod tests {
             ToolAccess::Execute,
             "scripted tools keep the Execute default"
         );
+    }
+
+    /// A tool that says an MCP server serves it.
+    struct FakeMcpTool(&'static str);
+
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "fake MCP tool for registry tests"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        fn kind(&self) -> super::super::ToolKind {
+            super::super::ToolKind::Mcp
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("clicked"))
+        }
+    }
+
+    /// `safe` defers MCP tools and nothing else, including natives registered
+    /// after the deferral was set, and a deferred MCP tool still runs when
+    /// called by name.
+    #[tokio::test]
+    async fn mcp_only_deferral_keeps_every_native_tool() {
+        let dir = std::env::temp_dir().join(format!("wizard-mcp-defer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext::new(&dir);
+
+        let mut registry = ToolRegistry::with_native_tools();
+        let natives = registry.specs().len();
+        registry.register(Arc::new(FakeMcpTool("browser_click")));
+        registry.register(Arc::new(FakeMcpTool("browser_type")));
+        assert!(registry.has_mcp_tools());
+        let deferral = Arc::new(Deferral::mcp_only());
+        registry.set_deferral(Arc::clone(&deferral));
+        registry.register(Arc::new(FakeTool {
+            name: "late_native",
+            reply: "ok",
+        }));
+
+        let advertised: Vec<String> = registry
+            .advertised_specs()
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        assert_eq!(advertised.len(), natives + 1, "{advertised:?}");
+        assert!(advertised.iter().any(|n| n == "late_native"));
+        assert!(!advertised.iter().any(|n| n.starts_with("browser_")));
+        assert_eq!(
+            registry.deferrable_names(),
+            vec!["browser_click", "browser_type"]
+        );
+        assert!(deferral.is_available("read_file"));
+        assert!(!deferral.is_available("browser_click"));
+
+        let out = registry
+            .execute("browser_click", serde_json::json!({}), &ctx)
+            .await
+            .expect("a deferred MCP tool runs when called by name");
+        assert_eq!(out.content, "clicked");
+        assert!(!registry.is_deferred("browser_click"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A deferred tool is not advertised, a call to it by name runs and loads

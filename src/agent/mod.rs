@@ -1708,7 +1708,7 @@ impl Agent {
         let deferrable = deferred_tool_listing(self.dispatcher.registry());
         if !deferrable.is_empty() {
             prompt.push_str(
-                "\n\n## More tools\n\nLoad with `tool_search` (`select:name`, or keywords) before first use: ",
+                "\n\n## More tools\n\nCall these by name, or fetch a schema first with `tool_search` (`select:name`, or keywords): ",
             );
             prompt.push_str(&deferrable.join(", "));
             prompt.push('.');
@@ -2219,20 +2219,29 @@ fn deferred_tool_listing(registry: &ToolRegistry) -> Vec<String> {
     listing
 }
 
-/// Under the `lean` and `min` token profiles, advertise only the core tools
-/// in full and put the rest behind `tool_search`. `existing` carries a
-/// session's loaded set across a `/reload`. A no-op under `stock` and `safe`.
+/// Put tools behind `tool_search`: MCP tools under `safe`, everything outside
+/// the core set under `lean` and `min`. `existing` carries a session's loaded
+/// set across a `/reload`. A no-op under `stock`.
 fn apply_tool_deferral(
     registry: &mut ToolRegistry,
     existing: Option<Arc<crate::tools::registry::Deferral>>,
 ) {
     use crate::tools::tool_search::{self, ToolSearchTool};
     let profile = crate::token_profile::current();
-    if !profile.lean() {
+    if !profile.safe() {
         return;
     }
+    if !profile.lean() {
+        // `safe` defers MCP tools only, and only when a server brought some:
+        // one server can cost more than every native tool together.
+        if !registry.has_mcp_tools() {
+            return;
+        }
+    }
     let deferral = existing.unwrap_or_else(|| {
-        Arc::new(if profile.min() {
+        Arc::new(if !profile.lean() {
+            crate::tools::registry::Deferral::mcp_only()
+        } else if profile.min() {
             crate::tools::registry::Deferral::new(
                 tool_search::MIN_CORE,
                 tool_search::terse_core_specs(),
