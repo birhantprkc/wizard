@@ -258,6 +258,16 @@ pub(crate) fn split_frontmatter(raw: &str) -> (SkillMeta, String) {
 /// `description`, `always`, `when_env`). Unknown keys and malformed lines
 /// are ignored. `when_env` is a comma-separated list of env var names.
 fn parse_meta(lines: &[&str]) -> SkillMeta {
+    if crate::token_profile::current().safe() {
+        return parse_meta_yaml(lines);
+    }
+    parse_meta_trimmed(lines)
+}
+
+/// The original parser: every line trimmed, so a nested key such as
+/// `metadata.openclaw.always` reads as a top-level `always`, and a folded
+/// `description: >` reads as the literal `>`. Kept for the `stock` profile.
+fn parse_meta_trimmed(lines: &[&str]) -> SkillMeta {
     let mut meta = SkillMeta::default();
     for line in lines {
         let line = line.trim();
@@ -267,6 +277,62 @@ fn parse_meta(lines: &[&str]) -> SkillMeta {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
+        let value = strip_quotes(value.trim());
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "name" => meta.name = Some(value.to_string()),
+            "description" => meta.description = Some(value.to_string()),
+            "always" => meta.always = parse_bool(value),
+            "when_env" => {
+                meta.when_env = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    meta
+}
+
+/// Top-level keys only, with YAML block scalars: `key: >` folds the indented
+/// lines that follow into one line, `key: |` keeps their line breaks.
+/// Indented lines under any other key belong to a nested map and are skipped.
+fn parse_meta_yaml(lines: &[&str]) -> SkillMeta {
+    let mut meta = SkillMeta::default();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        if line.is_empty() || line.starts_with([' ', '\t']) || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let mut value = value.trim().to_string();
+        let block = value.chars().next().filter(|c| matches!(c, '>' | '|'));
+        if block.is_some() && value[1..].chars().all(|c| matches!(c, '-' | '+')) {
+            let mut parts = Vec::new();
+            while i < lines.len()
+                && (lines[i].trim().is_empty() || lines[i].starts_with([' ', '\t']))
+            {
+                parts.push(lines[i].trim());
+                i += 1;
+            }
+            while parts.last().is_some_and(|p| p.is_empty()) {
+                parts.pop();
+            }
+            value = if block == Some('>') {
+                parts.join(" ")
+            } else {
+                parts.join("\n")
+            };
+        }
         let value = strip_quotes(value.trim());
         if value.is_empty() {
             continue;
@@ -323,6 +389,32 @@ mod tests {
         let dir = root.join(dir_name);
         std::fs::create_dir_all(&dir).expect("create skill dir");
         std::fs::write(dir.join("SKILL.md"), content).expect("write SKILL.md");
+    }
+
+    #[test]
+    fn yaml_parser_reads_top_level_keys_and_block_scalars() {
+        let raw = "name: common-sense\ndescription: >\n  Give the agent\n  judgment.\nmetadata:\n  openclaw:\n    always: true\nwhen_env: A, B\n";
+        let lines: Vec<&str> = raw.lines().collect();
+        let meta = parse_meta_yaml(&lines);
+        assert_eq!(meta.name.as_deref(), Some("common-sense"));
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Give the agent judgment.")
+        );
+        assert!(!meta.always, "a nested always must not inline the body");
+        assert_eq!(meta.when_env, vec!["A", "B"]);
+
+        let literal: Vec<&str> = "description: |\n  one\n  two\nalways: yes"
+            .lines()
+            .collect();
+        let meta = parse_meta_yaml(&literal);
+        assert_eq!(meta.description.as_deref(), Some("one\ntwo"));
+        assert!(meta.always);
+
+        // The stock parser keeps its old reading of the same frontmatter.
+        let old = parse_meta_trimmed(&lines);
+        assert!(old.always);
+        assert_eq!(old.description.as_deref(), Some(">"));
     }
 
     #[test]
