@@ -744,6 +744,43 @@ fn sections_from_base(
     sections
 }
 
+/// Skills as one line: names, grouped under the directory they share when
+/// they sit at `<dir>/<name>/SKILL.md`, so a path is written once per root
+/// instead of once per skill.
+fn min_skills_line(skills: &[Skill]) -> String {
+    let mut roots: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    for skill in skills.iter().filter(|s| crate::skills::skill_visible(s)) {
+        let dir = skill.path.parent();
+        let conventional = skill.path.file_name().is_some_and(|f| f == "SKILL.md")
+            && dir
+                .and_then(Path::file_name)
+                .is_some_and(|d| d == skill.name.as_str());
+        match dir.and_then(Path::parent) {
+            Some(root) if conventional => {
+                let root = root.display().to_string();
+                match roots.iter_mut().find(|(r, _)| *r == root) {
+                    Some((_, names)) => names.push(&skill.name),
+                    None => roots.push((root, vec![&skill.name])),
+                }
+            }
+            _ => loose.push(format!("{} ({})", skill.name, skill.path.display())),
+        }
+    }
+    let mut parts: Vec<String> = roots
+        .into_iter()
+        .map(|(root, names)| format!("{} (in {root}/<name>/SKILL.md)", names.join(", ")))
+        .collect();
+    parts.extend(loose);
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Skills, read the file before using one: {}.",
+        parts.join("; ")
+    )
+}
+
 /// [`sections_from_base`] for the `min` token profile: same section names
 /// and order, each one cut to what changes the model's behavior. Skills are
 /// listed by name and path; their descriptions and bodies stay on disk.
@@ -772,18 +809,11 @@ fn min_sections(
             ),
         },
     ];
-    let visible: Vec<String> = skills
-        .iter()
-        .filter(|s| crate::skills::skill_visible(s))
-        .map(|s| format!("{} ({})", s.name, s.path.display()))
-        .collect();
-    if !visible.is_empty() {
+    let skills_line = min_skills_line(skills);
+    if !skills_line.is_empty() {
         sections.push(PromptSection {
             name: "skills",
-            text: format!(
-                "Skills (read the file before using one): {}.",
-                visible.join(", ")
-            ),
+            text: skills_line,
         });
     }
     if let Some(filtered) = agents_md.and_then(|raw| filter_charter_dupes(raw, WIZARD_CHARTER)) {
