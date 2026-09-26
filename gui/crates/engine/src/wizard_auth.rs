@@ -101,7 +101,7 @@ const XAI_TOKEN_FILE: &str = "xai_oauth.json";
 const CHATGPT_PROVIDER: &str = "chatgpt";
 const CHATGPT_KIND: &str = "chatgptoauth";
 const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const CHATGPT_MODEL: &str = "gpt-5.6-sol";
+const CHATGPT_MODEL: &str = "gpt-6-astra";
 const CHATGPT_TOKEN_FILE: &str = "chatgpt_oauth.json";
 
 const OPENAI_PROVIDER: &str = "openai";
