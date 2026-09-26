@@ -867,6 +867,22 @@ pub(crate) fn shrink_old_results(
     keep_whole: usize,
     min_reclaim: usize,
 ) -> usize {
+    shrink_old_results_with(
+        history,
+        keep_whole,
+        min_reclaim,
+        crate::token_profile::current().lean(),
+    )
+}
+
+/// [`shrink_old_results`] with the `lean` profile's argument digest chosen by
+/// the caller, so a test can exercise both.
+fn shrink_old_results_with(
+    history: &mut [ChatMessage],
+    keep_whole: usize,
+    min_reclaim: usize,
+    digest_args: bool,
+) -> usize {
     let recent = history.len().saturating_sub(KEEP_RECENT);
     let results: usize = history
         .iter()
@@ -879,10 +895,14 @@ pub(crate) fn shrink_old_results(
     // reclaims too little must not rewrite anything at all, and that is not
     // known until every candidate has been costed.
     let mut planned: Vec<(usize, usize, String)> = Vec::new();
+    let mut planned_args: Vec<(usize, usize, Value)> = Vec::new();
     let mut reclaimed = 0usize;
     {
         let calls = calls_by_id(history);
         let mut seen = 0usize;
+        // Calls whose results fall in the digest band: their arguments are as
+        // far back as their results, and under the `lean` profile they go too.
+        let mut old_calls: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (index, message) in history.iter().enumerate() {
             for (block_index, block) in message.content.iter().enumerate() {
                 let crate::llm::ContentBlock::ToolResult(result) = block else {
@@ -892,6 +912,9 @@ pub(crate) fn shrink_old_results(
                 seen += 1;
                 if index >= recent {
                     continue;
+                }
+                if ordinal < digest_before {
+                    old_calls.insert(result.tool_use_id.as_str());
                 }
                 let before = result.content.chars().count();
                 let shrunk = if ordinal < digest_before {
@@ -913,25 +936,60 @@ pub(crate) fn shrink_old_results(
                 planned.push((index, block_index, shrunk));
             }
         }
+        if digest_args {
+            for (index, message) in history.iter().enumerate().take(recent) {
+                for (block_index, block) in message.content.iter().enumerate() {
+                    let crate::llm::ContentBlock::ToolUse(call) = block else {
+                        continue;
+                    };
+                    if !old_calls.contains(call.id.as_str()) {
+                        continue;
+                    }
+                    let before = call.function.arguments.to_string().chars().count();
+                    if before < DIGEST_MIN_CHARS {
+                        continue;
+                    }
+                    let Some(digested) = digest_call_args(&call.function.arguments) else {
+                        continue;
+                    };
+                    let after = digested.to_string().chars().count();
+                    if after >= before {
+                        continue;
+                    }
+                    reclaimed += before - after;
+                    planned_args.push((index, block_index, digested));
+                }
+            }
+        }
     }
 
     if reclaimed < min_reclaim {
         return 0;
     }
+    // Arguments are planned after results, so the earliest rewrite may be an
+    // argument; the tail check below has to see it.
+    planned.sort_by_key(|(index, _, _)| *index);
+    let first_arg = planned_args.iter().map(|(index, _, _)| *index).min();
     // The other half of the floor. What a rewrite costs is not the message it
     // rewrites, it is every token after it: the provider's cached prefix ends
     // at the first edit. So the pass is also priced against the tail its
     // earliest edit invalidates. See [`RECLAIM_TAIL_DIVISOR`].
+    let first = planned
+        .first()
+        .map(|(index, _, _)| *index)
+        .into_iter()
+        .chain(first_arg)
+        .min();
     if min_reclaim > 0
-        && let Some((first, _, _)) = planned.first()
+        && let Some(first) = first
     {
-        let invalidated = crate::llm::estimate_history_tokens(&history[*first..]);
+        let invalidated = crate::llm::estimate_history_tokens(&history[first..]);
         let reclaimed_tokens = crate::llm::estimate_tokens_from_chars(reclaimed);
         if reclaimed_tokens < invalidated / RECLAIM_TAIL_DIVISOR as u64 {
             return 0;
         }
     }
-    let shrunk = planned.len();
+    let shrunk = planned.len() + planned_args.len();
     for (index, block_index, content) in planned {
         if let crate::llm::ContentBlock::ToolResult(result) =
             &mut history[index].content[block_index]
@@ -939,7 +997,55 @@ pub(crate) fn shrink_old_results(
             result.content = content;
         }
     }
+    for (index, block_index, arguments) in planned_args {
+        if let crate::llm::ContentBlock::ToolUse(call) = &mut history[index].content[block_index] {
+            call.function.arguments = arguments;
+        }
+    }
     shrunk
+}
+
+/// A string argument longer than this in an old tool call is cut down by
+/// [`digest_call_args`].
+const ARG_KEEP_CHARS: usize = 200;
+
+/// Head of a long string argument kept in front of the elision note.
+const ARG_HEAD_CHARS: usize = 120;
+
+/// `arguments` with every string longer than [`ARG_KEEP_CHARS`] cut to a head
+/// and a note, or `None` when nothing is that long.
+///
+/// The call stays a valid JSON object with every key it had, because a
+/// provider rejects a `tool_use` whose input does not parse, and the head says
+/// what the call was about (the command, the start of the edit). The digested
+/// string is shorter than [`ARG_KEEP_CHARS`], so a second pass leaves it
+/// alone. Old arguments are the file contents a `write_file` wrote and the
+/// text an `edit_file` replaced, which are on disk, and the full call is in
+/// the session file.
+pub(crate) fn digest_call_args(arguments: &Value) -> Option<Value> {
+    fn walk(value: &Value, changed: &mut bool) -> Value {
+        match value {
+            Value::String(text) if text.chars().count() > ARG_KEEP_CHARS => {
+                *changed = true;
+                let head: String = text.chars().take(ARG_HEAD_CHARS).collect();
+                Value::String(format!(
+                    "{head}… [{} chars, {} lines elided from this old call]",
+                    text.chars().count(),
+                    text.lines().count()
+                ))
+            }
+            Value::Array(items) => Value::Array(items.iter().map(|v| walk(v, changed)).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), walk(v, changed)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let mut changed = false;
+    let digested = walk(arguments, &mut changed);
+    changed.then_some(digested)
 }
 
 /// Every tool call in `history`, by the id its result carries.
@@ -1605,6 +1711,67 @@ mod tests {
             history.push(ChatMessage::tool_result(format!("id{step}"), "probe", body));
         }
         history
+    }
+
+    /// Under the `lean` profile an old call's long arguments go with its
+    /// result: every key survives, the long strings are cut to a head, the
+    /// recent calls are untouched, and a second pass is a no-op.
+    #[test]
+    fn lean_digests_old_call_arguments_and_leaves_recent_ones() {
+        const STEPS: usize = 20;
+        let content = "fn main() {}\n".repeat(400);
+        let mut history = vec![ChatMessage::system("you are wizard")];
+        for step in 0..STEPS {
+            let mut call_message = ChatMessage::assistant(format!("step {step}"));
+            let mut call = crate::llm::ToolCall::new(
+                "write_file",
+                serde_json::json!({ "path": format!("src/f{step}.rs"), "content": content }),
+            );
+            call.id = format!("id{step}");
+            call_message.push_tool_call(call);
+            history.push(call_message);
+            history.push(ChatMessage::tool_result(
+                format!("id{step}"),
+                "write_file",
+                "wrote it",
+            ));
+        }
+
+        let without = history.clone();
+        let mut untouched = without.clone();
+        assert_eq!(
+            shrink_old_results_with(&mut untouched, KEEP_WHOLE_RESULTS, 0, false),
+            0,
+            "stock leaves arguments alone"
+        );
+
+        let shrunk = shrink_old_results_with(&mut history, KEEP_WHOLE_RESULTS, 0, true);
+        assert_eq!(shrunk, STEPS - KEEP_WHOLE_RESULTS);
+        let calls: Vec<&crate::llm::ToolCall> =
+            history.iter().flat_map(ChatMessage::tool_calls).collect();
+        for (step, call) in calls.iter().enumerate() {
+            let args = &call.function.arguments;
+            assert_eq!(
+                args["path"],
+                format!("src/f{step}.rs"),
+                "short keys survive"
+            );
+            let text = args["content"].as_str().expect("content stays a string");
+            if step < STEPS - KEEP_WHOLE_RESULTS {
+                assert!(
+                    text.contains("elided from this old call"),
+                    "step {step}: {text}"
+                );
+                assert!(text.chars().count() < ARG_KEEP_CHARS);
+            } else {
+                assert_eq!(text, content, "step {step} is recent and stays whole");
+            }
+        }
+        assert_eq!(
+            shrink_old_results_with(&mut history, KEEP_WHOLE_RESULTS, 0, true),
+            0,
+            "a second pass finds nothing left to digest"
+        );
     }
 
     /// A tool result several times the per-result budget.
