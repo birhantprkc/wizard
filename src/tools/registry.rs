@@ -378,16 +378,21 @@ impl ToolRegistry {
         if self.is_deferred(name)
             && let Some(deferral) = &self.deferral
         {
-            // Load it now and hand back the schema, so the retry is the only
-            // extra call and the model never has to guess the arguments.
+            // The model named the tool, so run it: a refusal costs a whole
+            // round trip with the context re-sent. Arguments that do not fit
+            // come back with the schema, and the tool stays loaded for the
+            // retry.
             deferral.load(name);
-            let schema = serde_json::to_string(&tool.spec().function).unwrap_or_default();
-            return Err(ToolError::InvalidArgs {
-                tool: name.to_string(),
-                message: format!(
-                    "{name} was not loaded. It is loaded now; check the schema and call it again.\n{schema}"
-                ),
-            });
+            return match tool.execute(args, ctx).await {
+                Err(ToolError::InvalidArgs { tool: t, message }) => {
+                    let schema = serde_json::to_string(&tool.spec().function).unwrap_or_default();
+                    Err(ToolError::InvalidArgs {
+                        tool: t,
+                        message: format!("{message}\n{name} schema: {schema}"),
+                    })
+                }
+                other => other,
+            };
         }
         tool.execute(args, ctx).await
     }
@@ -876,9 +881,9 @@ mod tests {
         );
     }
 
-    /// A deferred tool is not advertised, a call to it is refused with its
-    /// schema (and loads it), and `tool_search` loads another so that it is
-    /// advertised and runs.
+    /// A deferred tool is not advertised, a call to it by name runs and loads
+    /// it, bad arguments come back with the schema, and `tool_search` still
+    /// returns full specs.
     #[tokio::test]
     async fn deferred_tools_load_through_tool_search() {
         use crate::tools::tool_search::{TOOL_SEARCH_TOOL_NAME, ToolSearchTool};
@@ -911,20 +916,21 @@ mod tests {
                 .contains(&"list_files".to_string())
         );
 
-        let refused = registry
-            .execute("list_files", serde_json::json!({}), &ctx)
-            .await
-            .expect_err("a deferred tool is refused before it is loaded");
-        assert!(refused.to_string().contains("not loaded"), "{refused}");
-        assert!(
-            refused.to_string().contains("\"parameters\""),
-            "schema rides along"
-        );
         let listed = registry
             .execute("list_files", serde_json::json!({}), &ctx)
             .await
-            .expect("and runs once loaded");
+            .expect("a deferred tool called by name runs on the first call");
         assert!(listed.content.contains("a.txt"));
+        assert!(!registry.is_deferred("list_files"), "and stays loaded");
+
+        let bad = registry
+            .execute("search_files", serde_json::json!({ "nope": 1 }), &ctx)
+            .await
+            .expect_err("arguments that do not fit are refused");
+        assert!(
+            bad.to_string().contains("\"parameters\""),
+            "with the schema: {bad}"
+        );
 
         let found = registry
             .execute(
