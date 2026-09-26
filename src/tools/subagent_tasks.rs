@@ -80,6 +80,8 @@ pub struct SubagentTaskSnapshot {
     pub task: String,
     /// `None` while the run is still in flight.
     pub result: Option<SubagentRunResult>,
+    /// The completion note already carried the result into the conversation.
+    pub reported: bool,
 }
 
 impl SubagentTaskSnapshot {
@@ -112,6 +114,7 @@ impl Entry {
             name: self.name.clone(),
             task: self.task.clone(),
             result: self.result.clone(),
+            reported: self.reported,
         }
     }
 }
@@ -290,6 +293,9 @@ struct SubagentStatusArgs {
     /// Omit to list every background subagent.
     #[serde(default)]
     id: Option<u32>,
+    /// Return the report even when its completion note already delivered it.
+    #[serde(default)]
+    full: bool,
 }
 
 /// `subagent_status` — state (and report, once finished) of background
@@ -312,7 +318,8 @@ impl Tool for SubagentStatusTool {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "integer", "description": "Background subagent id; omit to list all" }
+                "id": { "type": "integer", "description": "Background subagent id; omit to list all" },
+                "full": { "type": "boolean", "description": "Repeat a report the completion note already delivered" }
             }
         })
     }
@@ -334,7 +341,12 @@ impl Tool for SubagentStatusTool {
                 run.describe(),
                 run.task
             );
-            if let Some(result) = &run.result
+            let delivered = run.reported && crate::token_profile::current().safe() && !args.full;
+            if delivered && run.result.is_some() {
+                content.push_str(
+                    "\n(report already delivered in its completion note; pass full: true to repeat it)",
+                );
+            } else if let Some(result) = &run.result
                 && !result.output.trim().is_empty()
             {
                 let mut output = result.output.trim_end().to_string();
