@@ -51,9 +51,7 @@ is plain files you can inspect or delete.
 
 The picker lists the 20 most recent turns, newest first, each with its turn number, the
 first line of the prompt that started it (capped at 120 characters), and the base names
-of the files its edits touched. ↑/↓ select, Enter rewinds, Esc cancels. `/rewind` also
-runs in the window, where it answers with a notice naming the turn it went back to and
-the files it restored.
+of the files its edits touched. ↑/↓ select, Enter rewinds, Esc cancels.
 
 Rewinding to turn N:
 

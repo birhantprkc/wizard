@@ -1,35 +1,23 @@
 # Commands
 
 Wizard's built-in `/commands`, the custom ones you define as markdown files, and the `@path`
-tokens that inline file contents. All three live in `src/commands/`. The interactive surfaces
-— TUI and the window — read the built-in table from there; headless `-p` shares
+tokens that inline file contents. All three live in `src/commands/`. The TUI reads the
+built-in table from there; headless `-p` shares
 the custom-command and `@path` pipeline but does not parse built-ins (a `/word` typed there
 goes to the model unless it names a custom command).
 
 ## Built-in commands
 
 `COMMANDS` in `src/commands/mod.rs` is the single source of truth: what a command is called,
-what it does, and how each surface runs it. The TUI's suggestion popup, the window's `/`
-palette, and the allowlist the *agent* may invoke through its `run_command` tool are all
+what it does, and how each surface runs it. The TUI's suggestion popup and the allowlist the
+*agent* may invoke through its `run_command` tool are both
 derived from it. Two hand-kept lists is how two surfaces drift into offering different
 commands; there is one.
 
-The TUI runs every command — it is the surface they were written against. The window is the
-constrained one, and each command declares what it is there. Its column is still called
-`gui`: it was the browser GUI's, and when that surface was deleted the window inherited the
-column rather than growing a duplicate of it (`Surface::Gui`, `src/commands/surface.rs`).
-
-| | command | the window |
-|---|---|---|
-| **Against the agent** | `/model`, `/mode`, `/genie`, `/sovereign`, `/effort`, `/plan`, `/omakase`, `/compact`, `/btw`, `/fork`, `/goal`, `/status`, `/cost`, `/usage`, `/memory`, `/doctor`, `/bashes`, `/agents`, `/reload`, `/rewind`, `/fusion`, `/ultra`, `/server`, `/evolve`, `/publish`, `/help` | `agent` — queued on the chat's worker; the reply is a notice in the chat |
-| **The window's own** | `/clear`, `/diff`, `/todos`, `/dashboard`, `/resume`, `/resume-claude`, `/settings` (`/setup` is the same menu), `/provider`, `/login` | `ui`: a pane, a sheet, a list |
-| **Terminal only** | `/vim`, `/ui`, `/quit`, `/exit` | `unavailable` — refused, with what the command is and why a window is not where it runs |
-
-Where the two surfaces differ, the reason is the same one: **a chat is its session file.**
-`/clear` rotates that file, and `/resume` picks another — so in the window they are a new chat
-and the chat list, not commands against the agent. `/rewind` truncates it, and answers with a
-notice naming the turn and the files it restored; the transcript already drawn above that
-point is left where it is.
+The TUI runs every command — it is the surface they were written against. The table also
+carries a `gui` column (`Surface::Gui`, `src/commands/surface.rs`) that says how a graphical
+front end over the agent core would run each one. Both surfaces that used it, the browser GUI
+and then the iced window, are gone; Wizard GUI is a separate app that talks to Wizard over ACP.
 
 ### What the agent may run itself
 

@@ -318,7 +318,6 @@ impl LlamaCppPlugin {
                     "pi".to_string(),
                     "server".to_string(),
                     "default".to_string(),
-                    "full".to_string(),
                 ],
             },
         }

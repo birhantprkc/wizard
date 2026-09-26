@@ -91,11 +91,7 @@ impl GatewayPlugin {
                 // `server` above all: a long-lived headless process with no
                 // terminal is the shape of machine this is for. Out of `pi` and
                 // `minimal`, where there is nobody to have set a bot up.
-                profiles: vec![
-                    "server".to_string(),
-                    "default".to_string(),
-                    "full".to_string(),
-                ],
+                profiles: vec!["server".to_string(), "default".to_string()],
             },
         }
     }

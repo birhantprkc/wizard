@@ -324,21 +324,7 @@ pub enum Command {
     // The absent text only. See the `Fleet` variant above for why.
     Acp,
 
-    /// Open the GUI: an iced window (chat list, streaming conversation, git
-    /// rail) over the same agent core as the TUI. One process — no webview, no
-    /// HTTP, no port. Needs a build with `--features native`; chats are built
-    /// lazily, so it opens fine without a reachable provider.
-    /// See docs/native-gui.md.
-    //
-    // The one plugin-owned subcommand whose row stays in `--help` when
-    // nothing has registered it, and the doc comment above is that row —
-    // written for a reader who does *not* have a window, which is why it ends
-    // by naming the flag. `native` is off by default and the window ships as
-    // its own release asset, so on a stock build this is the common case
-    // rather than a misconfiguration, and dropping the row would be the only
-    // way most people never learn the window exists. A build that has one
-    // gets `Entrypoint::about` instead, which does not tell the reader to go
-    // and get something already in front of them.
+    /// Open Wizard GUI, the desktop app (a separate release asset)
     Gui {
         /// Accepted and ignored. `wizard gui --native` was how you asked for
         /// the window back when a plain `wizard gui` served a browser page
@@ -862,66 +848,38 @@ pub enum ScheduleCmd {
 /* Help, built from what this build actually has                          */
 /* ---------------------------------------------------------------------- */
 
-/// What `--help` does with a subcommand nothing has registered.
-///
-/// Two answers, because the two cases are genuinely different and the
-/// difference is already written down in [`crate::entrypoint::absent`]: `acp`,
-/// `fleet` and `mesh` are on by default and in every published binary, so a
-/// build without one is a build somebody made that way on purpose, and the
-/// row is noise. `native` is off by default and the window ships as its own
-/// release asset, so a build without it is the normal case and the row is how
-/// most people find out there is a window at all.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WhenAbsent {
-    /// Drop the row. The `clap` variant still parses, so `wizard acp` still
-    /// answers — with [`crate::entrypoint::absent`], which names the flag.
-    Drop,
-    /// Keep the row, with core's own text. That text is the doc comment on
-    /// the variant, so this arm does nothing at all: it is here to be named
-    /// at the one call site that means it.
-    Keep,
-}
-
 /// One row per CLI subcommand whose body ships in a plugin: what it answers
-/// to, what the plugin says it is on this build, and what to do when nothing
-/// answers.
+/// to, and what the plugin says it is on this build. A row nothing answers
+/// is hidden; the `clap` variant still parses, so `wizard acp` still
+/// answers, with [`crate::entrypoint::absent`], which names the flag.
 ///
-/// Core enumerating its five plugin-owned subcommands, which it already does
+/// Core enumerating its four plugin-owned subcommands, which it already does
 /// twice — once as `clap` variants above, once as dispatch arms in
 /// [`crate::run`] — and for the same reason: parsing `wizard fleet run -n 3`
 /// is core's job whether or not a fleet is compiled in, so the variants stay,
 /// and something has to join each one to the lookup that finds its body. The
 /// argument type is part of that join ([`crate::entrypoint::installed`] is a
-/// `TypeId` downcast), which is why this is five written-out lookups and not
+/// `TypeId` downcast), which is why this is four written-out lookups and not
 /// a loop over a table of names.
-fn plugin_subcommands() -> [(&'static str, Option<&'static str>, WhenAbsent); 5] {
+fn plugin_subcommands() -> [(&'static str, Option<&'static str>); 4] {
     use crate::entrypoint::{self, installed, installed_subcommand};
 
     [
         (
-            entrypoint::GUI,
-            installed::<crate::config::Config>(entrypoint::GUI).map(|entry| entry.about()),
-            WhenAbsent::Keep,
-        ),
-        (
             entrypoint::ACP,
             installed::<crate::config::Config>(entrypoint::ACP).map(|entry| entry.about()),
-            WhenAbsent::Drop,
         ),
         (
             entrypoint::FLEET,
             installed::<FleetCmd>(entrypoint::FLEET).map(|entry| entry.about()),
-            WhenAbsent::Drop,
         ),
         (
             entrypoint::MCP_SERVE,
             installed::<McpServeCmd>(entrypoint::MCP_SERVE).map(|entry| entry.about()),
-            WhenAbsent::Drop,
         ),
         (
             entrypoint::PEERS,
             installed_subcommand(entrypoint::PEERS).map(|entry| entry.about()),
-            WhenAbsent::Drop,
         ),
     ]
 }
@@ -930,9 +888,9 @@ fn plugin_subcommands() -> [(&'static str, Option<&'static str>, WhenAbsent); 5]
 /// derive describes.
 ///
 /// The derive cannot know: whether `wizard acp` does anything is a property of
-/// the plugin set, which is a runtime lookup. So the five rows above are
+/// the plugin set, which is a runtime lookup. So the four rows above are
 /// folded in here — the description a registered surface gave itself replaces
-/// core's, and a row with nothing behind it is dropped or kept per its policy.
+/// core's, and a row with nothing behind it is dropped.
 ///
 /// Everything else in the tree keeps using `Cli::parse` / `Cli::try_parse_from`
 /// on the derived command, because everything else is *parsing*, and parsing
@@ -942,11 +900,10 @@ pub fn command() -> clap::Command {
     use clap::CommandFactory;
 
     let mut cmd = Cli::command();
-    for (name, about, absent) in plugin_subcommands() {
-        cmd = cmd.mut_subcommand(name, |sub| match (about, absent) {
-            (Some(about), _) => sub.about(about),
-            (None, WhenAbsent::Drop) => sub.hide(true),
-            (None, WhenAbsent::Keep) => sub,
+    for (name, about) in plugin_subcommands() {
+        cmd = cmd.mut_subcommand(name, |sub| match about {
+            Some(about) => sub.about(about),
+            None => sub.hide(true),
         });
     }
     cmd

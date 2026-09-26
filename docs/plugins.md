@@ -20,8 +20,8 @@ current answer, so nobody has to reconstruct it from the history.
 | | |
 | --- | --- |
 | Backends | in-tree Rust behind a cargo feature; LuaJIT; JavaScript (QuickJS) |
-| Cargo features | 20, all on by default except `native` |
-| Rust plugins | 9 providers (7 features), the window, `graph`, `tool-web`, `mesh`, `fleet`, `acp`, `gateway`, `mcp`, and the llama.cpp runtime folded into `provider-llamacpp` |
+| Cargo features | 18, all on by default |
+| Rust plugins | 9 providers (7 features), `graph`, `tool-web`, `mesh`, `fleet`, `acp`, `gateway`, `mcp`, and the llama.cpp runtime folded into `provider-llamacpp` |
 | Lua plugins | `git` (`git_status`, `git_diff`), `publish` |
 | JavaScript plugins | `json` (`json_query`) |
 | Verified how | `contrib/check-provider-plugins.sh` and `contrib/check-tool-plugins.sh` build **and test** every leave-one-out feature set |
@@ -358,9 +358,8 @@ them off an installed binary and marks the one it is.
 | `pi` | `provider-llamacpp`, `provider-ollama`, `tool-git` | Raspberry Pi, small ARM: a local model, no account |
 | `server` | default minus `graph` and `mesh` | headless boxes: every provider and every remote surface, no P2P |
 | `default` | Cargo's `default` list — seventeen | everyone else, and what every release binary is |
-| `full` | default plus `native` | one binary with the window in it |
 
-`src/plugins/profile.rs` is the table; the same five are restated in
+`src/plugins/profile.rs` is the table; the same four are restated in
 `install.sh` because that script is piped from a URL and has no checkout to
 read, and a test sources it and diffs the two.
 
@@ -944,6 +943,10 @@ failed: exited 3" rather than as "tool '...' failed".
 
 ## As built: the window is a plugin, and it is the first one that is not a provider
 
+> The iced window described in this section was removed in 3.5; the desktop
+> app is now Wizard GUI in `gui/`, a separate program. The section is kept
+> as the record of how the first non-provider plugin was cut.
+
 `src/native/` (the iced window, ~15.7k lines) and `src/gui/` (the agent core
 under it — sessions, the config store, git, OAuth, ~5.1k) are now
 `src/plugins/native/` and `src/plugins/gui/`, behind the existing `native`
@@ -1045,7 +1048,7 @@ Nesting it would say the window owns it. `compiled_in()` therefore has one
 
 `native`, exactly as before. `install.sh` reads `WIZARD_NATIVE=1`, the
 `native` job in `.github/workflows/release.yml` publishes
-`wizard-native-<target>.tar.gz`, and `docs/native-gui.md` spells it
+`wizard-native-<target>.tar.gz`, and `docs/native-gui.md` spelled it
 throughout. Renaming it to `plugin-native` for symmetry with
 `provider-anthropic` would break the release pipeline to make a table look
 tidier.

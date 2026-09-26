@@ -35,10 +35,8 @@ DEFAULT_MIN_LINE_PERCENT=79
 # minutes apart measure the same machine and not the CI matrix. Tighten it
 # once CI has measured this branch a few times.
 #
-# Measured with DEFAULT features only, which is the whole point of the number:
-# `src/plugins/native/` sits behind an off-by-default flag and is absent from both
-# sides of the ratio, so an unmeasured GUI can neither prop the figure up nor
-# drag it down.
+# Measured with DEFAULT features only: the number describes the binary that
+# ships.
 #
 # A zero here means UNSEEDED and makes this script exit 1 on every run. That
 # path is still live, and `coverage-selfcheck` in CI is what proves it: a

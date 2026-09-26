@@ -45,9 +45,8 @@ categories = [
 # 1.2 MB — over half the crate on its own, downloaded by every `cargo install`
 # and never opened by one.
 #
-# Deliberately narrow, because two things under `assets/` are compiled *into*
-# the binary and excluding either breaks the build rather than slimming it:
-# `assets/fonts/*.ttf` is `include_bytes!`d by `src/plugins/native/font.rs`, and
+# Deliberately narrow, because one thing under `assets/` is compiled *into*
+# the binary and excluding it breaks the build rather than slimming it:
 # `assets/themes/*.toml` is `include_str!`d by `src/theme.rs`. `build.rs`,
 # `WIZARD.md` (`include_str!` in `src/agent/prompts.rs` and `src/tools/manual.rs`)
 # and `wizard-release.pub` (`include_str!` in `src/update.rs`) are all load-bearing
@@ -205,11 +204,8 @@ mcp = []
 #
 # The only plugin that registers nothing through `Ctx`, because what it
 # produces is a data model rather than a tool, a command or a provider; see
-# `GraphPlugin`. Its one consumer is the GUI's explorer screen
-# (`src/plugins/native/graph/`), which is gated on this feature in step, so a
-# build without it is a window with no explorer -- which is the window that
-# ships today, since `src/plugins/native/mod.rs` records that screen as deferred
-# and not yet reachable.
+# `GraphPlugin`. Nothing in the tree draws it any more: its one consumer was
+# the iced window's explorer screen, which went with the window.
 #
 # It enables `mesh` rather than merely assuming it: a `MeshGraph` is built from
 # a `PeerStore`, so this is a genuine dependency between two plugins and Cargo
@@ -310,38 +306,6 @@ tool-json = ["plugin-js"]
 # `web_search`, `generate_image` and `sync` all use them and have nothing to do
 # with which model answers a turn. See `src/plugins/xai.rs`.
 provider-xai = []
-
-# The GUI (`wizard gui`): an iced window over the agent core, with no webview,
-# no loopback HTTP and no JSON round-trip per streaming token. It is the only
-# GUI — the browser one it replaced (axum, a WebSocket and `gui/assets/`) is
-# deleted; see `docs/native-gui.md`.
-#
-# OFF by default: iced is a windowing toolkit, so a default-featured build
-# would link winit, a font stack and a rasterizer into every headless
-# `wizard -p`, every `wizard acp` and every CI container — several hundred
-# crates that a terminal user never executes a line of. It would also break the
-# static musl build, because winit reaches X11 and Wayland through `dlopen`,
-# and it would put the whole UI layer inside the coverage ratchet
-# (`contrib/check-coverage.sh` measures default features), where a widget tree
-# that can only be exercised with a compositor would drag the floor down for
-# everyone.
-#
-# So `cargo build` with no features must keep linking no iced at all, and the
-# window ships as its *own* release asset: the `native` job in
-# `.github/workflows/release.yml` publishes `wizard-native-<target>.tar.gz` for
-# the four gnu/darwin targets, and `install.sh WIZARD_NATIVE=1` installs one.
-# See `docs/native-gui.md`.
-# `src/plugins/gui/` — sessions, config store, git, OAuth — is behind this flag too:
-# the window is now the only thing that reaches it.
-#
-# The name is load-bearing and must not change: `install.sh` reads
-# `WIZARD_NATIVE=1`, `.github/workflows/release.yml` has a job called `native`,
-# and `docs/native-gui.md` spells it throughout. It is also the one plugin
-# feature that is not a provider — the window registers a `wizard gui`
-# entrypoint with the kernel and core looks it up by string, so leaving the
-# feature out removes the surface without core changing a line. See
-# `src/plugins/native/plugin.rs`.
-native = ["dep:iced", "dep:iced_highlighter", "dep:iced_test"]
 
 [dependencies]
 # NOTE: every dependency here must be a crates.io dependency. `cargo publish`
@@ -497,68 +461,6 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # a blocking `recv()` is not.
 mdns-sd = { version = "0.20", optional = true, default-features = false, features = ["log", "async"] }
 
-# The native GUI (`--features native` only). Every feature here is chosen
-# against a dependency that is already in the tree, because the whole point of
-# an in-process GUI is that it does not bring a second copy of anything:
-#
-# `default-features = false` + `tiny-skia` is the load-bearing one. It links no
-# wgpu at all — not a runtime fallback, an absent dependency — which is what
-# keeps `curl | bash` honest on a box with no Vulkan driver, and what keeps the
-# build off the shader toolchain. `cargo tree -i wgpu --features native` must
-# stay empty.
-#
-# `image-without-codecs` rather than `image`: the latter turns on `image`'s
-# default feature set, which would undo the four-format selection above
-# (`png, jpeg, gif, webp`) that keeps the TIFF/DDS/EXR/AVIF decoders out.
-#
-# `linux-theme-detection` is deliberately OFF. It is in iced's default set and
-# it pulls `mundy`, which runs its D-Bus query on `async-io` — a second,
-# smol-flavoured reactor thread alongside the tokio runtime the agent core
-# already owns. The theme comes from `crate::theme` anyway (see
-# `src/plugins/native/theme.rs`), so the detection would be ignored even if it worked.
-#
-# `highlighter` reaches syntect through `two-face` with `syntect-default-fancy`,
-# which is byte-identical to the selection above: one syntect, fancy-regex, no
-# oniguruma and so no C dependency.
-#
-# `markdown` is deliberately OFF: it pins `pulldown-cmark ^0.12` against the
-# 0.13 above, so enabling it links two copies of the parser. Wizard's own
-# markdown pipeline feeds `text::Rich` spans instead.
-iced = { version = "0.14", optional = true, default-features = false, features = [
-  "tiny-skia",
-  "x11",
-  "wayland",
-  "canvas",
-  "tokio",
-  "image-without-codecs",
-  "highlighter",
-  "lazy",
-  "advanced",
-] }
-# Reached directly for `Highlighter::new`, which the transcript's code blocks
-# drive per-line. Re-exported by iced under the `highlighter` feature, but
-# naming it here is what pins the version alongside iced's.
-iced_highlighter = { version = "0.14", optional = true }
-
-# Headless UI testing for the window: `Simulator` drives a widget tree with no
-# compositor and snapshots it to PNG, and `iced_test::runtime` re-exports the
-# `UserInterface` the selection tests drive directly, because
-# `Simulator::simulate` hardcodes `clipboard::Null` and so cannot observe a
-# copy. Only `src/plugins/native/**` names it, always under `#[cfg(test)]`.
-#
-# Here rather than in `[dev-dependencies]`, which is where it belongs and where
-# it cannot go. Cargo compiles a dev-dependency for every `cargo test` whether
-# or not any code under `#[cfg]` names it, so an unconditional entry drags
-# `iced_renderer` into a default-feature test build, where it gets no renderer
-# backend and hits iced's own `compile_error!`. That breaks `cargo test
-# --release` specifically, which is the command deep evolve gates a
-# self-authored patch on (`src/evolve/mod.rs`, `TEST_ARGS`) — so every
-# self-rebuild would fail on an error that has nothing to do with the patch.
-# `optional` is the fix and `[dev-dependencies]` forbids it ("dev-dependencies
-# are not allowed to be optional"), so it moves up here and `native` turns it
-# on. A `native` release build compiles the crate and links none of it.
-iced_test = { version = "0.14", optional = true }
-
 # Embedded LuaJIT for self-extension: scripted tools and evolve glue run through
 # the just-in-time compiler in-process. Vendored so the binary has no system
 # libluajit dependency; `send` so Lua handles can cross await points.
@@ -607,9 +509,6 @@ core-graphics = { version = "0.24", features = ["highsierra"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
-# `iced_test` is not here: it is optional and lives under `[dependencies]`,
-# because a dev-dependency cannot be optional and an unconditional one breaks
-# `cargo test --release` without `native`. See the note at its entry.
 
 [profile.release]
 strip = true

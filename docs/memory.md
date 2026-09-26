@@ -78,7 +78,7 @@ where it is already about to save or delete:
 
 ## Seeing and managing them
 
-`/memory` in the TUI (and in the window) is the human's view of the store:
+`/memory` in the TUI is the human's view of the store:
 
 | Command | What it does |
 |---------|--------------|

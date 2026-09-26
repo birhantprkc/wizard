@@ -2,7 +2,8 @@
 
 Wizard speaks the [Agent Client Protocol](https://agentclientprotocol.com/),
 so ACP editors — **Zed**, **Neovim** (CodeCompanion / avante), **Emacs** — can
-drive it as their coding agent. Same agent core as the TUI and the window;
+drive it as their coding agent. Same agent core as the TUI, and the protocol
+Wizard GUI drives it over;
 the surface is your editor on the other end of a pipe.
 
 ```bash

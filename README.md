@@ -18,7 +18,7 @@ nix run github:teddytennant/wizard
 cd contrib/aur/wizard-bin && makepkg -si
 ```
 
-Every other flavor (a preinstalled local model, the window, from source, Termux) is in [Getting started](docs/getting-started.md#install).
+Every other flavor (a preinstalled local model, from source, Termux) is in [Getting started](docs/getting-started.md#install).
 
 ## Startup
 
@@ -51,8 +51,6 @@ Measured 2026-09-11 with [`bench/startup/run.sh`](bench/startup/README.md) on an
 Measured 2026-09-26 on 8 tasks taken from a real project's history: a commit that adds failing tests, then the commit that makes them pass. Two tries each on Grok 4.6. A run fails if it edits the tests or breaks another one. The first request is from an empty directory with one MCP server and one hook configured. The per-task `safe` row was run before MCP tools were deferred, so the shipped default sends less than it shows. `min` has the smallest first request but costs more per task: a stripped prompt makes the model take three to five extra steps, and each one sends new tokens that miss the cache. How the defaults were found, from the AHE run through the Terminal-Bench post-mortem to this, is in [Harness engineering](docs/harness-engineering.md). The profiles are in [Token profiles](docs/token-profiles.md).
 
 ## Desktop app
-
-![Wizard GUI](gui/apps/zeron/assets/screenshot.png)
 
 Wizard GUI is the desktop app, built from `gui/` in this repo. It runs Wizard, Pi and Claude Code side by side across your projects and on machines you reach over SSH, and it can reuse a Codex (ChatGPT) or Grok CLI sign-in it finds on disk. Installers for Linux, macOS and Windows are attached to every [release](https://github.com/teddytennant/wizard/releases), and `wizard gui` opens it once it is installed. It is a fork of [Zeron](https://github.com/zeronsh/zeron) under the MIT license. [gui/README.md](gui/README.md)
 

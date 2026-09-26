@@ -1,0 +1,14 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- Wizard GUI app icon: Wizard's wand mark inside the platform icon grid. -->
+<g transform="translate(100 100) scale(1.609375)">
+  
+  <rect width="512" height="512" rx="114" fill="#0c0c0e"/>
+  <rect x="0.5" y="0.5" width="511" height="511" rx="113.5" fill="none" stroke="#26262a"/>
+  <g fill="#ececee">
+    <path d="M 157.07 385.07 L 305.27 236.87 L 291.13 222.73 L 142.93 370.93 Z"/>
+    <circle cx="150.00" cy="378.00" r="10.00"/>
+    <circle cx="298.20" cy="229.80" r="9.00"/>
+    <path d="M 389.45 161.71 L 356.26 192.97 L 366.29 237.45 L 335.03 204.26 L 290.55 214.29 L 323.74 183.03 L 313.71 138.55 L 344.97 171.74 Z"/>
+  </g>
+</g>
+</svg>

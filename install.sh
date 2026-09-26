@@ -86,13 +86,6 @@
 #                                about what the installer sets up, not about
 #                                which plugins the binary has.
 #   WIZARD_WITH_TOOLCHAIN        1 = eagerly install a Rust toolchain for deep evolve (default 0)
-#   WIZARD_NATIVE                1 = also install the native GUI: a second binary,
-#                                    `wizard-native` (built --features native),
-#                                    which is the only build that can open the
-#                                    window with `wizard gui`. Needs no
-#                                    system packages on either OS. `wizard` itself
-#                                    is untouched. Unsupported on Termux, and
-#                                    there is no static musl build of it.
 #                                    (WIZARD_APP is the old name, still honored.)
 #                                    (default 0)
 #   WIZARD_VERSION               release tag to install, e.g. v0.4.0 (default: the
@@ -169,7 +162,6 @@ WIZARD_LLAMACPP_NO_CUDA="${WIZARD_LLAMACPP_NO_CUDA:-0}"
 WIZARD_USE_OLLAMA="${WIZARD_USE_OLLAMA:-0}"
 WIZARD_SKIP_OLLAMA_INSTALL="${WIZARD_SKIP_OLLAMA_INSTALL:-0}"
 WIZARD_WITH_TOOLCHAIN="${WIZARD_WITH_TOOLCHAIN:-0}"
-WIZARD_NATIVE="${WIZARD_NATIVE:-0}"
 WIZARD_VERSION="${WIZARD_VERSION:-}"
 WIZARD_REPO="${WIZARD_REPO:-teddytennant/wizard}"
 WIZARD_REF="${WIZARD_REF:-}"
@@ -181,22 +173,18 @@ WIZARD_REF="${WIZARD_REF:-}"
 WIZARD_MIRROR="${WIZARD_MIRROR:-}"
 WIZARD_BUILD_FROM_SOURCE="${WIZARD_BUILD_FROM_SOURCE:-0}"
 
-# WIZARD_APP is the old name for the graphical install. It installed
-# `wizard-desktop`, a webview window over the loopback GUI server, which this
-# release deleted; WIZARD_NATIVE installs the iced window that replaced it.
-# Honored as a deprecated alias so an existing provisioning script still gets a
-# window rather than silently getting nothing.
-if [ "${WIZARD_APP:-0}" = "1" ]; then WIZARD_NATIVE=1; fi
+# WIZARD_NATIVE and WIZARD_APP used to install a second binary with a window
+# in it. The desktop app is Wizard GUI now, a separate release asset, so say
+# where it is rather than silently installing nothing.
+if [ "${WIZARD_NATIVE:-0}" = "1" ] || [ "${WIZARD_APP:-0}" = "1" ]; then
+    WIZARD_GUI_HINT=1
+fi
 
 # Termux cannot run the published gnu/musl release binaries (Android/Bionic).
-# Force a source build unless the user already asked for one; never try the
-# native GUI (no display server, and no prebuilt asset for Bionic).
+# Force a source build unless the user already asked for one.
 if is_termux; then
     if [ "$WIZARD_BUILD_FROM_SOURCE" != "1" ]; then
         WIZARD_BUILD_FROM_SOURCE=1
-    fi
-    if [ "$WIZARD_NATIVE" = "1" ]; then
-        WIZARD_NATIVE=0
     fi
 fi
 
@@ -259,9 +247,6 @@ MEM_SOURCE=""
 BINARY_INSTALLED=0
 INSTALLED_PATH=""
 PLACED_PATH=""
-NATIVE_INSTALLED=0
-NATIVE_PATH=""
-NATIVE_BIN=""
 
 TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
@@ -324,7 +309,6 @@ profile_features() {
         pi)      printf 'provider-llamacpp,provider-ollama,tool-git' ;;
         server)  profile_default_minus graph mesh ;;
         default) printf '%s' "$WIZARD_DEFAULT_FEATURES" ;;
-        full)    printf '%s,native' "$WIZARD_DEFAULT_FEATURES" ;;
         *)       return 1 ;;
     esac
 }
@@ -340,7 +324,6 @@ profile_features() {
 profile_cargo_flags() {
     case "${1:-}" in
         default) printf '' ;;
-        full)    printf -- '--features native' ;;
         minimal|pi|server)
             printf -- '--no-default-features --features %s' "$(profile_features "$1")" ;;
         *) return 1 ;;
@@ -353,7 +336,7 @@ WIZARD_PROFILE="${WIZARD_PROFILE:-}"
 CARGO_FEATURE_FLAGS=""
 if [ -n "$WIZARD_PROFILE" ]; then
     profile_features "$WIZARD_PROFILE" >/dev/null 2>&1 \
-        || die "WIZARD_PROFILE='${WIZARD_PROFILE}' is not a profile — pick one of: minimal, pi, server, default, full (see docs/plugins.md)"
+        || die "WIZARD_PROFILE='${WIZARD_PROFILE}' is not a profile — pick one of: minimal, pi, server, default (see docs/plugins.md)"
     CARGO_FEATURE_FLAGS="$(profile_cargo_flags "$WIZARD_PROFILE")"
     # A profile is a *build*, and the published release assets are all the
     # default one, so anything else has to be compiled here. `default` is the
@@ -361,12 +344,6 @@ if [ -n "$WIZARD_PROFILE" ]; then
     # WIZARD_PROFILE=default a no-op rather than a slow no-op.
     if [ "$WIZARD_PROFILE" != "default" ]; then
         WIZARD_BUILD_FROM_SOURCE=1
-    fi
-    # Not a conflict, but it is almost always a mistake: `full` puts the window
-    # inside the one `wizard` binary, and WIZARD_NATIVE installs a second binary
-    # called `wizard-native` that also has it. Doing both compiles iced twice.
-    if [ "$WIZARD_PROFILE" = "full" ] && [ "$WIZARD_NATIVE" = "1" ]; then
-        warn "WIZARD_PROFILE=full already builds the window into 'wizard'; WIZARD_NATIVE=1 will build it a second time as 'wizard-native'"
     fi
 fi
 
@@ -446,7 +423,6 @@ termux_banner() {
     printf '\n' >&2
     warn "Local GGUF / stock llama-server and Ollama curl installs are not supported here;"
     warn "use a cloud provider in onboarding, or put a Termux-built llama-server on PATH."
-    warn "The native GUI (WIZARD_NATIVE) is skipped — use the TUI."
     printf '\n'
 }
 
@@ -1119,7 +1095,7 @@ pull_model() {
 
 place_binary() {
     # $1 = path to the extracted binary, $2 = name to install it as (default
-    # "wizard"; the native GUI build goes in beside it as "wizard-native").
+    # "wizard").
     # Sets PLACED_PATH to where it landed.
     local src="$1" name="${2:-wizard}"
     chmod 755 "$src"
@@ -1758,8 +1734,7 @@ download_binary() {
             # `find` hit lets a rejected binary answer for the asset tried
             # after it, in whatever order the directory happens to walk —
             # which would install the very binary the sanity check below
-            # just refused. `fetch_native_binary` unpacks per-asset for the
-            # same reason.
+            # just refused.
             local unpack="${TMP_DIR}/unpack-${asset}"
             rm -rf "$unpack"
             mkdir -p "$unpack" || continue
@@ -1978,97 +1953,6 @@ build_from_source() {
     INSTALLED_PATH="$PLACED_PATH"
     BINARY_INSTALLED=1
     say "Installed wizard (built from source) to ${INSTALLED_PATH}"
-}
-
-# --- native GUI (WIZARD_NATIVE=1) ---------------------------------------
-
-# `wizard gui` opens an iced window in the agent's own process. iced
-# is behind an off-by-default cargo feature (`Cargo.toml` `[features]` says
-# why), so it needs its own build — and that build ships as a *separate*
-# binary, `wizard-native`, which never replaces `wizard`.
-#
-# Two binaries rather than one, for the same reason the webview shell this
-# replaced had two, minus the webview's reason. There is no shared library to
-# be missing here: the asset links only libc, libm and libgcc_s, because
-# `tiny-skia` means no wgpu and winit reaches X11 and Wayland through `dlopen`
-# at the moment a window opens. What is still true is that the native asset
-# exists only for the gnu and darwin targets — `dlopen` from a fully static
-# musl binary does not work — so on a host where `wizard` itself is the musl
-# build, replacing it with this one would trade a binary that runs anywhere for
-# a binary that runs here. Keeping them apart means the graphical build is
-# strictly additive.
-
-native_asset_name() {
-    case "$OS" in
-        macos) printf 'wizard-native-%s-apple-darwin.tar.gz' "$ARCH" ;;
-        # No musl native asset: see above.
-        *)     printf 'wizard-native-%s-unknown-linux-gnu.tar.gz' "$ARCH" ;;
-    esac
-}
-
-# Sets NATIVE_BIN to a runnable native-GUI binary; returns nonzero if one
-# could not be obtained. Mirrors download_binary / build_from_source.
-#
-# The path comes back in a global, and the caller must never wrap this in
-# `$(…)`. verify_checksum below reaches die() on a digest mismatch, an
-# unsignable release or a signature that does not verify, and inside a command
-# substitution that `exit 1` ends only the subshell: the install would carry on,
-# report "no runnable native build", and finish 0 after refusing a tampered
-# asset. Nothing unverified would be installed either way, but "every failure
-# aborts" (SECURITY.md) would be false and the user would be told the wrong
-# reason. This is the only place in the script where a die() sits under a
-# function that a caller could capture, so it is kept uncapturable instead.
-fetch_native_binary() {
-    local asset bin src_dir
-    NATIVE_BIN=""
-    if [ "$WIZARD_BUILD_FROM_SOURCE" = "1" ]; then
-        src_dir="${TMP_DIR}/wizard-src"
-        [ -d "$src_dir" ] || return 1
-        say "Building the native GUI from source (--features native) ..."
-        ( cd "$src_dir" && cargo build --release --features native ) || return 1
-        bin="${src_dir}/target/release/wizard"
-    else
-        asset="$(native_asset_name)"
-        download_release_asset "$asset" "${TMP_DIR}/${asset}" || return 1
-        verify_checksum "${TMP_DIR}/${asset}" "$asset"
-        local unpack="${TMP_DIR}/native"
-        mkdir -p "$unpack"
-        tar -xzf "${TMP_DIR}/${asset}" -C "$unpack" || return 1
-        bin="$(find "$unpack" -type f -name wizard | head -n1 || true)"
-    fi
-    [ -n "$bin" ] && [ -f "$bin" ] || return 1
-    chmod 755 "$bin"
-    # `--version` returns before any window is opened, so this proves the
-    # binary links and reaches main without needing a display.
-    "$bin" --version >/dev/null 2>&1 || return 1
-    NATIVE_BIN="$bin"
-}
-
-install_native_gui() {
-    [ "$WIZARD_NATIVE" = "1" ] || return 0
-
-    printf '\n'
-    say "Native GUI (WIZARD_NATIVE=1): the agent in its own window"
-
-    if is_termux; then
-        warn "the native GUI is not supported on Termux (no display server, no Bionic asset)"
-        warn "use the TUI ('wizard') — skipping WIZARD_NATIVE"
-        return 0
-    fi
-
-    # A verification failure never lands here: verify_checksum aborts the whole
-    # install rather than returning, so reaching this branch means the asset
-    # could not be fetched, held no wizard binary, or does not run on this host.
-    if ! fetch_native_binary; then
-        warn "could not install the native GUI for ${OS}/${ARCH} (no native asset could be fetched, or the build inside it does not run here)"
-        warn "use the TUI ('wizard') — 'wizard gui' needs this build, and the browser GUI is gone"
-        return 0
-    fi
-
-    place_binary "$NATIVE_BIN" "wizard-native"
-    NATIVE_PATH="$PLACED_PATH"
-    NATIVE_INSTALLED=1
-    say "Installed wizard-native to ${NATIVE_PATH}"
 }
 
 # --- config -------------------------------------------------------------
@@ -2533,11 +2417,10 @@ main() {
     install_toolchain
     write_config
     install_loadout
-    install_native_gui
 
     printf '\n'
-    if [ "$NATIVE_INSTALLED" = "1" ]; then
-        say "Native GUI installed. Open the window with: wizard-native gui"
+    if [ "${WIZARD_GUI_HINT:-0}" = "1" ]; then
+        say "The desktop app is Wizard GUI, a separate download: https://github.com/${WIZARD_REPO}/releases/latest"
     fi
     if [ "$BINARY_INSTALLED" = "1" ]; then
         say "Done. Run: wizard"

@@ -58,7 +58,7 @@ The same script has four mutually exclusive flavors:
 |----------|-------|
 | Linux x86_64 / aarch64 | Prebuilt glibc and static-musl binaries; the installer prefers musl on NixOS |
 | macOS Apple Silicon / Intel | Same `curl … \| bash`; prebuilt binaries for both architectures; Metal-backed `llama-server` for the local stack |
-| Termux (Android) | Supported via on-device **source build** into `$PREFIX/bin`. No matching prebuilt release (Bionic libc). The native GUI, stock llama.cpp Ubuntu assets, and the Ollama curl installer are skipped; use a cloud provider, or put a Termux-built `llama-server` on `PATH` |
+| Termux (Android) | Supported via on-device **source build** into `$PREFIX/bin`. No matching prebuilt release (Bionic libc). Stock llama.cpp Ubuntu assets and the Ollama curl installer are skipped; use a cloud provider, or put a Termux-built `llama-server` on `PATH` |
 | Windows | Not supported natively; use WSL2 |
 
 The installer downloads the prebuilt binary matching your OS and architecture, verifies the release signature and the binary's checksum, and falls back to a source build when no prebuilt asset is available. On Termux it always builds from source (no matching prebuilt). Everywhere else the one-liner installs a signed release binary.
@@ -75,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh
 What the installer does on Termux:
 
 1. Detects Termux (`TERMUX_VERSION` / `$PREFIX`) and sets `WIZARD_INSTALL_DIR=$PREFIX/bin` (no `sudo`)
-2. Forces `WIZARD_BUILD_FROM_SOURCE=1` and skips prebuilt download, `WIZARD_NATIVE`, stock llama.cpp assets, and the Ollama curl installer
+2. Forces `WIZARD_BUILD_FROM_SOURCE=1` and skips prebuilt download, stock llama.cpp assets, and the Ollama curl installer
 3. Clones the repo, runs `cargo build --release`, and installs `wizard` next to your other Termux packages
 
 First run opens onboarding: pick a **cloud** provider (API key or sign-in). On-device GGUF via the one-click Local path is not wired to a Termux-native llama.cpp build yet; if you already have a Termux-built `llama-server` on `PATH` (or in `~/.wizard/bin`), Wizard will use it.
@@ -99,32 +99,15 @@ nix run github:teddytennant/wizard              # run without installing
 nix profile install github:teddytennant/wizard  # add to your profile
 ```
 
-The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard, plus the X11/Wayland libraries `--features native` opens a window with), `overlays.default`, and `homeModules.default` for wiring it into a Home Manager config (it was called `homeManagerModules.default` before 2.0.0, which is not an output name Nix recognizes, so `nix flake check` skipped it; that spelling is still exported as an alias, so an existing import keeps working). On NixOS the curl installer detects the system, points you at these commands, and, if you run it anyway, prefers the musl asset into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there). The musl assets are static (the release workflow fails a musl build that asks for a loader), so that prebuilt starts as it is; if no published asset runs on the machine, `wizard update` builds the tag from source instead of leaving you on the old binary.
-
-`packages.default` builds with default features, so it does **not** carry the native GUI — build one from a checkout of the flake with `cargo build --release --features native` inside `nix develop`.
+The flake exposes `packages.default` (and `.wizard`), `apps.default`, `devShells.default` (Rust toolchain + `llama-cpp` for hacking on Wizard), `overlays.default`, and `homeModules.default` for wiring it into a Home Manager config (it was called `homeManagerModules.default` before 2.0.0, which is not an output name Nix recognizes, so `nix flake check` skipped it; that spelling is still exported as an alias, so an existing import keeps working). On NixOS the curl installer detects the system, points you at these commands, and, if you run it anyway, prefers the musl asset into `~/.local/bin` rather than `/usr/local/bin` (which isn't on the FHS path there). The musl assets are static (the release workflow fails a musl build that asks for a loader), so that prebuilt starts as it is; if no published asset runs on the machine, `wizard update` builds the tag from source instead of leaving you on the old binary.
 
 ### The GUI
 
-Wizard has one graphical surface, `wizard gui`, and it needs a build with `--features native`. The browser GUI that used to be the other one — a loopback HTTP server on port 4680 and a JavaScript page — is deleted.
+The desktop app is Wizard GUI, built from [`gui/`](../gui/README.md) and attached to every release from 3.5.0 on as `wizard-gui-<version>-<platform>` (a Linux tarball, a macOS dmg, a Windows zip). `wizard gui` starts it once it is installed, and says where to download it when it is not. `--native` is still accepted and ignored.
 
-That leaves four ways to drive a machine you are not sitting at, none of which needs a window or a port: run the TUI over SSH, run `wizard -p '<prompt>'`, point an ACP editor at `wizard acp` over the same SSH connection, or run the [Telegram gateway](gateway.md) on the box.
+The iced window that `wizard gui` used to open, and the `wizard-native` binary that carried it, were removed in 3.5.
 
-The window is a separate build because iced is several hundred crates that a `wizard -p`, a `wizard acp` or a CI container never executes a line of, and because it cannot be linked into the static musl binary. Two ways to get one:
-
-```bash
-# a second binary beside `wizard`, from the release assets
-curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \
-  | WIZARD_NATIVE=1 bash
-wizard-native gui
-
-# or from a checkout
-cargo build --release --features native
-./target/release/wizard gui
-```
-
-`WIZARD_NATIVE=1` installs `wizard-native` next to `wizard` and never replaces it, so the plain binary keeps its runs-anywhere promise. The asset exists for glibc Linux and macOS on both architectures; there is no musl or Termux build of it. A plain binary asked for `wizard gui` says it has no window and prints these lines. `--native` is still accepted and ignored, so an alias written when there were two GUIs still opens the one there is. See [Native GUI](native-gui.md).
-
-`WIZARD_NATIVE=1` downloads that asset; combined with `WIZARD_BUILD_FROM_SOURCE=1` it builds the window from the same checkout instead, and so does the `cargo build --release --features native` line above.
+To drive a machine you are not sitting at without any app: run the TUI over SSH, run `wizard -p '<prompt>'`, point an ACP editor at `wizard acp` over the same SSH connection, or run the [Telegram gateway](gateway.md) on the box. Wizard GUI can also reach a machine over SSH itself.
 
 ### Model tiers (automatic)
 
@@ -166,7 +149,6 @@ The budget is detected as: GPU VRAM via `nvidia-smi` for NVIDIA, `rocm-smi` for 
 | `WIZARD_USE_OLLAMA` | `0` | Set to `1` for the Ollama variant of the local flavor (implies `WIZARD_LOCAL`) |
 | `WIZARD_SKIP_OLLAMA_INSTALL` | `0` | With Ollama flavors: Ollama is already managed elsewhere |
 | `WIZARD_WITH_TOOLCHAIN` | `0` | Set to `1` to eagerly install a Rust toolchain for deep evolve |
-| `WIZARD_NATIVE` | `0` | Set to `1` to also install `wizard-native`, a second binary built `--features native` — the only build that can open the window with `wizard gui`. Needs no system packages. No musl or Termux asset. `WIZARD_APP` is the old name and still works. See [Native GUI](native-gui.md) |
 | `WIZARD_REPO` | `teddytennant/wizard` | `owner/repo` to install from: how a published fork ships itself |
 | `WIZARD_MIRROR` | *(none)* | Download mirror to try before GitHub Releases, e.g. `https://dl.example.com`. See [The download mirror](#the-download-mirror). `off`, `none`, `0` and the empty string all mean "no mirror", which is the default |
 | `WIZARD_REF` | latest release tag | Git ref/tag when building from source (falls back to `main` only when the repo has no release) |
@@ -410,7 +392,7 @@ You can use xAI without an API key by signing in with your xAI account (OAuth 2.
 wizard --login xai     # or /login xai from inside the TUI
 ```
 
-Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. A second `/login xai` (or `wizard --login xai`) with a live session is a no-op: it does not open the browser again. `/login xai force` replaces the session. On success it adds the `xai-oauth` provider and switches the live agent to it; no `/provider add` needed. The window can start the same flow from its settings sheet (see [Native GUI](native-gui.md)).
+Wizard opens your browser, captures the callback on localhost, and stores the tokens in `~/.wizard/xai_oauth.json` (file mode 0600); the access token is refreshed automatically. A second `/login xai` (or `wizard --login xai`) with a live session is a no-op: it does not open the browser again. `/login xai force` replaces the session. On success it adds the `xai-oauth` provider and switches the live agent to it; no `/provider add` needed.
 
 Note: xAI gates OAuth API access to certain SuperGrok plans. If requests come back with HTTP 403, use the API-key flavor (`kind = "xai"` with `XAI_API_KEY`) instead.
 

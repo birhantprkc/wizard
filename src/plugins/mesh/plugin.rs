@@ -80,7 +80,7 @@ impl MeshPlugin {
                 // it also takes `quinn`, `rustls` and `mdns-sd` out of that
                 // build. `pi` and `minimal` have no room for the largest plugin
                 // in the tree. See `src/plugins/profile.rs`.
-                profiles: vec!["default".to_string(), "full".to_string()],
+                profiles: vec!["default".to_string()],
             },
         }
     }

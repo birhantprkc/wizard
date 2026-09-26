@@ -41,7 +41,7 @@ env:
 
 jobs:
   # A tag that disagrees with Cargo.toml is cheap to catch and expensive to
-  # discover after ten uploads. Its own job, on one runner, needing nothing but
+  # discover after six uploads. Its own job, on one runner, needing nothing but
   # a checkout: as a step inside the `test` matrix it ran once per runner, so a
   # mismatched tag failed twice with the same annotation and the second failure
   # waited on whatever queue that runner was in. Everything below checks out
@@ -67,8 +67,8 @@ jobs:
 
       # The same refusal the `release` job makes before publishing, made here
       # first because of what it costs there. Down at the signing step this
-      # fires only after the full matrix — ten builds across four macOS and
-      # four ARM legs — has already been paid for. The answer cannot change
+      # fires only after the full matrix — six builds, two of them on
+      # macOS — has already been paid for. The answer cannot change
       # in between: both read the committed wizard-release.pub at the same
       # tag. So a tag pushed with the placeholder still in the repo fails in
       # about a runner-minute instead of an hour.
@@ -90,7 +90,7 @@ jobs:
           echo "A real release signing key is committed."
 
   # The gate. A tag push used to go straight to `cargo build` and then to a
-  # published, non-draft release: nothing between `git tag` and ten binaries on
+  # published, non-draft release: nothing between `git tag` and six binaries on
   # the download page ever ran a test or started the binary. Everything below
   # needs this job, so a red suite means no artifacts and no release.
   #
@@ -109,10 +109,9 @@ jobs:
   # anything. Both flip to the same state once the suite is known green there.
   #
   # Only the *suite* is split that way. CI's macOS leg still blocks on
-  # `cargo check --locked` (and on the `--features native` check), so a
-  # Darwin-only compile break is refused at the pull request rather than
-  # discovered here, where it would cost a tag that publishes zero of ten
-  # assets.
+  # `cargo check --locked`, so a Darwin-only compile break is refused at the
+  # pull request rather than discovered here, where it would cost a tag that
+  # publishes zero of six assets.
   test:
     name: Test suite (${{ matrix.runner }})
     needs: [version]
@@ -187,7 +186,7 @@ jobs:
       # `musl-strip` by name and panics with "cannot find musl-ar" when either
       # is absent. That panic happens in `Build (release)` below, which has no
       # continue-on-error, so the whole `build` job goes red and `release`
-      # (needs: [build, native]) never runs — a tag push would publish nothing
+      # (needs: [build]) never runs — a tag push would publish nothing
       # at all rather than a bad musl asset.
       #
       # ar and strip are binutils, not libc: the host's operate on musl objects
@@ -293,100 +292,9 @@ jobs:
           path: wizard-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  # The native GUI (`wizard gui`): the same binary built with
-  # `--features native`, which links iced. A separate job and a separate asset,
-  # never a replacement for the six above.
-  #
-  # It is a second asset rather than the default build for the reason written
-  # out in `Cargo.toml`'s `[features]`: iced is several hundred crates of winit,
-  # cosmic-text and tiny-skia that a `wizard -p`, a `wizard acp` or a CI
-  # container never executes a line of, and putting them in the default build
-  # would tax every headless user for a window they will never open. This job
-  # is what keeps that choice from meaning "source-only" — `curl | bash` with
-  # `WIZARD_NATIVE=1` installs one of these, and `wizard update` on a binary
-  # built this way stays on this asset line (`native_assets` in
-  # `src/update.rs`).
-  #
-  # No musl target: winit reaches X11 and Wayland through `dlopen`, which a
-  # fully static musl binary cannot do. No Windows target: the port is deferred
-  # to a release of its own, same as for the plain assets.
-  native:
-    name: Build native GUI (${{ matrix.target }})
-    needs: [test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            runnable: true
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-            runnable: true
-          # Cross-compiled on an arm64 runner, same as in the `build` job: no
-          # Rosetta 2, so it cannot be started here.
-          - target: x86_64-apple-darwin
-            runner: macos-15
-            runnable: false
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            runnable: true
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      # No `apt-get` step, and that is the point of the toolkit choice rather
-      # than an omission. `default-features = false` + `tiny-skia` links no
-      # wgpu, so there is no Vulkan or Mesa development package to install, and
-      # winit opens X11 and Wayland with `dlopen` at run time rather than
-      # linking them, so there is no `-dev` package at build time either. The
-      # webview shell this job replaced needed `libwebkit2gtk-4.1-dev` and
-      # `libgtk-3-dev` on every Linux leg.
-
-      - name: Build (release, native GUI)
-        run: cargo build --release --locked --features native --target ${{ matrix.target }}
-
-      # The binary inside keeps the name `wizard`, same as every other asset,
-      # so `wizard update` unpacks it with the same code path. The *asset* name
-      # is what distinguishes the build.
-      - name: Package
-        run: |
-          strip "target/${{ matrix.target }}/release/wizard"
-          tar -C "target/${{ matrix.target }}/release" \
-            -czf "wizard-native-${{ matrix.target }}.tar.gz" wizard
-
-      # Same purpose as the smoke test in `build`: prove that strip and tar
-      # produced a binary that links, loads and reaches main. `--version`
-      # returns before any window is opened, so no display is needed — which is
-      # also all this can prove. There is no compositor on a runner, so that
-      # `wizard gui` opens a window is not tested here and is not
-      # tested anywhere (see "Testing, and what a headless machine cannot
-      # prove" in docs/native-gui.md).
-      - name: Smoke test the packaged binary
-        if: matrix.runnable
-        run: |
-          set -eu
-          rm -rf smoke && mkdir smoke
-          tar -xzf "wizard-native-${{ matrix.target }}.tar.gz" -C smoke
-          ./smoke/wizard --version
-          rm -rf smoke
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: wizard-native-${{ matrix.target }}
-          path: wizard-native-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-
   release:
     name: Create GitHub release
-    needs: [build, native]
+    needs: [build]
     runs-on: ubuntu-latest
     # The only job in this workflow that writes anything. See the workflow-level
     # `permissions` above.
@@ -396,14 +304,19 @@ jobs:
       # The checkout is here for one file: wizard-release.pub, the public half
       # of the signing key. The signature below is verified against it before
       # anything is published, so a secret that has drifted from the key users
-      # actually carry fails the release instead of shipping ten assets nobody
+      # actually carry fails the release instead of shipping six assets nobody
       # can install.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
+      # `pattern` keeps the desktop app's artifacts (the gui-* jobs below) out
+      # of checksums.txt. They build in parallel and may or may not have
+      # uploaded by now, and a checksum list whose contents depend on a race
+      # is not one worth signing.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          pattern: wizard-*
           merge-multiple: true
 
       - name: Generate checksums
@@ -458,7 +371,7 @@ jobs:
 
       # `draft: false` publishes the moment this job runs, which is only
       # defensible because of what has to be green first: the tag matching
-      # Cargo.toml, the suite on both shipping platforms, then ten builds,
+      # Cargo.toml, the suite on both shipping platforms, then six builds,
       # then every asset that can run on its build runner actually starting,
       # and finally a checksums.txt signature that verifies against the public
       # key in the repository.
@@ -483,7 +396,7 @@ jobs:
       # but it means the file that advertises the others arrives after them.
       #
       # `generate_release_notes: true` because without it the body is empty:
-      # the ten assets appear on the release page with nothing above them, no
+      # the six assets appear on the release page with nothing above them, no
       # changelog and no statement about what they are. GitHub builds the
       # changelog from the commits since the previous tag; `body` below is
       # prepended to it.
@@ -534,10 +447,6 @@ jobs:
             wizard-aarch64-unknown-linux-musl.tar.gz
             wizard-x86_64-apple-darwin.tar.gz
             wizard-aarch64-apple-darwin.tar.gz
-            wizard-native-x86_64-unknown-linux-gnu.tar.gz
-            wizard-native-aarch64-unknown-linux-gnu.tar.gz
-            wizard-native-x86_64-apple-darwin.tar.gz
-            wizard-native-aarch64-apple-darwin.tar.gz
             checksums.txt
             checksums.txt.minisig
 
@@ -725,3 +634,204 @@ jobs:
               commit -m "wizard ${GITHUB_REF_NAME#v}"
           git push "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/teddytennant/homebrew-tap" HEAD:main
           echo "Tap formula now at ${GITHUB_REF_NAME}" >>"$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Wizard GUI (gui/), the desktop app
+  # ---------------------------------------------------------------------
+  #
+  # Built from the same tag and attached to the same release, but kept off
+  # the wizard binary's path: none of these jobs is in `release`'s needs, and
+  # their artifacts are named gui-* so `release` never downloads them. A GUI
+  # build that breaks costs the GUI assets, not the release. They start after
+  # `version` so a mismatched tag builds nothing.
+  #
+  # No rust-cache here either, for the reason at the top of this file.
+  gui-linux:
+    name: GUI build (linux ${{ matrix.arch }})
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: gpui system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: Package
+        run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-linux-${{ matrix.arch }}
+          path: gui/target/package/*.tar.gz
+          if-no-files-found: error
+
+  # Signing and notarization are optional. With no MACOS_CERT_P12 the app is
+  # ad-hoc signed and Gatekeeper asks on first launch; gui/README.md says so.
+  #   MACOS_CERT_P12 / MACOS_CERT_PASSWORD: base64 Developer ID Application
+  #     .p12 and its export password.
+  #   AC_API_KEY_P8 / AC_API_KEY_ID / AC_API_ISSUER_ID: App Store Connect API
+  #     key for notarytool. All three present means notarize and staple.
+  gui-macos:
+    name: GUI build (macos arm64)
+    needs: [version]
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Import the Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: Notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: Package
+        run: scripts/package-macos.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-macos-arm64
+          path: gui/target/package/*.dmg
+          if-no-files-found: error
+
+  gui-windows:
+    name: GUI build (windows x86_64)
+    needs: [version]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Locate the Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      # The feed URL is written into zeron-update.json, but the app only
+      # checks for updates when ZERON_RELEASES_URL is set, so it is inert.
+      - name: Package
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-windows-x86_64
+          path: gui/target/package/*.zip
+          if-no-files-found: error
+
+  # Attaches the GUI to the release `release` created, under wizard's
+  # version rather than the app's internal one, with its own checksum list
+  # signed by the same key as checksums.txt.
+  gui-release:
+    name: Attach Wizard GUI to the release
+    needs: [release, gui-linux, gui-macos, gui-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: gui-*
+          path: gui-dist
+          merge-multiple: true
+      - name: Name the assets after this release
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir out
+          for f in gui-dist/*; do
+            base="$(basename "$f")"
+            # zeron-<app version>-<platform>.<ext> -> wizard-gui-<ver>-<platform>.<ext>
+            platform="$(printf '%s' "$base" | sed -E 's/^zeron-[0-9][^-]*-//')"
+            cp "$f" "out/wizard-gui-${ver}-${platform}"
+          done
+          ls -l out
+          for want in linux-x86_64.tar.gz linux-aarch64.tar.gz macos-arm64.dmg windows-x86_64.zip; do
+            test -f "out/wizard-gui-${ver}-${want}" || { echo "::error::missing wizard-gui-${ver}-${want}" >&2; exit 1; }
+          done
+          (cd out && sha256sum -- * > gui-checksums.txt)
+      - name: Sign the GUI checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -eu
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -S -s minisign.key -m out/gui-checksums.txt \
+            -c "wizard ${GITHUB_REF_NAME} gui checksums" \
+            -t "wizard ${GITHUB_REF_NAME} gui checksums, signed by the wizard release key" \
+            </dev/null
+          rm -f minisign.key
+          key="$(grep -v '^untrusted comment:' wizard-release.pub | tr -d '[:space:]')"
+          minisign -Vm out/gui-checksums.txt -x out/gui-checksums.txt.minisig -P "$key"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber

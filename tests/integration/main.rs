@@ -20,8 +20,6 @@
 #[cfg(all(feature = "provider-ollama", feature = "acp"))]
 mod acp;
 mod cli;
-#[cfg(all(feature = "native", feature = "graph"))]
-mod graph_explorer;
 #[cfg(feature = "mesh")]
 mod mesh_quic;
 mod recorded_provider;

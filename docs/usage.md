@@ -356,36 +356,14 @@ A failing tool result keeps its "error:" prefix in the text, because Wizard's
 result block has no separate flag to carry it and a failure that reads as a
 success is how a resumed model concludes that a broken command worked.
 
-### From the window
+### From the TUI
 
-The window lists these sessions in the same picker as Wizard's own, and marks
-which is which.
-
-In the window (`wizard gui`) the chat list grows a **claude code** section under
-the workspace groups, folded shut. It only appears when
-Claude Code has actually recorded something for the directory a new chat would
-open in, so a machine without it sees nothing. Its rows carry a hollow diamond
-in the gutter where a Wizard chat carries a dot, and the word `claude` where a
-Wizard chat carries its age — a shape and a word, not a colour.
-
-Opening one is not the same act as opening a Wizard chat, and the fold says so
-before the click (*opens as a copy · file untouched*). It imports: the chain is
-walked back from that session's leaf, written as a new Wizard session, and the
-new chat opens with a note saying how much came across and that Claude Code's
-own file was read and not modified.
-
-The section reads on open rather than on the sidebar's refresh timer, because
-listing means parsing every transcript in the project — that is tens of
-megabytes for a repository worked in for months. Moving the window to another
-workspace drops the rows rather than relabelling them.
-
-`/resume-claude` is the same thing in the TUI: the picker `/resume` opens, over
+`/resume-claude` is the TUI's picker: the one `/resume` opens, over
 the conversations Claude Code recorded for the working directory, with the same
 keys and the same import behind Enter. It is a separate command rather than a
 row in `/resume` because opening one is a different act — a `/resume` row
 reopens a file Wizard owns, and this one copies a conversation out of another
-program. In the window, `/resume-claude` unfolds the sidebar's Claude Code
-section, which is where those rows already live.
+program.
 
 `wizard resume --claude` remains the shell spelling, and is still what a script
 wants: `--list` prints the ids, `--session <id>` skips the picker, and `--leaf

@@ -41,7 +41,7 @@ to do.
 
 | Doc | What it covers |
 | --- | --- |
-| [Native GUI](native-gui.md) | `wizard gui`: the iced window, and what went with the browser GUI |
+| [Wizard GUI](../gui/README.md) | The desktop app, which `wizard gui` opens |
 | [UI skins](ui-skins.md) | `/ui wizard`, `codex`, `grok` |
 | [Interactive commands](interactive-commands.md) | Answering a shell command that stops to ask |
 | [ACP](acp.md) | `wizard acp`: Zed, Neovim, Emacs |
@@ -70,9 +70,8 @@ to do.
 
 These describe intent rather than current behaviour.
 
-- [GUI design spec](gui-design-spec.md), the look the window is built to.
-- [Graph explorer](graph-explorer.md), which is **deferred**: it has no route into the window in
-  2.0. `wizard peers` and the mesh itself are unaffected.
+- [Graph explorer](graph-explorer.md), which is **deferred**: the iced window it was drawn in
+  was removed in 3.5. `wizard peers` and the mesh itself are unaffected.
 
 ## Elsewhere in the repo
 

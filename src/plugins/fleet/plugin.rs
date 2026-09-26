@@ -77,11 +77,7 @@ impl FleetPlugin {
                 // where it makes the most sense, not the least. Out of `pi`
                 // and `minimal`, where N parallel agents and N git worktrees
                 // are not what the machine is for.
-                profiles: vec![
-                    "server".to_string(),
-                    "default".to_string(),
-                    "full".to_string(),
-                ],
+                profiles: vec!["server".to_string(), "default".to_string()],
             },
         }
     }

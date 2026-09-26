@@ -31,6 +31,17 @@ and src/skin/motion.rs.
 
 --------------------------------------------------------------------------------
 
+Zeron
+https://github.com/zeronsh/zeron
+Copyright (c) 2026 Wing
+Licensed under the MIT License.
+
+gui/ is a fork of Zeron. Its license and third-party notices are in
+gui/LICENSE and gui/THIRD_PARTY_NOTICES.md; gui/ is built and shipped
+separately from the wizard binary.
+
+--------------------------------------------------------------------------------
+
 A verbatim copy of the Apache License, Version 2.0 ships with this project as
 LICENSE-APACHE, next to this file. Section 4(a) of that license requires that
 whoever receives a derivative work receives the license text with it, so it is a

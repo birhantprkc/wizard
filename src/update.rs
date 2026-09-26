@@ -216,24 +216,6 @@ fn asset_candidates_for(os: &str, arch: &str, nixos: bool, termux: bool) -> Vec<
     }
 }
 
-/// Rewrite the plain-build candidates into native-GUI ones: a binary with the
-/// `native` feature must not silently update itself into a binary without it —
-/// `wizard gui` would stop opening a window, and the launcher entry
-/// or shell alias pointing at it would stop working with no explanation.
-///
-/// Only `-gnu` and `-darwin` survive: there is no musl native asset. winit
-/// reaches X11 and Wayland through `dlopen`, which a fully static musl binary
-/// cannot do, so on a machine where the gnu build will not run there is
-/// nothing to fall back to, and failing loudly beats quietly removing the
-/// window.
-fn native_assets(candidates: Vec<String>) -> Vec<String> {
-    candidates
-        .into_iter()
-        .filter(|asset| asset.contains("-gnu") || asset.contains("-darwin"))
-        .map(|asset| asset.replacen("wizard-", "wizard-native-", 1))
-        .collect()
-}
-
 /// The release-asset candidates for this machine, or an error on an
 /// architecture we ship no binary for / a host with no matching prebuilt.
 fn asset_candidates() -> Result<Vec<String>> {
@@ -258,9 +240,6 @@ fn asset_candidates() -> Result<Vec<String>> {
             std::env::consts::OS,
             arch
         );
-    }
-    if cfg!(feature = "native") {
-        return Ok(native_assets(candidates));
     }
     Ok(candidates)
 }
@@ -1249,9 +1228,6 @@ fn build_from_source(repo: &str, tag: &str, dest_exe: &Path, report: Report<'_>)
     let mut cmd = std::process::Command::new(&cargo);
     cmd.args(["build", "--release", "--locked"])
         .current_dir(&src_dir);
-    if cfg!(feature = "native") {
-        cmd.args(["--features", "native"]);
-    }
     let status = cmd
         .status()
         .context("running cargo build --release --locked")?;
@@ -1949,28 +1925,6 @@ mod tests {
         // No Android/Bionic release asset: update must not try gnu/musl.
         assert!(asset_candidates_for("linux", "aarch64", false, true).is_empty());
         assert!(asset_candidates_for("linux", "x86_64", true, true).is_empty());
-    }
-
-    #[test]
-    fn native_assets_keep_the_native_build_a_native_build() {
-        // A `--features native` binary updates to a native asset, never to the
-        // plain one: it is the binary that can open the window.
-        assert_eq!(
-            native_assets(asset_candidates_for("linux", "x86_64", false, false)),
-            vec!["wizard-native-x86_64-unknown-linux-gnu.tar.gz".to_string()]
-        );
-        assert_eq!(
-            native_assets(asset_candidates_for("macos", "aarch64", false, false)),
-            vec!["wizard-native-aarch64-apple-darwin.tar.gz".to_string()]
-        );
-        // musl is dropped rather than rewritten — we publish no static native
-        // build, so on NixOS this leaves the gnu one and nothing else.
-        assert_eq!(
-            native_assets(asset_candidates_for("linux", "x86_64", true, false)),
-            vec!["wizard-native-x86_64-unknown-linux-gnu.tar.gz".to_string()]
-        );
-        // Termux has nothing to rewrite either.
-        assert!(native_assets(asset_candidates_for("linux", "aarch64", false, true)).is_empty());
     }
 
     #[test]
@@ -3165,65 +3119,6 @@ printf 'INSTALLED-ANYWAY\n'
         assert_eq!(
             refusals[0], refusals[1],
             "a mirror-served release and a GitHub-served one must be refused identically"
-        );
-    }
-
-    #[test]
-    fn install_sh_aborts_the_whole_install_when_the_native_asset_fails_verification() {
-        // `wizard-native` is fetched by `install_native_gui`, the last step of
-        // `main`, and it is the one asset whose verification sits under a
-        // function with a `|| return 1` caller. When that call was a command
-        // substitution, `die`'s `exit 1` ended only the subshell: the installer
-        // shrugged, warned "no runnable native build" — naming a cause that had
-        // nothing to do with what happened — and exited 0 after refusing an
-        // asset it could not verify. Nothing unverified was installed either
-        // way, but SECURITY.md's "every failure aborts" was false for this one
-        // asset, so the exit status is pinned here.
-        //
-        // The stub answers every URL with the same bytes, so `checksums.txt`
-        // and its `.minisig` are the same garbage and the signature cannot
-        // verify — the failure a real tampered release would produce. A host
-        // with no signature checker at all reaches the same `die` by the other
-        // branch, so this runs everywhere.
-        let (_, _, public) = test_key(47);
-        let key_line = public.lines().nth(1).expect("key line").to_string();
-        let tmp = TempDir::new();
-        let out = run_installer_script(
-            &tmp.0,
-            "github.com",
-            "d3adbeef  wizard-native.tar.gz",
-            &format!(
-                r#"set -euo pipefail
-export WIZARD_VERSION=v9.9.9
-export WIZARD_NATIVE=1
-source '{installer}'
-WIZARD_RELEASE_PUBKEY='{key_line}'
-install_native_gui
-printf 'CONTINUED\n'
-"#,
-                installer = install_sh().display()
-            ),
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(
-            !out.status.success(),
-            "an unverifiable wizard-native asset let the install finish 0: {stdout}\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("CONTINUED"),
-            "the install carried on past the refusal: {stdout}"
-        );
-        assert!(
-            stderr.lines().any(|line| line.starts_with("error:")),
-            "the refusal must say what happened: {stderr}"
-        );
-        // And it must not be reported as a missing build, which is what sends
-        // the reader looking for an unsupported platform instead of a bad
-        // download.
-        assert!(
-            !stderr.contains("could not install the native GUI"),
-            "a verification failure was reported as an absent asset: {stderr}"
         );
     }
 

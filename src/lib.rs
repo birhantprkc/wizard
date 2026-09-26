@@ -14,6 +14,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod credentials;
+pub mod desktop_app;
 pub mod dispatch;
 pub mod doctor;
 pub mod entrypoint;
@@ -185,50 +186,10 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         return usage::run_cli(since.as_deref());
     }
 
-    // The window opens existing sessions and builds agents lazily per chat, so
-    // it loads config directly (defaults on a fresh install) and never
-    // onboards — startup must not depend on a reachable provider.
-    //
-    // The window is a plugin, so this arm names a *string* and not a module.
-    // `plugins::boot` above has already loaded whatever this build compiled
-    // in, and `entrypoint::installed` is the same `inject`-returns-`None`
-    // shape a missing provider `kind` has: absent means a sentence, never a
-    // link error. There is no `#[cfg]` here on purpose — the arm reads the
-    // same on every build, and the difference between them is one lookup.
+    // The desktop app is Wizard GUI, built from gui/ and shipped as its own
+    // release asset; this only starts it.
     if let Some(cli::Command::Gui { native: _ }) = &cli.command {
-        if let Some(dir) = &cli.cwd {
-            std::env::set_current_dir(dir)?;
-        }
-        if let Some(window) = entrypoint::installed(entrypoint::GUI) {
-            let config = config::Config::load()?;
-            return window.run(config).await;
-        }
-        // Two routes, and naming both matters: `wizard app` shipped for a
-        // year telling people to rebuild, while the release page carried a
-        // binary that already worked. Whoever reads this has a terminal in
-        // front of them, so give them the line to paste.
-        //
-        // The list of what to do instead is not a consolation prize: it is
-        // what replaced the browser GUI, which used to be the answer here and
-        // was deleted. A headless box is reached by running the TUI over SSH,
-        // by `wizard -p`, by an ACP editor, or through the Telegram gateway —
-        // none of which need a window or a port.
-        anyhow::bail!(
-            "this build has no native GUI — it was built without the `native` feature.\n\
-             \n\
-             The window is a separate build because it links iced, several hundred crates\n\
-             that a headless `wizard -p` or `wizard acp` never executes a line of, and that\n\
-             cannot go into the static musl binary.\n\
-             \n\
-             To get one:\n\
-             \x20 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh \\\n\
-             \x20   | WIZARD_NATIVE=1 bash        # installs `wizard-native` beside `wizard`\n\
-             \x20 cargo build --release --features native   # from a checkout\n\
-             \n\
-             To drive this machine without one: `wizard` over SSH, `wizard -p '<prompt>'`,\n\
-             `wizard acp` from an ACP editor, or `wizard gateway` for Telegram.\n\
-             See docs/native-gui.md."
-        );
+        return desktop_app::open(cli.cwd.as_deref()).map(|()| 0);
     }
 
     // ACP server: an editor drives Wizard over stdin/stdout, so it must not

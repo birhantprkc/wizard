@@ -1,0 +1,144 @@
+name: GUI
+
+# Wizard GUI (gui/) is its own Cargo workspace. These are the upstream
+# test legs that do not need Zeron's hosted pieces, run only when gui/ or
+# this file changes, so a wizard-only change never waits on a gpui build.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gui/**'
+      - '.github/workflows/gui.yml'
+  pull_request:
+    paths:
+      - 'gui/**'
+      - '.github/workflows/gui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: gui
+
+jobs:
+  engine:
+    name: GUI engine, sync and updater
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Harness protocol regressions
+        run: |
+          cargo test --locked -p zeron-harness --lib opencode::
+          cargo test --locked -p zeron-harness --test opencode
+      - name: Session publication and recovery
+        run: |
+          cargo test --locked -p zeron-sync --lib
+          cargo test --locked -p zeron-update --lib
+          cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+      - name: Preview networking
+        run: cargo test --locked -p zeron-preview
+
+  ui:
+    name: GUI UI and layout (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: gpui system libraries
+        run: |
+          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check the app
+        run: cargo check --release --locked -p zeron
+      - name: UI and headless layout regressions
+        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+
+  macos:
+    name: GUI check (macos)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check the app
+        run: cargo check --release --locked -p zeron
+      - name: Native diff font geometry and notification regressions
+        run: |
+          cargo test --release --locked -p zeron-ui --lib native_diff_font_geometry -- --test-threads=1
+          cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
+
+  windows:
+    name: GUI tests (windows)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Locate the Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the app
+        run: cargo build --release --locked -p zeron
+      - name: Portable packaging
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - name: Application and updater tests
+        run: cargo test --release --locked -p zeron -p zeron-update
+      - name: Engine unit tests
+        run: cargo test --release --locked -p zeron-engine --lib
+      - name: GUI subsystem and redirected CLI output
+        run: ./scripts/test-windows-startup.ps1

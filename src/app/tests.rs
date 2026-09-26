@@ -4442,11 +4442,10 @@ fn a_turn_ending_takes_back_a_console_the_tool_never_closed() {
 /// happen, and reasonably concluded the console was broken rather than that
 /// the label was.
 ///
-/// Both surfaces, because the class is not the window's: the TUI's `/help`
-/// lists ten keys and its binding table is far larger, so a promise there is
-/// easier to make and just as broken. The two spell a binding differently —
-/// iced's `Key::Character("x")` and crossterm's `KeyCode::Char('x')` — and
-/// either counts, since what is being asserted is that *something* handles it.
+/// The TUI's `/help` lists ten keys and its binding table is far larger, so a
+/// promise there is easy to make and easy to break. A binding is spelled
+/// crossterm's `KeyCode::Char('x')`, and what is being asserted is that
+/// *something* handles it.
 ///
 /// Nothing structural connects a label to a binding, so a scan of the source
 /// is the instrument.
@@ -4468,17 +4467,14 @@ fn every_key_a_surface_advertises_is_bound() {
         }
     }
 
-    // `plugins/native` rather than `native`: the window moved under
-    // `src/plugins/` when it became a plugin, and a path this scan cannot find
-    // reads as a surface that advertises nothing — which is why the empty case
-    // below is an assertion rather than a skip.
-    for surface in ["plugins/native", "app"] {
+    // A path this scan cannot find reads as a surface that advertises nothing,
+    // which is why the empty case below is an assertion rather than a skip.
+    {
+        let surface = "app";
         let mut files = Vec::new();
         sources(&root.join(surface), &mut files);
-        if surface == "app" {
-            // The TUI draws in `ui/` and binds in `app/`; both are its text.
-            sources(&root.join("ui"), &mut files);
-        }
+        // The TUI draws in `ui/` and binds in `app/`; both are its text.
+        sources(&root.join("ui"), &mut files);
 
         let mut advertised: Vec<char> = Vec::new();
         let mut bound = String::new();
@@ -4527,10 +4523,7 @@ fn every_key_a_surface_advertises_is_bound() {
         let unbound: Vec<char> = advertised
             .iter()
             .copied()
-            .filter(|key| {
-                !bound.contains(&format!("Character(\"{key}\")"))
-                    && !bound.contains(&format!("Char('{key}')"))
-            })
+            .filter(|key| !bound.contains(&format!("Char('{key}')")))
             .collect();
         assert!(
             unbound.is_empty(),

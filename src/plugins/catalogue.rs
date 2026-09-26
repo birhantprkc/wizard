@@ -136,15 +136,6 @@ pub const CATALOGUE: &[Entry] = &[
         present: cfg!(feature = "mesh"),
     },
     Entry {
-        feature: "native",
-        plugin: Some("native"),
-        backend: Some(Backend::Rust),
-        summary: "`wizard gui`: the iced window. Off by default and shipped as its own release \
-                  asset",
-        default_on: false,
-        present: cfg!(feature = "native"),
-    },
-    Entry {
         feature: "plugin-js",
         plugin: None,
         backend: None,

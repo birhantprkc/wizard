@@ -68,35 +68,6 @@ const BUILD_ARGS: [&str; 3] = ["build", "--release", "--locked"];
 /// rule.
 const TEST_ARGS: [&str; 3] = ["test", "--release", "--locked"];
 
-/// The cargo features every deep-evolve rung is run with: the ones this binary
-/// was built with, so what comes out of the gate is the same *kind* of binary
-/// as the one that went in.
-///
-/// A `wizard-native` install is a `--features native` build. Rebuilt with
-/// default features it still compiles, still passes, still installs — and
-/// `wizard gui` then opens no window, because iced was never linked in. That is
-/// the same silent downgrade [`native_assets`] refuses to make for `wizard
-/// update` (`src/update.rs`), and deep evolve has more reason to refuse it: it
-/// replaces the running binary in place. The build's failure would be loud and
-/// `.prev` recovers, but recovering is not the bar.
-///
-/// Carried on the test rung too, not only the build: `--release` there is only
-/// artifact reuse if both rungs resolve the same feature set, and a suite run
-/// without `native` is not the suite for a native binary.
-///
-/// `cfg!` rather than a probe, because the feature set of the binary doing the
-/// evolving *is* the feature set that has to come out the other end. Empty on a
-/// default build, where nothing changes.
-///
-/// [`native_assets`]: crate::update
-fn feature_args() -> &'static [&'static str] {
-    if cfg!(feature = "native") {
-        &["--features", "native"]
-    } else {
-        &[]
-    }
-}
-
 /// How long `cargo test --release --locked` may run before deep evolve gives
 /// up on it. Generous, because a release-mode test build of a 87k-line crate
 /// on a cold cache is genuinely slow, but bounded: a patch that deadlocks a
@@ -1123,7 +1094,6 @@ impl Evolver {
         let cargo = find_cargo().context("cargo is not available (no Rust toolchain installed)")?;
         let mut cmd = tokio::process::Command::new(&cargo);
         cmd.args(BUILD_ARGS)
-            .args(feature_args())
             .current_dir(source_dir)
             .env("PATH", augmented_path())
             .stdin(Stdio::null())
@@ -1226,7 +1196,6 @@ impl Evolver {
         let timeout = test_timeout();
         let mut cmd = tokio::process::Command::new(&cargo);
         cmd.args(TEST_ARGS)
-            .args(feature_args())
             .current_dir(source_dir)
             .env("PATH", augmented_path())
             // A test that reads stdin would otherwise block until the timeout.
@@ -3542,14 +3511,8 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("Cargo.toml"),
-            // The `native` feature exists here for the same reason the real
-            // crate has one: `feature_args` passes `--features native` on a
-            // native build, and cargo rejects a flag naming a feature the
-            // package does not declare before it ever looks at the lockfile.
-            // The probe has to be the shape of the thing being built.
             "[workspace]\n\n[package]\nname = \"lockfile-probe\"\nversion = \"0.1.0\"\n\
-             \nedition = \"2021\"\n\n[features]\ndefault = []\nnative = []\n\
-             \n[dependencies]\nhelper = { path = \"helper\" }\n",
+             \nedition = \"2021\"\n\n[dependencies]\nhelper = { path = \"helper\" }\n",
         )
         .unwrap();
         std::fs::write(
@@ -3741,37 +3704,6 @@ mod tests {
             production.matches("crate::platform::is_termux()").count(),
             1,
             "one call, to the platform detector"
-        );
-    }
-
-    #[test]
-    fn both_cargo_rungs_carry_the_running_binarys_features() {
-        // A native install's deep evolve must not rebuild default features over
-        // itself: the new binary compiles and passes and then `wizard gui`
-        // opens nothing.
-        if cfg!(feature = "native") {
-            assert_eq!(feature_args(), ["--features", "native"]);
-        } else {
-            assert!(feature_args().is_empty());
-        }
-        // `cfg!` is resolved at compile time, so one run of the suite can only
-        // ever see one of those branches — which is why the wiring is checked
-        // as text as well. Both rungs, because `--release` on the test step is
-        // artifact reuse only if it resolves the same features as the build.
-        let source = include_str!("mod.rs");
-        let (production, _) = source
-            .split_once("#[cfg(test)]\nmod tests {")
-            .expect("this module ends with its test module");
-        for rung in ["cmd.args(BUILD_ARGS)", "cmd.args(TEST_ARGS)"] {
-            assert!(
-                production.contains(&format!("{rung}\n            .args(feature_args())")),
-                "{rung} must carry feature_args()"
-            );
-        }
-        assert_eq!(
-            production.matches(".args(feature_args())").count(),
-            2,
-            "every cargo invocation in the gate, and only those"
         );
     }
 

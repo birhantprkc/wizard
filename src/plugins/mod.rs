@@ -112,18 +112,6 @@ pub mod mcp;
 // directory, and the largest thing that has gone through the door.
 #[cfg(feature = "mesh")]
 pub mod mesh;
-// The window and the agent core under it: two directories, one plugin. `gui`
-// is not a second plugin and registers nothing — it is sessions, the config
-// store, git and OAuth, the half of the GUI that draws nothing and that
-// another front end could be written against. It stays a sibling rather than
-// a child of `native` because nesting it would say the window owns it, and
-// `native/mod.rs` is explicit that the window is a *client* of it. Both are
-// behind the one `native` feature, which `install.sh`, the release workflow
-// and `docs/native-gui.md` all name.
-#[cfg(feature = "native")]
-pub mod gui;
-#[cfg(feature = "native")]
-pub mod native;
 #[cfg(feature = "provider-ollama")]
 pub mod ollama;
 #[cfg(feature = "provider-openai")]
@@ -190,8 +178,6 @@ fn compiled_in() -> Vec<Arc<dyn Plugin>> {
     plugins.push(Arc::new(llamacpp::LlamaCppPlugin::new()));
     #[cfg(feature = "mcp")]
     plugins.push(Arc::new(mcp::plugin::McpPlugin::new()));
-    #[cfg(feature = "native")]
-    plugins.push(Arc::new(native::NativePlugin::new()));
     #[cfg(feature = "provider-ollama")]
     plugins.push(Arc::new(ollama::OllamaPlugin::new()));
     #[cfg(feature = "provider-openai")]
@@ -753,13 +739,6 @@ mod tests {
         // assertion. Written out for the same reason the provider and tool
         // tables are: derived from `compiled_in`, it could only agree with
         // itself.
-        assert_eq!(
-            services
-                .inject_as::<Entrypoint>(entrypoint::GUI)
-                .map(|entry| entry.name()),
-            cfg!(feature = "native").then_some(entrypoint::GUI),
-            "the window's entrypoint"
-        );
         assert_eq!(
             services
                 .inject_as::<Entrypoint>(entrypoint::ACP)

@@ -28,14 +28,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Required if you touch `src/plugins/native/` — the native GUI is off by default, so
-nothing above compiles a line of it, and it ships as its own release asset
-(`wizard-native-*`). CI runs both:
-
-```bash
-cargo clippy --all-targets --locked --features native -- -D warnings
-cargo test --locked --features native
-```
+Wizard GUI under `gui/` is its own Cargo workspace with its own CI (`.github/workflows/gui.yml`); see [gui/README.md](gui/README.md) to build it.
 
 Optional supply-chain check:
 

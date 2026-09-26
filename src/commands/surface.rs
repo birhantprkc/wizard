@@ -56,17 +56,14 @@ use crate::tools::tasks::Task;
 pub enum Surface {
     /// The terminal UI (`wizard`).
     Tui,
-    /// The GUI (`wizard gui`): the iced window, and the task worker that holds
-    /// the agent it draws.
+    /// A graphical front end over the agent core.
     ///
-    /// Named `Gui` and not `Native` on purpose. It was the browser GUI's
-    /// column — a page and the HTTP server behind it — and when that surface
-    /// was deleted the window inherited the column rather than growing one of
-    /// its own, because every answer in a second column would have been a copy
-    /// of this one: same agent, same commands, same three refusals
-    /// (`/vim`, `/theme`, `/quit`). A duplicated column is a column that
-    /// drifts. See `src/plugins/native/command.rs`, which returns this
-    /// variant and says why there is no `Surface::Native`.
+    /// The column outlived both of the surfaces that answered from it: first
+    /// the browser GUI, then the iced window. Nothing in this binary runs as
+    /// `Gui` today (`wizard gui` launches Wizard GUI, a separate app), but the
+    /// table keeps the column so a front end written against the core has its
+    /// answers already decided: same agent, same commands, same three
+    /// refusals (`/vim`, `/theme`, `/quit`).
     Gui,
     /// The Telegram gateway (`wizard gateway`): an allow-listed chat, and the
     /// operator's machine running the turn.
@@ -270,9 +267,7 @@ pub struct SessionSnapshot {
 /// they drift.
 ///
 /// The window-owning verbs carry defaults, so a surface that has no window to
-/// change — the task worker in `src/plugins/gui/command.rs`, which holds the
-/// agent while the window holds the panels — implements only what it runs and
-/// answers the rest honestly. Everything else is required: a surface that
+/// change implements only what it runs and answers the rest honestly. Everything else is required: a surface that
 /// cannot set the model does not compile.
 #[async_trait]
 pub trait CommandSurface {

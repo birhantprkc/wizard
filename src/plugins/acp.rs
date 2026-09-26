@@ -955,10 +955,7 @@ const ABOUT: &str = "Run Wizard as an Agent Client Protocol (ACP) agent over std
 /// The ACP server, as a plugin.
 ///
 /// The registration sits at the bottom of this file rather than in a
-/// `plugin.rs` beside it, which is where the window's lives. The rule that
-/// split them is length, not principle: `src/plugins/native/` is sixteen
-/// thousand lines across two dozen files and its twenty-line contract with
-/// core would be lost in them. This file is one screen of scrolling and its
+/// `plugin.rs` beside it. This file is one screen of scrolling and its
 /// contract is the last thing in it, which is where a reader looks.
 pub struct AcpPlugin {
     manifest: PluginManifest,
@@ -993,11 +990,7 @@ impl AcpPlugin {
                 // `docs/plugins.md` puts ACP in `server` by name: an editor on
                 // a laptop driving a checkout on a headless box over stdio is
                 // exactly the machine that has no window and wants this.
-                profiles: vec![
-                    "server".to_string(),
-                    "default".to_string(),
-                    "full".to_string(),
-                ],
+                profiles: vec!["server".to_string(), "default".to_string()],
             },
         }
     }

@@ -36,7 +36,6 @@
 //!   published release binary is. It is in the list so that
 //!   `wizard plugin profiles` can say "you have this one" rather than leaving
 //!   the stock build unnamed.
-//! - [`FULL`] is [`DEFAULT`] plus the window.
 //!
 //! There is deliberately no profile per feature and no `custom` row.
 //! `--features a,b,c` is already the custom profile and giving it a name would
@@ -65,8 +64,6 @@ use super::catalogue::{self, CATALOGUE};
 enum Shape {
     /// The stock build: no cargo flags at all.
     Default,
-    /// The stock build plus these.
-    DefaultPlus(&'static [&'static str]),
     /// The stock build minus these.
     DefaultMinus(&'static [&'static str]),
     /// Built up from nothing: `--no-default-features --features <these>`.
@@ -108,22 +105,15 @@ pub const SERVER: Profile = Profile {
 /// What `cargo install --path .` builds.
 pub const DEFAULT: Profile = Profile {
     name: "default",
-    audience: "everyone else: every backend and every tool, no window",
+    audience: "everyone else: every backend and every tool",
     shape: Shape::Default,
-};
-
-/// Everything, window included.
-pub const FULL: Profile = Profile {
-    name: "full",
-    audience: "one binary with the GUI in it, for a desktop you build yourself",
-    shape: Shape::DefaultPlus(&["native"]),
 };
 
 /// Every profile, smallest first.
 ///
 /// The order is the order `wizard plugin profiles` prints, and it is by size
 /// because that is the axis somebody scanning the list is choosing along.
-pub const PROFILES: &[Profile] = &[MINIMAL, PI, SERVER, DEFAULT, FULL];
+pub const PROFILES: &[Profile] = &[MINIMAL, PI, SERVER, DEFAULT];
 
 impl Profile {
     /// The feature list this profile resolves to, in catalogue order.
@@ -134,16 +124,6 @@ impl Profile {
     pub fn features(&self) -> Vec<&'static str> {
         match self.shape {
             Shape::Default => default_features(),
-            Shape::DefaultPlus(extra) => {
-                let mut features = default_features();
-                for name in extra {
-                    if !features.contains(name) {
-                        features.push(name);
-                    }
-                }
-                features.sort_unstable();
-                features
-            }
             Shape::DefaultMinus(dropped) => default_features()
                 .into_iter()
                 // A feature that another kept feature enables is not removed by
@@ -172,9 +152,6 @@ impl Profile {
     pub fn cargo_flags(&self) -> Vec<String> {
         match self.shape {
             Shape::Default => Vec::new(),
-            Shape::DefaultPlus(extra) => {
-                vec!["--features".to_string(), extra.join(",")]
-            }
             Shape::DefaultMinus(_) | Shape::Only(_) => vec![
                 "--no-default-features".to_string(),
                 "--features".to_string(),
@@ -250,7 +227,6 @@ mod tests {
     fn the_default_profile_is_the_stock_build_and_passes_no_flags() {
         assert!(DEFAULT.cargo_flags().is_empty());
         assert_eq!(DEFAULT.features(), default_features());
-        assert!(!DEFAULT.features().contains(&"native"));
     }
 
     /// `server` is the default build minus the mesh and the explorer over it,
@@ -304,7 +280,7 @@ mod tests {
     /// Skipped on any other feature set, because leaving a plugin out is the
     /// whole point of the flags and `contrib/check-tool-plugins.sh` runs this
     /// suite under a dozen sets that match no profile at all. What the guard
-    /// asserts is the pairing: with every default feature on and `native` off,
+    /// asserts is the pairing: with every default feature on,
     /// `active()` must find `default` and not `None`.
     #[test]
     fn a_stock_build_reports_the_default_profile() {

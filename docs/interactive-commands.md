@@ -57,16 +57,6 @@ one of those too; what it does not have is somebody reading it.
 
 - **TUI** (`wizard`): `Interactive` (`src/app/session.rs:155`). This is the
   surface the bug was reported from and the one that works end to end.
-- **The window** (`wizard gui`, a `--features native` build): `Interactive`. It
-  is the same process as the child it would be driving, it dies when the agent
-  dies, and it has a person in front of it — the same condition the TUI meets —
-  so `TaskManager::attended` builds its tasks with `ConsoleAccess::Interactive`
-  (`src/plugins/gui/tasks.rs`) and the window claims the gate
-  (`src/plugins/native/console.rs`). See `docs/native-gui.md`.
-  `TaskManager::with_registry`, the constructor that does *not* say this, leaves
-  `ConsoleAccess::None` in place: a caller that has not claimed a keyboard keeps
-  `/dev/null` on fd 0, because announcing a prompt nobody can answer would park
-  the turn on a question with no keyboard behind it.
 - **Headless** (`wizard -p`), **gateway**, **ACP**, **fleet**: `None`. Same
   reasoning, more obviously.
 - **Subagents**, everywhere: `None`, forced, plus `events: None`. A subagent's
@@ -192,8 +182,8 @@ it means the model may need to be told what you chose if it matters.
 - **No console over a socket.** The browser GUI never grew one, and that was
   right: a page holding the stdin of a live child in another process is a hung
   `apt install` waiting on a tab somebody closed. It was the boundary that made
-  it impossible, not the fact of being graphical — the window, which has no such
-  boundary, does have a console. That surface is now deleted; the constraint is
-  recorded here because the next surface with a socket in it inherits it.
+  it impossible, not the fact of being graphical. That surface is deleted, and
+  so is the iced window that followed it; the constraint is recorded here
+  because the next surface with a socket in it inherits it.
 - **No console for background tasks or subagents.** Both are unattended by
   construction.
