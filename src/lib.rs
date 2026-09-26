@@ -52,6 +52,7 @@ pub mod skin;
 pub mod sync;
 pub(crate) mod text;
 pub mod theme;
+pub mod token_profile;
 pub mod tools;
 pub mod transcript;
 pub mod trust;
