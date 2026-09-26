@@ -791,10 +791,17 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
                 ended = Some(DoneReason::Stopped);
                 break;
             }
-            let outcome = match host.intercept(call, sink).await {
+            let mut outcome = match host.intercept(call, sink).await {
                 Some(outcome) => outcome,
                 None => CallOutcome::dispatched(host.dispatch(call, sink).await),
             };
+            if call.function.name == "read_file"
+                && outcome.images.is_empty()
+                && crate::token_profile::current().safe()
+                && let Some(stub) = reread_stub(host.history(), &outcome.body)
+            {
+                outcome.body = stub;
+            }
             results.push(ToolResultBlock {
                 tool_use_id: call.id.clone(),
                 name: call.function.name.clone(),
@@ -1336,6 +1343,39 @@ async fn stream(
 /// by the call itself: the loop accumulates the results into one message and
 /// appends the images and nudges *after* the whole batch, which is the only
 /// ordering both frontier APIs accept.
+/// Smallest `read_file` result worth replacing with a pointer to an earlier
+/// copy. Below this the stub saves nothing.
+const REREAD_STUB_MIN_BYTES: usize = 400;
+
+/// A stub for a `read_file` result that is byte-for-byte identical to one
+/// still whole in `history`, or `None` to send it as is.
+///
+/// Comparing the fresh output with the earlier result, rather than trusting a
+/// path and an mtime, is what makes this safe: if the file changed on disk by
+/// any route (an `execute`, another process), or the earlier copy was shrunk,
+/// evicted or compacted away, the bytes differ and the model gets the full
+/// read. The session file is append-only and keeps both results whole.
+fn reread_stub(history: &[ChatMessage], body: &str) -> Option<String> {
+    if body.len() < REREAD_STUB_MIN_BYTES {
+        return None;
+    }
+    let earlier = history.iter().rev().find_map(|message| {
+        message.content.iter().find_map(|block| match block {
+            ContentBlock::ToolResult(result)
+                if result.name == "read_file" && result.content == body =>
+            {
+                Some(result.tool_use_id.clone())
+            }
+            _ => None,
+        })
+    })?;
+    Some(format!(
+        "[unchanged: identical to the read_file result for call {earlier}, which is still in \
+         this conversation above; {} lines not repeated]",
+        body.lines().count()
+    ))
+}
+
 pub(super) struct CallOutcome {
     /// Result body as the model will see it, error prefix included.
     pub body: String,
@@ -3158,5 +3198,50 @@ mod tests {
             turn.operator_control,
             agent.mode == crate::config::Mode::Sovereign
         );
+    }
+
+    /// A repeated `read_file` of an unchanged file is stubbed; once the file
+    /// changes on disk, by any route, the new read goes through whole.
+    #[tokio::test]
+    async fn a_reread_is_stubbed_only_while_the_file_is_unchanged() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("wizard-reread-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.rs");
+        std::fs::write(&path, "let x = 1;\n".repeat(200)).unwrap();
+        let ctx = crate::tools::ToolContext::new(&dir);
+        let read = || async {
+            crate::tools::file::ReadFileTool
+                .execute(serde_json::json!({ "path": "big.rs" }), &ctx)
+                .await
+                .unwrap()
+                .content
+        };
+
+        let first = read().await;
+        let history = vec![ChatMessage::tool_result(
+            "call_1",
+            "read_file",
+            first.clone(),
+        )];
+        let stub = reread_stub(&history, &read().await).expect("unchanged file is stubbed");
+        assert!(stub.contains("call_1"), "{stub}");
+
+        std::fs::write(&path, "let x = 2;\n".repeat(200)).unwrap();
+        assert!(
+            reread_stub(&history, &read().await).is_none(),
+            "a file that changed on disk is read again in full"
+        );
+
+        let mut shrunk = history.clone();
+        if let ContentBlock::ToolResult(result) = &mut shrunk[0].content[0] {
+            result.content = "[read_file big.rs: elided]".to_string();
+        }
+        std::fs::write(&path, "let x = 1;\n".repeat(200)).unwrap();
+        assert!(
+            reread_stub(&shrunk, &read().await).is_none(),
+            "an earlier copy that was shrunk away is not pointed at"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
