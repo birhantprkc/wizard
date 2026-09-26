@@ -12,6 +12,12 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 - **Wizard GUI ships in `gui/`.**
 
+- **GPT-6 Astra is the ChatGPT default.** Sign in with ChatGPT now starts on
+  `gpt-6-astra`. On an account the staged rollout has not reached, the first
+  request that the endpoint refuses for the model is retried on `gpt-5.6-sol`,
+  and the rest of the session stays there. API-key OpenAI setups keep
+  `gpt-5.6-sol` as the picker default.
+
 - **Token profiles.** `--token-profile`, `$WIZARD_TOKEN_PROFILE`, or
   `token_profile` in config.toml pick how much harness each request carries:
   `safe` (the default), `stock` (3.2.5's harness), `lean`, or `min`. The first

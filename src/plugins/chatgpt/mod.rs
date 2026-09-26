@@ -46,7 +46,13 @@ use crate::llm::{
 use oauth::StoredTokens;
 
 /// Static fallback model list; the live list comes from `GET /models`.
-const FALLBACK_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+const FALLBACK_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+];
 
 /// Manages the stored OAuth tokens: hands out the bearer + account id, and
 /// refreshes proactively (near expiry) or after a 401.
@@ -189,6 +195,9 @@ pub struct ChatgptProvider {
     tokens: Arc<ChatgptTokens>,
     /// A stable id for this process's requests (the endpoint expects one).
     session_id: String,
+    /// Set once the endpoint says this account cannot use the default model,
+    /// so later requests go straight to [`oauth::ROLLOUT_FALLBACK_MODEL`].
+    default_unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl ChatgptProvider {
@@ -203,6 +212,7 @@ impl ChatgptProvider {
             model: model.into(),
             tokens: Arc::new(ChatgptTokens::new()?),
             session_id: session_id(),
+            default_unavailable: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -349,7 +359,36 @@ impl LlmProvider for ChatgptProvider {
     }
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
-        let response = self.post_responses(&request).await?;
+        use std::sync::atomic::Ordering;
+        let mut request = request;
+        let asks_default = request.model == oauth::DEFAULT_MODEL;
+        if asks_default && self.default_unavailable.load(Ordering::Relaxed) {
+            request.model = oauth::ROLLOUT_FALLBACK_MODEL.to_string();
+        }
+        let mut response = self.post_responses(&request).await?;
+        if asks_default
+            && request.model == oauth::DEFAULT_MODEL
+            && model_may_be_unavailable(response.status())
+        {
+            let status = response.status();
+            let retry_after = crate::llm::retry_after_from_headers(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            if !names_unavailable_model(&body) {
+                return Err(crate::llm::http_error_with_retry_after(
+                    status.as_u16(),
+                    format!("ChatGPT returned HTTP {status}: {body}"),
+                    retry_after,
+                ));
+            }
+            tracing::warn!(
+                "{} is not available on this ChatGPT account yet; using {}",
+                oauth::DEFAULT_MODEL,
+                oauth::ROLLOUT_FALLBACK_MODEL
+            );
+            self.default_unavailable.store(true, Ordering::Relaxed);
+            request.model = oauth::ROLLOUT_FALLBACK_MODEL.to_string();
+            response = self.post_responses(&request).await?;
+        }
         if !response.status().is_success() {
             return Err(self.http_failure(response).await);
         }
@@ -372,6 +411,28 @@ impl LlmProvider for ChatgptProvider {
     fn label(&self) -> String {
         format!("chatgpt:{}", self.model)
     }
+}
+
+/// Statuses the endpoint answers a model the account cannot use with.
+fn model_may_be_unavailable(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 403 | 404)
+}
+
+/// Whether an error body is about the model itself rather than the request.
+fn names_unavailable_model(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("model")
+        && [
+            "not supported",
+            "not found",
+            "does not exist",
+            "not available",
+            "unsupported",
+            "no access",
+            "access to model",
+        ]
+        .iter()
+        .any(|phrase| body.contains(phrase))
 }
 
 fn fallback_models() -> Vec<String> {
@@ -998,6 +1059,28 @@ impl Plugin for ChatGptPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_model_error_triggers_the_rollout_fallback() {
+        use super::{model_may_be_unavailable, names_unavailable_model};
+        use reqwest::StatusCode;
+        assert!(model_may_be_unavailable(StatusCode::BAD_REQUEST));
+        assert!(model_may_be_unavailable(StatusCode::NOT_FOUND));
+        assert!(!model_may_be_unavailable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!model_may_be_unavailable(StatusCode::UNAUTHORIZED));
+        assert!(names_unavailable_model(
+            r#"{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}"#
+        ));
+        assert!(names_unavailable_model(
+            r#"{"error":{"message":"Model gpt-6-astra does not exist"}}"#
+        ));
+        assert!(!names_unavailable_model(
+            r#"{"detail":"Instructions are not valid"}"#
+        ));
+        assert!(!names_unavailable_model(
+            r#"{"detail":"Unsupported parameter: reasoning.summary"}"#
+        ));
+    }
+
     use super::*;
     use crate::llm::ToolSpec;
 
@@ -1022,6 +1105,7 @@ mod tests {
                 cache: Mutex::new(TokenCache::default()),
             }),
             session_id: "test".to_string(),
+            default_unavailable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

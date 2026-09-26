@@ -49,7 +49,10 @@ const EXPIRY_LEEWAY_SECS: i64 = 300;
 /// The subscription API base (Responses API lives under it).
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// A reasonable default model; the real list comes from `GET {BASE_URL}/models`.
-pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const DEFAULT_MODEL: &str = "gpt-6-astra";
+/// What a request for [`DEFAULT_MODEL`] falls back to on an account the
+/// staged GPT-6 Astra rollout has not reached yet.
+pub const ROLLOUT_FALLBACK_MODEL: &str = "gpt-5.6-sol";
 /// Client identifier sent on every API request.
 pub const API_ORIGINATOR: &str = ORIGINATOR;
 

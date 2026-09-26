@@ -375,6 +375,7 @@ fn reasoning_effort_for<'a>(model: &str, effort: &'a str) -> Option<&'a str> {
     let grok = model.starts_with("grok-4");
     let takes_effort = grok
         || model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
         || model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4");
@@ -393,6 +394,7 @@ fn reasoning_effort_for<'a>(model: &str, effort: &'a str) -> Option<&'a str> {
 fn rejects_temperature(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
         || model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4")
@@ -677,7 +679,11 @@ pub(crate) fn context_window(model: &str) -> Option<u32> {
     if model.starts_with("grok") {
         return Some(131_072);
     }
-    // OpenAI.
+    // OpenAI. GPT-6's window is not published for the ChatGPT backend; 400k
+    // is the smallest a current GPT model has, so compaction stays safe.
+    if model.starts_with("gpt-6") {
+        return Some(400_000);
+    }
     if model.starts_with("gpt-5.6") {
         return Some(1_000_000);
     }
