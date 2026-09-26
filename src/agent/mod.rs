@@ -1705,10 +1705,10 @@ impl Agent {
                 &self.dispatcher.registry().advertised_specs(),
             ));
         }
-        let deferrable = self.dispatcher.registry().deferrable_names();
+        let deferrable = deferred_tool_listing(self.dispatcher.registry());
         if !deferrable.is_empty() {
             prompt.push_str(
-                "\n\n## More tools\n\nLoad with `tool_search` (`select:name`) before first use: ",
+                "\n\n## More tools\n\nLoad with `tool_search` (`select:name`, or keywords) before first use: ",
             );
             prompt.push_str(&deferrable.join(", "));
             prompt.push('.');
@@ -2186,6 +2186,37 @@ pub async fn build_tool_registry(
         )));
     }
     Ok((registry, subagent_model))
+}
+
+/// The deferred tools as the system prompt lists them. Native, scripted and
+/// plugin tools by name; MCP tools grouped by the prefix before their first
+/// `_` (`browser_*: 25 MCP tools`), since a server's tools share one and a
+/// keyword search on it finds them.
+fn deferred_tool_listing(registry: &ToolRegistry) -> Vec<String> {
+    let mut listing = Vec::new();
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for name in registry.deferrable_names() {
+        let is_mcp = registry
+            .get(&name)
+            .is_some_and(|tool| tool.kind() == crate::tools::ToolKind::Mcp);
+        if !is_mcp {
+            listing.push(name);
+            continue;
+        }
+        let prefix = name
+            .split_once('_')
+            .map_or(name.as_str(), |(p, _)| p)
+            .to_string();
+        match groups.iter_mut().find(|(p, _)| *p == prefix) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((prefix, 1)),
+        }
+    }
+    listing.extend(groups.into_iter().map(|(prefix, count)| match count {
+        1 => format!("{prefix} (MCP)"),
+        n => format!("{prefix}_* ({n} MCP tools)"),
+    }));
+    listing
 }
 
 /// Under the `lean` and `min` token profiles, advertise only the core tools
