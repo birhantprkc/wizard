@@ -18,7 +18,7 @@ nix run github:teddytennant/wizard
 cd contrib/aur/wizard-bin && makepkg -si
 ```
 
-Every other flavor (a preinstalled local model, the window, from source, Termux) is in [Getting started](docs/getting-started.md#install).
+Every other flavor (a preinstalled local model, from source, Termux) is in [Getting started](docs/getting-started.md#install).
 
 ## Startup
 
@@ -68,7 +68,7 @@ Run 2026-09-12 with Harbor, one trial per task, through the [`tbench/`](tbench/R
 - **Gateway.** Headless as a Telegram bot, each message a turn in your project. [Gateway](docs/gateway.md)
 - **Memory.** Plain markdown under `~/.wizard/memory/`, indexed into the prompt each session; `/memory` reads it back. [Memory](docs/memory.md)
 - **Fork it.** `/publish` puts your evolved Wizard on your GitHub with its own installer; `wizard skills` shares one piece from a git-backed registry. [Fork and distribute](docs/market.md)
-- **A window** (preview). `wizard gui` from a `--features native` build, or `wizard-native gui` from the installer. [Native GUI](docs/native-gui.md)
+- **Desktop app.** Wizard GUI runs Wizard, Pi and Claude Code side by side, locally or over SSH; `wizard gui` opens it. It ships with each release. [Wizard GUI](gui/README.md)
 
 ## Limitations
 

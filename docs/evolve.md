@@ -141,8 +141,6 @@ If there's no toolchain or source and one can't be provisioned (offline, no `rus
 | Tests | `cargo test --release --locked` | "It compiles and prints a version string" is a bar any plausible-looking patch clears while quietly breaking the agent loop. `--release` reuses the artifacts the build just produced, and it carries `--locked` too so the lockfile rule holds for the whole gate |
 | Smoke test | the built binary, `--version` | It has to actually run on this machine before it replaces a binary that does |
 
-Both cargo rungs carry the features the running binary was built with, so a `wizard-native` install (`--features native`) is rebuilt and tested as a native build rather than quietly becoming one whose `wizard gui` opens no window — the same rule `wizard update` follows when it picks a release asset.
-
 **The test rung is why a deep evolve now takes as long as it does.** It runs Wizard's whole suite, which on a laptop is minutes rather than seconds, on top of a release build that is already slow. That is the cost of the change being checked by something other than the compiler; budget for it before starting a deep evolve, especially from the TUI where the session waits on it.
 
 The run is bounded: if the suite does not finish within **45 minutes** it is killed and the patch is rejected exactly as a failing test would be. `WIZARD_EVOLVE_TEST_TIMEOUT_SECS` overrides that bound with a number of seconds, for a slow or heavily loaded machine:

@@ -1,13 +1,12 @@
 # The graph explorer
 
-> **Deferred — not in 2.0.0.** This screen is compiled and tested but there is
-> no way to open it: the window has no mesh button, no `Screen::Mesh` and no
-> `Message::Graph`. It was too unfinished to ship, and it is held for a later
-> release. Everything below describes what it does when it is wired back in —
-> `src/plugins/native/graph/mod.rs` lists the four seams that do that. The mesh itself
-> is unaffected: `wizard peers` works, and [mesh.md](mesh.md) is current.
+> **Deferred, with nowhere to draw it.** The screen lived in the iced window,
+> which was removed in 3.5. What remains is the `graph` plugin: the model and
+> the layout, toolkit-independent and tested. Everything below describes the
+> screen as it was designed. The mesh itself is unaffected: `wizard peers`
+> works, and [mesh.md](mesh.md) is current.
 
-The mesh, drawn. One screen in the native GUI (`--features native`) that answers
+The mesh, drawn. One screen that answers
 three questions about the peers this machine knows about: **who is there**,
 **what is this machine's decision about them**, and — the one everything else is
 subordinate to — **who is actually up right now**.
@@ -211,10 +210,7 @@ The split between the last four and the first two is the point: nothing in
 decides anything about the mesh.
 
 That split is now a cargo feature as well as a directory. The model and the
-layout are the `graph` plugin (`--features graph`, on by default) and the six
-files under `src/native/graph/` are gated on it in step, so a window built
-without it is a window with no explorer — which is the window that ships today,
-since the screen is not yet reachable from the UI. See
-[`plugins.md`](plugins.md) for why a plugin that registers nothing through
-`Ctx` is still a plugin, and also [`mesh.md`](mesh.md) and
-[`native-gui.md`](native-gui.md).
+layout are the `graph` plugin (`--features graph`, on by default); the screen
+that drew them went with the iced window. See [`plugins.md`](plugins.md) for
+why a plugin that registers nothing through `Ctx` is still a plugin, and also
+[`mesh.md`](mesh.md).

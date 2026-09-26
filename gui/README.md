@@ -4,7 +4,7 @@ The desktop app for Wizard. It runs Wizard, Pi and Claude Code side by side acro
 
 Wizard GUI is a fork of [Zeron](https://github.com/zeronsh/zeron), the open-source agent controller built by the Zeron team ([zeron.sh](https://zeron.sh)). Nearly all of it is their work: the engine, sync, transcript, composer and gpui interface. Thank you to Zeron's creators. It stays under their MIT license (see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
-This is a different thing from `wizard gui`, which opens Wizard's own single-window iced front end ([docs/native-gui.md](../docs/native-gui.md)).
+`wizard gui` opens this app once it is installed.
 
 What the fork changes:
 

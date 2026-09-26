@@ -1,6 +1,6 @@
 # Architecture
 
-Wizard is a single-binary Rust application: a Ratatui TUI, a headless/sovereign loop, an iced window (`--features native`), and several other surfaces (ACP, MCP server, gateway, fleet, scheduler) on top of one provider-agnostic agent loop. The tool set is native tools plus MCP servers plus scripted tools, with tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, xAI (key or OAuth), ChatGPT OAuth, OpenRouter, Cloudflare Workers AI, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
+Wizard is a single-binary Rust application: a Ratatui TUI, a headless/sovereign loop, and several other surfaces (ACP, MCP server, gateway, fleet, scheduler) on top of one provider-agnostic agent loop. The tool set is native tools plus MCP servers plus scripted tools, with tiered self-extension. Providers are interchangeable: any OpenAI-compatible endpoint, Anthropic, xAI (key or OAuth), ChatGPT OAuth, OpenRouter, Cloudflare Workers AI, Ollama, or a local llama.cpp server whose `llama-server` lifecycle Wizard manages itself.
 
 ## High-level overview
 
@@ -15,11 +15,10 @@ flowchart TB
         CLI[clap CLI] --> Mode{surface}
         Mode -->|genie| TUI[ratatui TUI]
         Mode -->|sovereign / continuous| Headless[autonomous loop]
-        Mode -->|gui| GUI["iced window (native)"]
+        Mode -->|gui| GUI["launch Wizard GUI (gui/)"]
         Mode -->|acp / mcp-serve / gateway| Other[other surfaces]
         TUI --> Agent[agent loop]
         Headless --> Agent
-        GUI --> Agent
         Other --> Agent
         Agent --> LLM["active LlmProvider"]
         Agent -.spawns when down.-> Server[llama-server lifecycle]
@@ -93,7 +92,7 @@ Parses arguments and selects the surface:
 | `--cwd` | Project root override |
 | `--bg` | Internal (hidden): marks a headless run dispatched from `/dashboard` |
 | `--output-format text\|json\|stream-json` | Headless output |
-| `wizard gui` | The iced window (needs `--features native`; `--native` is still accepted and ignored) |
+| `wizard gui` | Open Wizard GUI, the desktop app (`--native` is still accepted and ignored) |
 | `wizard acp` | Agent Client Protocol over stdio |
 | `wizard mcp-serve` | Expose native tools as an MCP server |
 | `wizard agents` / `doctor` / `usage` / `sync` / `fleet` / `schedule` / `scheduler` / `gateway` / `peers` / `skills` / `harness` / `evolve` / `resume` / `update` / … | Utility subcommands (`update` exists but refuses every download today — see [Install scripts](#install-scripts)) |
@@ -242,7 +241,7 @@ Evolution events go to `~/.wizard/evolution.jsonl`. `/publish` pushes `~/.wizard
 
 - **TUI** (`app/`, `ui/`, `event.rs`): chat, tool cards, git sidebar, subagent rail, status bar, slash commands
 - **Headless** (`agent` + `output.rs`): text / JSON / stream-json ([headless.md](headless.md))
-- **Window** (`src/plugins/native/` drawing, `src/plugins/gui/` holding the agent; both `--features native`): the same agent core in-process, in an iced window — no HTTP, no webview, no port ([native-gui.md](native-gui.md)). There is no browser GUI: the loopback HTTP server and JavaScript page that used to be the second surface are deleted. A headless box is reached by running the TUI over SSH, by `wizard -p`, by `wizard acp`, or through the gateway
+- **Wizard GUI** (`gui/`): the desktop app, its own Cargo workspace and release asset, forked from Zeron. It drives Wizard over ACP. `wizard gui` only starts it ([gui/README.md](../gui/README.md)).
 - **ACP** (`acp.rs`): editor embedding ([acp.md](acp.md)); also the surface Buzz and other ACP harnesses drive ([buzz.md](buzz.md))
 - **Gateway** (`gateway/`): Telegram bot turns ([gateway.md](gateway.md))
 - **Fleet / schedule / sync / doctor / update**: see the matching docs pages
@@ -287,7 +286,7 @@ By default: binary + [default loadout](loadout.md) (browser MCP + subagents). No
 
 **The download path verifies before it installs.** `install.sh` and `wizard update` both check `checksums.txt` against its minisign signature under `wizard-release.pub`, then each asset's sha256 against that file, and every failure aborts. The check comes first, before any flavor does its work, so a refusal costs about a second rather than a multi-gigabyte GGUF. `WIZARD_BUILD_FROM_SOURCE=1` (implied on Termux) builds from the tag instead, along with Nix and a plain checkout. Details in [Getting started](getting-started.md#install).
 
-Flavors: `WIZARD_LOCAL=1` preinstalls the local stack; `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor; `WIZARD_BYOM=1` sets up Ollama and defers the model choice; `WIZARD_MINIMAL=1` is binary only (`WIZARD_BESPOKE=1` is a deprecated alias). `WIZARD_NATIVE=1` additionally installs `wizard-native`, the build with the iced window. Deep-evolve toolchain installs on first `/evolve --deep`, or eagerly with `WIZARD_WITH_TOOLCHAIN=1`.
+Flavors: `WIZARD_LOCAL=1` preinstalls the local stack; `WIZARD_USE_OLLAMA=1` is the Ollama variant of that flavor; `WIZARD_BYOM=1` sets up Ollama and defers the model choice; `WIZARD_MINIMAL=1` is binary only (`WIZARD_BESPOKE=1` is a deprecated alias). Deep-evolve toolchain installs on first `/evolve --deep`, or eagerly with `WIZARD_WITH_TOOLCHAIN=1`.
 
 ### `install-byom.sh`
 
