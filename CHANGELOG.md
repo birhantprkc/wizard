@@ -10,7 +10,12 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ### Added
 
-- **Wizard GUI ships in `gui/`.**
+- **Wizard GUI, the desktop app, ships in `gui/`.** It runs Wizard, Pi and
+  Claude Code side by side across projects and on machines reached over SSH,
+  and onboarding can reuse a Codex (ChatGPT) or Grok CLI sign-in found on disk.
+  Linux, macOS and Windows builds are attached to each release, and `wizard gui`
+  opens it once it is installed. It is a fork of
+  [Zeron](https://github.com/zeronsh/zeron) under the MIT license.
 
 - **GPT-6 Astra is the ChatGPT default.** Sign in with ChatGPT now starts on
   `gpt-6-astra`. On an account the staged rollout has not reached, the first
@@ -74,6 +79,13 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   count as top-level, so a nested `always: true` stopped putting that skill's
   whole body into every prompt, and folded (`>`) and literal (`|`)
   descriptions are read in full instead of as the bare indicator.
+
+### Removed
+
+- **The iced window and `wizard-native`.** `wizard gui` now opens Wizard GUI
+  instead, and says how to install it when it is missing. `--features native`
+  is gone.
+
 
 ## [3.2.5] - 2026-09-20
 
