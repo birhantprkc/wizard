@@ -402,8 +402,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # `pattern` keeps the desktop app's artifacts (the gui-* jobs below) out
+      # of checksums.txt. They build in parallel and may or may not have
+      # uploaded by now, and a checksum list whose contents depend on a race
+      # is not one worth signing.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          pattern: wizard-*
           merge-multiple: true
 
       - name: Generate checksums
@@ -725,3 +730,204 @@ jobs:
               commit -m "wizard ${GITHUB_REF_NAME#v}"
           git push "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/teddytennant/homebrew-tap" HEAD:main
           echo "Tap formula now at ${GITHUB_REF_NAME}" >>"$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Wizard GUI (gui/), the desktop app
+  # ---------------------------------------------------------------------
+  #
+  # Built from the same tag and attached to the same release, but kept off
+  # the wizard binary's path: none of these jobs is in `release`'s needs, and
+  # their artifacts are named gui-* so `release` never downloads them. A GUI
+  # build that breaks costs the GUI assets, not the release. They start after
+  # `version` so a mismatched tag builds nothing.
+  #
+  # No rust-cache here either, for the reason at the top of this file.
+  gui-linux:
+    name: GUI build (linux ${{ matrix.arch }})
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: gpui system libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: Package
+        run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-linux-${{ matrix.arch }}
+          path: gui/target/package/*.tar.gz
+          if-no-files-found: error
+
+  # Signing and notarization are optional. With no MACOS_CERT_P12 the app is
+  # ad-hoc signed and Gatekeeper asks on first launch; gui/README.md says so.
+  #   MACOS_CERT_P12 / MACOS_CERT_PASSWORD: base64 Developer ID Application
+  #     .p12 and its export password.
+  #   AC_API_KEY_P8 / AC_API_KEY_ID / AC_API_ISSUER_ID: App Store Connect API
+  #     key for notarytool. All three present means notarize and staple.
+  gui-macos:
+    name: GUI build (macos arm64)
+    needs: [version]
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Import the Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: Notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: Package
+        run: scripts/package-macos.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-macos-arm64
+          path: gui/target/package/*.dmg
+          if-no-files-found: error
+
+  gui-windows:
+    name: GUI build (windows x86_64)
+    needs: [version]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: Locate the Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      # The feed URL is written into zeron-update.json, but the app only
+      # checks for updates when ZERON_RELEASES_URL is set, so it is inert.
+      - name: Package
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gui-windows-x86_64
+          path: gui/target/package/*.zip
+          if-no-files-found: error
+
+  # Attaches the GUI to the release `release` created, under wizard's
+  # version rather than the app's internal one, with its own checksum list
+  # signed by the same key as checksums.txt.
+  gui-release:
+    name: Attach Wizard GUI to the release
+    needs: [release, gui-linux, gui-macos, gui-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: gui-*
+          path: gui-dist
+          merge-multiple: true
+      - name: Name the assets after this release
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir out
+          for f in gui-dist/*; do
+            base="$(basename "$f")"
+            # zeron-<app version>-<platform>.<ext> -> wizard-gui-<ver>-<platform>.<ext>
+            platform="$(printf '%s' "$base" | sed -E 's/^zeron-[0-9][^-]*-//')"
+            cp "$f" "out/wizard-gui-${ver}-${platform}"
+          done
+          ls -l out
+          for want in linux-x86_64.tar.gz linux-aarch64.tar.gz macos-arm64.dmg windows-x86_64.zip; do
+            test -f "out/wizard-gui-${ver}-${want}" || { echo "::error::missing wizard-gui-${ver}-${want}" >&2; exit 1; }
+          done
+          (cd out && sha256sum -- * > gui-checksums.txt)
+      - name: Sign the GUI checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -eu
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -S -s minisign.key -m out/gui-checksums.txt \
+            -c "wizard ${GITHUB_REF_NAME} gui checksums" \
+            -t "wizard ${GITHUB_REF_NAME} gui checksums, signed by the wizard release key" \
+            </dev/null
+          rm -f minisign.key
+          key="$(grep -v '^untrusted comment:' wizard-release.pub | tr -d '[:space:]')"
+          minisign -Vm out/gui-checksums.txt -x out/gui-checksums.txt.minisig -P "$key"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber
