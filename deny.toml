@@ -11,12 +11,9 @@
 #
 #     cargo deny --locked --all-features check
 #
-# `--all-features` is load-bearing, not decoration. The `native` feature pulls
-# in iced and several hundred crates of winit, cosmic-text and tiny-skia behind
-# it, and the release workflow publishes four `wizard-native-*` assets built
-# from exactly that graph. Checking only the default features would leave those
-# crates shipping to users without one advisory or license ever having been
-# looked at, which is the failure mode this file exists to prevent.
+# `--all-features` so an off-by-default feature cannot bring in a crate that no
+# advisory or license check ever looked at, which is the failure mode this file
+# exists to prevent.
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
@@ -91,27 +88,6 @@ ignore = [
     # both entries when plist ships against quick-xml >= 0.41.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 DoS; no XML is ever parsed (plist's loaders are never called), and plist 1.9 pins quick-xml 0.39 so no lockfile bump reaches the fix" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 DoS; no XML is ever parsed (plist's loaders are never called), and plist 1.9 pins quick-xml 0.39 so no lockfile bump reaches the fix" },
-
-    # Reviewed 2026-08-07, with the native GUI (`--features native`). Same
-    # shape as the gtk-rs block above and scoped the same way, to one advisory
-    # id, so a *new* advisory against ttf-parser still fails the build.
-    #
-    # ttf-parser is reached through fontdb <- cosmic-text <- iced_graphics: it
-    # is the font-file parser behind text shaping. Two paths bring it into the
-    # lockfile, and neither is in the shipped default binary — `iced` is
-    # optional and off by default, and `iced_test` is a dev-dependency, so a
-    # release build links no copy of it at all. (`cargo deny` reads the
-    # lockfile, which is feature- and target-agnostic, which is why it is
-    # visible here.)
-    #
-    # The advisory is "the author will not fix further bugs", not a
-    # vulnerability: no CVE, no exploit, and the alternative it names (skrifa)
-    # is already in this tree beside it, because cosmic-text uses skrifa for
-    # rasterization and fontdb uses ttf-parser only to read a face's metadata
-    # when building the font database. The fix is upstream — fontdb dropping
-    # ttf-parser, or cosmic-text dropping fontdb — and neither has landed.
-    # Delete this the moment it does.
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25: unmaintained (author-declared, no CVE); reached only through cosmic-text under the optional `native` feature and the iced_test dev-dependency, so no shipped binary links it" },
 ]
 
 [licenses]
@@ -149,26 +125,19 @@ allow = [
     # covers the symbol tables it derives from TeX, so both halves have to be
     # allowed for the crate to pass.
     "LPPL-1.3c",
-    # target-lexicon, and the wasm/unicode crates under iced. The LLVM
+    # rustix, linux-raw-sys and wasi. The LLVM
     # exception only *removes* an obligation from Apache-2.0, which is already
     # allowed, so this widens nothing in substance; SPDX simply does not let a
     # bare `Apache-2.0` allow-entry satisfy an expression that carries a WITH
     # clause, so it has to be spelled out.
     "Apache-2.0 WITH LLVM-exception",
-    # Reviewed 2026-08-07, arriving with the native GUI. Four crates under iced
-    # resolve to BSD-2-Clause on their own rather than as one branch of an OR:
-    # `arrayref` (through tiny-skia, the rasterizer), and `kamadak-exif` with
-    # its `mutate_once` (through iced_graphics, which reads image orientation).
-    # It is the 3-clause license already allowed above with the
-    # no-endorsement clause struck out — strictly weaker, same permissive
-    # shape, no condition on the binary they link into.
+    # The 3-clause license already allowed above with the no-endorsement
+    # clause struck out: strictly weaker, same permissive shape, no condition
+    # on the binary it links into.
     "BSD-2-Clause",
-    # Same review. `clipboard-win` and its `error-code`, reached through
-    # `window_clipboard` <- iced_winit, and *Windows-only* — they are in the
-    # lockfile because it is target-agnostic, and no asset this project
-    # publishes links either one. The Boost license is permissive with no
-    # attribution requirement at all for a binary distribution, which is
-    # weaker than the MIT terms the tree is already full of.
+    # Permissive with no attribution requirement at all for a binary
+    # distribution, which is weaker than the MIT terms the tree is already
+    # full of.
     "BSL-1.0",
 ]
 exceptions = []

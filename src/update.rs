@@ -3122,65 +3122,6 @@ printf 'INSTALLED-ANYWAY\n'
         );
     }
 
-    #[test]
-    fn install_sh_aborts_the_whole_install_when_the_native_asset_fails_verification() {
-        // `wizard-native` is fetched by `install_native_gui`, the last step of
-        // `main`, and it is the one asset whose verification sits under a
-        // function with a `|| return 1` caller. When that call was a command
-        // substitution, `die`'s `exit 1` ended only the subshell: the installer
-        // shrugged, warned "no runnable native build" — naming a cause that had
-        // nothing to do with what happened — and exited 0 after refusing an
-        // asset it could not verify. Nothing unverified was installed either
-        // way, but SECURITY.md's "every failure aborts" was false for this one
-        // asset, so the exit status is pinned here.
-        //
-        // The stub answers every URL with the same bytes, so `checksums.txt`
-        // and its `.minisig` are the same garbage and the signature cannot
-        // verify — the failure a real tampered release would produce. A host
-        // with no signature checker at all reaches the same `die` by the other
-        // branch, so this runs everywhere.
-        let (_, _, public) = test_key(47);
-        let key_line = public.lines().nth(1).expect("key line").to_string();
-        let tmp = TempDir::new();
-        let out = run_installer_script(
-            &tmp.0,
-            "github.com",
-            "d3adbeef  wizard-native.tar.gz",
-            &format!(
-                r#"set -euo pipefail
-export WIZARD_VERSION=v9.9.9
-export WIZARD_NATIVE=1
-source '{installer}'
-WIZARD_RELEASE_PUBKEY='{key_line}'
-install_native_gui
-printf 'CONTINUED\n'
-"#,
-                installer = install_sh().display()
-            ),
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(
-            !out.status.success(),
-            "an unverifiable wizard-native asset let the install finish 0: {stdout}\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("CONTINUED"),
-            "the install carried on past the refusal: {stdout}"
-        );
-        assert!(
-            stderr.lines().any(|line| line.starts_with("error:")),
-            "the refusal must say what happened: {stderr}"
-        );
-        // And it must not be reported as a missing build, which is what sends
-        // the reader looking for an unsupported platform instead of a bad
-        // download.
-        assert!(
-            !stderr.contains("could not install the native GUI"),
-            "a verification failure was reported as an absent asset: {stderr}"
-        );
-    }
-
     /// Run `script` with a stub `curl` that serves a whole release: a request
     /// whose URL ends in the name of one of `assets` is answered with that
     /// file's bytes, anything else fails the way curl fails a 404, and every

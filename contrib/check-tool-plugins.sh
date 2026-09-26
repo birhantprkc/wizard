@@ -14,14 +14,10 @@
 # *library* plugin is only interesting when its consumer is present. So the
 # legs below build combinations the provider script never produces:
 #
-#   - `graph` left out with the GUI *present*, which is the only way to catch
-#     `src/native/graph/` reaching for a plugin that is not there. Neither
-#     `--no-default-features` nor a default build can see it: `native` is off
-#     in both.
 #   - `tool-web` left out with everything else present, which catches a core
 #     module — or another plugin — that took a dependency on the web tools
 #     rather than on `src/tools/http.rs`.
-#   - `mesh` left out, twice: once headless and once with the GUI present. The
+#   - `mesh` left out. The
 #     mesh is the one plugin core reaches through *two* seams rather than one
 #     — `wizard peers` (an `entrypoint::Subcommand`) and the session tee (an
 #     `app::tee::TeeFactory`) — and the second of those is on the TUI's hot
@@ -214,21 +210,6 @@ leg "without plugin-js" --features "$(without_many plugin-js tool-json)"
 # `None`, `wizard peers` degrades to a sentence, and quinn/rustls/mdns-sd are
 # genuinely out of the build rather than merely uncalled.
 leg "without mesh" --features "$(without_many mesh graph)"
-
-# The GUI is where `graph` is actually consumed, so both sides of it need a
-# build with the window linked. `--build-only` is not enough here: the
-# `graph_explorer` integration test is gated on `all(native, graph)` and has to
-# be seen compiling *and* passing in the first of these and compiling to
-# nothing in the second. The gate is the `#[cfg]` on its `mod` line in
-# tests/integration/main.rs; it was a `#![cfg(...)]` inside the file itself
-# until the five integration targets became one.
-leg "the window, with the explorer" --features "$(all),native"
-leg "the window, with graph deleted" --features "$(without graph),native"
-
-# The window renders peers, so a mesh-less GUI is the combination most likely
-# to have an edge nobody gated. Neither leg above sees it: `without mesh` has
-# no window and `the window, with graph deleted` still has the mesh.
-leg "the window, with the mesh deleted" --features "$(without_many mesh graph),native"
 
 printf '\n=== removability matrix ===\n'
 for line in "${results[@]}"; do

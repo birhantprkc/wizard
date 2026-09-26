@@ -84,26 +84,6 @@
           inherit system;
           overlays = [ self.overlays.default ];
         };
-
-        # The windowing libraries the native GUI `dlopen`s at run time, on the
-        # platform that has them.
-        #
-        # Linux-only, because they are Linux-only: nixpkgs marks `wayland` and
-        # the Xorg client libraries as unavailable for darwin, and winit on
-        # macOS goes through AppKit and never looks for them. Listing them
-        # unconditionally made `nix develop` and `nix flake check` fail outright
-        # on macOS with "refusing to evaluate package 'wayland' … not available
-        # on the requested hostPlatform" — a broken dev shell on one of the two
-        # platforms this project supports, from an attribute that does nothing
-        # there.
-        guiLibs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-          pkgs.libxkbcommon
-          pkgs.wayland
-          pkgs.libx11
-          pkgs.libxcursor
-          pkgs.libxi
-          pkgs.libxrandr
-        ];
       in
       {
         packages = {
@@ -127,22 +107,7 @@
             pkgs.llama-cpp
           ];
 
-          # The native GUI (`cargo build --features native`,
-          # `wizard gui`) needs nothing at *build* time: `tiny-skia`
-          # means no wgpu, and winit reaches X11 and Wayland through `dlopen`
-          # rather than linking them, so there is no `-dev` package to find.
-          #
-          # `dlopen` is exactly why they have to be here anyway. On NixOS there
-          # is no /usr/lib for the loader to fall back to, so a window opened
-          # from this shell finds libX11 and libwayland-client only if
-          # LD_LIBRARY_PATH names their store paths. The default package below
-          # is unaffected: it builds with default features and links no iced,
-          # which is the whole point of the feature flag. See `guiLibs` above
-          # for why the list is empty on macOS.
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = guiLibs;
-
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibs;
 
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };

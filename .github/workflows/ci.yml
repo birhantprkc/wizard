@@ -29,19 +29,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The Linux legs. These four were one job called `rust` until they were
+  # The Linux legs. These three were one job called `rust` until they were
   # split, and the split is the only reason this file is worth reading twice:
   # the work did not get cheaper, it stopped being in a line. The old job ran
-  # clippy, the suite, a release build, then clippy and the suite again under
-  # `--features native`, one after another, for 763 seconds of wall clock on a
-  # green run while every other job in this file had been finished for ten
-  # minutes. Nothing in that sequence needed the step before it.
+  # clippy, the suite and a release build one after another, while every
+  # other job in this file had long finished. Nothing in that sequence needed
+  # the step before it.
   #
-  # Public repository, so standard runners are not metered and four in
-  # parallel cost exactly what one cost. What they do cost is four checkouts,
-  # four toolchain installs and four cache restores, about 30 seconds each,
-  # which is why this is four jobs and not nine: past a point the setup is the
-  # job.
+  # Public repository, so standard runners are not metered and three in
+  # parallel cost exactly what one cost. What they do cost is three checkouts,
+  # three toolchain installs and three cache restores, about 30 seconds each,
+  # which is why this is three jobs and not more: past a point the setup is
+  # the job.
   #
   # The required check named "Rust checks" is now the `rust` gate at the
   # bottom. Read the note there before renaming anything here.
@@ -219,7 +218,7 @@ jobs:
           tool: cargo-machete
 
       # Cheapest-first within the job, so a formatting slip does not wait on
-      # clippy: machete -> fmt -> clippy -> clippy --features native.
+      # clippy: machete -> fmt -> clippy.
       # --locked makes Cargo.lock drift a hard failure instead of a
       # silent re-resolve.
       - name: Unused dependencies
@@ -230,22 +229,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-
-      # The native GUI (`wizard gui`) is off by default, so nothing
-      # above compiles a line of it — and it is a *published release asset*
-      # (`wizard-native-*`, the `native` job in release.yml), so letting it rot
-      # unnoticed would mean shipping four binaries no gate ever looked at.
-      #
-      # Lint and suite, not a bare `cargo check`, and that is the difference
-      # from the webview shell this replaced: `--features native` adds real
-      # logic (the widget trees, the selection layer, the console gate) with
-      # real tests behind `#[cfg(feature = "native")]`, and a `cargo check`
-      # compiles none of them. The suite half is `rust-test-native` below. It
-      # needs no system packages — winit reaches X11 and Wayland through
-      # `dlopen`, and `tiny-skia` means no wgpu — so there is nothing to
-      # `apt-get` first.
-      - name: Clippy (--features native)
-        run: cargo clippy --all-targets --locked --features native -- -D warnings
 
   rust-test:
     name: Rust suite
@@ -272,36 +255,6 @@ jobs:
 
       - name: Test
         run: cargo test --locked
-
-  # Split from `rust-test` rather than run after it, because the two do not
-  # share a build: `--features native` pulls in iced, winit, cosmic-text and
-  # tiny-skia, so the second run recompiles most of the graph either way. Two
-  # jobs pay one extra setup and save 130 seconds.
-  rust-test-native:
-    name: Rust suite (--features native)
-    runs-on: ubuntu-latest
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # No compositor here, and there never will be one: everything in
-      # `src/plugins/native/tests.rs` drives `iced_test`'s headless `Simulator` or a
-      # software-rasterized frame in memory. See "Testing, and what a headless
-      # machine cannot prove" in docs/native-gui.md for what that leaves
-      # unproven.
-      - name: Test (--features native)
-        run: cargo test --locked --features native
 
   rust-release:
     name: Rust release build
@@ -350,7 +303,7 @@ jobs:
   # the `Workflow invariants` step above will fail before a rename can merge.
   rust:
     name: Rust checks
-    needs: [rust-lint, rust-test, rust-test-native, rust-release]
+    needs: [rust-lint, rust-test, rust-release]
     # Without this a failed leg SKIPS the gate, and GitHub does not treat a
     # skipped required check as a failing one: the pull request sits at
     # "Expected - Waiting for status to be reported" with a green tick on
@@ -472,15 +425,6 @@ jobs:
       # that can turn it off without editing this line.
       - name: Check
         run: cargo check --locked
-
-      # The native GUI compiles a Darwin-specific windowing path (winit's
-      # AppKit backend) that the Linux leg above never touches, and it ships as
-      # two of the four `wizard-native-*` assets. A check rather than the
-      # Linux leg's full clippy-and-suite, matching the `Check` step above:
-      # this leg's suite is still the unproven half below. Blocking for the
-      # same reason as that check — it is a compile.
-      - name: Check (--features native)
-        run: cargo check --all-targets --locked --features native
 
   # The unproven half, moved out of `suite` so the compile gate stops waiting
   # on it. It was the last two thirds of that job: 105 seconds of `cargo check`
@@ -719,10 +663,8 @@ jobs:
   # cannot ship under, and dependencies arriving from an unexpected source.
   # Policy, and every exception with its reason, lives in deny.toml.
   #
-  # `--all-features` because the release workflow publishes four
-  # `wizard-native-*` assets built with `--features native`, which drags in
-  # iced and several hundred crates of winit, cosmic-text and tiny-skia.
-  # Without it those crates would ship to users having never been looked at.
+  # `--all-features` so an off-by-default feature cannot bring in a crate
+  # nobody looked at.
   #
   # Note for whoever finds this job red on a commit that changed nothing: the
   # advisory database is fetched live, so a newly published advisory can turn
@@ -925,7 +867,7 @@ jobs:
   # Evaluation only, and that is the point. `nix build` here would compile the
   # whole crate a second time for no new information, but nothing evaluated
   # flake.nix at all, so an attribute that is unavailable on a platform — the
-  # Wayland and Xorg libraries the dev shell lists, which nixpkgs marks
+  # Wayland and Xorg libraries the dev shell used to list, which nixpkgs marks
   # Linux-only — broke `nix develop` and `nix flake check` on macOS and no
   # check here noticed. `--all-systems` is what makes this leg see the macOS
   # shell from a Linux runner.
