@@ -997,6 +997,19 @@ pub struct SpawnSubagentTool {
     binding: SharedActiveModel,
 }
 
+/// The first sentence of a subagent description, capped at 90 characters,
+/// for the one-line roster.
+fn first_clause(description: &str) -> String {
+    let line = description.lines().next().unwrap_or("").trim();
+    let end = line.find(". ").map(|i| i + 1).unwrap_or(line.len());
+    let sentence = &line[..end];
+    if sentence.chars().count() <= 90 {
+        return sentence.to_string();
+    }
+    let cut: String = sentence.chars().take(89).collect();
+    format!("{}…", cut.trim_end())
+}
+
 impl SpawnSubagentTool {
     pub fn new(
         configs: Vec<SubagentConfig>,
@@ -1004,9 +1017,13 @@ impl SpawnSubagentTool {
         registry: Arc<ToolRegistry>,
         hooks: Arc<HookEngine>,
     ) -> Self {
+        let short = crate::token_profile::current().safe();
         let roster = configs
             .iter()
             .map(|c| {
+                if short {
+                    return format!("\n  - `{}`: {}", c.name, first_clause(&c.description));
+                }
                 let scope = match &c.tool_scope {
                     None => "all tools".to_string(),
                     Some(names) => names.join(", "),
@@ -1030,6 +1047,14 @@ impl SpawnSubagentTool {
              beats a chain of follow-ups.\n\n\
              Available subagents:{roster}"
         );
+        let description = if short {
+            format!(
+                "{description}\n\nFor one subagent's full description, tools and step budget, \
+                 call this with that `subagent` and `task` set to `describe`."
+            )
+        } else {
+            description
+        };
         Self {
             configs,
             client,
@@ -1096,6 +1121,22 @@ impl Tool for SpawnSubagentTool {
             tool: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
             message: err.to_string(),
         })?;
+        if crate::token_profile::current().safe() && args.task.trim() == "describe" {
+            return Ok(
+                match self.configs.iter().find(|c| c.name == args.subagent) {
+                    Some(c) => ToolOutput::ok(format!(
+                        "`{}`: {}\ntools: {}\nmax steps: {}",
+                        c.name,
+                        c.description,
+                        c.tool_scope
+                            .as_ref()
+                            .map_or_else(|| "all tools".to_string(), |names| names.join(", ")),
+                        c.max_steps
+                    )),
+                    None => ToolOutput::error(format!("no subagent named {:?}", args.subagent)),
+                },
+            );
+        }
         // A foreground run happens *inside* the parent's turn, so Esc must end
         // it; a background one outlives that turn on purpose and is killed
         // through the subagent registry instead. Deciding here rather than in
