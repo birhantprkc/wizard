@@ -36,6 +36,26 @@ Every other flavor (a preinstalled local model, the window, from source, Termux)
 
 Measured 2026-09-11 with [`bench/startup/run.sh`](bench/startup/README.md) on an idle 16-core box: one ubuntu:24.04 container per agent, installed the way its README says, phone-home switched off where the agent offers a switch, the model endpoint on a dead local port, ten pty starts each with the page cache dropped before the first. Warm is the median of starts two to ten. The full table, each agent's setup, the host record and what is not measured are in [`bench/startup/results.md`](bench/startup/results.md).
 
+## Tokens
+
+3.5 sends 35% less on the first request and uses 16% fewer prompt tokens per task than 3.2.5, with the same pass rate and the whole harness still there: subagents, MCP, memory, skills, checkpoints, the completion review and the clock.
+
+<!-- BENCH:tokens -->
+| profile | first request | passed | prompt tokens per task | est. cost per task |
+|---|---:|---:|---:|---:|
+| wizard 3.2.5 | 15,517 | 16/16 | 624k | $0.61 |
+| **wizard 3.5 (`safe`, default)** | **10,087** | **16/16** | **522k** | **$0.54** |
+| wizard 3.5 `--token-profile min` | 1,729 | 16/16 | 568k | $0.66 |
+<!-- /BENCH -->
+
+Measured 2026-09-26 on 8 tasks taken from a real project's history: a commit that adds failing tests, then the commit that makes them pass. Two tries each on Grok 4.6. A run fails if it edits the tests or breaks another one. The first request is from an empty directory with one MCP server and one hook configured. The per-task `safe` row was run before MCP tools were deferred, so the shipped default sends less than it shows. `min` has the smallest first request but costs more per task: a stripped prompt makes the model take three to five extra steps, and each one sends new tokens that miss the cache. How the defaults were found, from the AHE run through the Terminal-Bench post-mortem to this, is in [Harness engineering](docs/harness-engineering.md). The profiles are in [Token profiles](docs/token-profiles.md).
+
+## Desktop app
+
+![Wizard GUI](gui/apps/zeron/assets/screenshot.png)
+
+Wizard GUI is the desktop app, built from `gui/` in this repo. It runs Wizard, Pi and Claude Code side by side across your projects and on machines you reach over SSH, and it can reuse a Codex (ChatGPT) or Grok CLI sign-in it finds on disk. Installers for Linux, macOS and Windows are attached to every [release](https://github.com/teddytennant/wizard/releases), and `wizard gui` opens it once it is installed. It is a fork of [Zeron](https://github.com/zeronsh/zeron) under the MIT license. [gui/README.md](gui/README.md)
+
 ## First run
 
 ![Wizard's first run: one screen, a pasted key, the TUI, a starter prompt](demo/first-run.gif)
@@ -68,7 +88,6 @@ Run 2026-09-12 with Harbor, one trial per task, through the [`tbench/`](tbench/R
 - **Gateway.** Headless as a Telegram bot, each message a turn in your project. [Gateway](docs/gateway.md)
 - **Memory.** Plain markdown under `~/.wizard/memory/`, indexed into the prompt each session; `/memory` reads it back. [Memory](docs/memory.md)
 - **Fork it.** `/publish` puts your evolved Wizard on your GitHub with its own installer; `wizard skills` shares one piece from a git-backed registry. [Fork and distribute](docs/market.md)
-- **A window** (preview). `wizard gui` from a `--features native` build, or `wizard-native gui` from the installer. [Native GUI](docs/native-gui.md)
 
 ## Limitations
 
