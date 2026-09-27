@@ -6,6 +6,34 @@ plugins {
     alias(libs.plugins.baselineprofile)
 }
 
+// Release signing comes from the environment so the keystore and its passwords
+// never sit in the repository. The release workflow sets all four. A local build
+// with none of them set signs with this machine's debug key, as before; a build
+// with only some of them set fails, because falling back to the debug key there
+// would hide a broken setup until the APK refused to install over the last one.
+val releaseSigningVars = listOf(
+    "WIZARD_ANDROID_KEYSTORE",
+    "WIZARD_ANDROID_KEYSTORE_PASSWORD",
+    "WIZARD_ANDROID_KEY_ALIAS",
+    "WIZARD_ANDROID_KEY_PASSWORD",
+)
+val releaseSigning = releaseSigningVars.associateWith { name ->
+    providers.environmentVariable(name).orNull?.takeIf { it.isNotEmpty() }
+}
+val hasReleaseKey = releaseSigning.values.any { it != null }
+if (hasReleaseKey) {
+    val missing = releaseSigning.filterValues { it == null }.keys
+    if (missing.isNotEmpty()) {
+        throw GradleException("Release signing is half configured: ${missing.joinToString()} not set")
+    }
+    val keystore = file(releaseSigning.getValue("WIZARD_ANDROID_KEYSTORE")!!)
+    if (!keystore.isFile) {
+        throw GradleException("WIZARD_ANDROID_KEYSTORE points at $keystore, which does not exist")
+    }
+} else {
+    logger.lifecycle("WIZARD_ANDROID_KEYSTORE is not set: release builds are signed with the debug key")
+}
+
 android {
     namespace = "com.teddytennant.wizard"
     compileSdk = 37
@@ -19,13 +47,23 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = file(releaseSigning.getValue("WIZARD_ANDROID_KEYSTORE")!!)
+                storePassword = releaseSigning.getValue("WIZARD_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = releaseSigning.getValue("WIZARD_ANDROID_KEY_ALIAS")
+                keyPassword = releaseSigning.getValue("WIZARD_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Signed with the local debug key until there is a release key, so it installs over a debug build.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
         }
     }
 

@@ -14,7 +14,7 @@ nix develop
 ./gradlew assembleRelease
 ```
 
-The APK lands in `app/build/outputs/apk/release/app-release.apk`. It is minified with R8, carries the baseline profile, and is signed with this machine's debug key, so it installs over a debug build from the same machine. `assembleDebug` gives `app/build/outputs/apk/debug/app-debug.apk`, which is noticeably slower: Compose runs unoptimised in debug builds.
+The APK lands in `app/build/outputs/apk/release/app-release.apk`. It is minified with R8, carries the baseline profile, and is signed with this machine's debug key, so it installs over a debug build from the same machine. To sign with a real key instead, set all four of `WIZARD_ANDROID_KEYSTORE` (the keystore's path), `WIZARD_ANDROID_KEYSTORE_PASSWORD`, `WIZARD_ANDROID_KEY_ALIAS` and `WIZARD_ANDROID_KEY_PASSWORD`; the release workflow does this. `assembleDebug` gives `app/build/outputs/apk/debug/app-debug.apk`, which is noticeably slower: Compose runs unoptimised in debug builds.
 
 Without Nix you need JDK 21 and an Android SDK with `platforms;android-37.0` and `build-tools;36.1.0`, with `ANDROID_HOME` pointing at it.
 
