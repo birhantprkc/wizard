@@ -167,6 +167,11 @@ pub(super) fn provider_types() -> Vec<ProviderType> {
 /// is what gets written to `[web] search_backend` and (for keyed backends) the
 /// `~/.wizard/credentials.toml` key name; the order is the display order.
 pub(super) const WEB_BACKENDS: &[(&str, &str, &str)] = &[
+    (
+        "auto",
+        "Automatic",
+        "Grok when signed in with xAI, else DuckDuckGo",
+    ),
     ("duckduckgo", "DuckDuckGo", "free · no API key"),
     ("brave", "Brave Search", "API key · brave.com/search/api"),
     ("tavily", "Tavily", "API key · tavily.com"),

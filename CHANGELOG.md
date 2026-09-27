@@ -6,6 +6,14 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Changed
+
+- **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a
+  stored key, or `XAI_API_KEY`) `web_search` uses Grok's server-side search and
+  its cited results; without them it is DuckDuckGo as before. `grok` is now the
+  documented name for the xAI backend, and `xai` still works. A config that
+  names a backend keeps it.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed

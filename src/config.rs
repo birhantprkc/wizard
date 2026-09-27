@@ -369,11 +369,13 @@ pub struct WebConfig {
     /// Allow fetches that resolve to localhost / private address ranges
     /// (default false). The SSRF guard is on unless this is set.
     pub allow_local: bool,
-    /// `web_search` backend: `"duckduckgo"` (default, no key), `"brave"`,
-    /// `"tavily"`, `"exa"`, `"serper"` (all key-based), or `"xai"`/`"grok"`
+    /// `web_search` backend: `"auto"` (default: `grok` when xAI credentials
+    /// exist, else `duckduckgo`), `"duckduckgo"` (no key), `"brave"`,
+    /// `"tavily"`, `"exa"`, `"serper"` (all key-based), or `"grok"`/`"xai"`
     /// (xAI Grok web search via the Responses API, using the `wizard --login
     /// xai` OAuth session, else a stored key / `XAI_API_KEY`). Configure it
-    /// interactively with `/settings` or during onboarding.
+    /// interactively with `/settings` or during onboarding. Read it through
+    /// [`WebConfig::effective_search_backend`], which settles `auto`.
     pub search_backend: String,
     /// Optional fallback env var name holding the search API key, used when no
     /// key has been pasted via `/settings` (which stores keys in
@@ -393,11 +395,48 @@ impl Default for WebConfig {
         Self {
             fetch_max_bytes: 100_000,
             allow_local: false,
-            search_backend: "duckduckgo".to_string(),
+            search_backend: AUTO_SEARCH_BACKEND.to_string(),
             search_api_key_env: None,
             search_model: None,
         }
     }
+}
+
+/// The `search_backend` value that picks for itself: Grok's own search when
+/// there are xAI credentials to run it with, DuckDuckGo otherwise.
+pub const AUTO_SEARCH_BACKEND: &str = "auto";
+
+impl WebConfig {
+    /// The backend `web_search` will actually call, with `auto` settled
+    /// against the credentials on this machine and `xai` spelled `grok`.
+    pub fn effective_search_backend(&self) -> String {
+        resolve_search_backend(&self.search_backend, xai_search_credentials())
+    }
+}
+
+/// [`WebConfig::effective_search_backend`] with the credential check passed
+/// in, so the choice is testable without a home directory. Blank counts as
+/// `auto`; anything else is returned lowercased, known or not, so an unknown
+/// name still reaches `web_search`'s error that lists the real ones.
+pub fn resolve_search_backend(configured: &str, xai_credentials: bool) -> String {
+    let name = configured.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "" | AUTO_SEARCH_BACKEND if xai_credentials => "grok".to_string(),
+        "" | AUTO_SEARCH_BACKEND => "duckduckgo".to_string(),
+        "xai" => "grok".to_string(),
+        _ => name,
+    }
+}
+
+/// Whether xAI search could authenticate right now: an account sign-in
+/// (`wizard --login xai`), a stored `xai` key, or `$XAI_API_KEY`. The same
+/// three places, in the same order, the search tools look.
+pub fn xai_search_credentials() -> bool {
+    let signed_in = crate::llm::xai_oauth::token_path().is_ok_and(|path| path.exists());
+    let stored = crate::credentials::get("xai").is_some_and(|key| !key.trim().is_empty());
+    let env = std::env::var(crate::llm::xai_oauth::DEFAULT_KEY_ENV)
+        .is_ok_and(|key| !key.trim().is_empty());
+    signed_in || stored || env
 }
 
 /// Shell tool settings (`[shell]` in `config.toml`).

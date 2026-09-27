@@ -412,8 +412,24 @@ fn web_defaults_when_section_missing() {
     assert_eq!(config.web, WebConfig::default());
     assert_eq!(config.web.fetch_max_bytes, 100_000);
     assert!(!config.web.allow_local);
-    assert_eq!(config.web.search_backend, "duckduckgo");
+    assert_eq!(config.web.search_backend, "auto");
     assert!(config.web.search_api_key_env.is_none());
+}
+
+/// `auto` is Grok with xAI credentials and DuckDuckGo without; a named
+/// backend is what it says, whatever credentials exist.
+#[test]
+fn auto_search_backend_follows_the_xai_credentials_and_a_name_wins() {
+    use crate::config::resolve_search_backend;
+    assert_eq!(resolve_search_backend("auto", true), "grok");
+    assert_eq!(resolve_search_backend("auto", false), "duckduckgo");
+    assert_eq!(resolve_search_backend("  ", true), "grok");
+    assert_eq!(resolve_search_backend("", false), "duckduckgo");
+    assert_eq!(resolve_search_backend("duckduckgo", true), "duckduckgo");
+    assert_eq!(resolve_search_backend("XAI", false), "grok");
+    assert_eq!(resolve_search_backend("grok", false), "grok");
+    assert_eq!(resolve_search_backend("Brave", true), "brave");
+    assert_eq!(resolve_search_backend("bing", true), "bing");
 }
 
 #[test]

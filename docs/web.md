@@ -41,16 +41,17 @@ Query a search backend and return a numbered markdown list of results (title, ur
 
 - **Arguments:** `query` (required), `count` (optional, default 5, clamped to 1–10)
 
-The default backend is `duckduckgo`, which needs no key, so `web_search` works on a fresh install with no `[web]` section at all. The **keyed** backends are what needs configuring: pick one, and paste an API key, during onboarding or any time via **`/settings` → Web search backend**. The picker writes `search_backend` to config and stores pasted keys in `~/.wizard/credentials.toml` (0600). Backends, selected by `search_backend` (case-insensitive):
+The default backend is `auto`: Grok's own web search when this machine has xAI credentials (an account sign-in from `/login xai`, a stored `xai` key, or `XAI_API_KEY`), and DuckDuckGo, which needs no key, otherwise. So `web_search` works on a fresh install with no `[web]` section at all, and gets Grok's cited results as soon as you sign in to xAI. A backend named explicitly is used as named. The **keyed** backends are what needs configuring: pick one, and paste an API key, during onboarding or any time via **`/settings` → Web search backend**. The picker writes `search_backend` to config and stores pasted keys in `~/.wizard/credentials.toml` (0600). Backends, selected by `search_backend` (case-insensitive):
 
 | Backend | Key needed | How |
 |---------|-----------|-----|
-| `duckduckgo` (default) | none | scrapes the DuckDuckGo HTML endpoint |
+| `auto` (default) | none | `grok` with xAI credentials, else `duckduckgo` |
+| `duckduckgo` | none | scrapes the DuckDuckGo HTML endpoint |
 | `brave` | yes | Brave Search API (`X-Subscription-Token`) |
 | `tavily` | yes | Tavily Search API |
 | `exa` | yes | Exa Search API (`x-api-key`) |
 | `serper` | yes | Serper (Google) Search API (`X-API-KEY`) |
-| `xai` / `grok` | sign-in or key | xAI Grok web search via the Responses API server-side `web_search` tool |
+| `grok` / `xai` | sign-in or key | xAI Grok web search via the Responses API server-side `web_search` tool |
 
 A key pasted via `/settings`/onboarding is stored under the backend name in `~/.wizard/credentials.toml` and read at call time. As a fallback (e.g. CI), `search_api_key_env` may name an environment variable holding the key instead; a stored key takes precedence.
 
@@ -58,9 +59,13 @@ Search endpoints get their redirects walked by hand too, since these clients fol
 
 ### xAI Grok web search
 
-The `xai` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider). **If you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`.
+The `grok` backend runs Grok's own server-side search-and-browse loop (the same mechanism as in the Grok app) and returns the synthesized results. It authenticates with the xAI OAuth session created by `wizard --login xai` / `/login xai` (the same credentials as the `xai-oauth` provider). **If you are already signed in, selecting xAI for web search reuses that session; it does not ask you to authenticate again.** If you have not signed in, it falls back to a stored key or `XAI_API_KEY`.
 
 The search runs on a fast non-reasoning Grok, not the flagship chat model. Searching is a fetch-and-format job, and the flagship model spends most of the wall clock reasoning about a list of links for the same hits, so a typical query lands in a few seconds instead of twenty. Set `[web] search_model` to pin a different model. The default is a pinned snapshot; if xAI retires it, the search retries once on the flagship model rather than failing. The request timeout is 45 s.
+
+The request is a `POST /v1/responses` with `tools: [{"type": "web_search"}]` (or `x_search`) and `include: ["no_inline_citations"]`. Grok is asked for a JSON list of `{title, url, description}`; when it answers in prose instead, the hits come from its `url_citation` annotations, then from a top-level `citations` array. Either way the chat model gets a numbered list of titled links, which is what it cites from.
+
+Why a tool Wizard calls rather than a server-side tool on the chat request itself: xAI offers `web_search` and `x_search` only on the Responses API, and Wizard's chat providers speak Chat Completions. Keeping search as a tool means it works whatever model is answering (chat with Claude, search with Grok), each search shows up as a tool call in the TUI and in ACP clients, and the same OAuth session works for both.
 
 ## x_search
 
@@ -83,9 +88,9 @@ No extra config is required beyond xAI sign-in or an API key. Results render as 
 [web]
 fetch_max_bytes = 100000          # cap on web_fetch response bytes (default 100000)
 allow_local = false               # permit localhost/private-range fetches (default false)
-search_backend = "duckduckgo"     # duckduckgo | brave | tavily | exa | serper | xai
+search_backend = "auto"           # auto | grok | duckduckgo | brave | tavily | exa | serper
 search_api_key_env = "BRAVE_API_KEY"  # optional env-var fallback when no key was pasted
-search_model = "grok-4.6"         # xai backend only: model that runs the search (default: a fast non-reasoning Grok)
+search_model = "grok-4.6"         # grok backend only: model that runs the search (default: a fast non-reasoning Grok)
 ```
 
 Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand: it also handles the API key.
