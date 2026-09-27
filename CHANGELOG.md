@@ -6,6 +6,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.6.1] - 2026-09-27
+
 ### Fixed
 
 - **Claude Code on Android broke its own background agents.** The app closed
