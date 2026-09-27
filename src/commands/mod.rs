@@ -885,6 +885,10 @@ pub struct CommandSpec {
     /// carry any answer that is text, and nothing that is a picker, a panel or
     /// a keystroke (see [`Surface::Gateway`]).
     pub gateway: Execution,
+    /// How `wizard acp` runs it for an ACP client (an editor, Wizard GUI, the
+    /// Android app). Text in, text out, like the gateway, but the client draws
+    /// its own thread list and model menu (see [`Surface::Acp`]).
+    pub acp: Execution,
     /// A valid argument for the commands whose bare form opens an interactive
     /// picker (`/model`, `/mode`, `/effort`), which [`SlashCommand::agent_runnable`]
     /// refuses for want of the choice a human would have made. [`agent_commands`]
@@ -904,6 +908,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "gpt-5",
     },
     CommandSpec {
@@ -914,6 +919,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "sovereign",
     },
     CommandSpec {
@@ -924,6 +930,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -934,6 +941,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -944,6 +952,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "high",
     },
     CommandSpec {
@@ -954,6 +963,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -964,6 +974,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -977,6 +988,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // (`dispatch` falls back to it wherever there is no picker), and
         // `/rewind <turn>` is typeable in a chat.
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -991,6 +1003,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         // line because the list of past sessions *is* the command. Nothing to
         // show a chat but a menu it cannot render.
         gateway: Execution::Unavailable,
+        // The client's thread history is the session list (`session/list`,
+        // `session/load`), so there is nothing for a command to open.
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1005,6 +1020,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // which is not something to do on a chat message with no picker behind
         // it to show what is being taken.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1015,6 +1031,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1025,6 +1042,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1035,6 +1053,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1047,6 +1066,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // No picker, so `dispatch` answers with the roster itself — which is
         // the same text the picker is drawn over.
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1057,6 +1077,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1068,6 +1089,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Agent,
         // Long, but its whole result is a one-line installer: text.
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1081,6 +1103,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         // have the operator paste an API key into a Telegram chat, where it
         // stays in the message history on someone else's servers.
         gateway: Execution::Unavailable,
+        // `list` only, and bare `/provider` answers with the list. Adding a
+        // provider or switching the active one rewrites the config every
+        // surface shares; a session picks its model from the `model` option.
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1091,6 +1117,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1101,6 +1128,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1116,6 +1144,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // The model server runs on the operator's machine, which is where the
         // gateway runs too; status/start/stop all report back as text.
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1128,6 +1157,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // OAuth opens a browser and waits for a callback on the machine. The
         // person in the chat is not sitting at it.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1139,6 +1169,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Ui,
         // A sidebar toggle: its entire effect is on a panel nobody here can see.
         gateway: Execution::Unavailable,
+        // No sidebar: the diff comes back as the command's answer.
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1150,6 +1182,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Ui,
         // Same — a band above a composer. `/status` carries the counts instead.
         gateway: Execution::Unavailable,
+        // No band: the list comes back as the command's answer.
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1161,6 +1195,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Ui,
         // A live, machine-wide session view. There is no screen to hold it.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1171,6 +1206,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1181,6 +1217,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1191,6 +1228,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1201,6 +1239,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1211,6 +1250,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1221,6 +1261,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1231,6 +1272,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1242,6 +1284,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Ui,
         // An in-app menu; every entry of it is a choice made at a picker.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1253,6 +1296,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Unavailable,
         // Modal editing of a composer this surface does not have.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1266,6 +1310,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Unavailable,
         // Telegram has no chrome of ours at all.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1278,6 +1323,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Unavailable,
         // A chat only ever gets the answer.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1288,6 +1334,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1298,6 +1345,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         tui: Execution::Agent,
         gui: Execution::Agent,
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1310,6 +1358,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         // A chat can be handed a fresh session as easily as a window can, and
         // it is how a gateway conversation is ended (see `/quit`).
         gateway: Execution::Agent,
+        // `Agent::clear` rotates onto a new session file under a new id, and
+        // the client owns this thread's id. A fresh conversation is a new
+        // thread in the client.
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1323,6 +1375,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // client half to run it instead, so it belongs to the process holding
         // the agent, like everything else here.
         gateway: Execution::Agent,
+        acp: Execution::Agent,
         agent_arg: "",
     },
     CommandSpec {
@@ -1337,6 +1390,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         // conversation is `/clear`; stopping the service is done on the
         // machine that runs it.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -1348,6 +1402,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Unavailable,
         // The alias, and the same reasoning.
         gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
 ];
@@ -1404,7 +1459,7 @@ pub fn listing(surface: Surface) -> Vec<Listing> {
     let builtin = COMMANDS.iter().map(|spec| Listing {
         name: spec.name.to_string(),
         args: spec.args.to_string(),
-        description: spec.description.to_string(),
+        description: spec.describe(surface).to_string(),
         takes_args: spec.takes_args,
         execution: spec.execution(surface),
         from_plugin: false,
@@ -1463,6 +1518,24 @@ impl CommandSpec {
             Surface::Tui => self.tui,
             Surface::Gui => self.gui,
             Surface::Gateway => self.gateway,
+            Surface::Acp => self.acp,
+        }
+    }
+
+    /// What this command is called on `surface`. The table's description,
+    /// except where a surface answers a panel toggle or a picker with text
+    /// instead: saying "toggle the git diff sidebar" to a client with no
+    /// sidebar would describe a command it is not getting.
+    pub fn describe(&self, surface: Surface) -> &'static str {
+        match (surface, self.name) {
+            (Surface::Acp, "diff") => "show the working tree's git diff",
+            (Surface::Acp, "todos") => "show the todo list",
+            (Surface::Acp, "provider") => "list configured providers",
+            (Surface::Acp, "help") => "show available commands",
+            // MCP servers are connected once per `wizard acp` process and
+            // shared by its sessions, so one session's reload leaves them.
+            (Surface::Acp, "reload") => "reload skills and scripted tools",
+            _ => self.description,
         }
     }
 

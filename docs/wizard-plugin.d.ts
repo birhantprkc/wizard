@@ -84,7 +84,7 @@ type WizardEvent =
   | "config_reload";
 
 /** Where a slash command is allowed to run. */
-type CommandSurface = "tui" | "gui" | "gateway";
+type CommandSurface = "tui" | "gui" | "gateway" | "acp";
 
 /**
  * How much a tool is allowed to do, which is what plan mode gates on.

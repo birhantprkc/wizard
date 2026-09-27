@@ -638,8 +638,9 @@ fn surface_named(command: &str, value: &str) -> mlua::Result<Surface> {
         "tui" => Ok(Surface::Tui),
         "gui" => Ok(Surface::Gui),
         "gateway" => Ok(Surface::Gateway),
+        "acp" => Ok(Surface::Acp),
         other => Err(mlua::Error::external(format!(
-            "ctx:command{{name='{command}'}} names surface '{other}' (tui|gui|gateway)"
+            "ctx:command{{name='{command}'}} names surface '{other}' (tui|gui|gateway|acp)"
         ))),
     }
 }

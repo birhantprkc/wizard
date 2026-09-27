@@ -76,11 +76,21 @@ pub enum Surface {
     /// the gateway has no second half that could run a command *instead of*
     /// the process holding the agent — the chat only carries text.
     Gateway,
+    /// `wizard acp`: an Agent Client Protocol client (an editor, Wizard GUI,
+    /// the Android app) on the other end of a pipe.
+    ///
+    /// Shaped like the gateway: every answer is text streamed back into the
+    /// client's thread, nothing is [`Execution::Ui`], and there is nobody at a
+    /// picker. It differs where the client already owns the thing a command
+    /// would open: the thread list (`/resume`, `/clear`) and the model menu
+    /// (bare `/model`).
+    Acp,
 }
 
 impl Surface {
     /// Every surface, for the tests that hold each one to the whole table.
-    pub const ALL: &'static [Surface] = &[Surface::Tui, Surface::Gui, Surface::Gateway];
+    pub const ALL: &'static [Surface] =
+        &[Surface::Tui, Surface::Gui, Surface::Gateway, Surface::Acp];
 }
 
 /// One of a surface's interactive choosers: what a command opens when it is
@@ -750,6 +760,7 @@ fn elsewhere(name: &str, surface: Surface) -> String {
         // The gateway has no second half to point at: there is one process,
         // and it is the one that just refused.
         Surface::Gateway => format!("'/{name}' is not available in this chat"),
+        Surface::Acp => format!("'/{name}' is not available over ACP"),
     }
 }
 
@@ -777,6 +788,24 @@ fn unavailable(name: &str, surface: Surface) -> String {
                                        every allow-listed chat shares: use /clear to start a \
                                        fresh conversation, or stop it on the machine running it"
             .to_string(),
+        (Surface::Acp, "clear") => "'/clear' would move this conversation to a new session id, \
+                                    and the client keeps this thread under the old one: start a \
+                                    new thread instead"
+            .to_string(),
+        (Surface::Acp, "resume" | "resume-claude") => format!(
+            "'/{name}' opens a session picker; reopen a past session from the client's thread \
+             history instead"
+        ),
+        (Surface::Acp, "quit" | "exit") => {
+            "'/quit' exits the terminal app. The client ends this server by closing the connection"
+                .to_string()
+        }
+        (Surface::Acp, "login") => "'/login' waits for a browser sign-in on this machine; run it \
+                                    in the terminal"
+            .to_string(),
+        (Surface::Acp, "vim" | "ui" | "view" | "dashboard" | "settings") => {
+            format!("'/{name}' is part of the terminal UI; the client draws this session")
+        }
         (_, other) => format!("'/{other}' does not run on this surface"),
     }
 }
@@ -837,11 +866,16 @@ pub fn help_text(surface: Surface) -> String {
         let label = match surface {
             Surface::Tui | Surface::Gui => "terminal only",
             Surface::Gateway => "not available over chat",
+            Surface::Acp => "not available over ACP",
         };
         text.push_str(&format!("\n\n{label}: {}", missing.join(", ")));
     }
-    text.push_str("\n\nplus any custom command in .wizard/commands/*.md, and @path to");
-    text.push_str(" reference a file.");
+    // An ACP prompt reaches the agent as typed: custom commands and `@path`
+    // are expanded by the terminal and `-p`, not by this surface.
+    if surface != Surface::Acp {
+        text.push_str("\n\nplus any custom command in .wizard/commands/*.md, and @path to");
+        text.push_str(" reference a file.");
+    }
     text
 }
 
@@ -1675,6 +1709,36 @@ mod tests {
             );
         }
         assert!(COMMANDS.iter().all(|spec| spec.gateway != Execution::Ui));
+    }
+
+    /// ACP is text in, text out like the gateway, but it answers the panels
+    /// (`/diff`, `/todos`) with their contents, and leaves what the client
+    /// already owns (its thread list, its window) to the client.
+    #[test]
+    fn the_acp_column_runs_text_and_leaves_the_client_its_own() {
+        for runs in [
+            "effort", "model", "usage", "help", "diff", "todos", "provider",
+        ] {
+            assert_eq!(
+                spec(runs).map(|spec| spec.acp),
+                Some(Execution::Agent),
+                "/{runs} runs over ACP"
+            );
+        }
+        for refused in ["clear", "resume", "vim", "view", "settings", "quit"] {
+            assert_eq!(
+                spec(refused).map(|spec| spec.acp),
+                Some(Execution::Unavailable),
+                "/{refused} is the client's or the terminal's"
+            );
+        }
+        assert!(COMMANDS.iter().all(|spec| spec.acp != Execution::Ui));
+        let diff = spec("diff").expect("diff");
+        assert_eq!(
+            diff.describe(Surface::Acp),
+            "show the working tree's git diff"
+        );
+        assert_eq!(diff.describe(Surface::Tui), diff.description);
     }
 
     /* ------------------------------------------------------------------ */

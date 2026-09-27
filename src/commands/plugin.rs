@@ -107,8 +107,8 @@ where
 /// One `/name` a plugin added to the palette: a [`CommandSpec`] with a body
 /// attached and a runtime lifetime.
 ///
-/// The per-surface columns are three named fields rather than a set, mirroring
-/// [`CommandSpec`] exactly: a fourth [`Surface`] is then a field this struct has
+/// The per-surface columns are named fields rather than a set, mirroring
+/// [`CommandSpec`] exactly: a new [`Surface`] is then a field this struct has
 /// to answer for before the crate compiles again, which is the property that
 /// keeps a plugin command from quietly missing a surface.
 ///
@@ -128,6 +128,7 @@ pub struct PluginCommand {
     tui: bool,
     gui: bool,
     gateway: bool,
+    acp: bool,
     handler: Arc<dyn CommandHandler>,
 }
 
@@ -153,6 +154,7 @@ impl PluginCommand {
             tui: true,
             gui: true,
             gateway: true,
+            acp: true,
             handler,
         }
     }
@@ -176,6 +178,7 @@ impl PluginCommand {
         self.tui = surfaces.contains(&Surface::Tui);
         self.gui = surfaces.contains(&Surface::Gui);
         self.gateway = surfaces.contains(&Surface::Gateway);
+        self.acp = surfaces.contains(&Surface::Acp);
         self
     }
 
@@ -195,6 +198,7 @@ impl PluginCommand {
             Surface::Tui => self.tui,
             Surface::Gui => self.gui,
             Surface::Gateway => self.gateway,
+            Surface::Acp => self.acp,
         };
         match available {
             true => Execution::Agent,
@@ -220,6 +224,7 @@ impl fmt::Debug for PluginCommand {
             .field("tui", &self.tui)
             .field("gui", &self.gui)
             .field("gateway", &self.gateway)
+            .field("acp", &self.acp)
             .finish()
     }
 }

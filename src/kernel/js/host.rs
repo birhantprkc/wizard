@@ -901,10 +901,11 @@ fn surface_named(js: &JsCtx<'_>, command: &str, value: &str) -> rquickjs::Result
         "tui" => Ok(Surface::Tui),
         "gui" => Ok(Surface::Gui),
         "gateway" => Ok(Surface::Gateway),
+        "acp" => Ok(Surface::Acp),
         other => Err(external(
             js,
             anyhow::anyhow!(
-                "ctx.command({{ name: '{command}' }}) names surface '{other}' (tui|gui|gateway)"
+                "ctx.command({{ name: '{command}' }}) names surface '{other}' (tui|gui|gateway|acp)"
             ),
         )),
     }
