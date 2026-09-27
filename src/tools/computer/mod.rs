@@ -23,6 +23,7 @@
 //! `ToolAccess`'s own doc says so. There is no per-action approval gate in
 //! Wizard, for this tool or any other (see `SECURITY.md`).
 
+pub mod rfb;
 pub mod setup;
 
 #[cfg(target_os = "linux")]
