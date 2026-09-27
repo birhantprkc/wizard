@@ -1155,6 +1155,21 @@ impl Agent {
         }
     }
 
+    /// Point `web_search` at another backend (`auto`, `grok`, `duckduckgo`,
+    /// ...) for the rest of this session. The tools read the backend from the
+    /// tool context on every call, so the next search uses it.
+    pub fn set_search_backend(&mut self, backend: &str) {
+        self.config.web.search_backend = backend.to_string();
+        let mut web = (*self.ctx.web).clone();
+        web.search_backend = backend.to_string();
+        self.ctx.web = Arc::new(web);
+    }
+
+    /// The configured `web_search` backend, as set (`auto` stays `auto`).
+    pub fn search_backend(&self) -> &str {
+        &self.ctx.web.search_backend
+    }
+
     /// Set the reasoning effort (`/effort`) forwarded on subsequent turns.
     /// `None` leaves the provider default. Only reaches models that accept a
     /// `reasoning_effort` request field; others ignore it.

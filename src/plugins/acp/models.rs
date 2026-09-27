@@ -37,6 +37,20 @@ pub(super) const EFFORT_OPTION: &str = "thought_level";
 /// category `mode`: ACP clients read that one as a permission mode, and
 /// Wizard never asks for permission in either.
 pub(super) const MODE_OPTION: &str = "wizard_mode";
+/// Config option id for the `web_search` backend.
+pub(super) const SEARCH_OPTION: &str = "search_backend";
+
+/// Every backend name `search_backend` accepts, `xai` aside (it is read as
+/// `grok`).
+const SEARCH_BACKENDS: [&str; 7] = [
+    "auto",
+    "grok",
+    "duckduckgo",
+    "brave",
+    "tavily",
+    "exa",
+    "serper",
+];
 
 /// The effort value that leaves the provider's default in place.
 const EFFORT_DEFAULT: &str = "default";
@@ -58,6 +72,9 @@ pub(super) struct Selection {
     pub model: String,
     pub effort: Option<ReasoningEffort>,
     pub mode: Mode,
+    /// `[web] search_backend` for this session, as chosen (`auto` stays
+    /// `auto`; what it resolves to is shown in the option's description).
+    pub search_backend: String,
 }
 
 impl Selection {
@@ -69,6 +86,8 @@ impl Selection {
             model: active.model,
             effort: config.reasoning_effort,
             mode: config.mode,
+            search_backend: parse_search_backend(&config.web.search_backend)
+                .unwrap_or_else(|| config.web.search_backend.trim().to_ascii_lowercase()),
         }
     }
 
@@ -82,6 +101,7 @@ impl Selection {
         let mut config = config.clone();
         config.reasoning_effort = self.effort;
         config.mode = self.mode;
+        config.web.search_backend = self.search_backend.clone();
         match config
             .providers
             .iter_mut()
@@ -141,6 +161,46 @@ pub(super) fn parse_mode(value: &str) -> Option<Mode> {
 
 fn mode_value(mode: Mode) -> &'static str {
     mode.as_str()
+}
+
+/// Parse a `search_backend` value: one of [`SEARCH_BACKENDS`], any case, with
+/// `xai` read as `grok` and a blank as `auto`.
+pub(super) fn parse_search_backend(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    let value = match value.as_str() {
+        "" => "auto",
+        "xai" => "grok",
+        other => other,
+    };
+    SEARCH_BACKENDS.contains(&value).then(|| value.to_string())
+}
+
+/// The `search_backend` select: automatic, Grok and DuckDuckGo always, and a
+/// keyed backend only when it is the one selected (a client cannot supply the
+/// key, so offering the others would offer a search that fails).
+fn search_choices(selection: &Selection, xai_credentials: bool) -> Vec<SessionConfigSelectOption> {
+    let resolved = crate::config::resolve_search_backend("auto", xai_credentials);
+    let auto = format!("Grok when signed in with xAI, else DuckDuckGo (now: {resolved})");
+    let mut rows = vec![
+        SessionConfigSelectOption::new("auto", "Automatic").description(auto),
+        SessionConfigSelectOption::new("grok", "Grok")
+            .description("xAI's server-side web search, with your xAI sign-in or key".to_string()),
+        SessionConfigSelectOption::new("duckduckgo", "DuckDuckGo")
+            .description("No key needed".to_string()),
+    ];
+    if !matches!(
+        selection.search_backend.as_str(),
+        "auto" | "grok" | "duckduckgo"
+    ) {
+        rows.push(
+            SessionConfigSelectOption::new(
+                selection.search_backend.clone(),
+                selection.search_backend.clone(),
+            )
+            .description("From your config, with its stored API key".to_string()),
+        );
+    }
+    rows
 }
 
 /// Whether a tag from a provider's model list is something the agent can chat
@@ -434,6 +494,13 @@ pub(super) fn config_options(
         ),
         SessionConfigOption::select(MODE_OPTION, "Mode", mode_value(selection.mode), modes)
             .description("Wizard's personality mode".to_string()),
+        SessionConfigOption::select(
+            SEARCH_OPTION,
+            "Web search",
+            selection.search_backend.clone(),
+            search_choices(selection, crate::config::xai_search_credentials()),
+        )
+        .description("Backend the web_search tool uses".to_string()),
     ]
 }
 
@@ -531,6 +598,74 @@ mod tests {
         assert_eq!(parse_mode("sovereign"), Some(Mode::Sovereign));
         assert_eq!(parse_mode("chat"), Some(Mode::Chat));
         assert_eq!(parse_mode("yolo"), None);
+    }
+
+    #[test]
+    fn search_backends_parse_with_xai_read_as_grok() {
+        assert_eq!(parse_search_backend("auto").as_deref(), Some("auto"));
+        assert_eq!(parse_search_backend("").as_deref(), Some("auto"));
+        assert_eq!(parse_search_backend("Grok").as_deref(), Some("grok"));
+        assert_eq!(parse_search_backend("xai").as_deref(), Some("grok"));
+        assert_eq!(
+            parse_search_backend("duckduckgo").as_deref(),
+            Some("duckduckgo")
+        );
+        assert_eq!(parse_search_backend("brave").as_deref(), Some("brave"));
+        assert_eq!(parse_search_backend("bing"), None);
+    }
+
+    /// A session's search backend is its own, like its model: applied to the
+    /// copy the agent is built from, never to the config it came from.
+    #[test]
+    fn a_selected_search_backend_applies_to_the_session_copy_only() {
+        let mut config = config(vec![provider("xai", "xaioauth", "grok-4.6")], None);
+        config.web.search_backend = "xai".into();
+        let mut selection = Selection::from_config(&config);
+        assert_eq!(selection.search_backend, "grok");
+
+        selection.search_backend = "duckduckgo".into();
+        selection.mode = Mode::Chat;
+        let applied = selection.apply(&config);
+        assert_eq!(applied.web.search_backend, "duckduckgo");
+        assert_eq!(applied.mode, Mode::Chat);
+        assert_eq!(config.web.search_backend, "xai");
+    }
+
+    #[test]
+    fn the_search_select_says_what_auto_resolves_to() {
+        let config = config(vec![provider("xai", "xaioauth", "grok-4.6")], None);
+        let selection = Selection::from_config(&config);
+        assert_eq!(selection.search_backend, "auto");
+        let values = |rows: Vec<SessionConfigSelectOption>| -> Vec<serde_json::Value> {
+            serde_json::to_value(rows)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let signed_in = values(search_choices(&selection, true));
+        let signed_out = values(search_choices(&selection, false));
+        assert_eq!(signed_in.len(), 3);
+        assert_eq!(signed_in[0]["value"], "auto");
+        assert!(
+            signed_in[0]["description"]
+                .as_str()
+                .unwrap()
+                .ends_with("(now: grok)")
+        );
+        assert!(
+            signed_out[0]["description"]
+                .as_str()
+                .unwrap()
+                .ends_with("(now: duckduckgo)")
+        );
+
+        // A keyed backend from the config is offered only as the current pick.
+        let mut keyed = selection.clone();
+        keyed.search_backend = "brave".into();
+        let rows = values(search_choices(&keyed, false));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3]["value"], "brave");
     }
 
     #[test]
@@ -635,5 +770,8 @@ mod tests {
             .map(|row| row["value"].as_str().unwrap())
             .collect();
         assert_eq!(modes, ["genie", "sovereign", "chat"]);
+        assert_eq!(options[3]["id"], SEARCH_OPTION);
+        assert!(options[3].get("category").is_none());
+        assert_eq!(options[3]["currentValue"], "auto");
     }
 }

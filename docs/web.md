@@ -93,4 +93,4 @@ search_api_key_env = "BRAVE_API_KEY"  # optional env-var fallback when no key wa
 search_model = "grok-4.6"         # grok backend only: model that runs the search (default: a fast non-reasoning Grok)
 ```
 
-Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand: it also handles the API key.
+Every key is optional; a missing `[web]` section means the defaults above. Prefer `/settings` over editing this by hand: it also handles the API key. An ACP client can change the backend for one session with the `search_backend` config option (see [acp.md](acp.md)); that never writes the config.

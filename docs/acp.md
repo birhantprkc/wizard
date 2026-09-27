@@ -65,7 +65,7 @@ editor for permission.
 
 ## Choosing the model, effort, and mode
 
-Every session advertises four config options in its `session/new` and
+Every session advertises five config options in its `session/new` and
 `session/load` answers, and a client changes them with
 `session/set_config_option`:
 
@@ -84,10 +84,15 @@ Every session advertises four config options in its `session/new` and
 - **`wizard_mode`**: `genie`, `sovereign` or `chat`, as `/mode`. `chat` is
   plain conversation with web search and nothing else (see
   [modes.md](modes.md#chat-mode)); it is what a chat app wants.
+- **`search_backend`**: which backend `web_search` uses: `auto` (Grok when
+  signed in with xAI, else DuckDuckGo; the description says which it is right
+  now), `grok`, or `duckduckgo`. A keyed backend from `[web] search_backend`
+  (Brave, Tavily, Exa, Serper) is listed too when it is the configured one.
+  See [web.md](web.md).
 
 A choice applies to that session only and is never written to your config, so
 switching models in one editor thread does not change the TUI's model or any
-other session. Effort and mode apply in place; a model switch
+other session. Effort, mode and search backend apply in place; a model switch
 rebuilds the session's agent over its saved history, so the conversation
 continues on the new model. The answer carries the options' new state. Options can be set
 between turns, not while one is running. A session reopened with
