@@ -481,6 +481,14 @@ mlua = { version = "0.12", default-features = false, features = ["luajit", "vend
 # makes a host call awaitable from straight-line JavaScript.
 rquickjs = { version = "0.12", default-features = false, features = ["std", "futures", "parallel", "classes", "properties", "array-buffer", "macro"], optional = true }
 
+# rquickjs-sys ships pre-generated bindings for a fixed list of targets and
+# Android is not on it, so an Android build generates them with bindgen. That
+# needs libclang at build time; `contrib/android/build.sh` points
+# `LIBCLANG_PATH` at the NDK's copy. Target-gated, so no other build compiles
+# bindgen.
+[target.'cfg(target_os = "android")'.dependencies]
+rquickjs = { version = "0.12", default-features = false, features = ["bindgen"], optional = true }
+
 # Process-group kill for background tasks (`task_kill`, timeouts)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
