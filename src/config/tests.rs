@@ -319,6 +319,17 @@ fn full_file_round_trips() {
             max_draft_chars: 4_000,
         }),
         code_mode: true,
+        computer: ComputerConfig {
+            enabled: true,
+            backend: ComputerBackend::Vm,
+            driver: HostDriver::Scripted,
+            vm: ComputerVmConfig {
+                engine: "podman".to_string(),
+                port: 5999,
+                address: Some("10.0.0.5:5901".to_string()),
+                ..ComputerVmConfig::default()
+            },
+        },
     };
     let raw = toml::to_string_pretty(&original).expect("serialize");
     let parsed: Config = toml::from_str(&raw).expect("parse back");
@@ -347,6 +358,7 @@ fn full_file_round_trips() {
     assert_eq!(parsed.max_context_tokens, original.max_context_tokens);
     assert_eq!(parsed.prune_after_tokens, original.prune_after_tokens);
     assert_eq!(parsed.code_mode, original.code_mode);
+    assert_eq!(parsed.computer, original.computer);
     assert_eq!(parsed.providers.len(), 1);
     assert_eq!(parsed.providers[0].name, "openai");
     assert_eq!(parsed.providers[0].kind, ProviderKind::OPENAI);
@@ -1635,4 +1647,23 @@ fn a_group_id_in_the_allow_list_is_warned_about_and_a_direct_chat_is_not() {
 
     assert_eq!(group_chat_warning(&[123, 456]), None);
     assert_eq!(group_chat_warning(&[]), None);
+}
+
+/// Computer use is something a user sets up, never something a default
+/// config quietly has: no `[computer]` table means no `computer` tool.
+#[test]
+fn computer_use_is_off_until_configured() {
+    let config: Config = toml::from_str("").expect("empty config parses");
+    assert!(!config.computer.enabled);
+    assert_eq!(config.computer.backend, ComputerBackend::Host);
+    assert_eq!(config.computer.vm.vnc_address(), "127.0.0.1:5905");
+
+    let config: Config = toml::from_str(
+        "[computer]\nenabled = true\nbackend = \"vm\"\n[computer.vm]\nport = 5910\n",
+    )
+    .expect("valid toml");
+    assert!(config.computer.enabled);
+    assert_eq!(config.computer.backend, ComputerBackend::Vm);
+    assert_eq!(config.computer.vm.vnc_address(), "127.0.0.1:5910");
+    assert_eq!(config.computer.vm.width, 1280, "unset keys keep defaults");
 }

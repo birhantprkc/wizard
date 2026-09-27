@@ -182,12 +182,13 @@ impl ToolRegistry {
         registry.register(Arc::new(SubagentKillTool));
         registry.register(Arc::new(RunCommandTool));
         registry.register(Arc::new(CompactTool));
-        // Desktop control. Registered unconditionally so the model can always
-        // discover it and report *why* it is unavailable — the backend refuses
-        // at call time with setup instructions (`wizard desktop-setup` on
-        // Linux, Accessibility + Screen Recording on macOS) rather than the
-        // tool silently not existing on an unprovisioned machine.
-        registry.register(Arc::new(ComputerTool));
+        // Desktop control. Here so its name is reserved and the harness export
+        // covers it, but it is off by default: `computer::configure` takes it
+        // out again unless `[computer] enabled` is set, on every surface that
+        // hands a registry to a model. A model on a machine nobody set up
+        // learns about computer use from the `computer` manual page instead
+        // of from a tool that can only fail.
+        registry.register(Arc::new(ComputerTool::default()));
         registry
     }
 

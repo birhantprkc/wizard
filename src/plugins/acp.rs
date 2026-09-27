@@ -409,7 +409,12 @@ async fn build_session_agent(
     cwd: &Path,
     session: Session,
 ) -> Result<(Arc<Mutex<Agent>>, CancelHandle), acp::Error> {
-    let config = selection.apply(&state.config);
+    let mut config = selection.apply(&state.config);
+    // Set up after this server started? `wizard computer setup` writes the
+    // file from another process; a new session picks that up.
+    if let Some(computer) = Config::computer_on_disk() {
+        config.computer = computer;
+    }
     let mut agent =
         agent::build_headless_agent_for_session(&config, cwd, session, Some(&state.mcp))
             .await

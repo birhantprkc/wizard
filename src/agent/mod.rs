@@ -2121,6 +2121,9 @@ pub async fn build_tool_registry(
     manager: &McpManager,
 ) -> Result<(ToolRegistry, subagent::SharedActiveModel)> {
     let mut base = ToolRegistry::with_native_tools();
+    // Before the scripted tools load, so a configured `computer` keeps its
+    // name the way every native tool does.
+    crate::tools::computer::configure(&mut base, &config.computer);
     match Config::scripted_tools_dir() {
         Ok(dir) => {
             if let Err(err) = base.load_scripted(&dir) {

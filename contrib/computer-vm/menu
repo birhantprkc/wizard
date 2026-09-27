@@ -1,0 +1,7 @@
+[begin] (Desktop)
+  [exec] (Terminal) {xterm -fa 'DejaVu Sans Mono' -fs 12}
+  [separator]
+  [workspaces] (Workspaces)
+  [config] (Settings)
+  [reconfig] (Reload)
+[end]

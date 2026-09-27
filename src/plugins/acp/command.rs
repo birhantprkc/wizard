@@ -230,6 +230,9 @@ impl CommandSurface for AcpSurface<'_> {
     async fn reload(&mut self) {
         let hooks = Arc::clone(self.agent.hooks());
         let client = Arc::clone(self.agent.client());
+        if let Some(computer) = Config::computer_on_disk() {
+            self.config.computer = computer;
+        }
         let built =
             crate::agent::build_tool_registry(&self.config, &client, &hooks, self.mcp).await;
         match built {
