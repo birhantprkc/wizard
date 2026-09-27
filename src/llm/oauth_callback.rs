@@ -373,12 +373,18 @@ where
     let ssh = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         .iter()
         .any(|key| get(key).is_some());
-    // On a desktop OS the browser is always local. On Linux and the BSDs, a
-    // session with neither display server is a console or a service, and
-    // `xdg-open` has nothing to open.
-    let headless = cfg!(not(any(target_os = "macos", target_os = "windows")))
-        && get("DISPLAY").is_none()
-        && get("WAYLAND_DISPLAY").is_none();
+    // On a desktop OS the browser is always local, and so it is on a phone,
+    // where the app running Wizard hands the URL to it. On Linux and the BSDs,
+    // a session with neither display server is a console or a service, and
+    // `xdg-open` has nothing to open, unless `$BROWSER` names something that
+    // does.
+    let headless = cfg!(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ))) && get("DISPLAY").is_none()
+        && get("WAYLAND_DISPLAY").is_none()
+        && get("BROWSER").is_none();
     if !ssh && !headless {
         return None;
     }
@@ -403,6 +409,63 @@ where
          \x20 2. or open the URL above anyway, let the final redirect fail to \
          connect, and paste that failed page's address back here."
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Opening the browser
+// ---------------------------------------------------------------------------
+
+/// Best-effort browser launch. Every caller also shows the URL, so a launch
+/// that goes nowhere costs a click and nothing else.
+///
+/// `$BROWSER` comes first, read the way `xdg-open`, `git web--browse` and
+/// Python's `webbrowser` read it. It is also the only way through on Android,
+/// which has no `xdg-open`: the app running Wizard sets `BROWSER` to a helper
+/// that hands the URL to the app.
+pub fn open_browser(url: &str) {
+    let configured = std::env::var("BROWSER").unwrap_or_default();
+    let fallbacks = [
+        vec!["xdg-open".to_string(), url.to_string()],
+        vec!["open".to_string(), url.to_string()],
+    ];
+    for argv in browser_commands(&configured, url)
+        .into_iter()
+        .chain(fallbacks)
+    {
+        let Some((program, args)) = argv.split_first() else {
+            continue;
+        };
+        if std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// The commands a `$BROWSER` value asks for, in order: a `:`-separated list,
+/// each entry split on whitespace (no shell), with the URL in place of a `%s`
+/// or appended when there is none.
+fn browser_commands(browser: &str, url: &str) -> Vec<Vec<String>> {
+    browser
+        .split(':')
+        .filter_map(|entry| {
+            let words: Vec<&str> = entry.split_whitespace().collect();
+            if words.is_empty() {
+                return None;
+            }
+            let mut argv: Vec<String> = words.iter().map(|w| w.replace("%s", url)).collect();
+            if !words.iter().any(|w| w.contains("%s")) {
+                argv.push(url.to_string());
+            }
+            Some(argv)
+        })
+        .collect()
 }
 
 /// Serve one connection. `Some(result)` ends the wait; `None` keeps waiting.
@@ -986,5 +1049,38 @@ mod tests {
             hint.contains("ssh -N -L 56121:127.0.0.1:56121 <you>@<this-machine>"),
             "{hint}"
         );
+    }
+
+    #[test]
+    fn browser_takes_a_list_and_puts_the_url_where_it_is_asked_for() {
+        let url = "https://auth.example/authorize?a=1";
+        assert_eq!(browser_commands("", url), Vec::<Vec<String>>::new());
+        assert_eq!(
+            browser_commands("/data/app/x/lib/arm64/libopenurl.so", url),
+            vec![vec![
+                "/data/app/x/lib/arm64/libopenurl.so".to_string(),
+                url.to_string()
+            ]]
+        );
+        assert_eq!(
+            browser_commands("firefox --new-tab %s: :w3m", url),
+            vec![
+                vec![
+                    "firefox".to_string(),
+                    "--new-tab".to_string(),
+                    url.to_string()
+                ],
+                vec!["w3m".to_string(), url.to_string()],
+            ]
+        );
+    }
+
+    /// A session that says where its browser is has one, display or not.
+    #[test]
+    fn a_session_with_browser_set_gets_no_hint() {
+        let hint = remote_hint_from(56121, |key| {
+            (key == "BROWSER").then(|| "/opt/open-url".to_string())
+        });
+        assert_eq!(hint, None);
     }
 }
