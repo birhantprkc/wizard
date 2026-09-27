@@ -31,13 +31,19 @@ Some tests need real binaries and skip themselves otherwise. `AgentIntegrationTe
 
 ## Install
 
-Turn on USB debugging on the phone, plug it in, and:
+Android 10 or later. On the phone, open
+
+https://github.com/teddytennant/wizard/releases/latest/download/wizard-android.apk
+
+Android asks whether your browser may install unknown apps the first time; allow it, then open the downloaded file and tap Install. To update, do the same with a newer release.
+
+Each release also carries `wizard-android-<version>.apk` (the same file) and `android-checksums.txt`, signed with the Wizard release key like the rest of the release. The check is the one in the release notes, with `android-checksums.txt` in place of `checksums.txt`.
+
+An APK you built yourself is signed with a different key, so Android won't install a release over it, or the other way round. Uninstall one before installing the other. With USB debugging on and the phone plugged in, a local build goes on with:
 
 ```bash
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
-
-Android 10 or later.
 
 ## Add a machine
 
