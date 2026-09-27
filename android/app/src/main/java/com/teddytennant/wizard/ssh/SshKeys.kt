@@ -63,9 +63,8 @@ object SshKeys {
     fun provider(privateKey: String, passphrase: String?): KeyProvider {
         val format = KeyProviderUtil.detectKeyFileFormat(privateKey, false)
         if (format == KeyFormat.Unknown) throw KeyImportException("unknown key format")
-        val factory = Factory.Named.Util.create(DefaultConfig().fileKeyProviderFactories, format.toString())
+        val file: FileKeyProvider = Factory.Named.Util.create(DefaultConfig().fileKeyProviderFactories, format.toString())
             ?: throw KeyImportException("unsupported key format $format")
-        val file = factory as FileKeyProvider
         if (passphrase != null) {
             file.init(privateKey, null, PasswordUtils.createOneOff(passphrase.toCharArray()))
         } else {

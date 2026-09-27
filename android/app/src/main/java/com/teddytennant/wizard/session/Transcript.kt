@@ -102,7 +102,9 @@ object Transcript {
         items.lastOrNull { it is TranscriptItem.Agent }
             ?.let { (it as TranscriptItem.Agent).text }
             ?.lineSequence()
-            ?.map { it.trim().trimStart('#', '>', '-', '*', ' ') }
+            ?.map { it.trim() }
+            ?.filterNot { it.startsWith("```") }
+            ?.map { it.trimStart('#', '>', '-', '*', ' ').replace("**", "").replace("`", "") }
             ?.firstOrNull { it.isNotBlank() }
 
     private fun nextKey(items: List<TranscriptItem>, prefix: String) = "$prefix${items.size}"

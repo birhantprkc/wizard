@@ -37,7 +37,7 @@ class SshEndToEndTest {
     fun startSshd() {
         val sshdBin = find("/run/current-system/sw/bin/sshd", "/usr/sbin/sshd")
         val keygen = find("/run/current-system/sw/bin/ssh-keygen", "/usr/bin/ssh-keygen")
-        val wizard = find(System.getProperty("user.home") + "/.local/bin/wizard")
+        val wizard = find(System.getProperty("user.home")!! + "/.local/bin/wizard")
         assumeTrue("needs sshd, ssh-keygen and wizard", sshdBin != null && keygen != null && wizard != null)
         val dir = tmp.newFolder("sshd")
         val hostKey = File(dir, "host_ed25519")

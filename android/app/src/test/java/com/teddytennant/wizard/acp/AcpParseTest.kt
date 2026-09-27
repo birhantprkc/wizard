@@ -65,7 +65,7 @@ class AcpParseTest {
         assertTrue(tool.input!!.contains("\"command\": \"wc -l src/agent/turn.rs\""))
         assertEquals(ToolContent.Text("  2714 src/agent/turn.rs"), tool.output.single())
         assertEquals("- `src/agent/turn.rs`: 2714", (items[3] as TranscriptItem.Agent).text)
-        assertEquals("`src/agent/turn.rs`: 2714", Transcript.lastReplyFirstLine(items))
+        assertEquals("src/agent/turn.rs: 2714", Transcript.lastReplyFirstLine(items))
     }
 
     @Test
