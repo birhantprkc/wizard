@@ -26,7 +26,8 @@ object RemoteScripts {
         else
           echo wizard=
         fi
-        printf 'running=%s\n' "${'$'}(pgrep -x -u "${'$'}(id -u)" wizard 2>/dev/null | wc -l | tr -d ' ')"
+        # Wizard processes of this user, not counting ACP servers (this app's own among them).
+        printf 'running=%s\n' "${'$'}(ps -u "${'$'}(id -u)" -o comm= -o args= 2>/dev/null | awk '{ n = ${'$'}1; sub(".*/", "", n); if (n == "wizard" && ${'$'}NF != "acp") c++ } END { print c + 0 }')"
         printf 'home=%s\n' "${'$'}HOME"
         """.trimIndent(),
     )
