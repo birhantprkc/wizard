@@ -7695,10 +7695,16 @@ impl Composer {
                 .into();
                 let mut description = command.description.clone();
                 if let Some(hint) = &command.input_hint {
-                    if description.is_empty() {
-                        description = format!("<{hint}>");
+                    // Some agents send their hints already bracketed.
+                    let hint = if hint.starts_with(['<', '[']) {
+                        hint.clone()
                     } else {
-                        description = format!("{description} · <{hint}>");
+                        format!("<{hint}>")
+                    };
+                    if description.is_empty() {
+                        description = hint;
+                    } else {
+                        description = format!("{description} · {hint}");
                     }
                 }
                 let description: SharedString = description.into();
