@@ -1,8 +1,8 @@
 # Wizard for Android
 
-Drive Wizard on your own machines from your phone. The app connects over SSH, runs `wizard acp` on the machine and speaks the Agent Client Protocol over that channel, so there is no server in between and nothing to install on the machine beyond Wizard itself.
+Drive Wizard, Pi and Claude Code on your own machines from your phone. The app connects over SSH and talks to each agent the way Wizard GUI does: `wizard acp` and Pi's `pi-acp` adapter over the Agent Client Protocol, and Claude Code over its stream-json mode. There is no server in between.
 
-![A chat with a streamed reply](docs/screenshots/chat.png)
+![The new-chat screen](docs/screenshots/home.png)
 
 ## Build
 
@@ -26,7 +26,7 @@ Checks:
 ./gradlew recordPaparazziDebug  # re-renders the screens in docs/screenshots
 ```
 
-Two of the test classes need real binaries and skip themselves otherwise. `WizardAcpIntegrationTest` runs `~/.local/bin/wizard acp` as a local process. `SshEndToEndTest` also starts a throwaway `sshd` on 127.0.0.1 with its own host key and authorized_keys, and connects to it the way the app does. Neither sends a prompt, so no model is called.
+Some tests need real binaries and skip themselves otherwise. `AgentIntegrationTest` runs each installed agent through the app's own launch scripts in a local shell: Wizard and Pi through initialize, `session/new`, a config change and `session/list`, Claude Code through its `initialize` control request and its saved session logs. `SshEndToEndTest` starts a throwaway `sshd` on 127.0.0.1 and connects the way the app does. None of them sends a prompt, so no model is called. `ClaudeBackendTest` plays full turns against Wizard GUI's fake Claude CLI.
 
 ## Install
 
@@ -40,25 +40,31 @@ Android 10 or later.
 
 ## Add a machine
 
-1. Tap +, then fill in a name, the host, the user and the port.
-2. Leave "SSH key" selected and tap New key. The app makes an Ed25519 key and shows its public half. Copy or share that line into `~/.ssh/authorized_keys` on the machine. You can import an existing private key instead, or use a password.
-3. Tap Save and connect. The first time, the app shows the machine's host key fingerprint; check it against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the machine before you trust it. If that key ever changes, the app refuses to connect until you say otherwise.
-4. If Wizard isn't installed there, the machine screen offers to run Wizard's installer and shows its output.
+The first launch walks through this; later, it's Settings, Machines, +.
 
-From the machine screen, pick a project to start a session, or reopen one from the list. The tune button in a chat switches model, reasoning effort and mode for that session.
+1. Fill in the host, the user and the port.
+2. Generate a key. The app makes an Ed25519 key and shows its public half. Copy or share that line into `~/.ssh/authorized_keys` on the machine. From Settings you can also import an existing private key, or use a password.
+3. The first connection shows the machine's host key fingerprint; check it against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the machine before you trust it. If that key ever changes, the app refuses to connect until you say otherwise.
+4. If an agent isn't installed there, the agent chip and the machine screen offer to install it and show the installer's output. Wizard and Claude Code use their official install scripts. Pi gets its CLI, then the pinned `pi-acp` adapter in `~/.zeron/adapters`, the same place Wizard GUI puts it, which needs npm on the machine.
+
+## Use it
+
+The app opens on a new chat. Type and send. The chips under the message pick the agent, the machine and the folder, and remember the last choice. Below is one list of recent chats from every machine and agent, newest first. The tune button in a chat switches model and effort (and Wizard's mode) for that session.
+
+Settings has the theme, compact mode (a turn's tool calls and thinking fold into one line) and the Starship artwork behind new Wizard chats, as on the desktop.
 
 ## How it behaves
 
-- One `wizard acp` process per machine serves every chat on it. It starts when you open the machine and stops a minute after the app goes to the background with nothing running.
-- While a turn runs, a foreground service keeps the connection open with the screen off. Its notification names the machine and has a Stop button. When the turn ends and the app isn't open, you get "Wizard finished on <machine>" with the first line of the reply; tapping it opens the chat.
-- The app asks for notification permission the first time you start a turn.
+- Per machine: one SSH connection, one ACP process each for Wizard and Pi serving all their chats, and one `claude -p` per Claude Code turn (`--session-id` on the first, `--resume` after). Claude Code's tool permissions are allowed without asking, as on the desktop; its questions come to you.
+- Connections close a minute after the app goes to the background with nothing running.
+- While a turn runs, a foreground service keeps the connection open with the screen off. Its notification names the machine and has a Stop button. When the turn ends and the app isn't open, you get "<agent> finished on <machine>" with the first line of the reply; tapping it opens the chat.
 - Private keys and passwords are sealed with a key that stays in the Android Keystore. App data is excluded from backups.
 
 ## What it doesn't do
 
 - Prompts are text only.
 - A session that is running in a terminal on the machine can be reopened here from its saved history, but not joined live.
-- If the connection drops mid-turn (the phone loses signal), the app marks the turn as lost. `wizard acp` on the machine sees its stdin close, and the session keeps whatever Wizard had saved.
-- The "needs your input" prompt and notification fire when an agent sends `session/request_permission`. Wizard itself never does, since it runs its tools without asking.
+- If the connection drops mid-turn (the phone loses signal), the app marks the turn as lost. The agent on the machine sees its stdin close, and the session keeps whatever it had saved.
+- Wizard never asks for permission over ACP, so "needs your input" only fires for Claude Code's questions and for an ACP agent that sends `session/request_permission`.
 
 The look follows Wizard GUI, the desktop app, which is a fork of [Zeron](https://github.com/zeronsh/zeron). Fonts are Geist and Geist Mono (OFL), icons are from the Solar set (CC BY 4.0), as in the desktop app.
