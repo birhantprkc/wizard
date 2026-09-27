@@ -47,6 +47,7 @@ inline hints.
 | `/settings` | Open the in-app settings menu |
 | `/setup` | The same menu under the name the first-run card prints (`/setup changes it`) |
 | `/ui [name]` | List the available interfaces, or wear one: `wizard`, `codex`, `grok` ([The interface](#the-interface)) |
+| `/view [compact\|full]` | Show the conversation only, or everything; no argument flips it ([Compact view](#compact-view)) |
 | `/vim` | Toggle modal (vim-style) editing of the input composer |
 | `/quit` | Exit Wizard |
 | `/exit` | The same thing, under the other name people type. `/q` is accepted too, though only `/quit` and `/exit` are offered by tab-completion |
@@ -82,13 +83,13 @@ argument, `/fusion config`, `/ultra config`, `/agents`), that ends or rewinds
 the session (`/quit`, `/clear`, `/rewind`, `/resume`), that sets up providers
 or rewrites the binary (`/provider`, `/login`, `/publish`, `/evolve`), that
 manages the local server (`/server`, all subcommands including `status`), that
-repaints your terminal (`/ui`), or that peels off another thread the agent
+repaints your terminal (`/ui`, `/view`), or that peels off another thread the agent
 has native tools for (`/btw`, `/fork` — `spawn_subagent` is the agent's route).
 
 Only the interactive surfaces (TUI and GUI) apply these commands; the tool is
 refused outright in headless `-p` runs, the gateway, ACP, and subagents
 (including `/ultra` lenses), nothing is silently dropped. The GUI narrows the
-set further, since `/vim`, `/ui`, `/quit` and `/exit` are terminal-only
+set further, since `/vim`, `/ui`, `/view`, `/quit` and `/exit` are terminal-only
 there.
 
 ### Queued user messages
@@ -158,6 +159,27 @@ first, so the skins still read under `NO_COLOR` and on a 16-color terminal).
 
 Implementation notes and the full attribution live in
 [ui-skins.md](ui-skins.md).
+
+### Compact view
+
+Compact view shows the conversation and leaves out the work: your messages,
+the model's replies and notices stay, while tool cards, command output, diffs,
+file reads and reasoning go. Each run of tool calls becomes one line, `ran 6
+tools` (with `, 1 failed` when one did), or `running execute` while a call is
+in flight. Errors are notices, so they still show.
+
+`/view compact` turns it on, `/view full` turns it off, and `/view` alone
+flips it. The transcript already on screen redraws in the new view. It is off
+by default; `/view` saves the choice, or set it yourself:
+
+```toml
+[ui]
+compact = true
+```
+
+It changes the screen only. The model still sees every tool result, and
+`/compact` is the unrelated command that summarises its context. A subagent's
+pane stays full.
 
 ### Where the looks come from
 

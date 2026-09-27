@@ -271,6 +271,7 @@ fn full_file_round_trips() {
         ui: UiConfig {
             spinner_verbs: vec!["Pondering".to_string(), "Musing".to_string()],
             vim: true,
+            compact: true,
             skin: Some("codex".to_string()),
         },
         web: WebConfig {
@@ -437,6 +438,17 @@ fn spinner_verbs_default_when_section_missing() {
         let verb = config.ui.spinner_verb(seed);
         assert!(UiConfig::DEFAULT_SPINNER_VERBS.contains(&verb));
     }
+}
+
+#[test]
+fn compact_view_is_off_unless_the_ui_table_says_so() {
+    let config: Config = toml::from_str("").expect("valid toml");
+    assert!(!config.ui.compact);
+    let config: Config = toml::from_str("[ui]\ncompact = true").expect("valid toml");
+    assert!(config.ui.compact);
+    // Off is the default, so a saved config does not grow the key.
+    let saved = toml::to_string_pretty(&Config::default()).expect("serializes");
+    assert!(!saved.contains("compact = "), "{saved}");
 }
 
 #[test]

@@ -30,6 +30,10 @@
 //! items. A renderer that cached widgets per index would need the same
 //! machinery, which is why the signal lives in the model rather than here.
 //!
+//! The other is compact view ([`TranscriptView::shown`]): the same items with
+//! the tool work left out. Also a property of the screen, and nothing is
+//! stored for it, so switching it redraws the conversation already there.
+//!
 //! # Whose conversation this is
 //!
 //! Since the mesh's tier 2, a `TranscriptView` may hold a *peer's* session
@@ -70,6 +74,7 @@
 //! trait keeps "derived from the key" a property of the type rather than of
 //! every call site.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
@@ -236,6 +241,9 @@ pub struct TranscriptView {
     /// that changed nothing does not re-derive (and so discard) the user's
     /// folds against a stale [`Change`].
     synced: u64,
+    /// Compact view (`[ui] compact`, `/view`): the conversation without the
+    /// work. See [`TranscriptView::shown`].
+    compact: bool,
     /// First visible line, measured from the top of the rendered content. Only
     /// consulted while [`Self::follow`] is false; when following, the live tail
     /// is always in view.
@@ -259,6 +267,7 @@ impl Default for TranscriptView {
             model: TranscriptModel::new(),
             folded: Vec::new(),
             synced: 0,
+            compact: false,
             scroll: 0,
             follow: true,
             max_scroll: Cell::new(0),
@@ -347,6 +356,72 @@ impl TranscriptView {
 
     pub fn iter(&self) -> std::slice::Iter<'_, TranscriptItem> {
         self.items().iter()
+    }
+
+    /// Whether this view is compact.
+    pub fn compact(&self) -> bool {
+        self.compact
+    }
+
+    /// Switch compact view on or off. Nothing is recomputed: the renderers
+    /// read [`TranscriptView::shown`] on every frame, so the next frame is
+    /// already the other view.
+    pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
+    }
+
+    /// The rows a renderer draws, each with its index into [`Self::items`].
+    ///
+    /// The full view is every item. The compact view is the conversation: what
+    /// the user said, what the model answered, and the notices (errors
+    /// included). Tool cards, what they returned, the images a tool produced
+    /// and the model's reasoning are left out, and each run of them becomes
+    /// one borrowed [`TranscriptItem::Notice`] saying how much work happened,
+    /// or which tool is running now. A notice rather than a new kind of row so
+    /// that every skin draws it with the notice style it already has.
+    pub fn shown(&self) -> Vec<(usize, Cow<'_, TranscriptItem>)> {
+        let items = self.items();
+        if !self.compact {
+            return items.iter().map(Cow::Borrowed).enumerate().collect();
+        }
+        let mut shown = Vec::new();
+        let mut run: Option<(usize, Activity)> = None;
+        for (index, item) in items.iter().enumerate() {
+            let hidden = match item {
+                TranscriptItem::Tool(tool) => {
+                    run.get_or_insert((index, Activity::default())).1.add(tool);
+                    true
+                }
+                TranscriptItem::Thinking(_) => true,
+                TranscriptItem::Images { source, .. } => source.tool().is_some(),
+                // Turn markers draw nothing either way, so they neither end a
+                // run nor start one.
+                TranscriptItem::TurnMarker { .. } => true,
+                _ => false,
+            };
+            if hidden {
+                continue;
+            }
+            if let Some((at, activity)) = run.take() {
+                shown.push((at, Cow::Owned(TranscriptItem::Notice(activity.line()))));
+            }
+            shown.push((index, Cow::Borrowed(item)));
+        }
+        if let Some((at, activity)) = run {
+            shown.push((at, Cow::Owned(TranscriptItem::Notice(activity.line()))));
+        }
+        shown
+    }
+
+    /// The live tail as this view draws it: [`Self::streaming`], less the
+    /// reasoning when the view is compact.
+    pub fn shown_streaming(&self) -> (&str, &str) {
+        let (thinking, text) = self.streaming();
+        if self.compact {
+            ("", text)
+        } else {
+            (thinking, text)
+        }
     }
 
     /// Whether the row at `index` is drawn folded. Meaningless for anything
@@ -525,6 +600,44 @@ impl TranscriptView {
                 }
             }
         }
+    }
+}
+
+/// A run of tool calls as the compact view reports it.
+#[derive(Debug, Default)]
+struct Activity {
+    calls: usize,
+    failed: usize,
+    /// The newest call, when it has not answered yet.
+    running: Option<String>,
+}
+
+impl Activity {
+    fn add(&mut self, tool: &ToolItem) {
+        self.calls += 1;
+        match &tool.output {
+            Some(output) => {
+                self.failed += usize::from(output.is_error);
+                self.running = None;
+            }
+            None => self.running = Some(tool.name.clone()),
+        }
+    }
+
+    fn line(&self) -> String {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        if let Some(name) = &self.running {
+            let done = self.calls - 1;
+            return match done {
+                0 => format!("running {name}"),
+                n => format!("running {name} ({n} tool{} done)", plural(n)),
+            };
+        }
+        let mut line = format!("ran {} tool{}", self.calls, plural(self.calls));
+        if self.failed > 0 {
+            line.push_str(&format!(", {} failed", self.failed));
+        }
+        line
     }
 }
 

@@ -6,6 +6,14 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Compact view.** `/view compact` (or `[ui] compact = true`) shows only the
+  conversation: messages, replies and notices, with each run of tool calls
+  folded into one line such as `ran 6 tools` or `running execute`. `/view full`
+  brings the cards back, and `/view` flips between the two. Off by default,
+  and the same in all three skins.
+
 ### Fixed
 
 - **Long tool output flashed open before it folded.** A running `execute`

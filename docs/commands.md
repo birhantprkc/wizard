@@ -28,8 +28,8 @@ The `run_command` tool lets the model invoke these commands. Two gates apply, in
    `/model` and `/mode`), the editors behind `/fusion config` and `/ultra config`, the roster
    picker `/agents`, the session-ending and destructive commands (`/quit`, `/clear`,
    `/rewind`, `/resume`, `/resume-claude`), the ones that reach outside the session to set the tool up
-   (`/provider`, `/login`, `/publish`, `/evolve`, `/server`), `/ui` (it repaints the
-   user's terminal), and `/btw` and `/fork` (they are the user's aside and the user's side
+   (`/provider`, `/login`, `/publish`, `/evolve`, `/server`), `/ui` and `/view` (they
+   repaint the user's terminal), and `/btw` and `/fork` (they are the user's aside and the user's side
    quest; the agent has the conversation already, and `spawn_subagent` for its own background
    work).
 2. The surface's dispatch set — every command on the TUI, the `server` ones the executor

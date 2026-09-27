@@ -188,6 +188,13 @@ pub enum SlashCommand {
     /// skin is the shape of the chrome, a theme is its palette, and wanting
     /// Codex's layout in `ember`'s colors is a reasonable thing to want.
     Ui(Option<String>),
+    /// `/view [compact|full]`: how much of the transcript the TUI draws.
+    /// `Some(true)` is compact, `Some(false)` full, `None` flips it.
+    ///
+    /// Not `/compact`, which summarises the model's context and is a different
+    /// thing entirely: one changes what the model reads, this one only what
+    /// the screen shows.
+    View(Option<bool>),
     /// Import the selected artifacts from Claude Code (`~/.claude/`). Not a
     /// typed command; dispatched from the `/settings` import picker, which is
     /// why it carries the [`ImportSelection`].
@@ -590,6 +597,12 @@ impl SlashCommand {
             // Joined so `/ui claude code` is the same request as `/ui claude`:
             // people type the product name, not the key.
             "ui" => Ok(Self::Ui((!args.is_empty()).then(|| args.join(" ")))),
+            "view" => match args.as_slice() {
+                [] => Ok(Self::View(None)),
+                ["compact"] => Ok(Self::View(Some(true))),
+                ["full"] => Ok(Self::View(Some(false))),
+                _ => Err("usage: /view [compact|full]".to_string()),
+            },
             "quit" | "q" | "exit" => Ok(Self::Quit),
             // Not a built-in word. Ask the runtime registry before giving up,
             // so a plugin command is resolved by the same parser every surface
@@ -702,6 +715,7 @@ impl SlashCommand {
             }
             Login { .. } => Err("`/login` is an interactive sign-in; leave it to the user".into()),
             Ui(_) => Err("`/ui` restyles the user's terminal; leave it to them".into()),
+            View(_) => Err("`/view` changes what the user sees; leave it to them".into()),
             ImportClaude(_) => {
                 Err("`/settings` import is driven from a picker; leave it to the user".into())
             }
@@ -770,6 +784,7 @@ impl SlashCommand {
             Settings | ImportClaude(_) => "settings",
             Vim => "vim",
             Ui(_) => "ui",
+            View(_) => "view",
             Quit => "quit",
             Plugin { name, .. } => name,
         }
@@ -1250,6 +1265,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         // for a skin to reshape.
         gui: Execution::Unavailable,
         // Telegram has no chrome of ours at all.
+        gateway: Execution::Unavailable,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "view",
+        args: "[compact|full]",
+        description: "show tool calls in the transcript, or only the conversation",
+        takes_args: false,
+        tui: Execution::Ui,
+        // The window draws its own transcript.
+        gui: Execution::Unavailable,
+        // A chat only ever gets the answer.
         gateway: Execution::Unavailable,
         agent_arg: "",
     },
@@ -1877,6 +1904,7 @@ mod tests {
             SlashCommand::Settings,
             SlashCommand::ImportClaude(ImportSelection::default()),
             SlashCommand::Vim,
+            SlashCommand::View(None),
             SlashCommand::Quit,
         ];
         for command in &commands {
@@ -2160,6 +2188,21 @@ mod tests {
     /// refuses a bare `/fork` with a usage error. The agent may not invoke it
     /// (it already has `spawn_subagent`).
     #[test]
+    fn view_takes_compact_full_or_nothing_and_is_not_compact() {
+        let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
+        assert_eq!(parse("/view"), Ok(SlashCommand::View(None)));
+        assert_eq!(parse("/view compact"), Ok(SlashCommand::View(Some(true))));
+        assert_eq!(parse("/view full"), Ok(SlashCommand::View(Some(false))));
+        assert_eq!(
+            parse("/view tiny"),
+            Err("usage: /view [compact|full]".to_string())
+        );
+        // `/compact` summarises the model's context; it is not this.
+        assert_eq!(parse("/compact"), Ok(SlashCommand::Compact));
+        assert!(SlashCommand::View(None).agent_runnable().is_err());
+    }
+
+    #[test]
     fn fork_keeps_the_full_task_and_refuses_an_empty_one() {
         let parse = |line: &str| SlashCommand::parse(line).expect("a slash command");
         assert_eq!(
@@ -2207,7 +2250,7 @@ mod tests {
         let missing: Vec<&str> = commands_for(Surface::Gui, Execution::Unavailable)
             .map(|spec| spec.name)
             .collect();
-        assert_eq!(missing, ["vim", "ui", "quit", "exit"]);
+        assert_eq!(missing, ["vim", "ui", "view", "quit", "exit"]);
     }
 
     // --- loading ---

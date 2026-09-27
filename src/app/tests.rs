@@ -236,6 +236,7 @@ fn spinner_verb_is_deterministic_and_stable_within_a_busy_period() {
                 "Noodling".to_string(),
             ],
             vim: false,
+            compact: false,
             skin: None,
         },
         ..Config::default()
