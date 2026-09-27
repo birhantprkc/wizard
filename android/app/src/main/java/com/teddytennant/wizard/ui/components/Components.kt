@@ -33,7 +33,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -225,7 +224,7 @@ fun WizardButton(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (busy) {
-            CircularProgressIndicator(Modifier.size(16.dp), color = fg, strokeWidth = 1.5.dp)
+            com.teddytennant.wizard.ui.life.LifeIndicator(size = 16.dp, color = fg)
             Spacer(Modifier.width(10.dp))
         } else if (icon != null) {
             WizardIcon(icon, null, size = 18.dp, tint = fg)
@@ -410,7 +409,7 @@ fun CodeBox(text: String, modifier: Modifier = Modifier, maxLines: Int = Int.MAX
 
 @Composable
 fun Spinner(modifier: Modifier = Modifier, size: Dp = 16.dp, color: Color = WizardTheme.colors.muted) {
-    CircularProgressIndicator(modifier.size(size), color = color, strokeWidth = 1.5.dp, trackColor = Color.Transparent)
+    com.teddytennant.wizard.ui.life.LifeIndicator(modifier, size = size, color = color)
 }
 
 /** The wand mark from the desktop icon. */

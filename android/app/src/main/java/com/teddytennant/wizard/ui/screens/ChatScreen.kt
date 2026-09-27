@@ -67,6 +67,8 @@ import com.teddytennant.wizard.ui.components.IconAction
 import com.teddytennant.wizard.ui.components.Markdown
 import com.teddytennant.wizard.ui.components.PillShape
 import com.teddytennant.wizard.ui.components.Spinner
+import com.teddytennant.wizard.ui.life.LifeIndicator
+import com.teddytennant.wizard.ui.life.LifeSeed
 import com.teddytennant.wizard.ui.components.StatusDot
 import com.teddytennant.wizard.ui.components.TopBar
 import com.teddytennant.wizard.ui.components.WizardButton
@@ -134,8 +136,8 @@ fun ChatContent(
 private fun CenterNote(text: String, spinner: Boolean = false, isError: Boolean = false) {
     Column(Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         if (spinner) {
-            Spinner(size = 20.dp)
-            Spacer(Modifier.height(14.dp))
+            LifeIndicator(size = 44.dp, cells = 11, seed = LifeSeed.Glider, warmup = 2, contentDescription = text)
+            Spacer(Modifier.height(16.dp))
         }
         Text(text, style = WizardTheme.type.small, color = if (isError) WizardTheme.colors.danger else WizardTheme.colors.muted, textAlign = TextAlign.Center)
     }
@@ -261,7 +263,7 @@ private fun UserBubble(text: String) {
 private fun WorkingRow() {
     val colors = WizardTheme.colors
     Row(Modifier.padding(vertical = 4.dp).semantics(mergeDescendants = true) {}, verticalAlignment = Alignment.CenterVertically) {
-        StatusDot(colors.accent, pulsing = true)
+        LifeIndicator(size = 22.dp, cells = 8, color = colors.accent, seed = LifeSeed.Glider, warmup = 1)
         Text("Working", style = WizardTheme.type.small, color = colors.faint, modifier = Modifier.padding(start = 10.dp))
     }
 }

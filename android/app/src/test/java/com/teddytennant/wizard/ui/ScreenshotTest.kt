@@ -153,6 +153,32 @@ class ScreenshotTest {
         }
     }
 
+    @Test fun connecting() = shot("connecting") {
+        MachineContent(
+            MachineScreenState(Fixtures.buildbox, com.teddytennant.wizard.session.MachineStatus(com.teddytennant.wizard.session.Reach.Checking)),
+            onBack = {}, onEdit = {}, onRetry = {}, onInstall = {}, onNewChat = {}, onSession = {}, onShowAll = {},
+        )
+    }
+
+    @Test fun firstReply() = shot("first_reply") {
+        Chat(Fixtures.chat.copy(items = com.teddytennant.wizard.session.Transcript.userMessage(emptyList(), "Why is the release build 40% slower than last week?"), title = "Why is the release build 40% slower than last week?"))
+    }
+
+    @Test fun lifeSizes() = shot("life_indicator") {
+        Column(Modifier.padding(32.dp), verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp)) {
+            Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
+                com.teddytennant.wizard.ui.life.LifeSeed.entries.forEach {
+                    com.teddytennant.wizard.ui.life.LifeIndicator(size = 44.dp, cells = 11, seed = it, warmup = 3)
+                }
+            }
+            Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
+                com.teddytennant.wizard.ui.life.LifeIndicator(size = 14.dp)
+                com.teddytennant.wizard.ui.life.LifeIndicator(size = 22.dp, cells = 8, color = WizardTheme.colors.accent, warmup = 1)
+                com.teddytennant.wizard.ui.life.LifeIndicator(size = 56.dp, cells = 12, seed = com.teddytennant.wizard.ui.life.LifeSeed.Lwss, warmup = 3)
+            }
+        }
+    }
+
     @Test fun chatWizard() = shot("chat_wizard") { Chat(Fixtures.chat) }
 
     @Test fun chatClaude() = shot("chat_claude") { Chat(Fixtures.claudeChat) }

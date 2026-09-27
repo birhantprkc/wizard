@@ -188,7 +188,7 @@ fun BrowseSheetContent(state: BrowseState, home: String?, onOpen: (String) -> Un
         )
         Box(Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 420.dp)) {
             when {
-                state.loading -> Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { Spinner(size = 20.dp) }
+                state.loading -> Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { com.teddytennant.wizard.ui.life.LifeIndicator(size = 32.dp, cells = 10, contentDescription = "Loading folders") }
                 state.error != null -> Text(state.error, style = WizardTheme.type.small, color = colors.danger, modifier = Modifier.padding(20.dp))
                 else -> LazyColumn(state = listState) {
                     if (state.listing?.path != "/") {
@@ -247,7 +247,13 @@ fun InstallSheetContent(machineName: String, state: InstallState, onInstall: () 
         Box(Modifier.fillMaxWidth().clip(FieldShape).background(colors.code).border(1.dp, colors.border, FieldShape).padding(12.dp)) {
             Text(installLine(state.agent), style = WizardTheme.type.monoSmall, color = colors.faint)
         }
-        if (state.lines.isNotEmpty() || state.running) {
+        if (state.running && state.lines.isEmpty()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                com.teddytennant.wizard.ui.life.LifeIndicator(size = 24.dp, cells = 10, seed = com.teddytennant.wizard.ui.life.LifeSeed.Toad, contentDescription = "Installing")
+                Text("Starting the installer", style = WizardTheme.type.small, color = colors.muted, modifier = Modifier.padding(start = 12.dp))
+            }
+        }
+        if (state.lines.isNotEmpty()) {
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 300.dp).clip(FieldShape).background(colors.code).border(1.dp, colors.border, FieldShape),
