@@ -1,6 +1,6 @@
 # Maintainer: Teddy Tennant <teddytennant@icloud.com>
 pkgname=wizard-bin
-pkgver=3.5.0
+pkgver=3.5.1
 pkgrel=1
 pkgdesc="One line. Your sovereign agent. Self-extending. Bring any model"
 arch=('x86_64' 'aarch64')
@@ -14,8 +14,8 @@ source=("LICENSE-MIT-$pkgver::$url/raw/v$pkgver/LICENSE-MIT")
 source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/wizard-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/wizard-aarch64-unknown-linux-gnu.tar.gz")
 sha256sums=('74b073d5ef3b24eb791fccbded9fceffb34bc4dabc37fb0a0e2613fc6b705477')
-sha256sums_x86_64=('5a9dabeafbeca9a5a15234335bf9ecef2a3f34f5af9e884133a4f991089f9d73')
-sha256sums_aarch64=('5166b44bfe427401623403bcde2068fcbf069c5e53b0a45a3410713b31b3a8e2')
+sha256sums_x86_64=('c6a46afde162205461ba3e26616731ca3468edaa032a8dabac289dfa8a1618e3')
+sha256sums_aarch64=('f6786b2637b9add59c1bbc53a41e9ef8a2db26f19c32d03f15b1072a1f052424')
 
 package() {
   install -Dm755 wizard "$pkgdir/usr/bin/wizard"
