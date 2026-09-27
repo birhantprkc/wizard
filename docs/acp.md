@@ -126,7 +126,7 @@ Advertised:
 | `/server [status\|start\|stop]` | local model server |
 | `/diff` | the working tree's git diff, as text |
 | `/todos` | the todo list, as text |
-| `/cost`, `/usage`, `/status`, `/bashes`, `/doctor` | reports |
+| `/cost`, `/usage`, `/status`, `/bashes`, `/doctor`, `/computer` | reports |
 | `/memory [read\|forget <name>]`, `/turing`, `/goal [text]` | as in the TUI |
 | `/reload` | skills and scripted tools (MCP servers stay connected) |
 | `/help` | this list |

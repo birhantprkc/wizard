@@ -115,6 +115,9 @@ pub enum SlashCommand {
     Cost,
     /// `/usage`: xAI subscription usage when signed in with OAuth.
     Usage,
+    /// `/computer`: whether computer use is set up, what this system is, and
+    /// how to set it up.
+    Computer,
     /// `/memory [read|forget <name>]` — inspect and manage the saved project
     /// memories the agent writes with the `memory` tool.
     Memory(MemoryAction),
@@ -518,6 +521,7 @@ impl SlashCommand {
             "dashboard" => Ok(Self::Dashboard),
             "cost" => Ok(Self::Cost),
             "usage" => Ok(Self::Usage),
+            "computer" => Ok(Self::Computer),
             "memory" => parse_memory(&args),
             "turing" => parse_turing(&args),
             "doctor" => Ok(Self::Doctor),
@@ -648,6 +652,7 @@ impl SlashCommand {
             | Dashboard
             | Cost
             | Usage
+            | Computer
             // Every `/memory` action — list, read, forget — is one the `memory`
             // tool already grants the agent, so a gate here would be theater.
             | Memory(_)
@@ -767,6 +772,7 @@ impl SlashCommand {
             Dashboard => "dashboard",
             Cost => "cost",
             Usage => "usage",
+            Computer => "computer",
             Memory(_) => "memory",
             Turing(_) => "turing",
             Doctor => "doctor",
@@ -1213,6 +1219,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "usage",
         args: "",
         description: "xAI subscription usage when signed in with OAuth",
+        takes_args: false,
+        tui: Execution::Agent,
+        gui: Execution::Agent,
+        gateway: Execution::Agent,
+        acp: Execution::Agent,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "computer",
+        args: "",
+        description: "computer use: whether it is set up, and how",
         takes_args: false,
         tui: Execution::Agent,
         gui: Execution::Agent,
@@ -1950,6 +1967,7 @@ mod tests {
             SlashCommand::Dashboard,
             SlashCommand::Cost,
             SlashCommand::Usage,
+            SlashCommand::Computer,
             SlashCommand::Memory(MemoryAction::List),
             SlashCommand::Turing(TuringAction::Status),
             SlashCommand::Doctor,

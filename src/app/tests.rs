@@ -3713,6 +3713,7 @@ fn bare_commands_parse_to_their_variants() {
         ("/todos", SlashCommand::Todos),
         ("/cost", SlashCommand::Cost),
         ("/usage", SlashCommand::Usage),
+        ("/computer", SlashCommand::Computer),
         ("/compact", SlashCommand::Compact),
         ("/dashboard", SlashCommand::Dashboard),
         ("/omakase", SlashCommand::Omakase),

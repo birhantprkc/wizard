@@ -24,8 +24,9 @@ Climb this ladder, cheapest rung first. Each rung is the `evolve` tool with a
 different channel; everything below source is live after `/reload` (no recompile).
 
 1. **Skill** — knowledge or procedure, not new code.
-2. **MCP server** — capability lives outside Wizard (browser, computer use, DB,
-   search, cloud APIs). **Browser use belongs here** (see §2).
+2. **MCP server** — capability lives outside Wizard (browser, DB, search,
+   cloud APIs). **Browser use belongs here** (see §2). Computer use does not:
+   it is built in and off until set up (topic `computer`).
 3. **Scripted tool** — small LuaJIT helper (shell/Python only when needed).
 4. **Subagent** — reusable specialist with its own prompt and tool scope
    (`spawn_subagent`; see that tool's description).
@@ -55,7 +56,7 @@ evolve(description: "Register an MCP server for browser automation: the
 
 If `npx`/Node is missing, install it or fall back to `curl`/`lynx` for read-only
 fetch. **Try the real thing before declaring it impossible.** Same pattern for
-databases, search, and computer use.
+databases and search.
 
 ## 3. Subagents (map)
 
