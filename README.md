@@ -45,6 +45,10 @@ Ten pty starts per agent in its own ubuntu:24.04 container, page cache dropped b
 
 Wizard GUI runs Wizard, Pi and Claude Code side by side across your projects and on machines you reach over SSH. It can reuse a ChatGPT or Grok sign-in it finds on disk. Installers for Linux, macOS and Windows come with every [release](https://github.com/teddytennant/wizard/releases), and `wizard gui` opens it. It is a fork of [Zeron](https://github.com/zeronsh/zeron). [gui/README.md](gui/README.md)
 
+## Android
+
+On your phone, open **[wizard-android.apk](https://github.com/teddytennant/wizard/releases/latest/download/wizard-android.apk)** and install it. It drives Wizard, Pi and Claude Code on your own machines over SSH, with a notification when a turn finishes. [android/README.md](android/README.md)
+
 ## Terminal-Bench
 
 <!-- BENCH:tbench -->

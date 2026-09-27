@@ -6,7 +6,33 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-09-27
+
 ### Added
+
+- **Wizard for Android, in `android/`.** Drive Wizard, Pi and Claude Code on
+  your own machines over SSH from a phone: one new-chat screen with agent,
+  machine and folder chips, one recent list across every machine, streamed
+  replies with collapsible tool cards, and notifications when a turn finishes
+  or needs you. A signed APK is attached to each release as
+  `wizard-android.apk`, so
+  <https://github.com/teddytennant/wizard/releases/latest/download/wizard-android.apk>
+  always installs the newest one.
+
+- **Power user mode in Wizard GUI.** A Settings toggle that makes the whole app
+  keyboard-driven with vim-style keys (`j`/`k`, `gg`/`G`, `h`/`l` and `Ctrl-w`
+  between panes, a `Space` leader, `:` palette, `?` cheat sheet) and lists
+  every app command in the slash menu with argument hints and fuzzy matching.
+
+- **Vim editing in Wizard GUI's message box.** A separate toggle: Normal,
+  Insert and Visual modes with motions, text objects, counts, undo, redo and
+  `.`; `Enter` in Normal mode sends.
+
+- **The Starship artwork shows behind new chats for every agent** in Wizard
+  GUI and the Android app, and the setting is now called Starship artwork.
+
+- **A small Game of Life is the spinner** next to Wizard GUI's and the Android
+  app's waiting words.
 
 - **Slash commands over ACP.** `wizard acp` now sends an
   `available_commands_update` after `session/new` and `session/load`, so Zed,
