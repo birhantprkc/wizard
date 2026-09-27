@@ -65,11 +65,13 @@ mod actions_ui;
 mod command_palette;
 mod files_panel;
 mod onboarding;
+mod power_nav;
 mod sidebar_pins;
 mod sidebar_sections;
 mod spaces;
 mod tabs;
 
+pub use power_nav::nav_ring;
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
@@ -320,6 +322,7 @@ pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
+    power_user_mode: bool,
 ) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
         let candidate = platform_combo(combo);
@@ -423,6 +426,11 @@ pub fn apply_keymap(
             None,
         ))
     }));
+    // Power user navigation keys. They only match on the shell's navigation
+    // focus target, never inside a text field (see `power_keys`).
+    if power_user_mode {
+        cx.bind_keys(crate::power_keys::key_bindings());
+    }
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -1752,8 +1760,24 @@ pub struct Shell {
     /// settle, preserving focus on mounted controls.
     focus_sub: Option<Subscription>,
     shortcut_focus: FocusHandle,
-    /// Neutral shortcut target after clicking away from an input.
+    /// Neutral shortcut target after clicking away from an input. In power
+    /// user mode it is also the navigation target: it carries the
+    /// `PowerNav` key context, so navigation mode is "this has focus".
     unfocused: FocusHandle,
+    /// Power user mode: the pane holding the navigation cursor
+    /// (`Composer` means the message box has the keyboard).
+    nav_pane: crate::power_keys::Pane,
+    /// The session-list row the navigation cursor is on.
+    nav_sidebar_cursor: Option<String>,
+    /// The `?` cheat sheet is open.
+    cheat_sheet: bool,
+    /// Chat awaiting the archive confirmation `x` / `dd` opened.
+    nav_archive_confirm: Option<String>,
+    /// Whether navigation mode had focus at the start of this frame. Row
+    /// renderers without a `Window` read it to draw the focus ring.
+    nav_focus_visible: bool,
+    /// Repaints the which-key hint while a prefix key is pending.
+    pending_input_sub: Option<Subscription>,
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
@@ -1866,7 +1890,12 @@ impl Shell {
         crate::appshots::set_enabled(settings.appshots_enabled);
         crate::appshots::set_capture_sound_enabled(settings.appshot_sound_enabled);
         // Bind the customizable shortcuts from the persisted keymap.
-        apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
+        apply_keymap(
+            cx,
+            &settings.keymap,
+            settings.composer_send_behavior,
+            settings.power_user_mode,
+        );
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
@@ -2075,6 +2104,12 @@ impl Shell {
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
             unfocused: cx.focus_handle(),
+            nav_pane: crate::power_keys::Pane::Composer,
+            nav_sidebar_cursor: None,
+            cheat_sheet: false,
+            nav_archive_confirm: None,
+            nav_focus_visible: false,
+            pending_input_sub: None,
             activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -4121,6 +4156,13 @@ impl Shell {
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;
                                 }
+                                ShortcutsEvent::PowerUserModeChanged(enabled) => {
+                                    this.settings.power_user_mode = *enabled;
+                                    if !*enabled {
+                                        this.nav_pane = crate::power_keys::Pane::Composer;
+                                        this.cheat_sheet = false;
+                                    }
+                                }
                                 ShortcutsEvent::VimComposerChanged(enabled) => {
                                     this.settings.vim_composer = *enabled;
                                 }
@@ -4140,6 +4182,7 @@ impl Shell {
                                 cx,
                                 &this.settings.keymap,
                                 this.settings.composer_send_behavior,
+                                this.settings.power_user_mode,
                             );
                             this.schedule_save(cx);
                             cx.notify();
@@ -5768,7 +5811,7 @@ impl Shell {
         out
     }
 
-    fn render_sidebar(&mut self, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // The sidebar is part of the resolved theme. A second fixed-Zeron
         // palette here made imported families look split in half and froze
         // activity/glyph personality independently of the selected variant.
@@ -5783,11 +5826,13 @@ impl Shell {
         // full window height (the titlebar overlays it), so the column pads
         // itself below the chrome.
         div()
+            .relative()
             .h_full()
             .flex_none()
             .overflow_hidden()
             .w(px(self.sidebar_now()))
             .child(div().h_full().pt(px(Theme::TITLEBAR_HEIGHT)).child(inner))
+            .children(self.pane_ring(crate::power_keys::Pane::Sidebar, cx))
             .into_any_element()
     }
 
@@ -5818,6 +5863,7 @@ impl Shell {
         // the sidebar's right edge (user-reported). Device identity lives on
         // the Accounts page now — the one surface where the device matters.
         let account = self.render_settings_account(theme, cx);
+        let settings_ring = self.nav_ring_on_settings();
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
@@ -5875,6 +5921,15 @@ impl Shell {
                                         })
                                         .cursor_pointer()
                                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                                        .when(selected && settings_ring, |el| {
+                                            el.relative().child(
+                                                nav_ring(theme, 8.0)
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right_0(),
+                                            )
+                                        })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.open_settings(item, cx)
                                         }))
@@ -5971,6 +6026,7 @@ impl Shell {
                 self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
             });
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
+        let nav_ring_here = !preview && search_query.is_none() && self.nav_ring_on_row(&id, cx);
         let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
         let content_id = id.clone();
         // Send-truth overrides: a send unadopted past the grace window is
@@ -6488,6 +6544,10 @@ impl Shell {
                             })
                         }),
                 )
+            })
+            .when(nav_ring_here, |el| {
+                el.relative()
+                    .child(nav_ring(theme, 8.0).top_0().bottom_0().left_0().right_0())
             })
             .into_any_element()
     }
@@ -7786,6 +7846,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.power_confirm_key(&event.keystroke.key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.sidebar_session_transfer.is_some() {
             cx.stop_active_drag(window);
             self.cancel_sidebar_session_transfer(cx);
@@ -7821,6 +7885,18 @@ impl Shell {
             } else {
                 window.focus_next(cx);
             }
+            cx.stop_propagation();
+            return;
+        }
+        // Power user mode: an Escape nothing else used (menus, completions,
+        // vim normal mode and the terminal take theirs first) leaves the
+        // message box, a settings page or a button for keyboard navigation.
+        if self.power_user_mode()
+            && event.keystroke.key == "escape"
+            && !modifiers.modified()
+            && !self.nav_mode(window)
+        {
+            self.leave_to_navigation(window, cx);
             cx.stop_propagation();
             return;
         }
@@ -8139,6 +8215,12 @@ impl Shell {
                                 })),
                         ),
                 )
+                .when(self.power_user_mode(), |card| {
+                    card.child(power_nav::confirm_keys_hint(
+                        &theme,
+                        "Enter or y deletes, Esc or n cancels",
+                    ))
+                })
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
@@ -8146,6 +8228,14 @@ impl Shell {
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
             overlays.push(sync);
         }
+        if let Some(confirm) = self.render_nav_archive_confirm(viewport, cx) {
+            overlays.push(confirm);
+        }
+        if let Some(sheet) = self.render_cheat_sheet(viewport, cx) {
+            overlays.push(sheet);
+        }
+        overlays.extend(self.render_which_key(window, cx));
+        overlays.extend(self.render_nav_status(window, cx));
 
         overlays
     }
@@ -8388,6 +8478,7 @@ impl Shell {
                 .when(departing_transcript, |el| {
                     el.child(div().absolute().inset_0().occlude())
                 })
+                .children(self.pane_ring(crate::power_keys::Pane::Transcript, cx))
                 .into_any_element()
         } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
@@ -9058,7 +9149,12 @@ impl Shell {
             target,
             self.right_visible_width(cx),
             edge_offset,
-            div().h_full().relative().child(panel).into_any_element(),
+            div()
+                .h_full()
+                .relative()
+                .child(panel)
+                .children(self.pane_ring(crate::power_keys::Pane::RightPanel, cx))
+                .into_any_element(),
         )
     }
 
@@ -10449,6 +10545,7 @@ impl Render for Shell {
         }
 
         self.render_time = Some(std::time::Instant::now());
+        self.sync_nav_frame(window, cx);
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
         {
@@ -10637,7 +10734,13 @@ impl Render for Shell {
         let root = div()
             .id("shell-root")
             .track_focus(&self.shortcut_focus)
-            .child(div().track_focus(&self.unfocused))
+            .child(
+                div()
+                    .track_focus(&self.unfocused)
+                    .when_some(self.nav_key_context(), |el, context| {
+                        el.key_context(context)
+                    }),
+            )
             .relative()
             .flex()
             .flex_row()
@@ -10775,6 +10878,7 @@ impl Render for Shell {
                     this.open_add_space(cx);
                 }
             }));
+        let root = Self::with_power_actions(root, cx);
 
         let render_gate = if restart_required {
             GatePhase::Loading

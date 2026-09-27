@@ -1026,6 +1026,26 @@ impl Pickers {
         }
     }
 
+    /// Power user `Space e`: the model menu with its reasoning list already
+    /// open, when the model has one.
+    pub fn open_effort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_model_menu(window, cx);
+        if self
+            .setting_groups(cx)
+            .iter()
+            .any(|group| group.id == ModelSetting::Reasoning)
+        {
+            self.open_setting(ModelSetting::Reasoning, cx);
+        }
+    }
+
+    /// Power user `Space d`: the new-chat device menu.
+    pub fn open_device_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_kind() != Some(PickerKind::Device) {
+            self.toggle(PickerKind::Device, window, cx);
+        }
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // A press that found this picker open closes it — the card's
         // `on_mouse_down_out` already began the close on that same press,

@@ -1068,6 +1068,8 @@ fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
     devices
 }
 
+mod nav;
+
 /// A transcript row: stable id + content version (diff key) + block payload.
 #[derive(Clone)]
 pub struct Row {
@@ -3207,6 +3209,10 @@ pub struct Transcript {
     code_fences: HashMap<SharedString, render::CodeFenceRuntime>,
     /// Entry whose hover action is showing transient copied-check feedback.
     copied_message: Option<SharedString>,
+    /// Power user navigation cursor: the row id it sits on, and whether the
+    /// transcript currently owns the navigation keys (ring drawn).
+    nav_cursor: Option<SharedString>,
+    nav_active: bool,
     copied_message_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
@@ -3418,6 +3424,8 @@ impl Transcript {
             copied_clear: None,
             code_fences: HashMap::new(),
             copied_message: None,
+            nav_cursor: None,
+            nav_active: false,
             copied_message_clear: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
@@ -6595,6 +6603,7 @@ impl Transcript {
         });
         let entry_id = row.entry_id.clone();
         let row_id = row.id.clone();
+        let nav_ring = self.nav_active && self.nav_cursor.as_ref() == Some(&row.id);
         let outer = div()
             .id(row.id.clone())
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -6631,12 +6640,22 @@ impl Transcript {
             .px(px(48.0))
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(self.content_width))
                     .min_w_0()
                     .child(inner)
                     .children(strip)
-                    .children(trailer),
+                    .children(trailer)
+                    .when(nav_ring, |el| {
+                        el.child(
+                            crate::shell::nav_ring(&theme, 10.0)
+                                .top(px(-4.0))
+                                .bottom(px(-4.0))
+                                .left(px(-12.0))
+                                .right(px(-12.0)),
+                        )
+                    }),
             );
         let Some(work_id) = row.compact_fold.clone() else {
             return outer.into_any_element();

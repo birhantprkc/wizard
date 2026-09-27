@@ -303,6 +303,12 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     });
 }
 
+/// Whether power user mode is on, without cloning the whole settings value.
+pub fn power_user_mode(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .is_some_and(|store| store.current.power_user_mode)
+}
+
 /// Whether vim editing is on in the message box.
 pub fn vim_composer(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
@@ -791,6 +797,9 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// Power user mode: vim-style keyboard navigation across the whole app,
+    /// the `?` cheat sheet, and the extra app commands in the slash menu.
+    pub power_user_mode: bool,
     /// Modal (vim) editing in the message box. Independent of power user mode.
     pub vim_composer: bool,
     /// Light/dark preference. Defaults to following the OS.
@@ -896,6 +905,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            power_user_mode: false,
             vim_composer: false,
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
@@ -2251,6 +2261,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            power_user_mode: true,
             vim_composer: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
@@ -3131,6 +3142,27 @@ mod tests {
         assert!(!loaded.escape_stops_active_agent);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+    }
+
+    #[test]
+    fn power_user_and_vim_are_opt_in_and_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.power_user_mode);
+        assert!(!loaded.vim_composer);
+
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"powerUserMode": false, "vimComposer": true}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.power_user_mode);
+        assert!(loaded.vim_composer);
+        let json = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(json["vimComposer"], true);
+        assert_eq!(json["powerUserMode"], false);
     }
 
     #[test]

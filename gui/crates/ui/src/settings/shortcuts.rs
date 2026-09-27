@@ -51,6 +51,8 @@ pub enum ShortcutsEvent {
     EscapeStopsActiveAgentChanged(bool),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
+    /// Power user mode toggled: persist it and re-apply the keymap.
+    PowerUserModeChanged(bool),
     /// Vim editing in the message box toggled.
     VimComposerChanged(bool),
     AppshotsChanged {
@@ -68,6 +70,7 @@ pub struct ShortcutsPage {
     keymap: KeymapConfig,
     escape_stops_active_agent: bool,
     composer_send_behavior: ComposerSendBehavior,
+    power_user_mode: bool,
     vim_composer: bool,
     recording: Option<ShortcutId>,
     recording_blur: Option<gpui::Subscription>,
@@ -109,6 +112,7 @@ impl ShortcutsPage {
             keymap,
             escape_stops_active_agent,
             composer_send_behavior,
+            power_user_mode: crate::settings::power_user_mode(cx),
             vim_composer: crate::settings::vim_composer(cx),
             recording: None,
             recording_blur: None,
@@ -177,6 +181,14 @@ impl ShortcutsPage {
         if self.escape_stops_active_agent != enabled {
             self.escape_stops_active_agent = enabled;
             cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
+            cx.notify();
+        }
+    }
+
+    fn set_power_user_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.power_user_mode != enabled {
+            self.power_user_mode = enabled;
+            cx.emit(ShortcutsEvent::PowerUserModeChanged(enabled));
             cx.notify();
         }
     }
@@ -591,6 +603,7 @@ impl Render for ShortcutsPage {
                 ),
         );
 
+        let power_user_mode = self.power_user_mode;
         let vim_composer = self.vim_composer;
         let toggle_row = |title: &'static str, copy: &'static str, first: bool| {
             widgets::card_row(&theme, first).min_h(px(84.0)).child(
@@ -611,12 +624,27 @@ impl Render for ShortcutsPage {
                     ),
             )
         };
-        let vim_card = widgets::section_card(&theme)
+        let power_card = widgets::section_card(&theme)
+            .child(
+                toggle_row(
+                    "Power user mode",
+                    "Drive the whole app from the keyboard with vim-style keys: j and k move, h and l switch panes, Space is the leader, : opens the palette. Press Esc to leave the message box and ? to see every key. The slash menu also lists every app command.",
+                    true,
+                )
+                .child(
+                    widgets::toggle_switch(&theme, power_user_mode)
+                        .id("power-user-mode-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_power_user_mode(!power_user_mode, cx);
+                        })),
+                ),
+            )
             .child(
                 toggle_row(
                     "Vim editing in the message box",
-                    "Normal, insert and visual modes in the message box. Esc for normal mode, Enter in normal mode sends.",
-                    true,
+                    "Normal, insert and visual modes in the message box. Esc for normal mode, Enter in normal mode sends. Works with or without power user mode.",
+                    false,
                 )
                 .child(
                     widgets::toggle_switch(&theme, vim_composer)
@@ -849,7 +877,7 @@ impl Render for ShortcutsPage {
                                             .child(SharedString::from("Restore defaults"))
                                     }),
                             )
-                            .child(vim_card.mt(px(32.0)))
+                            .child(power_card.mt(px(32.0)))
                             .child(send_behavior_row)
                             .child(completion)
                             .child(

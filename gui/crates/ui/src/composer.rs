@@ -3098,6 +3098,26 @@ impl ComposerInput {
         cx.notify();
     }
 
+    /// Start typing: vim to Insert at the cursor (power user `i`, new chat).
+    pub(crate) fn vim_insert(&mut self, cx: &mut Context<Self>) {
+        if self
+            .vim
+            .as_ref()
+            .is_none_or(|vim| vim.mode() == crate::vim::Mode::Insert)
+        {
+            return;
+        }
+        let mut cursor = if self.vim_range.as_ref() == Some(&self.selected_range) {
+            self.vim_cursor
+        } else {
+            self.cursor_offset()
+        };
+        if let Some(vim) = self.vim.as_mut() {
+            vim.set_mode(crate::vim::Mode::Insert, &self.content, &mut cursor);
+        }
+        self.sync_vim_selection(cursor, cx);
+    }
+
     /// Mode and pending keys for the indicator, when vim is on.
     pub(crate) fn vim_status(&self) -> Option<(crate::vim::Mode, String)> {
         self.vim.as_ref().map(|vim| (vim.mode(), vim.pending()))
