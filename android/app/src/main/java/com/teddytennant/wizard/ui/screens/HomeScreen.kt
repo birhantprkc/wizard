@@ -75,6 +75,7 @@ data class HomeState(
     val recents: List<RecentRow>,
     val refreshing: Boolean,
     val hasMachines: Boolean,
+    val artwork: Boolean,
 )
 
 @Composable
@@ -91,8 +92,7 @@ fun HomeContent(
     now: Instant = Instant.now(),
 ) {
     val colors = WizardTheme.colors
-    // As on the desktop, the artwork is behind new Wizard chats.
-    val showArt = state.agent == Agent.Wizard
+    val showArt = state.artwork && state.agent == Agent.Wizard
     BoxWithConstraints(Modifier.fillMaxSize().background(colors.background)) {
         val heroHeight = (maxHeight * 0.52f).coerceIn(300.dp, 480.dp)
         if (showArt) Starship(Modifier.fillMaxWidth().height(heroHeight))

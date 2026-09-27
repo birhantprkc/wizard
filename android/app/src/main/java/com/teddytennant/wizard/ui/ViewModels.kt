@@ -21,6 +21,8 @@ import com.teddytennant.wizard.ui.screens.BrowseState
 import com.teddytennant.wizard.ui.screens.InstallState
 import com.teddytennant.wizard.ui.screens.MachineCardModel
 import com.teddytennant.wizard.ui.screens.MachineFormState
+import com.teddytennant.wizard.ui.screens.OnboardingMachine
+import com.teddytennant.wizard.ui.screens.OnboardingStep
 import com.teddytennant.wizard.ui.screens.HomeState
 import com.teddytennant.wizard.ui.screens.RecentRow
 import kotlinx.coroutines.CancellationException
@@ -245,7 +247,7 @@ class HomeViewModel(private val graph: AppGraph) : ViewModel() {
         Triple(machines, statuses, selection)
     }
 
-    val state: StateFlow<HomeState?> = combine(base, graph.recents.recents, graph.hub.running, refreshing) { b, recents, running, refreshing ->
+    val state: StateFlow<HomeState?> = combine(base, graph.recents.recents, graph.hub.running, graph.settings.settings, refreshing) { b, recents, running, settings, refreshing ->
         val (machines, statuses, selection) = b
         val machine = machines.firstOrNull { it.id == selection.machineId } ?: machines.firstOrNull()
         val status = machine?.let { statuses[it.id] } ?: MachineStatus()
@@ -260,6 +262,7 @@ class HomeViewModel(private val graph: AppGraph) : ViewModel() {
             },
             refreshing = refreshing,
             hasMachines = machines.isNotEmpty(),
+            artwork = settings.artwork,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
@@ -342,6 +345,37 @@ class HomeViewModel(private val graph: AppGraph) : ViewModel() {
     fun closeInstall() {
         if (install.value?.running == true) return
         install.value = null
+    }
+}
+
+class OnboardingViewModel(private val graph: AppGraph) : ViewModel() {
+    val step = MutableStateFlow(OnboardingStep.Welcome)
+    val machine = MutableStateFlow(OnboardingMachine())
+    val notificationsAsked = MutableStateFlow(false)
+
+    fun generateKey() = viewModelScope.launch {
+        val key = withContext(Dispatchers.Default) { graph.vault.generate(KeysViewModel.defaultKeyLabel()) }
+        machine.update { it.copy(key = key) }
+    }
+
+    fun saveMachine() = viewModelScope.launch {
+        val m = machine.value
+        val key = m.key ?: return@launch
+        val errors = MachineForm.validate(m.host, m.host, m.port, m.user, AuthKind.Key, key.id, "", false)
+        if (!errors.ok) {
+            machine.update { it.copy(error = listOfNotNull(errors.host, errors.user, errors.port).first()) }
+            return@launch
+        }
+        val id = UUID.randomUUID().toString()
+        graph.machines.upsert(Machine(id, MachineForm.defaultName(m.host), m.host, m.port.toInt(), m.user, AuthKind.Key, key.id))
+        graph.selection.setMachine(id)
+        machine.update { it.copy(saved = true, error = null) }
+    }
+
+    suspend fun finish() = graph.settings.markOnboarded()
+    suspend fun markAsked() {
+        graph.settings.markAskedForNotifications()
+        notificationsAsked.value = true
     }
 }
 

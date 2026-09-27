@@ -22,6 +22,11 @@ data class Settings(
     val notifyFinished: Boolean = true,
     val notifyInput: Boolean = true,
     val askedForNotifications: Boolean = false,
+    /** Folds each turn's tool calls and thinking into one line, as the desktop's Compact mode. */
+    val compact: Boolean = false,
+    /** The Starship backdrop behind new Wizard chats, as the desktop's "Wizard artwork". */
+    val artwork: Boolean = true,
+    val onboarded: Boolean = false,
 )
 
 class MachineStore(private val store: DataStore<Preferences>) {
@@ -56,6 +61,9 @@ class SettingsStore(private val store: DataStore<Preferences>) {
     private val finished = booleanPreferencesKey("notify_finished")
     private val input = booleanPreferencesKey("notify_input")
     private val asked = booleanPreferencesKey("asked_notifications")
+    private val compact = booleanPreferencesKey("compact")
+    private val artwork = booleanPreferencesKey("artwork")
+    private val onboarded = booleanPreferencesKey("onboarded")
 
     val settings: Flow<Settings> = store.data.map { p ->
         Settings(
@@ -63,6 +71,9 @@ class SettingsStore(private val store: DataStore<Preferences>) {
             notifyFinished = p[finished] ?: true,
             notifyInput = p[input] ?: true,
             askedForNotifications = p[asked] ?: false,
+            compact = p[compact] ?: false,
+            artwork = p[artwork] ?: true,
+            onboarded = p[onboarded] ?: false,
         )
     }
 
@@ -71,7 +82,9 @@ class SettingsStore(private val store: DataStore<Preferences>) {
     suspend fun setNotifyFinished(on: Boolean) = store.edit { it[finished] = on }
     suspend fun setNotifyInput(on: Boolean) = store.edit { it[input] = on }
     suspend fun markAskedForNotifications() = store.edit { it[asked] = true }
-
+    suspend fun setCompact(on: Boolean) = store.edit { it[compact] = on }
+    suspend fun setArtwork(on: Boolean) = store.edit { it[artwork] = on }
+    suspend fun markOnboarded() = store.edit { it[onboarded] = true }
 
     companion object {
         fun dataStore(context: Context): DataStore<Preferences> = context.dataStore

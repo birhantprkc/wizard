@@ -50,6 +50,8 @@ import com.teddytennant.wizard.ui.screens.AgentSheetContent
 import com.teddytennant.wizard.ui.screens.FolderSheetContent
 import com.teddytennant.wizard.ui.screens.HomeContent
 import com.teddytennant.wizard.ui.screens.MachineSheetContent
+import com.teddytennant.wizard.ui.screens.OnboardingContent
+import com.teddytennant.wizard.ui.screens.OnboardingStep
 import com.teddytennant.wizard.ssh.StoredKey
 import com.teddytennant.wizard.ui.screens.AboutContent
 import com.teddytennant.wizard.ui.screens.BrowseSheetContent
@@ -74,7 +76,7 @@ import com.teddytennant.wizard.ui.theme.WizardTheme
 import kotlinx.coroutines.launch
 
 @Composable
-fun WizardNavHost(graph: AppGraph, pendingChat: ChatRoute?, onChatOpened: () -> Unit) {
+fun WizardNavHost(graph: AppGraph, settings: Settings, startWithOnboarding: Boolean, pendingChat: ChatRoute?, onChatOpened: () -> Unit) {
     val nav = rememberNavController()
     LaunchedEffect(pendingChat) {
         if (pendingChat != null) {
@@ -88,18 +90,19 @@ fun WizardNavHost(graph: AppGraph, pendingChat: ChatRoute?, onChatOpened: () -> 
     }
     NavHost(
         navController = nav,
-        startDestination = HomeRoute,
+        startDestination = if (startWithOnboarding) OnboardingRoute else HomeRoute,
         modifier = Modifier.fillMaxSize().background(WizardTheme.colors.background),
         enterTransition = { slideInHorizontally { it / 6 } + fadeIn() },
         exitTransition = { fadeOut() },
         popEnterTransition = { fadeIn() },
         popExitTransition = { slideOutHorizontally { it / 6 } + fadeOut() },
     ) {
+        composable<OnboardingRoute> { OnboardingRouteScreen(graph, nav, settings) }
         composable<HomeRoute> { HomeRouteScreen(graph, nav) }
         composable<MachinesRoute> { MachinesRouteScreen(graph, nav) }
         composable<EditMachineRoute> { entry -> EditMachineRouteScreen(graph, nav, entry.toRoute<EditMachineRoute>().machineId) }
         composable<MachineRoute> { entry -> MachineRouteScreen(graph, nav, entry.toRoute<MachineRoute>().machineId) }
-        composable<ChatRoute> { entry -> ChatRouteScreen(graph, nav, entry.toRoute()) }
+        composable<ChatRoute> { entry -> ChatRouteScreen(graph, nav, entry.toRoute(), settings.compact) }
         composable<SettingsRoute> { SettingsRouteScreen(graph, nav) }
         composable<KeysRoute> { KeysRouteScreen(graph, nav) }
         composable<AboutRoute> { AboutRouteScreen(graph, nav) }
@@ -354,7 +357,47 @@ private fun HomeRouteScreen(graph: AppGraph, nav: NavHostController) {
 }
 
 @Composable
-private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: ChatRoute) {
+private fun OnboardingRouteScreen(graph: AppGraph, nav: NavHostController, settings: Settings) {
+    val vm = viewModel { OnboardingViewModel(graph) }
+    val step by vm.step.collectAsStateWithLifecycle()
+    val machine by vm.machine.collectAsStateWithLifecycle()
+    val asked by vm.notificationsAsked.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        vm.step.value = OnboardingStep.Done
+    }
+    OnboardingContent(
+        step = step,
+        settings = settings,
+        machine = machine,
+        notificationsAsked = asked || graph.notifier.permissionGranted(),
+        onStep = { vm.step.value = it },
+        onTheme = { scope.launch { graph.settings.setTheme(it) } },
+        onCompact = { scope.launch { graph.settings.setCompact(it) } },
+        onArtwork = { scope.launch { graph.settings.setArtwork(it) } },
+        onMachine = { vm.machine.value = it },
+        onGenerateKey = { vm.generateKey() },
+        onCopyKey = { machine.key?.let { copy(context, "SSH public key", it.publicKey) } },
+        onShareKey = { machine.key?.let { share(context, it) } },
+        onSaveMachine = { vm.saveMachine() },
+        onAllowNotifications = {
+            scope.launch {
+                vm.markAsked()
+                if (Build.VERSION.SDK_INT >= 33) askPermission.launch(Manifest.permission.POST_NOTIFICATIONS) else vm.step.value = OnboardingStep.Done
+            }
+        },
+        onFinish = {
+            scope.launch {
+                vm.finish()
+                nav.navigate(HomeRoute) { popUpTo(OnboardingRoute) { inclusive = true } }
+            }
+        },
+    )
+}
+
+@Composable
+private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: ChatRoute, compact: Boolean) {
     val vm = viewModel(key = "chat-${route.machineId}-${route.agent}-${route.sessionId}-${route.cwd}-${route.prompt.hashCode()}") { ChatViewModel(graph, route) }
     val chatFlow by vm.chat.collectAsStateWithLifecycle()
     val state: ChatState? = chatFlow?.collectAsStateWithLifecycle()?.value
@@ -418,6 +461,7 @@ private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: Chat
         onOptions = { options = true },
         onPermission = vm::answer,
         onBack = { nav.popBackStack() },
+        compact = compact,
     )
     if (options && state != null) {
         WizardSheet(onDismiss = { options = false }) {
@@ -455,6 +499,8 @@ private fun SettingsRouteScreen(graph: AppGraph, nav: NavHostController) {
         version = graph.version,
         onMachines = { nav.navigate(MachinesRoute) },
         onTheme = { scope.launch { graph.settings.setTheme(it) } },
+        onCompact = { scope.launch { graph.settings.setCompact(it) } },
+        onArtwork = { scope.launch { graph.settings.setArtwork(it) } },
         onNotifyFinished = { scope.launch { graph.settings.setNotifyFinished(it) } },
         onNotifyInput = { scope.launch { graph.settings.setNotifyInput(it) } },
         onSystemNotifications = {

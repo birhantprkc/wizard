@@ -69,6 +69,8 @@ fun SettingsContent(
     version: String,
     onMachines: () -> Unit,
     onTheme: (ThemeChoice) -> Unit,
+    onCompact: (Boolean) -> Unit,
+    onArtwork: (Boolean) -> Unit,
     onNotifyFinished: (Boolean) -> Unit,
     onNotifyInput: (Boolean) -> Unit,
     onSystemNotifications: () -> Unit,
@@ -90,6 +92,11 @@ fun SettingsContent(
 
         SectionLabel("Appearance", Modifier.padding(top = 20.dp))
         Segmented(listOf(ThemeChoice.Dark to "Dark", ThemeChoice.Light to "Light", ThemeChoice.System to "System"), settings.theme, onTheme)
+        Panel(padding = PaddingValues(0.dp)) {
+            ToggleRow("Compact mode", "Fold each turn's tool calls and thinking into one line", settings.compact, onCompact)
+            Hairline()
+            ToggleRow("Wizard artwork", "The Starship backdrop behind new Wizard chats", settings.artwork, onArtwork)
+        }
 
         SectionLabel("Notifications", Modifier.padding(top = 20.dp))
         Panel(padding = PaddingValues(0.dp)) {

@@ -12,6 +12,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.teddytennant.wizard.data.Settings
 import com.teddytennant.wizard.notify.Notifier
 import com.teddytennant.wizard.ui.ChatRoute
@@ -22,13 +24,18 @@ import com.teddytennant.wizard.ui.theme.isDark
 class MainActivity : ComponentActivity() {
     private var pendingChat by mutableStateOf<ChatRoute?>(null)
 
+    private var initial by mutableStateOf<Settings?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        installSplashScreen()
+        // Hold the splash until settings are read, so the first frame is the right screen in the right theme.
+        installSplashScreen().setKeepOnScreenCondition { initial == null }
         super.onCreate(savedInstanceState)
         pendingChat = chatFrom(intent)
         val graph = (application as WizardApp).graph
+        lifecycleScope.launch { initial = graph.settings.current() }
         setContent {
-            val settings by graph.settings.settings.collectAsStateWithLifecycle(initialValue = Settings())
+            val first = initial ?: return@setContent
+            val settings by graph.settings.settings.collectAsStateWithLifecycle(initialValue = first)
             val dark = isDark(settings.theme)
             LaunchedEffect(dark) {
                 val style = if (dark) SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
@@ -36,7 +43,7 @@ class MainActivity : ComponentActivity() {
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
             }
             WizardTheme(dark = dark) {
-                WizardNavHost(graph, pendingChat, onChatOpened = { pendingChat = null })
+                WizardNavHost(graph, settings, startWithOnboarding = !first.onboarded, pendingChat, onChatOpened = { pendingChat = null })
             }
         }
     }

@@ -3,6 +3,7 @@ package com.teddytennant.wizard.ui
 import kotlinx.serialization.Serializable
 
 @Serializable data object HomeRoute
+@Serializable data object OnboardingRoute
 @Serializable data object MachinesRoute
 @Serializable data class EditMachineRoute(val machineId: String? = null)
 @Serializable data class MachineRoute(val machineId: String)

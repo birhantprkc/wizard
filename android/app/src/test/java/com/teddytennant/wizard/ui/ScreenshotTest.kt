@@ -30,6 +30,9 @@ import com.teddytennant.wizard.ui.screens.AgentSheetContent
 import com.teddytennant.wizard.ui.screens.FolderSheetContent
 import com.teddytennant.wizard.ui.screens.HomeContent
 import com.teddytennant.wizard.ui.screens.MachineSheetContent
+import com.teddytennant.wizard.ui.screens.OnboardingContent
+import com.teddytennant.wizard.ui.screens.OnboardingMachine
+import com.teddytennant.wizard.ui.screens.OnboardingStep
 import com.teddytennant.wizard.data.Settings
 import com.teddytennant.wizard.notify.NotificationPolicy
 import com.teddytennant.wizard.notify.RunningTurn
@@ -64,10 +67,10 @@ class ScreenshotTest {
         paparazzi.snapshot(name) { WizardTheme(dark = dark) { Box(Modifier.fillMaxSize().background(WizardTheme.colors.background)) { content() } } }
 
     @Composable
-    private fun Chat(state: com.teddytennant.wizard.session.ChatState, draft: String = "") {
+    private fun Chat(state: com.teddytennant.wizard.session.ChatState, draft: String = "", compact: Boolean = false) {
         ChatContent(
             state = state, agent = state.agent, machineName = "buildbox", cwd = state.cwd, starting = false, startError = null,
-            draft = draft, onDraft = {}, onSend = {}, onStop = {}, onOptions = {}, onPermission = {}, onBack = {},
+            draft = draft, onDraft = {}, onSend = {}, onStop = {}, onOptions = {}, onPermission = {}, onBack = {}, compact = compact,
         )
     }
 
@@ -98,7 +101,7 @@ class ScreenshotTest {
     @Test fun homeClaude() = shot("home_claude") { Home(Fixtures.home(Agent.ClaudeCode)) }
 
     @Test fun homeFirstRun() = shot("home_first_run") {
-        Home(com.teddytennant.wizard.ui.screens.HomeState(null, com.teddytennant.wizard.session.MachineStatus(), Agent.Wizard, null, emptyList(), false, false))
+        Home(com.teddytennant.wizard.ui.screens.HomeState(null, com.teddytennant.wizard.session.MachineStatus(), Agent.Wizard, null, emptyList(), false, false, true))
     }
 
     @Test fun agentSheet() = shot("agent_sheet") {
@@ -152,6 +155,8 @@ class ScreenshotTest {
 
     @Test fun chatPi() = shot("chat_pi") { Chat(Fixtures.piChat) }
 
+    @Test fun chatCompact() = shot("chat_compact") { Chat(Fixtures.chat, compact = true) }
+
     @Test fun chatLight() = shot("chat_light", dark = false) {
         Chat(Fixtures.chat.copy(running = false, items = Fixtures.chat.items.dropLast(1)), draft = "Now open a PR")
     }
@@ -175,10 +180,27 @@ class ScreenshotTest {
     @Test fun settings() = shot("settings") {
         SettingsContent(
             settings = Settings(), machineCount = 3, keyCount = 2, trustedHosts = 3, notificationsAllowed = true, version = "0.2.0",
-            onMachines = {}, onTheme = {}, onNotifyFinished = {}, onNotifyInput = {},
+            onMachines = {}, onTheme = {}, onCompact = {}, onArtwork = {}, onNotifyFinished = {}, onNotifyInput = {},
             onSystemNotifications = {}, onKeys = {}, onAbout = {}, onBack = {},
         )
     }
+
+    @Composable
+    private fun Onboarding(step: OnboardingStep, machine: OnboardingMachine = OnboardingMachine()) {
+        OnboardingContent(
+            step = step, settings = Settings(), machine = machine, notificationsAsked = false,
+            onStep = {}, onTheme = {}, onCompact = {}, onArtwork = {}, onMachine = {}, onGenerateKey = {}, onCopyKey = {},
+            onShareKey = {}, onSaveMachine = {}, onAllowNotifications = {}, onFinish = {},
+        )
+    }
+
+    @Test fun onboardingWelcome() = shot("onboarding_1_welcome") { Onboarding(OnboardingStep.Welcome) }
+    @Test fun onboardingAppearance() = shot("onboarding_2_appearance") { Onboarding(OnboardingStep.Appearance) }
+    @Test fun onboardingMachine() = shot("onboarding_3_machine") {
+        Onboarding(OnboardingStep.Machine, OnboardingMachine(host = "buildbox", user = "dev", key = Fixtures.key))
+    }
+    @Test fun onboardingNotifications() = shot("onboarding_4_notifications") { Onboarding(OnboardingStep.Notifications) }
+    @Test fun onboardingDone() = shot("onboarding_5_done") { Onboarding(OnboardingStep.Done) }
 
     /** What the ongoing and finished notifications say, drawn as a shade. */
     @Test fun notifications() = shot("notifications") {

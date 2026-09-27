@@ -88,6 +88,7 @@ fun ChatContent(
     onOptions: () -> Unit,
     onPermission: (String?) -> Unit,
     onBack: () -> Unit,
+    compact: Boolean = false,
     listState: LazyListState = rememberLazyListState(),
 ) {
     val colors = WizardTheme.colors
@@ -108,7 +109,7 @@ fun ChatContent(
                 starting || state == null -> CenterNote("Starting a session", spinner = true)
                 state.loading && items.isEmpty() -> CenterNote("Loading the transcript", spinner = true)
                 items.isEmpty() -> EmptyChat(agent, cwd)
-                else -> Transcript(items, running, listState)
+                else -> Transcript(items, running, listState, compact)
             }
         }
         state?.permission?.let { PermissionCard(agent, it.request, onPermission) }
@@ -150,8 +151,35 @@ private fun EmptyChat(agent: Agent, cwd: String) {
     }
 }
 
+/** What the transcript draws: an item, or (compact mode) a run of tool calls and thinking folded into one line. */
+private sealed interface Row_ {
+    val key: String
+    data class One(val item: TranscriptItem) : Row_ { override val key get() = item.key }
+    data class Steps(override val key: String, val items: List<TranscriptItem>, val active: Boolean) : Row_
+}
+
+private fun rows(items: List<TranscriptItem>, compact: Boolean, running: Boolean): List<Row_> {
+    if (!compact) return items.map { Row_.One(it) }
+    val out = mutableListOf<Row_>()
+    var run = mutableListOf<TranscriptItem>()
+    fun flush(active: Boolean) {
+        if (run.isNotEmpty()) out += Row_.Steps("steps-" + run.first().key, run, active)
+        run = mutableListOf()
+    }
+    items.forEachIndexed { i, item ->
+        if (item is TranscriptItem.Tool || item is TranscriptItem.Thinking) {
+            run += item
+            if (i == items.lastIndex) flush(active = running)
+        } else {
+            flush(active = false)
+            out += Row_.One(item)
+        }
+    }
+    return out
+}
+
 @Composable
-private fun Transcript(items: List<TranscriptItem>, running: Boolean, listState: LazyListState) {
+private fun Transcript(items: List<TranscriptItem>, running: Boolean, listState: LazyListState, compact: Boolean) {
     // Follow the stream while the reader is at the bottom; stay put if they scrolled up.
     val atBottom by remember {
         derivedStateOf {
@@ -169,16 +197,25 @@ private fun Transcript(items: List<TranscriptItem>, running: Boolean, listState:
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 16.dp),
     ) {
-        itemsIndexed(items, key = { _, it -> it.key }) { index, item ->
-            val previous = items.getOrNull(index - 1)
+        val display = rows(items, compact, running)
+        itemsIndexed(display, key = { _, it -> it.key }) { index, row ->
+            val previous = display.getOrNull(index - 1)
+            val item = (row as? Row_.One)?.item
+            val previousItem = (previous as? Row_.One)?.item
             // Runs of tool calls sit close together; everything else breathes.
             val gap = when {
                 index == 0 -> 0.dp
-                item is TranscriptItem.Tool && previous is TranscriptItem.Tool -> 6.dp
-                item is TranscriptItem.User -> 28.dp
+                item is TranscriptItem.Tool && previousItem is TranscriptItem.Tool -> 6.dp
+                item is TranscriptItem.User -> if (compact) 20.dp else 28.dp
+                compact -> 10.dp
                 else -> 14.dp
             }
-            Box(Modifier.padding(top = gap)) { TranscriptRow(item) }
+            Box(Modifier.padding(top = gap)) {
+                when (row) {
+                    is Row_.One -> TranscriptRow(row.item)
+                    is Row_.Steps -> StepsRow(row)
+                }
+            }
         }
         item(key = "tail") {
             if (running) Box(Modifier.padding(top = 14.dp)) { WorkingRow() } else Spacer(Modifier.height(1.dp))
@@ -256,6 +293,49 @@ private fun ThinkingRow(text: String) {
             }
         }
         if (open) Text(text.trim(), style = WizardTheme.type.small, color = colors.muted, modifier = Modifier.padding(start = 24.dp, top = 4.dp))
+    }
+}
+
+@Composable
+private fun StepsRow(row: Row_.Steps) {
+    val colors = WizardTheme.colors
+    var open by rememberSaveable(row.key) { mutableStateOf(false) }
+    val tools = row.items.filterIsInstance<TranscriptItem.Tool>()
+    val failed = tools.count { it.status == ToolStatus.Failed }
+    val summary = buildString {
+        append(
+            when {
+                tools.isEmpty() -> "Thought"
+                tools.size == 1 -> "1 step"
+                else -> "${tools.size} steps"
+            },
+        )
+        if (failed > 0) append(", $failed failed")
+        if (row.active) tools.lastOrNull()?.let { append("  ·  " + it.title) }
+    }
+    Column(Modifier.fillMaxWidth().animateContentSize()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(role = Role.Button, onClickLabel = if (open) "Collapse steps" else "Expand steps") { open = !open }
+                .heightIn(min = 40.dp)
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            when {
+                row.active -> Spinner(size = 14.dp)
+                tools.isEmpty() -> WizardIcon(R.drawable.ic_magic_stick_3, null, size = 15.dp, tint = colors.faint)
+                else -> WizardIcon(R.drawable.ic_widget, null, size = 15.dp, tint = colors.faint)
+            }
+            Text(summary, style = WizardTheme.type.small, color = colors.faint, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(start = 10.dp))
+            WizardIcon(if (open) R.drawable.ic_alt_arrow_down else R.drawable.ic_alt_arrow_right, null, size = 14.dp, tint = colors.faint)
+        }
+        if (open) {
+            Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                row.items.forEach { TranscriptRow(it) }
+            }
+        }
     }
 }
 

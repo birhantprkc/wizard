@@ -79,7 +79,7 @@ object Fixtures {
         RecentRow(RecentChat("m1", "claude", "e286ecdc", "/home/dev/src/site", "Draft the essays index page", minutesAgo(60 * 24 * 4)), "buildbox", running = false),
     )
 
-    fun home(agent: Agent = Agent.Wizard) = HomeState(
+    fun home(agent: Agent = Agent.Wizard, artwork: Boolean = true) = HomeState(
         machine = buildbox,
         status = buildboxStatus,
         agent = agent,
@@ -87,6 +87,7 @@ object Fixtures {
         recents = recents,
         refreshing = false,
         hasMachines = true,
+        artwork = artwork,
     )
 
     val options = listOf(
