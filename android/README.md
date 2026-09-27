@@ -11,10 +11,10 @@ With Nix (the flake brings JDK 21 and an Android SDK with platform 37 and build-
 ```bash
 cd android
 nix develop
-./gradlew assembleDebug
+./gradlew assembleRelease
 ```
 
-The APK lands in `app/build/outputs/apk/debug/app-debug.apk`.
+The APK lands in `app/build/outputs/apk/release/app-release.apk`. It is minified with R8, carries the baseline profile, and is signed with this machine's debug key, so it installs over a debug build from the same machine. `assembleDebug` gives `app/build/outputs/apk/debug/app-debug.apk`, which is noticeably slower: Compose runs unoptimised in debug builds.
 
 Without Nix you need JDK 21 and an Android SDK with `platforms;android-37.0` and `build-tools;36.1.0`, with `ANDROID_HOME` pointing at it.
 
@@ -24,6 +24,7 @@ Checks:
 ./gradlew testDebugUnitTest   # JVM tests
 ./gradlew lint
 ./gradlew recordPaparazziDebug  # re-renders the screens in docs/screenshots
+./gradlew :app:generateReleaseBaselineProfile  # needs a device or emulator on adb
 ```
 
 Some tests need real binaries and skip themselves otherwise. `AgentIntegrationTest` runs each installed agent through the app's own launch scripts in a local shell: Wizard and Pi through initialize, `session/new`, a config change and `session/list`, Claude Code through its `initialize` control request and its saved session logs. `SshEndToEndTest` starts a throwaway `sshd` on 127.0.0.1 and connects the way the app does. None of them sends a prompt, so no model is called. `ClaudeBackendTest` plays full turns against Wizard GUI's fake Claude CLI.
@@ -33,7 +34,7 @@ Some tests need real binaries and skip themselves otherwise. `AgentIntegrationTe
 Turn on USB debugging on the phone, plug it in, and:
 
 ```bash
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
 Android 10 or later.
