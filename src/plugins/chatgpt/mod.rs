@@ -220,6 +220,16 @@ impl ChatgptProvider {
         format!("{}{}", self.base_url, path)
     }
 
+    /// `GET /models` refuses a request without `client_version` (HTTP 400,
+    /// "Field required"), the way the Codex CLI it expects always sends one.
+    fn models_url(&self) -> String {
+        format!(
+            "{}/models?client_version={}",
+            self.base_url,
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
     /// Attach the auth + Codex-client headers a subscription request needs.
     async fn authed(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         let (access, account) = self.tokens.credentials().await?;
@@ -324,7 +334,7 @@ impl ChatgptProvider {
 impl LlmProvider for ChatgptProvider {
     async fn health(&self) -> Result<()> {
         let response = self
-            .authed(self.http.get(self.url("/models")))
+            .authed(self.http.get(self.models_url()))
             .await?
             .send()
             .await
@@ -340,7 +350,7 @@ impl LlmProvider for ChatgptProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let response = match self.authed(self.http.get(self.url("/models"))).await {
+        let response = match self.authed(self.http.get(self.models_url())).await {
             Ok(builder) => builder.send().await,
             Err(_) => return Ok(fallback_models()),
         };
@@ -351,10 +361,15 @@ impl LlmProvider for ChatgptProvider {
             return Ok(fallback_models());
         }
         match response.json::<ModelsResponse>().await {
-            Ok(models) if !models.data.is_empty() => {
-                Ok(models.data.into_iter().map(|m| m.id).collect())
+            Ok(models) => {
+                let ids = models.ids();
+                if ids.is_empty() {
+                    Ok(fallback_models())
+                } else {
+                    Ok(ids)
+                }
             }
-            _ => Ok(fallback_models()),
+            Err(_) => Ok(fallback_models()),
         }
     }
 
@@ -453,13 +468,31 @@ fn user_agent() -> String {
 
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
+    /// OpenAI's shape: `{"data": [{"id": ...}]}`.
     #[serde(default)]
     data: Vec<ModelEntry>,
+    /// The Codex backend's shape: `{"models": [{"slug": ...}]}`.
+    #[serde(default)]
+    models: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+impl ModelsResponse {
+    fn ids(self) -> Vec<String> {
+        self.data
+            .into_iter()
+            .chain(self.models)
+            .filter_map(|m| m.slug.or(m.id))
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
 }
 
 /// Translate native messages into `(instructions, input)`: system messages join
@@ -1055,6 +1088,32 @@ impl Plugin for ChatGptPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn models_are_requested_with_a_client_version() {
+        let url = super::ChatgptProvider::new("https://chatgpt.example/backend-api/codex/", "m")
+            .unwrap()
+            .models_url();
+        assert_eq!(
+            url,
+            format!(
+                "https://chatgpt.example/backend-api/codex/models?client_version={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn both_models_list_shapes_parse() {
+        let openai: super::ModelsResponse =
+            serde_json::from_str(r#"{"data":[{"id":"gpt-5.6-sol"}]}"#).unwrap();
+        assert_eq!(openai.ids(), vec!["gpt-5.6-sol"]);
+        let codex: super::ModelsResponse = serde_json::from_str(
+            r#"{"models":[{"slug":"gpt-6-astra","display_name":"GPT-6 Astra"},{"slug":"gpt-5.6-sol"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(codex.ids(), vec!["gpt-6-astra", "gpt-5.6-sol"]);
+    }
+
     #[test]
     fn only_a_model_error_triggers_the_rollout_fallback() {
         use super::{model_may_be_unavailable, names_unavailable_model};
