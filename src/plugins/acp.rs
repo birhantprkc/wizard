@@ -1055,6 +1055,21 @@ fn tool_kind(name: &str) -> ToolKind {
 /// A one-line title for a tool call, preferring a path/command/query from its
 /// arguments.
 fn tool_title(name: &str, args: &Value) -> String {
+    // `computer` has no path or command; its action and target are what a
+    // reader of the thread wants to see.
+    if name == crate::tools::computer::TOOL_NAME
+        && let Some(action) = args.get("action").and_then(Value::as_str)
+    {
+        let xy = match (args.get("x"), args.get("y"), args.get("coordinate")) {
+            (Some(x), Some(y), _) => Some((x.clone(), y.clone())),
+            (_, _, Some(Value::Array(c))) if c.len() == 2 => Some((c[0].clone(), c[1].clone())),
+            _ => None,
+        };
+        return match xy {
+            Some((x, y)) => format!("{name}: {action} ({x}, {y})"),
+            None => format!("{name}: {action}"),
+        };
+    }
     let detail = args
         .get("path")
         .and_then(Value::as_str)
@@ -1208,6 +1223,17 @@ mod tests {
             "execute: cargo test"
         );
         assert_eq!(tool_title("todo", &json!({})), "todo");
+        assert_eq!(
+            tool_title(
+                "computer",
+                &json!({ "action": "left_click", "x": 5, "y": 6 })
+            ),
+            "computer: left_click (5, 6)"
+        );
+        assert_eq!(
+            tool_title("computer", &json!({ "action": "screenshot" })),
+            "computer: screenshot"
+        );
     }
 
     #[test]
