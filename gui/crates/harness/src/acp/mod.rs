@@ -201,6 +201,28 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     dirs
 }
 
+/// Where pi's CLI can live: pi.dev's installer puts it in
+/// `$PI_CODING_AGENT_DIR/bin` (default `~/.pi/agent/bin`) when no writable
+/// PATH directory is available, and npm puts it in a global bin.
+fn pi_install_paths() -> Vec<PathBuf> {
+    pi_install_paths_in(
+        std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
+        crate::executable::home_dir(),
+    )
+}
+
+fn pi_install_paths_in(agent_dir: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let agent_dir = agent_dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .or_else(|| home.map(|h| h.join(".pi").join("agent")));
+    if let Some(agent_dir) = agent_dir {
+        dirs.push(agent_dir.join("bin").join("pi"));
+    }
+    dirs.extend(npm_global_bins("pi"));
+    dirs
+}
+
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = crate::executable::home_dir() {
@@ -507,7 +529,7 @@ fn pi_spec() -> AcpAgentSpec {
         archive: None,
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
+        cli_extra_paths: pi_install_paths,
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
              and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
              pi-acp automatically when npm is available — the pi CLI itself is \
@@ -1334,6 +1356,29 @@ impl AcpHarness {
     }
 
     fn configure_adapter_environment(&self, cmd: &mut Command, executable: &Path) {
+        // pi-acp runs `pi` from PATH. A pi installed outside PATH (pi.dev's
+        // installer can use ~/.pi/agent/bin) is found by `cli_path`, so hand
+        // its directory to the adapter too.
+        if self.spec.id == HarnessId::Pi
+            && let Some(dir) = self
+                .cli_path()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            let current = cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == "PATH")
+                .and_then(|(_, v)| v.map(|v| v.to_os_string()))
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
+            if !paths.contains(&dir) {
+                paths.insert(0, dir);
+                if let Ok(joined) = std::env::join_paths(paths) {
+                    cmd.env("PATH", joined);
+                }
+            }
+        }
         if self.spec.id == HarnessId::Antigravity
             && let Some(parent) = executable.parent()
         {
@@ -4183,6 +4228,23 @@ async fn run_session(session: Session) {
     }
 
     child.shutdown(kill_grace).await;
+}
+
+#[cfg(test)]
+mod pi_path_tests {
+    use super::pi_install_paths_in;
+    use std::path::PathBuf;
+
+    #[test]
+    fn pi_is_looked_for_where_its_installer_puts_it() {
+        let home = PathBuf::from("/home/u");
+        let default = pi_install_paths_in(None, Some(home.clone()));
+        assert_eq!(default[0], home.join(".pi/agent/bin/pi"));
+        let custom = pi_install_paths_in(Some(PathBuf::from("/opt/pi-agent")), Some(home.clone()));
+        assert_eq!(custom[0], PathBuf::from("/opt/pi-agent/bin/pi"));
+        let empty = pi_install_paths_in(Some(PathBuf::new()), Some(home.clone()));
+        assert_eq!(empty[0], home.join(".pi/agent/bin/pi"));
+    }
 }
 
 #[cfg(test)]

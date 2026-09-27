@@ -181,7 +181,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Codex => ("codex", "~/.local/bin or the npm global bin"),
         Cursor => ("cursor-agent", "~/.local/bin or ~/.cursor/bin"),
         Opencode => ("opencode", "~/.opencode/bin or the npm global bin"),
-        Pi => ("pi", "the npm global bin"),
+        Pi => ("pi", "~/.pi/agent/bin or the npm global bin"),
         Grok => ("grok", "~/.grok/bin or the npm global bin"),
         Hermes => ("hermes", "~/.local/bin or ~/.hermes/bin"),
         Devin => ("devin", "~/.local/bin"),
