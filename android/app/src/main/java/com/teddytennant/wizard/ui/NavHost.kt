@@ -42,6 +42,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.teddytennant.wizard.AppGraph
 import com.teddytennant.wizard.data.Settings
+import com.teddytennant.wizard.notify.TurnService
 import com.teddytennant.wizard.session.ChatState
 import com.teddytennant.wizard.session.Reach
 import com.teddytennant.wizard.ssh.StoredKey
@@ -72,7 +73,11 @@ fun WizardNavHost(graph: AppGraph, pendingChat: ChatRoute?, onChatOpened: () -> 
     val nav = rememberNavController()
     LaunchedEffect(pendingChat) {
         if (pendingChat != null) {
-            nav.navigate(pendingChat) { launchSingleTop = true }
+            // Replace any open chat so back goes to the machine, not to a second copy of this chat.
+            nav.navigate(pendingChat) {
+                popUpTo<ChatRoute> { inclusive = true }
+                launchSingleTop = true
+            }
             onChatOpened()
         }
     }
@@ -273,7 +278,11 @@ private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: Chat
     val machineName by vm.machineName.collectAsStateWithLifecycle()
     var options by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val context = LocalContext.current
+    val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        // The ongoing notification was posted before this answer; post it again so it shows.
+        if (granted && graph.hub.running.value.isNotEmpty()) TurnService.start(context)
+    }
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val sessionId = state?.sessionId
