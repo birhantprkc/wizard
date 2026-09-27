@@ -46,7 +46,8 @@ object Transcript {
                 else -> if (update.text.isEmpty()) items else items + TranscriptItem.Thinking(nextKey(items, "t"), update.text)
             }
             is SessionUpdate.ToolCallStarted -> {
-                val index = items.indexOfLast { it is TranscriptItem.Tool && it.callId == update.id }
+                // Ids only need to be unique within a turn, so an earlier turn's card is never reused.
+                val index = indexInTurn(items, update.id)
                 val tool = TranscriptItem.Tool(
                     key = if (index >= 0) items[index].key else nextKey(items, "c"),
                     callId = update.id,
@@ -59,7 +60,7 @@ object Transcript {
                 if (index >= 0) items.toMutableList().also { it[index] = tool } else items + tool
             }
             is SessionUpdate.ToolCallUpdated -> {
-                val index = items.indexOfLast { it is TranscriptItem.Tool && it.callId == update.id }
+                val index = indexInTurn(items, update.id)
                 if (index < 0) return items
                 val tool = items[index] as TranscriptItem.Tool
                 items.toMutableList().also {
@@ -80,6 +81,12 @@ object Transcript {
             }
             is SessionUpdate.ConfigOptionsChanged, is SessionUpdate.Other -> items
         }
+    }
+
+    private fun indexInTurn(items: List<TranscriptItem>, callId: String): Int {
+        val turnStart = items.indexOfLast { it is TranscriptItem.User }
+        val index = items.indexOfLast { it is TranscriptItem.Tool && it.callId == callId }
+        return if (index > turnStart) index else -1
     }
 
     fun userMessage(items: List<TranscriptItem>, text: String): List<TranscriptItem> =

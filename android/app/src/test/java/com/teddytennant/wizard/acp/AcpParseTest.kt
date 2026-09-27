@@ -91,6 +91,18 @@ class AcpParseTest {
     }
 
     @Test
+    fun aToolIdReusedInALaterTurnGetsItsOwnCard() {
+        val start = SessionUpdate.ToolCallStarted("t1", "execute: ls", "execute", ToolStatus.Running, null, emptyList())
+        var items = Transcript.apply(Transcript.userMessage(emptyList(), "one"), start)
+        items = Transcript.apply(items, SessionUpdate.ToolCallUpdated("t1", null, ToolStatus.Completed, null))
+        items = Transcript.apply(Transcript.userMessage(items, "two"), start)
+        items = Transcript.settle(items)
+        val tools = items.filterIsInstance<TranscriptItem.Tool>()
+        assertEquals(listOf(ToolStatus.Completed, ToolStatus.Failed), tools.map { it.status })
+        assertEquals(2, tools.map { it.key }.distinct().size)
+    }
+
+    @Test
     fun settleFailsToolsLeftRunning() {
         val items = Transcript.apply(emptyList(), SessionUpdate.ToolCallStarted("t", "execute: sleep 99", "execute", ToolStatus.Running, null, emptyList()))
         assertEquals(ToolStatus.Failed, (Transcript.settle(items).single() as TranscriptItem.Tool).status)
