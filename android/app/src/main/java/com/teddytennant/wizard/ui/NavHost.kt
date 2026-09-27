@@ -412,7 +412,9 @@ private fun AboutRouteScreen(graph: AppGraph, nav: NavHostController) {
     AboutContent(
         version = graph.version,
         onLicense = { entry ->
-            val text = runCatching { context.assets.open(entry.asset!!).bufferedReader().use { it.readText() } }.getOrDefault("")
+            val raw = runCatching { context.assets.open(entry.asset!!).bufferedReader().use { it.readText() } }.getOrDefault("")
+            // License files are hard-wrapped at 80 columns; let paragraphs flow to the screen instead.
+            val text = raw.replace("\r\n", "\n").split(Regex("\n\\s*\n")).joinToString("\n\n") { it.trim().replace(Regex("\\s*\n\\s*"), " ") }
             open = entry to text
         },
         onBack = { nav.popBackStack() },
