@@ -1550,6 +1550,9 @@ pub struct Shell {
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
+    /// What Wizard's `computer` tool sees: a floating card over the window
+    /// that opens into a lightbox with take-control.
+    live_screen: Entity<crate::live_screen::LiveScreen>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
     browser_context: crate::browser::BrowserContext,
@@ -1996,6 +1999,7 @@ impl Shell {
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
             browsers: std::collections::HashMap::new(),
+            live_screen: cx.new(crate::live_screen::LiveScreen::new),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
@@ -8239,6 +8243,7 @@ impl Shell {
         }
         overlays.extend(self.render_which_key(window, cx));
         overlays.extend(self.render_nav_status(window, cx));
+        overlays.push(self.live_screen.clone().into_any_element());
 
         overlays
     }
