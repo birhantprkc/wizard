@@ -3,7 +3,9 @@ package com.teddytennant.wizard.claude
 import com.teddytennant.wizard.acp.PermissionAnswer
 import com.teddytennant.wizard.acp.PermissionRequest
 import com.teddytennant.wizard.acp.SessionNotification
+import com.teddytennant.wizard.acp.SessionUpdate
 import com.teddytennant.wizard.acp.ToolStatus
+import com.teddytennant.wizard.session.Activity
 import com.teddytennant.wizard.session.Transcript
 import com.teddytennant.wizard.session.TranscriptItem
 import com.teddytennant.wizard.testing.LocalExec
@@ -17,6 +19,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 /**
  * Drives [ClaudeBackend] through the real launch script against Wizard GUI's
@@ -27,6 +31,7 @@ class ClaudeBackendTest {
     @get:Rule val tmp = TemporaryFolder()
     private val updates = mutableListOf<SessionNotification>()
     private val questions = mutableListOf<PermissionRequest>()
+    private val activity = LinkedBlockingQueue<Activity>()
 
     @Before
     fun installFake() {
@@ -44,6 +49,7 @@ class ClaudeBackendTest {
             questions += request
             PermissionAnswer(request.options.last().optionId)
         },
+        onActivity = { activity += it },
     )
 
     private fun items() = synchronized(updates) { updates.map { it.update } }
@@ -63,6 +69,18 @@ class ClaudeBackendTest {
         assertEquals(listOf("Bash: ls -la", "mcp__linear__search"), tools.map { it.title })
         assertEquals(listOf(ToolStatus.Completed, ToolStatus.Failed), tools.map { it.status })
         assertTrue("subagent text leaked", items.none { it is TranscriptItem.Agent && it.text.contains("SUBAGENT") })
+    }
+
+    @Test
+    fun theWakeTurnAfterABackgroundAgentIsForwarded() = runBlocking {
+        val backend = backend()
+        val session = backend.newSession(tmp.root.path)
+        assertEquals("end_turn", withTimeout(30_000) { backend.prompt(session.sessionId, tmp.root.path, "scenario:wake") })
+        val id = session.sessionId
+        val seen = listOf(Activity.WakeStarted(id), Activity.WakeEnded(id, null), Activity.Idle(id)).map { activity.poll(10, TimeUnit.SECONDS) }
+        assertEquals(listOf(Activity.WakeStarted(id), Activity.WakeEnded(id, null), Activity.Idle(id)), seen)
+        val replies = synchronized(updates) { updates.mapNotNull { (it.update as? SessionUpdate.AgentText)?.text } }
+        assertEquals(listOf("LAUNCHED", "subagent finished"), replies)
     }
 
     @Test
@@ -93,6 +111,7 @@ class ClaudeBackendTest {
         val state = ClaudeBackend.Session(tmp.root.path, started = false, effort = "high")
         val first = backend.flags(session.sessionId, state)
         assertTrue(first.containsAll(listOf("--session-id", session.sessionId, "--effort", "high", "--permission-prompt-tool", "stdio")))
+        assertTrue(first.containsAll(listOf("--permission-mode", "bypassPermissions", "--dangerously-skip-permissions")))
         state.started = true
         assertTrue("--resume=${session.sessionId}" in backend.flags(session.sessionId, state))
     }

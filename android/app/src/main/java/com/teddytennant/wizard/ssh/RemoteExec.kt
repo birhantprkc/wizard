@@ -10,6 +10,8 @@ interface RemoteProcess : AcpTransport {
 
 /** Runs commands on a machine. [SshLink] over SSH; a local shell in tests. */
 interface RemoteExec {
+    /** False once the link to the machine is gone. */
+    val isConnected: Boolean get() = true
     fun run(command: String, timeoutSeconds: Long = 30): ExecResult
     fun start(command: String): RemoteProcess
 }

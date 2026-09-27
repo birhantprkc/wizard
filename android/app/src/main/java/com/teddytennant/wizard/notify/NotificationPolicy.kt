@@ -15,6 +15,10 @@ data class RunningTurn(
     val title: String?,
     val cwd: String,
     val agent: com.teddytennant.wizard.agent.Agent = com.teddytennant.wizard.agent.Agent.Wizard,
+    /** Background tasks the session is running. */
+    val tasks: Int = 0,
+    /** The turn itself ended and only its background tasks are left. */
+    val waiting: Boolean = false,
 )
 
 /** When to notify and what to say. No Android types, so it's tested on the JVM. */
@@ -64,16 +68,23 @@ object NotificationPolicy {
         turns.isEmpty() -> NotificationText("Wizard", "Connecting")
         turns.size == 1 -> {
             val t = turns.single()
-            NotificationText("Working on ${t.machineName}", t.title?.let(::clip) ?: projectName(t.cwd))
+            val what = t.title?.let(::clip) ?: projectName(t.cwd)
+            when {
+                !t.waiting -> NotificationText("Working on ${t.machineName}", what)
+                t.tasks == 0 -> NotificationText("Finishing up on ${t.machineName}", what)
+                else -> NotificationText("Background tasks on ${t.machineName}", "${tasks(t.tasks)} running: $what")
+            }
         }
         else -> {
             val machines = turns.map { it.machineName }.distinct()
             NotificationText(
-                "Working in ${turns.size} sessions",
+                if (turns.all { it.waiting }) "Background tasks in ${turns.size} sessions" else "Working in ${turns.size} sessions",
                 if (machines.size == 1) "On ${machines.single()}" else machines.joinToString(", "),
             )
         }
     }
+
+    fun tasks(n: Int) = if (n == 1) "1 task" else "$n tasks"
 
     fun projectName(cwd: String): String = cwd.trimEnd('/').substringAfterLast('/').ifEmpty { cwd }
 

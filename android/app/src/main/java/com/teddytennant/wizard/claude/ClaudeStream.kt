@@ -25,6 +25,17 @@ sealed interface ClaudeEvent {
     data class Result(val subtype: String, val isError: Boolean, val error: String?, val sessionId: String?) : ClaudeEvent
     /** `can_use_tool`: every request needs an answer or the CLI waits forever. */
     data class ToolPermission(val requestId: String, val toolName: String, val input: JsonObject) : ClaudeEvent
+    /**
+     * `system/init`: the CLI started a model turn. It sends one for every
+     * turn, including the wake turn it runs on its own when a background task
+     * finishes.
+     */
+    data object TurnStarted : ClaudeEvent
+    /**
+     * Background tasks changed. [all] is the whole set when the CLI lists it
+     * (`background_tasks_changed`); otherwise one task [started] or [ended].
+     */
+    data class Tasks(val all: Set<String>? = null, val started: String? = null, val ended: String? = null) : ClaudeEvent
 }
 
 /**
@@ -61,6 +72,7 @@ class ClaudeNormalizer(private val live: Boolean) {
                     sessionId = obj.str("session_id"),
                 ),
             )
+            "system" -> system(obj)
             "control_request" -> {
                 val request = obj["request"] as? JsonObject
                 if (request?.str("subtype") == "can_use_tool") {
@@ -72,6 +84,28 @@ class ClaudeNormalizer(private val live: Boolean) {
             else -> emptyList()
         }
     }
+
+    private fun system(obj: JsonObject): List<ClaudeEvent> = when (obj.str("subtype")) {
+        "init" -> {
+            // A wake turn's reply is its own message, not more of the last one.
+            lastWasText = false
+            listOf(ClaudeEvent.TurnStarted)
+        }
+        "background_tasks_changed" -> listOf(
+            ClaudeEvent.Tasks(all = (obj["tasks"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonObject)?.str("task_id") }.toSet()),
+        )
+        "task_started" -> listOfNotNull(obj.str("task_id")?.let { ClaudeEvent.Tasks(started = it) })
+        "task_notification" -> listOfNotNull(obj.str("task_id")?.takeIf { finished(obj.str("status")) }?.let { ClaudeEvent.Tasks(ended = it) })
+        "task_updated" -> listOfNotNull(
+            obj.str("task_id")?.takeIf { finished((obj["patch"] as? JsonObject)?.str("status")) }?.let { ClaudeEvent.Tasks(ended = it) },
+        )
+        else -> emptyList()
+    }
+
+    private fun finished(status: String?) = status in setOf(
+        "completed", "complete", "succeeded", "success", "failed", "errored", "error",
+        "killed", "cancelled", "canceled", "stopped", "interrupted",
+    )
 
     private fun streamEvent(event: JsonObject?): List<ClaudeEvent> {
         event ?: return emptyList()

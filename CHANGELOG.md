@@ -6,6 +6,18 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Code on Android broke its own background agents.** The app closed
+  the `claude -p` process at the end of each turn, but a turn that starts
+  background subagents leaves that process running, and every tool call they
+  made then failed with `AbortError: Stream closed`; the "finished"
+  notification also came while they were still working. The app now keeps one
+  process per open chat, runs tools with `bypassPermissions` as the desktop
+  does, shows the turn Claude Code runs when a background task finishes, and
+  holds the connection until nothing is left running. A dropped connection
+  says so in the chat, and the next message resumes the session.
+
 ## [3.6.0] - 2026-09-27
 
 ### Added

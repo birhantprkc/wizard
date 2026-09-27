@@ -33,7 +33,7 @@ data class ExecResult(val exitStatus: Int?, val stdout: String, val stderr: Stri
 
 /** One authenticated SSH connection (sshj). */
 class SshLink private constructor(private val client: SSHClient) : RemoteExec, AutoCloseable {
-    val isConnected: Boolean get() = client.isConnected && client.isAuthenticated
+    override val isConnected: Boolean get() = client.isConnected && client.isAuthenticated
 
     override fun run(command: String, timeoutSeconds: Long): ExecResult {
         client.startSession().use { session ->

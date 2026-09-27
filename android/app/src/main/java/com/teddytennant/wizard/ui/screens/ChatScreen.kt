@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import com.teddytennant.wizard.R
 import com.teddytennant.wizard.acp.PermissionRequest
 import com.teddytennant.wizard.agent.Agent
+import com.teddytennant.wizard.notify.NotificationPolicy
 import com.teddytennant.wizard.acp.ToolContent
 import com.teddytennant.wizard.acp.ToolStatus
 import com.teddytennant.wizard.session.ChatState
@@ -115,6 +116,15 @@ fun ChatContent(
         state?.permission?.let { PermissionCard(agent, it.request, onPermission) }
         if (state?.error != null && items.isNotEmpty()) {
             Text(state.error, style = WizardTheme.type.small, color = colors.danger, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
+        }
+        val background = state?.background ?: 0
+        if (background > 0 && !running) {
+            Text(
+                "${NotificationPolicy.tasks(background)} running in the background",
+                style = WizardTheme.type.small,
+                color = colors.faint,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            )
         }
         Composer(
             draft = draft,

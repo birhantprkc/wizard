@@ -137,4 +137,18 @@ class RemoteScriptsTest {
         assertTrue(log.contains("second line"))
         assertEquals(3, run(RemoteScripts.claudeTranscript("missing")).first)
     }
+
+    @Test
+    fun claudeAsRootAsksInsteadOfBypassing() {
+        val bin = File(tmp.root, ".local/bin").apply { mkdirs() }
+        File(bin, "claude").apply { writeText("#!/bin/sh\nprintf '%s\\n' \"\$@\"\n"); setExecutable(true) }
+        val id = File(bin, "id").apply { writeText("#!/bin/sh\necho 1000\n"); setExecutable(true) }
+        val flags = listOf("-p", "--permission-prompt-tool", "stdio", "--permission-mode", "bypassPermissions", "--dangerously-skip-permissions", "--resume=x y")
+        assertEquals(flags, run(RemoteScripts.claude(tmp.root.path, flags)).second.lines().dropLast(1))
+        id.writeText("#!/bin/sh\necho 0\n")
+        assertEquals(
+            listOf("-p", "--permission-prompt-tool", "stdio", "--permission-mode", "default", "--resume=x y"),
+            run(RemoteScripts.claude(tmp.root.path, flags)).second.lines().dropLast(1),
+        )
+    }
 }

@@ -31,12 +31,40 @@ interface AgentBackend {
     suspend fun setOption(sessionId: String, configId: String, value: String): List<ConfigOption>
     /** Runs one turn and returns ACP's stop reason. */
     suspend fun prompt(sessionId: String, cwd: String, text: String): String
+    /** Background tasks the session's last turn left running, which will report back through an [ActivitySink]. */
+    fun backgroundTasks(sessionId: String): Int = 0
     suspend fun cancel(sessionId: String)
     fun close()
 }
 
 typealias UpdateSink = suspend (SessionNotification) -> Unit
 typealias PermissionSink = suspend (PermissionRequest) -> PermissionAnswer
+typealias ActivitySink = suspend (Activity) -> Unit
+
+/**
+ * What a session does after [AgentBackend.prompt] returned: Claude Code
+ * keeps background tasks running and wakes up on its own when one finishes.
+ */
+sealed interface Activity {
+    val sessionId: String
+
+    /** [count] background tasks are running. */
+    data class Tasks(override val sessionId: String, val count: Int) : Activity
+
+    /** A turn nobody sent started, the wake turn after a background task. */
+    data class WakeStarted(override val sessionId: String) : Activity
+
+    data class WakeEnded(override val sessionId: String, val error: String?) : Activity
+
+    /** Background work or a wake turn happened, and now nothing is left running. Sent once each time. */
+    data class Idle(override val sessionId: String) : Activity
+
+    /**
+     * The agent exited with work outstanding. [lost] means the connection
+     * went; otherwise [detail] is what it said, null when it was asked to stop.
+     */
+    data class Stopped(override val sessionId: String, val lost: Boolean, val detail: String?) : Activity
+}
 
 /** Wizard (`wizard acp`) and Pi (`pi-acp`): one ACP process serves every session. */
 class AcpBackend private constructor(override val agent: Agent, private val client: AcpClient) : AgentBackend {

@@ -54,12 +54,26 @@ object RemoteScripts {
     }
 
     /**
-     * One Claude Code turn, the way Wizard GUI runs it: stream-json both ways,
-     * partial messages for streaming, permissions on the stdio control channel.
-     * `$1` is the working directory, the rest are flags.
+     * Claude Code for one session, the way Wizard GUI runs it: stream-json
+     * both ways, partial messages for streaming, questions on the stdio
+     * control channel. `$1` is the working directory, the rest are flags.
      */
     fun claude(cwd: String, flags: List<String>): String =
-        sh("$PATH_SETUP\ncd \"\$1\" || exit 3\nshift\nexec claude \"\$@\"", cwd, *flags.toTypedArray())
+        sh("$PATH_SETUP\ncd \"\$1\" || exit 3\nshift\n$CLAUDE_AS_ROOT\nexec claude \"\$@\"", cwd, *flags.toTypedArray())
+
+    /** The CLI won't bypass permissions as root outside a sandbox, so there it asks over stdio instead, and the app allows. */
+    private val CLAUDE_AS_ROOT = """
+        if [ "${'$'}(id -u)" = 0 ] && [ "${'$'}{IS_SANDBOX:-}" != 1 ]; then
+          for a do
+            shift
+            case "${'$'}a" in
+              --dangerously-skip-permissions) ;;
+              bypassPermissions) set -- "${'$'}@" default ;;
+              *) set -- "${'$'}@" "${'$'}a" ;;
+            esac
+          done
+        fi
+    """.trimIndent()
 
     val probe: String = sh(
         """

@@ -71,4 +71,16 @@ class NotificationPolicyTest {
         assertEquals(NotificationText("Working in 2 sessions", "On buildbox"), NotificationPolicy.ongoing(listOf(a, b)))
         assertEquals("buildbox, pi", NotificationPolicy.ongoing(listOf(a, b, c)).body)
     }
+
+    @Test
+    fun ongoingSaysWhenOnlyBackgroundTasksAreLeft() {
+        val held = RunningTurn("m1", "buildbox", "s1", "Fix the build", "/home/t/wizard", tasks = 2, waiting = true)
+        assertEquals(NotificationText("Background tasks on buildbox", "2 tasks running: Fix the build"), NotificationPolicy.ongoing(listOf(held)))
+        assertEquals("1 task running: Fix the build", NotificationPolicy.ongoing(listOf(held.copy(tasks = 1))).body)
+        assertEquals("Finishing up on buildbox", NotificationPolicy.ongoing(listOf(held.copy(tasks = 0))).title)
+        // A wake turn is work like any other.
+        assertEquals("Working on buildbox", NotificationPolicy.ongoing(listOf(held.copy(waiting = false))).title)
+        val other = RunningTurn("m1", "buildbox", "s2", null, "/home/t/reverie", tasks = 1, waiting = true)
+        assertEquals("Background tasks in 2 sessions", NotificationPolicy.ongoing(listOf(held, other)).title)
+    }
 }

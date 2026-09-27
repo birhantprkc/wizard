@@ -62,16 +62,17 @@ Settings has the theme, compact mode (a turn's tool calls and thinking fold into
 
 ## How it behaves
 
-- Per machine: one SSH connection, one ACP process each for Wizard and Pi serving all their chats, and one `claude -p` per Claude Code turn (`--session-id` on the first, `--resume` after). Claude Code's tool permissions are allowed without asking, as on the desktop; its questions come to you.
+- Per machine: one SSH connection, one ACP process each for Wizard and Pi serving all their chats, and one `claude -p` per open Claude Code chat (`--session-id` for a new one, `--resume` when it restarts). It stays up between turns and closes after ten quiet minutes. Claude Code runs with `bypassPermissions`, as on the desktop, except as root, where the CLI refuses it and the app allows each tool instead; its questions come to you.
 - Connections close a minute after the app goes to the background with nothing running.
 - While a turn runs, a foreground service keeps the connection open with the screen off. Its notification names the machine and has a Stop button. When the turn ends and the app isn't open, you get "<agent> finished on <machine>" with the first line of the reply; tapping it opens the chat.
+- A Claude Code turn that starts background tasks keeps the service and the connection until they are done. The turn Claude Code runs when one finishes shows up in the chat, and "finished" comes once, when nothing is left running. Stop ends the tasks too.
 - Private keys and passwords are sealed with a key that stays in the Android Keystore. App data is excluded from backups.
 
 ## What it doesn't do
 
 - Prompts are text only.
 - A session that is running in a terminal on the machine can be reopened here from its saved history, but not joined live.
-- If the connection drops mid-turn (the phone loses signal), the app marks the turn as lost. The agent on the machine sees its stdin close, and the session keeps whatever it had saved.
+- If the connection drops mid-turn (the phone loses signal), the app marks the turn as lost. The agent on the machine sees its stdin close, and the session keeps whatever it had saved. The next message reconnects and resumes it.
 - Wizard never asks for permission over ACP, so "needs your input" only fires for Claude Code's questions and for an ACP agent that sends `session/request_permission`.
 
 The look follows Wizard GUI, the desktop app, which is a fork of [Zeron](https://github.com/zeronsh/zeron). Fonts are Geist and Geist Mono (OFL), icons are from the Solar set (CC BY 4.0), as in the desktop app.

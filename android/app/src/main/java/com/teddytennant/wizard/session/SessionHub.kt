@@ -92,6 +92,8 @@ data class ChatState(
     val error: String? = null,
     val permission: PendingPermission? = null,
     val acceptReplay: Boolean = false,
+    /** Background tasks still running after the turn ended. */
+    val background: Int = 0,
 )
 
 /** A saved session on a machine, for lists that mix agents. */
@@ -111,7 +113,12 @@ interface HubEnvironment {
 /**
  * Owns every SSH connection and agent process, and the state of every open
  * chat. Per machine: one SSH connection, one ACP process each for Wizard and
- * Pi serving all their chats, and a `claude -p` per Claude Code turn.
+ * Pi serving all their chats, and a `claude -p` per open Claude Code chat.
+ *
+ * A turn stays in [running] after it returns while it has background tasks,
+ * so the service and the connection stay up; the wake turns those tasks start
+ * run in the chat like any other, and "finished" is posted once, when the
+ * session has nothing left running.
  */
 class SessionHub(
     private val machines: MachineStore,
@@ -204,7 +211,7 @@ class SessionHub(
             val onPermission: PermissionSink = { onPermission(machine, agent, it) }
             val backend = when (agent) {
                 Agent.Wizard, Agent.Pi -> AcpBackend.start(agent, live.link, scope, clientVersion, onUpdate, onPermission)
-                Agent.ClaudeCode -> ClaudeBackend(live.link, onUpdate, onPermission)
+                Agent.ClaudeCode -> ClaudeBackend(live.link, onUpdate, onPermission, { onActivity(machine, agent, it) }, scope)
             }
             live.backends[agent] = backend
             backend
@@ -393,20 +400,22 @@ class SessionHub(
         scope.launch {
             val machine = machines.get(machineId)
             val turn = RunningTurn(machineId, machine?.name ?: "your machine", sessionId, flow.value.title, flow.value.cwd, agent)
-            _running.update { it + turn }
+            _running.update { list -> list.filterNot { it.machineId == machineId && it.sessionId == sessionId } + turn }
             remember(flow.value)
             env.startTurnService()
             var stopReason: String? = null
             var error: String? = null
+            var backend: AgentBackend? = null
             try {
-                val backend = ensureLoaded(flow)
+                backend = ensureLoaded(flow)
                 stopReason = backend.prompt(sessionId, flow.value.cwd, text)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                error = describe(e)
+                error = if (e is ConnectionClosedException) lostMessage(turn.machineName) else describe(e)
                 if (e is ConnectionClosedException) lives[machineId]?.backends?.remove(agent)
             }
             val outcome = NotificationPolicy.outcome(stopReason, failed = error != null)
+            val tasks = if (outcome == TurnOutcome.Finished) backend?.backgroundTasks(sessionId) ?: 0 else 0
             flow.update { state ->
                 var items = state.items
                 if (outcome != TurnOutcome.Finished) items = Transcript.settle(items)
@@ -416,17 +425,83 @@ class SessionHub(
                     TurnOutcome.Failed -> items = Transcript.notice(items, error ?: "The turn failed", isError = true)
                     TurnOutcome.Finished -> Unit
                 }
-                state.copy(items = items, running = false, permission = null)
+                // A background task's question can still be waiting on the user.
+                state.copy(items = items, running = false, background = tasks, permission = state.permission.takeIf { tasks > 0 })
             }
-            _running.update { list -> list.filterNot { it.machineId == machineId && it.sessionId == sessionId } }
-            remember(flow.value)
-            if (NotificationPolicy.notifyTurnEnd(outcome, key in stoppedByUser, situation(key))) {
-                env.postTurnEnded(
-                    turn.copy(title = flow.value.title),
-                    NotificationPolicy.turnEnded(turn.machineName, outcome, Transcript.lastReplyFirstLine(flow.value.items), error, agent.displayName),
-                )
+            if (tasks > 0) {
+                // Background tasks keep the turn: it ends when the session is idle.
+                hold(machineId, sessionId) { it.copy(title = flow.value.title, tasks = tasks, waiting = true) }
+                remember(flow.value)
+                return@launch
             }
-            if (!env.appInForeground) scheduleIdleClose()
+            endTurn(key, flow, outcome, error)
+        }
+    }
+
+    /** Lets the turn go and says so, if nobody is looking. */
+    private suspend fun endTurn(key: String, flow: MutableStateFlow<ChatState>, outcome: TurnOutcome, error: String?) {
+        val state = flow.value
+        val turn = _running.value.firstOrNull { it.machineId == state.machineId && it.sessionId == state.sessionId }
+            ?: RunningTurn(state.machineId, machines.get(state.machineId)?.name ?: "your machine", state.sessionId, state.title, state.cwd, state.agent)
+        _running.update { list -> list.filterNot { it.machineId == state.machineId && it.sessionId == state.sessionId } }
+        remember(state)
+        if (NotificationPolicy.notifyTurnEnd(outcome, key in stoppedByUser, situation(key))) {
+            env.postTurnEnded(
+                turn.copy(title = state.title),
+                NotificationPolicy.turnEnded(turn.machineName, outcome, Transcript.lastReplyFirstLine(state.items), error, state.agent.displayName),
+            )
+        }
+        if (!env.appInForeground) scheduleIdleClose()
+    }
+
+    private fun hold(machineId: String, sessionId: String, change: (RunningTurn) -> RunningTurn) =
+        _running.update { list -> list.map { if (it.machineId == machineId && it.sessionId == sessionId) change(it) else it } }
+
+    private fun holding(machineId: String, sessionId: String) = _running.value.any { it.machineId == machineId && it.sessionId == sessionId }
+
+    /** Background tasks and the wake turns they start, after [AgentBackend.prompt] returned. */
+    private suspend fun onActivity(machine: Machine, agent: Agent, activity: Activity) {
+        val key = chatKey(machine.id, agent, activity.sessionId)
+        val flow = chats[key] ?: return
+        val id = activity.sessionId
+        when (activity) {
+            is Activity.Tasks -> {
+                flow.update { it.copy(background = activity.count) }
+                hold(machine.id, id) { it.copy(tasks = activity.count) }
+            }
+            is Activity.WakeStarted -> {
+                // The notice keeps the wake turn's reply apart from the last one.
+                flow.update { it.copy(items = Transcript.notice(it.items, "A background task finished"), running = true, error = null) }
+                if (holding(machine.id, id)) {
+                    hold(machine.id, id) { it.copy(waiting = false) }
+                } else {
+                    val state = flow.value
+                    _running.update { it + RunningTurn(machine.id, machine.name, id, state.title, state.cwd, agent, tasks = state.background) }
+                    // Android can refuse a foreground service started from the background.
+                    runCatching { env.startTurnService() }
+                }
+            }
+            is Activity.WakeEnded -> {
+                flow.update { state ->
+                    val items = activity.error?.let { Transcript.notice(Transcript.settle(state.items), it, isError = true) } ?: state.items
+                    state.copy(items = items, running = false)
+                }
+                hold(machine.id, id) { it.copy(waiting = true) }
+            }
+            is Activity.Idle -> {
+                if (!holding(machine.id, id) || flow.value.running) return
+                flow.update { it.copy(background = 0) }
+                endTurn(key, flow, TurnOutcome.Finished, null)
+            }
+            is Activity.Stopped -> {
+                if (!holding(machine.id, id)) return
+                val error = if (activity.lost) lostMessage(machine.name) else activity.detail
+                flow.update { state ->
+                    val items = Transcript.notice(Transcript.settle(state.items), error ?: "Stopped", isError = error != null)
+                    state.copy(items = items, running = false, background = 0)
+                }
+                endTurn(key, flow, if (error == null) TurnOutcome.Cancelled else TurnOutcome.Failed, error)
+            }
         }
     }
 
@@ -517,6 +592,8 @@ class SessionHub(
     }
 
     companion object {
+        fun lostMessage(machine: String) = "Lost the connection to $machine. Send again to reconnect and pick up where the session left off."
+
         fun titleFrom(text: String): String {
             val line = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
             return if (line.length <= 80) line else line.take(79).trimEnd() + "…"
