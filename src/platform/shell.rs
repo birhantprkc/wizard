@@ -125,7 +125,68 @@ fn probe(mut probe: std::process::Command) -> bool {
 /// they are usually both "sh"-ish anyway; on Windows they are not related at
 /// all.
 pub fn name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| display_name(program()))
+}
+
+/// The program [`command`] spawns: `sh` from `PATH` unless something said
+/// otherwise; see [`resolve_program`].
+pub fn program() -> &'static str {
     invocation().0
+}
+
+/// Pin the shell to `program`: `[shell] program` in `config.toml`, which
+/// [`crate::config::Config::load`] passes here. The first call wins, and only
+/// if it comes before the first command runs, so one process never runs two
+/// shells or tells the model about one it is not using.
+pub fn set_program(program: &str) {
+    let _ = CONFIGURED.set(program.to_string());
+}
+
+static CONFIGURED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Which shell runs command lines, decided once.
+///
+/// `[shell] program` wins everywhere. Past that, desktop Unix keeps `sh` from
+/// `PATH` and deliberately ignores `$SHELL` (see [`name`]). Android is the
+/// exception on both counts: an app has no `/bin`, and the shell an app ships
+/// sits in its native library directory as `libbash.so`, a name no `PATH`
+/// lookup finds. The app says where it is through `$SHELL`, and
+/// `/system/bin/sh`, which every Android has, covers an app that does not.
+#[cfg(unix)]
+fn resolve_program() -> String {
+    if let Some(program) = CONFIGURED.get() {
+        return program.clone();
+    }
+    #[cfg(target_os = "android")]
+    {
+        if let Some(shell) = std::env::var_os("SHELL")
+            .map(std::path::PathBuf::from)
+            .filter(|shell| shell.is_absolute() && shell.is_file())
+        {
+            return shell.to_string_lossy().into_owned();
+        }
+        "/system/bin/sh".to_string()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        "sh".to_string()
+    }
+}
+
+/// What a shell calls itself: the file name, with the `lib…so` wrapping an
+/// Android APK forces on bundled executables taken off (`libbash.so` is
+/// `bash`).
+fn display_name(program: &str) -> String {
+    let file = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    file.strip_prefix("lib")
+        .and_then(|rest| rest.strip_suffix(".so"))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(file)
+        .to_string()
 }
 
 /// A shebang line that runs a script under the platform shell.
@@ -141,7 +202,7 @@ pub fn name() -> &'static str {
 pub fn shebang() -> String {
     // `command -v` is POSIX and built into every candidate shell, so this
     // resolves the same `sh` that `command()` would spawn rather than a guess.
-    let resolved = command(&format!("command -v {}", name()))
+    let resolved = command(&format!("command -v {}", program()))
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -160,10 +221,12 @@ pub fn shebang() -> String {
 /// One function so [`command`], [`tokio_command`] and [`name`] cannot disagree
 /// about what the active shell is. `sh` unqualified rather than `/bin/sh`:
 /// Termux has no `/bin`, and its `sh` lives at `$PREFIX/bin/sh` on `PATH`.
+/// [`resolve_program`] says what can replace it.
 fn invocation() -> (&'static str, &'static str) {
     #[cfg(unix)]
     {
-        ("sh", "-c")
+        static PROGRAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        (PROGRAM.get_or_init(resolve_program).as_str(), "-c")
     }
     // The Windows arm is a choice, not a translation: `cmd /C` is present on
     // every machine but is a poor language, while PowerShell (`-NoProfile
@@ -195,8 +258,8 @@ mod tests {
         // The whole point of the shell surface: pipes, quotes and redirection
         // survive because the line is passed as a single argument, not split.
         let line = "echo 'a b' | wc -l > /dev/null";
-        let (program, args) = parts(&command(line));
-        assert_eq!(program, name());
+        let (spawned, args) = parts(&command(line));
+        assert_eq!(spawned, program());
         assert_eq!(args.len(), 2, "expected <flag> <line>, got {args:?}");
         assert_eq!(args[1], line);
     }
@@ -264,9 +327,10 @@ mod tests {
         let reported = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert_eq!(
             reported,
-            name(),
-            "the shell that ran the command line is not the one name() reports"
+            program(),
+            "the shell that ran the command line is not the one program() reports"
         );
+        assert_eq!(display_name(&reported), name());
     }
 
     #[test]
@@ -291,5 +355,15 @@ mod tests {
             Some(name()),
             "the resolved shell is not the one name() reports"
         );
+    }
+
+    #[test]
+    fn a_bundled_shell_is_named_by_what_it_is() {
+        assert_eq!(display_name("sh"), "sh");
+        assert_eq!(display_name("/usr/bin/zsh"), "zsh");
+        assert_eq!(display_name("/data/app/x/lib/arm64/libbash.so"), "bash");
+        assert_eq!(display_name("/system/bin/sh"), "sh");
+        assert_eq!(display_name("/opt/lib.so"), "lib.so");
+        assert_eq!(display_name("/usr/lib/libfoo"), "libfoo");
     }
 }

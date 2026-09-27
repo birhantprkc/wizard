@@ -281,7 +281,10 @@ fn full_file_round_trips() {
             search_api_key_env: Some("BRAVE_API_KEY".to_string()),
             search_model: Some("grok-4.6".to_string()),
         },
-        shell: ShellConfig { timeout_secs: 45 },
+        shell: ShellConfig {
+            timeout_secs: 45,
+            program: None,
+        },
         checkpoints: CheckpointConfig { keep_turns: 12 },
         fleet: FleetConfig {
             max_minutes: 45,
