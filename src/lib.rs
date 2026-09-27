@@ -182,8 +182,18 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         return server.run(*cmd).await;
     }
 
-    // Usage rollup: reads ~/.wizard/usage.jsonl only.
-    if let Some(cli::Command::Usage { since }) = &cli.command {
+    // Usage rollup: reads ~/.wizard/usage.jsonl only. `--subscriptions` asks
+    // the signed-in accounts instead; it reads their token files, never the
+    // config, which is what lets the desktop app run it beside a live session.
+    if let Some(cli::Command::Usage {
+        since,
+        subscriptions,
+        json,
+    }) = &cli.command
+    {
+        if *subscriptions {
+            return subscription_usage::run_cli(*json).await;
+        }
         return usage::run_cli(since.as_deref());
     }
 

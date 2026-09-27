@@ -45,8 +45,8 @@ the model reads before the turn ends. It is never silently dropped.
 Most reports read the session. `/usage` asks the accounts instead: one block per signed-in
 subscription (xAI, ChatGPT), whichever provider is active, plus the session's token rollup
 when the active provider is an API key. It runs the same on the TUI and over ACP, so Wizard
-GUI, Zed and the Android app get the same plain text
-([usage.md](usage.md#subscription-limits)).
+GUI, Zed and the Android app get the same plain text. `wizard usage --subscriptions --json`
+is the machine-readable form ([usage.md](usage.md#subscription-limits)).
 
 ## Custom slash commands
 

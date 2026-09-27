@@ -14,6 +14,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   of the last reply. Every signed-in subscription now gets its own block
   whichever provider is active; on an API-key provider the session's token
   rollup follows.
+- **`wizard usage --subscriptions [--json]`** prints the same limits outside a
+  session, as text or as JSON.
 
 ## [3.6.1] - 2026-09-27
 

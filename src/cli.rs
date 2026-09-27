@@ -338,10 +338,20 @@ pub enum Command {
 
     /// Roll up ~/.wizard/usage.jsonl: turns, tokens, and estimated cost per
     /// project and per provider. Self-contained; never loads config.
+    ///
+    /// With `--subscriptions`, show the plan limits of each signed-in
+    /// subscription instead (xAI, ChatGPT), the same as `/usage`.
     Usage {
         /// Only include turns from the last N days (e.g. `--since 7d`).
-        #[arg(long, value_name = "DAYS")]
+        #[arg(long, value_name = "DAYS", conflicts_with = "subscriptions")]
         since: Option<String>,
+        /// Ask each signed-in subscription for its plan limits.
+        #[arg(long)]
+        subscriptions: bool,
+        /// Print the subscription limits as JSON (`{"version": 1,
+        /// "subscriptions": [...]}`). Needs `--subscriptions`.
+        #[arg(long, requires = "subscriptions")]
+        json: bool,
     },
 
     /// Inspect and roll back self-extensions recorded in
@@ -1621,13 +1631,41 @@ mod tests {
     #[test]
     fn usage_parses_with_optional_since() {
         let cli = parse(&["usage"]).expect("usage parses");
-        assert!(matches!(cli.command, Some(Command::Usage { since: None })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Usage {
+                since: None,
+                subscriptions: false,
+                json: false
+            })
+        ));
 
         let cli = parse(&["usage", "--since", "7d"]).expect("usage --since parses");
-        let Some(Command::Usage { since }) = cli.command else {
+        let Some(Command::Usage { since, .. }) = cli.command else {
             panic!("expected usage");
         };
         assert_eq!(since.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn usage_json_is_for_the_subscriptions_only() {
+        let cli = parse(&["usage", "--subscriptions", "--json"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Usage {
+                since: None,
+                subscriptions: true,
+                json: true
+            })
+        ));
+        assert!(
+            parse(&["usage", "--json"]).is_err(),
+            "--json needs --subscriptions"
+        );
+        assert!(
+            parse(&["usage", "--subscriptions", "--since", "7d"]).is_err(),
+            "the ledger window means nothing to a plan limit"
+        );
     }
 
     #[test]

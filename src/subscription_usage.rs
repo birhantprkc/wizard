@@ -1,4 +1,5 @@
-//! What each signed-in subscription has used: `/usage`.
+//! What each signed-in subscription has used: `/usage`, and
+//! `wizard usage --subscriptions [--json]` for the desktop app.
 //!
 //! A subscription here is an account sign-in (`/login xai`,
 //! `wizard --login chatgpt`), not an API key. Each one reports its own plan
@@ -15,8 +16,9 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The machine-readable form of the same report. `version` moves when a
-/// field changes meaning; new optional fields do not move it.
+/// The machine-readable form `wizard usage --subscriptions --json` prints.
+/// `version` moves when a field changes meaning; new optional fields do not
+/// move it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
@@ -123,6 +125,18 @@ async fn chatgpt() -> Option<Subscription> {
 #[cfg(not(feature = "provider-chatgpt"))]
 async fn chatgpt() -> Option<Subscription> {
     None
+}
+
+/// `wizard usage --subscriptions [--json]`. Exits 0 whatever the accounts
+/// said: a failed read is a note in the output, not a failed command.
+pub async fn run_cli(json: bool) -> anyhow::Result<i32> {
+    let subscriptions = collect().await;
+    if json {
+        println!("{}", serde_json::to_string(&Report::new(subscriptions))?);
+    } else {
+        println!("{}", render(&subscriptions, None));
+    }
+    Ok(0)
 }
 
 /// Which subscription the active provider is, if it is one.

@@ -536,7 +536,8 @@ on its final stream chunk.
 
 ### Subscription limits
 
-`/usage` asks each signed-in account for its plan limits. They read the sign-in files, never the ledger above.
+`/usage` and `wizard usage --subscriptions` ask each signed-in account for its
+plan limits. They read the sign-in files, never the ledger above.
 
 ```
 xAI (SuperGrok Heavy, active)
@@ -558,6 +559,16 @@ ChatGPT (Plus)
   running one out. A token about to expire skips the call.
 - A subscription that is signed in but has no reading says so rather than
   showing 0%: `no request yet this session; limits show after the first reply`.
+
+`wizard usage --subscriptions --json` prints the same thing for programs:
+
+```json
+{"version":1,"subscriptions":[{"id":"xai","name":"xAI","plan":"SuperGrok Heavy","windows":[{"label":"weekly","usedPercent":20.0,"windowMinutes":10080,"resetsAt":"2026-10-01T21:06:39Z"}],"products":[{"label":"build","usedPercent":12.0}],"source":"account"}]}
+```
+
+`windows` is always present, short window first; `plan`, `products`, `source`
+(`account` or `lastReply`) and `note` are left out when there is nothing to
+say. Tokens and account ids never appear.
 
 `/cost` inside a session is a different, simpler path: it multiplies the
 session's prompt and completion totals by the `usd_per_mtok_in` /
