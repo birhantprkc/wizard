@@ -31,7 +31,7 @@ import kotlin.random.Random
 private const val FADE_NANOS = 280_000_000f
 
 /** Dead cells stay faintly visible, so the indicator reads as a board. */
-private const val GHOST = 0.10f
+private const val GHOST = 0.08f
 
 /**
  * A tiny Game of Life on a torus, the app's wait indicator. It runs about
@@ -43,7 +43,7 @@ private const val GHOST = 0.10f
 fun LifeIndicator(
     modifier: Modifier = Modifier,
     size: Dp = 16.dp,
-    cells: Int = 8,
+    cells: Int = 6,
     color: Color = WizardTheme.colors.muted,
     seed: LifeSeed = LifeSeed.Glider,
     /** Generations to run before the first frame, so a still render isn't just the seed. */

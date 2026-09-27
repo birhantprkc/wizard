@@ -33,8 +33,6 @@ import com.teddytennant.wizard.ui.components.IconAction
 import com.teddytennant.wizard.ui.components.Panel
 import com.teddytennant.wizard.ui.components.SectionLabel
 import com.teddytennant.wizard.ui.components.Spinner
-import com.teddytennant.wizard.ui.life.LifeIndicator
-import com.teddytennant.wizard.ui.life.LifeSeed
 import com.teddytennant.wizard.ui.components.StatusDot
 import com.teddytennant.wizard.ui.components.TextAction
 import com.teddytennant.wizard.ui.components.TopBar
@@ -153,12 +151,13 @@ private fun ConnectionBanner(status: MachineStatus, onRetry: () -> Unit) {
             StatusDot(dot)
             Text(words, style = WizardTheme.type.small, color = colors.muted, modifier = Modifier.padding(start = 9.dp))
         }
-        Reach.Checking, Reach.Unknown -> Column(
-            Modifier.fillMaxWidth().padding(vertical = 48.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+        Reach.Checking, Reach.Unknown -> Row(
+            Modifier.fillMaxWidth().padding(vertical = 24.dp),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            LifeIndicator(size = 56.dp, cells = 12, seed = LifeSeed.Lwss, warmup = 3, contentDescription = "Connecting")
-            Text("Connecting", style = WizardTheme.type.small, color = colors.muted, modifier = Modifier.padding(top = 16.dp))
+            Spinner()
+            Text("Connecting", style = WizardTheme.type.small, color = colors.muted, modifier = Modifier.padding(start = 10.dp))
         }
         else -> Panel {
             Row(verticalAlignment = Alignment.CenterVertically) {

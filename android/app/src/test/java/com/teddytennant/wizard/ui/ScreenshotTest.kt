@@ -164,17 +164,13 @@ class ScreenshotTest {
         Chat(Fixtures.chat.copy(items = com.teddytennant.wizard.session.Transcript.userMessage(emptyList(), "Why is the release build 40% slower than last week?"), title = "Why is the release build 40% slower than last week?"))
     }
 
-    @Test fun lifeSizes() = shot("life_indicator") {
-        Column(Modifier.padding(32.dp), verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp)) {
-            Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-                com.teddytennant.wizard.ui.life.LifeSeed.entries.forEach {
-                    com.teddytennant.wizard.ui.life.LifeIndicator(size = 44.dp, cells = 11, seed = it, warmup = 3)
+    @Test fun lifeSpinner() = shot("life_spinner") {
+        Column(Modifier.padding(32.dp), verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(20.dp)) {
+            listOf("Connecting", "Working", "Loading the transcript").forEachIndexed { i, label ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    com.teddytennant.wizard.ui.components.Spinner(size = if (i == 2) 20.dp else 14.dp, color = if (i == 1) WizardTheme.colors.accent else WizardTheme.colors.muted)
+                    Text(label, style = WizardTheme.type.small, color = WizardTheme.colors.muted, modifier = Modifier.padding(start = 10.dp))
                 }
-            }
-            Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-                com.teddytennant.wizard.ui.life.LifeIndicator(size = 14.dp)
-                com.teddytennant.wizard.ui.life.LifeIndicator(size = 22.dp, cells = 8, color = WizardTheme.colors.accent, warmup = 1)
-                com.teddytennant.wizard.ui.life.LifeIndicator(size = 56.dp, cells = 12, seed = com.teddytennant.wizard.ui.life.LifeSeed.Lwss, warmup = 3)
             }
         }
     }
