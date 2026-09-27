@@ -72,6 +72,7 @@ class WizardApp : Application() {
         Security.insertProviderAt(BouncyCastleProvider(), 1)
         graph = AppGraph(this)
         graph.notifier.createChannels()
+        com.teddytennant.wizard.ui.Artwork.prewarm(this)
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) = graph.hub.onForeground()
             override fun onStop(owner: LifecycleOwner) = graph.hub.onBackground()

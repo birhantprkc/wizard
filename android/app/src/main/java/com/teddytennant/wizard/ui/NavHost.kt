@@ -10,6 +10,7 @@ import android.provider.Settings as AndroidSettings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -75,6 +76,8 @@ import com.teddytennant.wizard.ui.screens.WizardSheet
 import com.teddytennant.wizard.ui.theme.WizardTheme
 import kotlinx.coroutines.launch
 
+private const val NAV_MS = 240
+
 @Composable
 fun WizardNavHost(graph: AppGraph, settings: Settings, startWithOnboarding: Boolean, pendingChat: ChatRoute?, onChatOpened: () -> Unit) {
     val nav = rememberNavController()
@@ -92,10 +95,12 @@ fun WizardNavHost(graph: AppGraph, settings: Settings, startWithOnboarding: Bool
         navController = nav,
         startDestination = if (startWithOnboarding) OnboardingRoute else HomeRoute,
         modifier = Modifier.fillMaxSize().background(WizardTheme.colors.background),
-        enterTransition = { slideInHorizontally { it / 6 } + fadeIn() },
-        exitTransition = { fadeOut() },
-        popEnterTransition = { fadeIn() },
-        popExitTransition = { slideOutHorizontally { it / 6 } + fadeOut() },
+        // Short tweens rather than the default springs: with predictive back these
+        // track the finger, and on release they finish in a quarter second.
+        enterTransition = { slideInHorizontally(tween(NAV_MS)) { it / 8 } + fadeIn(tween(NAV_MS)) },
+        exitTransition = { fadeOut(tween(NAV_MS)) },
+        popEnterTransition = { fadeIn(tween(NAV_MS)) },
+        popExitTransition = { slideOutHorizontally(tween(NAV_MS)) { it / 8 } + fadeOut(tween(NAV_MS)) },
     ) {
         composable<OnboardingRoute> { OnboardingRouteScreen(graph, nav, settings) }
         composable<HomeRoute> { HomeRouteScreen(graph, nav) }
@@ -234,7 +239,7 @@ private fun MachineRouteScreen(graph: AppGraph, nav: NavHostController, machineI
     val install by vm.install.collectAsStateWithLifecycle()
     var showAll by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    LaunchedEffect(Unit) { vm.load() }
+    LaunchedEffect(vm) { vm.loadOnce() }
     val m = machine ?: return
     MachineContent(
         state = MachineScreenState(m, status, sessions, loading, error, showAll),
@@ -289,7 +294,13 @@ private fun HomeRouteScreen(graph: AppGraph, nav: NavHostController) {
     val machines by vm.machinesWithStatus.collectAsStateWithLifecycle()
     var sheet by remember { mutableStateOf<HomeSheet?>(null) }
     val scope = rememberCoroutineScope()
-    LaunchedEffect(Unit) { vm.refresh() }
+    // Coming back from another screen doesn't redo the SSH round trips; only a stale list does.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_START) vm.refreshIfStale() }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     val s = state ?: return
     HomeContent(
         state = s,

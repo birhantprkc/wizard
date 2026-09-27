@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,7 +38,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -49,6 +50,7 @@ import com.teddytennant.wizard.agent.Agent
 import com.teddytennant.wizard.data.Machine
 import com.teddytennant.wizard.data.RecentChat
 import com.teddytennant.wizard.session.MachineStatus
+import com.teddytennant.wizard.ui.Artwork
 import com.teddytennant.wizard.ui.Format
 import com.teddytennant.wizard.ui.components.AgentMark
 import com.teddytennant.wizard.ui.components.AgentTile
@@ -56,6 +58,7 @@ import com.teddytennant.wizard.ui.components.Chip
 import com.teddytennant.wizard.ui.components.Hairline
 import com.teddytennant.wizard.ui.components.IconAction
 import com.teddytennant.wizard.ui.components.Panel
+import com.teddytennant.wizard.ui.components.panelSegment
 import com.teddytennant.wizard.ui.components.SectionLabel
 import com.teddytennant.wizard.ui.components.Spinner
 import com.teddytennant.wizard.ui.components.StatusDot
@@ -130,12 +133,19 @@ fun HomeContent(
                     )
                 }
             } else {
-                item(key = "recent") {
-                    Panel(Modifier.padding(horizontal = 14.dp), padding = PaddingValues(0.dp)) {
-                        state.recents.forEachIndexed { i, row ->
-                            if (i > 0) Hairline(inset = 66.dp)
-                            RecentChatRow(row, now) { onRecent(row.chat) }
-                        }
+                // One lazy item per chat, so a long history composes only what is on screen.
+                val last = state.recents.lastIndex
+                itemsIndexed(state.recents, key = { _, row -> row.chat.key }) { i, row ->
+                    val top = if (i == 0) 16.dp else 0.dp
+                    val bottom = if (i == last) 16.dp else 0.dp
+                    Column(
+                        Modifier
+                            .padding(horizontal = 14.dp)
+                            .panelSegment(i == 0, i == last, colors.card, colors.border)
+                            .clip(RoundedCornerShape(top, top, bottom, bottom)),
+                    ) {
+                        if (i > 0) Hairline(inset = 66.dp)
+                        RecentChatRow(row, now) { onRecent(row.chat) }
                     }
                 }
             }
@@ -150,7 +160,7 @@ fun Starship(modifier: Modifier = Modifier) {
     val bg = WizardTheme.colors.background
     Box(modifier) {
         Image(
-            painterResource(R.drawable.wizard_starship),
+            Artwork.starship(LocalContext.current),
             contentDescription = null,
             contentScale = ContentScale.Crop,
             alignment = Alignment.TopCenter,

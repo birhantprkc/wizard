@@ -188,12 +188,25 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
         loadSessions()
     }
 
+    private var loaded = false
+
+    /** The first time the screen shows; coming back from a chat keeps what's there. */
+    fun loadOnce() {
+        if (loaded) return
+        loaded = true
+        load()
+    }
+
     private suspend fun loadSessions() {
         if (graph.hub.status(machineId).reach != Reach.Online) return
         sessionsLoading.value = true
         try {
             val found = graph.hub.sessions(machineId)
             sessions.value = found
+            graph.recents.upsert(found.map { s ->
+                RecentChat(machineId, s.agent.id, s.info.sessionId, s.info.cwd, s.info.title?.takeIf { it != "(no prompt)" },
+                    SessionHub.parseTime(s.info.updatedAt) ?: SessionHub.parseTime(s.info.sessionId) ?: 0)
+            })
             sessionsError.value = null
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -270,8 +283,13 @@ class HomeViewModel(private val graph: AppGraph) : ViewModel() {
         machines.map { it to (statuses[it.id] ?: MachineStatus()) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    private var refreshedAt = 0L
+    private var refreshedMachines = emptySet<String>()
+
     fun refresh() {
         if (refreshing.value) return
+        refreshedAt = System.currentTimeMillis()
+        viewModelScope.launch { refreshedMachines = graph.machines.machines.first().map { it.id }.toSet() }
         viewModelScope.launch {
             refreshing.value = true
             try {
@@ -279,6 +297,15 @@ class HomeViewModel(private val graph: AppGraph) : ViewModel() {
             } finally {
                 refreshing.value = false
             }
+        }
+    }
+
+    /** On return to the screen: refresh only when the last pass is a couple of minutes old. */
+    fun refreshIfStale(maxAgeMs: Long = 120_000) {
+        viewModelScope.launch {
+            val machines = graph.machines.machines.first().map { it.id }.toSet()
+            // A machine added or removed since the last pass counts as stale.
+            if (System.currentTimeMillis() - refreshedAt > maxAgeMs || machines != refreshedMachines) refresh()
         }
     }
 
