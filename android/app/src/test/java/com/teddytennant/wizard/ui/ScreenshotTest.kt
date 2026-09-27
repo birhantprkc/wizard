@@ -100,6 +100,10 @@ class ScreenshotTest {
 
     @Test fun homeClaude() = shot("home_claude") { Home(Fixtures.home(Agent.ClaudeCode)) }
 
+    @Test fun homePi() = shot("home_pi") { Home(Fixtures.home(Agent.Pi)) }
+
+    @Test fun homeNoArtwork() = shot("home_no_artwork") { Home(Fixtures.home().copy(artwork = false)) }
+
     @Test fun homeFirstRun() = shot("home_first_run") {
         Home(com.teddytennant.wizard.ui.screens.HomeState(null, com.teddytennant.wizard.session.MachineStatus(), Agent.Wizard, null, emptyList(), false, false, true))
     }

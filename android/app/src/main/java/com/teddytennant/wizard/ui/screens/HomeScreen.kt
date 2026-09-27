@@ -92,7 +92,7 @@ fun HomeContent(
     now: Instant = Instant.now(),
 ) {
     val colors = WizardTheme.colors
-    val showArt = state.artwork && state.agent == Agent.Wizard
+    val showArt = state.artwork
     BoxWithConstraints(Modifier.fillMaxSize().background(colors.background)) {
         val heroHeight = (maxHeight * 0.52f).coerceIn(300.dp, 480.dp)
         if (showArt) Starship(Modifier.fillMaxWidth().height(heroHeight))

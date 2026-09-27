@@ -95,7 +95,7 @@ fun SettingsContent(
         Panel(padding = PaddingValues(0.dp)) {
             ToggleRow("Compact mode", "Fold each turn's tool calls and thinking into one line", settings.compact, onCompact)
             Hairline()
-            ToggleRow("Wizard artwork", "The Starship backdrop behind new Wizard chats", settings.artwork, onArtwork)
+            ToggleRow("Starship artwork", "The Starship backdrop behind new chats", settings.artwork, onArtwork)
         }
 
         SectionLabel("Notifications", Modifier.padding(top = 20.dp))

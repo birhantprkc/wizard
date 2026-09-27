@@ -24,7 +24,7 @@ data class Settings(
     val askedForNotifications: Boolean = false,
     /** Folds each turn's tool calls and thinking into one line, as the desktop's Compact mode. */
     val compact: Boolean = false,
-    /** The Starship backdrop behind new Wizard chats, as the desktop's "Wizard artwork". */
+    /** The Starship backdrop behind the new-chat screen, for every agent. */
     val artwork: Boolean = true,
     val onboarded: Boolean = false,
 )

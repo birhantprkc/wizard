@@ -51,7 +51,7 @@ The first launch walks through this; later, it's Settings, Machines, +.
 
 The app opens on a new chat. Type and send. The chips under the message pick the agent, the machine and the folder, and remember the last choice. Below is one list of recent chats from every machine and agent, newest first. The tune button in a chat switches model and effort (and Wizard's mode) for that session.
 
-Settings has the theme, compact mode (a turn's tool calls and thinking fold into one line) and the Starship artwork behind new Wizard chats, as on the desktop.
+Settings has the theme, compact mode (a turn's tool calls and thinking fold into one line) and the Starship artwork behind new chats.
 
 ## How it behaves
 

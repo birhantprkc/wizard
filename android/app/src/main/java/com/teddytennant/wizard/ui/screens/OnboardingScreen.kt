@@ -195,7 +195,7 @@ private fun Appearance(settings: Settings, onTheme: (ThemeChoice) -> Unit, onCom
     Segmented(listOf(ThemeChoice.Dark to "Dark", ThemeChoice.Light to "Light", ThemeChoice.System to "System"), settings.theme, onTheme)
     Column(Modifier.padding(horizontal = 0.dp)) {
         ToggleRow("Compact mode", "Fold each turn's tool calls and thinking into one line, so replies stay front and center.", settings.compact, onCompact, inset = 0.dp)
-        ToggleRow("Wizard artwork", "Show the Starship backdrop behind new Wizard chats.", settings.artwork, onArtwork, inset = 0.dp)
+        ToggleRow("Starship artwork", "Show the Starship backdrop behind new chats.", settings.artwork, onArtwork, inset = 0.dp)
     }
     Nav(OnboardingStep.Appearance, onStep)
 }
