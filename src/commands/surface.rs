@@ -588,8 +588,9 @@ pub async fn dispatch<S: CommandSurface + Send + ?Sized>(command: SlashCommand, 
             surface.notice(text);
         }
         SlashCommand::Usage => {
-            let text = crate::llm::xai_oauth::subscription_usage_notice().await;
-            surface.notice(text);
+            let session = surface.snapshot();
+            let subscriptions = crate::subscription_usage::collect().await;
+            surface.notice(usage_report(&session, &subscriptions));
         }
         SlashCommand::Status => {
             let text = status_report(&surface.snapshot());
@@ -954,6 +955,22 @@ fn cost_report(session: &SessionSnapshot) -> String {
              ~/.wizard/config.toml for cost estimates",
             session.provider_name
         )),
+    }
+    text
+}
+
+/// `/usage`: a block per signed-in subscription, whichever provider is
+/// active. On an API-key provider the session's token rollup follows, since
+/// that is the only usage such a provider has.
+fn usage_report(
+    session: &SessionSnapshot,
+    subscriptions: &[crate::subscription_usage::Subscription],
+) -> String {
+    let active = crate::subscription_usage::active_id(&session.provider_kind);
+    let mut text = crate::subscription_usage::render(subscriptions, active);
+    if active.is_none() {
+        text.push_str("\n\n");
+        text.push_str(&cost_report(session));
     }
     text
 }
@@ -1636,6 +1653,34 @@ mod tests {
             cost.contains("21200 prompt + 2100 completion tokens (2000 of them reasoning)"),
             "got: {cost}"
         );
+    }
+
+    #[test]
+    fn usage_adds_the_token_rollup_only_on_an_api_key_provider() {
+        use crate::subscription_usage::Subscription;
+        let waiting = Subscription {
+            note: Some("no request yet this session; limits show after the first reply".into()),
+            ..Subscription::new("chatgpt", "ChatGPT")
+        };
+        let keyed = Recorder::default().snapshot();
+        let text = usage_report(&keyed, &[]);
+        assert!(text.starts_with("no subscription signed in"), "{text}");
+        assert!(
+            text.contains("session usage: 0 prompt + 0 completion"),
+            "{text}"
+        );
+
+        let text = usage_report(&keyed, std::slice::from_ref(&waiting));
+        assert!(text.starts_with("ChatGPT\n  no request yet"), "{text}");
+        assert!(text.contains("session usage:"), "{text}");
+
+        let signed_in = SessionSnapshot {
+            provider_kind: ProviderKind::CHATGPT_OAUTH,
+            ..Recorder::default().snapshot()
+        };
+        let text = usage_report(&signed_in, &[waiting]);
+        assert!(text.starts_with("ChatGPT (active)\n"), "{text}");
+        assert!(!text.contains("session usage"), "{text}");
     }
 
     #[test]

@@ -34,7 +34,7 @@ inline hints.
 | `/diff` | Toggle the git diff sidebar |
 | `/todos` | Toggle the todo list above the input |
 | `/cost` | Session token usage, with cost estimates when per-provider rates are configured |
-| `/usage` | xAI subscription usage when signed in with OAuth: the weekly percent, when it resets, and the split across products. An API key is not enough; without an OAuth session it says so |
+| `/usage` | Plan limits for every signed-in subscription, whichever provider is active: xAI's weekly percent with its reset and the build/chat/voice split, ChatGPT's 5-hour and weekly windows with their resets. On an API-key provider the session's token rollup follows. See [Subscription limits](#subscription-limits) |
 | `/memory [read\|forget <name>]` | List the saved project memories, show one, or forget one ([memory.md](memory.md)) |
 | `/status` | Session status: model, provider, mode, effort, session id, usage, todo progress, background tasks, plan/omakase, ultra (GUI also prints current context tokens) |
 | `/doctor` | Environment diagnostics, same checks as `wizard doctor` ([doctor.md](doctor.md)) |
@@ -533,6 +533,31 @@ on its final stream chunk.
   `cache_read_tokens` only: cache *writes* are billed and are in the cost
   figure, but no column shows them, so a cache-heavy turn's `cached` reads
   lower than the number of prompt tokens that got a non-standard rate.
+
+### Subscription limits
+
+`/usage` asks each signed-in account for its plan limits. They read the sign-in files, never the ledger above.
+
+```
+xAI (SuperGrok Heavy, active)
+  weekly: 20% used, resets 2026-10-01 21:06 UTC
+  build 12%, chat 7%, voice 1%
+ChatGPT (Plus)
+  5h: 12.5% used, resets 2026-09-27 23:10 UTC
+  weekly: 41% used, resets 2026-10-03 00:00 UTC
+```
+
+- **xAI** comes from the Grok CLI proxy (`cli-chat-proxy.grok.com`), which
+  answers the OAuth session only. An xAI API key does not unlock it.
+- **ChatGPT** comes from `chatgpt.com/backend-api/wham/usage`, the endpoint the
+  Codex CLI's `/status` reads, so it shows before the first reply. Every reply
+  also carries the windows in `x-codex-primary-*` and `x-codex-secondary-*`
+  headers; Wizard keeps the latest and uses it when the endpoint does not
+  answer, marked "as of the last reply". The usage call never refreshes the
+  sign-in, since a second process spending the refresh token would sign the
+  running one out. A token about to expire skips the call.
+- A subscription that is signed in but has no reading says so rather than
+  showing 0%: `no request yet this session; limits show after the first reply`.
 
 `/cost` inside a session is a different, simpler path: it multiplies the
 session's prompt and completion totals by the `usd_per_mtok_in` /

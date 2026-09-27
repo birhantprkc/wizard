@@ -25,6 +25,19 @@ use std::sync::Mutex;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
+use crate::subscription_usage::{LimitWindow, Source, Subscription, plan_label, window_label};
+
+/// The usage endpoint. Fixed rather than derived from a configured base URL,
+/// so the bearer only ever goes to ChatGPT.
+#[cfg(not(test))]
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+#[cfg(not(test))]
+const USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What `/usage` says before any reply has come back and the endpoint did
+/// not answer either.
+pub const NO_READING: &str = "no request yet this session; limits show after the first reply";
+
 /// One rate-limit window as the endpoint reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
@@ -176,6 +189,125 @@ pub fn from_usage_body(body: &Value, now: i64) -> Option<Limits> {
     // A body with a plan and no windows is still an answer: a free account
     // with nothing metered yet. The caller shows the plan and says so.
     (limits.has_windows() || limits.plan_type.is_some()).then_some(limits)
+}
+
+/// `/usage`'s ChatGPT block: `None` when this machine is not signed in.
+///
+/// Asks `/wham/usage` first, since it costs no turn and is current. When
+/// that fails, the headers of the last reply stand in, and with neither the
+/// block says so. Tests never reach the network: the suite would spend the
+/// session of whoever runs it.
+pub async fn subscription() -> Option<Subscription> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let path = super::oauth::token_path().ok()?;
+        let tokens = super::oauth::load_tokens(&path).ok().flatten()?;
+        let signed_in_plan = tokens
+            .id_token
+            .as_deref()
+            .and_then(super::oauth::plan_type_from_id_token);
+        let fetched = fetch(&tokens).await;
+        if let Ok(limits) = &fetched {
+            record(limits.clone());
+        }
+        Some(to_subscription(fetched, latest(), signed_in_plan))
+    }
+}
+
+/// Ask the usage endpoint with the stored tokens, read-only.
+///
+/// This never refreshes. The desktop app runs it as its own process, and a
+/// refresh there would spend the single-use refresh token the running
+/// Wizard holds in memory, whose next refresh would then be refused and sign
+/// the user out. A token about to expire just skips the call.
+#[cfg(not(test))]
+async fn fetch(tokens: &super::oauth::StoredTokens) -> Result<Limits, String> {
+    if super::oauth::expires_soon(&tokens.access_token) {
+        return Err("the sign-in is due for a refresh".into());
+    }
+    let client = crate::llm::oauth_http_builder(USAGE_TIMEOUT)
+        .build()
+        .map_err(|err| format!("building the usage client: {err}"))?;
+    let mut request = client
+        .get(USAGE_URL)
+        .bearer_auth(&tokens.access_token)
+        .header("originator", super::oauth::API_ORIGINATOR)
+        .header("User-Agent", super::user_agent())
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(account) = &tokens.account_id {
+        request = request.header("ChatGPT-Account-Id", account);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "the usage endpoint did not answer".to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        // The body is dropped: an error page is no place to find numbers,
+        // and it must not land in the chat.
+        return Err(format!("usage endpoint: HTTP {}", status.as_u16()));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "the usage endpoint did not answer JSON".to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    from_usage_body(&body, now).ok_or_else(|| "the usage endpoint reported no limits".into())
+}
+
+/// The block from what was found: the endpoint's reading, else the last
+/// reply's, else a note. The endpoint's plan beats the one signed in with,
+/// which can be stale after an upgrade.
+pub fn to_subscription(
+    fetched: Result<Limits, String>,
+    last_reply: Option<Limits>,
+    signed_in_plan: Option<String>,
+) -> Subscription {
+    let (limits, source, failure) = match fetched {
+        Ok(limits) => (Some(limits), Source::Account, None),
+        Err(reason) => (last_reply, Source::LastReply, Some(reason)),
+    };
+    let plan = limits
+        .as_ref()
+        .and_then(|limits| limits.plan_type.clone())
+        .or(signed_in_plan)
+        .filter(|plan| plan != "unknown")
+        .map(|plan| plan_label(&plan));
+    let mut subscription = Subscription {
+        plan,
+        ..Subscription::new("chatgpt", "ChatGPT")
+    };
+    let Some(limits) = limits else {
+        subscription.note = Some(match failure {
+            Some(reason) => format!("{NO_READING} ({reason})"),
+            None => NO_READING.to_string(),
+        });
+        return subscription;
+    };
+    for (window, fallback) in [
+        (limits.primary, "usage"),
+        (limits.secondary, "secondary usage"),
+    ] {
+        let Some(window) = window else { continue };
+        subscription.windows.push(LimitWindow {
+            label: window_label(window.window_minutes, fallback),
+            used_percent: window.used_percent,
+            window_minutes: window.window_minutes,
+            resets_at: window
+                .resets_at
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
+        });
+    }
+    if subscription.windows.is_empty() {
+        subscription.note = Some("the account reported no metered limits".into());
+    } else {
+        subscription.source = Some(source);
+    }
+    subscription
 }
 
 fn finite(value: Option<&Value>) -> Option<f64> {
@@ -340,6 +472,56 @@ mod tests {
         assert_eq!(
             from_usage_body(&serde_json::json!({"plan_type": "unknown"}), 0),
             None
+        );
+    }
+
+    #[test]
+    fn the_endpoint_reading_becomes_a_block_with_the_live_plan() {
+        let body = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 12, "limit_window_seconds": 18000, "reset_at": 1790550600},
+                "secondary_window": {"used_percent": 41, "limit_window_seconds": 604800, "reset_at": 1790985600}
+            }
+        });
+        let limits = from_usage_body(&body, 0).expect("limits");
+        let block = to_subscription(Ok(limits), None, Some("plus".into()));
+        assert_eq!(block.plan.as_deref(), Some("Pro"), "live plan wins");
+        assert_eq!(block.source, Some(Source::Account));
+        let labels: Vec<&str> = block.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5h", "weekly"]);
+        assert_eq!(
+            crate::subscription_usage::render(&[block], Some("chatgpt")),
+            "ChatGPT (Pro, active)\n  \
+             5h: 12% used, resets 2026-09-27 23:10 UTC\n  \
+             weekly: 41% used, resets 2026-10-03 00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn recorded_headers_stand_in_when_the_endpoint_fails() {
+        let from_reply = from_headers(&recorded_headers());
+        let block = to_subscription(
+            Err("usage endpoint: HTTP 403".into()),
+            from_reply,
+            Some("plus".into()),
+        );
+        assert_eq!(block.plan.as_deref(), Some("Plus"));
+        assert_eq!(block.source, Some(Source::LastReply));
+        assert_eq!(block.windows.len(), 2);
+        assert_eq!(block.windows[0].used_percent, 12.5);
+        assert_eq!(block.note, None);
+    }
+
+    #[test]
+    fn signed_in_with_nothing_yet_says_when_limits_show() {
+        let block = to_subscription(Err("the sign-in is due for a refresh".into()), None, None);
+        assert!(block.windows.is_empty());
+        assert_eq!(
+            block.note.as_deref(),
+            Some(
+                "no request yet this session; limits show after the first reply (the sign-in is due for a refresh)"
+            )
         );
     }
 

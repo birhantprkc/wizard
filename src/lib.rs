@@ -50,6 +50,7 @@ pub mod server;
 pub mod session_registry;
 pub mod skills;
 pub mod skin;
+pub mod subscription_usage;
 pub mod sync;
 pub(crate) mod text;
 pub mod theme;
