@@ -4834,6 +4834,8 @@ impl Render for ComposerInput {
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
     WorkspaceCommand(WorkspaceCommand),
+    /// An app command typed out with its argument (`/theme dark`).
+    WorkspaceCommandWithArgs(WorkspaceCommand, String),
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
     /// the first destination frame on the same timeline as the source frame.
@@ -5178,75 +5180,213 @@ pub enum WorkspaceCommand {
     Terminal,
     Rename,
     Stop,
+    // Power user mode only.
+    Agent,
+    Effort,
+    Device,
+    Archive,
+    Export,
+    Theme,
+    Keys,
+    Sidebar,
+    Panel,
+    Next,
+    Prev,
+    Vim,
+}
+
+/// One app command in the slash menu.
+struct WorkspaceCommandSpec {
+    command: WorkspaceCommand,
+    name: &'static str,
+    description: &'static str,
+    /// Only offered inside a conversation.
+    needs_chat: bool,
+    /// Only offered in power user mode.
+    power: bool,
+    /// Argument hint shown in the menu. Commands with an argument also run
+    /// when typed out in full (`/theme dark`).
+    arg: Option<&'static str>,
+    /// Picking it from the menu inserts `/name ` for the argument instead of
+    /// running it.
+    needs_arg: bool,
+}
+
+const fn spec(
+    command: WorkspaceCommand,
+    name: &'static str,
+    description: &'static str,
+    needs_chat: bool,
+) -> WorkspaceCommandSpec {
+    WorkspaceCommandSpec {
+        command,
+        name,
+        description,
+        needs_chat,
+        power: false,
+        arg: None,
+        needs_arg: false,
+    }
+}
+
+const fn power(mut spec: WorkspaceCommandSpec) -> WorkspaceCommandSpec {
+    spec.power = true;
+    spec
+}
+
+const fn arg(
+    mut spec: WorkspaceCommandSpec,
+    hint: &'static str,
+    needed: bool,
+) -> WorkspaceCommandSpec {
+    spec.arg = Some(hint);
+    spec.needs_arg = needed;
+    spec
 }
 
 impl WorkspaceCommand {
-    fn catalog() -> &'static [(Self, &'static str, &'static str, bool)] {
-        &[
-            (
-                Self::Model,
+    fn catalog() -> &'static [WorkspaceCommandSpec] {
+        use WorkspaceCommand as W;
+        const CATALOG: &[WorkspaceCommandSpec] = &[
+            spec(
+                W::Model,
                 "model",
                 "Wizard GUI: choose agent, model, and reasoning",
                 false,
             ),
-            (
-                Self::New,
-                "new",
-                "Wizard GUI: start a new conversation",
-                false,
-            ),
-            (
-                Self::Resume,
+            spec(W::New, "new", "Wizard GUI: start a new conversation", false),
+            spec(
+                W::Resume,
                 "resume",
                 "Wizard GUI: search and open conversations",
                 false,
             ),
-            (
-                Self::Settings,
-                "settings",
-                "Wizard GUI: open settings",
+            spec(W::Settings, "settings", "Wizard GUI: open settings", false),
+            spec(W::Diff, "diff", "Wizard GUI: open changes", true),
+            spec(W::Files, "files", "Wizard GUI: open project files", true),
+            spec(W::Terminal, "terminal", "Wizard GUI: open a terminal", true),
+            arg(
+                spec(
+                    W::Rename,
+                    "rename",
+                    "Wizard GUI: rename this conversation",
+                    true,
+                ),
+                "title",
                 false,
             ),
-            (Self::Diff, "diff", "Wizard GUI: open changes", true),
-            (Self::Files, "files", "Wizard GUI: open project files", true),
-            (
-                Self::Terminal,
-                "terminal",
-                "Wizard GUI: open a terminal",
+            spec(W::Stop, "stop", "Wizard GUI: stop the active run", true),
+            power(spec(W::Agent, "agent", "Wizard GUI: switch agent", false)),
+            power(spec(
+                W::Effort,
+                "effort",
+                "Wizard GUI: change reasoning effort",
+                false,
+            )),
+            power(spec(
+                W::Device,
+                "device",
+                "Wizard GUI: pick the device for a new chat",
+                false,
+            )),
+            power(spec(
+                W::Archive,
+                "archive",
+                "Wizard GUI: archive this conversation",
                 true,
-            ),
-            (
-                Self::Rename,
-                "rename",
-                "Wizard GUI: rename this conversation",
+            )),
+            power(spec(
+                W::Export,
+                "export",
+                "Wizard GUI: copy this conversation as Markdown",
                 true,
-            ),
-            (Self::Stop, "stop", "Wizard GUI: stop the active run", true),
-        ]
+            )),
+            power(arg(
+                spec(
+                    W::Theme,
+                    "theme",
+                    "Wizard GUI: switch the color theme",
+                    false,
+                ),
+                "light|dark|system",
+                true,
+            )),
+            power(spec(
+                W::Keys,
+                "keys",
+                "Wizard GUI: show every keyboard shortcut",
+                false,
+            )),
+            power(spec(
+                W::Sidebar,
+                "sidebar",
+                "Wizard GUI: show or hide the sidebar",
+                false,
+            )),
+            power(spec(
+                W::Panel,
+                "panel",
+                "Wizard GUI: show or hide the right panel",
+                true,
+            )),
+            power(spec(W::Next, "next", "Wizard GUI: next session", false)),
+            power(spec(W::Prev, "prev", "Wizard GUI: previous session", false)),
+            power(spec(
+                W::Vim,
+                "vim",
+                "Wizard GUI: turn vim editing on or off",
+                false,
+            )),
+        ];
+        CATALOG
+    }
+
+    fn spec(self) -> Option<&'static WorkspaceCommandSpec> {
+        Self::catalog().iter().find(|spec| spec.command == self)
+    }
+
+    /// Whether picking it from the menu waits for an argument.
+    fn needs_arg(self) -> bool {
+        self.spec().is_some_and(|spec| spec.needs_arg)
     }
 }
 
+#[cfg(test)]
 fn with_workspace_commands(
-    mut rows: Vec<InvocationCandidate>,
+    rows: Vec<InvocationCandidate>,
     in_chat: bool,
 ) -> Vec<InvocationCandidate> {
+    with_workspace_commands_for(rows, in_chat, false)
+}
+
+/// The agent's rows plus the app's own commands. Power user mode adds the
+/// power-only commands and argument hints.
+fn with_workspace_commands_for(
+    mut rows: Vec<InvocationCandidate>,
+    in_chat: bool,
+    power_user: bool,
+) -> Vec<InvocationCandidate> {
     rows.retain(|row| row.workspace_command.is_none());
-    for &(command, name, description, needs_chat) in WorkspaceCommand::catalog() {
-        if needs_chat && !in_chat {
+    for spec in WorkspaceCommand::catalog() {
+        if (spec.needs_chat && !in_chat) || (spec.power && !power_user) {
             continue;
         }
         // Keep provider commands intact. Explicit Zeron names remain available
         // when a provider owns the unqualified name.
-        let mut name = name.to_string();
+        let mut name = spec.name.to_string();
         while rows.iter().any(|row| row.name == name) {
             name = format!("zeron:{name}");
         }
         rows.push(InvocationCandidate {
             invocation: zeron_proto::invocation::Invocation::Command { name: name.clone() },
             name,
-            description: description.into(),
-            input_hint: None,
-            workspace_command: Some(command),
+            description: spec.description.into(),
+            input_hint: if power_user {
+                spec.arg.map(str::to_string)
+            } else {
+                None
+            },
+            workspace_command: Some(spec.command),
         });
     }
     rows
@@ -5264,6 +5404,174 @@ fn workspace_command_for_text(
     rows.iter()
         .find(|row| row.name == token.query)?
         .workspace_command
+}
+
+/// `/theme dark`, `/rename New title`: an app command that takes an argument,
+/// typed out in full as the whole draft. Pure.
+fn workspace_command_with_args(
+    text: &str,
+    rows: &[InvocationCandidate],
+) -> Option<(WorkspaceCommand, String)> {
+    let rest = text.strip_prefix('/')?;
+    let (name, args) = rest.split_once(char::is_whitespace)?;
+    let args = args.trim();
+    if args.is_empty() || args.contains('\n') {
+        return None;
+    }
+    let command = rows
+        .iter()
+        .find(|row| row.name == name)?
+        .workspace_command?;
+    command.spec()?.arg?;
+    Some((command, args.to_string()))
+}
+
+/// Power user slash filtering: prefix matches first, then substring, then a
+/// fuzzy in-order match of the letters (`/mdl` finds `model`), then matches
+/// in the description. Stable within each rank. Pure.
+fn power_filter_indices(query: &str, rows: &[InvocationCandidate]) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let mut ranked: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, row)| {
+            let name = row.name.to_lowercase();
+            let rank = if query.is_empty() || name.starts_with(&query) {
+                0
+            } else if name.contains(&query) {
+                1
+            } else if is_subsequence(&query, &name) {
+                2
+            } else if row.description.to_lowercase().contains(&query) {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, ix))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, ix)| (rank, ix));
+    ranked.into_iter().map(|(_, ix)| ix).collect()
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars();
+    needle.chars().all(|c| hay.any(|h| h == c))
+}
+
+#[cfg(test)]
+mod power_slash_tests {
+    use super::*;
+
+    fn agent(name: &str, description: &str, hint: Option<&str>) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: description.into(),
+            input_hint: hint.map(str::to_string),
+        }
+    }
+
+    fn names(rows: &[InvocationCandidate]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn normal_mode_keeps_todays_list() {
+        let rows = with_workspace_commands_for(vec![], true, false);
+        assert_eq!(
+            names(&rows),
+            [
+                "model", "new", "resume", "settings", "diff", "files", "terminal", "rename", "stop"
+            ]
+        );
+        assert!(rows.iter().all(|r| r.input_hint.is_none()));
+    }
+
+    #[test]
+    fn power_mode_adds_app_commands_with_hints() {
+        let advertised = invocation_candidates(
+            vec![
+                agent("compact", "Compact the context", None),
+                agent("review", "Review a PR", Some("pr number")),
+            ],
+            vec![],
+        );
+        let rows = with_workspace_commands_for(advertised, true, true);
+        let names = names(&rows);
+        // Every advertised command stays, ahead of the app's own.
+        assert_eq!(&names[..2], ["compact", "review"]);
+        for name in [
+            "model", "agent", "effort", "device", "archive", "export", "theme", "keys", "sidebar",
+            "panel", "next", "prev", "vim", "rename",
+        ] {
+            assert!(names.contains(&name), "{name} missing");
+        }
+        let hint = |name: &str| {
+            rows.iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.input_hint.clone())
+        };
+        assert_eq!(hint("theme").as_deref(), Some("light|dark|system"));
+        assert_eq!(hint("rename").as_deref(), Some("title"));
+        assert_eq!(hint("review").as_deref(), Some("pr number"));
+        // Chat-only commands stay out of the blank canvas.
+        let draft = with_workspace_commands_for(vec![], false, true);
+        assert!(!self::names(&draft).contains(&"archive"));
+        assert!(self::names(&draft).contains(&"theme"));
+    }
+
+    #[test]
+    fn power_filter_is_fuzzy_and_ranked() {
+        let rows = with_workspace_commands_for(
+            invocation_candidates(vec![agent("memory", "Edit memory files", None)], vec![]),
+            true,
+            true,
+        );
+        let hits = |q: &str| -> Vec<String> {
+            power_filter_indices(q, &rows)
+                .into_iter()
+                .map(|ix| rows[ix].name.clone())
+                .collect()
+        };
+        // Prefix first, then substring.
+        assert_eq!(
+            hits("re")[..2],
+            ["resume".to_string(), "rename".to_string()]
+        );
+        // Letters in order, not adjacent.
+        assert_eq!(hits("mdl"), ["model"]);
+        assert!(hits("thm").contains(&"theme".to_string()));
+        // Falls back to the description.
+        assert!(hits("markdown").contains(&"export".to_string()));
+        assert!(hits("zzz").is_empty());
+        assert_eq!(hits("").len(), rows.len());
+    }
+
+    #[test]
+    fn typed_arguments_run_only_commands_that_take_one() {
+        let rows = with_workspace_commands_for(vec![], true, true);
+        assert_eq!(
+            workspace_command_with_args("/theme dark", &rows),
+            Some((WorkspaceCommand::Theme, "dark".into()))
+        );
+        assert_eq!(
+            workspace_command_with_args("/rename Fix the  flaky test ", &rows),
+            Some((WorkspaceCommand::Rename, "Fix the  flaky test".into()))
+        );
+        assert_eq!(workspace_command_with_args("/theme", &rows), None);
+        assert_eq!(workspace_command_with_args("/theme ", &rows), None);
+        assert_eq!(workspace_command_with_args("/model gpt", &rows), None);
+        assert_eq!(
+            workspace_command_with_args("please /theme dark", &rows),
+            None
+        );
+        assert_eq!(
+            workspace_command_with_args("/theme dark\nmore", &rows),
+            None
+        );
+        assert!(WorkspaceCommand::Theme.needs_arg());
+        assert!(!WorkspaceCommand::Rename.needs_arg());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7030,8 +7338,9 @@ impl Composer {
             "{preferences:?}:{}:{params}",
             self.completion_connection_context(cx),
         );
+        let power_user = crate::settings::power_user_mode(cx);
         let context = format!(
-            "{}:{include_skills}:{commands_allowed}:{catalog_context}",
+            "{}:{include_skills}:{commands_allowed}:{power_user}:{catalog_context}",
             if skill { "skill" } else { "command" },
         );
         let context_changed = self.slash.context != context;
@@ -7073,7 +7382,11 @@ impl Composer {
         if harness.is_none() && !skill && commands_allowed {
             self.slash_cache.insert(
                 context.clone(),
-                with_workspace_commands(vec![], self.state.read(cx).selected_chat.is_some()),
+                with_workspace_commands_for(
+                    vec![],
+                    self.state.read(cx).selected_chat.is_some(),
+                    power_user,
+                ),
             );
         }
         if harness.is_none()
@@ -7087,7 +7400,11 @@ impl Composer {
             if !skill && commands_allowed {
                 self.slash_cache.insert(
                     context,
-                    with_workspace_commands(vec![], self.state.read(cx).selected_chat.is_some()),
+                    with_workspace_commands_for(
+                        vec![],
+                        self.state.read(cx).selected_chat.is_some(),
+                        power_user,
+                    ),
                 );
                 self.slash.error = Some("Agent command discovery requires a connection".into());
                 self.refilter_slash(cx);
@@ -7146,9 +7463,10 @@ impl Composer {
                 match decoded {
                     Ok(candidates) => {
                         let candidates = if !skill && commands_allowed {
-                            with_workspace_commands(
+                            with_workspace_commands_for(
                                 candidates,
                                 composer.state.read(cx).selected_chat.is_some(),
+                                power_user,
                             )
                         } else {
                             candidates
@@ -7161,9 +7479,10 @@ impl Composer {
                         if !skill && commands_allowed {
                             composer.slash_cache.insert(
                                 context,
-                                with_workspace_commands(
+                                with_workspace_commands_for(
                                     vec![],
                                     composer.state.read(cx).selected_chat.is_some(),
+                                    power_user,
                                 ),
                             );
                         }
@@ -7189,8 +7508,12 @@ impl Composer {
             .get(&self.slash.context)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        self.slash.filtered = if crate::settings::power_user_mode(cx) {
+            power_filter_indices(&query, commands)
+        } else {
+            let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+            crate::popover::filter_indices(&query, &names)
+        };
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         crate::popover::reset_menu_scroll(&self.slash_scroll, &mut self.popup_bar);
@@ -7239,6 +7562,16 @@ impl Composer {
             return;
         };
         if let Some(action) = command.workspace_command {
+            if action.needs_arg() {
+                // `/theme ` and wait for the argument.
+                let insertion = format!("/{} ", command.name);
+                self.input.update(cx, |input, cx| {
+                    input.replace_plain_token(token.range, &insertion, cx)
+                });
+                self.reset_slash(None, cx);
+                cx.notify();
+                return;
+            }
             self.execute_workspace_command(action, token.range, cx);
             return;
         }
@@ -7712,6 +8045,30 @@ impl Composer {
             .and_then(|rows| workspace_command_for_text(self.input.read(cx).text(), rows))
         {
             self.execute_workspace_command(action, 0..self.input.read(cx).text().len(), cx);
+            return;
+        }
+        // Typed out in full, an app command runs even before the agent's own
+        // command list has loaded; the app catalog alone is enough to match.
+        let typed_command = crate::settings::power_user_mode(cx)
+            .then(|| match self.slash_cache.get(&self.slash.context) {
+                Some(rows) => workspace_command_with_args(&text, rows),
+                None => workspace_command_with_args(
+                    &text,
+                    &with_workspace_commands_for(
+                        vec![],
+                        self.state.read(cx).selected_chat.is_some(),
+                        true,
+                    ),
+                ),
+            })
+            .flatten();
+        if let Some((action, args)) = typed_command {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.reset_slash(None, cx);
+            self.failure = None;
+            self.failure_key = None;
+            cx.emit(ComposerEvent::WorkspaceCommandWithArgs(action, args));
+            cx.notify();
             return;
         }
         let no_content = !composer_has_content(

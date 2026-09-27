@@ -782,6 +782,94 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// The app commands power user mode adds to the slash menu.
+    pub(super) fn run_power_workspace_command(
+        &mut self,
+        command: crate::composer::WorkspaceCommand,
+        args: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::composer::WorkspaceCommand as W;
+        let in_chat = !self.active_chat.is_empty();
+        match command {
+            W::Agent => self.run_nav(Command::PickAgent, window, cx),
+            W::Effort => self.run_nav(Command::PickEffort, window, cx),
+            W::Device => self.run_nav(Command::PickDevice, window, cx),
+            W::Archive if in_chat => self.archive_selected_chat(cx),
+            W::Export if in_chat => {
+                let markdown = {
+                    let state = self.state.read(cx);
+                    let title = state
+                        .selected_chat_row()
+                        .and_then(|chat| chat.title.clone())
+                        .unwrap_or_else(|| "Conversation".into());
+                    transcript_markdown(&title, &state.transcript)
+                };
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(markdown));
+            }
+            W::Theme => {
+                let mode = match args.as_deref().map(str::trim) {
+                    Some("light") => Some(crate::appearance::AppearanceMode::Light),
+                    Some("dark") => Some(crate::appearance::AppearanceMode::Dark),
+                    Some("system") => Some(crate::appearance::AppearanceMode::System),
+                    _ => None,
+                };
+                if let Some(mode) = mode {
+                    crate::appearance::set_mode(mode, cx);
+                    self.schedule_save(cx);
+                }
+            }
+            W::Keys => {
+                self.cheat_sheet = true;
+                cx.notify();
+            }
+            W::Sidebar => self.toggle_sidebar(cx),
+            W::Panel if in_chat => self.toggle_right_pane(cx),
+            W::Next => self.cycle_session(true, cx),
+            W::Prev => self.cycle_session(false, cx),
+            W::Vim => {
+                self.settings.vim_composer = !self.settings.vim_composer;
+                self.schedule_save(cx);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `/export`: the conversation as Markdown, prompts and replies only (tool
+/// calls and reasoning stay out). Pure.
+pub(super) fn transcript_markdown(
+    title: &str,
+    entries: &[zeron_doc::SessionMessageEntry],
+) -> String {
+    let mut out = format!("# {title}\n");
+    for entry in entries {
+        let text: Vec<&str> = entry
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                zeron_doc::MessagePart::Text { text, .. } if !text.trim().is_empty() => {
+                    Some(text.trim())
+                }
+                _ => None,
+            })
+            .collect();
+        if text.is_empty() {
+            continue;
+        }
+        let who = match entry.role {
+            zeron_doc::MessageRole::User => "You",
+            zeron_doc::MessageRole::Assistant => "Assistant",
+            zeron_doc::MessageRole::System => "System",
+        };
+        out.push_str(&format!("\n## {who}\n\n{}\n", text.join("\n\n")));
+    }
+    out
+}
+
 /// The keyboard line under a power-mode confirmation's buttons.
 pub(super) fn confirm_keys_hint(theme: &Theme, text: &'static str) -> gpui::Div {
     div()
@@ -823,7 +911,51 @@ enum TabStep {
 
 #[cfg(test)]
 mod tests {
-    use super::SidebarStep;
+    use super::{SidebarStep, transcript_markdown};
+    use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+
+    fn entry(role: MessageRole, parts: Vec<MessagePart>) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: "m".into(),
+            role,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    fn text(t: &str) -> MessagePart {
+        MessagePart::Text {
+            id: "p".into(),
+            text: t.into(),
+        }
+    }
+
+    #[test]
+    fn export_keeps_prompts_and_replies_only() {
+        let entries = vec![
+            entry(MessageRole::User, vec![text("fix the build")]),
+            entry(
+                MessageRole::Assistant,
+                vec![
+                    MessagePart::Reasoning {
+                        id: "r".into(),
+                        text: "thinking".into(),
+                    },
+                    text("Done."),
+                    text("  "),
+                ],
+            ),
+            entry(MessageRole::Assistant, vec![]),
+        ];
+        assert_eq!(
+            transcript_markdown("Build", &entries),
+            "# Build\n\n## You\n\nfix the build\n\n## Assistant\n\nDone.\n"
+        );
+    }
 
     #[test]
     fn sidebar_steps_clamp_instead_of_wrapping() {

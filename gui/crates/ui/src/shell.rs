@@ -1601,6 +1601,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     command_palette: Option<command_palette::CommandPalette>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
+    /// The argument typed after a power user app command (`/theme dark`).
+    pending_workspace_args: Option<String>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Hover/drag + scroll-linger state of the dropdown's floating rail.
@@ -1810,6 +1812,12 @@ impl Shell {
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::WorkspaceCommand(command) => {
                     this.pending_workspace_command = Some(*command);
+                    this.pending_workspace_args = None;
+                    cx.notify();
+                }
+                ComposerEvent::WorkspaceCommandWithArgs(command, args) => {
+                    this.pending_workspace_command = Some(*command);
+                    this.pending_workspace_args = Some(args.clone());
                     cx.notify();
                 }
                 ComposerEvent::NewThreadTransitionStarted => {
@@ -2026,6 +2034,7 @@ impl Shell {
             add_space: None,
             command_palette: None,
             pending_workspace_command: None,
+            pending_workspace_args: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
             sidebar_view_menu: popover::Popup::default(),
@@ -10520,6 +10529,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(command) = self.pending_workspace_command.take() {
             use crate::composer::WorkspaceCommand;
+            let args = self.pending_workspace_args.take();
             match command {
                 WorkspaceCommand::Model => self
                     .composer
@@ -10534,13 +10544,21 @@ impl Render for Shell {
                 WorkspaceCommand::Terminal if !self.active_chat.is_empty() => {
                     self.add_terminal_surface(cx)
                 }
-                WorkspaceCommand::Rename if !self.active_chat.is_empty() => {
-                    self.open_rename_chat(self.active_chat.clone(), cx)
-                }
+                WorkspaceCommand::Rename if !self.active_chat.is_empty() => match args {
+                    Some(title) => self.mutate(
+                        serde_json::json!({
+                            "op": "renameChat",
+                            "chatId": self.active_chat.clone(),
+                            "title": title,
+                        }),
+                        cx,
+                    ),
+                    None => self.open_rename_chat(self.active_chat.clone(), cx),
+                },
                 WorkspaceCommand::Stop => {
                     self.composer.update(cx, |c, cx| c.interrupt_selected(cx))
                 }
-                _ => {}
+                command => self.run_power_workspace_command(command, args, window, cx),
             }
         }
 
