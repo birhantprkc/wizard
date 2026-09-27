@@ -11,6 +11,8 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use super::which;
+
 /// Package families Wizard knows how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Distro {
@@ -328,17 +330,6 @@ fn nixos_missing_summary(missing: &[&str]) -> String {
             missing.join(", ")
         ),
     }
-}
-
-/// Look `bin` up on `PATH`.
-///
-/// A local copy of the same helper the Linux backend uses: `setup` runs as its
-/// own subcommand on every OS, and `linux.rs` is compiled only on Linux.
-fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
 }
 
 /// macOS setup is permission-granting, not package installation.

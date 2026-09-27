@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::{Backend, MouseButton, Screenshot, ScrollDirection, png_dimensions};
+use super::{Backend, MouseButton, Screenshot, ScrollDirection, png_dimensions, which};
 
 /// Linux backend. Stateless — every method shells out fresh.
 pub(crate) struct LinuxBackend;
@@ -192,14 +192,6 @@ fn capture_screen() -> Result<Vec<u8>> {
         "screen capture failed (tried: {}). Last error: {last_err}",
         tried.join(", ")
     )
-}
-
-/// Locate `bin` on `PATH`. Returns `None` when absent.
-fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Parse a key chord like `"ctrl+c"`, `"Return"`, `"cmd+shift+t"` into a list

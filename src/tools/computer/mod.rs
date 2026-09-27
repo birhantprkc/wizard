@@ -23,6 +23,7 @@
 //! `ToolAccess`'s own doc says so. There is no per-action approval gate in
 //! Wizard, for this tool or any other (see `SECURITY.md`).
 
+pub mod detect;
 pub mod rfb;
 pub mod setup;
 
@@ -110,6 +111,14 @@ pub(crate) fn detect() -> Box<dyn Backend> {
     {
         Box::new(UnsupportedBackend)
     }
+}
+
+/// Locate `bin` on `PATH`.
+pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Fallback backend for OSes Wizard does not yet drive (e.g. Windows).
