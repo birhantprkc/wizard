@@ -1365,7 +1365,7 @@ impl AcpHarness {
                 .and_then(|p| p.parent().map(Path::to_path_buf))
         {
             let current = cmd
-                .as_std()
+                .as_std_mut()
                 .get_envs()
                 .find(|(k, _)| *k == "PATH")
                 .and_then(|(_, v)| v.map(|v| v.to_os_string()))

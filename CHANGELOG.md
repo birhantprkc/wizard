@@ -6,6 +6,14 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-09-27
+
+### Fixed
+
+- **Wizard GUI did not build on Windows in 3.5.1**, so 3.5.1 shipped without
+  GUI installers. The Pi PATH change read the child's environment through a
+  method the Windows process wrapper does not have.
+
 ## [3.5.1] - 2026-09-27
 
 ### Added
