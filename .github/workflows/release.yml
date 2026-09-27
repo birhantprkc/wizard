@@ -835,3 +835,214 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ---------------------------------------------------------------------
+  # Wizard for Android (android/)
+  # ---------------------------------------------------------------------
+  #
+  # Same arrangement as the GUI: built from the tag, attached to the release
+  # `release` created, kept off the wizard binary's path. The artifact is named
+  # android-apk, which neither `wizard-*` nor `gui-*` matches, so it lands in
+  # neither of those checksum lists. A broken Android build costs the APK, not
+  # the release.
+  #
+  # The asset names are an interface. android/README.md sends people to
+  # releases/latest/download/wizard-android.apk, so every release has to carry
+  # an asset by exactly that name or the link 404s the moment the release
+  # becomes latest. wizard-android-<version>.apk is the same file under a name
+  # that says which one it is.
+  #
+  # Signing secrets, all four required:
+  #   ANDROID_KEYSTORE_B64       the keystore file (PKCS12 or JKS), base64
+  #   ANDROID_KEYSTORE_PASSWORD  its store password
+  #   ANDROID_KEY_ALIAS          the key's alias in it
+  #   ANDROID_KEY_PASSWORD       the key's password (a PKCS12 keystore from
+  #                              keytool uses the store password for both)
+  # That key is the app's identity for good: Android installs an update only
+  # if it is signed by the key that signed the installed copy, so a lost or
+  # replaced keystore means every user uninstalls and starts over.
+  android-build:
+    name: Android APK
+    needs: [version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # gradlew starts by running the committed gradle-wrapper.jar, and it runs
+      # it with the keystore and its passwords in reach. Check that jar is one
+      # Gradle published before handing it anything.
+      - uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      # No `cache: gradle`, for the reason there is no rust-cache in this file:
+      # a restored ~/.gradle is plugin and dependency jars that run inside the
+      # build that signs the APK, written by whatever ran on any branch.
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The versions android/flake.nix pins, so the release builds against the
+      # SDK the app is developed against, not whatever the runner image has.
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          cmdline-tools-version: '15859902'
+          packages: 'platforms;android-37.0 build-tools;36.1.0'
+          log-accepted-android-sdk-licenses: false
+
+      # Fails rather than skipping. An APK signed with anything else cannot
+      # update the one people already have, and a release without the asset
+      # breaks the README's latest/download link, so a missing key is a thing
+      # to fix before tagging, not a thing to find out from a user.
+      - name: Restore the release keystore
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${ANDROID_KEYSTORE_B64}" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 is not set, so this release has no Android APK. Make the key once and keep the keystore outside the repo: keytool -genkeypair -keystore wizard-android.p12 -storetype PKCS12 -alias wizard -keyalg RSA -keysize 4096 -validity 36500 -dname 'CN=Wizard'. Then: base64 -w0 wizard-android.p12 | gh secret set ANDROID_KEYSTORE_B64 --repo ${GITHUB_REPOSITORY}, and gh secret set ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS (wizard) and ANDROID_KEY_PASSWORD (the store password, for PKCS12) the same way" >&2
+            exit 1
+          fi
+          for name in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is not set; the Android release needs it alongside ANDROID_KEYSTORE_B64: gh secret set ${name} --repo ${GITHUB_REPOSITORY}" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          keystore="$RUNNER_TEMP/wizard-android.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d >"$keystore"
+          # Open it now, so a wrong password or alias is reported as that and
+          # not as a stack trace from the middle of packageRelease. keytool
+          # writes its errors to stdout, hence the capture.
+          if ! out="$(keytool -list -keystore "$keystore" -storepass:env ANDROID_KEYSTORE_PASSWORD \
+              -alias "$ANDROID_KEY_ALIAS" 2>&1)"; then
+            echo "::error::cannot open alias ${ANDROID_KEY_ALIAS} in ANDROID_KEYSTORE_B64 with ANDROID_KEYSTORE_PASSWORD: ${out}" >&2
+            exit 1
+          fi
+          echo "WIZARD_ANDROID_KEYSTORE=$keystore" >>"$GITHUB_ENV"
+
+      # Tests and lint gate the upload the way `test` gates the binaries.
+      # testDebugUnitTest because that is the variant the JVM tests are written
+      # against; lintRelease because release is what ships.
+      - name: Test, lint and build the release APK
+        env:
+          WIZARD_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          WIZARD_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          WIZARD_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew --no-daemon -Pwizard.version="${GITHUB_REF_NAME#v}" \
+            :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
+
+      # `apksigner verify` alone would pass an APK signed with the debug key:
+      # that is a valid signature too, and the build falls back to it when the
+      # signing variables do not arrive. So the certificate is also compared
+      # with the one in the keystore, and the version with the tag's.
+      - name: Verify the APK's signature, key and version
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          apk=app/build/outputs/apk/release/app-release.apk
+          tools="$ANDROID_HOME/build-tools/36.1.0"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" >apksigner.out
+          grep -v '^WARNING' apksigner.out | tee apksigner.txt
+          grep -qx 'Number of signers: 1' apksigner.txt || { echo "::error::expected exactly one signer" >&2; exit 1; }
+          if grep -q '^Signer #1 certificate DN: .*CN=Android Debug' apksigner.txt; then
+            echo "::error::the APK is signed with a debug key" >&2
+            exit 1
+          fi
+          actual="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' apksigner.txt)"
+          expected="$(keytool -exportcert -keystore "$WIZARD_ANDROID_KEYSTORE" \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" | sha256sum | cut -d' ' -f1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::the APK's certificate (${actual}) is not the release keystore's (${expected})" >&2
+            exit 1
+          fi
+          # To a file, not piped into head: head exits after one line, aapt2
+          # takes a SIGPIPE, and pipefail turns that into a failed step.
+          "$tools/aapt2" dump badging "$apk" >badging.txt
+          badging="$(head -1 badging.txt)"
+          echo "$badging"
+          case "$badging" in
+            *"versionName='${ver}'"*) ;;
+            *) echo "::error::the APK's versionName is not ${ver}" >&2; exit 1 ;;
+          esac
+          cp "$apk" "wizard-android-${ver}.apk"
+          echo "Android APK signed by certificate SHA-256 ${actual}" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/wizard-android.keystore"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-apk
+          path: android/wizard-android-*.apk
+          if-no-files-found: error
+
+  # The APK and its checksum list, signed by the same key as checksums.txt,
+  # attached to the release the way gui-release attaches the GUI. Its own
+  # android-checksums.txt rather than a line in gui-checksums.txt, so a GUI
+  # build that fails does not take the APK's checksum with it.
+  #
+  # The release is public before this runs, so for the minutes between
+  # `release` and this upload, latest/download/wizard-android.apk 404s. The
+  # APK builds in parallel with the wizard matrix and is normally waiting by
+  # then, which keeps that window to the length of this job.
+  android-release:
+    name: Attach the Android APK to the release
+    needs: [release, android-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: android-apk
+          path: android-dist
+      - name: Name the assets and list their checksums
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir out
+          cp "android-dist/wizard-android-${ver}.apk" "out/wizard-android-${ver}.apk"
+          cp "android-dist/wizard-android-${ver}.apk" out/wizard-android.apk
+          (cd out && sha256sum -- *.apk > android-checksums.txt)
+          cat out/android-checksums.txt
+      - name: Sign the Android checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -eu
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -S -s minisign.key -m out/android-checksums.txt \
+            -c "wizard ${GITHUB_REF_NAME} android checksums" \
+            -t "wizard ${GITHUB_REF_NAME} android checksums, signed by the wizard release key" \
+            </dev/null
+          rm -f minisign.key
+          key="$(grep -v '^untrusted comment:' wizard-release.pub | tr -d '[:space:]')"
+          minisign -Vm out/android-checksums.txt -x out/android-checksums.txt.minisig -P "$key"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber

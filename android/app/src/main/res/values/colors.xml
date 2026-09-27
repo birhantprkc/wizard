@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The desktop app icon: #ececee wand on #0c0c0e. -->
+    <color name="launcher_background">#0C0C0E</color>
+    <color name="launcher_mark">#ECECEE</color>
+    <!-- Dark is the default theme, so launch dark whatever the system says. -->
+    <color name="splash_background">#060606</color>
+    <color name="splash_mark">#E8E8EA</color>
+    <color name="window_background">#060606</color>
+</resources>
