@@ -65,6 +65,7 @@ use crate::llm::{self, ChatMessage, Role};
 use crate::mcp::McpManager;
 use crate::tools::CommandDispatch;
 
+mod auth;
 mod command;
 mod models;
 
@@ -95,7 +96,8 @@ pub async fn run(config: Config) -> Result<()> {
     // Connect MCP once and share it across every session (a per-session connect
     // would spawn a duplicate of every server).
     let state = Arc::new(State {
-        config,
+        config: std::sync::RwLock::new(Arc::new(config)),
+        sign_in: std::sync::Mutex::new(None),
         mcp: Arc::new(agent::connect_mcp().await),
         sessions: Mutex::new(HashMap::new()),
         next_call_id: Arc::new(AtomicU64::new(0)),
@@ -106,7 +108,7 @@ pub async fn run(config: Config) -> Result<()> {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let current = state.catalog().clone();
-            let next = current.refresh(&state.config).await;
+            let next = current.refresh(&state.config()).await;
             if let Err(err) = next.save() {
                 tracing::debug!("acp: could not cache the model catalog: {err:#}");
             }
@@ -121,6 +123,7 @@ pub async fn run(config: Config) -> Result<()> {
     let prompt_state = Arc::clone(&state);
     let cancel_state = Arc::clone(&state);
     let exit_state = Arc::clone(&state);
+    let auth_state = Arc::clone(&state);
 
     let serve = AcpRole
         .builder()
@@ -128,8 +131,9 @@ pub async fn run(config: Config) -> Result<()> {
         .on_receive_request(
             async move |args: InitializeRequest, responder: Responder<InitializeResponse>, _cx| {
                 // Echo the client's protocol version; advertise Wizard with
-                // text prompts, no auth, no client-side fs/terminal needed
-                // (Wizard does its own I/O), `session/load`, and `session/list`.
+                // text prompts, the sign-ins `auth` can run, no client-side
+                // fs/terminal needed (Wizard does its own I/O), `session/load`,
+                // and `session/list`.
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
                     .session_capabilities(
@@ -138,6 +142,7 @@ pub async fn run(config: Config) -> Result<()> {
                 responder.respond(
                     InitializeResponse::new(args.protocol_version)
                         .agent_capabilities(capabilities)
+                        .auth_methods(auth::methods())
                         .agent_info(
                             Implementation::new("wizard", env!("CARGO_PKG_VERSION"))
                                 .title("Wizard"),
@@ -147,12 +152,21 @@ pub async fn run(config: Config) -> Result<()> {
             acp::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_args: AuthenticateRequest,
+            async move |args: AuthenticateRequest,
                         responder: Responder<AuthenticateResponse>,
-                        _cx| {
-                // Wizard authenticates to its own providers via ~/.wizard
-                // config; the editor never authenticates it.
-                responder.respond(AuthenticateResponse::default())
+                        cx: ConnectionTo<Client>| {
+                // An OAuth sign-in waits minutes for the browser, so it runs
+                // off the dispatch loop like a prompt does.
+                let state = Arc::clone(&auth_state);
+                let connection = cx.clone();
+                cx.spawn(async move {
+                    let result = sign_in(&state, &args, &connection).await;
+                    match result {
+                        Ok(()) => responder.respond(AuthenticateResponse::default()),
+                        Err(err) => responder.respond_with_error(err),
+                    }
+                })?;
+                Ok(())
             },
             acp::on_receive_request!(),
         )
@@ -293,6 +307,35 @@ async fn discard_unused_sessions(state: &State) {
     }
 }
 
+/// `authenticate`: run the sign-in, then serve every later session from the
+/// config it saved. The model catalog is refreshed for the new provider,
+/// bounded like a first `session/new`, so the picker lists its models.
+async fn sign_in(
+    state: &State,
+    args: &AuthenticateRequest,
+    connection: &ConnectionTo<Client>,
+) -> Result<(), acp::Error> {
+    let (canceller, cancel) = llm::oauth_callback::cancellation();
+    let previous = state
+        .sign_in
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(canceller);
+    if let Some(previous) = previous {
+        previous.cancel();
+    }
+    let config = auth::authenticate(args, connection, &state.config(), cancel).await?;
+    let current = state.catalog().clone();
+    if let Ok(next) = tokio::time::timeout(CATALOG_WAIT, current.refresh(&config)).await {
+        if let Err(err) = next.save() {
+            tracing::debug!("acp: could not cache the model catalog: {err:#}");
+        }
+        *state.catalog() = next;
+    }
+    *state.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+    Ok(())
+}
+
 /// A session file that holds nothing but its header line.
 fn session_file_unused(path: &Path) -> bool {
     std::fs::read_to_string(path)
@@ -302,7 +345,12 @@ fn session_file_unused(path: &Path) -> bool {
 /// Shared connection state. `Send + Sync` so ACP 2.0's dispatch handlers (which
 /// require `Send`) can share it across request/notification callbacks.
 struct State {
-    config: Config,
+    /// Replaced whole when `authenticate` adds a provider; a session keeps
+    /// the config it was built from.
+    config: std::sync::RwLock<Arc<Config>>,
+    /// Cancels the OAuth sign-in in flight, if any, so a newer one can bind
+    /// the callback port.
+    sign_in: std::sync::Mutex<Option<llm::oauth_callback::Canceller>>,
     mcp: Arc<McpManager>,
     sessions: Mutex<HashMap<String, SessionEntry>>,
     /// Monotonic across the whole connection so every tool call gets a unique
@@ -316,6 +364,10 @@ struct State {
 }
 
 impl State {
+    fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
     fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
         self.catalog.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -324,12 +376,13 @@ impl State {
     /// of a fresh install waits briefly for the providers' model lists, so a
     /// client that asks once (to fill a picker) sees them.
     async fn config_options(&self, selection: &Selection) -> Vec<SessionConfigOption> {
-        if self.catalog().is_missing_any(&self.config) {
+        let config = self.config();
+        if self.catalog().is_missing_any(&config) {
             let mut ready = self.catalog_ready.clone();
             let _ = tokio::time::timeout(CATALOG_WAIT, ready.wait_for(|done| *done)).await;
         }
         let catalog = self.catalog().clone();
-        models::config_options(&self.config, &catalog, selection)
+        models::config_options(&config, &catalog, selection)
     }
 }
 
@@ -373,7 +426,7 @@ async fn open_session(
     let session = Session::create_in(&sessions_dir, &cwd).map_err(internal)?;
     let session_id = session.id.clone();
     let unused_file = session.path().to_path_buf();
-    let selection = Selection::from_config(&state.config);
+    let selection = Selection::from_config(&state.config());
 
     let built = build_session_agent(state, &selection, &cwd, session.clone()).await;
     let (agent, cancel) = match built {
@@ -409,7 +462,7 @@ async fn build_session_agent(
     cwd: &Path,
     session: Session,
 ) -> Result<(Arc<Mutex<Agent>>, CancelHandle), acp::Error> {
-    let config = selection.apply(&state.config);
+    let config = selection.apply(&state.config());
     let mut agent =
         agent::build_headless_agent_for_session(&config, cwd, session, Some(&state.mcp))
             .await
@@ -457,7 +510,7 @@ async fn set_config_option(
     match args.config_id.0.as_ref() {
         models::MODEL_OPTION => {
             let (provider, model) =
-                models::parse_model_id(&value, &state.config).ok_or_else(|| {
+                models::parse_model_id(&value, &state.config()).ok_or_else(|| {
                     acp::Error::invalid_params()
                         .data(format!("{value} names no configured provider"))
                 })?;
@@ -522,7 +575,7 @@ async fn load_session(
     // a turn still holding the old agent keeps it until the turn ends. It
     // reopens on the config's defaults: a model picked over ACP lasts as long
     // as the connection, and the client sets it again.
-    let selection = Selection::from_config(&state.config);
+    let selection = Selection::from_config(&state.config());
     let (agent, cancel) =
         build_session_agent(state, &selection, &args.cwd, session.clone()).await?;
     let options = state.config_options(&selection).await;
@@ -784,13 +837,14 @@ async fn run_slash_command(
         acp::Error::invalid_request().data("a turn is running; send commands between turns")
     })?;
 
+    let base = state.config();
     let (mut answer, mut next, fusion, model_change) =
         match crate::commands::SlashCommand::parse(line) {
             Some(Ok(parsed)) => {
                 let mut surface = command::AcpSurface {
                     agent: &mut agent,
-                    base: &state.config,
-                    config: selection.apply(&state.config),
+                    base: &base,
+                    config: selection.apply(&base),
                     selection: selection.clone(),
                     mcp: &state.mcp,
                     cwd: cwd.clone(),

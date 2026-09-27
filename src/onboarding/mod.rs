@@ -721,6 +721,29 @@ fn key_providers(installed: &[ProviderKind]) -> Vec<KeyProvider> {
     rows
 }
 
+/// The provider entry a key pasted for `name` earns, by the key list's own
+/// names (`xai`, `claude`, `openai`, `openrouter`, and the OpenAI-compatible
+/// presets), for a client that hands Wizard a key rather than a terminal to
+/// paste it in. `api_key_env` names no variable, so a stale export cannot
+/// shadow the key stored under `name`. `None` for a name this build has no
+/// backend for, and for Cloudflare, whose URL needs an account id.
+pub(crate) fn keyed_provider(name: &str) -> Option<ProviderConfig> {
+    key_providers(&crate::llm::registry::kinds())
+        .into_iter()
+        .find(|row| row.name == name && !row.base_url.is_empty())
+        .map(|row| ProviderConfig {
+            name: row.name.to_string(),
+            kind: row.kind,
+            base_url: row.base_url.to_string(),
+            model: row.model.to_string(),
+            api_key_env: Some(String::new()),
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+            vision: None,
+        })
+}
+
 /// The exported value of `name`, when it has one that is not blank.
 fn exported(name: &str) -> Option<String> {
     std::env::var(name)
