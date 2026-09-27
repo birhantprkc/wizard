@@ -1,26 +1,27 @@
 # Wizard
 
-The fastest agent in your terminal: one Rust binary, any model, at its prompt before the others have finished loading.
-
-## Install
+The fastest agent in your terminal. One Rust binary, any model, a desktop app, and a full harness that still finishes your task before the minimal ones do.
 
 ```bash
-# Linux and macOS
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
-
-# Homebrew
-brew install teddytennant/tap/wizard
-
-# Nix
-nix run github:teddytennant/wizard
-
-# Arch: not on the AUR yet, build the package from the repo
-cd contrib/aur/wizard-bin && makepkg -si
 ```
 
-Every other flavor (a preinstalled local model, from source, Termux) is in [Getting started](docs/getting-started.md#install).
+Homebrew (`brew install teddytennant/tap/wizard`), Nix (`nix run github:teddytennant/wizard`), local models, Termux and building from source are in [Getting started](docs/getting-started.md#install).
 
-## Startup
+## Faster where you wait
+
+pi is about as lean as an agent gets: four tools and a short prompt, which makes it close to the floor on tokens. Wizard carries subagents, MCP, memory, skills, checkpoints, a completion review and a clock on top of that. On the same tasks with the same model it finished every one faster, used 43% fewer output tokens, and cost less than pi on the two longest.
+
+<!-- BENCH:pi -->
+| agent | passed | wall time per task | prompt tokens | output tokens | est. cost per task |
+|---|---:|---:|---:|---:|---:|
+| **wizard 3.5** | **16/16** | **262 s** | 522k | **12.2k** | $0.54 |
+| pi 0.87.1 | 16/16 | 460 s | **377k** | 21.6k | **$0.43** |
+<!-- /BENCH -->
+
+Wall time is what you feel. Wizard was 1.8x faster on average and up to 3x on a single task. pi sends fewer prompt tokens, but most of Wizard's input is cache reads at a quarter of the price and its output is the expensive part it writes less of, so 38% more prompt tokens came out 25% more money on average and less than pi on the two longest tasks. The 8 tasks come from a real project's history: a commit that adds failing tests, then the commit that makes them pass. Two tries each on Grok 4.6, graded on the original tests. Wizard's row predates 3.5 deferring MCP tools, so the shipped default sends less than it shows. [Harness engineering](docs/harness-engineering.md) has how the defaults were found and [Token profiles](docs/token-profiles.md) has `--token-profile min`, whose first request (1,724 tokens) is smaller than pi's (1,817).
+
+## Faster to start
 
 <!-- BENCH:startup -->
 | agent | warm start | cold start | RSS at the prompt | install |
@@ -34,31 +35,11 @@ Every other flavor (a preinstalled local model, from source, Termux) is in [Gett
 | OpenCode 1.18.30 | 2847 ms | 6230 ms | 786 MB | 185 MB |
 <!-- /BENCH -->
 
-Measured 2026-09-11 with [`bench/startup/run.sh`](bench/startup/README.md) on an idle 16-core box: one ubuntu:24.04 container per agent, installed the way its README says, phone-home switched off where the agent offers a switch, the model endpoint on a dead local port, ten pty starts each with the page cache dropped before the first. Warm is the median of starts two to ten. The full table, each agent's setup, the host record and what is not measured are in [`bench/startup/results.md`](bench/startup/results.md).
-
-## Tokens
-
-3.5 sends 35% less on the first request and uses 16% fewer prompt tokens per task than 3.2.5, with the same pass rate and the whole harness still there: subagents, MCP, memory, skills, checkpoints, the completion review and the clock.
-
-<!-- BENCH:tokens -->
-| profile | first request | passed | prompt tokens per task | est. cost per task |
-|---|---:|---:|---:|---:|
-| wizard 3.2.5 | 15,517 | 16/16 | 624k | $0.61 |
-| **wizard 3.5 (`safe`, default)** | **10,087** | **16/16** | **522k** | **$0.54** |
-| wizard 3.5 `--token-profile min` | 1,729 | 16/16 | 568k | $0.66 |
-<!-- /BENCH -->
-
-Measured 2026-09-26 on 8 tasks taken from a real project's history: a commit that adds failing tests, then the commit that makes them pass. Two tries each on Grok 4.6. A run fails if it edits the tests or breaks another one. The first request is from an empty directory with one MCP server and one hook configured. The per-task `safe` row was run before MCP tools were deferred, so the shipped default sends less than it shows. `min` has the smallest first request but costs more per task: a stripped prompt makes the model take three to five extra steps, and each one sends new tokens that miss the cache. How the defaults were found, from the AHE run through the Terminal-Bench post-mortem to this, is in [Harness engineering](docs/harness-engineering.md). The profiles are in [Token profiles](docs/token-profiles.md).
+Ten pty starts per agent in its own ubuntu:24.04 container, page cache dropped before the first. [How it was measured](bench/startup/results.md).
 
 ## Desktop app
 
-Wizard GUI is the desktop app, built from `gui/` in this repo. It runs Wizard, Pi and Claude Code side by side across your projects and on machines you reach over SSH, and it can reuse a Codex (ChatGPT) or Grok CLI sign-in it finds on disk. Installers for Linux, macOS and Windows are attached to every [release](https://github.com/teddytennant/wizard/releases), and `wizard gui` opens it once it is installed. It is a fork of [Zeron](https://github.com/zeronsh/zeron) under the MIT license. [gui/README.md](gui/README.md)
-
-## First run
-
-![Wizard's first run: one screen, a pasted key, the TUI, a starter prompt](demo/first-run.gif)
-
-The first run is one screen: sign in with xAI or ChatGPT, paste an API key, or run a model locally. Pick one and the TUI opens with the config saved and, in a git repo, three starter prompts read off the directory, so ↓ and Enter is a first turn. That screen is up in single-digit milliseconds on a release build, timed by [`contrib/first-run-pty.py`](contrib/first-run-pty.py); the rest is in [Getting started](docs/getting-started.md#first-run).
+Wizard GUI runs Wizard, Pi and Claude Code side by side across your projects and on machines you reach over SSH. It can reuse a ChatGPT or Grok sign-in it finds on disk. Installers for Linux, macOS and Windows come with every [release](https://github.com/teddytennant/wizard/releases), and `wizard gui` opens it. It is a fork of [Zeron](https://github.com/zeronsh/zeron). [gui/README.md](gui/README.md)
 
 ## Terminal-Bench
 
@@ -71,47 +52,23 @@ The first run is one screen: sign in with xAI or ChatGPT, paste an API key, or r
 | Terminus 2, public reference (Artificial Analysis, on e2b) | Grok 4.6 | 88.4% |
 <!-- /BENCH -->
 
-Run 2026-09-12 with Harbor, one trial per task, through the [`tbench/`](tbench/README.md) adapter. Wizard's run had every public copy of the benchmark blocked, so no pass came from reading a task's own tests; the two same-box control rows are earlier runs with their fetched-answer passes counted as failures. One trial per task is noisy: three tries each on the 35 hardest tasks resolved 46.7% where a single try resolved 34.3%. Wizard's default prompt was also tuned on 10 of the 89 tasks. The per-task list, every failure's reason, and what is being changed are in [`tbench/RESULTS.md`](tbench/RESULTS.md).
+One trial per task with every public copy of the benchmark blocked. [Per-task results](tbench/RESULTS.md).
 
-## Also
+## What else is in the box
 
-- **Any model.** xAI, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Mistral, OpenRouter, Cloudflare Workers AI, Ollama and any OpenAI-compatible endpoint; `/provider` switches live. Keys live in env vars or `~/.wizard/credentials.toml` (0600). [Providers](docs/getting-started.md#using-a-cloud-or-remote-provider)
-- **Local models.** Pick Local and Wizard sizes a Qwen GGUF to your hardware and runs llama.cpp's `llama-server` for you. [Bring your own model](docs/byom.md)
-- **`/fusion`.** A panel of your providers critique each other's drafts, then you get one answer. [Fusion](docs/fusion.md)
-- **`/ultra`.** N read-only subagents on the model you're using, then a judge. [Ultra](docs/ultra.md)
-- **`/evolve`.** Skills, MCP servers, scripted tools (embedded LuaJIT, no interpreter to install) and subagents as plain files that go live on `/reload`; deep evolve rebuilds the binary behind a locked build, the test suite and a smoke test, with the old binary one `mv` away. [Self-extension](docs/evolve.md)
-- **MCP, both directions.** stdio and HTTP servers join the tool registry at runtime; `wizard mcp-serve` serves Wizard's own tools to any client. [MCP](docs/mcp.md)
-- **Editors.** `wizard acp` runs it inside Zed, Neovim and Emacs over the Agent Client Protocol. [ACP](docs/acp.md)
-- **Modes.** Genie is the TUI, sovereign is headless (`wizard -p`), `--continuous` is a mission that outlives outages. [Modes](docs/modes.md)
-- **Gateway.** Headless as a Telegram bot, each message a turn in your project. [Gateway](docs/gateway.md)
-- **Memory.** Plain markdown under `~/.wizard/memory/`, indexed into the prompt each session; `/memory` reads it back. [Memory](docs/memory.md)
-- **Fork it.** `/publish` puts your evolved Wizard on your GitHub with its own installer; `wizard skills` shares one piece from a git-backed registry. [Fork and distribute](docs/market.md)
+Any model (xAI, OpenAI and ChatGPT sign-in, Anthropic, Gemini, DeepSeek, OpenRouter, Ollama, llama.cpp, anything OpenAI-compatible). A TUI, headless `wizard -p`, and `--continuous` missions. `/fusion` and `/ultra` for panels of models. `/evolve` for skills, MCP servers, Lua tools and subagents that go live on `/reload`. MCP in both directions, ACP for Zed, Neovim and Emacs, a Telegram gateway, and plain-markdown memory. Every page is in [docs/README.md](docs/README.md).
 
-## Limitations
+## Limits
 
-- Linux (x86_64, aarch64), macOS (Apple Silicon and Intel) and Termux on Android from source. Windows runs it under WSL2.
-- Releases are signed with minisign and both `install.sh` and `wizard update` refuse what they cannot verify; that needs `minisign`, an OpenSSL with ed25519 and blake2b, or `python3`, which macOS ships. [Install](docs/getting-started.md#install)
-- Small local models are worse than frontier models: a quantized 4B to 36B Qwen misformats tool calls and needs more steering, and the 4B tier that an 8 GB machine gets is a floor, not a good agent. [Model tiers](docs/getting-started.md#model-tiers-automatic)
-- No sandbox. Tools run with your privileges and nothing asks first. Read [SECURITY.md](SECURITY.md) before an autonomous run and prefer a container.
-- Context is finite. Wizard reads selectively and compacts old history, but a long session still pushes out early detail. [Agent-managed context](docs/usage.md#agent-managed-context)
+No sandbox: tools run with your privileges, so read [SECURITY.md](SECURITY.md) before an autonomous run. Windows runs it under WSL2. Small local models misformat tool calls more than frontier ones.
 
-## Docs
-
-Every page is indexed in [docs/README.md](docs/README.md), grouped by what you are trying to do. [CHANGELOG.md](CHANGELOG.md) has what changed and what breaks; [WIZARD.md](WIZARD.md) is the agent's charter, inherited by every fork.
-
-## Development
-
-Rust 2024, Ratatui, Tokio, embedded LuaJIT (`mlua`). Single binary.
+## Build
 
 ```bash
-git clone https://github.com/teddytennant/wizard
-cd wizard
+git clone https://github.com/teddytennant/wizard && cd wizard
 cargo build --release
-./target/release/wizard
 ```
-
-`nix develop` gives a shell with the Rust toolchain and `llama-cpp`. Local inference is [llama.cpp](https://github.com/ggml-org/llama.cpp); [Ollama](https://ollama.com) is a supported provider.
 
 ## License
 
-`MIT AND Apache-2.0`, both at once. Wizard's own code is MIT ([LICENSE-MIT](LICENSE-MIT)). The terminal-UI code ported from OpenAI Codex and xAI grok-build stays under Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)); [NOTICE](NOTICE) names every file it landed in and [docs/ui-skins.md](docs/ui-skins.md) has the file-by-file table.
+`MIT AND Apache-2.0`. Wizard's own code is MIT ([LICENSE-MIT](LICENSE-MIT)); terminal-UI code ported from OpenAI Codex and xAI grok-build stays Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE), [NOTICE](NOTICE)). Wizard GUI is MIT, from Zeron.
