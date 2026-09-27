@@ -6,6 +6,18 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Slash commands over ACP.** `wizard acp` now sends an
+  `available_commands_update` after `session/new` and `session/load`, so Zed,
+  Wizard GUI and the Android app can offer Wizard's commands. A prompt starting
+  with one (`/effort high`, `/usage`, `/compact`, `/diff`, `/help` and the rest
+  listed in `docs/acp.md`) runs through the TUI's command code instead of going
+  to the model, applies to that session only, and sends a
+  `config_option_update` when it changes the model, effort or mode. Commands
+  that need the terminal are not advertised and are refused by name. An unknown
+  `/word` still goes to the model.
+
 ## [3.5.2] - 2026-09-27
 
 ### Fixed

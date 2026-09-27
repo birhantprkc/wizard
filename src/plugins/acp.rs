@@ -14,7 +14,9 @@
 //! that restarted this process picks the conversation up where it left off.
 //! Every session advertises `model`, `thought_level`, and `wizard_mode` config
 //! options, and `session/set_config_option` changes them for that session
-//! alone; see [`models`].
+//! alone; see [`models`]. It also advertises the slash commands this surface
+//! runs, and a prompt that is one is dispatched rather than sent to the model;
+//! see [`command`].
 //!
 //! ACP 2.0's request handlers run inside the connection's dispatch loop, so a
 //! long `session/prompt` is spawned off the loop (see [`ConnectionTo::spawn`])
@@ -38,11 +40,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, ContentBlock,
-    ContentChunk, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionCapabilities, SessionConfigOption,
-    SessionId, SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, AvailableCommandsUpdate,
+    CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, SessionCapabilities, SessionConfigOption, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
@@ -62,6 +65,7 @@ use crate::llm::{self, ChatMessage, Role};
 use crate::mcp::McpManager;
 use crate::tools::CommandDispatch;
 
+mod command;
 mod models;
 
 use models::{Catalog, Selection};
@@ -153,9 +157,15 @@ pub async fn run(config: Config) -> Result<()> {
             acp::on_receive_request!(),
         )
         .on_receive_request(
-            async move |args: NewSessionRequest, responder: Responder<NewSessionResponse>, _cx| {
+            async move |args: NewSessionRequest,
+                        responder: Responder<NewSessionResponse>,
+                        cx: ConnectionTo<Client>| {
                 match open_session(&new_session_state, args).await {
-                    Ok(response) => responder.respond(response),
+                    Ok(response) => {
+                        let id = response.session_id.clone();
+                        responder.respond(response)?;
+                        advertise_commands(&cx, id)
+                    }
                     Err(err) => responder.respond_with_error(internal(err)),
                 }
             },
@@ -180,8 +190,12 @@ pub async fn run(config: Config) -> Result<()> {
             async move |args: LoadSessionRequest,
                         responder: Responder<LoadSessionResponse>,
                         cx: ConnectionTo<Client>| {
+                let id = args.session_id.clone();
                 match load_session(&load_session_state, args, &cx).await {
-                    Ok(response) => responder.respond(response),
+                    Ok(response) => {
+                        responder.respond(response)?;
+                        advertise_commands(&cx, id)
+                    }
                     Err(err) => responder.respond_with_error(err),
                 }
             },
@@ -334,6 +348,20 @@ struct SessionEntry {
     /// Set while a session this connection created has never been prompted:
     /// its file is removed when the connection ends.
     unused_file: Option<PathBuf>,
+    /// Turns run through the fusion panel (`/fusion`). A rebuild onto another
+    /// model leaves it.
+    fusion: bool,
+}
+
+/// Tell the client which slash commands a session runs. Sent after the
+/// `session/new` or `session/load` answer, so the client knows the session id
+/// it belongs to.
+fn advertise_commands(connection: &ConnectionTo<Client>, id: SessionId) -> Result<(), acp::Error> {
+    let update = AvailableCommandsUpdate::new(command::available_commands());
+    connection.send_notification(SessionNotification::new(
+        id,
+        SessionUpdate::AvailableCommandsUpdate(update),
+    ))
 }
 
 async fn open_session(
@@ -367,6 +395,7 @@ async fn open_session(
             session,
             selection,
             unused_file: Some(unused_file),
+            fusion: false,
         },
     );
     Ok(NewSessionResponse::new(session_id).config_options(options))
@@ -385,8 +414,9 @@ async fn build_session_agent(
         agent::build_headless_agent_for_session(&config, cwd, session, Some(&state.mcp))
             .await
             .map_err(internal)?;
-    // No Wizard slash commands over ACP: `run_command` refuses cleanly to
-    // the model rather than silently dropping work.
+    // The user's `/command` prompts are dispatched by `run_slash_command`; the
+    // model's `run_command` tool stays off, so it refuses cleanly rather than
+    // queueing a command nothing on this surface drains.
     agent.set_command_dispatch(CommandDispatch::None);
     let cancel = agent.cancel_handle();
     Ok((Arc::new(Mutex::new(agent)), cancel))
@@ -459,6 +489,7 @@ async fn set_config_option(
         if let Some((agent, cancel)) = rebuilt {
             entry.agent = agent;
             entry.cancel = cancel;
+            entry.fusion = false;
         }
         entry.selection = selection.clone();
     }
@@ -504,6 +535,7 @@ async fn load_session(
             session,
             selection,
             unused_file: None,
+            fusion: false,
         },
     );
 
@@ -660,6 +692,9 @@ async fn run_prompt(
 ) -> Result<(), acp::Error> {
     let session_id = args.session_id.clone();
     let text = prompt_text(&args.prompt);
+    if let Some(line) = command::command_line(&text) {
+        return run_slash_command(state, &session_id, line, connection, responder).await;
+    }
 
     // Short borrow of the sessions map: clone out the agent cell and cancel
     // handle, then release it so `cancel` can run during the turn.
@@ -717,6 +752,115 @@ async fn run_prompt(
         reason,
         cancel.is_cancelled(),
     )))
+}
+
+/// Run a `/command` prompt through the one dispatcher, against this session
+/// only, and answer with what it said. No turn and no model call, except for
+/// the commands whose whole point is one (`/btw`, `/compact`, `/evolve`).
+///
+/// A change to the model, effort, or mode is also sent as a
+/// `config_option_update`, so the client's pickers show what the session now
+/// runs.
+async fn run_slash_command(
+    state: &State,
+    session_id: &SessionId,
+    line: &str,
+    connection: &ConnectionTo<Client>,
+    responder: Responder<PromptResponse>,
+) -> Result<(), acp::Error> {
+    let id = session_id.0.to_string();
+    let (agent_cell, selection, cwd, session, fusion) = {
+        let sessions = state.sessions.lock().await;
+        let entry = sessions.get(&id).ok_or_else(acp::Error::invalid_params)?;
+        (
+            Arc::clone(&entry.agent),
+            entry.selection.clone(),
+            entry.cwd.clone(),
+            entry.session.clone(),
+            entry.fusion,
+        )
+    };
+    let mut agent = agent_cell.try_lock().map_err(|_| {
+        acp::Error::invalid_request().data("a turn is running; send commands between turns")
+    })?;
+
+    let (mut answer, mut next, fusion, model_change) =
+        match crate::commands::SlashCommand::parse(line) {
+            Some(Ok(parsed)) => {
+                let mut surface = command::AcpSurface {
+                    agent: &mut agent,
+                    base: &state.config,
+                    config: selection.apply(&state.config),
+                    selection: selection.clone(),
+                    mcp: &state.mcp,
+                    cwd: cwd.clone(),
+                    fusion,
+                    model_change: None,
+                    out: String::new(),
+                };
+                crate::commands::surface::dispatch(parsed, &mut surface).await;
+                (
+                    surface.out,
+                    surface.selection,
+                    surface.fusion,
+                    surface.model_change,
+                )
+            }
+            // The parser's own words: a bad argument, a usage line.
+            Some(Err(message)) => (message, selection.clone(), fusion, None),
+            None => (String::new(), selection.clone(), fusion, None),
+        };
+
+    // Still holding the old agent, so no turn starts on it mid-switch.
+    let mut rebuilt = None;
+    if let Some((provider, model)) = model_change {
+        let mut switched = next.clone();
+        switched.provider = provider;
+        switched.model = model;
+        if switched == next {
+            answer = format!("already on {}", next.model_id());
+        } else {
+            match build_session_agent(state, &switched, &cwd, session).await {
+                Ok(built) => {
+                    answer = format!("switched to model {}", switched.model_id());
+                    if fusion {
+                        answer.push_str(" (fusion off)");
+                    }
+                    rebuilt = Some(built);
+                    next = switched;
+                }
+                Err(_) => answer = format!("could not switch to {}", switched.model_id()),
+            }
+        }
+    }
+    let fusion = fusion && rebuilt.is_none();
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(&id) {
+            if let Some((agent, cancel)) = rebuilt {
+                entry.agent = agent;
+                entry.cancel = cancel;
+            }
+            entry.selection = next.clone();
+            entry.fusion = fusion;
+        }
+    }
+    drop(agent);
+
+    if !answer.is_empty() {
+        connection.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(answer))),
+        ))?;
+    }
+    if next != selection {
+        let options = state.config_options(&next).await;
+        connection.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+        ))?;
+    }
+    responder.respond(PromptResponse::new(StopReason::EndTurn))
 }
 
 /// Map a `DoneReason` (plus whether the user cancelled) to the ACP stop

@@ -33,7 +33,7 @@ The `run_command` tool lets the model invoke these commands. Two gates apply, in
    quest; the agent has the conversation already, and `spawn_subagent` for its own background
    work).
 2. The surface's dispatch set — every command on the TUI, the `server` ones the executor
-   implements on the GUI, **none at all** headless, on the gateway, or inside a subagent
+   implements on the GUI, **none at all** headless, on the gateway, over ACP, or inside a subagent
    (nothing there would drain the queue, so the tool refuses rather than report a success
    that never happens).
 

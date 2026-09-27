@@ -96,12 +96,56 @@ A client that opens a session only to read these options (to fill a model
 picker) leaves nothing behind: sessions that were never prompted are removed
 when the server exits, whether stdin closes or it is stopped with SIGTERM.
 
+## Slash commands
+
+After `session/new` and `session/load`, Wizard sends an
+`available_commands_update` listing the slash commands it runs over ACP, each
+with a short description and, where the command takes one, an input hint. A
+prompt whose first word is one of them runs through the same command code the
+TUI uses instead of going to the model, and its answer comes back as
+`agent_message_chunk`s followed by `end_turn`. It applies to that session only.
+When it changes the model, effort, or mode, a `config_option_update` follows so
+the client's pickers match.
+
+Advertised:
+
+| Command | Over ACP |
+|---|---|
+| `/model <provider>/<model>` | switch this session's model (a bare tag stays on the current provider). Bare `/model` points at the model menu |
+| `/mode <genie\|sovereign>`, `/genie`, `/sovereign` | switch mode |
+| `/effort <low\|medium\|high\|xhigh\|default>` | set reasoning effort |
+| `/plan`, `/omakase` | toggle plan mode (plans are auto-approved over ACP) |
+| `/rewind [turn]` | list rewindable turns, or restore files and history to before one |
+| `/compact` | summarize older history now |
+| `/btw <question>` | side question that stays out of history |
+| `/fork <task>` | background side quest; its report lands on the next turn |
+| `/agents` | list the subagents |
+| `/evolve [--deep] <desc>`, `/publish [branch]` | as in the TUI |
+| `/provider` | list configured providers (list only) |
+| `/fusion`, `/ultra` | toggle, per session. A model switch leaves fusion |
+| `/server [status\|start\|stop]` | local model server |
+| `/diff` | the working tree's git diff, as text |
+| `/todos` | the todo list, as text |
+| `/cost`, `/usage`, `/status`, `/bashes`, `/doctor` | reports |
+| `/memory [read\|forget <name>]`, `/turing`, `/goal [text]` | as in the TUI |
+| `/reload` | skills and scripted tools (MCP servers stay connected) |
+| `/help` | this list |
+
+Not run over ACP, and refused by name if typed: `/clear` (start a new thread
+instead; the client owns the session id), `/resume` and `/resume-claude` (use
+the client's thread history), `/login`, `/settings`, `/dashboard`, `/vim`,
+`/ui`, `/view`, `/quit`, `/exit`. Plugin commands are advertised unless the
+plugin restricts them to other surfaces. Any other `/word`, including custom
+commands from `.wizard/commands/` and paths like `/etc/hosts`, goes to the model
+as typed.
+
 ## Protocol and scope
 
 `agent-client-protocol` 2.0. Implemented: `initialize`, `authenticate` (a
 no-op — Wizard authenticates to its own providers from `~/.wizard`, so the
 editor never signs it in), `session/new`, `session/list`, `session/load`,
-`session/set_config_option`, `session/prompt`, `session/cancel`. Everything
+`session/set_config_option`, `session/prompt`, `session/cancel`, and the
+`available_commands_update` and `config_option_update` notifications. Everything
 else the crate declares — `session/set_mode`, `session/set_model` (the model is
 a config option instead), session forking, resuming, and deleting — answers
 "method not found".
@@ -123,7 +167,8 @@ runs on a single-threaded `LocalSet`; the agent's own turns still use the
 multi-thread runtime underneath.
 
 Text prompts only for now (a prompt's non-text blocks are dropped). Not
-surfaced over ACP: image results, todos, background tasks and subagent runs,
+surfaced over ACP: image results, todos (except on request, with `/todos`),
+background tasks and subagent runs,
 token-usage updates, and client-delegated file/terminal operations — Wizard
 performs its own I/O rather than routing it through the editor. A plan is not
 sent to the editor either: `exit_plan` is auto-approved and an `interview` is

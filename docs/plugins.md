@@ -504,8 +504,8 @@ A plugin command is a `PluginCommand` in a runtime registry
 (`src/commands/plugin.rs`) rather than a variant, and the two are merged by
 `commands::listing(surface)` — the one list every surface completes, helps and
 advertises from. First-class means all four of those: a plugin's `/name`
-completes in the TUI popup and the window's palette, appears in `/help` and in
-Telegram's `setMyCommands`, parses through `SlashCommand::parse`, and runs
+completes in the TUI popup and the window's palette, appears in `/help`, in
+Telegram's `setMyCommands` and in ACP's `available_commands_update`, parses through `SlashCommand::parse`, and runs
 through `commands::surface::dispatch` with no second path
 (`a_plugin_command_runs_through_the_one_dispatcher`).
 

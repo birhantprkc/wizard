@@ -15,6 +15,8 @@ mod term;
 mod tests;
 mod transcript;
 
+#[cfg(feature = "acp")]
+pub(crate) use command::git_diff_text;
 pub use picker::{Picker, PickerItem, PickerKind, Selection, StatusLine, Suggestion};
 pub use prompts::{Console, Interview, PlanReview, ProviderPrompt};
 pub use runtime::run_tui;

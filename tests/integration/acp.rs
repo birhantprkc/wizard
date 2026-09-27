@@ -32,7 +32,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// How long the test waits for the two JSON-RPC responses. Generous: the
@@ -79,19 +79,32 @@ impl Drop for Server {
 /// which drives the progress reporter) and `/api/show` advertises no
 /// capabilities (so the tool-protocol probe comes back false).
 fn spawn_fake_ollama() -> u16 {
+    spawn_recording_ollama().0
+}
+
+/// The request bodies of every `/api/chat` call, i.e. every model turn.
+type Chats = Arc<Mutex<Vec<String>>>;
+
+/// [`spawn_fake_ollama`], also answering `/api/chat` with a one-line reply and
+/// keeping each chat request body, so a test can tell whether a prompt reached
+/// the model.
+fn spawn_recording_ollama() -> (u16, Chats) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
+    let chats = Chats::default();
+    let recorded = Arc::clone(&chats);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
-            std::thread::spawn(move || serve_connection(stream));
+            let chats = Arc::clone(&recorded);
+            std::thread::spawn(move || serve_connection(stream, chats));
         }
     });
-    port
+    (port, chats)
 }
 
 /// Answer requests on one keep-alive connection until the client hangs up.
-fn serve_connection(stream: TcpStream) {
+fn serve_connection(stream: TcpStream, chats: Chats) {
     let mut writer = stream.try_clone().expect("clone socket");
     let mut reader = BufReader::new(stream);
     loop {
@@ -117,8 +130,9 @@ fn serve_connection(stream: TcpStream) {
         }
         // Drain the body so the next request on this connection starts at a
         // request line rather than in the middle of JSON.
+        let mut body = Vec::new();
         if let Some(len) = headers.get("content-length").and_then(|v| v.parse().ok()) {
-            let mut body = vec![0u8; len];
+            body = vec![0u8; len];
             if reader.read_exact(&mut body).is_err() {
                 return;
             }
@@ -137,6 +151,18 @@ fn serve_connection(stream: TcpStream) {
             // No `tools` capability: the agent falls back to the JSON tool
             // protocol and says so.
             "/api/show" => "{\"capabilities\":[]}".to_string(),
+            // A model turn: one line of text, then done.
+            "/api/chat" => {
+                chats
+                    .lock()
+                    .expect("chats lock")
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"the model answered\"},\
+                  \"done\":false}\n\
+                 {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\
+                  \"done_reason\":\"stop\"}\n"
+                    .to_string()
+            }
             _ => String::new(),
         };
         let status = if body.is_empty() {
@@ -444,4 +470,280 @@ fn acp_sessions_offer_model_options_and_probes_leave_no_file() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(files(), 0, "an unprompted session leaves no file");
+}
+
+/// A `wizard acp` on a fake Ollama that records model turns, initialized and
+/// with one session open.
+struct AcpSession {
+    // Field order is drop order: stdin closes before the server is killed.
+    stdin: std::process::ChildStdin,
+    lines: mpsc::Receiver<String>,
+    session_id: String,
+    chats: Chats,
+    next_id: u64,
+    _server: Server,
+    _home: TempDir,
+}
+
+impl AcpSession {
+    fn start(tag: &str) -> Self {
+        let home = TempDir(
+            std::env::temp_dir().join(format!("wizard-acp-itest-{tag}-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&home.0).expect("create temp dir");
+        let (port, chats) = spawn_recording_ollama();
+        write_config(&home.0, port);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wizard"))
+            .arg("acp")
+            .env("HOME", &home.0)
+            .env_remove("WIZARD_HOME")
+            .env_remove("WIZARD_MODEL")
+            .env_remove("WIZARD_OLLAMA_HOST")
+            .env_remove("WIZARD_LLAMACPP_HOST")
+            .env_remove("WIZARD_GGUF_PATH")
+            .env_remove("WIZARD_SYSTEM_PROMPT")
+            .env_remove("WIZARD_HARNESS_DIR")
+            .current_dir(&home.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("wizard acp starts");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (lines_tx, lines) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if lines_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut server = Server(child);
+        let stdin = server.0.stdin.take().expect("piped stdin");
+        let mut acp = Self {
+            stdin,
+            lines,
+            session_id: String::new(),
+            chats,
+            next_id: 1,
+            _server: server,
+            _home: home,
+        };
+        acp.call(
+            "initialize",
+            serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        );
+        let cwd = acp._home.0.display().to_string();
+        let (reply, _) = acp.call(
+            "session/new",
+            serde_json::json!({"cwd": cwd, "mcpServers": []}),
+        );
+        acp.session_id = reply["result"]["sessionId"]
+            .as_str()
+            .expect("a session id")
+            .to_string();
+        acp
+    }
+
+    /// Send a request; return its reply and the notifications before it.
+    fn call(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(self.stdin, "{frame}").expect("write request");
+        self.stdin.flush().expect("flush request");
+        let mut notifications = Vec::new();
+        loop {
+            let value = self.next_frame(method);
+            if value.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                return (value, notifications);
+            }
+            notifications.push(value);
+        }
+    }
+
+    fn next_frame(&self, waiting_on: &str) -> serde_json::Value {
+        let line = self
+            .lines
+            .recv_timeout(REPLY_TIMEOUT)
+            .unwrap_or_else(|err| panic!("nothing from wizard acp during {waiting_on} ({err})"));
+        serde_json::from_str(&line).unwrap_or_else(|err| panic!("non-JSON line ({err}): {line}"))
+    }
+
+    /// The next `session/update` of `kind`, skipping any other frame.
+    fn update(&self, kind: &str) -> serde_json::Value {
+        loop {
+            let value = self.next_frame(kind);
+            let update = &value["params"]["update"];
+            if update["sessionUpdate"] == kind {
+                return update.clone();
+            }
+        }
+    }
+
+    /// Prompt with `text`; return the stop reason and the updates it sent.
+    fn prompt(&mut self, text: &str) -> (String, Vec<serde_json::Value>) {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "prompt": [{"type": "text", "text": text}],
+        });
+        let (reply, notifications) = self.call("session/prompt", params);
+        let stop = reply["result"]["stopReason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{text} was answered with {reply}"))
+            .to_string();
+        let updates = notifications
+            .into_iter()
+            .map(|value| value["params"]["update"].clone())
+            .collect();
+        (stop, updates)
+    }
+
+    fn model_turns(&self) -> Vec<String> {
+        self.chats.lock().expect("chats lock").clone()
+    }
+}
+
+/// The text of every `agent_message_chunk` in `updates`, joined.
+fn said(updates: &[serde_json::Value]) -> String {
+    updates
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|update| update["content"]["text"].as_str())
+        .collect()
+}
+
+/// A new session tells the client which slash commands it runs, and leaves
+/// out the ones that need the terminal.
+#[test]
+fn acp_advertises_the_commands_it_runs() {
+    let acp = AcpSession::start("advertise");
+    let update = acp.update("available_commands_update");
+    let commands = update["availableCommands"]
+        .as_array()
+        .expect("a command list");
+    let names: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| command["name"].as_str())
+        .collect();
+    for expected in [
+        "model", "mode", "effort", "plan", "compact", "diff", "usage", "memory", "ultra", "fusion",
+        "rewind", "todos", "agents", "provider", "help",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "/{expected} not advertised: {names:?}"
+        );
+    }
+    for terminal_only in [
+        "vim",
+        "ui",
+        "view",
+        "settings",
+        "dashboard",
+        "quit",
+        "resume",
+    ] {
+        assert!(
+            !names.contains(&terminal_only),
+            "/{terminal_only} advertised: {names:?}"
+        );
+    }
+    let effort = commands
+        .iter()
+        .find(|command| command["name"] == "effort")
+        .expect("effort");
+    assert_eq!(effort["input"]["hint"], "[low|medium|high|xhigh|default]");
+    assert!(
+        effort["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
+}
+
+/// `/effort high` changes the session's effort through the command path and
+/// tells the client's picker, without a model turn.
+#[test]
+fn acp_effort_command_updates_the_session_and_its_picker() {
+    let mut acp = AcpSession::start("effort");
+    let (stop, updates) = acp.prompt("/effort high");
+    assert_eq!(stop, "end_turn");
+    assert_eq!(said(&updates), "reasoning effort: high");
+    let options = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "config_option_update")
+        .map(|update| &update["configOptions"])
+        .unwrap_or_else(|| panic!("no config_option_update in {updates:?}"));
+    assert_eq!(option(options, "thought_level")["currentValue"], "high");
+    assert_eq!(
+        option(options, "model")["currentValue"],
+        "fake/fake-model:test"
+    );
+
+    // The session holds it: the next option read starts from `high`.
+    let session_id = acp.session_id.clone();
+    let (set, _) = acp.call(
+        "session/set_config_option",
+        serde_json::json!({"sessionId": session_id, "configId": "wizard_mode", "value": "sovereign"}),
+    );
+    assert_eq!(
+        option(&set["result"]["configOptions"], "thought_level")["currentValue"],
+        "high"
+    );
+    assert!(
+        acp.model_turns().is_empty(),
+        "a command is not a model turn"
+    );
+}
+
+/// `/help` and `/usage` answer with text from the command code, not the
+/// model.
+#[test]
+fn acp_help_and_usage_answer_without_a_model_call() {
+    let mut acp = AcpSession::start("help");
+    let (stop, updates) = acp.prompt("/help");
+    assert_eq!(stop, "end_turn");
+    let help = said(&updates);
+    assert!(help.starts_with("commands:"), "{help}");
+    assert!(help.contains("/effort"), "{help}");
+    assert!(help.contains("not available over ACP"), "{help}");
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "config_option_update"),
+        "/help changes nothing: {updates:?}"
+    );
+
+    let (stop, updates) = acp.prompt("/usage");
+    assert_eq!(stop, "end_turn");
+    let usage = said(&updates);
+    assert!(usage.contains("xAI"), "{usage}");
+
+    assert!(
+        acp.model_turns().is_empty(),
+        "no /api/chat call: {:?}",
+        acp.model_turns()
+    );
+}
+
+/// A slash word this build does not know is an ordinary prompt.
+#[test]
+fn acp_unknown_slash_command_goes_to_the_model() {
+    let mut acp = AcpSession::start("unknown");
+    let (stop, updates) = acp.prompt("/frobnicate the widget");
+    assert_eq!(stop, "end_turn");
+    assert!(said(&updates).contains("the model answered"), "{updates:?}");
+    let turns = acp.model_turns();
+    assert!(
+        turns
+            .iter()
+            .any(|body| body.contains("/frobnicate the widget")),
+        "the prompt reached the model as typed: {turns:?}"
+    );
 }

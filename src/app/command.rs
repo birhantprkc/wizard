@@ -63,7 +63,10 @@ async fn git_output(root: &Path, args: &[&str]) -> Result<String> {
 /// untracked changes. Untracked (new) files are invisible to plain `git
 /// diff`, so without the third section a tree whose only changes are new
 /// files reads as "clean" — the diff sidebar looks broken.
-pub(super) async fn git_diff_text(root: &Path) -> Result<String> {
+///
+/// `wizard acp` answers `/diff` with the same text, since its client has no
+/// sidebar to open.
+pub(crate) async fn git_diff_text(root: &Path) -> Result<String> {
     // Three independent reads of the same tree, so they run as one round of
     // three processes rather than three rounds of one. `/diff` is a keypress
     // with a person waiting on the pane it opens.
