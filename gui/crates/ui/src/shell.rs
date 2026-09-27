@@ -6677,14 +6677,8 @@ impl Shell {
             ),
             S::Reconnecting => (
                 "Reconnecting…".into(),
-                loaders::mini_mono_spinner(
-                    "connection-spinner",
-                    2.0,
-                    theme.text_muted,
-                    self.sidebar_pane.entity_id(),
-                    cx,
-                )
-                .into_any_element(),
+                crate::life::life_spinner("connection-life", 8.0, theme.text_muted)
+                    .into_any_element(),
             ),
         };
         Some(
@@ -11205,11 +11199,11 @@ impl Render for Shell {
         let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false, cx.entity_id(), cx))
+                root.child(loaders::splash_overlay(&theme, false))
             }
             SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true, cx.entity_id(), cx))
+                root.child(loaders::splash_overlay(&theme, true))
             }
             SplashPhase::Gone => root,
         };

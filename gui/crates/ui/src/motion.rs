@@ -130,6 +130,11 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
+/// The 15Hz lease, for cell loaders that step slower than a text dissolve.
+pub fn pulse_lease_slow(view: EntityId, cx: &mut App) {
+    pulse_lease_every(view, 2, cx);
+}
+
 fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
     if cx.reduce_motion() {
         return;

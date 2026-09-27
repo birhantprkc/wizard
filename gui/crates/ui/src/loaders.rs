@@ -333,12 +333,11 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// Full-window boot splash: the app's dot loader (the same [`gradient_spinner`]
-/// the session list and the reconnecting line pulse — user request, replacing
-/// the hero ascii) over the app background with a quiet status line. While
-/// `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px lift); the
-/// shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App) -> AnyElement {
+/// Full-window boot splash: a tiny Game of Life ([`crate::life`]) over the
+/// app background with a quiet status line. While `fading` it plays
+/// `splash-out` (150ms hold, then 0.5s fade + 6px lift); the shell removes it
+/// once [`SPLASH_OUT`] has run its course.
+pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
     let content = div()
         .absolute()
         .inset_0()
@@ -352,14 +351,11 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         .items_center()
         .justify_center()
         .gap(px(12.0))
-        // Cell 2.5 — the size every other surface runs this spinner at (the
-        // "Sending…" strip, the transcript working trailer).
-        .child(gradient_spinner(
-            "boot-splash-spinner",
-            theme,
-            2.5,
-            view,
-            cx,
+        // A tiny Life in the 10px square the dot spinner used to take.
+        .child(crate::life::life_spinner(
+            "boot-splash-life",
+            10.0,
+            theme.accent,
         ))
         .child(
             div()

@@ -979,12 +979,10 @@ impl HarnessesPage {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .child(crate::loaders::mini_mono_spinner(
-                                format!("harness-install-spinner-{harness:?}"),
-                                1.5,
+                            .child(crate::life::life_spinner(
+                                format!("harness-install-life-{harness:?}"),
+                                6.0,
                                 theme.text_muted,
-                                cx.entity_id(),
-                                cx,
                             ))
                             .child(SharedString::from(install_label(&descriptor.name)))
                             .into_any_element(),

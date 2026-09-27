@@ -572,14 +572,8 @@ impl DevicesPage {
                         .text_color(if live { theme.text } else { theme.text_muted })
                         .child(div().flex_none().w(px(14.0)).flex().justify_center().child(
                             if live {
-                                crate::loaders::mini_mono_spinner(
-                                    "ssh-setup-spinner",
-                                    1.5,
-                                    theme.text_muted,
-                                    cx.entity_id(),
-                                    cx,
-                                )
-                                .into_any_element()
+                                crate::life::life_spinner("ssh-setup-life", 10.0, theme.text_muted)
+                                    .into_any_element()
                             } else if failed {
                                 crate::icons::icon(crate::icons::CLOSE_CIRCLE)
                                     .size(px(14.0))

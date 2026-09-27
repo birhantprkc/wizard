@@ -6228,12 +6228,11 @@ impl Transcript {
                 .gap(px(Theme::SPACE_SM))
                 .pt(px(Theme::SPACE_LG))
                 .text_size(crate::typography::ui_rems(11.0))
-                .child(crate::loaders::gradient_spinner(
-                    "working-indicator",
-                    &theme,
-                    2.5,
-                    cx.entity_id(),
-                    cx,
+                // The 10px square the 3x3 dot spinner took, as a tiny Life.
+                .child(crate::life::life_spinner(
+                    "working-indicator-life",
+                    10.0,
+                    theme.accent,
                 ))
                 .child(
                     div()
