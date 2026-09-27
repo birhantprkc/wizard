@@ -4,10 +4,12 @@ import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.teddytennant.wizard.AppGraph
-import com.teddytennant.wizard.acp.SessionInfo
+import com.teddytennant.wizard.agent.Agent
+import com.teddytennant.wizard.session.AgentSession
 import com.teddytennant.wizard.data.AuthKind
 import com.teddytennant.wizard.data.Machine
 import com.teddytennant.wizard.data.MachineForm
+import com.teddytennant.wizard.data.RecentChat
 import com.teddytennant.wizard.session.ChatState
 import com.teddytennant.wizard.session.MachineStatus
 import com.teddytennant.wizard.session.Reach
@@ -19,6 +21,8 @@ import com.teddytennant.wizard.ui.screens.BrowseState
 import com.teddytennant.wizard.ui.screens.InstallState
 import com.teddytennant.wizard.ui.screens.MachineCardModel
 import com.teddytennant.wizard.ui.screens.MachineFormState
+import com.teddytennant.wizard.ui.screens.HomeState
+import com.teddytennant.wizard.ui.screens.RecentRow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -56,6 +60,7 @@ class MachinesViewModel(private val graph: AppGraph) : ViewModel() {
         graph.hub.disconnect(id)
         withContext(Dispatchers.IO) { graph.vault.deleteSecret(Machine.passwordSecret(id)) }
         graph.machines.delete(id)
+        graph.recents.removeMachine(id)
     }
 }
 
@@ -158,6 +163,7 @@ class EditMachineViewModel(private val graph: AppGraph, private val machineId: S
             }
             graph.hub.disconnect(id)
             graph.machines.upsert(machine)
+            if (original == null) graph.selection.setMachine(id)
             form.update { it.copy(saving = false) }
             onSaved(id)
         }
@@ -170,10 +176,9 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
     val status: StateFlow<MachineStatus> = graph.hub.statuses.map { it[machineId] ?: MachineStatus() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, graph.hub.status(machineId))
 
-    val sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
+    val sessions = MutableStateFlow<List<AgentSession>>(emptyList())
     val sessionsLoading = MutableStateFlow(false)
     val sessionsError = MutableStateFlow<String?>(null)
-    val browse = MutableStateFlow<BrowseState?>(null)
     val install = MutableStateFlow<InstallState?>(null)
 
     fun load() = viewModelScope.launch {
@@ -182,11 +187,11 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
     }
 
     private suspend fun loadSessions() {
-        val s = graph.hub.status(machineId)
-        if (s.reach != Reach.Online || s.wizardVersion == null) return
+        if (graph.hub.status(machineId).reach != Reach.Online) return
         sessionsLoading.value = true
         try {
-            sessions.value = graph.hub.sessions(machineId)
+            val found = graph.hub.sessions(machineId)
+            sessions.value = found
             sessionsError.value = null
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -201,12 +206,107 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
         loadSessions()
     }
 
-    fun openBrowser(start: String = "~") {
+    fun openInstall(agent: Agent) {
+        install.value = InstallState(agent)
+    }
+
+    fun runInstall() = viewModelScope.launch {
+        val agent = install.value?.agent ?: return@launch
+        install.value = InstallState(agent, running = true)
+        val ok = runInstallOn(graph, machineId, agent) { line -> install.update { s -> s?.copy(lines = (s.lines + line).takeLast(400)) } }
+        install.update { it?.copy(running = false, done = ok) }
+        if (ok) loadSessions()
+    }
+
+    fun closeInstall() {
+        if (install.value?.running == true) return
+        install.value = null
+    }
+
+    /** Points the home composer at this machine. */
+    fun useForNewChat() = viewModelScope.launch { graph.selection.setMachine(machineId) }
+}
+
+private suspend fun runInstallOn(graph: AppGraph, machineId: String, agent: Agent, onLine: (String) -> Unit): Boolean = try {
+    graph.hub.install(machineId, agent, onLine)
+} catch (e: Exception) {
+    if (e is CancellationException) throw e
+    onLine(SessionHub.describe(e))
+    false
+}
+
+class HomeViewModel(private val graph: AppGraph) : ViewModel() {
+    val draft = MutableStateFlow("")
+    val refreshing = MutableStateFlow(false)
+    val browse = MutableStateFlow<BrowseState?>(null)
+    val install = MutableStateFlow<InstallState?>(null)
+
+    private val base = combine(graph.machines.machines, graph.hub.statuses, graph.selection.selection) { machines, statuses, selection ->
+        Triple(machines, statuses, selection)
+    }
+
+    val state: StateFlow<HomeState?> = combine(base, graph.recents.recents, graph.hub.running, refreshing) { b, recents, running, refreshing ->
+        val (machines, statuses, selection) = b
+        val machine = machines.firstOrNull { it.id == selection.machineId } ?: machines.firstOrNull()
+        val status = machine?.let { statuses[it.id] } ?: MachineStatus()
+        val names = machines.associate { it.id to it.name }
+        HomeState(
+            machine = machine,
+            status = status,
+            agent = selection.agent,
+            cwd = machine?.let { selection.cwd(it.id) ?: it.recentDirs.firstOrNull() ?: status.home },
+            recents = recents.filter { it.machineId in names }.map { chat ->
+                RecentRow(chat, names.getValue(chat.machineId), running.any { r -> r.machineId == chat.machineId && r.sessionId == chat.sessionId })
+            },
+            refreshing = refreshing,
+            hasMachines = machines.isNotEmpty(),
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    val machinesWithStatus: StateFlow<List<Pair<Machine, MachineStatus>>> = base.map { (machines, statuses, _) ->
+        machines.map { it to (statuses[it.id] ?: MachineStatus()) }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun refresh() {
+        if (refreshing.value) return
+        viewModelScope.launch {
+            refreshing.value = true
+            try {
+                graph.hub.refreshRecents()
+            } finally {
+                refreshing.value = false
+            }
+        }
+    }
+
+    fun setAgent(agent: Agent) = viewModelScope.launch { graph.selection.setAgent(agent) }
+
+    fun setMachine(id: String) = viewModelScope.launch {
+        graph.selection.setMachine(id)
+        graph.hub.refresh(id)
+    }
+
+    fun setCwd(cwd: String) = viewModelScope.launch {
+        state.value?.machine?.id?.let { graph.selection.setCwd(it, cwd) }
+    }
+
+    /** The route for a new chat with the draft, or null when there's no machine yet. */
+    fun send(): ChatRoute? {
+        val s = state.value ?: return null
+        val machine = s.machine ?: return null
+        val text = draft.value.trim().ifEmpty { return null }
+        draft.value = ""
+        return ChatRoute(machine.id, s.agent.id, s.cwd ?: "~", prompt = text)
+    }
+
+    fun openBrowser() {
+        val start = state.value?.cwd ?: "~"
         browse.value = BrowseState(path = start)
         navigate(start)
     }
 
     fun navigate(path: String) = viewModelScope.launch {
+        val machineId = state.value?.machine?.id ?: return@launch
         browse.update { it?.copy(path = path, loading = true, error = null) }
         try {
             val listing = graph.hub.listDirs(machineId, path)
@@ -226,21 +326,17 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
         browse.value = null
     }
 
-    fun openInstall() {
-        install.value = InstallState()
+    fun openInstall(agent: Agent) {
+        install.value = InstallState(agent)
     }
 
     fun runInstall() = viewModelScope.launch {
-        install.value = InstallState(running = true)
-        val ok = try {
-            graph.hub.install(machineId) { line -> install.update { s -> s?.copy(lines = (s.lines + line).takeLast(400)) } }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            install.update { s -> s?.copy(lines = s.lines + SessionHub.describe(e)) }
-            false
-        }
+        val agent = install.value?.agent ?: return@launch
+        val machineId = state.value?.machine?.id ?: return@launch
+        install.value = InstallState(agent, running = true)
+        val ok = runInstallOn(graph, machineId, agent) { line -> install.update { s -> s?.copy(lines = (s.lines + line).takeLast(400)) } }
         install.update { it?.copy(running = false, done = ok) }
-        if (ok) loadSessions()
+        if (ok) graph.selection.setAgent(agent)
     }
 
     fun closeInstall() {
@@ -250,10 +346,12 @@ class MachineViewModel(private val graph: AppGraph, val machineId: String) : Vie
 }
 
 class ChatViewModel(private val graph: AppGraph, private val route: ChatRoute) : ViewModel() {
+    val agent: Agent = Agent.fromId(route.agent)
     val chat = MutableStateFlow<StateFlow<ChatState>?>(null)
     val starting = MutableStateFlow(route.sessionId == null)
     val startError = MutableStateFlow<String?>(null)
     val draft = MutableStateFlow("")
+    val cwd = MutableStateFlow(route.cwd)
     val machineName: StateFlow<String> = graph.machines.machines.map { list -> list.firstOrNull { it.id == route.machineId }?.name ?: "" }
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
@@ -263,17 +361,26 @@ class ChatViewModel(private val graph: AppGraph, private val route: ChatRoute) :
         viewModelScope.launch {
             if (route.sessionId == null) {
                 try {
-                    val id = graph.hub.startChat(route.machineId, route.cwd)
-                    chat.value = graph.hub.chat(route.machineId, id)
+                    var dir = route.cwd
+                    if (dir == "~" || dir.isBlank()) {
+                        // A machine that was never probed has no home yet: connect first.
+                        graph.hub.refresh(route.machineId)
+                        dir = graph.hub.status(route.machineId).home ?: throw java.io.IOException(graph.hub.status(route.machineId).message ?: "Couldn't reach the machine.")
+                        cwd.value = dir
+                    }
+                    graph.selection.setCwd(route.machineId, dir)
+                    val id = graph.hub.startChat(route.machineId, agent, dir)
+                    chat.value = graph.hub.chat(route.machineId, agent, id)
+                    route.prompt?.let { graph.hub.send(route.machineId, agent, id, it) }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
-                    startError.value = "Couldn't start a session: " + SessionHub.describe(e)
+                    startError.value = "Couldn't start a chat: " + SessionHub.describe(e)
                 } finally {
                     starting.value = false
                 }
             } else {
-                chat.value = graph.hub.prepareChat(route.machineId, route.sessionId, route.cwd, route.title)
-                graph.hub.openChat(route.machineId, route.sessionId, route.cwd, route.title)
+                chat.value = graph.hub.prepareChat(route.machineId, agent, route.sessionId, route.cwd, route.title)
+                graph.hub.openChat(route.machineId, agent, route.sessionId, route.cwd, route.title)
             }
         }
     }
@@ -282,25 +389,25 @@ class ChatViewModel(private val graph: AppGraph, private val route: ChatRoute) :
         val id = sessionId ?: return
         val text = draft.value.trim()
         if (text.isEmpty()) return
-        graph.hub.send(route.machineId, id, text)
+        graph.hub.send(route.machineId, agent, id, text)
         draft.value = ""
     }
 
     fun stop() {
-        sessionId?.let { graph.hub.stop(route.machineId, it) }
+        sessionId?.let { graph.hub.stop(route.machineId, agent, it) }
     }
 
     fun setOption(configId: String, value: String) = viewModelScope.launch {
-        sessionId?.let { graph.hub.setOption(route.machineId, it, configId, value) }
+        sessionId?.let { graph.hub.setOption(route.machineId, agent, it, configId, value) }
     }
 
     fun answer(optionId: String?) {
-        sessionId?.let { graph.hub.answerPermission(route.machineId, it, optionId) }
+        sessionId?.let { graph.hub.answerPermission(route.machineId, agent, it, optionId) }
     }
 
     fun viewing(on: Boolean) {
         val id = sessionId ?: return
-        val key = "${route.machineId}/$id"
+        val key = graph.hub.chatKey(route.machineId, agent, id)
         if (on) {
             graph.hub.viewing = key
             graph.notifier.cancelFor(route.machineId, id)

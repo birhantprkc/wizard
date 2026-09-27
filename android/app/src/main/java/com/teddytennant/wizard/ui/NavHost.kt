@@ -45,6 +45,11 @@ import com.teddytennant.wizard.data.Settings
 import com.teddytennant.wizard.notify.TurnService
 import com.teddytennant.wizard.session.ChatState
 import com.teddytennant.wizard.session.Reach
+import com.teddytennant.wizard.session.MachineStatus
+import com.teddytennant.wizard.ui.screens.AgentSheetContent
+import com.teddytennant.wizard.ui.screens.FolderSheetContent
+import com.teddytennant.wizard.ui.screens.HomeContent
+import com.teddytennant.wizard.ui.screens.MachineSheetContent
 import com.teddytennant.wizard.ssh.StoredKey
 import com.teddytennant.wizard.ui.screens.AboutContent
 import com.teddytennant.wizard.ui.screens.BrowseSheetContent
@@ -83,13 +88,14 @@ fun WizardNavHost(graph: AppGraph, pendingChat: ChatRoute?, onChatOpened: () -> 
     }
     NavHost(
         navController = nav,
-        startDestination = MachinesRoute,
+        startDestination = HomeRoute,
         modifier = Modifier.fillMaxSize().background(WizardTheme.colors.background),
         enterTransition = { slideInHorizontally { it / 6 } + fadeIn() },
         exitTransition = { fadeOut() },
         popEnterTransition = { fadeIn() },
         popExitTransition = { slideOutHorizontally { it / 6 } + fadeOut() },
     ) {
+        composable<HomeRoute> { HomeRouteScreen(graph, nav) }
         composable<MachinesRoute> { MachinesRouteScreen(graph, nav) }
         composable<EditMachineRoute> { entry -> EditMachineRouteScreen(graph, nav, entry.toRoute<EditMachineRoute>().machineId) }
         composable<MachineRoute> { entry -> MachineRouteScreen(graph, nav, entry.toRoute<MachineRoute>().machineId) }
@@ -130,7 +136,7 @@ private fun MachinesRouteScreen(graph: AppGraph, nav: NavHostController) {
         onAdd = { nav.navigate(EditMachineRoute()) },
         onEdit = { nav.navigate(EditMachineRoute(it)) },
         onDelete = { deleting = it },
-        onSettings = { nav.navigate(SettingsRoute) },
+        onBack = { nav.popBackStack() },
     )
     deleting?.let { id ->
         val name = list.firstOrNull { it.machine.id == id }?.machine?.name ?: "this machine"
@@ -168,7 +174,7 @@ private fun EditMachineRouteScreen(graph: AppGraph, nav: NavHostController, mach
         onSave = {
             vm.save { id ->
                 if (machineId == null) {
-                    nav.navigate(MachineRoute(id)) { popUpTo(MachinesRoute) }
+                    nav.navigate(MachineRoute(id)) { popUpTo(EditMachineRoute()) { inclusive = true } }
                 } else {
                     nav.popBackStack()
                 }
@@ -222,44 +228,27 @@ private fun MachineRouteScreen(graph: AppGraph, nav: NavHostController, machineI
     val sessions by vm.sessions.collectAsStateWithLifecycle()
     val loading by vm.sessionsLoading.collectAsStateWithLifecycle()
     val error by vm.sessionsError.collectAsStateWithLifecycle()
-    val browse by vm.browse.collectAsStateWithLifecycle()
     val install by vm.install.collectAsStateWithLifecycle()
     var showAll by remember { mutableStateOf(false) }
-    var dismissedKey by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) { vm.load() }
     val m = machine ?: return
     MachineContent(
         state = MachineScreenState(m, status, sessions, loading, error, showAll),
         onBack = { nav.popBackStack() },
         onEdit = { nav.navigate(EditMachineRoute(machineId)) },
-        onRetry = { dismissedKey = null; vm.load() },
+        onRetry = { vm.load() },
         onInstall = vm::openInstall,
-        onNewSession = { vm.openBrowser(m.recentDirs.firstOrNull()?.substringBeforeLast('/')?.ifEmpty { null } ?: "~") },
-        onProject = { nav.navigate(ChatRoute(machineId, it)) },
-        onBrowse = { vm.openBrowser() },
-        onSession = { nav.navigate(ChatRoute(machineId, it.cwd, it.sessionId, it.title)) },
+        onNewChat = {
+            scope.launch {
+                vm.useForNewChat().join()
+                nav.navigate(HomeRoute) { popUpTo(HomeRoute) { inclusive = true } }
+            }
+        },
+        onSession = { nav.navigate(ChatRoute(machineId, it.agent.id, it.info.cwd, it.info.sessionId, it.info.title)) },
         onShowAll = { showAll = true },
     )
-    val presented = status.presented
-    if (presented != null && dismissedKey != presented.fingerprint) {
-        when (status.reach) {
-            Reach.NeedsTrust -> WizardDialog({ dismissedKey = presented.fingerprint }) {
-                HostKeyTrustContent(presented, onTrust = { vm.trust(presented) }, onCancel = { dismissedKey = presented.fingerprint })
-            }
-            Reach.KeyChanged -> WizardDialog({ dismissedKey = presented.fingerprint }, dismissible = false) {
-                HostKeyChangedContent(presented, status.trusted!!, onReplace = { vm.trust(presented) }, onCancel = { dismissedKey = presented.fingerprint })
-            }
-            else -> Unit
-        }
-    }
-    browse?.let { state ->
-        WizardSheet(onDismiss = vm::closeBrowser) {
-            BrowseSheetContent(state, status.home, onOpen = { vm.navigate(it) }, onUp = vm::up, onPick = { dir ->
-                vm.closeBrowser()
-                nav.navigate(ChatRoute(machineId, dir))
-            })
-        }
-    }
+    HostKeyPrompts(status, onTrust = vm::trust)
     install?.let { state ->
         WizardSheet(onDismiss = vm::closeInstall) {
             InstallSheetContent(m.name, state, onInstall = vm::runInstall, onClose = vm::closeInstall)
@@ -267,15 +256,113 @@ private fun MachineRouteScreen(graph: AppGraph, nav: NavHostController, machineI
     }
 }
 
+/** First-contact and changed host keys, wherever a machine gets connected. */
+@Composable
+private fun HostKeyPrompts(status: MachineStatus, onTrust: (com.teddytennant.wizard.ssh.PresentedKey) -> Unit) {
+    var dismissedKey by remember { mutableStateOf<String?>(null) }
+    val presented = status.presented
+    if (presented != null && dismissedKey != presented.fingerprint) {
+        when (status.reach) {
+            Reach.NeedsTrust -> WizardDialog({ dismissedKey = presented.fingerprint }) {
+                HostKeyTrustContent(presented, onTrust = { onTrust(presented) }, onCancel = { dismissedKey = presented.fingerprint })
+            }
+            Reach.KeyChanged -> WizardDialog({ dismissedKey = presented.fingerprint }, dismissible = false) {
+                HostKeyChangedContent(presented, status.trusted!!, onReplace = { onTrust(presented) }, onCancel = { dismissedKey = presented.fingerprint })
+            }
+            else -> Unit
+        }
+    }
+}
+
+private enum class HomeSheet { Agent, Machine, Folder }
+
+@Composable
+private fun HomeRouteScreen(graph: AppGraph, nav: NavHostController) {
+    val vm = viewModel { HomeViewModel(graph) }
+    val state by vm.state.collectAsStateWithLifecycle()
+    val draft by vm.draft.collectAsStateWithLifecycle()
+    val browse by vm.browse.collectAsStateWithLifecycle()
+    val install by vm.install.collectAsStateWithLifecycle()
+    val machines by vm.machinesWithStatus.collectAsStateWithLifecycle()
+    var sheet by remember { mutableStateOf<HomeSheet?>(null) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { vm.refresh() }
+    val s = state ?: return
+    HomeContent(
+        state = s,
+        draft = draft,
+        onDraft = { vm.draft.value = it },
+        onSend = {
+            if (s.machine == null) nav.navigate(EditMachineRoute()) else vm.send()?.let { nav.navigate(it) }
+        },
+        onAgent = { sheet = HomeSheet.Agent },
+        onMachine = { if (s.machine == null) nav.navigate(EditMachineRoute()) else sheet = HomeSheet.Machine },
+        onFolder = { sheet = HomeSheet.Folder },
+        onRecent = { nav.navigate(ChatRoute(it.machineId, it.agentId, it.cwd, it.sessionId, it.title)) },
+        onSettings = { nav.navigate(SettingsRoute) },
+    )
+    s.machine?.let { m ->
+        if (s.status.presented != null) {
+            HostKeyPrompts(s.status) { key ->
+                scope.launch {
+                    graph.hub.trustHostKey(m.id, key)
+                    vm.refresh()
+                }
+            }
+        }
+    }
+    when (sheet) {
+        HomeSheet.Agent -> WizardSheet(onDismiss = { sheet = null }) {
+            AgentSheetContent(s.agent, s.machine?.let { s.status }, s.machine?.name, onPick = { agent ->
+                vm.setAgent(agent)
+                sheet = null
+            }, onInstall = { agent ->
+                sheet = null
+                vm.openInstall(agent)
+            })
+        }
+        HomeSheet.Machine -> WizardSheet(onDismiss = { sheet = null }) {
+            MachineSheetContent(machines, s.machine?.id, onPick = { vm.setMachine(it); sheet = null }, onAdd = {
+                sheet = null
+                nav.navigate(EditMachineRoute())
+            }, onManage = {
+                sheet = null
+                nav.navigate(MachinesRoute)
+            })
+        }
+        HomeSheet.Folder -> WizardSheet(onDismiss = { sheet = null }) {
+            FolderSheetContent(s.machine?.recentDirs.orEmpty(), s.cwd, s.status.home, onPick = { vm.setCwd(it); sheet = null }, onBrowse = {
+                sheet = null
+                vm.openBrowser()
+            })
+        }
+        null -> Unit
+    }
+    browse?.let { b ->
+        WizardSheet(onDismiss = vm::closeBrowser) {
+            BrowseSheetContent(b, s.status.home, onOpen = { vm.navigate(it) }, onUp = vm::up, onPick = { dir ->
+                vm.setCwd(dir)
+                vm.closeBrowser()
+            })
+        }
+    }
+    install?.let { i ->
+        WizardSheet(onDismiss = vm::closeInstall) {
+            InstallSheetContent(s.machine?.name ?: "", i, onInstall = vm::runInstall, onClose = vm::closeInstall)
+        }
+    }
+}
+
 @Composable
 private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: ChatRoute) {
-    val vm = viewModel(key = "chat-${route.machineId}-${route.sessionId}-${route.cwd}") { ChatViewModel(graph, route) }
+    val vm = viewModel(key = "chat-${route.machineId}-${route.agent}-${route.sessionId}-${route.cwd}-${route.prompt.hashCode()}") { ChatViewModel(graph, route) }
     val chatFlow by vm.chat.collectAsStateWithLifecycle()
     val state: ChatState? = chatFlow?.collectAsStateWithLifecycle()?.value
     val starting by vm.starting.collectAsStateWithLifecycle()
     val startError by vm.startError.collectAsStateWithLifecycle()
     val draft by vm.draft.collectAsStateWithLifecycle()
     val machineName by vm.machineName.collectAsStateWithLifecycle()
+    val cwd by vm.cwd.collectAsStateWithLifecycle()
     var options by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -301,10 +388,18 @@ private fun ChatRouteScreen(graph: AppGraph, nav: NavHostController, route: Chat
         }
     }
 
+    // The first message goes out on its own, so ask about notifications as the chat opens.
+    LaunchedEffect(Unit) {
+        if (route.prompt != null && vm.shouldAskForNotifications()) {
+            vm.markAsked()
+            if (Build.VERSION.SDK_INT >= 33) askPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
     ChatContent(
         state = state,
+        agent = vm.agent,
         machineName = machineName,
-        cwd = route.cwd,
+        cwd = cwd,
         starting = starting,
         startError = startError,
         draft = draft,
@@ -350,12 +445,15 @@ private fun SettingsRouteScreen(graph: AppGraph, nav: NavHostController) {
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
     }
+    val machineList by graph.machines.machines.collectAsState(initial = emptyList())
     SettingsContent(
         settings = settings,
+        machineCount = machineList.size,
         keyCount = keys.size,
         trustedHosts = remember(keys) { graph.knownHosts.load().entries.size },
         notificationsAllowed = allowed,
         version = graph.version,
+        onMachines = { nav.navigate(MachinesRoute) },
         onTheme = { scope.launch { graph.settings.setTheme(it) } },
         onNotifyFinished = { scope.launch { graph.settings.setNotifyFinished(it) } },
         onNotifyInput = { scope.launch { graph.settings.setNotifyInput(it) } },

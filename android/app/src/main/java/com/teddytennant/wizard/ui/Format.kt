@@ -33,7 +33,7 @@ object Format {
 
     fun project(cwd: String): String = cwd.trimEnd('/').substringAfterLast('/').ifEmpty { cwd }
 
-    /** `/home/teddy/code/wizard` shown as `~/code/wizard` when home is known. */
+    /** `/home/dev/src/wizard` shown as `~/src/wizard` when home is known. */
     fun path(cwd: String, home: String?): String =
         if (home != null && home.length > 1 && (cwd == home || cwd.startsWith("$home/"))) "~" + cwd.removePrefix(home) else cwd
 }

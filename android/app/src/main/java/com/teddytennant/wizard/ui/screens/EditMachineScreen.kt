@@ -89,7 +89,7 @@ fun EditMachineContent(
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             Spacer(Modifier.height(4.dp))
-            Field("Name", form.name, { onChange(form.copy(name = it)) }, placeholder = "devbox", error = form.errors.name)
+            Field("Name", form.name, { onChange(form.copy(name = it)) }, placeholder = "buildbox", error = form.errors.name)
             Field(
                 "Host",
                 form.host,
@@ -103,7 +103,7 @@ fun EditMachineContent(
                         },
                     )
                 },
-                placeholder = "devbox.local or 192.168.1.20",
+                placeholder = "buildbox.local or 192.168.1.20",
                 error = form.errors.host,
                 mono = true,
                 keyboardType = KeyboardType.Uri,

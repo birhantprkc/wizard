@@ -2,10 +2,10 @@
 <resources>
     <string name="app_name">Wizard</string>
     <string name="channel_running">Running turns</string>
-    <string name="channel_running_desc">Shown while Wizard works on one of your machines, so the connection stays open.</string>
+    <string name="channel_running_desc">Shown while an agent works on one of your machines, so the connection stays open.</string>
     <string name="channel_finished">Turn finished</string>
-    <string name="channel_finished_desc">When Wizard finishes a turn while the app is in the background.</string>
+    <string name="channel_finished_desc">When an agent finishes a turn while the app is in the background.</string>
     <string name="channel_input">Needs your input</string>
-    <string name="channel_input_desc">When Wizard is waiting on you to allow something.</string>
+    <string name="channel_input_desc">When an agent is waiting on your answer.</string>
     <string name="fgs_subtype">Keeps the SSH connection to the user\'s own machine open while a coding agent turn they started runs there, so its reply streams back and they are told when it ends.</string>
 </resources>

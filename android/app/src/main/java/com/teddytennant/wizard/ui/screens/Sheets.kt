@@ -40,6 +40,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.teddytennant.wizard.R
 import com.teddytennant.wizard.acp.ConfigOption
+import com.teddytennant.wizard.agent.Agent
+import com.teddytennant.wizard.data.Machine
+import com.teddytennant.wizard.session.MachineStatus
+import com.teddytennant.wizard.session.Reach
+import com.teddytennant.wizard.ui.components.AgentTile
+import com.teddytennant.wizard.ui.components.StatusDot
+import com.teddytennant.wizard.ui.components.TextAction
 import com.teddytennant.wizard.ssh.RemoteScripts
 import com.teddytennant.wizard.ui.Format
 import com.teddytennant.wizard.ui.components.ButtonKind
@@ -148,7 +155,10 @@ fun optionsSummary(options: List<ConfigOption>): String? {
     if (options.isEmpty()) return null
     val model = options.firstOrNull { it.category == "model" || it.id == "model" }
     val parts = mutableListOf<String>()
-    model?.currentValue?.let { parts += it.substringAfterLast('/') }
+    model?.let { m ->
+        // Wizard and Pi ids are `provider/model`; Claude's are aliases with a display name.
+        parts += if ('/' in m.currentValue) m.currentValue.substringAfterLast('/') else (m.currentChoice?.name ?: m.currentValue).substringBefore(" (")
+    }
     options.filter { it !== model }.forEach { o ->
         val name = o.currentChoice?.name ?: o.currentValue
         if (o.currentValue != "default") parts += name
@@ -164,7 +174,7 @@ data class BrowseState(
 )
 
 @Composable
-fun BrowseSheetContent(state: BrowseState, home: String?, onOpen: (String) -> Unit, onUp: () -> Unit, onPick: (String) -> Unit) {
+fun BrowseSheetContent(state: BrowseState, home: String?, onOpen: (String) -> Unit, onUp: () -> Unit, onPick: (String) -> Unit, pickLabel: String = "Use this folder") {
     val colors = WizardTheme.colors
     val listState = rememberLazyListState()
     LaunchedEffect(state.listing?.path) { listState.scrollToItem(0) }
@@ -200,7 +210,7 @@ fun BrowseSheetContent(state: BrowseState, home: String?, onOpen: (String) -> Un
         }
         Spacer(Modifier.height(12.dp))
         WizardButton(
-            "Start a session here",
+            pickLabel,
             { state.listing?.path?.let(onPick) },
             Modifier.fillMaxWidth().padding(horizontal = 20.dp),
             enabled = state.listing != null,
@@ -208,7 +218,13 @@ fun BrowseSheetContent(state: BrowseState, home: String?, onOpen: (String) -> Un
     }
 }
 
-data class InstallState(val lines: List<String> = emptyList(), val running: Boolean = false, val done: Boolean? = null)
+data class InstallState(val agent: Agent, val lines: List<String> = emptyList(), val running: Boolean = false, val done: Boolean? = null)
+
+private fun installLine(agent: Agent) = when (agent) {
+    Agent.Wizard -> "curl -fsSL ${RemoteScripts.INSTALL_URL} | bash"
+    Agent.Pi -> "curl -fsSL https://pi.dev/install.sh | sh\nnpm install pi-acp@${RemoteScripts.PI_ACP_VERSION}"
+    Agent.ClaudeCode -> "curl -fsSL https://claude.ai/install.sh | bash"
+}
 
 @Composable
 fun InstallSheetContent(machineName: String, state: InstallState, onInstall: () -> Unit, onClose: () -> Unit) {
@@ -216,10 +232,20 @@ fun InstallSheetContent(machineName: String, state: InstallState, onInstall: () 
     val listState = rememberLazyListState()
     LaunchedEffect(state.lines.size) { if (state.lines.isNotEmpty()) listState.scrollToItem(state.lines.lastIndex) }
     Column(Modifier.padding(start = 20.dp, end = 20.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Install Wizard on $machineName", style = WizardTheme.type.title, color = colors.text, modifier = Modifier.padding(top = 8.dp))
-        Text("Runs Wizard's installer over SSH, into ~/.local/bin:", style = WizardTheme.type.small, color = colors.muted)
+        Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            AgentTile(state.agent, size = 32.dp)
+            Text("Install ${state.agent.displayName} on $machineName", style = WizardTheme.type.title, color = colors.text, modifier = Modifier.padding(start = 12.dp))
+        }
+        Text(
+            when (state.agent) {
+                Agent.Pi -> "Installs the pi CLI if it's missing, then the pi-acp adapter Wizard GUI uses, into ~/.zeron/adapters:"
+                else -> "Runs the official installer over SSH, into your home directory:"
+            },
+            style = WizardTheme.type.small,
+            color = colors.muted,
+        )
         Box(Modifier.fillMaxWidth().clip(FieldShape).background(colors.code).border(1.dp, colors.border, FieldShape).padding(12.dp)) {
-            Text("curl -fsSL ${RemoteScripts.INSTALL_URL} | bash", style = WizardTheme.type.monoSmall, color = colors.faint)
+            Text(installLine(state.agent), style = WizardTheme.type.monoSmall, color = colors.faint)
         }
         if (state.lines.isNotEmpty() || state.running) {
             LazyColumn(
@@ -233,7 +259,7 @@ fun InstallSheetContent(machineName: String, state: InstallState, onInstall: () 
             }
         }
         when (state.done) {
-            true -> Text("Wizard is installed.", style = WizardTheme.type.label, color = colors.success)
+            true -> Text("${state.agent.displayName} is installed.", style = WizardTheme.type.label, color = colors.success)
             false -> Text("The installer failed. Its output is above.", style = WizardTheme.type.label, color = colors.danger)
             null -> Unit
         }
@@ -245,3 +271,125 @@ fun InstallSheetContent(machineName: String, state: InstallState, onInstall: () 
     }
 }
 
+@Composable
+private fun SheetTitle(text: String) {
+    Text(text, style = WizardTheme.type.title, color = WizardTheme.colors.text, modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 12.dp))
+}
+
+/** Which agent a new chat runs, with what each machine has installed. */
+@Composable
+fun AgentSheetContent(selected: Agent, status: MachineStatus?, machineName: String?, onPick: (Agent) -> Unit, onInstall: (Agent) -> Unit) {
+    val colors = WizardTheme.colors
+    Column(Modifier.padding(bottom = 16.dp)) {
+        SheetTitle("Agent")
+        Column(Modifier.padding(horizontal = 20.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).border(1.dp, colors.border, RoundedCornerShape(16.dp))) {
+            Agent.entries.forEachIndexed { i, agent ->
+                if (i > 0) Hairline(inset = 66.dp)
+                val availability = status?.agent(agent)
+                val online = status?.reach == Reach.Online
+                val detail = when {
+                    status == null || machineName == null -> null
+                    !online -> "Connect to $machineName to check"
+                    availability?.ready == true -> "Ready" + (availability.version?.let { "  ·  " + versionOnly(it) } ?: "")
+                    availability?.missing != null -> availability.missing
+                    else -> "Not installed on $machineName"
+                }
+                val on = agent == selected
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(role = Role.RadioButton) { onPick(agent) }
+                        .semantics { this.selected = on }
+                        .heightIn(min = 64.dp)
+                        .padding(start = 14.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    AgentTile(agent)
+                    Column(Modifier.weight(1f).padding(start = 14.dp)) {
+                        Text(agent.displayName, style = WizardTheme.type.body, color = colors.text)
+                        detail?.let { Text(it, style = WizardTheme.type.small, color = colors.faint, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    }
+                    if (online && availability?.ready == false) {
+                        TextAction("Install", { onInstall(agent) })
+                    } else {
+                        Box(Modifier.padding(end = 8.dp)) { Radio(on) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun versionOnly(line: String): String =
+    Regex("\\d+(\\.\\d+)+").find(line)?.value ?: line
+
+/** Which machine a new chat runs on. */
+@Composable
+fun MachineSheetContent(
+    machines: List<Pair<Machine, MachineStatus>>,
+    selected: String?,
+    onPick: (String) -> Unit,
+    onAdd: () -> Unit,
+    onManage: () -> Unit,
+) {
+    val colors = WizardTheme.colors
+    Column(Modifier.padding(bottom = 16.dp)) {
+        SheetTitle("Machine")
+        if (machines.isNotEmpty()) {
+            Column(Modifier.padding(horizontal = 20.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).border(1.dp, colors.border, RoundedCornerShape(16.dp))) {
+                machines.forEachIndexed { i, (machine, status) ->
+                    if (i > 0) Hairline(inset = 50.dp)
+                    val (dot, words, pulsing) = statusLine(status)
+                    val on = machine.id == selected
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable(role = Role.RadioButton) { onPick(machine.id) }
+                            .semantics { this.selected = on }
+                            .heightIn(min = 60.dp)
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) { StatusDot(dot, pulsing = pulsing) }
+                        Column(Modifier.weight(1f).padding(start = 14.dp)) {
+                            Text(machine.name, style = WizardTheme.type.body, color = colors.text)
+                            Text(machine.address + "  ·  " + words, style = WizardTheme.type.small, color = colors.faint, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        Radio(on)
+                    }
+                }
+            }
+        }
+        Row(Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            WizardButton("Add machine", onAdd, kind = ButtonKind.Quiet, icon = R.drawable.ic_plus)
+            if (machines.isNotEmpty()) WizardButton("Manage", onManage, kind = ButtonKind.Quiet)
+        }
+    }
+}
+
+/** Where a new chat runs: recent folders on the machine, or browse. */
+@Composable
+fun FolderSheetContent(recent: List<String>, selected: String?, home: String?, onPick: (String) -> Unit, onBrowse: () -> Unit) {
+    val colors = WizardTheme.colors
+    Column(Modifier.padding(bottom = 16.dp)) {
+        SheetTitle("Folder")
+        val dirs = (listOfNotNull(home) + recent).distinct()
+        Column(Modifier.padding(horizontal = 20.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).border(1.dp, colors.border, RoundedCornerShape(16.dp))) {
+            dirs.forEachIndexed { i, dir ->
+                if (i > 0) Hairline(inset = 50.dp)
+                val on = dir == selected
+                ListRow(
+                    if (dir == home) "Home" else Format.project(dir),
+                    subtitle = Format.path(dir, home),
+                    icon = if (dir == home) R.drawable.ic_monitor else R.drawable.ic_folder,
+                    monoSubtitle = true,
+                    onClick = { onPick(dir) },
+                ) { Radio(on) }
+            }
+            if (dirs.isNotEmpty()) Hairline(inset = 50.dp)
+            ListRow("Browse folders", icon = R.drawable.ic_magnifer, onClick = onBrowse) {
+                WizardIcon(R.drawable.ic_alt_arrow_right, null, size = 18.dp, tint = colors.faint)
+            }
+        }
+    }
+}

@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
         val machine = intent?.getStringExtra(Notifier.EXTRA_MACHINE) ?: return null
         val session = intent.getStringExtra(Notifier.EXTRA_SESSION) ?: return null
         val cwd = intent.getStringExtra(Notifier.EXTRA_CWD) ?: return null
-        return ChatRoute(machine, cwd, session)
+        val agent = intent.getStringExtra(Notifier.EXTRA_AGENT) ?: "wizard"
+        return ChatRoute(machine, agent, cwd, session)
     }
 }

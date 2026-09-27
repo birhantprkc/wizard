@@ -87,7 +87,14 @@ fun IconAction(@DrawableRes id: Int, contentDescription: String, onClick: () -> 
 
 /** A top bar without Material's chrome: back, a title with an optional subtitle, and actions. */
 @Composable
-fun TopBar(title: String?, onBack: (() -> Unit)?, modifier: Modifier = Modifier, subtitle: String? = null, actions: @Composable RowScope.() -> Unit = {}) {
+fun TopBar(
+    title: String?,
+    onBack: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+    subtitle: String? = null,
+    titleIcon: (@Composable () -> Unit)? = null,
+    actions: @Composable RowScope.() -> Unit = {},
+) {
     Row(
         modifier
             .fillMaxWidth()
@@ -97,7 +104,10 @@ fun TopBar(title: String?, onBack: (() -> Unit)?, modifier: Modifier = Modifier,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (onBack != null) IconAction(R.drawable.ic_alt_arrow_left, "Back", onBack, tint = WizardTheme.colors.text)
-        Column(Modifier.weight(1f).padding(start = if (onBack != null) 2.dp else 0.dp)) {
+        if (titleIcon != null) {
+            Box(Modifier.padding(start = 2.dp, end = 10.dp)) { titleIcon() }
+        }
+        Column(Modifier.weight(1f).padding(start = if (onBack != null && titleIcon == null) 2.dp else 0.dp)) {
             if (title != null) {
                 Text(title, style = WizardTheme.type.title, color = WizardTheme.colors.text, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.semantics { heading() })
             }
@@ -344,14 +354,14 @@ fun <T> Segmented(options: List<Pair<T, String>>, selected: T, onSelect: (T) -> 
 }
 
 @Composable
-fun ToggleRow(title: String, subtitle: String?, checked: Boolean, onChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+fun ToggleRow(title: String, subtitle: String?, checked: Boolean, onChange: (Boolean) -> Unit, modifier: Modifier = Modifier, inset: Dp = 16.dp) {
     val colors = WizardTheme.colors
     Row(
         modifier
             .fillMaxWidth()
             .clickable(role = Role.Switch) { onChange(!checked) }
             .heightIn(min = 56.dp)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = inset, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -407,4 +417,64 @@ fun Spinner(modifier: Modifier = Modifier, size: Dp = 16.dp, color: Color = Wiza
 @Composable
 fun WandMark(modifier: Modifier = Modifier, size: Dp = 22.dp, tint: Color = WizardTheme.colors.text) {
     Icon(painterResource(R.drawable.ic_wizard_mark), contentDescription = null, modifier = modifier.size(size), tint = tint)
+}
+
+/** An agent's mark as the desktop draws it: monochrome, except Claude's orange. */
+@Composable
+fun AgentMark(agent: com.teddytennant.wizard.agent.Agent, modifier: Modifier = Modifier, size: Dp = 16.dp, tint: Color = WizardTheme.colors.text) {
+    Icon(
+        painterResource(agent.icon),
+        contentDescription = null,
+        modifier = modifier.size(size),
+        tint = agent.brandColor?.let { Color(it) } ?: tint,
+    )
+}
+
+/** The mark in a small rounded tile, for list rows. */
+@Composable
+fun AgentTile(agent: com.teddytennant.wizard.agent.Agent, modifier: Modifier = Modifier, size: Dp = 36.dp) {
+    val colors = WizardTheme.colors
+    val shape = RoundedCornerShape(size * 0.28f)
+    Box(
+        modifier.size(size).clip(shape).background(colors.raised).border(1.dp, colors.border, shape),
+        contentAlignment = Alignment.Center,
+    ) { AgentMark(agent, size = size * 0.46f) }
+}
+
+/** A small pill control with a 48dp touch target. */
+@Composable
+fun Chip(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    contentDescription: String = label,
+    leading: @Composable (() -> Unit)? = null,
+) {
+    val colors = WizardTheme.colors
+    Box(
+        modifier
+            .heightIn(min = 48.dp)
+            .clip(PillShape)
+            .clickable(role = Role.Button, onClickLabel = contentDescription, onClick = onClick)
+            .semantics { this.contentDescription = contentDescription },
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            Modifier
+                .clip(PillShape)
+                .background(colors.raised.copy(alpha = if (colors.isDark) 0.9f else 1f))
+                .border(1.dp, colors.border, PillShape)
+                .heightIn(min = 32.dp)
+                .padding(start = if (leading != null) 9.dp else 12.dp, end = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (leading != null) {
+                leading()
+                Spacer(Modifier.width(7.dp))
+            }
+            Text(label, style = WizardTheme.type.label, color = colors.text, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp))
+            Spacer(Modifier.width(4.dp))
+            WizardIcon(R.drawable.ic_alt_arrow_down, null, size = 12.dp, tint = colors.faint)
+        }
+    }
 }

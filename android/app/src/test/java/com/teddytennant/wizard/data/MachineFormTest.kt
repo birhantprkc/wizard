@@ -9,7 +9,7 @@ import org.junit.Test
 class MachineFormTest {
     @Test
     fun validatesEachField() {
-        val ok = MachineForm.validate("devbox", "devbox.local", "22", "teddy", AuthKind.Key, "k1", "", false)
+        val ok = MachineForm.validate("buildbox", "buildbox.local", "22", "dev", AuthKind.Key, "k1", "", false)
         assertTrue(ok.ok)
         val bad = MachineForm.validate("", "-oProxyCommand=x", "70000", "", AuthKind.Key, null, "", false)
         assertNotNull(bad.name); assertNotNull(bad.host); assertNotNull(bad.port); assertNotNull(bad.user); assertNotNull(bad.auth)
@@ -20,9 +20,9 @@ class MachineFormTest {
 
     @Test
     fun splitsPastedAddresses() {
-        assertEquals(Triple("teddy", "devbox.local", 2222), MachineForm.splitAddress("teddy@devbox.local:2222"))
+        assertEquals(Triple("dev", "buildbox.local", 2222), MachineForm.splitAddress("dev@buildbox.local:2222"))
         assertEquals(Triple("pi", "192.168.1.40", null), MachineForm.splitAddress(" pi@192.168.1.40 "))
-        assertEquals(Triple(null, "devbox", null), MachineForm.splitAddress("devbox"))
+        assertEquals(Triple(null, "buildbox", null), MachineForm.splitAddress("buildbox"))
     }
 
     @Test
@@ -35,5 +35,12 @@ class MachineFormTest {
         assertEquals(1, m.recentDirs.count { it == "/p5" })
         assertEquals("u@h", m.address)
         assertEquals("u@h:2222", m.copy(port = 2222).address)
+    }
+
+    @Test
+    fun defaultNames() {
+        assertEquals("buildbox", MachineForm.defaultName("buildbox.local"))
+        assertEquals("10.0.2.2", MachineForm.defaultName("10.0.2.2"))
+        assertEquals("fe80::1", MachineForm.defaultName("fe80::1"))
     }
 }

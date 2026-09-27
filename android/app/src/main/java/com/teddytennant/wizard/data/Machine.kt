@@ -56,6 +56,13 @@ object MachineForm {
         },
     )
 
+    /** A name for a machine added by host alone: `buildbox.local` is "buildbox", an address stays whole. */
+    fun defaultName(host: String): String {
+        val h = host.trim()
+        val address = h.all { it.isDigit() || it == '.' } || ':' in h
+        return if (address) h else h.substringBefore('.').ifEmpty { h }
+    }
+
     /** `user@host:port` pasted into the host field fills the other fields. */
     fun splitAddress(input: String): Triple<String?, String, Int?> {
         val trimmed = input.trim()

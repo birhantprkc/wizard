@@ -1,7 +1,5 @@
 package com.teddytennant.wizard.session
 
-import com.teddytennant.wizard.acp.AcpClient
-import com.teddytennant.wizard.acp.AgentInfo
 import com.teddytennant.wizard.acp.ConfigOption
 import com.teddytennant.wizard.acp.ConnectionClosedException
 import com.teddytennant.wizard.acp.JsonRpcException
@@ -10,9 +8,14 @@ import com.teddytennant.wizard.acp.PermissionRequest
 import com.teddytennant.wizard.acp.SessionInfo
 import com.teddytennant.wizard.acp.SessionNotification
 import com.teddytennant.wizard.acp.SessionUpdate
+import com.teddytennant.wizard.agent.Agent
+import com.teddytennant.wizard.agent.AgentAvailability
+import com.teddytennant.wizard.claude.ClaudeBackend
 import com.teddytennant.wizard.data.AuthKind
 import com.teddytennant.wizard.data.Machine
 import com.teddytennant.wizard.data.MachineStore
+import com.teddytennant.wizard.data.RecentChat
+import com.teddytennant.wizard.data.RecentStore
 import com.teddytennant.wizard.data.SettingsStore
 import com.teddytennant.wizard.notify.NotificationPolicy
 import com.teddytennant.wizard.notify.NotificationText
@@ -36,6 +39,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -52,26 +56,30 @@ import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 enum class Reach { Unknown, Checking, Online, Offline, NeedsTrust, KeyChanged, AuthFailed }
 
 data class MachineStatus(
     val reach: Reach = Reach.Unknown,
-    val wizardVersion: String? = null,
+    val agents: Map<Agent, AgentAvailability> = emptyMap(),
     val running: Int = 0,
     val message: String? = null,
     val presented: PresentedKey? = null,
     val trusted: KnownHost? = null,
     val home: String? = null,
 ) {
-    val wizardMissing: Boolean get() = reach == Reach.Online && wizardVersion == null
+    val wizardVersion: String? get() = agents[Agent.Wizard]?.version
+    fun agent(agent: Agent): AgentAvailability = agents[agent] ?: AgentAvailability.Unknown
+    val readyAgents: List<Agent> get() = Agent.entries.filter { agent(it).ready }
 }
 
 data class PendingPermission(val request: PermissionRequest)
 
 data class ChatState(
     val machineId: String,
+    val agent: Agent,
     val sessionId: String,
     val cwd: String,
     val title: String? = null,
@@ -86,8 +94,10 @@ data class ChatState(
     val acceptReplay: Boolean = false,
 )
 
-/** Something to tell the user about while they're in the app. */
-class WizardMissingException(machine: String) : IOException("Wizard isn't installed on $machine")
+/** A saved session on a machine, for lists that mix agents. */
+data class AgentSession(val agent: Agent, val info: SessionInfo)
+
+class AgentMissingException(agent: Agent, machine: String) : IOException("${agent.displayName} isn't installed on $machine")
 
 /** Hooks the hub needs from Android; a fake in tests. */
 interface HubEnvironment {
@@ -99,14 +109,16 @@ interface HubEnvironment {
 }
 
 /**
- * Owns every SSH connection and `wizard acp` process, and the state of every
- * open chat. One `wizard acp` per machine serves all of that machine's chats.
+ * Owns every SSH connection and agent process, and the state of every open
+ * chat. Per machine: one SSH connection, one ACP process each for Wizard and
+ * Pi serving all their chats, and a `claude -p` per Claude Code turn.
  */
 class SessionHub(
     private val machines: MachineStore,
     private val vault: KeyVault,
     private val knownHosts: KnownHostsStore,
     private val settings: SettingsStore,
+    private val recents: RecentStore,
     private val env: HubEnvironment,
     private val scope: CoroutineScope,
     private val clientVersion: String,
@@ -117,25 +129,22 @@ class SessionHub(
     private val _running = MutableStateFlow<List<RunningTurn>>(emptyList())
     val running: StateFlow<List<RunningTurn>> = _running.asStateFlow()
 
-    /** `machineId/sessionId` of the chat on screen, if any. */
+    /** Key of the chat on screen, if any. */
     @Volatile var viewing: String? = null
 
     private class Live(val link: SshLink) {
-        var acp: AcpClient? = null
-        var agent: AgentInfo? = null
-        var wizardVersion: String? = null
-        val loaded = ConcurrentHashMap.newKeySet<String>()
+        val backends = ConcurrentHashMap<Agent, AgentBackend>()
+        val loaded: MutableSet<String> = ConcurrentHashMap.newKeySet()
     }
 
     private val lives = ConcurrentHashMap<String, Live>()
     private val locks = ConcurrentHashMap<String, Mutex>()
     private val chats = ConcurrentHashMap<String, MutableStateFlow<ChatState>>()
     private val permissionAnswers = ConcurrentHashMap<String, CompletableDeferred<String?>>()
-    private val stoppedByUser = ConcurrentHashMap.newKeySet<String>()
+    private val stoppedByUser: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private var idleJob: Job? = null
 
-    private fun key(machineId: String, sessionId: String) = "$machineId/$sessionId"
-    private fun lock(machineId: String) = locks.getOrPut(machineId) { Mutex() }
+    private fun lock(name: String) = locks.getOrPut(name) { Mutex() }
 
     fun status(machineId: String): MachineStatus = _statuses.value[machineId] ?: MachineStatus()
 
@@ -159,13 +168,15 @@ class SessionHub(
             throw e
         }
         val live = Live(link)
-        val probe = withContext(Dispatchers.IO) { runCatching { RemoteScripts.parseProbe(link.exec(RemoteScripts.probe, 15).stdout) }.getOrNull() }
-        live.wizardVersion = probe?.wizardVersion
-        setStatus(machine.id) {
-            MachineStatus(Reach.Online, probe?.wizardVersion, probe?.running ?: 0, home = probe?.home)
-        }
         lives[machine.id] = live
+        probe(machine.id, live)
         live
+    }
+
+    private suspend fun probe(machineId: String, live: Live): RemoteScripts.Probe? {
+        val probe = withContext(Dispatchers.IO) { runCatching { RemoteScripts.parseProbe(live.link.run(RemoteScripts.probe, 30).stdout) }.getOrNull() }
+        setStatus(machineId) { MachineStatus(Reach.Online, probe?.agents.orEmpty(), probe?.running ?: 0, home = probe?.home) }
+        return probe
     }
 
     private fun auth(machine: Machine): SshAuth = when (machine.auth) {
@@ -180,56 +191,63 @@ class SessionHub(
         else -> previous.copy(reach = Reach.Offline, message = describe(e))
     }
 
-    private suspend fun acp(machine: Machine, live: Live): AcpClient = lock(machine.id + "#acp").withLock {
-        live.acp?.takeIf { !it.closed.isCompleted }?.let { return it }
-        live.loaded.clear()
-        if (live.wizardVersion == null) {
-            val probe = withContext(Dispatchers.IO) { RemoteScripts.parseProbe(live.link.exec(RemoteScripts.probe, 15).stdout) }
-            live.wizardVersion = probe.wizardVersion
-            setStatus(machine.id) { it.copy(wizardVersion = probe.wizardVersion, running = probe.running) }
-            if (probe.wizardVersion == null) throw WizardMissingException(machine.name)
+    private suspend fun backend(machine: Machine, agent: Agent): AgentBackend {
+        val live = live(machine)
+        return lock("${machine.id}#${agent.id}").withLock {
+            live.backends[agent]?.takeIf { !it.isClosed }?.let { return it }
+            live.loaded.removeAll { it.startsWith("${agent.id}/") }
+            if (!status(machine.id).agent(agent).ready) {
+                probe(machine.id, live)
+                if (!status(machine.id).agent(agent).ready) throw AgentMissingException(agent, machine.name)
+            }
+            val onUpdate: UpdateSink = { onUpdate(machine.id, agent, it) }
+            val onPermission: PermissionSink = { onPermission(machine, agent, it) }
+            val backend = when (agent) {
+                Agent.Wizard, Agent.Pi -> AcpBackend.start(agent, live.link, scope, clientVersion, onUpdate, onPermission)
+                Agent.ClaudeCode -> ClaudeBackend(live.link, onUpdate, onPermission)
+            }
+            live.backends[agent] = backend
+            backend
         }
-        val transport = withContext(Dispatchers.IO) { live.link.openAcp() }
-        val client = AcpClient(
-            transport = transport,
-            scope = scope,
-            onUpdate = { onUpdate(machine.id, it) },
-            onPermission = { onPermission(machine, it) },
-        )
-        try {
-            live.agent = withTimeout(30_000) { client.initialize(clientVersion) }
-        } catch (e: Exception) {
-            client.close()
-            throw if (e is CancellationException) e else IOException("wizard acp didn't start on ${machine.name}: ${describe(e)}", e)
-        }
-        live.acp = client
-        client
     }
 
     /** Connects if needed and reads the machine's state. Never throws. */
     suspend fun refresh(machineId: String) {
         val machine = machines.get(machineId) ?: return
         val existing = lives[machineId]
-        if (existing != null && existing.link.isConnected) {
-            val probe = withContext(Dispatchers.IO) { runCatching { RemoteScripts.parseProbe(existing.link.exec(RemoteScripts.probe, 15).stdout) }.getOrNull() }
-            if (probe != null) {
-                existing.wizardVersion = probe.wizardVersion
-                setStatus(machineId) { MachineStatus(Reach.Online, probe.wizardVersion, probe.running, home = probe.home) }
-                return
-            }
-        }
-        runCatching { withTimeout(20_000) { live(machine) } }.onFailure { e ->
+        if (existing != null && existing.link.isConnected && probe(machineId, existing) != null) return
+        runCatching { withTimeout(25_000) { live(machine) } }.onFailure { e ->
             if (e is kotlinx.coroutines.TimeoutCancellationException) setStatus(machineId) { it.copy(reach = Reach.Offline, message = "${machine.host} didn't answer in time.") }
         }
     }
 
     suspend fun refreshAll() {
         val list = machines.machines.first()
-        coroutineScopeAll(list.map { m -> suspend { refresh(m.id) } })
+        coroutineScope { list.map { m -> async { refresh(m.id) } }.awaitAll() }
     }
 
-    private suspend fun coroutineScopeAll(jobs: List<suspend () -> Unit>) =
-        kotlinx.coroutines.coroutineScope { jobs.map { async { it() } }.awaitAll() }
+    /** Refreshes every machine, then pulls each ready agent's saved sessions into the recent list. */
+    suspend fun refreshRecents() {
+        refreshAll()
+        val list = machines.machines.first()
+        coroutineScope {
+            list.filter { status(it.id).reach == Reach.Online }.map { m ->
+                async {
+                    val found = runCatching { sessions(m.id) }.getOrDefault(emptyList())
+                    recents.upsert(found.map { recentOf(m.id, it) })
+                }
+            }.awaitAll()
+        }
+    }
+
+    private fun recentOf(machineId: String, s: AgentSession) = RecentChat(
+        machineId = machineId,
+        agentId = s.agent.id,
+        sessionId = s.info.sessionId,
+        cwd = s.info.cwd,
+        title = s.info.title?.takeIf { it.isNotBlank() && it != "(no prompt)" },
+        updatedAt = parseTime(s.info.updatedAt) ?: 0,
+    )
 
     /** Trusts [presented] for its host (replacing any old key) and connects again. */
     suspend fun trustHostKey(machineId: String, presented: PresentedKey) {
@@ -245,73 +263,74 @@ class SessionHub(
     }
 
     private fun dispose(live: Live) {
-        live.acp?.let { runCatching { it.close() } }
+        live.backends.values.forEach { runCatching { it.close() } }
         runCatching { live.link.close() }
     }
 
     // Machine overview
 
-    suspend fun sessions(machineId: String, cwd: String? = null, pages: Int = 3): List<SessionInfo> {
+    /** Saved sessions of every ready agent on the machine, newest first. */
+    suspend fun sessions(machineId: String): List<AgentSession> {
         val machine = machine(machineId)
-        val client = acp(machine, live(machine))
-        val all = mutableListOf<SessionInfo>()
-        var cursor: String? = null
-        repeat(pages) {
-            val page = client.listSessions(cwd, cursor)
-            all += page.sessions
-            cursor = page.nextCursor ?: return all
+        live(machine)
+        return coroutineScope {
+            status(machineId).readyAgents.map { agent ->
+                async {
+                    runCatching { backend(machine, agent).listSessions(null).map { AgentSession(agent, it) } }.getOrDefault(emptyList())
+                }
+            }.awaitAll().flatten().sortedByDescending { parseTime(it.info.updatedAt) ?: parseTime(it.info.sessionId) ?: 0 }
         }
-        return all
     }
 
     suspend fun listDirs(machineId: String, path: String): RemoteScripts.Listing {
         val machine = machine(machineId)
         val live = live(machine)
-        val result = withContext(Dispatchers.IO) { live.link.exec(RemoteScripts.listDirs(path), 20) }
+        val result = withContext(Dispatchers.IO) { live.link.run(RemoteScripts.listDirs(path), 20) }
         if (result.exitStatus != 0) throw IOException(result.stderr.trim().ifEmpty { "Couldn't open $path" })
         return RemoteScripts.parseListing(result.stdout)
     }
 
-    /** Runs the Wizard installer on the machine, handing over each line of output. Returns true on success. */
-    suspend fun install(machineId: String, onLine: (String) -> Unit): Boolean {
+    /** Runs an agent's installer on the machine, handing over each line of output. Returns true on success. */
+    suspend fun install(machineId: String, agent: Agent, onLine: (String) -> Unit): Boolean {
         val machine = machine(machineId)
         val live = live(machine)
-        val status = withContext(Dispatchers.IO) { live.link.stream(RemoteScripts.install, onLine) }
-        live.wizardVersion = null
-        refresh(machineId)
-        return status == 0 && status(machineId).wizardVersion != null
+        val status = withContext(Dispatchers.IO) { live.link.stream(RemoteScripts.install(agent), onLine) }
+        live.backends.remove(agent)?.close()
+        probe(machineId, live)
+        return status == 0 && status(machineId).agent(agent).ready
     }
 
     // Chats
 
-    fun chat(machineId: String, sessionId: String): StateFlow<ChatState>? = chats[key(machineId, sessionId)]
+    fun chatKey(machineId: String, agent: Agent, sessionId: String) = "$machineId/${agent.id}/$sessionId"
+
+    fun chat(machineId: String, agent: Agent, sessionId: String): StateFlow<ChatState>? = chats[chatKey(machineId, agent, sessionId)]
 
     /** Opens a new session in [cwd] and returns its id. */
-    suspend fun startChat(machineId: String, cwd: String): String {
+    suspend fun startChat(machineId: String, agent: Agent, cwd: String): String {
         val machine = machine(machineId)
-        val live = live(machine)
-        val client = acp(machine, live)
-        val opened = client.newSession(cwd)
-        live.loaded += opened.sessionId
-        chats[key(machineId, opened.sessionId)] = MutableStateFlow(
-            ChatState(machineId, opened.sessionId, cwd, options = opened.configOptions),
+        val backend = backend(machine, agent)
+        val opened = backend.newSession(cwd)
+        lives[machineId]?.loaded?.add("${agent.id}/${opened.sessionId}")
+        chats[chatKey(machineId, agent, opened.sessionId)] = MutableStateFlow(
+            ChatState(machineId, agent, opened.sessionId, cwd, options = opened.configOptions),
         )
         machines.update(machineId) { it.withRecentDir(cwd) }
         return opened.sessionId
     }
 
     /** The state for a saved session, created empty if this app hasn't seen it. Call [openChat] to fill it. */
-    fun prepareChat(machineId: String, sessionId: String, cwd: String, title: String?): StateFlow<ChatState> =
-        chats.getOrPut(key(machineId, sessionId)) {
-            MutableStateFlow(ChatState(machineId, sessionId, cwd, title = title, loading = true))
+    fun prepareChat(machineId: String, agent: Agent, sessionId: String, cwd: String, title: String?): StateFlow<ChatState> =
+        chats.getOrPut(chatKey(machineId, agent, sessionId)) {
+            MutableStateFlow(ChatState(machineId, agent, sessionId, cwd, title = title, loading = true))
         }
 
     /** Opens a saved session, replaying its transcript if this app hasn't shown it yet. */
-    suspend fun openChat(machineId: String, sessionId: String, cwd: String, title: String?): StateFlow<ChatState> {
-        prepareChat(machineId, sessionId, cwd, title)
-        val flow = chats.getValue(key(machineId, sessionId))
+    suspend fun openChat(machineId: String, agent: Agent, sessionId: String, cwd: String, title: String?): StateFlow<ChatState> {
+        prepareChat(machineId, agent, sessionId, cwd, title)
+        val flow = chats.getValue(chatKey(machineId, agent, sessionId))
         try {
-            ensureLoaded(machineId, sessionId, flow)
+            ensureLoaded(flow)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             flow.update { it.copy(loading = false, error = describe(e)) }
@@ -319,37 +338,41 @@ class SessionHub(
         return flow
     }
 
-    private suspend fun ensureLoaded(machineId: String, sessionId: String, flow: MutableStateFlow<ChatState>): AcpClient {
-        val machine = machine(machineId)
-        val live = live(machine)
-        val client = acp(machine, live)
-        if (sessionId in live.loaded) {
+    private suspend fun ensureLoaded(flow: MutableStateFlow<ChatState>): AgentBackend {
+        val state = flow.value
+        val machine = machine(state.machineId)
+        val backend = backend(machine, state.agent)
+        val live = lives[state.machineId] ?: throw IOException("The connection dropped.")
+        val loadedKey = "${state.agent.id}/${state.sessionId}"
+        if (loadedKey in live.loaded) {
             flow.update { it.copy(loading = false) }
-            return client
+            return backend
         }
         flow.update { it.copy(acceptReplay = it.items.isEmpty(), loading = it.items.isEmpty(), error = null) }
         try {
-            val opened = client.loadSession(sessionId, flow.value.cwd)
+            val opened = backend.loadSession(state.sessionId, state.cwd)
             var options = opened.configOptions
             for ((id, value) in flow.value.chosen) {
                 if (options.firstOrNull { it.id == id }?.currentValue != value) {
-                    options = runCatching { client.setConfigOption(sessionId, id, value) }.getOrDefault(options)
+                    options = runCatching { backend.setOption(state.sessionId, id, value) }.getOrDefault(options)
                 }
             }
-            live.loaded += sessionId
+            live.loaded += loadedKey
             flow.update { it.copy(options = options, loading = false) }
         } finally {
             flow.update { it.copy(acceptReplay = false) }
         }
-        return client
+        return backend
     }
 
-    private fun onUpdate(machineId: String, note: SessionNotification) {
-        val flow = chats[key(machineId, note.sessionId)] ?: return
+    private fun onUpdate(machineId: String, agent: Agent, note: SessionNotification) {
+        val flow = chats[chatKey(machineId, agent, note.sessionId)] ?: return
         flow.update { state ->
             when {
                 note.isReplay && !state.acceptReplay -> state
                 note.update is SessionUpdate.ConfigOptionsChanged -> state.copy(options = note.update.options)
+                // Outside a turn, only a replay belongs in the transcript: Pi greets a new session with a banner.
+                !note.isReplay && !state.running -> state
                 else -> {
                     val items = Transcript.apply(state.items, note.update)
                     val title = state.title ?: (note.update as? SessionUpdate.UserText)?.text?.let(::titleFrom)
@@ -359,28 +382,29 @@ class SessionHub(
         }
     }
 
-    fun send(machineId: String, sessionId: String, text: String) {
-        val chatKey = key(machineId, sessionId)
-        val flow = chats[chatKey] ?: return
+    fun send(machineId: String, agent: Agent, sessionId: String, text: String) {
+        val key = chatKey(machineId, agent, sessionId)
+        val flow = chats[key] ?: return
         if (flow.value.running || text.isBlank()) return
         flow.update {
             it.copy(items = Transcript.userMessage(it.items, text), running = true, error = null, title = it.title ?: titleFrom(text))
         }
-        stoppedByUser.remove(chatKey)
+        stoppedByUser.remove(key)
         scope.launch {
             val machine = machines.get(machineId)
-            val turn = RunningTurn(machineId, machine?.name ?: "your machine", sessionId, flow.value.title, flow.value.cwd)
+            val turn = RunningTurn(machineId, machine?.name ?: "your machine", sessionId, flow.value.title, flow.value.cwd, agent)
             _running.update { it + turn }
+            remember(flow.value)
             env.startTurnService()
             var stopReason: String? = null
             var error: String? = null
             try {
-                val client = ensureLoaded(machineId, sessionId, flow)
-                stopReason = client.prompt(sessionId, text)
+                val backend = ensureLoaded(flow)
+                stopReason = backend.prompt(sessionId, flow.value.cwd, text)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 error = describe(e)
-                if (e is ConnectionClosedException) lives[machineId]?.let { it.acp = null }
+                if (e is ConnectionClosedException) lives[machineId]?.backends?.remove(agent)
             }
             val outcome = NotificationPolicy.outcome(stopReason, failed = error != null)
             flow.update { state ->
@@ -395,34 +419,44 @@ class SessionHub(
                 state.copy(items = items, running = false, permission = null)
             }
             _running.update { list -> list.filterNot { it.machineId == machineId && it.sessionId == sessionId } }
-            val situation = situation(chatKey)
-            if (NotificationPolicy.notifyTurnEnd(outcome, chatKey in stoppedByUser, situation)) {
+            remember(flow.value)
+            if (NotificationPolicy.notifyTurnEnd(outcome, key in stoppedByUser, situation(key))) {
                 env.postTurnEnded(
                     turn.copy(title = flow.value.title),
-                    NotificationPolicy.turnEnded(turn.machineName, outcome, Transcript.lastReplyFirstLine(flow.value.items), error),
+                    NotificationPolicy.turnEnded(turn.machineName, outcome, Transcript.lastReplyFirstLine(flow.value.items), error, agent.displayName),
                 )
             }
             if (!env.appInForeground) scheduleIdleClose()
         }
     }
 
-    fun stop(machineId: String, sessionId: String) {
-        val chatKey = key(machineId, sessionId)
-        stoppedByUser += chatKey
-        permissionAnswers.remove(chatKey)?.complete(null)
-        val client = lives[machineId]?.acp ?: return
-        scope.launch { runCatching { client.cancel(sessionId) } }
+    /** Puts a chat at the top of the recent list. */
+    fun remember(state: ChatState) {
+        scope.launch {
+            recents.upsert(listOf(RecentChat(state.machineId, state.agent.id, state.sessionId, state.cwd, state.title, System.currentTimeMillis())))
+        }
     }
 
-    fun stopAll() = _running.value.forEach { stop(it.machineId, it.sessionId) }
+    fun isRunning(machineId: String, agent: Agent, sessionId: String) =
+        chats[chatKey(machineId, agent, sessionId)]?.value?.running == true
 
-    suspend fun setOption(machineId: String, sessionId: String, configId: String, value: String) {
-        val flow = chats[key(machineId, sessionId)] ?: return
+    fun stop(machineId: String, agent: Agent, sessionId: String) {
+        val key = chatKey(machineId, agent, sessionId)
+        stoppedByUser += key
+        permissionAnswers.remove(key)?.complete(null)
+        val backend = lives[machineId]?.backends?.get(agent) ?: return
+        scope.launch { runCatching { backend.cancel(sessionId) } }
+    }
+
+    fun stopAll() = _running.value.forEach { stop(it.machineId, it.agent, it.sessionId) }
+
+    suspend fun setOption(machineId: String, agent: Agent, sessionId: String, configId: String, value: String) {
+        val flow = chats[chatKey(machineId, agent, sessionId)] ?: return
         if (flow.value.running) return
         flow.update { it.copy(chosen = it.chosen + (configId to value)) }
         try {
-            val client = ensureLoaded(machineId, sessionId, flow)
-            val options = client.setConfigOption(sessionId, configId, value)
+            val backend = ensureLoaded(flow)
+            val options = backend.setOption(sessionId, configId, value)
             flow.update { it.copy(options = options, error = null) }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -430,21 +464,21 @@ class SessionHub(
         }
     }
 
-    fun answerPermission(machineId: String, sessionId: String, optionId: String?) {
-        permissionAnswers.remove(key(machineId, sessionId))?.complete(optionId)
+    fun answerPermission(machineId: String, agent: Agent, sessionId: String, optionId: String?) {
+        permissionAnswers.remove(chatKey(machineId, agent, sessionId))?.complete(optionId)
     }
 
-    private suspend fun onPermission(machine: Machine, request: PermissionRequest): PermissionAnswer {
-        val chatKey = key(machine.id, request.sessionId)
-        val flow = chats[chatKey] ?: return PermissionAnswer(null)
+    private suspend fun onPermission(machine: Machine, agent: Agent, request: PermissionRequest): PermissionAnswer {
+        val key = chatKey(machine.id, agent, request.sessionId)
+        val flow = chats[key] ?: return PermissionAnswer(null)
         val answer = CompletableDeferred<String?>()
-        permissionAnswers[chatKey] = answer
+        permissionAnswers[key] = answer
         flow.update { it.copy(permission = PendingPermission(request)) }
-        if (NotificationPolicy.notifyNeedsInput(situation(chatKey))) {
+        if (NotificationPolicy.notifyNeedsInput(situation(key))) {
             val state = flow.value
             env.postNeedsInput(
-                RunningTurn(machine.id, machine.name, request.sessionId, state.title, state.cwd),
-                NotificationPolicy.needsInput(machine.name, request.title),
+                RunningTurn(machine.id, machine.name, request.sessionId, state.title, state.cwd, agent),
+                NotificationPolicy.needsInput(machine.name, request.title, agent.displayName),
             )
         }
         val choice = try {
@@ -455,9 +489,9 @@ class SessionHub(
         return PermissionAnswer(choice)
     }
 
-    private suspend fun situation(chatKey: String) = NotificationPolicy.Situation(
+    private suspend fun situation(key: String) = NotificationPolicy.Situation(
         appInForeground = env.appInForeground,
-        viewingChat = viewing == chatKey,
+        viewingChat = viewing == key,
         settings = settings.current(),
         permissionGranted = env.permissionGranted(),
     )
@@ -488,6 +522,18 @@ class SessionHub(
             return if (line.length <= 80) line else line.take(79).trimEnd() + "…"
         }
 
+        /** An RFC 3339 time, or a Wizard session id (`2026-08-31T15-39-52`, local time), as epoch millis. */
+        fun parseTime(value: String?): Long? {
+            if (value.isNullOrBlank()) return null
+            runCatching { return java.time.OffsetDateTime.parse(value).toInstant().toEpochMilli() }
+            runCatching { return Instant.parse(value).toEpochMilli() }
+            runCatching {
+                return java.time.LocalDateTime.parse(value, java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss"))
+                    .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            }
+            return null
+        }
+
         fun describe(e: Throwable): String = when (e) {
             is UnknownHostException -> "Can't find ${e.message ?: "that host"}."
             is ConnectException, is NoRouteToHostException -> "Nothing answered. Check the host, port and network."
@@ -495,7 +541,7 @@ class SessionHub(
             is HostKeyUnknownException -> "The host key needs confirming."
             is HostKeyChangedException -> "The host key changed."
             is ConnectionClosedException -> "The connection to the machine dropped."
-            is JsonRpcException -> e.message ?: "Wizard returned an error."
+            is JsonRpcException -> e.message ?: "The agent returned an error."
             is kotlinx.coroutines.TimeoutCancellationException -> "The machine didn't answer in time."
             else -> e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
         }

@@ -8,7 +8,14 @@ enum class TurnOutcome { Finished, TurnLimit, Cancelled, Failed }
 data class NotificationText(val title: String, val body: String)
 
 /** A turn in progress, for the ongoing notification. */
-data class RunningTurn(val machineId: String, val machineName: String, val sessionId: String, val title: String?, val cwd: String)
+data class RunningTurn(
+    val machineId: String,
+    val machineName: String,
+    val sessionId: String,
+    val title: String?,
+    val cwd: String,
+    val agent: com.teddytennant.wizard.agent.Agent = com.teddytennant.wizard.agent.Agent.Wizard,
+)
 
 /** When to notify and what to say. No Android types, so it's tested on the JVM. */
 object NotificationPolicy {
@@ -40,18 +47,18 @@ object NotificationPolicy {
     fun shouldAskPermission(sdkInt: Int, granted: Boolean, askedBefore: Boolean): Boolean =
         sdkInt >= 33 && !granted && !askedBefore
 
-    fun turnEnded(machine: String, outcome: TurnOutcome, firstLine: String?, error: String?): NotificationText {
+    fun turnEnded(machine: String, outcome: TurnOutcome, firstLine: String?, error: String?, agent: String = "Wizard"): NotificationText {
         val line = firstLine?.let(::clip)
         return when (outcome) {
-            TurnOutcome.Finished -> NotificationText("Wizard finished on $machine", line ?: "The turn is done.")
-            TurnOutcome.TurnLimit -> NotificationText("Wizard stopped on $machine", "It reached the turn limit." + (line?.let { " $it" } ?: ""))
-            TurnOutcome.Cancelled -> NotificationText("Wizard stopped on $machine", line ?: "The turn was cancelled.")
-            TurnOutcome.Failed -> NotificationText("Wizard lost $machine", error?.let(::clip) ?: "The connection dropped mid-turn.")
+            TurnOutcome.Finished -> NotificationText("$agent finished on $machine", line ?: "The turn is done.")
+            TurnOutcome.TurnLimit -> NotificationText("$agent stopped on $machine", "It reached the turn limit." + (line?.let { " $it" } ?: ""))
+            TurnOutcome.Cancelled -> NotificationText("$agent stopped on $machine", line ?: "The turn was cancelled.")
+            TurnOutcome.Failed -> NotificationText("$agent lost $machine", error?.let(::clip) ?: "The connection dropped mid-turn.")
         }
     }
 
-    fun needsInput(machine: String, what: String): NotificationText =
-        NotificationText("Wizard needs you on $machine", clip(what))
+    fun needsInput(machine: String, what: String, agent: String = "Wizard"): NotificationText =
+        NotificationText("$agent needs you on $machine", clip(what))
 
     fun ongoing(turns: List<RunningTurn>): NotificationText = when {
         turns.isEmpty() -> NotificationText("Wizard", "Connecting")

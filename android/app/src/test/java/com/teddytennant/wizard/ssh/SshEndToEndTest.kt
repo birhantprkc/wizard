@@ -89,15 +89,15 @@ class SshEndToEndTest {
 
         val trusted = KnownHosts().trust(presented)
         SshLink.connect(target, SshAuth.Key(client), trusted).use { link ->
-            val echo = link.exec(RemoteScripts.sh("printf '%s' \"\$1\"", "it's fine"))
+            val echo = link.run(RemoteScripts.sh("printf '%s' \"\$1\"", "it's fine"), 30)
             assertEquals(0, echo.exitStatus)
             assertEquals("it's fine", echo.stdout)
 
-            val probe = RemoteScripts.parseProbe(link.exec(RemoteScripts.probe).stdout)
+            val probe = RemoteScripts.parseProbe(link.run(RemoteScripts.probe, 60).stdout)
             assertTrue("wizard not found on PATH over ssh", probe.wizardVersion != null)
 
             val cwd = tmp.newFolder("project")
-            val acp = AcpClient(link.openAcp(), this + Dispatchers.IO, onUpdate = {})
+            val acp = AcpClient(link.start(RemoteScripts.acp(com.teddytennant.wizard.agent.Agent.Wizard)), this + Dispatchers.IO, onUpdate = {})
             try {
                 withTimeout(60_000) {
                     assertEquals("Wizard", acp.initialize("test").name)

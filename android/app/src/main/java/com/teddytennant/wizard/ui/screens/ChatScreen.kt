@@ -7,6 +7,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -51,11 +53,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.teddytennant.wizard.R
 import com.teddytennant.wizard.acp.PermissionRequest
+import com.teddytennant.wizard.agent.Agent
 import com.teddytennant.wizard.acp.ToolContent
 import com.teddytennant.wizard.acp.ToolStatus
 import com.teddytennant.wizard.session.ChatState
 import com.teddytennant.wizard.session.TranscriptItem
 import com.teddytennant.wizard.ui.Format
+import com.teddytennant.wizard.ui.components.AgentMark
+import com.teddytennant.wizard.ui.components.AgentTile
 import com.teddytennant.wizard.ui.components.ButtonKind
 import com.teddytennant.wizard.ui.components.CodeBox
 import com.teddytennant.wizard.ui.components.IconAction
@@ -64,7 +69,6 @@ import com.teddytennant.wizard.ui.components.PillShape
 import com.teddytennant.wizard.ui.components.Spinner
 import com.teddytennant.wizard.ui.components.StatusDot
 import com.teddytennant.wizard.ui.components.TopBar
-import com.teddytennant.wizard.ui.components.WandMark
 import com.teddytennant.wizard.ui.components.WizardButton
 import com.teddytennant.wizard.ui.components.WizardIcon
 import com.teddytennant.wizard.ui.theme.WizardTheme
@@ -72,6 +76,7 @@ import com.teddytennant.wizard.ui.theme.WizardTheme
 @Composable
 fun ChatContent(
     state: ChatState?,
+    agent: Agent,
     machineName: String,
     cwd: String,
     starting: Boolean,
@@ -92,7 +97,8 @@ fun ChatContent(
         TopBar(
             title = state?.title ?: "New session",
             onBack = onBack,
-            subtitle = "$machineName  ·  ${Format.project(cwd)}",
+            subtitle = "${agent.displayName}  ·  $machineName  ·  ${Format.project(cwd)}",
+            titleIcon = { AgentTile(agent, size = 32.dp) },
         ) {
             IconAction(R.drawable.ic_tuning, "Model and effort", onOptions, enabled = state != null)
         }
@@ -101,11 +107,11 @@ fun ChatContent(
                 startError != null || state?.error != null && items.isEmpty() -> CenterNote(startError ?: state?.error.orEmpty(), isError = true)
                 starting || state == null -> CenterNote("Starting a session", spinner = true)
                 state.loading && items.isEmpty() -> CenterNote("Loading the transcript", spinner = true)
-                items.isEmpty() -> EmptyChat(cwd)
+                items.isEmpty() -> EmptyChat(agent, cwd)
                 else -> Transcript(items, running, listState)
             }
         }
-        state?.permission?.let { PermissionCard(it.request, onPermission) }
+        state?.permission?.let { PermissionCard(agent, it.request, onPermission) }
         if (state?.error != null && items.isNotEmpty()) {
             Text(state.error, style = WizardTheme.type.small, color = colors.danger, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
         }
@@ -115,6 +121,7 @@ fun ChatContent(
             running = running,
             enabled = state != null && !starting,
             summary = state?.options?.let(::optionsSummary),
+            agentName = agent.displayName,
             onSend = onSend,
             onStop = onStop,
             onOptions = onOptions,
@@ -134,12 +141,12 @@ private fun CenterNote(text: String, spinner: Boolean = false, isError: Boolean 
 }
 
 @Composable
-private fun EmptyChat(cwd: String) {
+private fun EmptyChat(agent: Agent, cwd: String) {
     val colors = WizardTheme.colors
     Column(Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        WandMark(size = 28.dp, tint = colors.faint)
+        AgentMark(agent, size = 28.dp, tint = colors.faint)
         Spacer(Modifier.height(16.dp))
-        Text("What should Wizard do in ${Format.project(cwd)}?", style = WizardTheme.type.heading, color = colors.muted, textAlign = TextAlign.Center)
+        Text("What should ${agent.displayName} do in ${Format.project(cwd)}?", style = WizardTheme.type.heading, color = colors.muted, textAlign = TextAlign.Center)
     }
 }
 
@@ -365,8 +372,9 @@ private fun PlanCard(plan: TranscriptItem.Plan) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PermissionCard(request: PermissionRequest, onAnswer: (String?) -> Unit) {
+private fun PermissionCard(agent: Agent, request: PermissionRequest, onAnswer: (String?) -> Unit) {
     val colors = WizardTheme.colors
     val shape = RoundedCornerShape(16.dp)
     Column(
@@ -381,11 +389,11 @@ private fun PermissionCard(request: PermissionRequest, onAnswer: (String?) -> Un
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             WizardIcon(R.drawable.ic_bell, null, size = 18.dp, tint = colors.warning)
-            Text("Wizard is asking", style = WizardTheme.type.label, color = colors.text, modifier = Modifier.padding(start = 8.dp))
+            Text("${agent.displayName} is asking", style = WizardTheme.type.label, color = colors.text, modifier = Modifier.padding(start = 8.dp))
         }
-        Text(request.title, style = WizardTheme.type.mono, color = colors.text)
+        Text(request.title, style = if (request.options.all { it.kind == "allow_once" } && request.detail == null) WizardTheme.type.body else WizardTheme.type.mono, color = colors.text)
         request.detail?.let { CodeBox(it, maxLines = 8) }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             request.options.forEach { option ->
                 val reject = option.kind.startsWith("reject")
                 WizardButton(option.name, { onAnswer(option.optionId) }, kind = if (reject) ButtonKind.Quiet else ButtonKind.Solid)
@@ -397,6 +405,7 @@ private fun PermissionCard(request: PermissionRequest, onAnswer: (String?) -> Un
 
 @Composable
 private fun Composer(
+    agentName: String,
     draft: String,
     onDraft: (String) -> Unit,
     running: Boolean,
@@ -427,7 +436,7 @@ private fun Composer(
                     .semantics { contentDescription = "Message" },
                 decorationBox = { inner ->
                     Box {
-                        if (draft.isEmpty()) Text(if (running) "Wizard is working" else "Ask Wizard", style = WizardTheme.type.body, color = colors.faint)
+                        if (draft.isEmpty()) Text(if (running) "$agentName is working" else "Ask $agentName", style = WizardTheme.type.body, color = colors.faint)
                         inner()
                     }
                 },

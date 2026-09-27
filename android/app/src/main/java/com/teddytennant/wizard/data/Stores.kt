@@ -72,6 +72,7 @@ class SettingsStore(private val store: DataStore<Preferences>) {
     suspend fun setNotifyInput(on: Boolean) = store.edit { it[input] = on }
     suspend fun markAskedForNotifications() = store.edit { it[asked] = true }
 
+
     companion object {
         fun dataStore(context: Context): DataStore<Preferences> = context.dataStore
     }

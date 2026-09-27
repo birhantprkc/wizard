@@ -62,10 +62,12 @@ private fun ScreenColumn(title: String, onBack: () -> Unit, content: @Composable
 @Composable
 fun SettingsContent(
     settings: Settings,
+    machineCount: Int,
     keyCount: Int,
     trustedHosts: Int,
     notificationsAllowed: Boolean,
     version: String,
+    onMachines: () -> Unit,
     onTheme: (ThemeChoice) -> Unit,
     onNotifyFinished: (Boolean) -> Unit,
     onNotifyInput: (Boolean) -> Unit,
@@ -76,14 +78,24 @@ fun SettingsContent(
 ) {
     val colors = WizardTheme.colors
     ScreenColumn("Settings", onBack) {
-        SectionLabel("Appearance", Modifier.padding(top = 8.dp))
+        SectionLabel("Machines", Modifier.padding(top = 8.dp))
+        Panel(padding = PaddingValues(0.dp)) {
+            ListRow(
+                "Machines",
+                subtitle = when (machineCount) { 0 -> "None yet"; 1 -> "1 machine"; else -> "$machineCount machines" },
+                icon = R.drawable.ic_monitor,
+                onClick = onMachines,
+            ) { WizardIcon(R.drawable.ic_alt_arrow_right, null, size = 18.dp, tint = colors.faint) }
+        }
+
+        SectionLabel("Appearance", Modifier.padding(top = 20.dp))
         Segmented(listOf(ThemeChoice.Dark to "Dark", ThemeChoice.Light to "Light", ThemeChoice.System to "System"), settings.theme, onTheme)
 
         SectionLabel("Notifications", Modifier.padding(top = 20.dp))
         Panel(padding = PaddingValues(0.dp)) {
-            ToggleRow("Turn finished", "When Wizard finishes while you're away", settings.notifyFinished, onNotifyFinished)
+            ToggleRow("Turn finished", "When an agent finishes while you're away", settings.notifyFinished, onNotifyFinished)
             Hairline()
-            ToggleRow("Needs your input", "When Wizard waits on you to allow something", settings.notifyInput, onNotifyInput)
+            ToggleRow("Needs your input", "When an agent asks you something", settings.notifyInput, onNotifyInput)
             Hairline()
             ListRow(
                 "System settings",

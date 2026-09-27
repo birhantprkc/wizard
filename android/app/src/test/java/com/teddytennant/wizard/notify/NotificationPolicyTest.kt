@@ -50,24 +50,25 @@ class NotificationPolicyTest {
 
     @Test
     fun wording() {
-        val done = NotificationPolicy.turnEnded("devbox", TurnOutcome.Finished, "Fixed the flaky test.", null)
-        assertEquals(NotificationText("Wizard finished on devbox", "Fixed the flaky test."), done)
-        assertEquals("The turn is done.", NotificationPolicy.turnEnded("devbox", TurnOutcome.Finished, null, null).body)
-        val long = NotificationPolicy.turnEnded("devbox", TurnOutcome.Finished, "x".repeat(400), null).body
+        val done = NotificationPolicy.turnEnded("buildbox", TurnOutcome.Finished, "Fixed the flaky test.", null)
+        assertEquals(NotificationText("Wizard finished on buildbox", "Fixed the flaky test."), done)
+        assertEquals("The turn is done.", NotificationPolicy.turnEnded("buildbox", TurnOutcome.Finished, null, null).body)
+        val long = NotificationPolicy.turnEnded("buildbox", TurnOutcome.Finished, "x".repeat(400), null).body
         assertEquals(160, long.length)
         assertTrue(long.endsWith("…"))
-        assertEquals("Wizard lost devbox", NotificationPolicy.turnEnded("devbox", TurnOutcome.Failed, null, "The connection to the machine dropped.").title)
-        assertEquals("Wizard needs you on devbox", NotificationPolicy.needsInput("devbox", "execute: rm -rf target").title)
+        assertEquals("Wizard lost buildbox", NotificationPolicy.turnEnded("buildbox", TurnOutcome.Failed, null, "The connection to the machine dropped.").title)
+        assertEquals("Wizard needs you on buildbox", NotificationPolicy.needsInput("buildbox", "execute: rm -rf target").title)
+        assertEquals("Claude Code finished on buildbox", NotificationPolicy.turnEnded("buildbox", TurnOutcome.Finished, null, null, "Claude Code").title)
     }
 
     @Test
     fun ongoingSummarisesOneOrManyTurns() {
-        val a = RunningTurn("m1", "devbox", "s1", "Fix the build", "/home/t/wizard")
-        val b = RunningTurn("m1", "devbox", "s2", null, "/home/t/reverie")
+        val a = RunningTurn("m1", "buildbox", "s1", "Fix the build", "/home/t/wizard")
+        val b = RunningTurn("m1", "buildbox", "s2", null, "/home/t/reverie")
         val c = RunningTurn("m2", "pi", "s3", null, "/home/pi/code")
-        assertEquals(NotificationText("Working on devbox", "Fix the build"), NotificationPolicy.ongoing(listOf(a)))
-        assertEquals(NotificationText("Working on devbox", "reverie"), NotificationPolicy.ongoing(listOf(b)))
-        assertEquals(NotificationText("Working in 2 sessions", "On devbox"), NotificationPolicy.ongoing(listOf(a, b)))
-        assertEquals("devbox, pi", NotificationPolicy.ongoing(listOf(a, b, c)).body)
+        assertEquals(NotificationText("Working on buildbox", "Fix the build"), NotificationPolicy.ongoing(listOf(a)))
+        assertEquals(NotificationText("Working on buildbox", "reverie"), NotificationPolicy.ongoing(listOf(b)))
+        assertEquals(NotificationText("Working in 2 sessions", "On buildbox"), NotificationPolicy.ongoing(listOf(a, b)))
+        assertEquals("buildbox, pi", NotificationPolicy.ongoing(listOf(a, b, c)).body)
     }
 }

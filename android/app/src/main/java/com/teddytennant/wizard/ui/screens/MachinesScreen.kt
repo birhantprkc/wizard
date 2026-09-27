@@ -44,7 +44,7 @@ import com.teddytennant.wizard.session.MachineStatus
 import com.teddytennant.wizard.session.Reach
 import com.teddytennant.wizard.ui.components.ButtonKind
 import com.teddytennant.wizard.ui.components.IconAction
-import com.teddytennant.wizard.ui.components.LargeTitle
+import com.teddytennant.wizard.ui.components.TopBar
 import com.teddytennant.wizard.ui.components.Panel
 import com.teddytennant.wizard.ui.components.StatusDot
 import com.teddytennant.wizard.ui.components.WandMark
@@ -61,18 +61,20 @@ fun statusLine(status: MachineStatus): Triple<Color, String, Boolean> {
     return when (status.reach) {
         Reach.Unknown -> Triple(c.faint, "Not checked yet", false)
         Reach.Checking -> Triple(c.muted, "Connecting", true)
-        Reach.Online -> when {
-            status.wizardVersion == null -> Triple(c.warning, "Online, Wizard not installed", false)
-            else -> Triple(
-                c.success,
-                buildString {
-                    append("Online")
-                    append(" · ")
-                    append(status.wizardVersion.removePrefix("wizard ").let { "Wizard $it" })
-                    if (status.running > 0) append(" · ${status.running} running")
-                },
-                false,
-            )
+        Reach.Online -> {
+            val ready = status.readyAgents
+            when {
+                ready.isEmpty() -> Triple(c.warning, "Online, no agents installed", false)
+                else -> Triple(
+                    c.success,
+                    buildString {
+                        append("Online · ")
+                        append(ready.joinToString(", ") { it.displayName })
+                        if (status.running > 0) append(" · ${status.running} running")
+                    },
+                    false,
+                )
+            }
         }
         Reach.Offline -> Triple(c.faint, "Offline", false)
         Reach.NeedsTrust -> Triple(c.warning, "Confirm the host key", false)
@@ -91,19 +93,12 @@ fun MachinesContent(
     onAdd: () -> Unit,
     onEdit: (String) -> Unit,
     onDelete: (String) -> Unit,
-    onSettings: () -> Unit,
+    onBack: () -> Unit,
 ) {
     val colors = WizardTheme.colors
     Column(Modifier.fillMaxSize().background(colors.background)) {
-        Row(
-            Modifier.fillMaxWidth().statusBarsPadding().padding(start = 20.dp, end = 8.dp, top = 4.dp).height(56.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            WandMark(size = 20.dp)
-            Spacer(Modifier.width(10.dp))
-            Text("Wizard", style = WizardTheme.type.heading, color = colors.text, modifier = Modifier.weight(1f))
+        TopBar("Machines", onBack) {
             IconAction(R.drawable.ic_plus, "Add machine", onAdd, tint = colors.text)
-            IconAction(R.drawable.ic_settings, "Settings", onSettings, tint = colors.text)
         }
         PullToRefreshBox(isRefreshing = refreshing, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
             if (cards.isEmpty()) {
@@ -114,9 +109,6 @@ fun MachinesContent(
                     contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 32.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    item {
-                        LargeTitle("Machines", Modifier.padding(bottom = 12.dp))
-                    }
                     items(cards, key = { it.machine.id }) { card ->
                         MachineCard(card, onOpen = { onOpen(card.machine.id) }, onEdit = { onEdit(card.machine.id) }, onDelete = { onDelete(card.machine.id) })
                     }

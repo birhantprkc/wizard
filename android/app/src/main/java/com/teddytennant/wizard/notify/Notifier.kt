@@ -25,6 +25,7 @@ class Notifier(private val context: Context) {
         const val EXTRA_MACHINE = "machineId"
         const val EXTRA_SESSION = "sessionId"
         const val EXTRA_CWD = "cwd"
+        const val EXTRA_AGENT = "agent"
         private const val ACCENT = 0xFF8B7CF6.toInt()
     }
 
@@ -50,12 +51,13 @@ class Notifier(private val context: Context) {
         Build.VERSION.SDK_INT < 33 ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-    fun openChatIntent(machineId: String, sessionId: String, cwd: String, requestCode: Int): PendingIntent {
+    fun openChatIntent(machineId: String, agent: String, sessionId: String, cwd: String, requestCode: Int): PendingIntent {
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(EXTRA_MACHINE, machineId)
             putExtra(EXTRA_SESSION, sessionId)
             putExtra(EXTRA_CWD, cwd)
+            putExtra(EXTRA_AGENT, agent)
         }
         return PendingIntent.getActivity(context, requestCode, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
@@ -63,7 +65,7 @@ class Notifier(private val context: Context) {
     fun ongoing(turns: List<RunningTurn>): Notification {
         val text = NotificationPolicy.ongoing(turns)
         val builder = NotificationCompat.Builder(context, CHANNEL_RUNNING)
-            .setSmallIcon(R.drawable.ic_wizard_mark)
+            .setSmallIcon(turns.firstOrNull()?.agent?.icon ?: R.drawable.ic_wizard_mark)
             .setColor(ACCENT)
             .setContentTitle(text.title)
             .setContentText(text.body)
@@ -74,7 +76,7 @@ class Notifier(private val context: Context) {
             .setProgress(0, 0, true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         turns.firstOrNull()?.let { t ->
-            builder.setContentIntent(openChatIntent(t.machineId, t.sessionId, t.cwd, ONGOING_ID))
+            builder.setContentIntent(openChatIntent(t.machineId, t.agent.id, t.sessionId, t.cwd, ONGOING_ID))
             builder.addAction(0, if (turns.size == 1) "Stop" else "Stop all", TurnService.stopIntent(context))
         }
         return builder.build()
@@ -92,7 +94,7 @@ class Notifier(private val context: Context) {
         if (!permissionGranted()) return
         val id = idFor(turn.machineId, turn.sessionId)
         val notification = NotificationCompat.Builder(context, channel)
-            .setSmallIcon(R.drawable.ic_wizard_mark)
+            .setSmallIcon(turn.agent.icon)
             .setColor(ACCENT)
             .setContentTitle(text.title)
             .setContentText(text.body)
@@ -100,7 +102,7 @@ class Notifier(private val context: Context) {
             .setSubText(turn.title ?: NotificationPolicy.projectName(turn.cwd))
             .setPriority(priority)
             .setAutoCancel(true)
-            .setContentIntent(openChatIntent(turn.machineId, turn.sessionId, turn.cwd, id))
+            .setContentIntent(openChatIntent(turn.machineId, turn.agent.id, turn.sessionId, turn.cwd, id))
             .build()
         try {
             NotificationManagerCompat.from(context).notify(id, notification)

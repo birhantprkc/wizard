@@ -1,6 +1,5 @@
 package com.teddytennant.wizard.ssh
 
-import com.teddytennant.wizard.acp.AcpTransport
 import net.schmizz.sshj.DefaultConfig
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.KeyType
@@ -33,10 +32,10 @@ class SshAuthException(message: String, cause: Throwable?) : IOException(message
 data class ExecResult(val exitStatus: Int?, val stdout: String, val stderr: String)
 
 /** One authenticated SSH connection (sshj). */
-class SshLink private constructor(private val client: SSHClient) : AutoCloseable {
+class SshLink private constructor(private val client: SSHClient) : RemoteExec, AutoCloseable {
     val isConnected: Boolean get() = client.isConnected && client.isAuthenticated
 
-    fun exec(command: String, timeoutSeconds: Long = 30): ExecResult {
+    override fun run(command: String, timeoutSeconds: Long): ExecResult {
         client.startSession().use { session ->
             val cmd = session.exec(command)
             val errors = drain(cmd.errorStream)
@@ -57,14 +56,14 @@ class SshLink private constructor(private val client: SSHClient) : AutoCloseable
         }
     }
 
-    /** Starts `wizard acp` and returns its stdio. */
-    fun openAcp(command: String = RemoteScripts.acp): AcpTransport {
+    override fun start(command: String): RemoteProcess {
         val session = client.startSession()
         val cmd = session.exec(command)
         val errors = drain(cmd.errorStream)
-        return object : AcpTransport {
+        return object : RemoteProcess {
             override val input: InputStream = cmd.inputStream
             override val output: OutputStream = cmd.outputStream
+            override val stderrTail: String get() = errors.text().takeLast(2000)
             override fun close() {
                 runCatching { cmd.outputStream.close() }
                 runCatching { cmd.join(3, TimeUnit.SECONDS) }
@@ -72,7 +71,6 @@ class SshLink private constructor(private val client: SSHClient) : AutoCloseable
                 runCatching { session.close() }
                 errors.interrupt()
             }
-            override fun toString() = "acp over ssh (stderr: ${errors.text().takeLast(400)})"
         }
     }
 

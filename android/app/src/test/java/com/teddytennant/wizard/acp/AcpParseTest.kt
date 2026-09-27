@@ -40,9 +40,9 @@ class AcpParseTest {
 
     @Test
     fun sessionListPages() {
-        val page = AcpParse.sessionPage(result("""{"jsonrpc":"2.0","id":2,"result":{"sessions":[{"sessionId":"2026-08-31T15-39-52","cwd":"/home/nixos/all-my-repos/ai/wizard","title":"Report the line count","updatedAt":"2026-08-31T15:39:57.684761348+00:00"},{"cwd":"/no/id"}],"nextCursor":"abc"}}"""))
+        val page = AcpParse.sessionPage(result("""{"jsonrpc":"2.0","id":2,"result":{"sessions":[{"sessionId":"2026-08-31T15-39-52","cwd":"/home/dev/src/wizard","title":"Report the line count","updatedAt":"2026-08-31T15:39:57.684761348+00:00"},{"cwd":"/no/id"}],"nextCursor":"abc"}}"""))
         assertEquals(1, page.sessions.size)
-        assertEquals("/home/nixos/all-my-repos/ai/wizard", page.sessions[0].cwd)
+        assertEquals("/home/dev/src/wizard", page.sessions[0].cwd)
         assertEquals("abc", page.nextCursor)
     }
 

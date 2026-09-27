@@ -7,6 +7,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.teddytennant.wizard.data.MachineStore
+import com.teddytennant.wizard.data.RecentStore
+import com.teddytennant.wizard.data.SelectionStore
 import com.teddytennant.wizard.data.SettingsStore
 import com.teddytennant.wizard.notify.NotificationText
 import com.teddytennant.wizard.notify.Notifier
@@ -32,6 +34,8 @@ class AppGraph(context: Context) {
     private val dataStore = SettingsStore.dataStore(app)
     val machines = MachineStore(dataStore)
     val settings = SettingsStore(dataStore)
+    val recents = RecentStore(dataStore)
+    val selection = SelectionStore(dataStore)
     private val vaultKey by lazy { KeystoreKey.get() }
     val vault = KeyVault(File(app.filesDir, "vault"), AesGcmBox { vaultKey })
     val knownHosts = KnownHostsStore(File(app.filesDir, "known_hosts.json"))
@@ -43,6 +47,7 @@ class AppGraph(context: Context) {
         vault = vault,
         knownHosts = knownHosts,
         settings = settings,
+        recents = recents,
         env = object : HubEnvironment {
             override val appInForeground: Boolean
                 get() = ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
