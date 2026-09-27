@@ -22,8 +22,9 @@ use crate::tools::scripted::ScriptedTool;
 /// The driver's tool name, and the stem of its two files.
 pub const DRIVER_NAME: &str = "computer_driver";
 
-/// What a generated driver must do. The generation prompt, the `computer`
-/// manual page and docs/computer-use.md all quote this.
+/// What a generated driver must do. The generation prompt and the `computer`
+/// manual page carry it word for word; docs/computer-use.md has it as a
+/// table.
 pub const DRIVER_CONTRACT: &str = "\
 The driver is a LuaJIT scripted tool: ~/.wizard/tools/computer_driver.toml \
 (name = \"computer_driver\", script = \"computer_driver.lua\", runtime = \

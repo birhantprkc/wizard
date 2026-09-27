@@ -6,6 +6,34 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Computer use in a VM.** `wizard computer vm up` runs a small desktop
+  (Xvfb, fluxbox, xterm, x11vnc) in Docker or Podman on 127.0.0.1, and
+  `[computer] backend = "vm"` points the `computer` tool at it over VNC
+  instead of at your own screen. `address` under `[computer.vm]` drives a VM
+  you run yourself, such as QEMU with `-vnc`.
+
+- **`wizard computer setup`.** Detects the OS, session and compositor, offers
+  the VM or this desktop, and turns computer use on only after a screenshot
+  and a one-pixel pointer move work. Where Wizard has no built-in driver
+  (GNOME or KDE on Wayland, Windows, WSL) it shows a plan and asks whether the
+  agent should write one, as a LuaJIT scripted tool in `~/.wizard/tools/`.
+  Also `status`, `check`, `disable`, `/computer`, and a `computer` page in the
+  agent's manual.
+
+- **Live screen in Wizard GUI.** A card in the top right shows what the agent
+  sees, live for the VM, with a ripple where it clicked and a caption for
+  what it typed. Click it to open it large. Take control pauses the agent's
+  input actions and sends your mouse and keyboard to the VM; Give back hands
+  it over again.
+
+### Changed
+
+- **Computer use is off by default.** The `computer` tool is only registered
+  with `[computer] enabled = true`, which `wizard computer setup` writes.
+  Before, every session on every machine had it, set up or not.
+
 ## [3.6.0] - 2026-09-27
 
 ### Added
