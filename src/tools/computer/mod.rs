@@ -18,6 +18,8 @@
 //!   (`CGEvent`) for input and `screencapture` for capture. Requires
 //!   Accessibility and Screen Recording permission for the terminal running
 //!   Wizard.
+//! - **host, scripted** ([`driver`]): a LuaJIT driver the agent generated for
+//!   a system the native one does not cover ([`detect`] decides which).
 //! - **vm** ([`vm`]): a desktop in a local container, over VNC ([`rfb`]).
 //!
 //! Like `execute`, this is real control of the user's machine — and, like
@@ -28,6 +30,7 @@
 //! Wizard, for this tool or any other (see `SECURITY.md`).
 
 pub mod detect;
+pub mod driver;
 pub mod rfb;
 pub mod setup;
 pub mod state;
@@ -111,9 +114,8 @@ pub(crate) trait Backend: Send + Sync {
 pub(crate) fn backend_for(config: &ComputerConfig) -> Box<dyn Backend> {
     match (config.backend, config.driver) {
         (ComputerBackend::Vm, _) => Box::new(vm::VmBackend::new(config.vm.vnc_address())),
-        // The generated driver arrives with `driver`; until then a scripted
-        // setting falls back to the built-in one.
-        (ComputerBackend::Host, HostDriver::Native | HostDriver::Scripted) => native(),
+        (ComputerBackend::Host, HostDriver::Scripted) => Box::new(driver::ScriptedBackend::new()),
+        (ComputerBackend::Host, HostDriver::Native) => native(),
     }
 }
 
