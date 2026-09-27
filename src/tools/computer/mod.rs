@@ -23,6 +23,10 @@
 //!   a system the native one does not cover ([`detect`] decides which).
 //! - **vm** ([`vm`]): a desktop in a local container, over VNC ([`rfb`]).
 //!
+//! Each action is also written to `~/.wizard/computer/` ([`state`]) for Wizard
+//! GUI's live screen panel, and input actions wait while the user holds the
+//! screen through that panel's "Take control".
+//!
 //! Like `execute`, this is real control of the user's machine — and, like
 //! `execute`, nothing gates an individual action. [`ToolAccess::Execute`]
 //! here means plan mode refuses the tool, a checkpoint is taken around it,
@@ -55,6 +59,10 @@ use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args};
 
 /// The tool's advertised name.
 pub const TOOL_NAME: &str = "computer";
+
+/// How long an input action waits for the user to give the screen back
+/// before it fails and tells the model why.
+const CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest-side pixel cap applied to a screenshot before it is sent to the
 /// model. Keeps a 4K / multi-monitor capture from ballooning the request;
@@ -255,6 +263,13 @@ impl ComputerTool {
         Self { config }
     }
 
+    fn backend_name(&self) -> &'static str {
+        match self.config.backend {
+            ComputerBackend::Host => "host",
+            ComputerBackend::Vm => "vm",
+        }
+    }
+
     fn invalid(&self, message: impl Into<String>) -> ToolError {
         ToolError::InvalidArgs {
             tool: "computer".to_string(),
@@ -375,7 +390,20 @@ impl Tool for ComputerTool {
         };
         let text = args.text.clone();
 
+        // The user took the screen through Wizard GUI's panel. Looking is fine;
+        // acting is not until they give it back.
+        let is_input = !matches!(action.as_str(), "screenshot" | "cursor_position");
+        if is_input && let Some(holder) = wait_for_control(CONTROL_WAIT).await {
+            return Ok(ToolOutput::error(format!(
+                "The user has taken control of the screen ({holder}) and has not given it back. \
+                 Do not act on it now: wait, then take a screenshot before your next action, \
+                 since they may have changed what is on screen."
+            )));
+        }
+
+        state::record_action(self.backend_name(), &action, target, text.as_deref());
         let config = self.config.clone();
+        let keep_frame = config.backend == ComputerBackend::Host;
 
         // All backend work is synchronous (shell-outs / native API calls), so
         // run it off the async runtime.
@@ -383,8 +411,15 @@ impl Tool for ComputerTool {
             let backend = backend_for(&config);
             // Tag failures with the active backend so the model (and user)
             // can see which control path was used.
-            run_action(&*backend, &action, target, scroll, text.as_deref())
-                .map_err(|err| err.context(format!("backend: {}", backend.label())))
+            run_action(
+                &*backend,
+                &action,
+                target,
+                scroll,
+                text.as_deref(),
+                keep_frame,
+            )
+            .map_err(|err| err.context(format!("backend: {}", backend.label())))
         })
         .await
         .map_err(|err| ToolError::Execution {
@@ -407,9 +442,10 @@ fn run_action(
     target: Option<(i32, i32)>,
     scroll: Option<(ScrollDirection, u32)>,
     text: Option<&str>,
+    keep_frame: bool,
 ) -> anyhow::Result<ToolOutput> {
     match action {
-        "screenshot" => capture(backend),
+        "screenshot" => capture(backend, keep_frame),
         "mouse_move" => {
             let (x, y) = target.expect("validated");
             backend.mouse_move(x, y)?;
@@ -466,9 +502,12 @@ fn run_action(
 /// Take a screenshot, downscale for transport, and package it as a tool
 /// output carrying the base64 PNG plus a text note giving the real screen
 /// size (the model's coordinate space).
-fn capture(backend: &dyn Backend) -> anyhow::Result<ToolOutput> {
+fn capture(backend: &dyn Backend, keep_frame: bool) -> anyhow::Result<ToolOutput> {
     let shot = backend.screenshot()?;
     let (w, h) = (shot.width, shot.height);
+    if keep_frame {
+        state::record_frame(&shot.png);
+    }
     let delivered = downscale_png(shot.png, SCREENSHOT_MAX_EDGE);
     // `from_bytes` sniffs the media type and enforces the shared image size
     // cap, so an oversized capture is refused here rather than by the provider
@@ -486,6 +525,27 @@ fn capture(backend: &dyn Backend) -> anyhow::Result<ToolOutput> {
         is_error: false,
         images: vec![image],
     })
+}
+
+/// Wait up to `limit` for the user to give the screen back. Returns who
+/// still holds it when the wait runs out, `None` once it is free.
+async fn wait_for_control(limit: std::time::Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let lease = tokio::task::spawn_blocking(state::control_held)
+            .await
+            .ok()
+            .flatten()?;
+        if tokio::time::Instant::now() >= deadline {
+            let holder = if lease.holder.is_empty() {
+                format!("pid {}", lease.pid)
+            } else {
+                lease.holder
+            };
+            return Some(holder);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Read width/height from a PNG's IHDR chunk without decoding the image.
@@ -695,6 +755,21 @@ mod tests {
             .expect("wait runs");
         assert!(!out.is_error);
         assert!(out.content.contains("Waited"));
+    }
+
+    /// While the user holds the screen, input waits and then fails with a
+    /// message that tells the model to look again before acting.
+    #[tokio::test]
+    async fn input_waits_while_the_user_holds_the_screen() {
+        state::take_control("test panel").expect("write the lease");
+        let held = wait_for_control(std::time::Duration::from_millis(300)).await;
+        state::give_back();
+        assert_eq!(held.as_deref(), Some("test panel"));
+        assert_eq!(
+            wait_for_control(std::time::Duration::from_millis(300)).await,
+            None,
+            "a released screen does not wait"
+        );
     }
 
     #[test]
