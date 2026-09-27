@@ -1709,3 +1709,92 @@ fn selection_skips_the_gutter_left_of_each_rows_text_origin() {
         "world"
     );
 }
+
+/// Every row of one 100x60 frame, joined, for asserting on what was drawn.
+fn frame_text(app: &App) -> String {
+    let (width, height) = (100, 60);
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A long tool output is never drawn open, not even for the one frame between
+/// the event that made it long and the event that would have folded it.
+///
+/// The frame is drawn after every single event, which is what the event loop
+/// does. `execute` streams its output into the card while it runs, and the
+/// card used to stay open until the result landed, so a fast command drew its
+/// whole output and then snapped shut.
+#[test]
+fn a_long_tool_output_is_folded_from_the_first_frame_it_is_in() {
+    use crate::agent::{AgentEvent, ConsoleGate};
+    use crate::tools::ToolOutput;
+
+    let long: String = (1..=40).map(|n| format!("out-{n:02}\n")).collect();
+    for skin in crate::skin::Skin::ALL {
+        let _pinned = crate::skin::pin(skin);
+        let mut app = App::new(crate::config::Config::default());
+        app.welcome_dismissed = true;
+        let (gate, _host) = ConsoleGate::open();
+
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "execute".to_string(),
+            args: serde_json::json!({ "command": "seq 40" }),
+        });
+        // Short so far: a running command's first lines stay in view.
+        app.handle_agent_event(AgentEvent::ConsoleOutput {
+            gate,
+            chunk: "out-01\nout-02\n".to_string(),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            frame.contains("out-02"),
+            "{skin:?} short output shows\n{frame}"
+        );
+
+        // The chunk that makes it long folds it in the same frame.
+        app.handle_agent_event(AgentEvent::ConsoleOutput {
+            gate,
+            chunk: long["out-01\nout-02\n".len()..].to_string(),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("out-"),
+            "{skin:?} drew streamed output that is long\n{frame}"
+        );
+
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "execute".to_string(),
+            output: ToolOutput::ok(long.clone()),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("out-"),
+            "{skin:?} drew the result as it landed\n{frame}"
+        );
+
+        // A tool that does not stream: folded as the result arrives.
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            args: serde_json::json!({ "path": "big.txt" }),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "read_file".to_string(),
+            output: ToolOutput::ok(long.replace("out-", "read-")),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("read-"),
+            "{skin:?} drew a long read as it landed\n{frame}"
+        );
+    }
+}

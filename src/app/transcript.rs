@@ -228,10 +228,10 @@ pub struct TranscriptView {
     /// a method here so [`TranscriptView::sync`] runs against exactly one
     /// [`Change`], which is the contract the signal is defined under.
     model: TranscriptModel,
-    /// Whether the item at each index is folded, one flag per item. Only tool
-    /// rows can be folded; the flag on any other row is inert and costs a
-    /// byte, which is cheaper than a map keyed by an index that moves.
-    folded: Vec<bool>,
+    /// Whether the item at each index is folded, one entry per item. Only
+    /// tool rows can be folded; the entry on any other row is inert and costs
+    /// two bytes, which is cheaper than a map keyed by an index that moves.
+    folded: Vec<Fold>,
     /// The model revision `folded` was last brought into step with, so a call
     /// that changed nothing does not re-derive (and so discard) the user's
     /// folds against a stale [`Change`].
@@ -352,15 +352,15 @@ impl TranscriptView {
     /// Whether the row at `index` is drawn folded. Meaningless for anything
     /// but a tool row, and `false` past the end.
     pub fn folded(&self, index: usize) -> bool {
-        self.folded.get(index).copied().unwrap_or(false)
+        self.folded.get(index).is_some_and(|fold| fold.shut)
     }
 
     // -- Folding ----------------------------------------------------------
 
     /// Fold or unfold the row at `index`.
     pub fn toggle(&mut self, index: usize) {
-        if let Some(flag) = self.folded.get_mut(index) {
-            *flag = !*flag;
+        if let Some(fold) = self.folded.get_mut(index) {
+            fold.shut = !fold.shut;
         }
     }
 
@@ -380,7 +380,7 @@ impl TranscriptView {
     /// point of that turn is the answer below it, not the drafts behind it.
     pub fn set_last_tool_folded(&mut self, folded: bool) {
         if let Some(index) = self.last_tool_row() {
-            self.folded[index] = folded;
+            self.folded[index].shut = folded;
         }
     }
 
@@ -494,42 +494,79 @@ impl TranscriptView {
         match self.model.last_change() {
             // The tail is not an item.
             Change::Streaming => {}
-            Change::Reset => {
-                self.folded = self.model.items().iter().map(folds_by_default).collect()
-            }
+            Change::Reset => self.folded = self.model.items().iter().map(Fold::new).collect(),
             Change::Appended(at) => {
                 // Everything from `at` down is new, so nothing the user folded
                 // is being discarded here.
                 self.folded.truncate(at);
                 for item in &self.model.items()[self.folded.len()..] {
-                    self.folded.push(folds_by_default(item));
+                    self.folded.push(Fold::new(item));
                 }
             }
             Change::Inserted(at) => {
-                let flag = self.model.items().get(at).is_some_and(folds_by_default);
+                let fold = self
+                    .model
+                    .items()
+                    .get(at)
+                    .map(Fold::new)
+                    .unwrap_or_default();
                 let at = at.min(self.folded.len());
-                self.folded.insert(at, flag);
+                self.folded.insert(at, fold);
             }
             Change::Mutated(at) => {
-                // A row that just gained its result: the fold policy is about
-                // the output, which did not exist until now.
-                if let (Some(item), Some(flag)) =
+                // A row whose output just grew or landed. The policy is about
+                // the output, so it is asked again, in this same call: a
+                // command's streamed output has to fold in the event that made
+                // it long, or the frame drawn next shows it open.
+                if let (Some(item), Some(fold)) =
                     (self.model.items().get(at), self.folded.get_mut(at))
                 {
-                    *flag = folds_by_default(item);
+                    fold.follow(item);
                 }
             }
         }
     }
 }
 
-/// Whether a row starts folded.
+/// One row's fold: what it is drawn as, and what the policy last said.
 ///
-/// A call still running is always open — its card is where you watch it work.
-/// Once it answers, only length folds it: output long enough to bury the reply
-/// underneath it. A failure stays open whatever its exit, because the lines
-/// under `✗` are the reason it failed, and a reason behind Ctrl-T is a reason
-/// nobody reads.
+/// Two flags because a row's output changes after the row exists: every chunk
+/// a running command prints is a [`Change::Mutated`]. Re-applying the policy
+/// on each one would undo a Ctrl-T the user pressed to watch a long build, so
+/// a mutation only moves the row when the *policy's* answer moves.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fold {
+    /// Drawn folded.
+    shut: bool,
+    /// [`folds_by_default`] the last time it was asked about this row.
+    auto: bool,
+}
+
+impl Fold {
+    fn new(item: &TranscriptItem) -> Self {
+        let auto = folds_by_default(item);
+        Self { shut: auto, auto }
+    }
+
+    fn follow(&mut self, item: &TranscriptItem) {
+        let auto = folds_by_default(item);
+        if auto != self.auto {
+            *self = Self { shut: auto, auto };
+        }
+    }
+}
+
+/// Whether a row is folded by default.
+///
+/// Length folds a row: output long enough to bury the reply underneath it.
+/// That includes a call still running. A command streams what it prints into
+/// its card as it goes, and a card left open until the result landed drew the
+/// whole stream for a frame or two before snapping shut, which on a fast
+/// command reads as a flash of output that was never meant to be shown.
+///
+/// A short failure stays open whatever its exit, because the lines under `✗`
+/// are the reason it failed, and a reason behind Ctrl-T is a reason nobody
+/// reads.
 ///
 /// One rule, applied to a live row and a replayed one alike. The TUI used to
 /// have two: replay folded *every* answered call whatever its size, so a
@@ -540,7 +577,7 @@ fn folds_by_default(item: &TranscriptItem) -> bool {
     match item {
         TranscriptItem::Tool(tool) => match &tool.output {
             Some(output) => collapse_long(&output.content),
-            None => false,
+            None => collapse_long(&tool.progress),
         },
         _ => false,
     }

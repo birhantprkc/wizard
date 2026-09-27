@@ -4388,6 +4388,10 @@ impl App {
                         console.command
                     ));
                     self.console = Some(console);
+                    // The question is the last line of the card, and a long
+                    // stream has folded it. Nobody can answer what they cannot
+                    // see.
+                    self.transcript.set_last_tool_folded(false);
                 }
             }
             // Already folded into the running tool's card by the model above;
