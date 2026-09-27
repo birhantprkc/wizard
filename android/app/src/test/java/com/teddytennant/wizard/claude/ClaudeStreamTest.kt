@@ -92,6 +92,8 @@ class ClaudeStreamTest {
             """{"isSidechain":true,"type":"assistant","message":{"content":[{"type":"text","text":"subagent chatter"}]}}""",
             """{"isSidechain":false,"type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"Fixed: `x` was renamed."}]}}""",
             """{"type":"ai-title","aiTitle":"Fix the build"}""",
+            // The wake turn after a background agent starts from a message the CLI wrote itself.
+            """{"isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a7</task-id>\n<status>completed</status>\n</task-notification>"}}""",
         ).asSequence()
         val (items, _) = fold(ClaudeNormalizer(live = false), log)
         assertEquals(listOf("User", "Thinking", "Tool", "Agent"), items.map { it::class.simpleName })

@@ -214,7 +214,8 @@ class ClaudeNormalizer(private val live: Boolean) {
         fun isPrompt(text: String): Boolean {
             val t = text.trimStart()
             return t.isNotBlank() && !t.startsWith("<command-") && !t.startsWith("<local-command") &&
-                !t.startsWith("<system-reminder>") && !t.startsWith("Caveat:") && !t.startsWith("[Request interrupted")
+                !t.startsWith("<system-reminder>") && !t.startsWith("<task-notification>") && !t.startsWith("Caveat:") &&
+                !t.startsWith("[Request interrupted")
         }
 
         fun toolKind(name: String): String = when (name) {
