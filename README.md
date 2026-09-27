@@ -2,6 +2,10 @@
 
 The fastest agent in your terminal. One Rust binary, any model, a desktop app, and a full harness that still finishes your task before the minimal ones do.
 
+[![Wizard 3.5: the desktop app building Conway's Game of Life, the diff, and the result running in a terminal](demo/wizard-3.5.webp)](demo/wizard-3.5.mp4)
+
+A 21 second cut. The [full two minutes](demo/wizard-3.5.mp4) has sound.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/teddytennant/wizard/main/install.sh | bash
 ```
