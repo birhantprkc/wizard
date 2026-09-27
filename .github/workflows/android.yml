@@ -1,0 +1,63 @@
+name: Android
+
+# Wizard for Android (android/) is its own Gradle build, checked only when
+# android/ or this file changes, so a wizard-only change never waits on it.
+# Nothing here signs anything: with no WIZARD_ANDROID_* variables set the
+# release build falls back to the debug key, which is all a check needs. The
+# signed build is release.yml's `android-build`, and this runs the same
+# Gradle tasks so a tag does not find a failure first.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: android
+
+jobs:
+  build:
+    name: Android build, tests and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The versions android/flake.nix pins, same as release.yml.
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          cmdline-tools-version: '15859902'
+          packages: 'platforms;android-37.0 build-tools;36.1.0'
+          log-accepted-android-sdk-licenses: false
+
+      # Validates the wrapper jar and caches ~/.gradle. Only main writes the
+      # cache (the action's default), as with rust-cache in the other
+      # workflows. `basic` is the provider that is a plain wrapper over
+      # actions/cache; the default one is a closed-source component.
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-provider: basic
+
+      - name: Test, lint and build the release APK
+        run: ./gradlew :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
