@@ -9,8 +9,9 @@
 //! back 1:1 without any stateful scaling).
 //!
 //! Computer use is off until the user sets it up: the tool is registered only
-//! when `[computer] enabled = true`. Input and capture are delegated to a
-//! [`Backend`] chosen by `[computer]`:
+//! when `[computer] enabled = true`, which `wizard computer setup` writes
+//! after it has checked a backend works ([`command`]). Input and capture are
+//! delegated to a [`Backend`] chosen by `[computer]`:
 //! - **host, native, Linux** ([`linux`]): `ydotool` for input (works on
 //!   Wayland and X11 via the kernel uinput interface) and `grim`/`maim`/
 //!   ImageMagick for capture. `wizard desktop-setup` installs these.
@@ -29,6 +30,7 @@
 //! `ToolAccess`'s own doc says so. There is no per-action approval gate in
 //! Wizard, for this tool or any other (see `SECURITY.md`).
 
+pub mod command;
 pub mod detect;
 pub mod driver;
 pub mod rfb;

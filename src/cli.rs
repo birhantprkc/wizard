@@ -498,10 +498,89 @@ pub enum Command {
     /// See docs/computer-use.md.
     DesktopSetup,
 
+    /// Computer use: set it up, check it, and run its VM. Off until
+    /// `wizard computer setup` has checked a backend works. See
+    /// docs/computer-use.md.
+    Computer {
+        #[command(subcommand)]
+        cmd: Option<ComputerCmd>,
+    },
+
     /// Run the full setup wizard (provider, gateway, mode, interface, web
     /// search, Claude import), then start Wizard. The same as `--onboard`;
     /// the first run asks one question and `/setup` in the TUI has the rest.
     Setup,
+}
+
+/// `wizard computer` subcommands.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ComputerCmd {
+    /// What this system is, which backends can drive it, and what is
+    /// configured. The default.
+    Status,
+
+    /// Detect the system, pick a backend with you, check that it works, and
+    /// turn computer use on. Where Wizard has no built-in driver for the
+    /// desktop, offers to have the agent write one.
+    Setup {
+        /// Skip the question and use this backend.
+        #[arg(long, value_enum)]
+        backend: Option<ComputerBackendArg>,
+        /// Answer yes to every question (install tools, generate a driver).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Take a screenshot and nudge the pointer by one pixel and back, through
+    /// the configured backend or the one named. Changes nothing else.
+    Check {
+        #[arg(long, value_enum)]
+        backend: Option<ComputerBackendArg>,
+        /// For the host backend: the built-in driver or the generated one.
+        #[arg(long, value_enum)]
+        driver: Option<ComputerDriverArg>,
+        /// Also write the screenshot here.
+        #[arg(long)]
+        save: Option<std::path::PathBuf>,
+    },
+
+    /// Start, stop or inspect the VM the `vm` backend drives.
+    Vm {
+        #[command(subcommand)]
+        cmd: ComputerVmCmd,
+    },
+
+    /// Turn computer use off. A running VM keeps running until `vm down`.
+    Disable,
+}
+
+/// `wizard computer vm` subcommands.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ComputerVmCmd {
+    /// Build the image if needed, start the container, and wait for VNC.
+    Up {
+        /// Rebuild the image even if it exists.
+        #[arg(long)]
+        rebuild: bool,
+    },
+    /// Stop and remove the container.
+    Down,
+    /// Whether the container runs and VNC answers.
+    Status,
+}
+
+/// `--backend` for `wizard computer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ComputerBackendArg {
+    Host,
+    Vm,
+}
+
+/// `--driver` for `wizard computer check`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ComputerDriverArg {
+    Native,
+    Scripted,
 }
 
 /// `wizard plugin` subcommands.
