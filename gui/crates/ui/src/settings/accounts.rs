@@ -115,6 +115,78 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
+/// One usage window (zeron settings.agents.tsx `UsageMeter`): label ·
+/// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
+/// quiet reset time. Settings → Wizard draws its subscriptions with it too.
+pub fn render_usage_meter(
+    window: &zeron_proto::AgentUsageWindow,
+    theme: &Theme,
+    now: DateTime<Utc>,
+) -> AnyElement {
+    let fraction = window.used_fraction.clamp(0.0, 1.0);
+    let level = usage_level(fraction);
+    let fill = usage_color(level, theme).opacity(match level {
+        UsageLevel::Normal => 0.8,
+        _ => 0.85,
+    });
+    let reset = format_reset(window.resets_at, now);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .text_size(crate::typography::ui_rems(11.5))
+        .text_color(theme.text_muted.opacity(0.7))
+        .child(
+            div()
+                .w(px(48.0))
+                .flex_none()
+                .truncate()
+                .child(SharedString::from(window.label.clone())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(56.0))
+                .max_w(px(230.0))
+                .h(px(5.0))
+                .rounded_full()
+                .overflow_hidden()
+                .bg(crate::theme::ink(0.07))
+                .when(fraction > 0.0, |el| {
+                    el.child(
+                        div()
+                            .h_full()
+                            // A 1.5% floor keeps tiny non-zero usage
+                            // visible (zeron `max(used, 1.5)%`).
+                            .w(gpui::relative(fraction.max(0.015)))
+                            .rounded_full()
+                            .bg(fill),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .w(px(64.0))
+                .flex_none()
+                .text_right()
+                .child(SharedString::from(format!(
+                    "{}% used",
+                    (fraction * 100.0).round() as u32
+                ))),
+        )
+        .when_some(reset, |el, reset| {
+            el.child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_color(theme.text_muted.opacity(0.45))
+                    .child(SharedString::from(reset)),
+            )
+        })
+        .into_any_element()
+}
+
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`). Wizard and
 /// Pi keep their own sign-ins (onboarding imports Codex/Grok logins for
@@ -693,79 +765,6 @@ impl AccountsPage {
 
     // ---- render pieces ----
 
-    /// One usage window (zeron settings.agents.tsx `UsageMeter`): label ·
-    /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
-    /// quiet reset time.
-    fn render_usage_meter(
-        &self,
-        window: &zeron_proto::AgentUsageWindow,
-        theme: &Theme,
-        now: DateTime<Utc>,
-    ) -> AnyElement {
-        let fraction = window.used_fraction.clamp(0.0, 1.0);
-        let level = usage_level(fraction);
-        let fill = usage_color(level, theme).opacity(match level {
-            UsageLevel::Normal => 0.8,
-            _ => 0.85,
-        });
-        let reset = format_reset(window.resets_at, now);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(crate::typography::ui_rems(11.5))
-            .text_color(theme.text_muted.opacity(0.7))
-            .child(
-                div()
-                    .w(px(48.0))
-                    .flex_none()
-                    .truncate()
-                    .child(SharedString::from(window.label.clone())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(56.0))
-                    .max_w(px(230.0))
-                    .h(px(5.0))
-                    .rounded_full()
-                    .overflow_hidden()
-                    .bg(crate::theme::ink(0.07))
-                    .when(fraction > 0.0, |el| {
-                        el.child(
-                            div()
-                                .h_full()
-                                // A 1.5% floor keeps tiny non-zero usage
-                                // visible (zeron `max(used, 1.5)%`).
-                                .w(gpui::relative(fraction.max(0.015)))
-                                .rounded_full()
-                                .bg(fill),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(64.0))
-                    .flex_none()
-                    .text_right()
-                    .child(SharedString::from(format!(
-                        "{}% used",
-                        (fraction * 100.0).round() as u32
-                    ))),
-            )
-            .when_some(reset, |el, reset| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .truncate()
-                        .text_color(theme.text_muted.opacity(0.45))
-                        .child(SharedString::from(reset)),
-                )
-            })
-            .into_any_element()
-    }
-
     /// One account row (zeron settings.agents.tsx `AccountRow`): initial
     /// avatar, email + usage meters left; badges over the Switch/Forget
     /// actions right-anchored.
@@ -912,7 +911,7 @@ impl AccountsPage {
                                     account
                                         .usage_windows
                                         .iter()
-                                        .map(|w| self.render_usage_meter(w, theme, now)),
+                                        .map(|w| render_usage_meter(w, theme, now)),
                                 ),
                             )
                         }

@@ -7,6 +7,9 @@
 //! relay-forwardable `*WizardProvider*` RPCs and the page-header device
 //! switcher (the Agents pattern) retargets them. The composer's Wizard model
 //! list reloads after each change, so new providers' models show up at once.
+//!
+//! Usage shows each signed-in subscription's plan limits (xAI, ChatGPT) with
+//! the Accounts page's meters, read through `WizardUsage` on the same device.
 
 use std::time::Duration;
 
@@ -18,6 +21,7 @@ use zeron_engine::wizard_auth::CredentialSource;
 use zeron_engine::wizard_auth::providers::{
     Account, LoginState, LoginStatus, ProviderPreset, ProviderRow, WizardProviders,
 };
+use zeron_engine::wizard_auth::usage::{SubscriptionUsage, WizardUsage};
 use zeron_rpc::methods;
 
 use crate::composer::ComposerInput;
@@ -47,6 +51,10 @@ pub struct WizardProvidersPage {
     device_menu_pressed_open: bool,
     providers: Loadable<WizardProviders>,
     load_task: Option<Task<()>>,
+    /// Each signed-in subscription's plan limits. Loaded with the page and on
+    /// Refresh; a slow account never holds up the provider list.
+    usage: Loadable<WizardUsage>,
+    usage_task: Option<Task<()>>,
     pending: Option<Pending>,
     op_task: Option<Task<()>>,
     error: Option<String>,
@@ -80,6 +88,8 @@ impl WizardProvidersPage {
             device_menu_pressed_open: false,
             providers: Loadable::Idle,
             load_task: None,
+            usage: Loadable::Idle,
+            usage_task: None,
             pending: None,
             op_task: None,
             error: None,
@@ -94,6 +104,7 @@ impl WizardProvidersPage {
             login_task: None,
         };
         page.load(cx);
+        page.load_usage(cx);
         page
     }
 
@@ -119,6 +130,7 @@ impl WizardProvidersPage {
         self.cancel_login(cx);
         self.providers = Loadable::Idle;
         self.load(cx);
+        self.load_usage(cx);
         cx.notify();
     }
 
@@ -150,6 +162,38 @@ impl WizardProvidersPage {
             })
             .ok();
         }));
+    }
+
+    /// Ask the target device's Wizard for its subscriptions' plan limits.
+    fn load_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({}));
+        let target = self.target_device.clone();
+        self.usage = Loadable::Loading;
+        self.usage_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::WIZARD_USAGE, params)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<WizardUsage>(value).map_err(|e| e.to_string())
+                });
+            this.update(cx, |page, cx| {
+                if page.target_device != target {
+                    return;
+                }
+                page.usage = match result {
+                    Ok(usage) => Loadable::Ready(usage),
+                    Err(error) => Loadable::Error(error),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Run one change on the target device; every reply carries the list.
@@ -394,6 +438,7 @@ impl WizardProvidersPage {
                         } else {
                             page.load(cx);
                         }
+                        page.load_usage(cx);
                         crate::pickers::bump_model_catalog(cx);
                     }
                     LoginState::Failed => page.error = status.message,
@@ -759,6 +804,123 @@ impl WizardProvidersPage {
                             },
                             cx,
                         ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Settings → Wizard → Usage: a card per signed-in subscription, meters
+    /// XOR a quiet note, and Refresh beside the heading.
+    fn render_usage(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let loading = matches!(self.usage, Loadable::Idle | Loadable::Loading);
+        let refresh = if loading {
+            self.spinner_line("wizard-usage-loading", "Checking…", theme, cx)
+        } else {
+            widgets::ghost_action(theme)
+                .id("wizard-usage-refresh")
+                .flex_none()
+                .hover(|s| widgets::ghost_hover(theme, s))
+                .on_click(cx.listener(|page, _, _, cx| page.load_usage(cx)))
+                .child(SharedString::from("Refresh"))
+                .into_any_element()
+        };
+        let quiet = |text: String| {
+            widgets::section_card(theme)
+                .p(px(16.0))
+                .text_size(crate::typography::ui_rems(12.5))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(text))
+                .into_any_element()
+        };
+        let body = match &self.usage {
+            Loadable::Idle | Loadable::Loading => widgets::section_card(theme)
+                .p(px(16.0))
+                .child(popover::skeleton_rows(
+                    "wizard-usage-skeleton",
+                    theme,
+                    2,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .into_any_element(),
+            Loadable::Error(message) => {
+                widgets::error_strip(theme, message.clone()).into_any_element()
+            }
+            Loadable::Ready(usage) if usage.subscriptions.is_empty() => quiet(
+                "Wizard isn't signed in to a subscription on this device. Sign in to xAI or \
+                 ChatGPT below to see its plan limits here."
+                    .into(),
+            ),
+            Loadable::Ready(usage) => {
+                let now = chrono::Utc::now();
+                let rows: Vec<AnyElement> = usage
+                    .subscriptions
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, subscription)| {
+                        self.render_subscription(ix, subscription, theme, now)
+                    })
+                    .collect();
+                widgets::section_card(theme)
+                    .children(rows)
+                    .into_any_element()
+            }
+        };
+        div()
+            .child(
+                div()
+                    .mt(px(24.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(widgets::field_label(theme, "Usage"))
+                    .child(refresh),
+            )
+            .child(div().mt(px(10.0)).child(body))
+            .into_any_element()
+    }
+
+    fn render_subscription(
+        &self,
+        ix: usize,
+        subscription: &SubscriptionUsage,
+        theme: &Theme,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> AnyElement {
+        let title = match &subscription.plan {
+            Some(plan) => format!("{} · {plan}", subscription.name),
+            None => subscription.name.clone(),
+        };
+        let small = |text: String, opacity: f32| {
+            div()
+                .mt(px(6.0))
+                .truncate()
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted.opacity(opacity))
+                .child(SharedString::from(text))
+        };
+        widgets::card_row(theme, ix == 0)
+            .child(widgets::row_tile(theme, icons::GLOBAL))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::row_title(theme, title))
+                    .when(!subscription.windows.is_empty(), |el| {
+                        el.child(div().mt(px(6.0)).flex().flex_col().gap(px(4.0)).children(
+                            subscription.windows.iter().map(|window| {
+                                crate::settings::accounts::render_usage_meter(window, theme, now)
+                            }),
+                        ))
+                    })
+                    .when_some(subscription.products.clone(), |el, products| {
+                        el.child(small(products, 0.6))
+                    })
+                    .when_some(subscription.note.clone(), |el, note| {
+                        el.child(small(sentence(&note), 0.6))
                     }),
             )
             .into_any_element()
@@ -1153,6 +1315,7 @@ impl Render for WizardProvidersPage {
                         )
                     })
                     .child(self.render_providers(&list, &theme, cx))
+                    .child(self.render_usage(&theme, cx))
                     .children(self.render_importable(&list, &theme, cx))
                     .child(self.render_add(&list, &theme, cx))
                     .into_any_element()
@@ -1239,6 +1402,16 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
+/// Wizard's notes are lowercase clauses made for a chat line; a settings row
+/// starts with a capital.
+fn sentence(note: &str) -> String {
+    let mut chars = note.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// The last four characters of a key, for recognizing it.
 fn tail(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
@@ -1253,6 +1426,15 @@ mod tests {
     fn key_tail_shows_only_the_last_four() {
         assert_eq!(tail("sk-secret-abcd"), "abcd");
         assert_eq!(tail("ab"), "ab");
+    }
+
+    #[test]
+    fn a_wizard_note_reads_as_a_sentence() {
+        assert_eq!(
+            sentence("no request yet this session; limits show after the first reply"),
+            "No request yet this session; limits show after the first reply"
+        );
+        assert_eq!(sentence(""), "");
     }
 
     #[test]

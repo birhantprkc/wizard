@@ -560,7 +560,8 @@ ChatGPT (Plus)
 - A subscription that is signed in but has no reading says so rather than
   showing 0%: `no request yet this session; limits show after the first reply`.
 
-`wizard usage --subscriptions --json` prints the same thing for programs:
+`wizard usage --subscriptions --json` prints the same thing for programs. Wizard
+GUI runs it for the Usage section on Settings → Wizard:
 
 ```json
 {"version":1,"subscriptions":[{"id":"xai","name":"xAI","plan":"SuperGrok Heavy","windows":[{"label":"weekly","usedPercent":20.0,"windowMinutes":10080,"resetsAt":"2026-10-01T21:06:39Z"}],"products":[{"label":"build","usedPercent":12.0}],"source":"account"}]}

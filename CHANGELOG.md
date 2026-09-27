@@ -16,6 +16,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   rollup follows.
 - **`wizard usage --subscriptions [--json]`** prints the same limits outside a
   session, as text or as JSON.
+- **Wizard GUI shows subscription usage.** Settings → Wizard has a Usage
+  section with a bar per window, reset times, and a Refresh button.
 
 ## [3.6.1] - 2026-09-27
 
