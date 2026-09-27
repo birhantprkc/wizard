@@ -969,6 +969,13 @@ jobs:
             echo "::error::the APK's certificate (${actual}) is not the release keystore's (${expected})" >&2
             exit 1
           fi
+          # Pinned: installed copies only accept updates signed by this
+          # certificate, so a swapped secret must stop the release, not ship.
+          pinned=08a95a0f77e2a9ccc8c4131577c77e02eb52f43648cfeb39d1fcb12455b8bfb5
+          if [ "$actual" != "$pinned" ]; then
+            echo "::error::the APK's certificate (${actual}) is not the pinned release certificate (${pinned})" >&2
+            exit 1
+          fi
           # To a file, not piped into head: head exits after one line, aapt2
           # takes a SIGPIPE, and pipefail turns that into a failed step.
           "$tools/aapt2" dump badging "$apk" >badging.txt
