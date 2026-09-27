@@ -6,6 +6,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-09-27
+
 ### Added
 
 - **Compact view.** `/view compact` (or `[ui] compact = true`) shows only the
@@ -21,6 +23,17 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   the result landed, so a fast command drew its whole output for a frame. A
   running card now folds by the same length rule the moment its output gets
   long, and opens again if the command stops to ask something.
+
+- **"provider unreachable" on ChatGPT sign-in.** The ChatGPT backend's
+  `/models` now refuses a request without `client_version` (HTTP 400, "Field
+  required"), so the health check failed even though chat worked. Wizard sends
+  it on both `/models` calls, and reads the backend's `models[].slug` list as
+  well as `data[].id`.
+
+- **Wizard GUI could not find Pi after installing it.** pi.dev's installer can
+  put `pi` in `~/.pi/agent/bin` (or `$PI_CODING_AGENT_DIR/bin`), which the GUI
+  never searched, so onboarding said the installer finished but `pi` was not
+  found. That directory is searched now and put on the Pi adapter's PATH.
 
 ## [3.5.0] - 2026-09-27
 
