@@ -134,7 +134,7 @@ impl Chooser {
     fn usage(self) -> Option<&'static str> {
         match self {
             Chooser::Model => Some("usage: /model <tag> — or pick one from the model menu"),
-            Chooser::Mode => Some("usage: /mode <genie|sovereign>"),
+            Chooser::Mode => Some("usage: /mode <genie|sovereign|chat>"),
             Chooser::Effort => Some("usage: /effort <low|medium|high|xhigh|default>"),
             Chooser::FusionPanel => Some(
                 "`/fusion config` is an interactive editor; set the panel under [fusion] in \

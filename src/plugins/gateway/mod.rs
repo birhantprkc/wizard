@@ -2743,7 +2743,7 @@ mod tests {
             ("/notacommand", "unknown command '/notacommand' — try /help"),
             (
                 "/mode sideways",
-                "unknown mode 'sideways' (genie|sovereign)",
+                "unknown mode 'sideways' (genie|sovereign|chat)",
             ),
             ("/rewind soon", "usage: /rewind [turn]"),
             ("/btw", "usage: /btw <question>"),

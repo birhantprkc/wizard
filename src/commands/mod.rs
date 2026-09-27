@@ -471,12 +471,13 @@ impl SlashCommand {
             "model" => Ok(Self::Model(args.first().map(|s| s.to_string()))),
             "mode" => match args.first() {
                 None => Ok(Self::Mode(None)),
-                Some(&"genie") => Ok(Self::Mode(Some(Mode::Genie))),
-                Some(&"sovereign") => Ok(Self::Mode(Some(Mode::Sovereign))),
-                Some(other) => Err(format!("unknown mode '{other}' (genie|sovereign)")),
+                Some(name) => Mode::parse(name)
+                    .map(|mode| Self::Mode(Some(mode)))
+                    .ok_or_else(|| format!("unknown mode '{name}' (genie|sovereign|chat)")),
             },
             "genie" => Ok(Self::Mode(Some(Mode::Genie))),
             "sovereign" => Ok(Self::Mode(Some(Mode::Sovereign))),
+            "chat" => Ok(Self::Mode(Some(Mode::Chat))),
             "effort" => match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
                 None => Ok(Self::Effort(None)),
                 Some("low") => Ok(Self::Effort(Some(Some(ReasoningEffort::Low)))),
@@ -913,7 +914,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "mode",
-        args: "[genie|sovereign]",
+        args: "[genie|sovereign|chat]",
         description: "pick or switch personality mode",
         takes_args: false,
         tui: Execution::Agent,
@@ -937,6 +938,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "sovereign",
         args: "",
         description: "switch to sovereign mode",
+        takes_args: false,
+        tui: Execution::Agent,
+        gui: Execution::Agent,
+        gateway: Execution::Agent,
+        acp: Execution::Agent,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "chat",
+        args: "",
+        description: "switch to chat mode (web search, no project tools)",
         takes_args: false,
         tui: Execution::Agent,
         gui: Execution::Agent,
@@ -2009,6 +2021,21 @@ mod tests {
                 .is_ok()
         );
         assert!(agent_commands().contains(&"model"));
+    }
+
+    #[test]
+    fn chat_mode_has_a_mode_argument_and_a_shorthand() {
+        assert_eq!(
+            SlashCommand::parse("/mode chat"),
+            Some(Ok(SlashCommand::Mode(Some(Mode::Chat))))
+        );
+        assert_eq!(
+            SlashCommand::parse("/chat"),
+            Some(Ok(SlashCommand::Mode(Some(Mode::Chat))))
+        );
+        assert!(
+            matches!(SlashCommand::parse("/mode chatty"), Some(Err(message)) if message.contains("genie|sovereign|chat"))
+        );
     }
 
     #[test]

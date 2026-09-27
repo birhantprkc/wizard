@@ -2088,7 +2088,7 @@ fn context_line(app: &App, full: bool) -> Line<'static> {
             chips.push(vec![super::mode_span(app.status.mode)]);
         }
     }
-    if app.status.mode == Mode::Sovereign {
+    if app.status.mode != Mode::Genie {
         chips.push(vec![super::mode_span(app.status.mode)]);
     }
     if app.fusion_active {

@@ -59,6 +59,62 @@ asking permission — just do the work and narrate briefly as you go.
 /// Sovereign: autonomous, end-to-end, tests and commits where appropriate.
 pub const SOVEREIGN_SYSTEM_PROMPT: &str = include_str!("sovereign_prompt.md");
 
+/// Chat: plain conversation. The whole system prompt in chat mode, apart from
+/// the search lines and the date [`chat_system_prompt`] adds. No charter, no
+/// environment, no skills or project instructions: none of them is about a
+/// conversation, and every one of them talks about tools chat mode does not
+/// have.
+pub const CHAT_SYSTEM_PROMPT: &str = "\
+You are Wizard, talking with the user in a chat app, often on a phone. \
+This is a conversation, not a coding session: there is no project, no files \
+and no shell here.
+
+- Answer the question directly, in a natural voice. Short by default; go \
+long only when the question needs it or the user asks.
+- Plain markdown that reads well in a chat bubble: short paragraphs, a list \
+when it helps. No tables unless asked, no headings on a short answer.
+- Say so when you do not know, and never invent facts, quotes or links.
+- Everything you write is shown to the user as your reply, so do not narrate \
+your searching (\"let me check\", \"I'll look that up\"). Search quietly, \
+then answer.";
+
+/// The search half of the chat prompt: what to reach for, and the citation
+/// rule. `x_search` is named only when the tool is really there.
+fn chat_search_rules(x_search: bool) -> String {
+    let mut rules = String::from(
+        "## Searching\n\n\
+         - For anything recent, anything that changes (news, prices, releases, \
+         scores, people's current roles) or anything you are unsure of, search \
+         first with `web_search`. Use `web_fetch` to read a page when a snippet is \
+         not enough.\n",
+    );
+    if x_search {
+        rules.push_str(
+            "- Use `x_search` for posts, reactions and discussion on X, or when the \
+             user names an X account.\n",
+        );
+    }
+    rules.push_str(
+        "- When your answer uses search results, cite them: a markdown link \
+         `[source name](url)` right after the claim it supports, or a short \
+         **Sources** list of links at the end. Only link URLs a tool returned. \
+         Do not paste raw result lists or tool output; write the answer.\n\
+         - No search needed for small talk, opinions, or things that do not \
+         change.",
+    );
+    rules
+}
+
+/// The complete chat-mode system prompt. `today` is the local date, because
+/// \"what's the latest on X\" means nothing to a model that does not know
+/// when now is.
+pub fn chat_system_prompt(x_search: bool, today: &str) -> String {
+    format!(
+        "{CHAT_SYSTEM_PROMPT}\n\n{}\n\nToday is {today}.",
+        chat_search_rules(x_search)
+    )
+}
+
 /// Personality under the `min` token profile: the rules that change what the
 /// model does, none of the ones it would follow anyway.
 const MIN_RULES: &str = "\
@@ -79,6 +135,7 @@ fn min_personality(mode: Mode) -> String {
         Mode::Sovereign => {
             "You are Wizard, an autonomous coding agent. Tool calls are auto-approved and nobody is watching: work the task to completion without asking questions, and commit when a coherent unit of work passes its tests."
         }
+        Mode::Chat => return CHAT_SYSTEM_PROMPT.to_string(),
     };
     format!("{lead}\n\n{MIN_RULES}")
 }
@@ -583,6 +640,7 @@ fn base_system_prompt(mode: Mode) -> String {
     let default = match mode {
         Mode::Genie => GENIE_SYSTEM_PROMPT,
         Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
+        Mode::Chat => CHAT_SYSTEM_PROMPT,
     };
     let default = if crate::token_profile::current().min() {
         min_personality(mode)
@@ -1651,6 +1709,7 @@ mod tests {
         let base = match mode {
             Mode::Genie => GENIE_SYSTEM_PROMPT,
             Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
+            Mode::Chat => CHAT_SYSTEM_PROMPT,
         };
         let sections = sections_from_base(base.to_string(), &[], None, None);
         format!(
@@ -1692,6 +1751,7 @@ mod tests {
         let base = match mode {
             Mode::Genie => GENIE_SYSTEM_PROMPT,
             Mode::Sovereign => SOVEREIGN_SYSTEM_PROMPT,
+            Mode::Chat => CHAT_SYSTEM_PROMPT,
         };
         sections_from_base(base.to_string(), &[], None, None)
             .iter()

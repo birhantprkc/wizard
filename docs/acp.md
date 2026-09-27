@@ -65,7 +65,7 @@ editor for permission.
 
 ## Choosing the model, effort, and mode
 
-Every session advertises three config options in its `session/new` and
+Every session advertises four config options in its `session/new` and
 `session/load` answers, and a client changes them with
 `session/set_config_option`:
 
@@ -81,13 +81,15 @@ Every session advertises three config options in its `session/new` and
 - **`thought_level`** (category `thought_level`): `default`, `low`, `medium`,
   `high`, `xhigh` — the same levels as `/effort`, sent to models that take a
   reasoning effort and ignored by the rest.
-- **`wizard_mode`**: `genie` or `sovereign`, as `/mode`.
+- **`wizard_mode`**: `genie`, `sovereign` or `chat`, as `/mode`. `chat` is
+  plain conversation with web search and nothing else (see
+  [modes.md](modes.md#chat-mode)); it is what a chat app wants.
 
 A choice applies to that session only and is never written to your config, so
 switching models in one editor thread does not change the TUI's model or any
-other session. Effort and mode apply in place; a model switch rebuilds the
-session's agent over its saved history, so the conversation continues on the
-new model. The answer carries the options' new state. Options can be set
+other session. Effort and mode apply in place; a model switch
+rebuilds the session's agent over its saved history, so the conversation
+continues on the new model. The answer carries the options' new state. Options can be set
 between turns, not while one is running. A session reopened with
 `session/load` starts from your config's defaults again, and the client sets
 its choices anew.
@@ -112,7 +114,7 @@ Advertised:
 | Command | Over ACP |
 |---|---|
 | `/model <provider>/<model>` | switch this session's model (a bare tag stays on the current provider). Bare `/model` points at the model menu |
-| `/mode <genie\|sovereign>`, `/genie`, `/sovereign` | switch mode |
+| `/mode <genie\|sovereign\|chat>`, `/genie`, `/sovereign`, `/chat` | switch mode |
 | `/effort <low\|medium\|high\|xhigh\|default>` | set reasoning effort |
 | `/plan`, `/omakase` | toggle plan mode (plans are auto-approved over ACP) |
 | `/rewind [turn]` | list rewindable turns, or restore files and history to before one |

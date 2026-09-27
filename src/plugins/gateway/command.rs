@@ -78,7 +78,7 @@ pub async fn apply_command(agent: &mut Agent, ctx: &mut GatewayCtx<'_>, line: &s
     let command = match SlashCommand::parse(line) {
         Some(Ok(command)) => command,
         // The parser's own words: "unknown command '/x' — try /help",
-        // "unknown mode 'sideways' (genie|sovereign)", "usage: /btw <question>".
+        // "unknown mode 'sideways' (genie|sovereign|chat)", "usage: /btw <question>".
         Some(Err(message)) => return message,
         // Unreachable through `command_line`, which only builds lines that
         // start with a slash. Answered rather than asserted: this is a daemon,

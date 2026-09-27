@@ -1,6 +1,6 @@
 # Personality modes
 
-Wizard ships with two personalities that share the same tools and model but differ in autonomy, interaction style, and sampling temperature.
+Wizard ships with two coding personalities that share the same tools and model but differ in autonomy, interaction style, and sampling temperature, plus a chat mode that drops the coding tools altogether.
 
 ## Genie mode (default)
 
@@ -377,6 +377,29 @@ to `~/.wizard/evolution.jsonl`.
 > human in the loop and can rewrite its own binary. Point it only at work you're willing
 > to let it touch unattended, and read [SECURITY.md](../SECURITY.md) first.
 
+## Chat mode
+
+```bash
+wizard --mode chat                      # the TUI, in chat mode
+wizard --mode chat -p "what's new in Rust this month?"   # one answer, then exit
+```
+
+Plain conversation, for when you want an answer rather than a change to a
+project. It is what a phone app talking to `wizard acp` uses.
+
+- **Tools:** `web_search` and `web_fetch`, plus `x_search` when the active provider
+  is xAI (signed in with `/login xai` or an xAI key). Nothing else: no file, shell,
+  edit, git, subagent, memory or computer tool, and the model is not told they exist.
+  Switching out of chat puts them back
+- **Prompt:** a short conversational one with today's date and the rule to cite
+  sources as links when an answer used search. None of the coding charter,
+  skills, project instructions or memory index
+- **Search:** whatever `[web] search_backend` says. The default, `auto`, is Grok's
+  own web search when you are signed in to xAI and DuckDuckGo otherwise. See
+  [web.md](web.md)
+- Temperature 0.7. `-p` runs headless and prints the answer; there is no completion
+  review and no gates, since nothing is written
+
 ## Plan mode
 
 Plan mode is an overlay that works in every mode (genie, sovereign, continuous, gateway): the agent first investigates with read-only tools, presents a plan, and only executes once the plan is approved.
@@ -433,11 +456,13 @@ The last presented plan is always available at `<project>/.wizard/plan.md`.
 ```
 /mode sovereign    # switch to autonomous behavior (still in TUI)
 /mode genie        # switch back to interactive (Ratatui TUI) mode
+/mode chat         # conversation with web search, no project tools
 /sovereign         # shorthand for /mode sovereign
 /genie             # shorthand for /mode genie
+/chat              # shorthand for /mode chat
 ```
 
-Mode changes affect prompting, interaction style, and, if `max_steps` is capped, the step budget. Switching writes the new mode to `~/.wizard/config.toml`, so it survives a restart.
+Mode changes affect prompting, interaction style, the tool set (chat only), and, if `max_steps` is capped, the step budget. Switching writes the new mode to `~/.wizard/config.toml`, so it survives a restart.
 
 ## System prompts
 
@@ -447,7 +472,9 @@ Each mode injects a different system prompt:
 
 **Sovereign** emphasizes autonomy, completing the full task end-to-end, running tests, and committing when appropriate.
 
-Both prompts include loaded skills from the `skills/` directory and your instruction files: `~/.wizard/WIZARD.md`, plus, for each directory from the project root outwards, the first of `WIZARD.md`, `AGENTS.md`, `CLAUDE.md` that exists there.
+**Chat** is short and conversational: answer directly, search for anything current, cite what was found.
+
+The genie and sovereign prompts include loaded skills from the `skills/` directory and your instruction files: `~/.wizard/WIZARD.md`, plus, for each directory from the project root outwards, the first of `WIZARD.md`, `AGENTS.md`, `CLAUDE.md` that exists there.
 
 ## Choosing a mode
 
@@ -459,3 +486,4 @@ Both prompts include loaded skills from the `skills/` directory and your instruc
 | CI/automation/scripted runs | Sovereign |
 | Learning what the agent will do | Genie |
 | Overnight autonomous work | Continuous (`--continuous`) |
+| A question, not a code change | Chat |

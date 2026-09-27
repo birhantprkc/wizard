@@ -6,6 +6,14 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Chat mode.** `wizard --mode chat`, `/mode chat` (or `/chat`), and `chat` in
+  the ACP `wizard_mode` option. It is plain conversation: a short prompt that
+  knows today's date and cites its sources, and only `web_search`, `web_fetch`
+  and, when the active provider is xAI, `x_search`. No file, shell, edit or
+  subagent tools. `--mode chat -p "..."` prints one answer and exits.
+
 ### Changed
 
 - **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a

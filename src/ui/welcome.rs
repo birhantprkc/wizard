@@ -134,7 +134,7 @@ fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("wizard", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" {}", env!("CARGO_PKG_VERSION")), dim()),
     ])];
-    if app.status.mode == crate::config::Mode::Sovereign {
+    if app.status.mode != crate::config::Mode::Genie {
         lines.push(Line::from(mode_span(app.status.mode)));
     }
     let notices = welcome_notices(app);

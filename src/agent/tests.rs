@@ -4170,3 +4170,158 @@ async fn a_finished_turns_event_channel_closes() {
         .expect("collector did not panic");
     assert!(events > 0, "the turn should have emitted something");
 }
+
+// -- chat mode --------------------------------------------------------------
+
+/// A config in chat mode whose one provider is of `kind`.
+fn chat_config(kind: crate::llm::registry::ProviderKind) -> Config {
+    Config {
+        mode: Mode::Chat,
+        providers: vec![crate::config::ProviderConfig {
+            name: "p".to_string(),
+            kind,
+            base_url: "https://p.test/v1".to_string(),
+            model: "m".to_string(),
+            api_key_env: None,
+            gguf_path: None,
+            usd_per_mtok_in: None,
+            usd_per_mtok_out: None,
+            vision: None,
+        }],
+        ..Config::default()
+    }
+}
+
+/// An agent over the registry a real session builds, under `config`.
+async fn agent_over_real_registry(
+    tmp: &TempDir,
+    client: Arc<dyn LlmProvider>,
+    config: Config,
+) -> Agent {
+    let registry = code_mode_registry(&config).await;
+    let session = Session::create(&tmp.0).expect("create session");
+    let hooks = Arc::new(HookEngine::new(
+        Vec::new(),
+        tmp.0.clone(),
+        session.id.clone(),
+    ));
+    let mut agent = Agent::new(
+        client,
+        registry,
+        config,
+        Vec::new(),
+        tmp.0.clone(),
+        session,
+        true,
+        hooks,
+    )
+    .expect("build agent");
+    agent.set_usage_log(Some(tmp.0.join("usage.jsonl")));
+    agent
+}
+
+fn tool_names(registry: &ToolRegistry) -> Vec<String> {
+    registry
+        .specs()
+        .into_iter()
+        .map(|spec| spec.function.name)
+        .collect()
+}
+
+/// Chat mode is the web tools and nothing else. `x_search` rides along only
+/// when the active provider is xAI, by key or by sign-in.
+#[tokio::test]
+async fn chat_mode_offers_only_the_web_tools_and_x_search_only_on_xai() {
+    use crate::llm::registry::ProviderKind;
+    for (kind, x_search) in [
+        (ProviderKind::XAI_OAUTH, true),
+        (ProviderKind::XAI, true),
+        (ProviderKind::OPENAI, false),
+        (ProviderKind::ANTHROPIC, false),
+    ] {
+        let tmp = TempDir::new();
+        let agent = agent_over_real_registry(
+            &tmp,
+            ScriptedProvider::new(Vec::new()),
+            chat_config(kind.clone()),
+        )
+        .await;
+        let mut expected = vec!["web_search", "web_fetch"];
+        if x_search {
+            expected.push("x_search");
+        }
+        assert_eq!(tool_names(agent.dispatcher.registry()), expected, "{kind}");
+        let prompt = agent.history[0].text();
+        assert!(prompt.starts_with(prompts::CHAT_SYSTEM_PROMPT), "{prompt}");
+        assert_eq!(prompt.contains("`x_search`"), x_search, "{prompt}");
+        assert!(prompt.contains("Today is "), "{prompt}");
+        // None of the coding prompt comes along.
+        assert!(!prompt.contains("## Memory"), "{prompt}");
+        assert!(!prompt.contains("## Environment"), "{prompt}");
+    }
+}
+
+/// What reaches the provider is what counts: a chat turn's request carries the
+/// web tools and no `execute`, file, edit or subagent tool.
+#[tokio::test]
+async fn a_chat_turn_sends_only_the_web_tools() {
+    let tmp = TempDir::new();
+    let provider = ScriptedProvider::new(vec![vec![final_chunk("hello")]]);
+    let mut agent = agent_over_real_registry(
+        &tmp,
+        Arc::clone(&provider) as Arc<dyn LlmProvider>,
+        chat_config(crate::llm::registry::ProviderKind::OPENAI),
+    )
+    .await;
+    let (tx, _rx) = mpsc::channel(256);
+    agent.run_turn("hi there", tx).await.expect("turn ok");
+
+    let requests = provider.requests.lock().unwrap();
+    let sent: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|spec| spec.function.name.as_str())
+        .collect();
+    assert_eq!(sent, ["web_search", "web_fetch"]);
+}
+
+/// `/mode chat` and back: the project tools are set aside, not lost, and a
+/// `/reload` while chatting keeps the chat cut.
+#[tokio::test]
+async fn switching_to_chat_and_back_restores_the_project_tools() {
+    let tmp = TempDir::new();
+    let config = Config {
+        mode: Mode::Genie,
+        ..chat_config(crate::llm::registry::ProviderKind::XAI_OAUTH)
+    };
+    let mut agent =
+        agent_over_real_registry(&tmp, ScriptedProvider::new(Vec::new()), config.clone()).await;
+    let before = tool_names(agent.dispatcher.registry());
+    assert!(before.iter().any(|name| name == "execute"), "{before:?}");
+
+    agent.set_mode(Mode::Chat);
+    assert_eq!(
+        tool_names(agent.dispatcher.registry()),
+        ["web_search", "web_fetch", "x_search"]
+    );
+    assert!(
+        agent.history[0]
+            .text()
+            .starts_with(prompts::CHAT_SYSTEM_PROMPT)
+    );
+
+    agent.set_registry(code_mode_registry(&config).await);
+    assert_eq!(
+        tool_names(agent.dispatcher.registry()),
+        ["web_search", "web_fetch", "x_search"],
+        "a rebuilt registry must not bring the project tools back into chat"
+    );
+
+    agent.set_mode(Mode::Genie);
+    assert_eq!(tool_names(agent.dispatcher.registry()), before);
+    assert!(
+        !agent.history[0]
+            .text()
+            .starts_with(prompts::CHAT_SYSTEM_PROMPT)
+    );
+}

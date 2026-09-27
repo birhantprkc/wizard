@@ -28,8 +28,9 @@ use crate::llm::registry;
 // of the same decision.
 use crate::platform::secrets::create_private_dir;
 
-/// Personality mode. Shares tools and model; differs in prompting,
-/// temperature, step budget, and confirmation behavior (`docs/modes.md`).
+/// Personality mode. Genie and sovereign share tools and model and differ in
+/// prompting, temperature, step budget, and confirmation behavior; chat keeps
+/// only the web tools (`docs/modes.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
@@ -41,14 +42,37 @@ pub enum Mode {
     /// Autonomous agent. Works continuously without human intervention;
     /// self-directing and self-improving.
     Sovereign,
+    /// Plain conversation. No project tools: only web search and fetch, plus
+    /// X search when the active provider is xAI.
+    Chat,
 }
 
 impl Mode {
-    /// Sampling temperature for this mode (genie 0.8, sovereign 0.6).
+    /// Sampling temperature for this mode (genie 0.8, sovereign 0.6, chat 0.7).
     pub fn temperature(self) -> f32 {
         match self {
             Mode::Genie => 0.8,
             Mode::Sovereign => 0.6,
+            Mode::Chat => 0.7,
+        }
+    }
+
+    /// The name `--mode`, `/mode` and the ACP `wizard_mode` option use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Genie => "genie",
+            Mode::Sovereign => "sovereign",
+            Mode::Chat => "chat",
+        }
+    }
+
+    /// Parse a mode name, as typed after `/mode` or sent as an ACP option.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "genie" => Some(Mode::Genie),
+            "sovereign" => Some(Mode::Sovereign),
+            "chat" => Some(Mode::Chat),
+            _ => None,
         }
     }
 }
@@ -129,10 +153,7 @@ impl fmt::Display for StepBudget {
 
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Mode::Genie => write!(f, "genie"),
-            Mode::Sovereign => write!(f, "sovereign"),
-        }
+        f.write_str(self.as_str())
     }
 }
 

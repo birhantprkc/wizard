@@ -33,7 +33,7 @@ use crate::config::{Config, Mode, ProviderConfig, ReasoningEffort};
 pub(super) const MODEL_OPTION: &str = "model";
 /// Config option id for the reasoning-effort select (category `thought_level`).
 pub(super) const EFFORT_OPTION: &str = "thought_level";
-/// Config option id for Wizard's genie/sovereign mode. Deliberately not
+/// Config option id for Wizard's genie, sovereign or chat mode. Deliberately not
 /// category `mode`: ACP clients read that one as a permission mode, and
 /// Wizard never asks for permission in either.
 pub(super) const MODE_OPTION: &str = "wizard_mode";
@@ -136,18 +136,11 @@ pub(super) fn parse_effort(value: &str) -> Option<Option<ReasoningEffort>> {
 
 /// Parse a mode select value.
 pub(super) fn parse_mode(value: &str) -> Option<Mode> {
-    match value {
-        "genie" => Some(Mode::Genie),
-        "sovereign" => Some(Mode::Sovereign),
-        _ => None,
-    }
+    Mode::parse(value)
 }
 
 fn mode_value(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Genie => "genie",
-        Mode::Sovereign => "sovereign",
-    }
+    mode.as_str()
 }
 
 /// Whether a tag from a provider's model list is something the agent can chat
@@ -420,6 +413,8 @@ pub(super) fn config_options(
             .description("Interactive: acts on each request and reports back".to_string()),
         SessionConfigSelectOption::new("sovereign", "Sovereign")
             .description("Autonomous: keeps working toward the goal on its own".to_string()),
+        SessionConfigSelectOption::new("chat", "Chat")
+            .description("Conversation with web search; no file, shell or edit tools".to_string()),
     ];
     vec![
         SessionConfigOption::select(MODEL_OPTION, "Model", selection.model_id(), models)
@@ -534,6 +529,7 @@ mod tests {
         assert_eq!(parse_effort("xhigh"), Some(Some(ReasoningEffort::Xhigh)));
         assert_eq!(parse_effort("max"), None);
         assert_eq!(parse_mode("sovereign"), Some(Mode::Sovereign));
+        assert_eq!(parse_mode("chat"), Some(Mode::Chat));
         assert_eq!(parse_mode("yolo"), None);
     }
 
@@ -632,5 +628,12 @@ mod tests {
         assert_eq!(options[2]["id"], MODE_OPTION);
         assert!(options[2].get("category").is_none());
         assert_eq!(options[2]["currentValue"], "genie");
+        let modes: Vec<&str> = options[2]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(modes, ["genie", "sovereign", "chat"]);
     }
 }

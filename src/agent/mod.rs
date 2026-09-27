@@ -831,6 +831,41 @@ pub struct Agent {
     /// survive its own removal, or switching to a fallback model and back would
     /// lose the tool for the rest of the session.
     code: Option<Arc<dyn crate::tools::Tool>>,
+    /// The full tool registry, set aside while the agent is in chat mode.
+    /// `Some` exactly while [`Mode::Chat`] is active; the dispatcher then holds
+    /// only [`chat_registry`]'s cut of it, and leaving chat puts this back.
+    chat_stash: Option<ToolRegistry>,
+}
+
+/// The tools chat mode keeps, in the order they are advertised. `x_search`
+/// is further conditional, see [`chat_registry`].
+pub const CHAT_TOOLS: &[&str] = &["web_search", "web_fetch", "x_search"];
+
+/// Whether `config`'s active provider is xAI, by API key or account sign-in.
+/// Chat mode offers `x_search` only then.
+pub fn provider_is_xai(config: &Config) -> bool {
+    let kind = config.active().kind;
+    kind == crate::llm::registry::ProviderKind::XAI
+        || kind == crate::llm::registry::ProviderKind::XAI_OAUTH
+}
+
+/// The registry chat mode runs with: [`CHAT_TOOLS`] out of `full`, and
+/// nothing else. No file, shell, edit, subagent or computer tool, and no
+/// `exit_plan`, `interview` or `tool_search` either, so the model is not even
+/// told they exist. `x_search` stays only when `x_search` is true (the active
+/// provider is xAI). A tool the build left out (`--no-default-features`) is
+/// simply absent.
+pub fn chat_registry(full: &ToolRegistry, x_search: bool) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for name in CHAT_TOOLS {
+        if *name == "x_search" && !x_search {
+            continue;
+        }
+        if let Some(tool) = full.get(name) {
+            registry.register(Arc::clone(tool));
+        }
+    }
+    registry
 }
 
 /// One row of the `/rewind` picker: a turn, the prompt that started it, and
@@ -1032,6 +1067,7 @@ impl Agent {
             subagent_model: None,
             ultra: None,
             code: None,
+            chat_stash: None,
         };
         agent.code = agent
             .dispatcher
@@ -1046,6 +1082,7 @@ impl Agent {
             registry.remove(crate::tools::code::RUN_CODE_TOOL_NAME);
             agent.dispatcher.set_registry(registry);
         }
+        agent.sync_chat_tools();
         agent
             .history
             .push(ChatMessage::system(agent.compose_system_prompt()));
@@ -1095,7 +1132,27 @@ impl Agent {
         self.mode = mode;
         self.config.mode = mode;
         self.dispatcher.set_mode(mode);
+        self.sync_chat_tools();
+        self.sync_code_mode();
         self.refresh_system_prompt();
+    }
+
+    /// Swap the dispatcher's registry to match the mode: chat mode's cut
+    /// ([`chat_registry`]) while in chat, with the full registry stashed, and
+    /// the full one back once the mode is anything else. Idempotent, so every
+    /// path that can change the mode or the registry just calls it.
+    fn sync_chat_tools(&mut self) {
+        if self.mode == Mode::Chat {
+            let full = match self.chat_stash.take() {
+                Some(full) => full,
+                None => self.dispatcher.registry().snapshot(),
+            };
+            let chat = chat_registry(&full, provider_is_xai(&self.config));
+            self.chat_stash = Some(full);
+            self.dispatcher.set_registry(chat);
+        } else if let Some(full) = self.chat_stash.take() {
+            self.dispatcher.set_registry(full);
+        }
     }
 
     /// Set the reasoning effort (`/effort`) forwarded on subsequent turns.
@@ -1360,6 +1417,10 @@ impl Agent {
             self.code = Some(Arc::clone(tool));
         }
         self.dispatcher.set_registry(registry);
+        // A rebuilt registry in chat mode is the new full set: stash it and
+        // hand the dispatcher chat's cut again.
+        self.chat_stash = None;
+        self.sync_chat_tools();
         // The model's half of the gate, and the only place it is enforced: a
         // fallback model must not be offered a tool whose argument is a Lua
         // program. Runs before `refresh_system_prompt` composes the JSON
@@ -1655,7 +1716,7 @@ impl Agent {
         };
         let name = crate::tools::code::RUN_CODE_TOOL_NAME;
         let present = self.dispatcher.registry().get(name).is_some();
-        let wanted = self.native_tools && self.config.code_mode;
+        let wanted = self.native_tools && self.config.code_mode && self.mode != Mode::Chat;
         if present == wanted {
             return;
         }
@@ -1693,6 +1754,9 @@ impl Agent {
     }
 
     fn compose_system_prompt(&self) -> String {
+        if self.mode == Mode::Chat {
+            return self.compose_chat_prompt();
+        }
         let mut prompt = prompts::build_system_prompt(
             self.mode,
             &self.skills,
@@ -1744,6 +1808,21 @@ impl Agent {
                 prompt.push_str("\n\n");
                 prompt.push_str(prompts::OMAKASE_PROMPT);
             }
+        }
+        prompt
+    }
+
+    /// Chat mode's whole system prompt: the conversational personality, the
+    /// search rules for the tools actually present, the date, and the JSON
+    /// tool protocol when the model has no native tool calling. Nothing from
+    /// the coding prompt (charter, skills, memory, todo, plan mode) applies.
+    fn compose_chat_prompt(&self) -> String {
+        let registry = self.dispatcher.registry();
+        let today = chrono::Local::now().format("%A, %B %-d, %Y").to_string();
+        let mut prompt = prompts::chat_system_prompt(registry.get("x_search").is_some(), &today);
+        if !self.native_tools && !registry.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&prompts::render_tool_protocol(&registry.advertised_specs()));
         }
         prompt
     }
