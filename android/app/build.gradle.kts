@@ -34,6 +34,27 @@ if (hasReleaseKey) {
     logger.lifecycle("WIZARD_ANDROID_KEYSTORE is not set: release builds are signed with the debug key")
 }
 
+// The app ships with Wizard, so it carries Wizard's version: -Pwizard.version
+// from the release workflow, otherwise the root Cargo.toml's (read the way
+// release.yml's tag check reads it), so a local build reports the tree it came
+// from. versionCode is derived from it and has to grow with every release, or
+// Android refuses the APK as a downgrade; MAJOR*10000 + MINOR*100 + PATCH does,
+// as long as minor and patch stay under 100.
+val wizardVersion: String = providers.gradleProperty("wizard.version").orNull
+    ?: rootDir.resolve("../Cargo.toml").takeIf { it.isFile }?.let { cargo ->
+        Regex("""^version\s*=\s*"([^"]+)"""", RegexOption.MULTILINE).find(cargo.readText())?.groupValues?.get(1)
+    }
+    ?: "0.0.0"
+val wizardVersionCode: Int = run {
+    val parts = Regex("""(\d+)\.(\d+)\.(\d+)""").matchEntire(wizardVersion)?.groupValues?.drop(1)?.map(String::toInt)
+        ?: throw GradleException("Wizard version must be MAJOR.MINOR.PATCH, got \"$wizardVersion\"")
+    val (major, minor, patch) = parts
+    if (minor > 99 || patch > 99) {
+        throw GradleException("Wizard version $wizardVersion does not fit versionCode's MAJOR*10000 + MINOR*100 + PATCH")
+    }
+    major * 10000 + minor * 100 + patch
+}
+
 android {
     namespace = "com.teddytennant.wizard"
     compileSdk = 37
@@ -43,8 +64,8 @@ android {
         applicationId = "com.teddytennant.wizard"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = wizardVersionCode
+        versionName = wizardVersion
     }
 
     signingConfigs {
