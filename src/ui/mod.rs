@@ -816,7 +816,7 @@ pub(super) fn transcript_text(
     // The uncommitted tail: what the model is saying right now, below
     // everything it has finished saying. Decorated exactly like a committed
     // block, so nothing shifts sideways at the moment a turn lands.
-    let (thinking, streaming) = app.transcript.streaming();
+    let (thinking, streaming) = app.transcript.shown_streaming();
     let chrome = skin::chrome();
     let decorate = |lines: &mut Vec<Line<'static>>,
                     indents: &mut Vec<u16>,
@@ -945,7 +945,8 @@ pub(super) fn items_text(
     let mut prev_notice = false;
     let mut first = true;
 
-    for (index, item) in view.iter().enumerate() {
+    for (index, item) in view.shown() {
+        let item: &TranscriptItem = &item;
         // A turn boundary has no row of its own: the TUI shows a continuous
         // conversation, and `/rewind` is what turns are for.
         if matches!(item, TranscriptItem::TurnMarker { .. }) {

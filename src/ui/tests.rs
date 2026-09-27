@@ -1709,3 +1709,225 @@ fn selection_skips_the_gutter_left_of_each_rows_text_origin() {
         "world"
     );
 }
+
+/// Every row of one 100x60 frame, joined, for asserting on what was drawn.
+fn frame_text(app: &App) -> String {
+    let (width, height) = (100, 60);
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A long tool output is never drawn open, not even for the one frame between
+/// the event that made it long and the event that would have folded it.
+///
+/// The frame is drawn after every single event, which is what the event loop
+/// does. `execute` streams its output into the card while it runs, and the
+/// card used to stay open until the result landed, so a fast command drew its
+/// whole output and then snapped shut.
+#[test]
+fn a_long_tool_output_is_folded_from_the_first_frame_it_is_in() {
+    use crate::agent::{AgentEvent, ConsoleGate};
+    use crate::tools::ToolOutput;
+
+    let long: String = (1..=40).map(|n| format!("out-{n:02}\n")).collect();
+    for skin in crate::skin::Skin::ALL {
+        let _pinned = crate::skin::pin(skin);
+        let mut app = App::new(crate::config::Config::default());
+        app.welcome_dismissed = true;
+        let (gate, _host) = ConsoleGate::open();
+
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "execute".to_string(),
+            args: serde_json::json!({ "command": "seq 40" }),
+        });
+        // Short so far: a running command's first lines stay in view.
+        app.handle_agent_event(AgentEvent::ConsoleOutput {
+            gate,
+            chunk: "out-01\nout-02\n".to_string(),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            frame.contains("out-02"),
+            "{skin:?} short output shows\n{frame}"
+        );
+
+        // The chunk that makes it long folds it in the same frame.
+        app.handle_agent_event(AgentEvent::ConsoleOutput {
+            gate,
+            chunk: long["out-01\nout-02\n".len()..].to_string(),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("out-"),
+            "{skin:?} drew streamed output that is long\n{frame}"
+        );
+
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "execute".to_string(),
+            output: ToolOutput::ok(long.clone()),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("out-"),
+            "{skin:?} drew the result as it landed\n{frame}"
+        );
+
+        // A tool that does not stream: folded as the result arrives.
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "read_file".to_string(),
+            args: serde_json::json!({ "path": "big.txt" }),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            name: "read_file".to_string(),
+            output: ToolOutput::ok(long.replace("out-", "read-")),
+        });
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("read-"),
+            "{skin:?} drew a long read as it landed\n{frame}"
+        );
+    }
+}
+
+/// A turn with everything compact view hides and everything it keeps.
+fn a_busy_turn() -> App {
+    use crate::agent::AgentEvent;
+    use crate::tools::ToolOutput;
+
+    let mut app = App::new(crate::config::Config::default());
+    app.welcome_dismissed = true;
+    app.transcript
+        .user("fix the parser".to_string(), Vec::new());
+    app.handle_agent_event(AgentEvent::ThinkingDelta("mulling-it-over".to_string()));
+    app.handle_agent_event(AgentEvent::TextDelta("Looking at it now.".to_string()));
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        name: "read_file".to_string(),
+        args: serde_json::json!({ "path": "parser.rs" }),
+    });
+    app.handle_agent_event(AgentEvent::ToolFinished {
+        name: "read_file".to_string(),
+        output: ToolOutput::ok("fn parse-body() {}"),
+    });
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        name: "edit_file".to_string(),
+        args: serde_json::json!({
+            "path": "parser.rs",
+            "old_string": "old-diff-line",
+            "new_string": "new-diff-line",
+        }),
+    });
+    app.handle_agent_event(AgentEvent::ToolFinished {
+        name: "edit_file".to_string(),
+        output: ToolOutput::ok("Edited parser.rs"),
+    });
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        name: "execute".to_string(),
+        args: serde_json::json!({ "command": "cargo test" }),
+    });
+    app.handle_agent_event(AgentEvent::ToolFinished {
+        name: "execute".to_string(),
+        output: ToolOutput::error("test-output-failed\nexit code: 101"),
+    });
+    app.handle_agent_event(AgentEvent::TextDelta("Fixed it.".to_string()));
+    app.handle_agent_event(AgentEvent::Error("provider-said-no".to_string()));
+    app
+}
+
+#[test]
+fn compact_view_keeps_the_conversation_and_drops_the_work() {
+    for skin in crate::skin::Skin::ALL {
+        let _pinned = crate::skin::pin(skin);
+        let mut app = a_busy_turn();
+
+        let full = frame_text(&app);
+        for shown in ["fix the parser", "Looking at it now.", "test-output-failed"] {
+            assert!(
+                full.contains(shown),
+                "{skin:?} full view lost {shown}\n{full}"
+            );
+        }
+
+        app.transcript.set_compact(true);
+        let compact = frame_text(&app);
+        for kept in [
+            "fix the parser",
+            "Looking at it now.",
+            "Fixed it.",
+            "provider-said-no",
+            "ran 3 tools, 1 failed",
+        ] {
+            assert!(
+                compact.contains(kept),
+                "{skin:?} compact lost {kept}\n{compact}"
+            );
+        }
+        for hidden in [
+            "parse-body",
+            "diff-line",
+            "test-output-failed",
+            "cargo test",
+            "parser.rs",
+            "mulling-it-over",
+        ] {
+            assert!(
+                !compact.contains(hidden),
+                "{skin:?} compact drew {hidden}\n{compact}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compact_view_names_the_tool_that_is_running() {
+    use crate::agent::AgentEvent;
+    for skin in crate::skin::Skin::ALL {
+        let _pinned = crate::skin::pin(skin);
+        let mut app = a_busy_turn();
+        app.transcript.set_compact(true);
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            name: "execute".to_string(),
+            args: serde_json::json!({ "command": "make" }),
+        });
+        let frame = frame_text(&app);
+        assert!(frame.contains("running execute"), "{skin:?}\n{frame}");
+    }
+}
+
+#[test]
+fn view_toggles_the_transcript_that_is_already_there() {
+    let _pinned = crate::skin::pin(crate::skin::Skin::Wizard);
+    let mut app = a_busy_turn();
+    assert!(!app.transcript.compact(), "off by default");
+    assert!(frame_text(&app).contains("parse-body"));
+
+    app.set_compact_view(None);
+    assert!(app.transcript.compact() && app.config.ui.compact);
+    assert!(!frame_text(&app).contains("parse-body"));
+
+    app.set_compact_view(Some(true));
+    assert!(
+        app.transcript.compact(),
+        "naming the view it is in keeps it"
+    );
+
+    app.set_compact_view(Some(false));
+    assert!(!app.config.ui.compact);
+    assert!(frame_text(&app).contains("parse-body"));
+}
+
+#[test]
+fn compact_in_the_config_starts_the_session_compact() {
+    let mut config = crate::config::Config::default();
+    config.ui.compact = true;
+    assert!(App::new(config).transcript.compact());
+}

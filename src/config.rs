@@ -280,6 +280,11 @@ pub struct UiConfig {
     /// default; toggle live with `/vim`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub vim: bool,
+    /// Compact transcript: the conversation without tool cards, command
+    /// output, diffs, file reads or reasoning, each run of tool calls shown as
+    /// one line. Off by default; switch live with `/view`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compact: bool,
     /// Which coding agent's terminal chrome the TUI wears: `wizard` (default),
     /// `codex`, or `grok`. See [`crate::skin`], which owns the
     /// glyphs, and `/ui` to change it live.

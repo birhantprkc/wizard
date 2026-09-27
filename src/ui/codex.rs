@@ -632,7 +632,8 @@ fn transcript_lines(app: &App, cache: &mut ImageCache, budget: ImageBox, width: 
         }
     };
 
-    for (index, item) in app.transcript.iter().enumerate() {
+    for (index, item) in app.transcript.shown() {
+        let item: &TranscriptItem = &item;
         // A turn boundary has no cell of its own: the transcript is one
         // continuous conversation and `/rewind` is what turns are for.
         if matches!(item, TranscriptItem::TurnMarker { .. }) {
@@ -684,7 +685,7 @@ fn transcript_lines(app: &App, cache: &mut ImageCache, budget: ImageBox, width: 
 
     // The uncommitted tail, decorated exactly like a committed cell so nothing
     // shifts sideways at the moment a turn lands.
-    let (thinking, streaming) = app.transcript.streaming();
+    let (thinking, streaming) = app.transcript.shown_streaming();
     if !thinking.is_empty() {
         gap(&mut out, &mut first);
         out.lines.extend(reasoning_cell(thinking, width));

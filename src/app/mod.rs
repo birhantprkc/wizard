@@ -632,6 +632,7 @@ impl App {
             // with, and only when `[mesh] listen` says a peer could watch.
             mesh: None,
         };
+        app.transcript.set_compact(app.config.ui.compact);
         // A skin or theme that would not load is worth saying out loud (the
         // user asked for it); the defaults are already installed, so the
         // session continues either way.
@@ -2133,6 +2134,24 @@ impl App {
              x/dd/dw/cw edit · u undo), i to type. /vim to leave"
         } else {
             "vim mode off"
+        });
+    }
+
+    /// `/view [compact|full]`: switch the main transcript between the full
+    /// view and the compact one, or flip it with no argument, and persist the
+    /// choice to `[ui] compact`. A subagent's pane stays full: opening one is
+    /// asking to watch it work.
+    pub fn set_compact_view(&mut self, compact: Option<bool>) {
+        let on = compact.unwrap_or(!self.transcript.compact());
+        self.transcript.set_compact(on);
+        self.config.ui.compact = on;
+        if let Err(err) = self.config.save() {
+            self.notice(format!("could not save config: {err:#}"));
+        }
+        self.notice(if on {
+            "compact view: tool calls show as one line per run. /view full to see them"
+        } else {
+            "full view"
         });
     }
 
@@ -4388,6 +4407,10 @@ impl App {
                         console.command
                     ));
                     self.console = Some(console);
+                    // The question is the last line of the card, and a long
+                    // stream has folded it. Nobody can answer what they cannot
+                    // see.
+                    self.transcript.set_last_tool_folded(false);
                 }
             }
             // Already folded into the running tool's card by the model above;

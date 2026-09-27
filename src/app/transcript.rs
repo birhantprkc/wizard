@@ -30,6 +30,10 @@
 //! items. A renderer that cached widgets per index would need the same
 //! machinery, which is why the signal lives in the model rather than here.
 //!
+//! The other is compact view ([`TranscriptView::shown`]): the same items with
+//! the tool work left out. Also a property of the screen, and nothing is
+//! stored for it, so switching it redraws the conversation already there.
+//!
 //! # Whose conversation this is
 //!
 //! Since the mesh's tier 2, a `TranscriptView` may hold a *peer's* session
@@ -70,6 +74,7 @@
 //! trait keeps "derived from the key" a property of the type rather than of
 //! every call site.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
@@ -228,14 +233,17 @@ pub struct TranscriptView {
     /// a method here so [`TranscriptView::sync`] runs against exactly one
     /// [`Change`], which is the contract the signal is defined under.
     model: TranscriptModel,
-    /// Whether the item at each index is folded, one flag per item. Only tool
-    /// rows can be folded; the flag on any other row is inert and costs a
-    /// byte, which is cheaper than a map keyed by an index that moves.
-    folded: Vec<bool>,
+    /// Whether the item at each index is folded, one entry per item. Only
+    /// tool rows can be folded; the entry on any other row is inert and costs
+    /// two bytes, which is cheaper than a map keyed by an index that moves.
+    folded: Vec<Fold>,
     /// The model revision `folded` was last brought into step with, so a call
     /// that changed nothing does not re-derive (and so discard) the user's
     /// folds against a stale [`Change`].
     synced: u64,
+    /// Compact view (`[ui] compact`, `/view`): the conversation without the
+    /// work. See [`TranscriptView::shown`].
+    compact: bool,
     /// First visible line, measured from the top of the rendered content. Only
     /// consulted while [`Self::follow`] is false; when following, the live tail
     /// is always in view.
@@ -259,6 +267,7 @@ impl Default for TranscriptView {
             model: TranscriptModel::new(),
             folded: Vec::new(),
             synced: 0,
+            compact: false,
             scroll: 0,
             follow: true,
             max_scroll: Cell::new(0),
@@ -349,18 +358,84 @@ impl TranscriptView {
         self.items().iter()
     }
 
+    /// Whether this view is compact.
+    pub fn compact(&self) -> bool {
+        self.compact
+    }
+
+    /// Switch compact view on or off. Nothing is recomputed: the renderers
+    /// read [`TranscriptView::shown`] on every frame, so the next frame is
+    /// already the other view.
+    pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
+    }
+
+    /// The rows a renderer draws, each with its index into [`Self::items`].
+    ///
+    /// The full view is every item. The compact view is the conversation: what
+    /// the user said, what the model answered, and the notices (errors
+    /// included). Tool cards, what they returned, the images a tool produced
+    /// and the model's reasoning are left out, and each run of them becomes
+    /// one borrowed [`TranscriptItem::Notice`] saying how much work happened,
+    /// or which tool is running now. A notice rather than a new kind of row so
+    /// that every skin draws it with the notice style it already has.
+    pub fn shown(&self) -> Vec<(usize, Cow<'_, TranscriptItem>)> {
+        let items = self.items();
+        if !self.compact {
+            return items.iter().map(Cow::Borrowed).enumerate().collect();
+        }
+        let mut shown = Vec::new();
+        let mut run: Option<(usize, Activity)> = None;
+        for (index, item) in items.iter().enumerate() {
+            let hidden = match item {
+                TranscriptItem::Tool(tool) => {
+                    run.get_or_insert((index, Activity::default())).1.add(tool);
+                    true
+                }
+                TranscriptItem::Thinking(_) => true,
+                TranscriptItem::Images { source, .. } => source.tool().is_some(),
+                // Turn markers draw nothing either way, so they neither end a
+                // run nor start one.
+                TranscriptItem::TurnMarker { .. } => true,
+                _ => false,
+            };
+            if hidden {
+                continue;
+            }
+            if let Some((at, activity)) = run.take() {
+                shown.push((at, Cow::Owned(TranscriptItem::Notice(activity.line()))));
+            }
+            shown.push((index, Cow::Borrowed(item)));
+        }
+        if let Some((at, activity)) = run {
+            shown.push((at, Cow::Owned(TranscriptItem::Notice(activity.line()))));
+        }
+        shown
+    }
+
+    /// The live tail as this view draws it: [`Self::streaming`], less the
+    /// reasoning when the view is compact.
+    pub fn shown_streaming(&self) -> (&str, &str) {
+        let (thinking, text) = self.streaming();
+        if self.compact {
+            ("", text)
+        } else {
+            (thinking, text)
+        }
+    }
+
     /// Whether the row at `index` is drawn folded. Meaningless for anything
     /// but a tool row, and `false` past the end.
     pub fn folded(&self, index: usize) -> bool {
-        self.folded.get(index).copied().unwrap_or(false)
+        self.folded.get(index).is_some_and(|fold| fold.shut)
     }
 
     // -- Folding ----------------------------------------------------------
 
     /// Fold or unfold the row at `index`.
     pub fn toggle(&mut self, index: usize) {
-        if let Some(flag) = self.folded.get_mut(index) {
-            *flag = !*flag;
+        if let Some(fold) = self.folded.get_mut(index) {
+            fold.shut = !fold.shut;
         }
     }
 
@@ -380,7 +455,7 @@ impl TranscriptView {
     /// point of that turn is the answer below it, not the drafts behind it.
     pub fn set_last_tool_folded(&mut self, folded: bool) {
         if let Some(index) = self.last_tool_row() {
-            self.folded[index] = folded;
+            self.folded[index].shut = folded;
         }
     }
 
@@ -494,42 +569,117 @@ impl TranscriptView {
         match self.model.last_change() {
             // The tail is not an item.
             Change::Streaming => {}
-            Change::Reset => {
-                self.folded = self.model.items().iter().map(folds_by_default).collect()
-            }
+            Change::Reset => self.folded = self.model.items().iter().map(Fold::new).collect(),
             Change::Appended(at) => {
                 // Everything from `at` down is new, so nothing the user folded
                 // is being discarded here.
                 self.folded.truncate(at);
                 for item in &self.model.items()[self.folded.len()..] {
-                    self.folded.push(folds_by_default(item));
+                    self.folded.push(Fold::new(item));
                 }
             }
             Change::Inserted(at) => {
-                let flag = self.model.items().get(at).is_some_and(folds_by_default);
+                let fold = self
+                    .model
+                    .items()
+                    .get(at)
+                    .map(Fold::new)
+                    .unwrap_or_default();
                 let at = at.min(self.folded.len());
-                self.folded.insert(at, flag);
+                self.folded.insert(at, fold);
             }
             Change::Mutated(at) => {
-                // A row that just gained its result: the fold policy is about
-                // the output, which did not exist until now.
-                if let (Some(item), Some(flag)) =
+                // A row whose output just grew or landed. The policy is about
+                // the output, so it is asked again, in this same call: a
+                // command's streamed output has to fold in the event that made
+                // it long, or the frame drawn next shows it open.
+                if let (Some(item), Some(fold)) =
                     (self.model.items().get(at), self.folded.get_mut(at))
                 {
-                    *flag = folds_by_default(item);
+                    fold.follow(item);
                 }
             }
         }
     }
 }
 
-/// Whether a row starts folded.
+/// A run of tool calls as the compact view reports it.
+#[derive(Debug, Default)]
+struct Activity {
+    calls: usize,
+    failed: usize,
+    /// The newest call, when it has not answered yet.
+    running: Option<String>,
+}
+
+impl Activity {
+    fn add(&mut self, tool: &ToolItem) {
+        self.calls += 1;
+        match &tool.output {
+            Some(output) => {
+                self.failed += usize::from(output.is_error);
+                self.running = None;
+            }
+            None => self.running = Some(tool.name.clone()),
+        }
+    }
+
+    fn line(&self) -> String {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        if let Some(name) = &self.running {
+            let done = self.calls - 1;
+            return match done {
+                0 => format!("running {name}"),
+                n => format!("running {name} ({n} tool{} done)", plural(n)),
+            };
+        }
+        let mut line = format!("ran {} tool{}", self.calls, plural(self.calls));
+        if self.failed > 0 {
+            line.push_str(&format!(", {} failed", self.failed));
+        }
+        line
+    }
+}
+
+/// One row's fold: what it is drawn as, and what the policy last said.
 ///
-/// A call still running is always open — its card is where you watch it work.
-/// Once it answers, only length folds it: output long enough to bury the reply
-/// underneath it. A failure stays open whatever its exit, because the lines
-/// under `✗` are the reason it failed, and a reason behind Ctrl-T is a reason
-/// nobody reads.
+/// Two flags because a row's output changes after the row exists: every chunk
+/// a running command prints is a [`Change::Mutated`]. Re-applying the policy
+/// on each one would undo a Ctrl-T the user pressed to watch a long build, so
+/// a mutation only moves the row when the *policy's* answer moves.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fold {
+    /// Drawn folded.
+    shut: bool,
+    /// [`folds_by_default`] the last time it was asked about this row.
+    auto: bool,
+}
+
+impl Fold {
+    fn new(item: &TranscriptItem) -> Self {
+        let auto = folds_by_default(item);
+        Self { shut: auto, auto }
+    }
+
+    fn follow(&mut self, item: &TranscriptItem) {
+        let auto = folds_by_default(item);
+        if auto != self.auto {
+            *self = Self { shut: auto, auto };
+        }
+    }
+}
+
+/// Whether a row is folded by default.
+///
+/// Length folds a row: output long enough to bury the reply underneath it.
+/// That includes a call still running. A command streams what it prints into
+/// its card as it goes, and a card left open until the result landed drew the
+/// whole stream for a frame or two before snapping shut, which on a fast
+/// command reads as a flash of output that was never meant to be shown.
+///
+/// A short failure stays open whatever its exit, because the lines under `✗`
+/// are the reason it failed, and a reason behind Ctrl-T is a reason nobody
+/// reads.
 ///
 /// One rule, applied to a live row and a replayed one alike. The TUI used to
 /// have two: replay folded *every* answered call whatever its size, so a
@@ -540,7 +690,7 @@ fn folds_by_default(item: &TranscriptItem) -> bool {
     match item {
         TranscriptItem::Tool(tool) => match &tool.output {
             Some(output) => collapse_long(&output.content),
-            None => false,
+            None => collapse_long(&tool.progress),
         },
         _ => false,
     }

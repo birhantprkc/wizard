@@ -236,6 +236,7 @@ fn spinner_verb_is_deterministic_and_stable_within_a_busy_period() {
                 "Noodling".to_string(),
             ],
             vim: false,
+            compact: false,
             skin: None,
         },
         ..Config::default()
@@ -1792,6 +1793,68 @@ fn failed_tool_cards_start_open_unless_long() {
             if !tool.output.as_ref().expect("answered").is_error
     ));
     assert!(!app.transcript.folded(app.transcript.len() - 1));
+}
+
+/// A running command folds by the same length rule as a finished one, the
+/// moment its streamed output gets long, and a later chunk does not undo a
+/// fold the user changed by hand.
+#[test]
+fn a_running_command_folds_when_its_stream_gets_long() {
+    let mut app = app();
+    let (gate, _host) = crate::agent::ConsoleGate::open();
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        name: "execute".to_string(),
+        args: serde_json::json!({"command": "cargo build"}),
+    });
+    let row = app.transcript.len() - 1;
+    let chunk = |app: &mut App, text: &str| {
+        app.handle_agent_event(AgentEvent::ConsoleOutput {
+            gate,
+            chunk: text.to_string(),
+        })
+    };
+    chunk(&mut app, "Compiling a\n");
+    assert!(!app.transcript.folded(row), "short so far");
+    chunk(&mut app, &"Compiling b\n".repeat(10));
+    assert!(app.transcript.folded(row), "long now, in the same event");
+
+    // Ctrl-T to watch it: more output must not shut it again.
+    press_ctrl(&mut app, 't');
+    assert!(!app.transcript.folded(row));
+    chunk(&mut app, "Compiling c\n");
+    assert!(!app.transcript.folded(row), "the user's fold stands");
+
+    // The result is long too, so the policy did not move and neither does
+    // the row.
+    app.handle_agent_event(AgentEvent::ToolFinished {
+        name: "execute".to_string(),
+        output: crate::tools::ToolOutput::ok("Compiling\n".repeat(20)),
+    });
+    assert!(!app.transcript.folded(row));
+}
+
+/// A long stream is folded, but a command that stops to ask something opens
+/// its card: the question is its last line.
+#[test]
+fn a_command_that_asks_opens_its_folded_card() {
+    let mut app = app();
+    let (gate, _host) = crate::agent::ConsoleGate::open();
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        name: "execute".to_string(),
+        args: serde_json::json!({"command": "apt install x"}),
+    });
+    let row = app.transcript.len() - 1;
+    app.handle_agent_event(AgentEvent::ConsoleOpened {
+        command: "apt install x".to_string(),
+        gate,
+    });
+    app.handle_agent_event(AgentEvent::ConsoleOutput {
+        gate,
+        chunk: format!("{}Do you want to continue? [Y/n] ", "Get: pkg\n".repeat(20)),
+    });
+    assert!(app.transcript.folded(row));
+    app.handle_agent_event(AgentEvent::ConsoleWaiting { gate });
+    assert!(!app.transcript.folded(row), "the question is in view");
 }
 
 #[test]

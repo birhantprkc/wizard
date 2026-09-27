@@ -414,6 +414,13 @@ pub trait CommandSurface {
         self.error(message);
     }
 
+    /// `/view [compact|full]`: how much of the transcript is drawn.
+    async fn set_view(&mut self, compact: Option<bool>) {
+        let _ = compact;
+        let message = elsewhere("view", self.surface());
+        self.error(message);
+    }
+
     /// `/quit`: end the session.
     async fn quit(&mut self) {
         let message = elsewhere("quit", self.surface());
@@ -676,6 +683,7 @@ pub async fn dispatch<S: CommandSurface + Send + ?Sized>(command: SlashCommand, 
         SlashCommand::ImportClaude(selection) => surface.import_claude(selection).await,
         SlashCommand::Vim => surface.toggle_vim().await,
         SlashCommand::Ui(name) => surface.set_ui(name).await,
+        SlashCommand::View(compact) => surface.set_view(compact).await,
         SlashCommand::Quit => surface.quit().await,
 
         // Answered above, before `spec` was taken. The early return is what
@@ -1202,6 +1210,9 @@ mod tests {
         async fn set_ui(&mut self, _name: Option<String>) {
             self.verb("set_ui");
         }
+        async fn set_view(&mut self, _compact: Option<bool>) {
+            self.verb("set_view");
+        }
         async fn quit(&mut self) {
             self.verb("quit");
         }
@@ -1409,7 +1420,7 @@ mod tests {
             "not offered as a command: {text}"
         );
         assert!(
-            text.contains("terminal only: /vim, /ui, /quit, /exit"),
+            text.contains("terminal only: /vim, /ui, /view, /quit, /exit"),
             "but named, not silently absent: {text}"
         );
         assert!(text.contains("plus any custom command"));

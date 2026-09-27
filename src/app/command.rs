@@ -1830,6 +1830,10 @@ impl CommandSurface for CommandContext<'_> {
         self.app.notice(text);
     }
 
+    async fn set_view(&mut self, compact: Option<bool>) {
+        self.app.set_compact_view(compact);
+    }
+
     async fn quit(&mut self) {
         self.app.should_quit = true;
     }

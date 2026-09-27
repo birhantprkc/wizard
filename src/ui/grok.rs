@@ -656,8 +656,8 @@ fn scrollback(
     let mut entries: Vec<Entry> = Vec::new();
     let mut blocks: Vec<ImageBlock> = Vec::new();
 
-    for (index, item) in view.iter().enumerate() {
-        match item {
+    for (index, item) in view.shown() {
+        match &*item {
             // A turn boundary has no row of its own; the transcript reads as
             // one continuous conversation.
             TranscriptItem::TurnMarker { .. } => {}
@@ -704,7 +704,7 @@ fn scrollback(
     // The uncommitted tail: reasoning and prose arriving right now, decorated
     // exactly like a committed block so nothing shifts sideways when the turn
     // lands.
-    let (thinking, streaming) = view.streaming();
+    let (thinking, streaming) = view.shown_streaming();
     if !thinking.is_empty() {
         entries.push(thinking_entry(thinking, width, true));
     }
