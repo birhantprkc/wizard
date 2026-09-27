@@ -361,6 +361,22 @@ struct OpenTerminalParams {
     rows: u16,
 }
 
+/// Where a chat's terminal starts. Projectless chats record their folder as
+/// `~`, which is not a path the PTY can chdir into, so `~` and `~/…` expand to
+/// the home directory; a folder that no longer exists also falls back there
+/// instead of failing the terminal.
+fn terminal_cwd(cwd: Option<String>) -> String {
+    let home = home_dir();
+    let path = match cwd.as_deref() {
+        None | Some("") | Some("~") => home.clone(),
+        Some(rest) if rest.starts_with("~/") => home.join(&rest[2..]),
+        Some(path) => std::path::PathBuf::from(path),
+    };
+    if path.is_dir() { path } else { home }
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalIdParams {
@@ -2912,13 +2928,13 @@ impl RpcService for EngineRpc {
                 let p: OpenTerminalParams = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
                 // no row yet) gets the home directory.
-                let cwd = self
-                    .workspace
-                    .chat(&p.chat_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                let cwd = terminal_cwd(
+                    self.workspace
+                        .chat(&p.chat_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|chat| chat.cwd),
+                );
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -3069,6 +3085,24 @@ impl RpcService for EngineRpc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_cwd_expands_home_and_falls_back_to_it() {
+        let home = home_dir().to_string_lossy().into_owned();
+        assert_eq!(super::terminal_cwd(None), home);
+        assert_eq!(super::terminal_cwd(Some("~".into())), home);
+        assert_eq!(
+            super::terminal_cwd(Some("~/definitely-not-a-folder-zz9".into())),
+            home
+        );
+        assert_eq!(
+            super::terminal_cwd(Some("/definitely/not/a/folder".into())),
+            home
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().to_string_lossy().into_owned();
+        assert_eq!(super::terminal_cwd(Some(existing.clone())), existing);
+    }
+
     use super::*;
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
