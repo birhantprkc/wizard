@@ -118,6 +118,7 @@ class ClaudeLifetimeTest {
         val id = runBlocking { backend.newSession("/work").sessionId }
         val stop = scope.async { backend.prompt(id, "/work", "two agents") }
         val process = fake.next()
+        process.awaitWrite { it.contains("two agents") }
         process.emit(
             """{"type":"system","subtype":"init","session_id":"s"}""",
             """{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"},{"task_id":"b"}]}""",
@@ -147,6 +148,7 @@ class ClaudeLifetimeTest {
         val stop = scope.async { backend.prompt(id, "/work", "next") }
         val again = fake.next()
         assertTrue(again.command, again.command.contains("'--resume=$id'"))
+        again.awaitWrite { it.contains("next") }
         again.emit("""{"type":"result","subtype":"success","is_error":false,"session_id":"$id"}""")
         assertEquals("end_turn", runBlocking { withTimeout(10_000) { stop.await() } })
     }
@@ -157,6 +159,7 @@ class ClaudeLifetimeTest {
         val id = runBlocking { backend.newSession("/work").sessionId }
         val stop = scope.async { backend.prompt(id, "/work", "long job") }
         val process = fake.next()
+        process.awaitWrite { it.contains("long job") }
         process.emit(firstTurn.take(30))
         runBlocking { backend.cancel(id) }
         process.awaitWrite { it.contains("\"subtype\":\"interrupt\"") }
@@ -183,6 +186,7 @@ class ClaudeLifetimeTest {
         val stop = scope.async { backend.prompt(id, "/work", "still there?") }
         val again = fake.next()
         assertTrue(again.command.contains("'--resume=$id'"))
+        again.awaitWrite { it.contains("still there?") }
         again.emit("""{"type":"result","subtype":"success","is_error":false,"session_id":"$id"}""")
         assertEquals("end_turn", runBlocking { withTimeout(10_000) { stop.await() } })
     }
@@ -193,6 +197,7 @@ class ClaudeLifetimeTest {
         val id = runBlocking { backend.newSession("/work").sessionId }
         val stop = scope.async { backend.prompt(id, "/work", "hello") }
         val process = fake.next()
+        process.awaitWrite { it.contains("hello") }
         process.emit(firstTurn.take(10))
         fake.isConnected = false
         process.drop()
