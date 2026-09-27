@@ -9,8 +9,8 @@ pub(crate) fn decode(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
         .decode()
 }
 
-/// Bundled Wizard artwork: Starship stacked on the pad at Starbase. It is the
-/// new-chat background whenever Wizard is the selected harness and the user
-/// has not chosen an image of their own.
+/// Bundled Starship artwork: Starship stacked on the pad at Starbase. It is
+/// the new-chat background for every agent unless the user has chosen an image
+/// of their own or switched it off.
 pub(crate) static WIZARD_BACKGROUND: &[u8] =
     include_bytes!("../assets/backgrounds/wizard-starship.jpg");

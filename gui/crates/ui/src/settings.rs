@@ -384,7 +384,7 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     Ok(())
 }
 
-/// The bundled Wizard artwork on disk, written once under the data dir so the
+/// The bundled Starship artwork on disk, written once under the data dir so the
 /// path-keyed background pipeline (effects, luminance cache) can load it like
 /// a user-chosen image. `None` when the data dir is unwritable.
 pub fn wizard_background_path(cx: &App) -> Option<PathBuf> {
@@ -844,8 +844,9 @@ pub struct UiSettings {
     pub transcript_compact_mode: bool,
     /// Set once the first-run onboarding finishes or is skipped.
     pub onboarding_completed: bool,
-    /// Show the bundled Wizard artwork behind the new-chat composer when no
-    /// custom background is chosen and Wizard is the selected harness.
+    /// Show the bundled Starship artwork behind the new-chat composer when no
+    /// custom background is chosen, whatever the agent. The key keeps its old
+    /// name so existing settings files still read.
     pub new_thread_wizard_background: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,

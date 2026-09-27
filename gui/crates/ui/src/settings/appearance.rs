@@ -3116,8 +3116,8 @@ impl Render for AppearancePage {
         let background_available = current_background
             .as_ref()
             .is_some_and(|background| Path::new(&background.path).is_file());
-        // No image of their own: Wizard's bundled artwork stands in (shown
-        // while Wizard is the selected agent) unless it was switched off.
+        // No image of their own: the bundled Starship artwork stands in for
+        // every agent unless it was switched off.
         let wizard_artwork = current_background
             .is_none()
             .then(|| crate::settings::current(cx).new_thread_wizard_background)
@@ -3176,9 +3176,9 @@ impl Render for AppearancePage {
                     .into_any_element(),
             ],
             None if wizard_artwork => vec![
-                div().child("Wizard artwork").into_any_element(),
+                div().child("Starship artwork").into_any_element(),
                 div()
-                    .child("Shown while Wizard is the selected agent.")
+                    .child("Shown behind new chats with any agent.")
                     .into_any_element(),
             ],
             None => vec![
@@ -3234,9 +3234,9 @@ impl Render for AppearancePage {
                                     compact_action(
                                         &theme,
                                         if wizard_artwork {
-                                            "Hide Wizard artwork"
+                                            "Hide Starship artwork"
                                         } else {
-                                            "Use Wizard artwork"
+                                            "Use Starship artwork"
                                         },
                                         "new-thread-background-wizard",
                                     )

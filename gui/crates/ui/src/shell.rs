@@ -1638,8 +1638,8 @@ pub struct Shell {
     attention_sound_gate: crate::sound::AttentionSoundGate,
     /// First-run onboarding, mounted over the ready app until completed.
     onboarding: Option<onboarding::Onboarding>,
-    /// The new-chat canvas shows the bundled Wizard artwork (no custom
-    /// background, Wizard selected); held through the dissolve into a thread.
+    /// The new-chat canvas shows the bundled Starship artwork (no custom
+    /// background); held through the dissolve into a thread.
     new_thread_wizard_artwork: bool,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
@@ -8389,18 +8389,11 @@ impl Shell {
         let frame_time = self.render_time.unwrap_or_else(std::time::Instant::now);
         // Prewarm even in an established thread. Decode/effect work is not
         // contingent on a hero measurement or a navigation gesture.
-        // With no image of their own, Wizard users get the bundled artwork.
+        // With no image of their own, every agent gets the bundled artwork.
         // Latched on the new-chat canvas so the dissolve into a thread keeps
         // whatever the canvas showed.
         if !has_selection {
-            self.new_thread_wizard_artwork = ui_settings.new_thread_wizard_background
-                && self
-                    .composer
-                    .read(cx)
-                    .pickers()
-                    .read(cx)
-                    .effective_harness(cx)
-                    == Some(zeron_proto::HarnessId::Wizard);
+            self.new_thread_wizard_artwork = ui_settings.new_thread_wizard_background;
         }
         let artwork_path = match new_thread_background_setting.as_ref() {
             Some(background) => Some(std::path::PathBuf::from(&background.path)),

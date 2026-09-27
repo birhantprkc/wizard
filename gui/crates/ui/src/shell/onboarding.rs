@@ -1,4 +1,4 @@
-//! First-run onboarding: a full-window welcome over the Wizard artwork that
+//! First-run onboarding: a full-window welcome over the Starship artwork that
 //! installs agents, reuses sign-ins already on disk for Wizard, and sets the
 //! defaults new chats start with. Finishing or skipping records
 //! `onboardingCompleted`, so it shows once per install.
@@ -826,8 +826,8 @@ impl Shell {
                     ))
                     .child(toggle_row(
                         "onboarding-artwork",
-                        "Wizard artwork",
-                        "Show the Starship backdrop behind new Wizard chats.",
+                        "Starship artwork",
+                        "Show the Starship backdrop behind new chats.",
                         current.new_thread_wizard_background,
                         settings::set_new_thread_wizard_background,
                         cx,
