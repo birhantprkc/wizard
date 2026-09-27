@@ -51,6 +51,8 @@ pub enum ShortcutsEvent {
     EscapeStopsActiveAgentChanged(bool),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
+    /// Vim editing in the message box toggled.
+    VimComposerChanged(bool),
     AppshotsChanged {
         enabled: bool,
         sound_enabled: bool,
@@ -66,6 +68,7 @@ pub struct ShortcutsPage {
     keymap: KeymapConfig,
     escape_stops_active_agent: bool,
     composer_send_behavior: ComposerSendBehavior,
+    vim_composer: bool,
     recording: Option<ShortcutId>,
     recording_blur: Option<gpui::Subscription>,
     recording_interceptor: Option<gpui::Subscription>,
@@ -106,6 +109,7 @@ impl ShortcutsPage {
             keymap,
             escape_stops_active_agent,
             composer_send_behavior,
+            vim_composer: crate::settings::vim_composer(cx),
             recording: None,
             recording_blur: None,
             recording_interceptor: None,
@@ -173,6 +177,14 @@ impl ShortcutsPage {
         if self.escape_stops_active_agent != enabled {
             self.escape_stops_active_agent = enabled;
             cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
+            cx.notify();
+        }
+    }
+
+    fn set_vim_composer(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.vim_composer != enabled {
+            self.vim_composer = enabled;
+            cx.emit(ShortcutsEvent::VimComposerChanged(enabled));
             cx.notify();
         }
     }
@@ -579,6 +591,43 @@ impl Render for ShortcutsPage {
                 ),
         );
 
+        let vim_composer = self.vim_composer;
+        let toggle_row = |title: &'static str, copy: &'static str, first: bool| {
+            widgets::card_row(&theme, first).min_h(px(84.0)).child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::row_title(&theme, title))
+                    .child(
+                        div()
+                            .mt(px(4.0))
+                            .max_w(px(460.0))
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .line_height(px(17.0))
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child(SharedString::from(copy)),
+                    ),
+            )
+        };
+        let vim_card = widgets::section_card(&theme)
+            .child(
+                toggle_row(
+                    "Vim editing in the message box",
+                    "Normal, insert and visual modes in the message box. Esc for normal mode, Enter in normal mode sends.",
+                    true,
+                )
+                .child(
+                    widgets::toggle_switch(&theme, vim_composer)
+                        .id("vim-composer-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_vim_composer(!vim_composer, cx);
+                        })),
+                ),
+            );
+
         let send_behavior_control = div()
             .flex_none()
             .flex()
@@ -800,7 +849,8 @@ impl Render for ShortcutsPage {
                                             .child(SharedString::from("Restore defaults"))
                                     }),
                             )
-                            .child(send_behavior_row.mt(px(32.0)))
+                            .child(vim_card.mt(px(32.0)))
+                            .child(send_behavior_row)
                             .child(completion)
                             .child(
                                 div()

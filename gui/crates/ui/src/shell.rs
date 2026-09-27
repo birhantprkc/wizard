@@ -4121,6 +4121,9 @@ impl Shell {
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;
                                 }
+                                ShortcutsEvent::VimComposerChanged(enabled) => {
+                                    this.settings.vim_composer = *enabled;
+                                }
                                 ShortcutsEvent::AppshotsChanged {
                                     enabled,
                                     sound_enabled,

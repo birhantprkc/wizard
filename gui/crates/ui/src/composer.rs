@@ -601,6 +601,46 @@ fn interrupt_params(chat_id: &str) -> serde_json::Value {
     })
 }
 
+/// The smallest edit turning `old` into `new`: the changed byte range in
+/// each, trimming the common prefix and suffix on char boundaries. Pure.
+fn vim_edit_ranges(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
+    let prefix: usize = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    let suffix: usize = old[prefix..]
+        .chars()
+        .rev()
+        .zip(new[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    (prefix..old.len() - suffix, prefix..new.len() - suffix)
+}
+
+#[cfg(test)]
+mod vim_edit_tests {
+    use super::vim_edit_ranges;
+
+    #[test]
+    fn edit_ranges_trim_the_common_ends() {
+        assert_eq!(
+            vim_edit_ranges("hello world", "hello there world"),
+            (6..6, 6..12)
+        );
+        assert_eq!(vim_edit_ranges("abc", "abc"), (3..3, 3..3));
+        assert_eq!(vim_edit_ranges("foo bar", "bar"), (0..4, 0..0));
+        assert_eq!(vim_edit_ranges("", "x"), (0..0, 0..1));
+        // Repeated letters: the prefix wins, the suffix never overlaps it.
+        assert_eq!(vim_edit_ranges("aaa", "aa"), (2..3, 2..2));
+        // Multibyte stays on char boundaries.
+        assert_eq!(vim_edit_ranges("café au lait", "café lait"), (6..9, 6..6));
+        assert_eq!(vim_edit_ranges("éé", "é"), (2..4, 2..2));
+    }
+}
+
 fn escape_dismisses_completion(key: &str, completion_open: bool) -> bool {
     key == "escape" && completion_open
 }
@@ -1428,6 +1468,10 @@ enum EditKind {
 
 const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
 const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
+/// Key context of the message box while vim owns its keys (Normal and
+/// Visual). Nothing binds it, so every key reaches the vim handler instead
+/// of the text-editing bindings.
+const VIM_NORMAL_CONTEXT: &str = "VimNormal";
 const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1819,6 +1863,13 @@ pub struct ComposerInput {
     /// Created once when Waiting promotes; retaining this entity preserves
     /// GPUI's global animation state across prepaint frames.
     mention_tooltip_view: Option<Entity<MentionPathTooltip>>,
+    /// Modal editing (Settings, Vim editing in the message box). `None`
+    /// when off, and always for inputs other than the message box.
+    vim: Option<crate::vim::Vim>,
+    /// The cursor and selection vim last wrote. A different selection means
+    /// the caret moved outside vim (a click), so vim adopts it.
+    vim_cursor: usize,
+    vim_range: Option<Range<usize>>,
 }
 
 impl ComposerInput {
@@ -1897,6 +1948,9 @@ impl ComposerInput {
             mention_tooltip_popup: None,
             mention_tooltip_task: None,
             mention_tooltip_view: None,
+            vim: None,
+            vim_cursor: 0,
+            vim_range: None,
         }
     }
 
@@ -3031,6 +3085,146 @@ impl ComposerInput {
         self.last_edit = None;
         cx.notify();
         true
+    }
+
+    // ---- vim ----
+
+    pub(crate) fn set_vim_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled == self.vim.is_some() {
+            return;
+        }
+        self.vim = enabled.then(crate::vim::Vim::new);
+        self.vim_range = None;
+        cx.notify();
+    }
+
+    /// Mode and pending keys for the indicator, when vim is on.
+    pub(crate) fn vim_status(&self) -> Option<(crate::vim::Mode, String)> {
+        self.vim.as_ref().map(|vim| (vim.mode(), vim.pending()))
+    }
+
+    fn vim_owns_keys(&self) -> bool {
+        self.vim
+            .as_ref()
+            .is_some_and(|vim| vim.mode() != crate::vim::Mode::Insert)
+    }
+
+    /// Show vim's cursor: a one-character block in Normal mode, the selection
+    /// in Visual, a caret in Insert.
+    fn sync_vim_selection(&mut self, cursor: usize, cx: &mut Context<Self>) {
+        let Some(vim) = self.vim.as_ref() else {
+            return;
+        };
+        let cursor = vim.clamp(&self.content, cursor);
+        let range = match vim.mode() {
+            crate::vim::Mode::Insert => cursor..cursor,
+            crate::vim::Mode::Normal => {
+                let next = self.content[cursor..]
+                    .chars()
+                    .next()
+                    .filter(|c| *c != '\n')
+                    .map_or(cursor, |c| cursor + c.len_utf8());
+                cursor..next
+            }
+            crate::vim::Mode::Visual | crate::vim::Mode::VisualLine => vim
+                .selection(&self.content, cursor)
+                .unwrap_or(cursor..cursor),
+        };
+        self.selection_reversed = range.start == cursor && range.end > range.start;
+        self.selected_range = range.clone();
+        self.caret_affinity = CaretAffinity::Downstream;
+        self.preferred_column = None;
+        self.follow_cursor = true;
+        self.reset_blink();
+        self.vim_cursor = cursor;
+        self.vim_range = Some(range);
+        cx.emit(ComposerInputEvent::CursorMoved);
+        cx.notify();
+    }
+
+    /// Capture-phase key handler for vim. Insert mode only watches for Esc;
+    /// Normal and Visual take every key except chords vim passes back.
+    fn on_vim_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = self.vim.as_ref().map(crate::vim::Vim::mode) else {
+            return;
+        };
+        if !self.focus_handle.is_focused(window) || self.marked_range.is_some() {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let mods = keystroke.modifiers;
+        let escape = keystroke.key == "escape" || (keystroke.key == "[" && mods.control);
+        // Insert mode types through the input as usual. An open completion
+        // menu gets the first Esc to close itself.
+        if mode == crate::vim::Mode::Insert && (!escape || self.mention_open) {
+            return;
+        }
+        let key = crate::vim::Key {
+            key: keystroke.key.clone(),
+            ch: keystroke.key_char.as_deref().and_then(|s| {
+                let mut chars = s.chars();
+                chars.next().filter(|_| chars.next().is_none())
+            }),
+            ctrl: mods.control,
+            alt: mods.alt,
+            cmd: mods.platform,
+        };
+        let mut cursor = if self.vim_range.as_ref() == Some(&self.selected_range) {
+            self.vim_cursor
+        } else {
+            // The caret moved outside vim (a click or a completion). Adopt it.
+            let cursor = self.cursor_offset();
+            if let Some(vim) = self.vim.as_mut()
+                && matches!(
+                    vim.mode(),
+                    crate::vim::Mode::Visual | crate::vim::Mode::VisualLine
+                )
+            {
+                let mut c = cursor;
+                vim.set_mode(crate::vim::Mode::Normal, &self.content, &mut c);
+            }
+            cursor
+        };
+        let mut text = self.content.clone();
+        let Some(vim) = self.vim.as_mut() else {
+            return;
+        };
+        let outcome = vim.handle(&key, &mut text, &mut cursor);
+        match outcome {
+            crate::vim::Outcome::PassThrough => {}
+            crate::vim::Outcome::Escape => {
+                // Nothing to cancel: let Esc bubble (power user mode leaves
+                // the message box on it).
+                self.sync_vim_selection(cursor, cx);
+            }
+            crate::vim::Outcome::Submit => {
+                cx.stop_propagation();
+                self.submit(&Submit, window, cx);
+                // The next message starts in Insert, ready to type.
+                if let Some(vim) = self.vim.as_mut() {
+                    let mut c = self.content.len();
+                    vim.set_mode(crate::vim::Mode::Insert, &self.content, &mut c);
+                    cursor = c;
+                }
+                self.sync_vim_selection(cursor, cx);
+            }
+            crate::vim::Outcome::Handled => {
+                cx.stop_propagation();
+                if text != self.content {
+                    let (old, new) = vim_edit_ranges(&self.content, &text);
+                    let utf16 = self.range_to_utf16(&old);
+                    self.last_edit = None;
+                    self.replace_text_in_range(Some(utf16), &text[new], window, cx);
+                    self.last_edit = None;
+                }
+                self.sync_vim_selection(cursor, cx);
+            }
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -4513,8 +4707,13 @@ impl Render for ComposerInput {
             .role(self.accessibility_role)
             .aria_label(self.placeholder.clone())
             .aria_placeholder(self.placeholder.clone())
-            .key_context(self.key_context)
+            .key_context(if self.vim_owns_keys() {
+                VIM_NORMAL_CONTEXT
+            } else {
+                self.key_context
+            })
             .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(Self::on_vim_key_down))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -8778,6 +8977,9 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let vim_on = crate::settings::vim_composer(cx);
+        self.input
+            .update(cx, |input, cx| input.set_vim_enabled(vim_on, cx));
         if self.focus_pending {
             self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
@@ -9515,6 +9717,70 @@ impl Render for Composer {
         // (the popover glass treatment; radius matches the pill's rounding).
         // The shell keeps this entity under one parent on both routes. The
         // surface itself never fades, and frost follows the same morph radius.
+        // Vim mode tag, hanging just above the pill. In a conversation the
+        // left edge belongs to the run status strip, so it sits right; the
+        // blank canvas keeps its target selectors on the right, so it sits left.
+        let vim_tag_right = self.state.read(cx).selected_chat.is_some();
+        let vim_indicator = self.input.read(cx).vim_status().map(|(mode, pending)| {
+            let insert = mode == crate::vim::Mode::Insert;
+            let hint = match mode {
+                crate::vim::Mode::Insert => "Esc for normal mode",
+                crate::vim::Mode::Normal => "Enter sends \u{00B7} i to type",
+                crate::vim::Mode::Visual | crate::vim::Mode::VisualLine => {
+                    "y d c > < on the selection"
+                }
+            };
+            div()
+                .id("composer-vim-mode")
+                .absolute()
+                .top(px(-22.0))
+                .map(|el| {
+                    if vim_tag_right {
+                        el.right(px(14.0))
+                    } else {
+                        el.left(px(14.0))
+                    }
+                })
+                .h(px(18.0))
+                .px(px(6.0))
+                .rounded(px(5.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .bg(theme.bg.opacity(0.92))
+                .border_1()
+                .border_color(if insert {
+                    theme.border
+                } else {
+                    theme.accent.opacity(0.6)
+                })
+                .text_size(crate::typography::ui_rems(10.5))
+                .child(
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(if insert {
+                            theme.text_muted
+                        } else {
+                            theme.accent
+                        })
+                        .child(SharedString::from(mode.label())),
+                )
+                .when(!pending.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .font_family(theme.font_mono.clone())
+                            .text_color(theme.text)
+                            .child(SharedString::from(pending)),
+                    )
+                })
+                .child(
+                    div()
+                        .text_color(theme.text_muted.opacity(0.8))
+                        .child(SharedString::from(hint)),
+                )
+        });
         let pill_surface = div()
             .relative()
             .id("composer-surface")
@@ -9533,7 +9799,8 @@ impl Render for Composer {
             // Both completion popups span the full pill width above it —
             // the file-mention and slash tokens are mutually exclusive.
             .children(self.render_file_mention_popup(&theme, cx))
-            .children(self.render_slash_popup(&theme, cx));
+            .children(self.render_slash_popup(&theme, cx))
+            .children(vim_indicator);
         // Restore the original chip-only selector treatment: destination at
         // the top-right, no surrounding surface. Cancel the column gap as the
         // row collapses so the pill never jumps at the route boundary.
