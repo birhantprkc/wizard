@@ -360,7 +360,14 @@ pub async fn install_harness(
 ) -> Result<(), HarnessError> {
     // Choosing the method and asking whether Node is there both run the
     // login-shell probe the first time, which can take seconds.
-    let (method, needs_node) = tokio::task::spawn_blocking(move || (selected(id), false))
+    let (method, needs_node) = tokio::task::spawn_blocking(move || {
+        let method = selected(id);
+        let needs_node = id == HarnessId::Pi
+            && matches!(method, Some(Method::Shell(..) | Method::Npm(..)))
+            && !cfg!(windows)
+            && !crate::node_bootstrap::has_usable_node();
+        (method, needs_node)
+    })
     .await
     .map_err(|e| HarnessError::Install(e.to_string()))?;
     let method = method.ok_or_else(|| {
@@ -383,6 +390,14 @@ pub async fn install_harness(
             };
         }
         let mut front = Vec::new();
+        if needs_node {
+            progress.enter(Stage::Node);
+            front.push(crate::node_bootstrap::install(&progress, &cancel).await?);
+        } else if id == HarnessId::Pi
+            && let Some(bin) = crate::node_bootstrap::standalone_bin()
+        {
+            front.push(bin);
+        }
         #[cfg(unix)]
         let shim = if meters_curl(id, method) {
             resolve("curl").and_then(|curl| {
@@ -409,6 +424,15 @@ pub async fn install_harness(
     .await;
     invalidate_versions(id);
     result?;
+    if id == HarnessId::Pi && installed(id) {
+        // Pi's first chat would otherwise start by installing its ACP adapter
+        // in the background. Best effort: a failure here leaves Pi installed
+        // and the chat-time install as the fallback.
+        progress.enter(Stage::Adapter);
+        if let Err(error) = crate::acp::install_pi_adapter().await {
+            tracing::warn!("installing the Pi adapter after Pi failed: {error}");
+        }
+    }
     progress.enter(Stage::Checking);
     tokio::task::spawn_blocking(move || post_install(id))
         .await

@@ -172,6 +172,7 @@ pub mod install_progress;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
+pub(crate) mod node_bootstrap;
 pub mod opencode;
 pub mod process;
 mod scratch;

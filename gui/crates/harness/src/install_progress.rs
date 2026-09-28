@@ -260,6 +260,10 @@ impl Progress {
         self.with(|t| t.enter(stage, Instant::now()));
     }
 
+    pub(crate) fn bytes(&self, done: u64, total: Option<u64>) {
+        self.with(|t| t.bytes(done, total));
+    }
+
     pub(crate) fn line(&self, line: &str) {
         self.with(|t| t.line(line, Instant::now()));
     }

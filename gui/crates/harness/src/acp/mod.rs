@@ -630,6 +630,17 @@ pub fn can_install(harness: HarnessId) -> bool {
     harness == HarnessId::Antigravity && antigravity_archive().is_some()
 }
 
+/// Install Pi's pinned ACP adapter now rather than at its first chat.
+pub(crate) async fn install_pi_adapter() -> Result<(), HarnessError> {
+    let spec = pi_spec();
+    let pin = spec
+        .npm_package
+        .map(crate::adapter_install::NpmPin::parse)
+        .ok_or_else(|| HarnessError::Install("Pi has no pinned adapter".into()))?;
+    crate::adapter_install::ensure_installed(pin, spec.executable, spec.display_name).await?;
+    Ok(())
+}
+
 /// Only an explicit Settings action may call this installer.
 pub async fn install_harness(harness: HarnessId) -> Result<(), HarnessError> {
     let pin = (harness == HarnessId::Antigravity)
@@ -1359,24 +1370,23 @@ impl AcpHarness {
         // pi-acp runs `pi` from PATH. A pi installed outside PATH (pi.dev's
         // installer can use ~/.pi/agent/bin) is found by `cli_path`, so hand
         // its directory to the adapter too.
-        if self.spec.id == HarnessId::Pi
-            && let Some(dir) = self
+        if self.spec.id == HarnessId::Pi {
+            // pi's launcher runs `#!/usr/bin/env node` and needs Node 22.19+;
+            // a standalone Node installed for it goes ahead of an older one.
+            let front: Vec<PathBuf> = self
                 .cli_path()
                 .and_then(|p| p.parent().map(Path::to_path_buf))
-        {
+                .into_iter()
+                .chain(crate::node_bootstrap::standalone_bin())
+                .collect();
             let current = cmd
                 .as_std_mut()
                 .get_envs()
                 .find(|(k, _)| *k == "PATH")
                 .and_then(|(_, v)| v.map(|v| v.to_os_string()))
-                .or_else(|| std::env::var_os("PATH"))
-                .unwrap_or_default();
-            let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
-            if !paths.contains(&dir) {
-                paths.insert(0, dir);
-                if let Ok(joined) = std::env::join_paths(paths) {
-                    cmd.env("PATH", joined);
-                }
+                .or_else(|| std::env::var_os("PATH"));
+            if let Some(joined) = crate::gui_path::compose(&front, current.as_deref(), None, &[]) {
+                cmd.env("PATH", joined);
             }
         }
         if self.spec.id == HarnessId::Antigravity

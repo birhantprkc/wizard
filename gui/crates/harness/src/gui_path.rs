@@ -68,6 +68,10 @@ pub(crate) fn pi_node_bin_with(env: &impl Fn(&str) -> Option<OsString>) -> Optio
     pi_node_root_with(env).map(|root| root.join("current").join("bin"))
 }
 
+pub(crate) fn pi_node_root() -> Option<PathBuf> {
+    pi_node_root_with(&|key| std::env::var_os(key))
+}
+
 /// A child's PATH: `front` first, then the current PATH, the login shell's,
 /// and `back`, with empty and repeated entries dropped. Earlier wins, so an
 /// explicit PATH entry keeps beating a well-known fallback.
