@@ -3,12 +3,14 @@ name: GUI install smoke
 # Builds Wizard GUI, installs agents the way its Install button does from the
 # environment a Dock or desktop-launcher start gets (empty HOME, launchd's
 # PATH, no terminal), and on macOS launches the packaged app on the runner's
-# desktop session and screenshots it. Manual, or on pushes to the branch that
-# carries GUI install work.
+# desktop session and screenshots it. The update jobs build the app twice,
+# the second time with a newer version, serve that as a signed release from a
+# local HTTPS feed, and check the first build updates itself to it. Manual, or
+# on pushes to the branches that carry GUI install and update work.
 on:
   workflow_dispatch:
   push:
-    branches: [gui-macos-fixes]
+    branches: [gui-macos-fixes, gui-self-update]
 
 permissions:
   contents: read
@@ -128,3 +130,159 @@ jobs:
         with:
           name: linux-smoke
           path: ${{ runner.temp }}/smoke
+
+  # Both update jobs build with WIZARD_GUI_TEST_RELEASE_KEY, so the app trusts
+  # a key generated here instead of Wizard's, and accepts WIZARD_GUI_TEST_CA
+  # for the local feed's certificate. Release builds never set either.
+  update-linux:
+    name: Self-update (linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FEED: ${{ github.workspace }}/../feed
+      PKG: ${{ github.workspace }}/../pkg
+      NEW: 99.0.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: gpui system libraries and test tools
+        run: |
+          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev \
+            minisign xvfb xdotool imagemagick mesa-vulkan-drivers
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+      - name: Throwaway release key and TLS certificate
+        run: scripts/update-smoke-feed.sh keys "$FEED"
+      - name: Package the running version and a newer one
+        env:
+          WIZARD_GUI_TEST_RELEASE_KEY: ${{ github.workspace }}/../feed/test.pub
+        run: |
+          set -eux
+          old="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "OLD=$old" >>"$GITHUB_ENV"
+          mkdir -p "$PKG"
+          PROFILE=debug scripts/package-linux.sh
+          mv "target/package/wizard-gui-$old-linux-x86_64.tar.gz" "$PKG/"
+          sed -i "0,/^version = \"$old\"/s//version = \"$NEW\"/" Cargo.toml
+          PROFILE=debug scripts/package-linux.sh
+          mv "target/package/wizard-gui-$NEW-linux-x86_64.tar.gz" "$PKG/"
+          git checkout Cargo.toml Cargo.lock
+      - name: Install the running version
+        run: |
+          set -eux
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          tar -xzf "$PKG/wizard-gui-$OLD-linux-x86_64.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wizard-gui-$OLD-linux-x86_64/install.sh"
+          ls -la "$HOME/.local/bin" "$HOME/.local/share/wizard-gui"
+          test "$(readlink "$HOME/.local/share/wizard-gui/current")" = "$OLD"
+          "$HOME/.local/bin/wizard-gui" --version
+      - name: A release signed by another key is refused
+        run: |
+          set -eux
+          KEY=other scripts/update-smoke-feed.sh publish "$FEED" "$NEW" "$PKG/wizard-gui-$NEW-linux-x86_64.tar.gz"
+          scripts/update-smoke-feed.sh serve "$FEED"
+          export HOME="$RUNNER_TEMP/home" WIZARD_GUI_RELEASES_URL=https://127.0.0.1:8443/releases WIZARD_GUI_TEST_CA="$FEED/ca.pem"
+          if "$HOME/.local/bin/wizard-gui" update >"$RUNNER_TEMP/refused.txt" 2>&1; then
+            cat "$RUNNER_TEMP/refused.txt"
+            echo "::error::installed a release signed by the wrong key"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/refused.txt"
+          grep -q "signed by key" "$RUNNER_TEMP/refused.txt"
+          test "$(readlink "$HOME/.local/share/wizard-gui/current")" = "$OLD"
+          test ! -e "$HOME/.local/share/wizard-gui/$NEW"
+      - name: wizard-gui update installs the signed release
+        run: |
+          set -eux
+          scripts/update-smoke-feed.sh publish "$FEED" "$NEW" "$PKG/wizard-gui-$NEW-linux-x86_64.tar.gz"
+          export HOME="$RUNNER_TEMP/home" WIZARD_GUI_RELEASES_URL=https://127.0.0.1:8443/releases WIZARD_GUI_TEST_CA="$FEED/ca.pem"
+          set +e
+          "$HOME/.local/bin/wizard-gui" update --check
+          test $? -eq 1 || exit 1
+          set -e
+          "$HOME/.local/bin/wizard-gui" update
+          ls -la "$HOME/.local/share/wizard-gui"
+          test "$(readlink "$HOME/.local/share/wizard-gui/current")" = "$NEW"
+          test -x "$HOME/.local/share/wizard-gui/$OLD/wizard-gui"
+          "$HOME/.local/bin/wizard-gui" --version | grep -x "zeron $NEW"
+      - name: The app updates itself from the banner and relaunches
+        run: |
+          set -eux
+          export HOME="$RUNNER_TEMP/home"
+          # Back to the old version, the way a fresh install would be.
+          "$RUNNER_TEMP/wizard-gui-$OLD-linux-x86_64/install.sh"
+          rm -rf "$HOME/.local/share/wizard-gui/$NEW"
+          Xvfb :99 -screen 0 1440x900x24 >/dev/null 2>&1 &
+          export DISPLAY=:99
+          sleep 2
+          scripts/update-smoke-app.sh linux "$HOME/.local/bin/wizard-gui" "$FEED" "$NEW" "$RUNNER_TEMP/shots"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: linux-update
+          path: |
+            ${{ runner.temp }}/shots
+            ${{ runner.temp }}/home/.zeron/logs
+            ${{ runner.temp }}/refused.txt
+
+  update-macos:
+    name: Self-update (macos arm64)
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      FEED: ${{ github.workspace }}/../feed
+      PKG: ${{ github.workspace }}/../pkg
+      NEW: 99.0.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+      - name: Test tools
+        run: brew install --quiet minisign cliclick
+      - name: Throwaway release key and TLS certificate
+        run: scripts/update-smoke-feed.sh keys "$FEED"
+      - name: Package the running version and a newer one
+        env:
+          WIZARD_GUI_TEST_RELEASE_KEY: ${{ github.workspace }}/../feed/test.pub
+        run: |
+          set -eux
+          old="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "OLD=$old" >>"$GITHUB_ENV"
+          mkdir -p "$PKG"
+          PROFILE=debug scripts/package-macos.sh
+          cp -R "target/package/Wizard GUI.app" /Applications/
+          sed -i '' "1,/^version = \"$old\"/s//version = \"$NEW\"/" Cargo.toml
+          PROFILE=debug scripts/package-macos.sh
+          mv "target/package/zeron-$NEW-macos-arm64.dmg" "$PKG/wizard-gui-$NEW-macos-arm64.dmg"
+          git checkout Cargo.toml Cargo.lock
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "/Applications/Wizard GUI.app/Contents/Info.plist"
+      - name: Serve the newer version as a signed release
+        run: |
+          scripts/update-smoke-feed.sh publish "$FEED" "$NEW" "$PKG/wizard-gui-$NEW-macos-arm64.dmg"
+          scripts/update-smoke-feed.sh serve "$FEED"
+      - name: The app updates itself from the banner and relaunches
+        run: scripts/update-smoke-app.sh macos "/Applications/Wizard GUI.app" "$FEED" "$NEW" "$RUNNER_TEMP/shots"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: macos-update
+          path: |
+            ${{ runner.temp }}/shots
+            ~/.zeron/logs
