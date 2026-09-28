@@ -1200,9 +1200,7 @@ where
 fn forward_deadline(method: &str) -> std::time::Duration {
     use std::time::Duration;
     match method {
-        methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
-            Duration::from_secs(15 * 60)
-        }
+        methods::CLONE_REPO | methods::FETCH_ALL => Duration::from_secs(15 * 60),
         methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
         // Outlast the engine's own pi timeouts (pi_packages.rs) plus relay overhead.
         methods::INSTALL_PI_PACKAGE | methods::UPDATE_PI_PACKAGES => Duration::from_secs(11 * 60),
@@ -1315,7 +1313,7 @@ fn forwardable(method: &str) -> bool {
             | methods::READ_ATTACHMENT_CHUNK
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
-            | methods::APPLY_UPDATE
+            | methods::CHECK_FOR_UPDATES
     )
 }
 
@@ -2220,13 +2218,9 @@ impl RpcService for EngineRpc {
                 ))))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
-            methods::APPLY_UPDATE => {
-                let version = self
-                    .updater()?
-                    .apply()
-                    .await
-                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
-                RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
+            methods::CHECK_FOR_UPDATES => {
+                self.updater()?.check_now();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;

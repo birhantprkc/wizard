@@ -123,6 +123,9 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+    /// Check GitHub for Wizard GUI releases (the app and its daemon; tests
+    /// and one-shot commands leave it off).
+    pub check_for_updates: bool,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -155,8 +158,6 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<zeron_update::Updater>>,
-    /// The updater's token-change wake forwarder — owned so shutdown can end it.
-    updater_wake: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -337,7 +338,6 @@ impl EngineCore {
             links: std::sync::Mutex::new(None),
             ssh_peers: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
-            updater_wake: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -420,13 +420,6 @@ impl EngineCore {
     }
 
     /// Attach the release checker (before building the RPC service).
-    pub fn set_updater_wake(&self, handle: tokio::task::JoinHandle<()>) {
-        *self
-            .updater_wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
-    }
-
     pub fn set_updater(&self, updater: zeron_update::Updater) {
         *self
             .updater
@@ -541,15 +534,6 @@ impl EngineCore {
         // Cancel + await every worker that can reach Edge before flushing: a
         // replaced synced runtime must not keep polling releases or draining
         // the attachment outbox under the old identity after Local boots.
-        let wake = self
-            .updater_wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(wake) = wake {
-            wake.abort();
-            let _ = wake.await;
-        }
         let updater = self
             .updater
             .lock()
@@ -843,39 +827,16 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Portable Windows packages explicitly configure an update feed; users
-        // should not need to enable workspace sync to receive application updates.
-        // Wizard GUI ships with Wizard releases; the upstream Zeron feed would
-        // replace it with a build that has no Wizard support. Only an explicit
-        // feed (ZERON_RELEASES_URL) turns the checker on.
-        let check_updates =
-            edge_enabled && std::env::var_os("ZERON_RELEASES_URL").is_some_and(|v| !v.is_empty());
-        #[cfg(windows)]
-        let check_updates = check_updates
-            || matches!(
-                zeron_update::detect_install(),
-                zeron_update::InstallKind::WindowsPortable { .. }
-            );
-        if check_updates {
-            // Release checker: polls {edge}/releases on a 6h cadence; headless
-            // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
-            // on quiescence so a restart never lands under a live run or open PTY.
+        if config.check_for_updates {
+            // Wizard GUI release checker: the signed GitHub feed on launch and
+            // every 6h. `idle` in its status follows this gate, so the UI only
+            // offers a restart when no run or terminal would be cut off.
             let quiescent: zeron_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
                 Arc::new(move || !sessions.any_active() && !terminals.any_open())
             };
-            let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
-            if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
-                let updater_for_tokens = updater.clone();
-                let wake = tokio::spawn(async move {
-                    while token_changes.changed().await.is_ok() {
-                        updater_for_tokens.check_now();
-                    }
-                });
-                core.set_updater_wake(wake);
-            }
-            core.set_updater(updater);
+            core.set_updater(zeron_update::Updater::spawn(Some(quiescent)));
         }
         core.start_ssh_peers(&config.data_dir);
         tracing::info!(device_id = %core.device_id, "engine core assembled");

@@ -233,6 +233,7 @@ mod tests {
             default_harness: HarnessId::Mock,
             org_id: None,
             workos_client_id: Some("client_test".into()),
+            check_for_updates: false,
         }
     }
 

@@ -1,85 +1,42 @@
-//! `zeron update` — check for and apply a newer release, natively (the same
-//! flow upstream Zeron's `install.sh` performs: download → verify → symlink swap →
-//! service restart). macOS app bundles swap the bundle instead; source builds
-//! are report-only.
+//! `wizard-gui update`: the app's Update button from a terminal. Same feed,
+//! same signature and checksum checks, same install swap; it doesn't relaunch
+//! anything, so a running window keeps its version until it is reopened.
 
 use anyhow::bail;
-use zeron_update::{InstallKind, current_version, version_newer};
+use zeron_update::{current_version, detect_install, is_newer};
 
-const RELEASES_PAGE: &str = "https://github.com/teddytennant/wizard/releases/latest";
-
-/// `--check` prints the verdict and exits (nonzero when an update is available,
-/// so scripts can gate on it).
-pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
-    // Without an explicit feed the manifest would come from Zeron's own
-    // release bucket, and applying it would replace this build with upstream.
-    if std::env::var_os("ZERON_RELEASES_URL").is_none_or(|url| url.is_empty()) {
-        bail!(
-            "this build has no update feed. Download the latest Wizard GUI from\n\
-             {RELEASES_PAGE}"
-        );
-    }
-    let manifest = zeron_update::fetch_latest(edge_url).await?;
+/// `--check` prints the verdict and exits 1 when an update is available, so
+/// scripts can gate on it.
+pub async fn update(check_only: bool) -> anyhow::Result<()> {
+    let release = zeron_update::feed::fetch_latest().await?;
     let current = current_version();
-    if !version_newer(&manifest.version, current) {
-        println!(
-            "zeron {current} is up to date (latest: {}).",
-            manifest.version
-        );
+    let latest = release.version.to_string();
+    if !is_newer(&latest, current) {
+        println!("Wizard GUI {current} is up to date (latest: {latest}).");
         return Ok(());
     }
-    println!("zeron {current} → {} available", manifest.version);
+    println!(
+        "Wizard GUI {latest} is available (this is {current}). What's new: {}",
+        release.notes_url()
+    );
     if check_only {
         std::process::exit(1);
     }
-
-    match zeron_update::detect_install() {
-        InstallKind::Managed { app_root } => {
-            println!(
-                "downloading {}…",
-                zeron_update::headless_artifact(&manifest.version)
-            );
-            zeron_update::stage_headless(edge_url, &manifest, &app_root).await?;
-            zeron_update::apply_headless(&app_root, &manifest.version)?;
-            println!(
-                "installed {} (current → {})",
-                app_root.join(&manifest.version).display(),
-                manifest.version
-            );
-            match zeron_update::restart_service() {
-                Ok(()) => println!("engine service restarted."),
-                Err(err) => println!(
-                    "note: service restart failed ({err:#}) — restart the engine manually to finish."
-                ),
-            }
-            Ok(())
-        }
-        InstallKind::MacApp { bundle } => {
-            println!(
-                "downloading {}…",
-                zeron_update::mac_app_artifact(&manifest.version)
-            );
-            let data_dir = super::paths::data_dir();
-            let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
-            zeron_update::apply_mac_app(&staged, &bundle)?;
-            println!("updated {} — relaunch Zeron to finish.", bundle.display());
-            Ok(())
-        }
-        #[cfg(windows)]
-        InstallKind::WindowsPortable { directory } => {
-            let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
-            zeron_update::windows::apply(&staged, &directory, false)?;
-            println!(
-                "updated to {} — relaunch Zeron to finish.",
-                manifest.version
-            );
-            Ok(())
-        }
-        InstallKind::Unmanaged => {
-            bail!(
-                "this binary is not update-managed (source build or hand-copied).\n\
-                 Download the latest Wizard GUI from {RELEASES_PAGE}, or rebuild from source."
-            )
-        }
+    let kind = detect_install();
+    if let Some(reason) = kind.manual_reason() {
+        bail!("{reason}\nDownload it from {}", release.notes_url());
     }
+    let last = std::sync::Mutex::new(String::new());
+    let staged = kind
+        .stage(&release, &super::paths::data_dir(), &|progress| {
+            let mut last = last.lock().unwrap();
+            if *last != progress.status {
+                println!("{}", progress.status);
+                *last = progress.status;
+            }
+        })
+        .await?;
+    kind.apply(&staged, false)?;
+    println!("Installed Wizard GUI {latest}. Reopen the app to use it.");
+    Ok(())
 }

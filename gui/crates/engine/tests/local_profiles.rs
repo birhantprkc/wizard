@@ -24,6 +24,7 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        check_for_updates: false,
     }
 }
 

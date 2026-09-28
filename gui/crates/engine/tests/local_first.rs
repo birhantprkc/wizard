@@ -28,6 +28,7 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        check_for_updates: false,
     }
 }
 
@@ -332,7 +333,7 @@ async fn local_runtime_does_not_start_the_edge_updater() {
     assert!(runtime.core().links().is_none());
     assert!(
         runtime.core().updater().is_none(),
-        "local runtime must not start an Edge updater"
+        "a config without check_for_updates starts no release checker"
     );
     assert_eq!(requests.load(Ordering::SeqCst), 0);
 
@@ -414,14 +415,8 @@ async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
         runtime.core().links().is_some(),
         "peer routing must recover without restarting the app"
     );
-    // Wizard GUI only checks for updates against an explicit feed; when one
-    // is configured, its supervisor must survive an offline boot.
-    let feed = std::env::var_os("ZERON_RELEASES_URL").is_some_and(|url| !url.is_empty());
-    assert_eq!(
-        runtime.core().updater().is_some(),
-        feed,
-        "the Edge updater supervisor must survive an offline boot"
-    );
+    // The release checker is off in test configs, however Edge is doing.
+    assert!(runtime.core().updater().is_none());
     runtime.shutdown().await;
 }
 

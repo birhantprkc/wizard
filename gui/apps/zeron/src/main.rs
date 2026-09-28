@@ -53,8 +53,8 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Check for a newer release and apply it (download → verify → swap →
-    /// service restart). `--check` only reports (exits 1 when one is available).
+    /// Download and install the newest Wizard GUI release (signature and
+    /// checksum verified). `--check` only reports, exiting 1 when one is out.
     Update {
         #[arg(long)]
         check: bool,
@@ -277,7 +277,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+            runtime.block_on(update_cli::update(check))
         }
         Some(Command::Ssh { host }) => ssh_window(host),
         Some(Command::WizardAuth { command }) => wizard_auth_cli(command),
@@ -418,6 +418,8 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
         edge_token,
+        // A headless daemon reports releases to the UI attached to it.
+        check_for_updates: true,
     }
 }
 

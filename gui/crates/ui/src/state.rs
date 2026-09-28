@@ -326,6 +326,7 @@ impl EngineHandle {
             default_harness: config.default_harness,
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
+            check_for_updates: true,
         };
 
         // Own the data dir before opening anything under it or binding IPC —
