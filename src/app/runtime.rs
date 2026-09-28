@@ -575,6 +575,24 @@ pub async fn run_tui(
             continue;
         }
 
+        // A background `/plugins` install or remove finished: say what it
+        // did, and reload skills and commands so they are usable at once.
+        if let Event::PluginsChanged(report) = event {
+            CommandContext {
+                app: &mut app,
+                client: &mut client,
+                agent_slot: &mut agent_slot,
+                manager: &manager,
+                skills: &mut skills,
+                project_root: &project_root,
+                mcp_path: &mcp_path,
+                genie_max_steps,
+                events: &events,
+            }
+            .plugins_changed(report);
+            continue;
+        }
+
         // The independent goal critic returned its verdict on a claim of
         // done. `ACHIEVED` ends the loop; `NOT ACHIEVED` queues a turn carrying
         // the critic's feedback (drained below). The verdict summary was

@@ -199,6 +199,9 @@ pub enum SlashCommand {
     /// typed command; dispatched from the `/settings` import picker, which is
     /// why it carries the [`ImportSelection`].
     ImportClaude(ImportSelection),
+    /// `/plugins [terms|list|install <spec>|remove <name>]` — install Pi
+    /// packages as Wizard plugins (beta), for Pi, or for both.
+    Plugins(PluginsAction),
     Quit,
     /// A command a plugin registered at runtime: the name it registered under
     /// and the rest of the typed line, verbatim.
@@ -262,6 +265,62 @@ pub enum ProviderAction {
     },
     /// `/provider remove <name>`.
     Remove(String),
+}
+
+/// What a `/plugins` subcommand does. Each one is the terminal spelling of a
+/// `wizard plugins` verb, and runs the same code ([`crate::pi_plugins`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginsAction {
+    /// `/plugins [terms]` — search the Pi gallery and pick one to install.
+    Browse(String),
+    /// `/plugins list` — what is installed for Wizard; pick one to remove.
+    List,
+    /// `/plugins install <spec> [--for wizard|pi|both]`.
+    Install {
+        spec: String,
+        target: crate::pi_plugins::Target,
+    },
+    /// `/plugins remove <name> [--for wizard|pi|both]`.
+    Remove {
+        name: String,
+        target: crate::pi_plugins::Target,
+    },
+}
+
+/// Parse the arguments to `/plugins` (everything after the command word).
+fn parse_plugins(args: &[&str]) -> Result<SlashCommand, String> {
+    use crate::pi_plugins::Target;
+    let target = |rest: &[&str]| -> Result<Target, String> {
+        let value = match rest {
+            [] => return Ok(Target::Wizard),
+            ["--for", value] => *value,
+            [flag] if flag.starts_with("--for=") => &flag["--for=".len()..],
+            _ => return Err("usage: --for wizard|pi|both".to_string()),
+        };
+        match value {
+            "wizard" => Ok(Target::Wizard),
+            "pi" => Ok(Target::Pi),
+            "both" => Ok(Target::Both),
+            other => Err(format!("unknown target '{other}' (wizard|pi|both)")),
+        }
+    };
+    let action = match args {
+        [] => PluginsAction::Browse(String::new()),
+        ["list"] => PluginsAction::List,
+        ["install", spec, rest @ ..] => PluginsAction::Install {
+            spec: (*spec).to_string(),
+            target: target(rest)?,
+        },
+        ["install"] => return Err("usage: /plugins install <spec> [--for wizard|pi|both]".into()),
+        ["remove", name, rest @ ..] => PluginsAction::Remove {
+            name: (*name).to_string(),
+            target: target(rest)?,
+        },
+        ["remove"] => return Err("usage: /plugins remove <name> [--for wizard|pi|both]".into()),
+        ["search", terms @ ..] => PluginsAction::Browse(terms.join(" ")),
+        terms => PluginsAction::Browse(terms.join(" ")),
+    };
+    Ok(SlashCommand::Plugins(action))
 }
 
 /// Parse the arguments to `/provider` (everything after the command word).
@@ -592,6 +651,7 @@ impl SlashCommand {
                 }),
                 _ => Err("usage: /login xai [force]".to_string()),
             },
+            "plugins" => parse_plugins(&args),
             "settings" | "setup" => Ok(Self::Settings),
             "vim" => Ok(Self::Vim),
             // Joined so `/ui claude code` is the same request as `/ui claude`:
@@ -719,6 +779,11 @@ impl SlashCommand {
             ImportClaude(_) => {
                 Err("`/settings` import is driven from a picker; leave it to the user".into())
             }
+            // Installing a package puts somebody else's instructions into
+            // every future prompt; that is the user's decision to make.
+            Plugins(_) => Err(
+                "`/plugins` installs third-party skills and prompts; leave it to the user".into(),
+            ),
 
             // Plugin commands are not on the agent's allowlist, and this is a
             // deliberate stop rather than an oversight. Every `Ok` above is an
@@ -782,6 +847,7 @@ impl SlashCommand {
             Server(_) => "server",
             Login { .. } => "login",
             Settings | ImportClaude(_) => "settings",
+            Plugins(_) => "plugins",
             Vim => "vim",
             Ui(_) => "ui",
             View(_) => "view",
@@ -1273,6 +1339,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         gui: Execution::Agent,
         gateway: Execution::Agent,
         acp: Execution::Agent,
+        agent_arg: "",
+    },
+    CommandSpec {
+        name: "plugins",
+        args: "[search|list|install <spec>|remove <name>]",
+        description: "install Pi plugins for Wizard (beta), Pi, or both",
+        takes_args: false,
+        tui: Execution::Ui,
+        // Wizard GUI has a Plugins page of its own.
+        gui: Execution::Ui,
+        // Installing a package from a chat would put a stranger's
+        // instructions into the operator's prompts from their phone; the
+        // terminal and the desktop app are where that is decided.
+        gateway: Execution::Unavailable,
+        acp: Execution::Unavailable,
         agent_arg: "",
     },
     CommandSpec {
@@ -2104,6 +2185,7 @@ mod tests {
             },
             SlashCommand::Settings,
             SlashCommand::ImportClaude(ImportSelection::default()),
+            SlashCommand::Plugins(PluginsAction::List),
             SlashCommand::Vim,
             SlashCommand::View(None),
             SlashCommand::Quit,

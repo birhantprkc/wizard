@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use super::{
-    CommandSpec, Execution, FusionAction, ProviderAction, ServerAction, SlashCommand, UltraAction,
-    commands_for,
+    CommandSpec, Execution, FusionAction, PluginsAction, ProviderAction, ServerAction,
+    SlashCommand, UltraAction, commands_for,
 };
 use crate::agent::RewindCandidate;
 use crate::config::{Config, Mode, ProviderKind, ReasoningEffort, StepBudget, UltraConfig};
@@ -481,6 +481,13 @@ pub trait CommandSurface {
         let message = elsewhere("settings", self.surface());
         self.error(message);
     }
+
+    /// `/plugins`: search, install and remove Pi packages.
+    async fn plugins(&mut self, action: PluginsAction) {
+        let _ = action;
+        let message = elsewhere("plugins", self.surface());
+        self.error(message);
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -691,6 +698,7 @@ pub async fn dispatch<S: CommandSurface + Send + ?Sized>(command: SlashCommand, 
 
         SlashCommand::Settings => choose(surface, Chooser::Settings, spec).await,
         SlashCommand::ImportClaude(selection) => surface.import_claude(selection).await,
+        SlashCommand::Plugins(action) => surface.plugins(action).await,
         SlashCommand::Vim => surface.toggle_vim().await,
         SlashCommand::Ui(name) => surface.set_ui(name).await,
         SlashCommand::View(compact) => surface.set_view(compact).await,
@@ -800,6 +808,11 @@ fn unavailable(name: &str, surface: Surface) -> String {
             "'/quit' exits the terminal app. The client ends this server by closing the connection"
                 .to_string()
         }
+        (Surface::Gateway | Surface::Acp, "plugins") => "'/plugins' installs third-party \
+                                                           skills and prompts on this machine; \
+                                                           run it in the terminal, or use the \
+                                                           Plugins page in Wizard GUI"
+            .to_string(),
         (Surface::Acp, "login") => "'/login' waits for a browser sign-in on this machine; run it \
                                     in the terminal"
             .to_string(),

@@ -41,7 +41,7 @@ use serde_json::Value;
 use crate::agent::{Agent, AgentEvent, DoneReason, PlanVerdict, ultra};
 // The built-in command table and its parser live in [`crate::commands`].
 use crate::commands::CustomCommand;
-use crate::commands::{ProviderAction, SlashCommand, Surface, UltraAction};
+use crate::commands::{PluginsAction, ProviderAction, SlashCommand, Surface, UltraAction};
 use crate::config::{Config, Mode, ProviderKind, ReasoningEffort, UltraConfig};
 use crate::event::Event;
 use crate::image_view::ImageCache;
@@ -56,7 +56,7 @@ use paste::{
     clipboard_image_bytes, looks_like_image_path_token, parse_data_image_url,
     resolve_pasted_image_path, save_image_bytes, save_pasted_image_bytes, sniff_image_ext,
 };
-use picker::is_builtin_command;
+use picker::{is_builtin_command, plugin_remove_picker, plugin_target_picker, split_target};
 use prompts::{
     PROVIDER_ADD_ROW, PromptField, ProviderSetup, ULTRA_JUDGE_ROW, WEB_BACKENDS, prompt_question,
     provider_types, web_backend_label, web_backend_needs_key, xai_oauth_session_present,
@@ -2836,6 +2836,7 @@ impl App {
             | Event::ProviderHealthFailed(_)
             | Event::StarterPrompts(_)
             | Event::BtwFinished
+            | Event::PluginsChanged(_)
             | Event::GoalCritiqued(_)
             | Event::CompletionReviewed(_) => Ok(None),
         }
@@ -3320,6 +3321,46 @@ impl App {
                                     ..base
                                 },
                             )))
+                        }
+                        PickerKind::PiGallery => {
+                            let spec = item.value.clone();
+                            match plugin_target_picker(&spec, crate::pi_plugins::pi_available()) {
+                                Some(next) => {
+                                    self.picker = Some(next);
+                                    return Ok(None);
+                                }
+                                None => AppAction::Command(SlashCommand::Plugins(
+                                    PluginsAction::Install {
+                                        spec,
+                                        target: crate::pi_plugins::Target::Wizard,
+                                    },
+                                )),
+                            }
+                        }
+                        PickerKind::PiTarget => {
+                            let Some((target, spec)) = split_target(&item.value) else {
+                                return Ok(None);
+                            };
+                            AppAction::Command(SlashCommand::Plugins(PluginsAction::Install {
+                                spec,
+                                target,
+                            }))
+                        }
+                        PickerKind::PiInstalled => {
+                            self.picker = Some(plugin_remove_picker(
+                                &item.value,
+                                crate::pi_plugins::pi_available(),
+                            ));
+                            return Ok(None);
+                        }
+                        PickerKind::PiRemove => {
+                            let Some((target, name)) = split_target(&item.value) else {
+                                return Ok(None);
+                            };
+                            AppAction::Command(SlashCommand::Plugins(PluginsAction::Remove {
+                                name,
+                                target,
+                            }))
                         }
                         PickerKind::Provider => {
                             // The final row opens the add-provider type menu;
