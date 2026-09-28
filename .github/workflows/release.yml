@@ -63,6 +63,14 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match Cargo.toml version ${cargo_version}" >&2
             exit 1
           fi
+          # The GUI's assets are published under the tag's version, and its
+          # updater compares that with its own. A GUI one version behind would
+          # offer the same release as an update forever.
+          gui_version="$(grep -m1 '^version' gui/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          if [ "$gui_version" != "$cargo_version" ]; then
+            echo "::error::gui/Cargo.toml version ${gui_version} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
           echo "Releasing version ${cargo_version}"
 
       # The same refusal the `release` job makes before publishing, made here
@@ -768,8 +776,8 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      # The feed URL is written into zeron-update.json, but the app only
-      # checks for updates when ZERON_RELEASES_URL is set, so it is inert.
+      # zeron-update.json marks the unpacked zip as the portable install the
+      # in-app updater may replace; the updater itself reads GitHub releases.
       - name: Package
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
