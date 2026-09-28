@@ -166,7 +166,7 @@ pub async fn run(config: Config) -> Result<()> {
                         responder.respond(response)?;
                         advertise_commands(&cx, id)
                     }
-                    Err(err) => responder.respond_with_error(internal(err)),
+                    Err(err) => responder.respond_with_error(err),
                 }
             },
             acp::on_receive_request!(),
@@ -1074,11 +1074,14 @@ fn truncate(text: &str, cap: usize) -> String {
     format!("{}\n… (truncated)", &text[..end])
 }
 
-/// Map any error into an ACP internal error, logging the detail (the wire error
-/// is intentionally opaque).
+/// Map any error into an ACP internal error. The whole cause chain rides in
+/// `data`, which clients show beside the code: without it a signed-out
+/// provider reaches the editor as a bare "Internal error", and the one line
+/// that says to run `wizard --login` only lands in `~/.wizard/logs`.
 fn internal<E: std::fmt::Display>(err: E) -> acp::Error {
-    tracing::warn!("acp: {err}");
-    acp::Error::internal_error()
+    let detail = format!("{err:#}");
+    tracing::warn!("acp: {detail}");
+    acp::util::internal_error(detail)
 }
 
 // ---------------------------------------------------------------------------

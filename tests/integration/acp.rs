@@ -472,6 +472,79 @@ fn acp_sessions_offer_model_options_and_probes_leave_no_file() {
     assert_eq!(files(), 0, "an unprompted session leaves no file");
 }
 
+/// A session that cannot start says why. The agent build refusing is the
+/// common way `session/new` fails — a provider whose sign-in is gone — and
+/// the client has only the error it is sent: a bare "Internal error" left
+/// Wizard GUI with nothing to show but the code.
+#[cfg(feature = "provider-xai")]
+#[test]
+fn acp_session_new_failure_carries_the_reason() {
+    let home = TempDir::new();
+    let dir = home.0.join(".wizard");
+    std::fs::create_dir_all(&dir).expect("create .wizard dir");
+    // An account sign-in with no `xai_oauth.json` beside it: signed out.
+    std::fs::write(
+        dir.join("config.toml"),
+        "[[providers]]\n\
+         name = \"xai-oauth\"\n\
+         kind = \"xaioauth\"\n\
+         base_url = \"https://api.x.ai/v1\"\n\
+         model = \"grok-4.6\"\n",
+    )
+    .expect("write config.toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wizard"))
+        .arg("acp")
+        .env("HOME", &home.0)
+        .env_remove("WIZARD_HOME")
+        .env_remove("WIZARD_MODEL")
+        .env_remove("WIZARD_SYSTEM_PROMPT")
+        .env_remove("WIZARD_HARNESS_DIR")
+        .current_dir(&home.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("wizard acp starts");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (lines_tx, lines) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if lines_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut server = Server(child);
+    let mut stdin = server.0.stdin.take().expect("piped stdin");
+    let cwd = home.0.display().to_string();
+
+    request(
+        &mut stdin,
+        &lines,
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let session = request(
+        &mut stdin,
+        &lines,
+        2,
+        "session/new",
+        serde_json::json!({"cwd": cwd, "mcpServers": []}),
+    );
+    let error = session
+        .get("error")
+        .unwrap_or_else(|| panic!("session/new must fail with no xAI sign-in, got: {session}"));
+    assert_eq!(error["code"], -32603, "{error}");
+    let detail = error["data"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("not signed in to xAI") && detail.contains("wizard --login xai"),
+        "the error should say what is wrong and how to fix it, got: {error}"
+    );
+}
+
 /// A `wizard acp` on a fake Ollama that records model turns, initialized and
 /// with one session open.
 struct AcpSession {
