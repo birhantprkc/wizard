@@ -86,10 +86,6 @@ fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String 
     }
 }
 
-fn install_label(name: &str) -> String {
-    format!("Installing {name}…")
-}
-
 fn install_params(harness: HarnessId, target: &Option<String>) -> serde_json::Value {
     serde_json::json!({"harness": harness, "targetDeviceId": target})
 }
@@ -135,6 +131,11 @@ pub struct HarnessesPage {
     toggle_task: Option<Task<()>>,
     installing: Option<HarnessId>,
     install_task: Option<Task<()>>,
+    /// The engine's last answer about `installing`.
+    install_progress: Option<zeron_harness::install_progress::InstallProgress>,
+    install_poll: Option<Task<()>>,
+    /// The last failed install, shown in its row with a Retry.
+    install_failure: Option<(HarnessId, String)>,
     /// a sign-in that switches its harness on once it succeeds.
     sign_in: Option<SignIn>,
     sign_in_failure: Option<SignInFailure>,
@@ -198,6 +199,9 @@ impl HarnessesPage {
             toggle_task: None,
             installing: None,
             install_task: None,
+            install_progress: None,
+            install_poll: None,
+            install_failure: None,
             sign_in: None,
             sign_in_failure: None,
             sign_in_task: None,
@@ -230,6 +234,9 @@ impl HarnessesPage {
         self.title_saving = false;
         self.installing = None;
         self.install_task = None;
+        self.install_progress = None;
+        self.install_poll = None;
+        self.install_failure = None;
         self.target_device = target;
         self.error = None;
         self.sign_in_failure = None;
@@ -679,7 +686,24 @@ impl HarnessesPage {
         let params = install_params(harness, &self.target_device);
         let target = self.target_device.clone();
         self.installing = Some(harness);
+        self.install_progress = None;
+        self.install_failure = None;
         self.error = None;
+        self.install_poll = Some(crate::install_bar::poll(
+            engine.clone(),
+            params.clone(),
+            cx,
+            move |page: &mut Self, progress| {
+                if page.installing != Some(harness) {
+                    return false;
+                }
+                // The last poll can land after the install finished.
+                if progress.is_some() {
+                    page.install_progress = progress;
+                }
+                true
+            },
+        ));
         self.install_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -695,12 +719,14 @@ impl HarnessesPage {
                     return;
                 }
                 page.installing = None;
+                page.install_progress = None;
+                page.install_poll = None;
                 match result {
                     Ok(list) => {
                         page.harnesses = Loadable::Ready(list);
                         crate::pickers::bump_harness_catalog(cx);
                     }
-                    Err(error) => page.error = Some(format!("Installation failed — {error}")),
+                    Err(error) => page.install_failure = Some((harness, error)),
                 }
                 cx.notify();
             })
@@ -973,22 +999,28 @@ impl HarnessesPage {
                             .into_any_element(),
                     );
                 }
-                if self.installing == Some(harness) {
-                    meta.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(crate::life::life_spinner(
-                                format!("harness-install-life-{harness:?}"),
-                                6.0,
-                                theme.text_muted,
-                            ))
-                            .child(SharedString::from(install_label(&descriptor.name)))
-                            .into_any_element(),
-                    );
-                }
-                if !installed {
+                let install_failed = self
+                    .install_failure
+                    .as_ref()
+                    .filter(|(id, _)| *id == harness)
+                    .map(|(_, error)| error.clone());
+                let install_block: Option<gpui::AnyElement> = if self.installing == Some(harness) {
+                    Some(crate::install_bar::render(
+                        &theme,
+                        format!("harness-install-progress-{harness:?}"),
+                        self.install_progress.as_ref(),
+                    ))
+                } else {
+                    install_failed.as_ref().map(|error| {
+                        crate::install_bar::render_error(
+                            &theme,
+                            format!("harness-install-error-{harness:?}"),
+                            &format!("Couldn't install {}: {error}", descriptor.name),
+                            cx.listener(move |this, _, _, cx| this.install(harness, cx)),
+                        )
+                    })
+                };
+                if !installed && install_block.is_none() {
                     meta.push(
                         div()
                             .text_color(theme.warning_muted.opacity(0.9))
@@ -1029,11 +1061,15 @@ impl HarnessesPage {
                             .flex()
                             .flex_col()
                             .child(widgets::row_title(&theme, descriptor.name.clone()))
-                            .child(widgets::meta_line(&theme, meta)),
+                            .child(widgets::meta_line(&theme, meta))
+                            .when_some(install_block, |el, block| {
+                                el.child(div().mt(px(8.0)).max_w(px(420.0)).child(block))
+                            }),
                     )
                     .when(
                         offers_install(harness, installed, descriptor.can_install)
-                            && self.installing != Some(harness),
+                            && self.installing != Some(harness)
+                            && install_failed.is_none(),
                         |el| {
                             el.child(
                                 widgets::ghost_action(&theme)
@@ -1286,9 +1322,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
 
 #[cfg(test)]
 #[test]
-fn install_phase_copy_and_cancel_target_match_install() {
-    assert_eq!(install_label("Claude Code"), "Installing Claude Code…");
-    assert_eq!(install_label("Pi"), "Installing Pi…");
+fn cancel_target_matches_install() {
     for target in [None, Some("remote-device".to_string())] {
         let params = install_params(HarnessId::Pi, &target);
         assert_eq!(params["harness"], "pi");

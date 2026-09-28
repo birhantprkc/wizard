@@ -34,6 +34,7 @@ pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
 pub(crate) mod image_viewer;
+mod install_bar;
 pub mod life;
 pub mod links;
 pub mod loaders;
