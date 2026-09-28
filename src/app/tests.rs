@@ -354,6 +354,7 @@ fn exactly_typed_command_wins_over_longer_completion() {
 
 fn custom(name: &str, template: &str, description: Option<&str>) -> CustomCommand {
     CustomCommand {
+        pi_syntax: false,
         name: name.to_string(),
         description: description.map(str::to_string),
         template: template.to_string(),

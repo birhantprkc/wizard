@@ -38,6 +38,11 @@ pub struct SkillMeta {
     /// one of these environment variables is set to a non-empty value.
     #[serde(default)]
     pub when_env: Vec<String>,
+    /// Custom commands only: `pi` marks a prompt template installed from a Pi
+    /// package, whose placeholders follow Pi's grammar
+    /// ([`crate::commands::expand_pi_template`]).
+    #[serde(default)]
+    pub syntax: Option<String>,
 }
 
 /// One loaded skill.
@@ -285,6 +290,7 @@ fn parse_meta_trimmed(lines: &[&str]) -> SkillMeta {
             "name" => meta.name = Some(value.to_string()),
             "description" => meta.description = Some(value.to_string()),
             "always" => meta.always = parse_bool(value),
+            "syntax" => meta.syntax = Some(value.to_string()),
             "when_env" => {
                 meta.when_env = value
                     .split(',')
@@ -341,6 +347,7 @@ fn parse_meta_yaml(lines: &[&str]) -> SkillMeta {
             "name" => meta.name = Some(value.to_string()),
             "description" => meta.description = Some(value.to_string()),
             "always" => meta.always = parse_bool(value),
+            "syntax" => meta.syntax = Some(value.to_string()),
             "when_env" => {
                 meta.when_env = value
                     .split(',')
@@ -495,6 +502,7 @@ mod tests {
                 description: Some("A demo skill".to_string()),
                 always: false,
                 when_env: Vec::new(),
+                syntax: None,
             },
             body: "Body text.".to_string(),
         }];
@@ -519,6 +527,7 @@ mod tests {
                 description: Some("A demo skill".to_string()),
                 always: true,
                 when_env: Vec::new(),
+                syntax: None,
             },
             body: "Body text.".to_string(),
         }];
@@ -539,6 +548,7 @@ mod tests {
                 description: Some("Buzz workspace".to_string()),
                 always: true,
                 when_env: vec![var.clone()],
+                syntax: None,
             },
             body: "Prefer buzz messages send.".to_string(),
         }];

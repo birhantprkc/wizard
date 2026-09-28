@@ -1567,6 +1567,9 @@ pub struct CustomCommand {
     pub template: String,
     /// File it was loaded from.
     pub path: PathBuf,
+    /// Frontmatter `syntax: pi`: a prompt template from a Pi package, expanded
+    /// with Pi's placeholder grammar ([`expand_pi_template`]).
+    pub pi_syntax: bool,
 }
 
 impl CustomCommand {
@@ -1578,7 +1581,21 @@ impl CustomCommand {
             let rest = &bytes[i + 1..];
             rest.starts_with(b"ARGUMENTS")
                 || rest.first().is_some_and(|b| (b'1'..=b'9').contains(b))
+                || (self.pi_syntax
+                    && (rest.starts_with(b"@")
+                        || rest.starts_with(b"{@")
+                        || rest.starts_with(b"{ARGUMENTS")
+                        || (rest.starts_with(b"{") && rest.get(1).is_some_and(u8::is_ascii_digit))))
         })
+    }
+
+    /// The prompt this command sends for `args`.
+    pub fn expand(&self, args: &str) -> String {
+        if self.pi_syntax {
+            expand_pi_template(&self.template, args)
+        } else {
+            expand_template(&self.template, args)
+        }
     }
 }
 
@@ -1632,6 +1649,7 @@ pub fn load_from_dirs(dirs: &[PathBuf]) -> Vec<CustomCommand> {
                     description: meta.description,
                     template: body,
                     path,
+                    pi_syntax: meta.syntax.as_deref() == Some("pi"),
                 },
             );
         }
@@ -1668,13 +1686,123 @@ pub fn expand_template(template: &str, args: &str) -> String {
     out
 }
 
+/// Split arguments the way Pi's `parseCommandArgs` does: whitespace
+/// separates, and a single- or double-quoted run is one argument with its
+/// quotes dropped.
+pub fn split_pi_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in args.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Expand a Pi prompt template: `$1`.., `$@` and `$ARGUMENTS`,
+/// `${N:-default}`, `${@:-default}` / `${ARGUMENTS:-default}`, `${@:N}` and
+/// `${@:N:L}`. A port of Pi's `substituteArgs`, including that it makes one
+/// pass over the template so nothing inside an argument is re-expanded, and
+/// that `$10` is the tenth argument rather than `$1` then `0`.
+pub fn expand_pi_template(template: &str, args: &str) -> String {
+    let args = split_pi_args(args);
+    let all = args.join(" ");
+    let nth = |n: usize| n.checked_sub(1).and_then(|i| args.get(i)).cloned();
+    let mut out = String::with_capacity(template.len() + all.len());
+    let mut rest = template;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some((value, used)) = pi_braced(after, &args, &all) {
+            out.push_str(&value);
+            rest = &after[used..];
+        } else if let Some(tail) = after.strip_prefix("ARGUMENTS") {
+            out.push_str(&all);
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix('@') {
+            out.push_str(&all);
+            rest = tail;
+        } else {
+            let digits = after.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                out.push('$');
+                rest = after;
+            } else {
+                let n: usize = after[..digits].parse().unwrap_or(0);
+                out.push_str(&nth(n).unwrap_or_default());
+                rest = &after[digits..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One `${...}` placeholder at the start of `after` (just past the `$`):
+/// the expansion and how many bytes it consumed. `None` when it is not one
+/// of Pi's forms, which then passes through untouched.
+fn pi_braced(after: &str, args: &[String], all: &str) -> Option<(String, usize)> {
+    let inner = after.strip_prefix('{')?;
+    let close = inner.find('}')?;
+    let body = &inner[..close];
+    let used = close + 2;
+    if let Some((target, default)) = body.split_once(":-") {
+        let value = match target {
+            "@" | "ARGUMENTS" => all.to_string(),
+            n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| args.get(i))
+                .cloned()
+                .unwrap_or_default(),
+            _ => return None,
+        };
+        return Some((
+            if value.is_empty() {
+                default.to_string()
+            } else {
+                value
+            },
+            used,
+        ));
+    }
+    let slice = body.strip_prefix("@:")?;
+    let (start, length) = match slice.split_once(':') {
+        Some((start, length)) => (start, Some(length)),
+        None => (slice, None),
+    };
+    let start: usize = start.parse().ok()?;
+    let start = start.saturating_sub(1).min(args.len());
+    let end = match length {
+        Some(length) => start
+            .saturating_add(length.parse::<usize>().ok()?)
+            .min(args.len()),
+        None => args.len(),
+    };
+    Some((args[start..end].join(" "), used))
+}
+
 /// If `input` is `/name [args...]` for one of `commands`, expand its
 /// template. `None` when the input is not a custom-command invocation.
 pub fn expand_custom(input: &str, commands: &[CustomCommand]) -> Option<String> {
     let rest = input.trim().strip_prefix('/')?;
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let command = commands.iter().find(|command| command.name == name)?;
-    Some(expand_template(&command.template, args))
+    Some(command.expand(args))
 }
 
 /// Byte cap applied to one `@file` expansion.
@@ -2420,8 +2548,48 @@ mod tests {
     }
 
     #[test]
+    fn pi_templates_expand_every_pi_placeholder() {
+        let pi = |t: &str, a: &str| expand_pi_template(t, a);
+        assert_eq!(pi("$1|$2|$3", "a 'b c' \"d\""), "a|b c|d");
+        assert_eq!(pi("$@ / $ARGUMENTS", "x  y"), "x y / x y");
+        assert_eq!(pi("${1:-none} ${2:-none}", "one"), "one none");
+        assert_eq!(pi("${@:-nothing}", ""), "nothing");
+        assert_eq!(pi("${ARGUMENTS:-nothing}", "a"), "a");
+        assert_eq!(pi("${@:2}", "a b c d"), "b c d");
+        assert_eq!(pi("${@:2:2}", "a b c d"), "b c");
+        assert_eq!(pi("${@:0}", "a b"), "a b");
+        assert_eq!(pi("${@:9}", "a b"), "");
+        assert_eq!(pi("$10", "1 2 3 4 5 6 7 8 9 ten"), "ten");
+        // Not Pi placeholders: left exactly as written.
+        assert_eq!(pi("${HOME} ${1} $x $", "a"), "${HOME} ${1} $x $");
+        // One pass: an argument that looks like a placeholder stays literal.
+        assert_eq!(pi("say $1", "$@"), "say $@");
+        // The plain Wizard expander still leaves Pi syntax alone.
+        assert_eq!(expand_template("$@ ${1:-x}", "a"), "$@ ${1:-x}");
+    }
+
+    #[test]
+    fn only_pi_syntax_commands_use_the_pi_expander() {
+        let dir = std::env::temp_dir().join(format!("wizard-pi-cmd-{}", uuid::Uuid::new_v4()));
+        write(&dir, "pi.md", "---\nsyntax: pi\n---\nGo ${1:-home} $@");
+        write(&dir, "plain.md", "Go ${1:-home} $@");
+        let commands = load_from_dirs(std::slice::from_ref(&dir));
+        assert_eq!(expand_custom("/pi", &commands).as_deref(), Some("Go home "));
+        assert_eq!(
+            expand_custom("/plain now", &commands).as_deref(),
+            Some("Go ${1:-home} $@")
+        );
+        let pi = commands.iter().find(|c| c.name == "pi").unwrap();
+        assert!(pi.pi_syntax && pi.expects_args());
+        let plain = commands.iter().find(|c| c.name == "plain").unwrap();
+        assert!(!plain.pi_syntax && !plain.expects_args());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn expand_custom_matches_by_name() {
         let commands = vec![CustomCommand {
+            pi_syntax: false,
             name: "review".into(),
             description: None,
             template: "Review $ARGUMENTS carefully.".into(),
@@ -2552,6 +2720,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("ctx.txt"), "context").unwrap();
         let commands = vec![CustomCommand {
+            pi_syntax: false,
             name: "with-ctx".into(),
             description: None,
             template: "Use @ctx.txt for $ARGUMENTS".into(),
