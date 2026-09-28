@@ -626,13 +626,28 @@ pub(crate) fn verify_linux_build(dir: &Path, version: &str) -> Result<()> {
 }
 
 fn run_version(exe: &Path) -> Result<String> {
-    let mut child = std::process::Command::new(exe)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("running {} --version", exe.display()))?;
+    let spawn = || {
+        std::process::Command::new(exe)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    // ETXTBSY: a file just written can still be open for writing in a child
+    // some other thread forked a moment ago. It clears once that child execs.
+    let mut attempt = 0;
+    let mut child = loop {
+        match spawn() {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                break result.with_context(|| format!("running {} --version", exe.display()))?;
+            }
+        }
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.try_wait()? {
