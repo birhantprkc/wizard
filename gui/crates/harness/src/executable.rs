@@ -78,7 +78,13 @@ fn validate_native_override_with(
     Ok(path.to_path_buf())
 }
 
-pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn find_on_paths(exe: &str, mut extra: Vec<PathBuf>) -> Option<PathBuf> {
+    // After everything else: the places a GUI launch's PATH misses.
+    extra.extend(
+        crate::gui_path::well_known_bins()
+            .into_iter()
+            .map(|dir| dir.join(exe)),
+    );
     let mut candidates = Vec::new();
     find_on_paths_matching_with(
         exe,

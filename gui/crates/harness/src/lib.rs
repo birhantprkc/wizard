@@ -166,6 +166,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub(crate) mod executable;
+pub(crate) mod gui_path;
 pub mod install;
 pub(crate) mod jsonrpc;
 pub mod mock;
@@ -201,19 +202,16 @@ fn compose_path<'a>(
     cmd: &mut std::process::Command,
     executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
 ) {
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for dir in executable_dir {
-        paths.push(dir.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    if let Some(shell_path) = shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(shell_path));
-    }
-    let mut seen = std::collections::HashSet::new();
-    paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
-    if let Ok(joined) = std::env::join_paths(paths) {
+    let front: Vec<std::path::PathBuf> = executable_dir
+        .into_iter()
+        .map(std::path::Path::to_path_buf)
+        .collect();
+    if let Some(joined) = gui_path::compose(
+        &front,
+        std::env::var_os("PATH").as_deref(),
+        shell_env::login_shell_path(),
+        &gui_path::well_known_bins(),
+    ) {
         cmd.env("PATH", joined);
     }
 }
