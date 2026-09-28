@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # macOS packaging: build the release binary for the host arch and produce
-#   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
-#   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
+#   target/package/zeron-<version>-macos-<arch>.dmg
 # containing "Wizard GUI.app" (unsigned unless CODESIGN_IDENTITY is set). The
-# file names keep the zeron- prefix; release.yml renames them to wizard-gui-*.
+# in-app updater installs from the same dmg. The file name keeps the zeron-
+# prefix; release.yml renames it to wizard-gui-*.
 #
 # Usage: scripts/package-macos.sh
-# Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
+# Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
+#        CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
 #        API key (.p8) for notarization; all three set → notarize + staple the
 #        app and the dmg, which removes the Gatekeeper warning entirely.
@@ -15,20 +16,24 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+PROFILE="${PROFILE:-release}"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
 APP_NAME="Wizard GUI.app"
 APP="$OUT_DIR/$APP_NAME"
 DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p zeron
+if [[ "$PROFILE" == "release" ]]; then
+  cargo build --release -p zeron
+else
+  cargo build -p zeron
+fi
 
-rm -rf "$APP" "$DMG" "$APP_TARBALL"
+rm -rf "$APP" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/wizard-gui"
+install -m 755 "$ROOT/target/$PROFILE/zeron" "$APP/Contents/MacOS/wizard-gui"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
@@ -68,8 +73,8 @@ NOTARIZE=false
 [[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] && NOTARIZE=true
 
 if $NOTARIZE; then
-  # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
-  # no dmg involved, so the tarball copy must carry its own ticket to pass
+  # Staple the bundle itself, not only the dmg: the in-app updater copies the
+  # .app out of the dmg, so the app must carry its own ticket to pass
   # Gatekeeper offline.
   ZIP="$OUT_DIR/zeron-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
@@ -77,10 +82,6 @@ if $NOTARIZE; then
   rm -f "$ZIP"
   xcrun stapler staple "$APP"
 fi
-
-# The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" "$APP_NAME"
-echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
 # ascii-hands artwork (committed renders from scripts/dmg-background.py).

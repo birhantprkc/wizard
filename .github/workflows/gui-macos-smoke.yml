@@ -56,7 +56,6 @@ jobs:
           ls -la "/Volumes/Wizard GUI"
           test -d "/Volumes/Wizard GUI/Wizard GUI.app"
           hdiutil detach "/Volumes/Wizard GUI"
-          tar -tzf target/package/*-app.tar.gz | head -3
       - name: Install Pi, Claude Code and Wizard from a launchd environment
         env:
           HIDE_NODE: /opt/homebrew/bin /usr/local/bin

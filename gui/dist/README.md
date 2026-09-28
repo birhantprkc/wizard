@@ -34,9 +34,9 @@ Builds the release binary, assembles `Wizard GUI.app` (executable
 `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a dmg with the
 volume name "Wizard GUI". Output files keep the `zeron-` prefix and the release
 workflow renames them to `wizard-gui-*`. The bundle identifier stays
-`sh.zeron.app` so notification permission and saved preferences carry over, and
-the updater accepts both `Wizard GUI.app` and the older `Zeron.app` tarball
-layout. CI runs this on tags
+`sh.zeron.app` so notification permission and saved preferences carry over;
+the in-app updater refuses a downloaded bundle whose identifier differs. The
+updater installs from the same dmg. CI runs this on tags
 (`.github/workflows/release.yml`). The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
