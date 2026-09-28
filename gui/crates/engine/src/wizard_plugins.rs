@@ -242,7 +242,7 @@ async fn run(
     command
         .args(args)
         .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::null())
+        .stdin(zeron_harness::process::Stdio::null())
         .kill_on_drop(true);
     let output = match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => output,
