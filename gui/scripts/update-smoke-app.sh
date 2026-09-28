@@ -46,7 +46,15 @@ if [ "$os" = macos ]; then
   launchctl setenv WIZARD_GUI_TEST_CA "$feed/ca.pem"
   open "$target"
 else
-  shot() { import -window root "$out/$1.png" && log "shot $1"; }
+  shot() {
+    import -window root "$out/$1.png"
+    # The window on its own too: the root capture comes back black for a
+    # 32-bit window with no compositor.
+    local window
+    window="$(xdotool search --onlyvisible --class wizard-gui 2>/dev/null | head -1)"
+    [ -n "$window" ] && import -window "$window" "$out/$1-window.png"
+    log "shot $1"
+  }
   pids() { pgrep -f '/wizard-gui$'; }
   focus() {
     local window

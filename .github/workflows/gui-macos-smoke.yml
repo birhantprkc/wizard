@@ -173,7 +173,8 @@ jobs:
           mkdir -p "$PKG"
           PROFILE=debug scripts/package-linux.sh
           mv "target/package/wizard-gui-$old-linux-x86_64.tar.gz" "$PKG/"
-          sed -i "0,/^version = \"$old\"/s//version = \"$NEW\"/" Cargo.toml
+          perl -0pi -e "s/^version = \"\Q$old\E\"/version = \"$NEW\"/m" Cargo.toml
+          grep -m1 '^version' Cargo.toml
           PROFILE=debug scripts/package-linux.sh
           mv "target/package/wizard-gui-$NEW-linux-x86_64.tar.gz" "$PKG/"
           git checkout Cargo.toml Cargo.lock
@@ -268,7 +269,8 @@ jobs:
           mkdir -p "$PKG"
           PROFILE=debug scripts/package-macos.sh
           cp -R "target/package/Wizard GUI.app" /Applications/
-          sed -i '' "1,/^version = \"$old\"/s//version = \"$NEW\"/" Cargo.toml
+          perl -0pi -e "s/^version = \"\Q$old\E\"/version = \"$NEW\"/m" Cargo.toml
+          grep -m1 '^version' Cargo.toml
           PROFILE=debug scripts/package-macos.sh
           mv "target/package/zeron-$NEW-macos-arm64.dmg" "$PKG/wizard-gui-$NEW-macos-arm64.dmg"
           git checkout Cargo.toml Cargo.lock
