@@ -1,6 +1,6 @@
 # Maintainer: Teddy Tennant <teddytennant@icloud.com>
 pkgname=wizard
-pkgver=3.6.1
+pkgver=3.7.0
 pkgrel=1
 pkgdesc="One line. Your sovereign agent. Self-extending. Bring any model"
 arch=('x86_64' 'aarch64')
@@ -13,7 +13,7 @@ options=('!lto')
 # No check(): the suite runs in CI on every tag, and compiling the crate a second
 # time for the test profile more than doubles the build.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('8e87534f7d1ed56d0ef8524cb0766f0207bd8fb3fc9fc79783e123234a8cf691')
+sha256sums=('6058e1de874f1daeb8fa9845141101abb77f0aab99a03b004b73e4d151b3ba4f')
 
 prepare() {
   cd "$pkgname-$pkgver"
