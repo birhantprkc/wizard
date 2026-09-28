@@ -41,9 +41,15 @@
 //! slash commands, no session file — rather than reimplemented here. Each
 //! capability this loop lacked used to be one bug; `/ultra` and `/fusion` fan
 //! N of these out per turn, which made each one N.
+//!
+//! Shell tasks and nested subagent runs are not shared. The parent drains
+//! those registries itself, so a child that registered a background command
+//! on the parent's registry would land in the parent's transcript even with
+//! `events: None`. A sub-run gets a fresh pair.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -213,23 +219,35 @@ impl SubagentConfig {
 ///
 /// ```ignore
 /// match err.downcast_ref::<SubagentStop>() {
-///     Some(SubagentStop::Cancelled) => …,
+///     Some(SubagentStop::Cancelled { .. }) => …,
 ///     _ => …,
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStop {
     /// The user interrupted: [`SpawnOptions::cancel`] was raised.
-    Cancelled,
+    Cancelled { steps_used: u32 },
     /// The run outlived [`SpawnOptions::deadline`].
-    DeadlineExceeded(Duration),
+    DeadlineExceeded { after: Duration, steps_used: u32 },
+}
+
+impl SubagentStop {
+    /// Steps the loop had entered before it was dropped. Zero only when the
+    /// run never reached a step, not when the counter died with the future.
+    pub fn steps_used(self) -> u32 {
+        match self {
+            Self::Cancelled { steps_used } | Self::DeadlineExceeded { steps_used, .. } => {
+                steps_used
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for SubagentStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cancelled => f.write_str("cancelled"),
-            Self::DeadlineExceeded(after) => write!(f, "timed out after {after:?}"),
+            Self::Cancelled { .. } => f.write_str("cancelled"),
+            Self::DeadlineExceeded { after, .. } => write!(f, "timed out after {after:?}"),
         }
     }
 }
@@ -575,21 +593,40 @@ pub async fn spawn(
     hooks: &Arc<HookEngine>,
     ctx: &ToolContext,
 ) -> Result<SubagentResult> {
+    // The loop's stack counter dies when this select drops the future. The
+    // loop writes `steps` as it enters each step, so a deadline or an
+    // interrupt can still say how far the run got. Zero means the run never
+    // reached a step, not that the counter was thrown away.
+    let steps = Arc::new(AtomicU32::new(0));
     let stop = tokio::select! {
         biased;
-        () = cancelled(options.cancel.as_ref()) => SubagentStop::Cancelled,
+        () = cancelled(options.cancel.as_ref()) => SubagentStop::Cancelled {
+            steps_used: steps.load(Ordering::Relaxed),
+        },
         () = elapsed(options.deadline) => {
             // `elapsed` only resolves when there *is* a deadline.
-            SubagentStop::DeadlineExceeded(options.deadline.unwrap_or_default())
+            SubagentStop::DeadlineExceeded {
+                after: options.deadline.unwrap_or_default(),
+                steps_used: steps.load(Ordering::Relaxed),
+            }
         }
-        result = run_loop(run, config, task, options, client, registry, hooks, ctx) => return result,
+        result = run_loop(
+            run,
+            config,
+            task,
+            options,
+            client,
+            registry,
+            hooks,
+            ctx,
+            Arc::clone(&steps),
+        ) => return result,
     };
 
     // The loop's future has just been dropped mid-run, so it never reached its
     // own terminal event. Close the pane out here or it sits at "running" for
-    // the rest of the session. The pane's step count already arrived on
-    // `SubagentRunStep`; the loop's own counter went with its dropped future.
-    close_pane(&ctx.events, run, 0, &stop.to_string()).await;
+    // the rest of the session. The count is in `steps`, which outlived the drop.
+    close_pane(&ctx.events, run, stop.steps_used(), &stop.to_string()).await;
     Err(anyhow::Error::new(stop))
 }
 
@@ -634,10 +671,13 @@ async fn elapsed(deadline: Option<Duration>) {
 /// of the turn's gates it keeps — is [`Policy::sub_run`], not code in here.
 struct SubRun<'a> {
     client: &'a Arc<dyn LlmProvider>,
-    /// The context nested tools run in: the parent's registries, checkpoint
-    /// store and image store, with the surface deliberately unwired (see the
-    /// construction in [`run_loop`]).
+    /// The context nested tools run in. Todos, the checkpoint store and the
+    /// image store may be the parent's; the task and subagent registries are
+    /// not (see [`run_loop`]). The surface is deliberately unwired.
     ctx: ToolContext,
+    /// Steps entered so far. Outlives this future, so [`spawn`]'s deadline
+    /// and cancel arms can read it after the loop is dropped.
+    steps: Arc<AtomicU32>,
     /// This run's tool pipeline, over its scoped registry. The same
     /// [`Dispatcher`] a turn uses, built for a sub-run.
     dispatcher: Dispatcher,
@@ -679,6 +719,10 @@ impl Host for SubRun<'_> {
 
     fn ctx(&self) -> &ToolContext {
         &self.ctx
+    }
+
+    fn note_step(&self, step: u32) {
+        self.steps.store(step, Ordering::Relaxed);
     }
 
     fn tool_specs(&self) -> Vec<ToolSpec> {
@@ -804,6 +848,7 @@ async fn run_loop(
     registry: &ToolRegistry,
     hooks: &Arc<HookEngine>,
     ctx: &ToolContext,
+    steps: Arc<AtomicU32>,
 ) -> Result<SubagentResult> {
     let loaded = Config::load().unwrap_or_default();
     let model = options
@@ -880,6 +925,13 @@ async fn run_loop(
     let ctx = ToolContext {
         todos,
         events: None,
+        // A child's shell tasks are its own. Sharing the parent's registry
+        // is how a backgrounded execute landed in the parent's transcript:
+        // the parent drains that registry directly, and `events: None` does
+        // not stop it. Nested subagent runs are the same shape, so those
+        // stay off the parent's registry too.
+        tasks: Arc::new(crate::tools::tasks::TaskRegistry::new()),
+        subagents: Arc::new(crate::tools::subagent_tasks::SubagentTaskRegistry::new()),
         // A subagent has no surface to drive; it must never dispatch the
         // parent's slash commands even if the parent's ctx enabled it.
         command_dispatch: CommandDispatch::None,
@@ -918,6 +970,7 @@ async fn run_loop(
         client,
         dispatcher: Dispatcher::sub_run(scoped, Arc::clone(hooks)),
         ctx,
+        steps: Arc::clone(&steps),
         history,
         model,
         byte_threshold: loaded.compact_threshold_bytes,
@@ -929,10 +982,15 @@ async fn run_loop(
         Ok(ran) => ran,
         Err(err) => {
             let err = err.context(format!("subagent '{}' chat failed", config.name));
-            // Close the pane out, or it sits at "running" forever. The step
-            // count the pane shows already arrived on `SubagentRunStep`; the
-            // loop's own counter went with the error.
-            close_pane(&progress, run, 0, &format!("{err:#}")).await;
+            // Close the pane out, or it sits at "running" forever. The count
+            // is the one the loop published as it entered each step.
+            close_pane(
+                &progress,
+                run,
+                steps.load(Ordering::Relaxed),
+                &format!("{err:#}"),
+            )
+            .await;
             return Err(err);
         }
     };
@@ -944,10 +1002,15 @@ async fn run_loop(
             &progress,
             run,
             ran.steps_used,
-            &SubagentStop::Cancelled.to_string(),
+            &SubagentStop::Cancelled {
+                steps_used: ran.steps_used,
+            }
+            .to_string(),
         )
         .await;
-        return Err(anyhow::Error::new(SubagentStop::Cancelled));
+        return Err(anyhow::Error::new(SubagentStop::Cancelled {
+            steps_used: ran.steps_used,
+        }));
     }
 
     let completed = ran.reason == crate::agent::DoneReason::Completed;
@@ -1208,12 +1271,18 @@ impl Tool for SpawnSubagentTool {
                         steps_used: result.steps_used,
                         error: None,
                     },
-                    Err(err) => SubagentRunResult {
-                        completed: false,
-                        output: format!("subagent failed: {err:#}"),
-                        steps_used: 0,
-                        error: Some(format!("{err:#}")),
-                    },
+                    Err(err) => {
+                        let steps_used = err
+                            .downcast_ref::<SubagentStop>()
+                            .map(|stop| stop.steps_used())
+                            .unwrap_or(0);
+                        SubagentRunResult {
+                            completed: false,
+                            output: format!("subagent failed: {err:#}"),
+                            steps_used,
+                            error: Some(format!("{err:#}")),
+                        }
+                    }
                 }
             };
             // Reserve the id and announce the run *before* attaching the
@@ -2260,6 +2329,22 @@ mod tests {
         }
     }
 
+    fn tool_call_with(name: &str, arguments: serde_json::Value) -> ChatChunk {
+        let mut message = ChatMessage::assistant("");
+        message.push_tool_call(ToolCall::new(name.to_string(), arguments));
+        ChatChunk {
+            message: Some(message),
+            images: Vec::new(),
+            thinking: false,
+            done: true,
+            done_reason: None,
+            eval_count: None,
+            prompt_eval_count: None,
+            cache: CacheTokens::NONE,
+            reasoning_eval_count: None,
+        }
+    }
+
     #[test]
     fn invalid_manifests_are_skipped_and_the_rest_load() {
         let tmp = TempDir::new();
@@ -2794,9 +2879,11 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the interrupt ends the run, not the provider"
         );
-        assert_eq!(
-            err.downcast_ref::<SubagentStop>(),
-            Some(&SubagentStop::Cancelled),
+        assert!(
+            matches!(
+                err.downcast_ref::<SubagentStop>(),
+                Some(SubagentStop::Cancelled { .. })
+            ),
             "and says so in a way a fan-out can tell from a dead candidate: {err:#}"
         );
         assert_eq!(
@@ -2838,13 +2925,123 @@ mod tests {
         assert!(
             matches!(
                 err.downcast_ref::<SubagentStop>(),
-                Some(SubagentStop::DeadlineExceeded(_))
+                Some(SubagentStop::DeadlineExceeded { .. })
             ),
             "{err:#}"
         );
         let closed = done_events(&mut rx);
         assert_eq!(closed.len(), 1);
         assert!(closed[0].contains("timed out"), "{}", closed[0]);
+    }
+
+    /// A deadline drops the loop future. The step count has to survive that
+    /// drop, or a run that wrote files and then hung reports "0 step(s)".
+    #[tokio::test]
+    async fn a_deadline_reports_steps_the_dropped_loop_had_entered() {
+        let tmp = TempDir::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut ctx = ToolContext::new(&tmp.0);
+        ctx.events = Some(tx);
+
+        // Hangs on the first call, after the loop has entered step 1 and
+        // published the count. The old path reported 0, which is also what
+        // a run that never started reports, so the two were indistinguishable.
+        let provider = ScriptedProvider::stalling(1, Vec::new());
+        let client: Arc<dyn LlmProvider> = provider;
+        let started = std::time::Instant::now();
+
+        let err = spawn(
+            next_run_id(),
+            &worker(),
+            "hang after entering a step",
+            &SpawnOptions {
+                deadline: Some(Duration::from_millis(1000)),
+                ..SpawnOptions::default()
+            },
+            &client,
+            &ToolRegistry::new(),
+            &test_hooks(&tmp),
+            &ctx,
+        )
+        .await
+        .expect_err("a deadline is a stop");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match err.downcast_ref::<SubagentStop>() {
+            Some(SubagentStop::DeadlineExceeded { steps_used: 1, .. }) => {}
+            other => panic!("the count has to survive the drop, got {other:?} ({err:#})"),
+        }
+
+        let mut saw = false;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::SubagentRunDone {
+                steps_used, error, ..
+            } = event
+            {
+                assert_eq!(steps_used, 1, "the pane must not say 0 either");
+                assert!(error.as_deref().is_some_and(|e| e.contains("timed out")));
+                saw = true;
+            }
+        }
+        assert!(saw, "the pane has to close");
+    }
+
+    /// A backgrounded `execute` belongs to the child. The parent drains its
+    /// own registry straight into the transcript, so sharing that registry
+    /// is how a child's shell task used to show up there.
+    #[tokio::test]
+    async fn a_child_shell_task_does_not_land_in_the_parent_registry() {
+        let tmp = TempDir::new();
+        let ctx = ToolContext::new(&tmp.0);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::tools::shell::ExecuteTool));
+
+        let call = tool_call_with(
+            "execute",
+            json!({
+                "command": "true",
+                "run_in_background": true
+            }),
+        );
+        let provider = ScriptedProvider::new(vec![vec![call], vec![chunk("done", false, true)]]);
+        let client: Arc<dyn LlmProvider> = provider.clone();
+
+        let result = spawn(
+            next_run_id(),
+            &worker(),
+            "background a shell command",
+            &SpawnOptions::default(),
+            &client,
+            &registry,
+            &test_hooks(&tmp),
+            &ctx,
+        )
+        .await
+        .expect("the child finishes");
+        assert!(result.completed, "{}", result.output);
+
+        let leaked = ctx.tasks.list();
+        let finished = ctx.tasks.drain_completed();
+        assert!(
+            leaked.is_empty() && finished.is_empty(),
+            "a backgrounded execute must not register on the parent: running {leaked:?}, finished {finished:?}"
+        );
+
+        let requests = provider.requests.lock().unwrap();
+        let saw_task = requests.iter().any(|req| {
+            req.messages.iter().any(|message| {
+                message.content.iter().any(|block| match block {
+                    crate::llm::ContentBlock::ToolResult(result) => {
+                        result.content.contains("Background task")
+                    }
+                    _ => false,
+                })
+            })
+        });
+        assert!(
+            saw_task,
+            "execute has to have run, or an empty parent registry proves nothing"
+        );
     }
 
     /// A run that outgrows its window compacts, exactly as the parent turn
@@ -3089,9 +3286,11 @@ mod tests {
         let ToolError::Execution { source, .. } = &err else {
             panic!("a cancelled run is an execution failure, not bad arguments: {err}");
         };
-        assert_eq!(
-            source.downcast_ref::<SubagentStop>(),
-            Some(&SubagentStop::Cancelled),
+        assert!(
+            matches!(
+                source.downcast_ref::<SubagentStop>(),
+                Some(SubagentStop::Cancelled { .. })
+            ),
             "and the parent can tell an interrupt from a broken run: {source:#}"
         );
         assert!(

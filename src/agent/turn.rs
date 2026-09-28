@@ -438,11 +438,14 @@ impl Policy {
             byte_threshold,
             max_context_tokens,
             prune_after_tokens,
-            // Declined: the task and subagent registries in a sub-run's
-            // context are the *parent's*. Draining them here would consume
-            // notifications the parent has to inject into its own history and
-            // persist to its own session, and a sub-run has neither.
-            background_drain: false,
+            // On, now that a sub-run has its own task and subagent registries.
+            // Draining used to be declined because those registries were the
+            // parent's, and a drain here would steal notifications the parent
+            // still has to inject. They are not shared anymore (see `run_loop`),
+            // so the child is the only one who should hear about its own shell
+            // tasks. The run sink drops the surface event; the note lands in
+            // the child's history, not the parent's transcript.
+            background_drain: true,
             // Declined: `.wizard/loop-control` is the operator's handle on the
             // session's sovereign run. A `skip` written for the parent would be
             // eaten by whichever of N concurrent sub-runs happened to look
@@ -565,6 +568,13 @@ pub(super) trait Host: Send {
     /// dispatch it. Exactly one tool needs this: `compact`, which mutates the
     /// history the loop is standing on.
     async fn intercept(&mut self, call: &ToolCall, sink: &Sink) -> Option<CallOutcome>;
+
+    /// Publish the step the loop just entered.
+    ///
+    /// A sub-run writes a counter that outlives the future, so a deadline or
+    /// an interrupt can still say how far the run got after the future is
+    /// dropped. A turn has no such caller; the default does nothing.
+    fn note_step(&self, _step: u32) {}
 }
 
 /// What [`run`] produced.
@@ -599,6 +609,7 @@ pub(super) async fn run(host: &mut impl Host, policy: &Policy, sink: &Sink) -> R
 
     for step in 1..=policy.max_steps {
         steps_used = step;
+        host.note_step(step);
 
         // Surface background work that finished since the last step.
         if policy.background_drain {
@@ -3156,10 +3167,12 @@ mod tests {
             "a clock the parent owns is not one a sub-run can act on"
         );
         assert!(cancel.is_none(), "spawn owns the interrupt");
-        // These three are declined outright.
+        // background_drain is on: the registries are the child's, so the
+        // child is who should hear about its own shell tasks. Operator
+        // control and the pressure signal stay off.
         assert!(
-            !background_drain,
-            "the registries in a sub-run's context are the parent's"
+            background_drain,
+            "a sub-run drains its own registries, not the parent's"
         );
         assert!(
             !operator_control,

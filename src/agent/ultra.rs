@@ -798,7 +798,7 @@ impl Council {
             Err(err) => {
                 if matches!(
                     err.downcast_ref::<SubagentStop>(),
-                    Some(SubagentStop::Cancelled)
+                    Some(SubagentStop::Cancelled { .. })
                 ) {
                     return Asked::Cancelled;
                 }
