@@ -168,6 +168,7 @@ pub mod cursor;
 pub(crate) mod executable;
 pub(crate) mod gui_path;
 pub mod install;
+pub mod install_progress;
 pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;

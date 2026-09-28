@@ -1092,13 +1092,22 @@ fn should_invalidate_link(error: &RpcError) -> bool {
 /// everything else is interactive and must fail fast.
 #[derive(Default)]
 pub(crate) struct Installations(
-    std::sync::Mutex<std::collections::HashMap<HarnessId, zeron_harness::CancellationToken>>,
+    std::sync::Mutex<
+        std::collections::HashMap<
+            HarnessId,
+            (
+                zeron_harness::CancellationToken,
+                zeron_harness::install_progress::Progress,
+            ),
+        >,
+    >,
 );
 
 struct Installing<'a> {
     installs: &'a Installations,
     harness: HarnessId,
     cancel: zeron_harness::CancellationToken,
+    progress: zeron_harness::install_progress::Progress,
 }
 impl Drop for Installing<'_> {
     fn drop(&mut self) {
@@ -1117,15 +1126,17 @@ impl Installations {
             return Err(RpcError::Failed("already installing".into()));
         }
         let cancel = zeron_harness::CancellationToken::new();
-        installs.insert(harness, cancel.clone());
+        let progress = zeron_harness::install_progress::Progress::default();
+        installs.insert(harness, (cancel.clone(), progress.clone()));
         Ok(Installing {
             installs: self,
             harness,
             cancel,
+            progress,
         })
     }
     fn cancel(&self, harness: HarnessId) {
-        if let Some(cancel) = self
+        if let Some((cancel, _)) = self
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1134,18 +1145,36 @@ impl Installations {
             cancel.cancel();
         }
     }
+    /// `None` when `harness` is not installing; a just-started install
+    /// reports "Checking…" at zero until its plan is known.
+    fn progress(
+        &self,
+        harness: HarnessId,
+    ) -> Option<zeron_harness::install_progress::InstallProgress> {
+        let installs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, progress) = installs.get(&harness)?;
+        Some(progress.snapshot().unwrap_or_else(|| {
+            zeron_harness::install_progress::InstallProgress {
+                status: "Checking…".into(),
+                fraction: 0.0,
+                detail: None,
+            }
+        }))
+    }
 }
 
 async fn run_requested_install(
     harness: HarnessId,
     cancel: zeron_harness::CancellationToken,
+    progress: zeron_harness::install_progress::Progress,
 ) -> Result<(), zeron_harness::HarnessError> {
     #[cfg(test)]
     if let Ok(script) = std::env::var(format!("ZERON_INSTALLER_COMMAND_{harness:?}").to_uppercase())
     {
+        let _ = progress;
         return zeron_harness::install::install_with_command(harness, &script, cancel).await;
     }
-    zeron_harness::install::install_harness(harness, cancel).await
+    zeron_harness::install::install_harness(harness, cancel, progress).await
 }
 
 async fn install_harness_with<F, Fut>(
@@ -1193,6 +1222,7 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
+            | methods::INSTALL_PROGRESS
             | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
@@ -1588,10 +1618,18 @@ impl RpcService for EngineRpc {
                 let p: ListModelsParams = parse_params(params)?;
                 let installing = self.registry.installs.begin(p.harness)?;
                 let descriptors = install_harness_with(&self.registry, p.harness, || {
-                    run_requested_install(p.harness, installing.cancel.clone())
+                    run_requested_install(
+                        p.harness,
+                        installing.cancel.clone(),
+                        installing.progress.clone(),
+                    )
                 })
                 .await?;
                 RpcReply::value(&descriptors)
+            }
+            methods::INSTALL_PROGRESS => {
+                let p: ListModelsParams = parse_params(params)?;
+                RpcReply::value(&self.registry.installs.progress(p.harness))
             }
             methods::CANCEL_INSTALL => {
                 let p: ListModelsParams = parse_params(params)?;
@@ -3192,6 +3230,15 @@ mod tests {
             assert!(
                 matches!(other.handle(methods::INSTALL_HARNESS, params.clone()).await, Err(RpcError::Failed(e)) if e == "already installing")
             );
+            // The in-flight install reports progress to any service.
+            let RpcReply::Value(progress) = other
+                .handle(methods::INSTALL_PROGRESS, params.clone())
+                .await
+                .unwrap()
+            else {
+                panic!("expected a progress value");
+            };
+            assert_eq!(progress["status"], "Checking…");
             other.handle(methods::CANCEL_INSTALL, params).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), task)
                 .await
@@ -3230,6 +3277,19 @@ mod tests {
             _ => unreachable!(),
         }
         assert!(forwardable(methods::CANCEL_INSTALL));
+        assert!(forwardable(methods::INSTALL_PROGRESS));
+        // Nothing installing, nothing to report.
+        let RpcReply::Value(idle) = rpc
+            .handle(
+                methods::INSTALL_PROGRESS,
+                serde_json::json!({"harness": "codex"}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a progress value");
+        };
+        assert!(idle.is_null());
         core.shutdown().await;
     }
 

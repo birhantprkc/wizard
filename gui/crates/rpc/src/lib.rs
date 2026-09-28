@@ -37,6 +37,10 @@ pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const CANCEL_INSTALL: &str = "CancelInstall";
     pub const INSTALL_HARNESS: &str = "InstallHarness";
+    /// Where a running `InstallHarness` is: `{harness}` →
+    /// `zeron_harness::install_progress::InstallProgress`, or null when that
+    /// harness is not installing. Polled by the install progress bar.
+    pub const INSTALL_PROGRESS: &str = "InstallProgress";
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
