@@ -6,6 +6,8 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-09-28
+
 ### Added
 
 - **`/usage` covers ChatGPT sign-ins.** It shows the 5-hour and weekly windows
@@ -14,8 +16,10 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   of the last reply. Every signed-in subscription now gets its own block
   whichever provider is active; on an API-key provider the session's token
   rollup follows.
+
 - **`wizard usage --subscriptions [--json]`** prints the same limits outside a
   session, as text or as JSON.
+
 - **Wizard GUI shows subscription usage.** Settings → Wizard has a Usage
   section with a bar per window, reset times, and a Refresh button.
 
@@ -28,13 +32,36 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 - **`search_backend` ACP config option**, so a client can switch a session's
   web search between `auto`, `grok` and `duckduckgo`.
 
-### Changed
+- **Computer use in a VM.** `wizard computer vm up` runs a small desktop
+  (Xvfb, fluxbox, xterm, x11vnc) in Docker or Podman on 127.0.0.1, and
+  `[computer] backend = "vm"` points the `computer` tool at it over VNC
+  instead of at your own screen. `address` under `[computer.vm]` drives a VM
+  you run yourself, such as QEMU with `-vnc`.
 
-- **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a
-  stored key, or `XAI_API_KEY`) `web_search` uses Grok's server-side search and
-  its cited results; without them it is DuckDuckGo as before. `grok` is now the
-  documented name for the xAI backend, and `xai` still works. A config that
-  names a backend keeps it.
+- **`wizard computer setup`.** Detects the OS, session and compositor, offers
+  the VM or this desktop, and turns computer use on only after a screenshot
+  and a one-pixel pointer move work. Where Wizard has no built-in driver
+  (GNOME or KDE on Wayland, Windows, WSL) it shows a plan and asks whether the
+  agent should write one, as a LuaJIT scripted tool in `~/.wizard/tools/`.
+  Also `status`, `check`, `disable`, `/computer`, and a `computer` page in the
+  agent's manual.
+
+- **Live screen in Wizard GUI.** A card in the top right shows what the agent
+  sees, live for the VM, with a ripple where it clicked and a caption for
+  what it typed. Click it to open it large. Take control pauses the agent's
+  input actions and sends your mouse and keyboard to the VM; Give back hands
+  it over again.
+
+- **Wizard builds for Android.** `contrib/android/build.sh` produces
+  `libwizard.so` for arm64-v8a and x86_64 with the NDK, so a phone app can run
+  `wizard acp` itself. The shell comes from `$SHELL` or the new `[shell]
+  program` key, sign-in URLs go to `$BROWSER` first, and `wizard acp` now
+  advertises `xai-oauth`, `chatgpt-oauth` and `api-key` sign-in over ACP
+  `authenticate`, sending the URL as a `_wizard/auth_url` notification.
+
+- **Install progress in Wizard GUI.** Installing Wizard, Pi, Claude Code or
+  the Pi adapter shows the stage, a progress bar (real bytes for downloads) and
+  the installer's latest line; a failure shows the last lines and Retry.
 
 - **Pi plugins in Wizard (beta).** `wizard plugins search|inspect|install|list|remove`
   installs a Pi package for Wizard, for Pi (`--for pi` runs `pi install`), or for
@@ -42,13 +69,6 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   commands that expand Pi's placeholders. Extensions and themes are listed as not
   supported yet. `/plugins` does the same in the TUI with pickers. See
   [docs/pi-plugins.md](docs/pi-plugins.md).
-
-### Changed
-
-- **Wizard GUI's Pi extensions page is now Plugins.** Install asks whether a
-  package goes to Pi and Wizard, only Wizard, or only Pi, shows what would work
-  in Wizard first, and the installed list has Remove for each. Devices without
-  Wizard keep the Pi-only page.
 
 - **Wizard GUI updates itself.** It checks the GitHub releases on launch and
   every six hours, and a sidebar banner offers Update, a progress bar, then
@@ -63,10 +83,48 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ### Changed
 
+- **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a
+  stored key, or `XAI_API_KEY`) `web_search` uses Grok's server-side search and
+  its cited results; without them it is DuckDuckGo as before. `grok` is now the
+  documented name for the xAI backend, and `xai` still works. A config that
+  names a backend keeps it.
+
+- **Wizard GUI's Pi extensions page is now Plugins.** Install asks whether a
+  package goes to Pi and Wizard, only Wizard, or only Pi, shows what would work
+  in Wizard first, and the installed list has Remove for each. Devices without
+  Wizard keep the Pi-only page.
+
 - **The Linux GUI package installs into `~/.local/share/wizard-gui/<version>`**
   with `~/.local/bin/wizard-gui` linked through a `current` symlink, so
   updates can swap versions. An install from an older package is moved over
   on its first update.
+
+- **`wizard plugin` is now `wizard builtins`,** so it isn't mistaken for
+  `wizard plugins`, which installs Pi packages. `wizard plugin` still works as
+  a hidden alias.
+
+- **Computer use is off by default.** The `computer` tool is only registered
+  with `[computer] enabled = true`, which `wizard computer setup` writes.
+  Before, every session on every machine had it, set up or not.
+
+- **The desktop app is called Wizard GUI everywhere:** `Wizard GUI.app`, the
+  dmg, the Dock and menu bar, and the Linux launcher. `wizard gui` finds it
+  under the new names.
+
+### Fixed
+
+- **Pi would not install on macOS.** pi.dev's installer needs Node.js 22
+  and only offers to install it from a terminal, so an app started from the
+  Dock exited with "No terminal detected". Wizard GUI now downloads the
+  official Node 22, checks it against SHASUMS256.txt and hands it to the
+  installer.
+
+- **Agents installed with Homebrew or npm were invisible from the Dock.** A
+  Dock launch gets `/usr/bin:/bin:/usr/sbin:/sbin`; Wizard GUI now always adds
+  Homebrew, `/usr/local/bin`, `~/.local/bin` and its own Node to the PATH.
+
+- **The first window could open off screen** on displays smaller than
+  1320x880; it now fits and centres.
 
 ## [3.6.1] - 2026-09-27
 
