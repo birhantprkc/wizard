@@ -12,8 +12,11 @@ Produces `target/package/wizard-gui-<version>-linux-<arch>.tar.gz` containing:
 - `wizard-gui` — the binary (headed by default; `wizard-gui headless` runs the engine alone)
 - `wizard-gui.desktop` — XDG desktop entry, `StartupWMClass` matching the window's app id
 - `wizard-gui.png` — 1024×1024 app icon
-- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}` and
-  removes a `zeron.desktop` left by an older package
+- `install.sh` — copies the package to `~/.local/share/wizard-gui/<version>`,
+  points `~/.local/share/wizard-gui/current` at it, links
+  `~/.local/bin/wizard-gui` through `current`, installs the desktop entry and
+  icon, and removes a `zeron.desktop` left by an older package. The in-app
+  updater installs later versions the same way.
 
 The cargo binary is still `zeron`; the script installs it under the new name.
 
