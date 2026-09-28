@@ -1,6 +1,6 @@
 //! Pi packages on this device: the personal package list from pi's agent
 //! settings plus the `pi` CLI's own install/remove/update commands.
-//! Settings → Pi extensions drives these over relay-forwardable RPCs, so the
+//! Settings → Plugins drives these over relay-forwardable RPCs, so the
 //! page manages whichever device's Pi it targets.
 //!
 //! Pi owns the package state (`<agent-dir>/settings.json` `packages`, managed
@@ -197,6 +197,30 @@ fn classify(agent_dir: &Path, source: &str) -> (PiPackageKind, String, Option<Pa
         Some(agent_dir.join(path))
     };
     (PiPackageKind::Local, source.to_string(), resolved)
+}
+
+/// One identity for a package however its source was spelled, the way Pi
+/// tells packages apart: npm by package name, git by `host/owner/repo`
+/// without the ref, anything else by the source itself. For a configured
+/// package this is its [`PiPackage::name`]; the Plugins page uses it to line
+/// Wizard's installs up with Pi's.
+pub fn package_key(source: &str) -> String {
+    let source = source.trim();
+    if let Some(spec) = source.strip_prefix("npm:") {
+        return npm_name(spec.trim()).to_string();
+    }
+    let git = source.strip_prefix("git:").map(str::trim).or_else(|| {
+        ["https://", "http://", "ssh://", "git://"]
+            .iter()
+            .any(|p| source.starts_with(p))
+            .then_some(source)
+    });
+    if let Some(repo) = git
+        && let Some((host, path)) = git_host_path(repo)
+    {
+        return format!("{host}/{path}");
+    }
+    source.to_string()
 }
 
 /// `@scope/name@1.2.3` → `@scope/name`; `name@^1` → `name`.
@@ -531,6 +555,18 @@ mod tests {
             read_packages(&dir.path().join("missing")),
             (Vec::new(), None)
         );
+    }
+
+    #[test]
+    fn package_keys_match_what_pi_lists() {
+        assert_eq!(package_key("npm:@s/tools@^1"), "@s/tools");
+        assert_eq!(package_key("git:github.com/o/r@v1"), "github.com/o/r");
+        assert_eq!(package_key("https://github.com/o/r"), "github.com/o/r");
+        assert_eq!(package_key("./local"), "./local");
+        let dir = tempfile::tempdir().unwrap();
+        let (kind, name, _) = classify(dir.path(), "git:github.com/o/r@v2");
+        assert_eq!(kind, PiPackageKind::Git);
+        assert_eq!(name, package_key("git:github.com/o/r@v2"));
     }
 
     #[test]

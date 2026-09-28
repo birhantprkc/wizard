@@ -109,6 +109,17 @@ pub enum PickerKind {
     /// lens, one candidate — so this one picker sets both knobs the user cares
     /// about.
     UltraLenses,
+    /// `/plugins [terms]`: Pi gallery hits (item values are specs). Enter
+    /// asks which harness gets it, or installs for Wizard when Pi isn't here.
+    PiGallery,
+    /// Level 2 of an install: which harness (item values are
+    /// `<target> <spec>`).
+    PiTarget,
+    /// `/plugins list`: what is installed for Wizard (item values are
+    /// plugin names). Enter asks where to remove it from.
+    PiInstalled,
+    /// Level 2 of a remove (item values are `<target> <name>`).
+    PiRemove,
 }
 
 /// One selectable row in a picker popup.
@@ -145,6 +156,77 @@ impl Picker {
             _ => " ↑↓ move · enter select · esc cancel ",
         }
     }
+}
+
+/// Level 2 of a `/plugins` install: which harness gets `spec`. `None` when
+/// Pi isn't on this machine, where the only answer is Wizard and asking would
+/// be a one-row menu.
+pub(super) fn plugin_target_picker(spec: &str, pi_available: bool) -> Option<Picker> {
+    use crate::pi_plugins::Target;
+    if !pi_available {
+        return None;
+    }
+    let name = spec.strip_prefix("npm:").unwrap_or(spec);
+    let row = |target: Target, detail: &str| PickerItem {
+        value: format!("{} {spec}", target_word(target)),
+        detail: format!("{} \u{b7} {detail}", target.label()),
+        current: false,
+    };
+    Some(Picker {
+        kind: PickerKind::PiTarget,
+        title: format!(" install {name} for "),
+        items: vec![
+            row(Target::Both, "Wizard is beta: skills and prompts work"),
+            row(
+                Target::Wizard,
+                "beta: skills and prompts work, extensions don't yet",
+            ),
+            row(Target::Pi, "runs pi install"),
+        ],
+        selected: 0,
+    })
+}
+
+/// Level 2 of a `/plugins list` pick: where to remove `name` from.
+pub(super) fn plugin_remove_picker(name: &str, pi_available: bool) -> Picker {
+    use crate::pi_plugins::Target;
+    let row = |target: Target, detail: &str| PickerItem {
+        value: format!("{} {name}", target_word(target)),
+        detail: detail.to_string(),
+        current: false,
+    };
+    let mut items = vec![row(Target::Wizard, "remove from Wizard")];
+    if pi_available {
+        items.push(row(Target::Both, "remove from Pi and Wizard"));
+    }
+    Picker {
+        kind: PickerKind::PiRemove,
+        title: format!(" remove {name} "),
+        items,
+        selected: 0,
+    }
+}
+
+fn target_word(target: crate::pi_plugins::Target) -> &'static str {
+    use crate::pi_plugins::Target;
+    match target {
+        Target::Wizard => "wizard",
+        Target::Pi => "pi",
+        Target::Both => "both",
+    }
+}
+
+/// `both npm:x` → `(Both, "npm:x")`: the value a target row carries.
+pub(super) fn split_target(value: &str) -> Option<(crate::pi_plugins::Target, String)> {
+    use crate::pi_plugins::Target;
+    let (word, rest) = value.split_once(' ')?;
+    let target = match word {
+        "wizard" => Target::Wizard,
+        "pi" => Target::Pi,
+        "both" => Target::Both,
+        _ => return None,
+    };
+    Some((target, rest.to_string()))
 }
 
 /// Status bar contents.

@@ -354,6 +354,7 @@ fn exactly_typed_command_wins_over_longer_completion() {
 
 fn custom(name: &str, template: &str, description: Option<&str>) -> CustomCommand {
     CustomCommand {
+        pi_syntax: false,
         name: name.to_string(),
         description: description.map(str::to_string),
         template: template.to_string(),
@@ -5457,4 +5458,103 @@ fn a_drag_copy_leaves_the_transcript_gutter_behind_in_every_skin() {
             skin.key()
         );
     }
+}
+
+#[test]
+fn plugins_parses_its_verbs() {
+    use crate::commands::PluginsAction;
+    use crate::pi_plugins::Target;
+    let parse = |line: &str| SlashCommand::parse(line).unwrap();
+    assert_eq!(
+        parse("/plugins"),
+        Ok(SlashCommand::Plugins(PluginsAction::Browse(String::new())))
+    );
+    assert_eq!(
+        parse("/plugins sentry skills"),
+        Ok(SlashCommand::Plugins(PluginsAction::Browse(
+            "sentry skills".into()
+        )))
+    );
+    assert_eq!(
+        parse("/plugins search list"),
+        Ok(SlashCommand::Plugins(PluginsAction::Browse("list".into())))
+    );
+    assert_eq!(
+        parse("/plugins list"),
+        Ok(SlashCommand::Plugins(PluginsAction::List))
+    );
+    assert_eq!(
+        parse("/plugins install npm:pi-x"),
+        Ok(SlashCommand::Plugins(PluginsAction::Install {
+            spec: "npm:pi-x".into(),
+            target: Target::Wizard,
+        }))
+    );
+    assert_eq!(
+        parse("/plugins install pi-x --for both"),
+        Ok(SlashCommand::Plugins(PluginsAction::Install {
+            spec: "pi-x".into(),
+            target: Target::Both,
+        }))
+    );
+    assert_eq!(
+        parse("/plugins remove pi-x --for=pi"),
+        Ok(SlashCommand::Plugins(PluginsAction::Remove {
+            name: "pi-x".into(),
+            target: Target::Pi,
+        }))
+    );
+    assert!(parse("/plugins install").is_err());
+    assert!(parse("/plugins install pi-x --for everyone").is_err());
+    assert!(
+        SlashCommand::Plugins(PluginsAction::List)
+            .agent_runnable()
+            .is_err(),
+        "the agent does not install plugins for itself"
+    );
+}
+
+#[test]
+fn plugin_target_picker_asks_only_when_pi_is_here() {
+    use super::picker::{plugin_target_picker, split_target};
+    use crate::pi_plugins::Target;
+    assert!(plugin_target_picker("npm:pi-x", false).is_none());
+    let picker = plugin_target_picker("npm:pi-x", true).unwrap();
+    assert_eq!(picker.kind, PickerKind::PiTarget);
+    assert!(picker.title.contains("pi-x"));
+    let targets: Vec<Target> = picker
+        .items
+        .iter()
+        .map(|item| split_target(&item.value).unwrap().0)
+        .collect();
+    // Both first: the default when both harnesses are installed.
+    assert_eq!(targets, vec![Target::Both, Target::Wizard, Target::Pi]);
+    assert!(picker.items[0].detail.contains("beta"));
+    assert_eq!(split_target("nobody npm:x"), None);
+}
+
+#[test]
+fn plugin_pickers_emit_install_and_remove() {
+    use super::picker::{plugin_remove_picker, plugin_target_picker};
+    use crate::commands::PluginsAction;
+    use crate::pi_plugins::Target;
+    let mut app = app();
+    app.picker = plugin_target_picker("npm:pi-x", true);
+    press(&mut app, KeyCode::Down);
+    let action = press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        action,
+        Some(AppAction::Command(SlashCommand::Plugins(PluginsAction::Install { spec, target })))
+            if spec == "npm:pi-x" && target == Target::Wizard
+    ));
+
+    app.picker = Some(plugin_remove_picker("pi-x", false));
+    assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
+    let action = press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        action,
+        Some(AppAction::Command(SlashCommand::Plugins(PluginsAction::Remove { name, target })))
+            if name == "pi-x" && target == Target::Wizard
+    ));
+    assert_eq!(plugin_remove_picker("pi-x", true).items.len(), 2);
 }

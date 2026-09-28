@@ -19,7 +19,7 @@ use crate::agent::{Agent, RewindCandidate};
 use crate::commands::surface::{
     Chooser, CommandSurface, Panel, PlanState, SessionSnapshot, Surface, dispatch,
 };
-use crate::commands::{ProviderAction, ServerAction, SlashCommand};
+use crate::commands::{PluginsAction, ProviderAction, ServerAction, SlashCommand};
 use crate::config::{
     Config, Mode, ProviderConfig, ProviderKind, ReasoningEffort, StepBudget, UltraConfig,
 };
@@ -1610,6 +1610,120 @@ impl CommandContext<'_> {
         });
     }
 
+    /// `/plugins`: the gallery and the installed list are pickers; install
+    /// and remove run in the background (a Pi install can take minutes of
+    /// `npm install`) and report through [`Event::PluginsChanged`].
+    async fn plugins_command(&mut self, action: PluginsAction) {
+        use crate::pi_plugins;
+        match action {
+            PluginsAction::Browse(query) => {
+                let hits = match pi_plugins::search(&query, 25).await {
+                    Ok(hits) => hits,
+                    Err(err) => {
+                        self.app
+                            .notice(format!("couldn't search the Pi gallery: {err:#}"));
+                        return;
+                    }
+                };
+                if hits.is_empty() {
+                    self.app.notice(format!("no Pi packages match {query:?}"));
+                    return;
+                }
+                let installed: Vec<String> = pi_plugins::list_wizard()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                let items = hits
+                    .into_iter()
+                    .map(|hit| {
+                        let mut detail = hit.version.clone();
+                        if let Some(description) = &hit.description {
+                            detail.push_str(" \u{b7} ");
+                            detail.push_str(description);
+                        }
+                        PickerItem {
+                            current: installed.contains(&hit.name),
+                            value: hit.source,
+                            detail,
+                        }
+                    })
+                    .collect();
+                self.app.picker = Some(Picker {
+                    kind: PickerKind::PiGallery,
+                    title: " Pi plugins \u{b7} beta: skills and prompts work in Wizard "
+                        .to_string(),
+                    items,
+                    selected: 0,
+                });
+            }
+            PluginsAction::List => {
+                let plugins = match pi_plugins::list_wizard() {
+                    Ok(plugins) => plugins,
+                    Err(err) => {
+                        self.app
+                            .notice(format!("couldn't read the Pi plugins: {err:#}"));
+                        return;
+                    }
+                };
+                if plugins.is_empty() {
+                    self.app
+                        .notice("no Pi plugins installed for Wizard; /plugins <search> finds some");
+                    return;
+                }
+                let items = plugins
+                    .into_iter()
+                    .map(|plugin| {
+                        let (works, _) = plugin.summary();
+                        PickerItem {
+                            detail: format!("{} \u{b7} {}", works, plugin.source),
+                            value: plugin.name,
+                            current: false,
+                        }
+                    })
+                    .collect();
+                self.app.picker = Some(Picker {
+                    kind: PickerKind::PiInstalled,
+                    title: " Pi plugins installed for Wizard \u{b7} enter to remove ".to_string(),
+                    items,
+                    selected: 0,
+                });
+            }
+            PluginsAction::Install { spec, target } => {
+                self.app
+                    .notice(format!("installing {spec} for {}\u{2026}", target.label()));
+                let notify = self.events.sender();
+                tokio::spawn(async move {
+                    let report = pi_plugins::install(&spec, target).await;
+                    let text = pi_plugins::describe_report(&report, "installed");
+                    let _ = notify.send(Event::PluginsChanged(text)).await;
+                });
+            }
+            PluginsAction::Remove { name, target } => {
+                let notify = self.events.sender();
+                tokio::spawn(async move {
+                    let report = pi_plugins::remove(&name, target).await;
+                    let text = pi_plugins::describe_report(&report, "removed");
+                    let _ = notify.send(Event::PluginsChanged(text)).await;
+                });
+            }
+        }
+    }
+
+    /// The main loop's half of [`Event::PluginsChanged`]: the report, then
+    /// skills and custom commands reloaded from disk.
+    pub(super) fn plugins_changed(&mut self, report: String) {
+        self.app.notice(report.trim_end().to_string());
+        *self.skills = load_skill_roots();
+        self.app.custom_commands = crate::commands::load(self.project_root);
+        match self.agent_slot.as_mut() {
+            Some(agent) => agent.set_skills(self.skills.clone()),
+            None => self
+                .app
+                .notice("the agent is busy: /reload after this turn to hand it the new skills"),
+        }
+    }
+
     /// Background half of `/server start` (and the post-switch auto-start):
     /// bring the local server up for `provider`, streaming progress into the
     /// transcript as notices.
@@ -1877,6 +1991,10 @@ impl CommandSurface for CommandContext<'_> {
 
     async fn import_claude(&mut self, selection: ImportSelection) {
         self.run_claude_import(selection).await;
+    }
+
+    async fn plugins(&mut self, action: PluginsAction) {
+        self.plugins_command(action).await;
     }
 }
 

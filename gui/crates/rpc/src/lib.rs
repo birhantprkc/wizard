@@ -202,6 +202,16 @@ pub mod methods {
     pub const REMOVE_PI_PACKAGE: &str = "RemovePiPackage";
     /// Params `{source?}`: one configured package, or all when omitted.
     pub const UPDATE_PI_PACKAGES: &str = "UpdatePiPackages";
+    // Pi packages installed for Wizard (beta; ControlRpc, relay-forwardable —
+    // each device's `wizard plugins` CLI writes its own ~/.wizard).
+    /// Replies `WizardPlugins`.
+    pub const LIST_WIZARD_PLUGINS: &str = "ListWizardPlugins";
+    /// Params `{source}`; replies `WizardPlugin`: what would work in Wizard.
+    pub const INSPECT_WIZARD_PLUGIN: &str = "InspectWizardPlugin";
+    /// Params `{source}`; replies `WizardPluginChange`.
+    pub const INSTALL_WIZARD_PLUGIN: &str = "InstallWizardPlugin";
+    /// Params `{name}`; replies `WizardPlugins`.
+    pub const REMOVE_WIZARD_PLUGIN: &str = "RemoveWizardPlugin";
     // Wizard model providers (ControlRpc, relay-forwardable — each device's
     // Wizard keeps its own). Every call but the login trio replies with the
     // refreshed `WizardProviders`.

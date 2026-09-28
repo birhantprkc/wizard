@@ -410,6 +410,18 @@ pub enum Command {
         cmd: SkillsCmd,
     },
 
+    /// Install Pi packages as Wizard plugins (beta), for Pi, or for both.
+    ///
+    /// A Pi package bundles skills, prompt templates, extensions and themes.
+    /// For Wizard, skills are copied to ~/.wizard/skills and prompts become
+    /// commands in ~/.wizard/commands; extensions and themes are listed as
+    /// not supported yet. `--for pi` runs `pi install`. Self-contained: no
+    /// config load, no onboarding, no LLM. See docs/pi-plugins.md.
+    Plugins {
+        #[command(subcommand)]
+        cmd: PluginsCmd,
+    },
+
     /// Resume a conversation. Bare, this is the subcommand spelling of
     /// `wizard --resume`: reopen the most recent Wizard session recorded
     /// against this project. With `--claude` it takes the conversation from
@@ -724,6 +736,58 @@ pub enum SkillsCmd {
     /// standard library each entry runs under. Read from the receipts beside
     /// the installs themselves, so deleting an install deletes its record.
     List,
+}
+
+/// `wizard plugins` subcommands. `--json` prints one object per call with
+/// a `schema` version, which is what the desktop app reads.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum PluginsCmd {
+    /// Search the Pi package gallery (npm packages tagged `pi-package`).
+    Search {
+        /// Terms to match. Empty lists the most relevant packages.
+        #[arg(num_args = 0..)]
+        query: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show what a package holds and which parts Wizard can use, without
+    /// installing anything.
+    Inspect {
+        /// An npm name, npm:<name>[@version], git:<host>/<owner>/<repo>[@ref],
+        /// a git URL, or a local directory.
+        spec: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a Pi package.
+    Install {
+        /// An npm name, npm:<name>[@version], git:<host>/<owner>/<repo>[@ref],
+        /// a git URL, or a local directory.
+        spec: String,
+        /// Which harness gets it.
+        #[arg(long = "for", value_enum, default_value = "wizard")]
+        target: crate::pi_plugins::Target,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the Pi packages installed for Wizard, and Pi's own list.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a Pi package by name or source.
+    Remove {
+        name: String,
+        /// Which harness loses it.
+        #[arg(long = "for", value_enum, default_value = "wizard")]
+        target: crate::pi_plugins::Target,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `wizard sync` subcommands. Self-contained like update: no config load

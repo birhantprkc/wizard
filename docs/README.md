@@ -35,6 +35,7 @@ to do.
 | [Hooks](hooks.md) | Lifecycle hooks, and the project trust gate |
 | [Loadout](loadout.md) | Shipping a preconfigured tool surface |
 | [Fork and distribute](market.md) | `/publish`, and the `wizard skills` registry client |
+| [Pi plugins](pi-plugins.md) | `wizard plugins` and `/plugins`: Pi packages in Wizard (beta) |
 | [Computer use](computer-use.md) | Desktop control, off until set up: a VM or your own desktop, the GUI's live screen, and what it does not gate |
 
 ## Other surfaces

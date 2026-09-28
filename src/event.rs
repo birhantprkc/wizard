@@ -71,6 +71,10 @@ pub enum Event {
     /// because [`ProviderConfig`](crate::config::ProviderConfig) is large next
     /// to the input variants.
     ProviderActivated(Box<crate::config::ProviderConfig>),
+    /// A background `/plugins install` or `remove` finished. Carries the
+    /// report; the main loop shows it and reloads skills and custom commands
+    /// so what was installed is usable without a `/reload`.
+    PluginsChanged(String),
     /// A background `/btw` side-question finished. The answer (or error) was
     /// already sent as [`Event::Notice`]; this only clears the in-flight flag
     /// so another `/btw` can run.

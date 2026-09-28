@@ -130,6 +130,14 @@ struct PiPackageParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct WizardPluginParams {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
@@ -1178,6 +1186,11 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // Outlast the engine's own pi timeouts (pi_packages.rs) plus relay overhead.
         methods::INSTALL_PI_PACKAGE | methods::UPDATE_PI_PACKAGES => Duration::from_secs(11 * 60),
         methods::REMOVE_PI_PACKAGE => Duration::from_secs(4 * 60),
+        // Outlast the engine's own wizard timeouts (wizard_plugins.rs).
+        methods::INSPECT_WIZARD_PLUGIN | methods::INSTALL_WIZARD_PLUGIN => {
+            Duration::from_secs(6 * 60)
+        }
+        methods::LIST_WIZARD_PLUGINS | methods::REMOVE_WIZARD_PLUGIN => Duration::from_secs(90),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
@@ -1271,6 +1284,11 @@ fn forwardable(method: &str) -> bool {
             | methods::INSTALL_PI_PACKAGE
             | methods::REMOVE_PI_PACKAGE
             | methods::UPDATE_PI_PACKAGES
+            // So do the Pi packages installed for Wizard.
+            | methods::LIST_WIZARD_PLUGINS
+            | methods::INSPECT_WIZARD_PLUGIN
+            | methods::INSTALL_WIZARD_PLUGIN
+            | methods::REMOVE_WIZARD_PLUGIN
             // Wizard providers live in the target device's ~/.wizard.
             | methods::LIST_WIZARD_PROVIDERS
             | methods::ADD_WIZARD_PROVIDER
@@ -1633,6 +1651,35 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&packages)
+            }
+            methods::LIST_WIZARD_PLUGINS => RpcReply::value(&crate::wizard_plugins::list().await),
+            methods::INSPECT_WIZARD_PLUGIN => {
+                let p: WizardPluginParams = parse_params(params)?;
+                let source = p
+                    .source
+                    .ok_or_else(|| RpcError::BadParams("source".into()))?;
+                let plugin = crate::wizard_plugins::inspect(&source)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&plugin)
+            }
+            methods::INSTALL_WIZARD_PLUGIN => {
+                let p: WizardPluginParams = parse_params(params)?;
+                let source = p
+                    .source
+                    .ok_or_else(|| RpcError::BadParams("source".into()))?;
+                let change = crate::wizard_plugins::install(&source)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&change)
+            }
+            methods::REMOVE_WIZARD_PLUGIN => {
+                let p: WizardPluginParams = parse_params(params)?;
+                let name = p.name.ok_or_else(|| RpcError::BadParams("name".into()))?;
+                let list = crate::wizard_plugins::remove(&name)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&list)
             }
             methods::LIST_WIZARD_PROVIDERS => {
                 let providers = tokio::task::spawn_blocking(crate::wizard_auth::providers::list)
@@ -3417,6 +3464,30 @@ mod tests {
         );
         assert!(
             forward_deadline(methods::REMOVE_PI_PACKAGE) > std::time::Duration::from_secs(3 * 60)
+        );
+    }
+
+    #[test]
+    fn wizard_plugin_methods_target_devices_and_outlast_the_cli() {
+        for method in [
+            methods::LIST_WIZARD_PLUGINS,
+            methods::INSPECT_WIZARD_PLUGIN,
+            methods::INSTALL_WIZARD_PLUGIN,
+            methods::REMOVE_WIZARD_PLUGIN,
+        ] {
+            assert!(forwardable(method), "{method}");
+            assert!(!is_stream_method(method), "{method}");
+        }
+        assert!(
+            forward_deadline(methods::INSTALL_WIZARD_PLUGIN)
+                > std::time::Duration::from_secs(5 * 60)
+        );
+        assert!(
+            forward_deadline(methods::INSPECT_WIZARD_PLUGIN)
+                > std::time::Duration::from_secs(5 * 60)
+        );
+        assert!(
+            forward_deadline(methods::LIST_WIZARD_PLUGINS) > std::time::Duration::from_secs(30)
         );
     }
 

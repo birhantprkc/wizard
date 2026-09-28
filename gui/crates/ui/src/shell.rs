@@ -42,7 +42,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
-use crate::settings::pi_extensions::PiExtensionsPage;
+use crate::settings::plugins::PluginsPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::wizard_providers::WizardProvidersPage;
 use crate::settings::{
@@ -441,8 +441,9 @@ pub enum SettingsSection {
     Wizard,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
-    /// Pi packages (extensions, skills, prompts, themes) — "Pi extensions".
-    Extensions,
+    /// Pi packages (extensions, skills, prompts, themes) for Pi, Wizard, or
+    /// both — "Plugins".
+    Plugins,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
@@ -458,7 +459,7 @@ impl SettingsSection {
         SettingsSection::Devices,
         SettingsSection::Wizard,
         SettingsSection::Harnesses,
-        SettingsSection::Extensions,
+        SettingsSection::Plugins,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
@@ -475,7 +476,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Wizard => "Wizard",
             SettingsSection::Harnesses => "Agents",
-            SettingsSection::Extensions => "Pi extensions",
+            SettingsSection::Plugins => "Plugins",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
@@ -1577,7 +1578,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
-    pi_extensions_page: Option<Entity<PiExtensionsPage>>,
+    plugins_page: Option<Entity<PluginsPage>>,
     wizard_providers_page: Option<Entity<WizardProvidersPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
@@ -1916,7 +1917,9 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
-            Some("settings/extensions") => Route::Settings(SettingsSection::Extensions),
+            Some("settings/plugins" | "settings/extensions") => {
+                Route::Settings(SettingsSection::Plugins)
+            }
             Some("settings/wizard") => Route::Settings(SettingsSection::Wizard),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
@@ -2017,7 +2020,7 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
-            pi_extensions_page: None,
+            plugins_page: None,
             wizard_providers_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
@@ -3894,9 +3897,9 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
-        // Same for Pi: installed packages and the CLI probe are re-read.
-        if section == SettingsSection::Extensions {
-            self.pi_extensions_page = None;
+        // Same for Plugins: Pi's and Wizard's installs are re-read.
+        if section == SettingsSection::Plugins {
+            self.plugins_page = None;
         }
         // And Wizard: providers and sign-ins are re-read on every visit.
         if section == SettingsSection::Wizard {
@@ -4000,12 +4003,12 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Extensions => {
-                if self.pi_extensions_page.is_none() {
+            SettingsSection::Plugins => {
+                if self.plugins_page.is_none() {
                     let state = self.state.clone();
-                    self.pi_extensions_page = Some(cx.new(|cx| PiExtensionsPage::new(state, cx)));
+                    self.plugins_page = Some(cx.new(|cx| PluginsPage::new(state, cx)));
                 }
-                match &self.pi_extensions_page {
+                match &self.plugins_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -5861,7 +5864,7 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
-            SettingsSection::Extensions => icons::PI_MARK,
+            SettingsSection::Plugins => icons::PI_MARK,
             SettingsSection::Wizard => icons::WIZARD_MARK,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,

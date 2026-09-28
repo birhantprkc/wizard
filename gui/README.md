@@ -11,7 +11,7 @@ What the fork changes:
 - Only Wizard, Pi and Claude Code are offered, and Wizard is the default.
 - First-run onboarding installs the agents and lets Wizard reuse a Codex (ChatGPT) or Grok CLI sign-in it finds on disk.
 - SSH devices: Settings, Devices, Add SSH device. It uses your SSH keys, installs the engine and Wizard on the remote, can share this machine's Wizard sign-in, and starts the engine there. The machine then shows up in the device menu above the message box.
-- Pi extensions: Settings, Pi extensions browses the Pi package gallery and installs packages in one click.
+- Plugins: Settings, Plugins browses the Pi package gallery and installs a package for Pi, for Wizard, or both. Wizard support is in beta: skills and prompts work, extensions don't yet. Before installing, the page shows which parts of the package work in Wizard. It runs `wizard plugins` on the device, so remote devices work too (see [docs/pi-plugins.md](../docs/pi-plugins.md)).
 - No update check against Zeron's release feed, since that would replace this build with upstream Zeron.
 
 ## Keyboard

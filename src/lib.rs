@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod memory;
 pub mod onboarding;
 pub mod output;
+pub mod pi_plugins;
 pub mod platform;
 pub mod starter;
 pub mod turing;
@@ -355,12 +356,15 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         return fleet.run(cmd.clone()).await;
     }
 
-    // The registry client and the mesh peer store are self-contained in the
+    // The registry client, Pi plugins and the mesh peer store are self-contained in the
     // way `sync` is: no config, no onboarding, no LLM. Neither one reads the
     // working directory (both work entirely under ~/.wizard), which is why
     // they are the only arms in this chain without a chdir.
     if let Some(cli::Command::Skills { cmd }) = &cli.command {
         return registry_client::run_cli(cmd.clone()).await;
+    }
+    if let Some(cli::Command::Plugins { cmd }) = &cli.command {
+        return pi_plugins::run_cli(cmd.clone()).await;
     }
     // `wizard peers` is the second CLI subcommand whose body ships in a
     // plugin, and the first that carries arguments. Core parsed `peers` and

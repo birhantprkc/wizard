@@ -882,7 +882,7 @@ impl Shell {
         let tips = [
             "Start a chat from the composer; pick Wizard, Pi, or Claude Code per chat.",
             "Add remote machines in Settings → Devices → Add SSH device.",
-            "Browse and install Pi extensions in Settings → Pi extensions.",
+            "Install Pi plugins for Pi or Wizard in Settings → Plugins.",
             "Everything here lives in Settings — the gear at the bottom left.",
         ];
         div()
