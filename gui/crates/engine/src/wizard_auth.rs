@@ -13,6 +13,7 @@
 //! Secret values never reach logs, errors, or [`DetectedCredential`].
 
 pub mod providers;
+pub mod usage;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

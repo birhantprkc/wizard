@@ -220,6 +220,9 @@ pub mod methods {
     pub const POLL_WIZARD_LOGIN: &str = "PollWizardLogin";
     /// Params `{loginId}`.
     pub const CANCEL_WIZARD_LOGIN: &str = "CancelWizardLogin";
+    /// No params → `WizardUsage`: each signed-in subscription's plan limits
+    /// (runs `wizard usage --subscriptions --json`).
+    pub const WIZARD_USAGE: &str = "WizardUsage";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";

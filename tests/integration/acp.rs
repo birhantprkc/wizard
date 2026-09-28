@@ -796,7 +796,11 @@ fn acp_help_and_usage_answer_without_a_model_call() {
     let (stop, updates) = acp.prompt("/usage");
     assert_eq!(stop, "end_turn");
     let usage = said(&updates);
-    assert!(usage.contains("xAI"), "{usage}");
+    // A fresh home has no sign-in, and the fake provider is keyed, so the
+    // answer is how to sign in plus the session's own token rollup.
+    assert!(usage.starts_with("no subscription signed in"), "{usage}");
+    assert!(usage.contains("/login xai"), "{usage}");
+    assert!(usage.contains("session usage:"), "{usage}");
 
     assert!(
         acp.model_turns().is_empty(),

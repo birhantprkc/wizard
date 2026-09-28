@@ -25,6 +25,7 @@
 //! reasoning model re-derives its entire chain of thought on every step of a
 //! multi-step turn, and is billed for it every time.
 
+pub mod limits;
 pub mod oauth;
 
 use std::path::PathBuf;
@@ -404,6 +405,11 @@ impl LlmProvider for ChatgptProvider {
             request.model = oauth::ROLLOUT_FALLBACK_MODEL.to_string();
             response = self.post_responses(&request).await?;
         }
+        // Every reply carries the plan's windows, the refusal at the limit
+        // included, which is the one `/usage` is most wanted after.
+        if let Some(reading) = limits::from_headers(response.headers()) {
+            limits::record(reading);
+        }
         if !response.status().is_success() {
             return Err(self.http_failure(response).await);
         }
@@ -462,7 +468,7 @@ fn session_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn user_agent() -> String {
+pub(super) fn user_agent() -> String {
     format!("codex_cli_rs/{} (wizard)", env!("CARGO_PKG_VERSION"))
 }
 
@@ -876,6 +882,18 @@ where
                 if payload == "[DONE]" {
                     state.done = true;
                     state.terminated = true;
+                    continue;
+                }
+                // Codex reads this event on its websocket transport. The
+                // substring test keeps the second parse off every delta.
+                if payload.contains("\"codex.rate_limits\"") {
+                    if let Some(reading) = serde_json::from_str::<Value>(payload)
+                        .ok()
+                        .as_ref()
+                        .and_then(limits::from_event)
+                    {
+                        limits::record(reading);
+                    }
                     continue;
                 }
                 let event: Event = match serde_json::from_str(payload) {
@@ -1699,6 +1717,24 @@ mod tests {
         assert_eq!(first.message.expect("message").text(), "ok");
         assert!(out.next().await.expect("final").expect("ok").done);
         assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_event_is_remembered_and_not_shown() {
+        let parts: Vec<Result<Vec<u8>>> = vec![
+            Ok(br#"data: {"type":"codex.rate_limits","plan_type":"plus","rate_limits":{"primary":{"used_percent":9.0,"window_minutes":300,"reset_at":1790550600},"secondary":null}}"#.to_vec()),
+            Ok(b"\n\n".to_vec()),
+            Ok(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n".to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let mut out = decode_sse(stream::iter(parts).boxed());
+        let first = out.next().await.expect("text").expect("ok");
+        assert_eq!(first.message.expect("message").text(), "hi");
+        assert!(out.next().await.expect("final").expect("ok").done);
+        let latest = limits::latest().expect("recorded");
+        assert_eq!(latest.plan_type.as_deref(), Some("plus"));
+        assert_eq!(latest.primary.expect("primary").used_percent, 9.0);
+        assert_eq!(latest.secondary, None);
     }
 
     #[tokio::test]

@@ -1181,6 +1181,8 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
+        // Outlast the engine's own 25s wait on `wizard usage` plus relay overhead.
+        methods::WIZARD_USAGE => Duration::from_secs(40),
         _ => Duration::from_secs(30),
     }
 }
@@ -1278,6 +1280,7 @@ fn forwardable(method: &str) -> bool {
             | methods::START_WIZARD_LOGIN
             | methods::POLL_WIZARD_LOGIN
             | methods::CANCEL_WIZARD_LOGIN
+            | methods::WIZARD_USAGE
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -1687,6 +1690,12 @@ impl RpcService for EngineRpc {
                 let p: WizardLoginIdParams = parse_params(params)?;
                 crate::wizard_auth::providers::cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({}))
+            }
+            methods::WIZARD_USAGE => {
+                let usage = crate::wizard_auth::usage::load()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&usage)
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
             methods::SET_TITLE_SETTINGS => {
@@ -3382,6 +3391,7 @@ mod tests {
             methods::START_WIZARD_LOGIN,
             methods::POLL_WIZARD_LOGIN,
             methods::CANCEL_WIZARD_LOGIN,
+            methods::WIZARD_USAGE,
         ] {
             assert!(forwardable(method), "{method}");
             assert!(!is_stream_method(method), "{method}");

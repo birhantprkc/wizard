@@ -113,7 +113,7 @@ pub enum SlashCommand {
     Dashboard,
     /// Show session token usage (and cost when rates are configured).
     Cost,
-    /// `/usage`: xAI subscription usage when signed in with OAuth.
+    /// `/usage`: plan limits for each signed-in subscription (xAI, ChatGPT).
     Usage,
     /// `/memory [read|forget <name>]` — inspect and manage the saved project
     /// memories the agent writes with the `memory` tool.
@@ -1212,7 +1212,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "usage",
         args: "",
-        description: "xAI subscription usage when signed in with OAuth",
+        description: "plan limits for each signed-in subscription (xAI, ChatGPT)",
         takes_args: false,
         tui: Execution::Agent,
         gui: Execution::Agent,

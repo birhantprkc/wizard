@@ -31,8 +31,8 @@
 //!   within 120 s, and force-refreshes once after an API 401. Refresh is
 //!   locked across processes so a second Wizard cannot spend a grant the first
 //!   one just rotated and then delete the file.
-//! - [`subscription_usage_notice`] asks the Grok CLI proxy for the account's
-//!   weekly credit percent (`/usage`). An API key is a different credential and
+//! - [`subscription`] asks the Grok CLI proxy for the account's weekly credit
+//!   percent (`/usage`). An API key is a different credential and
 //!   does not unlock it.
 //!
 //! Tokens never go into `config.toml`; keys live in env vars or dedicated
@@ -50,6 +50,7 @@ use tokio::sync::Mutex;
 use super::oauth_callback::{self, Callback, Cancel, PasteChannel, Pkce, generate_pkce, jwt_exp};
 use super::wire::TokenSource;
 use crate::config::Config;
+use crate::subscription_usage::{LimitWindow, ProductShare, Source, Subscription};
 
 /// OpenID Connect discovery document for xAI accounts.
 const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
@@ -910,55 +911,54 @@ const USAGE_PROXY_HEADER: &str = "xai-grok-cli";
 #[cfg(not(test))]
 const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `/usage`: the xAI subscription, when this machine is signed in with OAuth.
+/// `/usage`'s xAI block: `None` when this machine is not signed in with
+/// OAuth.
 ///
 /// The number is the account's weekly (or whatever period the proxy reports)
-/// credit percent, not the local token ledger `/cost` reads. Without an OAuth
-/// session there is nothing to ask, and the notice says so rather than
-/// inventing a percent from `usage.jsonl`.
+/// credit percent, not the local token ledger `/cost` reads.
 ///
 /// Tests dispatch every slash command. A live call would spend the session of
 /// whoever is signed in on the machine running the suite, and fail offline.
-/// The formatter is tested with a captured body; this stub only keeps that
-/// dispatch from going silent.
-pub async fn subscription_usage_notice() -> String {
-    // `cfg!` rather than two function bodies: the notice is one function, and
+/// The parser is tested with a captured body; this stub only keeps that
+/// dispatch off the network.
+pub async fn subscription() -> Option<Subscription> {
+    // `cfg!` rather than two function bodies: the block is one function, and
     // the live helpers below are `cfg(not(test))` so a test build does not
     // warn that the unreachable call left them unused.
     #[cfg(test)]
     {
-        "xAI subscription usage is read from the OAuth session (not fetched in tests)".into()
+        None
     }
     #[cfg(not(test))]
     {
-        subscription_usage_notice_live().await
-    }
-}
-
-#[cfg(not(test))]
-async fn subscription_usage_notice_live() -> String {
-    if !signed_in() {
-        return not_signed_in();
-    }
-    match try_subscription_usage().await {
-        Ok(text) => text,
-        Err(err) if err.to_string().contains("HTTP 403") => {
-            "xAI refused the usage request (HTTP 403). The session is signed in, but this plan may not report CLI usage".into()
+        if !signed_in() {
+            return None;
         }
-        Err(err) => format!("could not read xAI subscription usage: {err}"),
+        Some(match try_subscription_usage().await {
+            Ok(block) => block,
+            Err(err) if err.to_string().contains("HTTP 403") => Subscription {
+                note: Some(
+                    "xAI refused the usage request (HTTP 403). The session is signed in, \
+                     but this plan may not report CLI usage"
+                        .into(),
+                ),
+                ..Subscription::new("xai", "xAI")
+            },
+            Err(err) => Subscription {
+                note: Some(format!("could not read usage: {err}")),
+                ..Subscription::new("xai", "xAI")
+            },
+        })
     }
 }
 
 #[cfg(not(test))]
-fn not_signed_in() -> String {
-    "not signed in to xAI. /usage reads the subscription from the OAuth session; run /login xai"
-        .into()
-}
-
-#[cfg(not(test))]
-async fn try_subscription_usage() -> Result<String> {
+async fn try_subscription_usage() -> Result<Subscription> {
     let source = XaiTokenSource::new()?;
-    let token = source.bearer().await?.ok_or_else(not_signed_in_err)?;
+    let token = source
+        .bearer()
+        .await?
+        .ok_or_else(|| anyhow!("not signed in to xAI; run /login xai"))?;
     let client = crate::llm::oauth_http_builder(USAGE_TIMEOUT)
         .build()
         .context("building the usage client")?;
@@ -972,14 +972,7 @@ async fn try_subscription_usage() -> Result<String> {
     );
     let billing = billing?;
     let tier = settings.ok().as_ref().and_then(settings_tier);
-    Ok(format_subscription_usage(&billing, tier.as_deref()))
-}
-
-#[cfg(not(test))]
-fn not_signed_in_err() -> anyhow::Error {
-    anyhow!(
-        "not signed in to xAI. /usage reads the subscription from the OAuth session; run /login xai"
-    )
+    Ok(subscription_from_billing(&billing, tier.as_deref()))
 }
 
 fn cli_proxy_url(path: &str) -> Result<reqwest::Url> {
@@ -1033,51 +1026,53 @@ fn settings_tier(body: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Render a billing payload. A missing or unusable percent is a miss, not a
+/// Read a billing payload. A missing or unusable percent is a miss, not a
 /// zero: the local ledger is a different number and must not fill the gap.
-pub(crate) fn format_subscription_usage(billing: &serde_json::Value, tier: Option<&str>) -> String {
-    let Some(config) = credits_config(billing) else {
-        return missing_percent(tier);
+pub(crate) fn subscription_from_billing(
+    billing: &serde_json::Value,
+    tier: Option<&str>,
+) -> Subscription {
+    let mut block = Subscription {
+        plan: tier
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(str::to_string),
+        ..Subscription::new("xai", "xAI")
     };
-    let Some(percent) = json_percent(config.get("creditUsagePercent")) else {
-        return missing_percent(tier);
+    let percent = credits_config(billing)
+        .and_then(|config| json_percent(config.get("creditUsagePercent")).map(|p| (config, p)));
+    let Some((config, percent)) = percent else {
+        block.note = Some("the account did not report a usage percent".into());
+        return block;
     };
     let period = config.get("currentPeriod");
-    let period_word = period
+    let date = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|value| value.as_str())
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|when| when.with_timezone(&chrono::Utc))
+    };
+    let start = date(period.and_then(|period| period.get("start")));
+    let end = date(period.and_then(|period| period.get("end")))
+        .or_else(|| date(config.get("billingPeriodEnd")));
+    let window_minutes = match (start, end) {
+        (Some(start), Some(end)) if end > start => Some((end - start).num_minutes()),
+        _ => None,
+    };
+    let label = period
         .and_then(|value| value.get("type"))
         .and_then(|value| value.as_str())
-        .and_then(period_word);
-    let reset = period
-        .and_then(|value| value.get("end"))
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            config
-                .get("billingPeriodEnd")
-                .and_then(|value| value.as_str())
-        })
-        .map(format_reset);
-    let mut bits = Vec::new();
-    if let Some(tier) = tier.map(str::trim).filter(|tier| !tier.is_empty()) {
-        bits.push(tier.to_string());
-    }
-    if let Some(reset) = reset {
-        bits.push(format!("resets {reset}"));
-    }
-    let tail = if bits.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", bits.join(", "))
-    };
-    let head = match period_word {
-        Some(word) => format!("xAI {word} usage: {}{tail}", fmt_percent(percent)),
-        None => format!("xAI usage: {}{tail}", fmt_percent(percent)),
-    };
-    let products = product_line(config.get("productUsage"));
-    if products.is_empty() {
-        head
-    } else {
-        format!("{head}\n{products}")
-    }
+        .and_then(period_word)
+        .unwrap_or("this period");
+    block.windows.push(LimitWindow {
+        label: label.to_string(),
+        used_percent: percent,
+        window_minutes,
+        resets_at: end,
+    });
+    block.products = products(config.get("productUsage"));
+    block.source = Some(Source::Account);
+    block
 }
 
 fn credits_config(body: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -1085,15 +1080,6 @@ fn credits_config(body: &serde_json::Value) -> Option<&serde_json::Value> {
         Some(config) if config.is_object() => Some(config),
         _ if body.get("creditUsagePercent").is_some() => Some(body),
         _ => None,
-    }
-}
-
-fn missing_percent(tier: Option<&str>) -> String {
-    match tier.map(str::trim).filter(|tier| !tier.is_empty()) {
-        Some(tier) => {
-            format!("signed in to xAI ({tier}), but the account did not report a usage percent")
-        }
-        None => "signed in to xAI, but the account did not report a usage percent".into(),
     }
 }
 
@@ -1111,37 +1097,21 @@ fn json_percent(value: Option<&serde_json::Value>) -> Option<f64> {
     (number.is_finite() && number >= 0.0).then_some(number)
 }
 
-fn fmt_percent(number: f64) -> String {
-    if number.fract().abs() < 0.05 {
-        format!("{}%", number.round() as i64)
-    } else {
-        format!("{number:.1}%")
-    }
-}
-
-fn format_reset(raw: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|when| {
-            when.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        })
-        .unwrap_or_else(|_| raw.to_string())
-}
-
-fn product_line(value: Option<&serde_json::Value>) -> String {
+fn products(value: Option<&serde_json::Value>) -> Vec<ProductShare> {
     let Some(items) = value.and_then(|value| value.as_array()) else {
-        return String::new();
+        return Vec::new();
     };
     items
         .iter()
         .filter_map(|item| {
             let name = item.get("product").and_then(|value| value.as_str())?;
-            let percent = json_percent(item.get("usagePercent"))?;
-            Some(format!("{} {}", product_label(name), fmt_percent(percent)))
+            let used_percent = json_percent(item.get("usagePercent"))?;
+            Some(ProductShare {
+                label: product_label(name),
+                used_percent,
+            })
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }
 
 fn product_label(raw: &str) -> String {
@@ -1629,10 +1599,13 @@ mod tests {
 
     #[test]
     fn weekly_usage_names_the_percent_the_reset_and_the_products() {
-        let text = format_subscription_usage(&captured_credits(), Some("SuperGrok Heavy"));
+        let block = subscription_from_billing(&captured_credits(), Some("SuperGrok Heavy"));
+        assert_eq!(block.windows[0].window_minutes, Some(7 * 24 * 60));
+        let text = crate::subscription_usage::render(&[block], Some("xai"));
         assert_eq!(
             text,
-            "xAI weekly usage: 74% (SuperGrok Heavy, resets 2026-09-24 21:06 UTC)\n\
+            "xAI (SuperGrok Heavy, active)\n  \
+             weekly: 74% used, resets 2026-09-24 21:06 UTC\n  \
              build 63%, chat 10%, voice 1%"
         );
         assert!(!text.contains("example.com"));
@@ -1642,11 +1615,11 @@ mod tests {
     #[test]
     fn a_missing_percent_is_not_filled_in() {
         let body = serde_json::json!({"config": {"productUsage": [{"product": "GrokChat", "usagePercent": 10.0}]}});
-        let text = format_subscription_usage(&body, None);
-        assert_eq!(
-            text,
-            "signed in to xAI, but the account did not report a usage percent"
-        );
+        let block = subscription_from_billing(&body, None);
+        assert!(block.windows.is_empty());
+        assert!(block.products.is_empty());
+        let text = crate::subscription_usage::render(&[block], None);
+        assert_eq!(text, "xAI\n  the account did not report a usage percent");
         assert!(!text.contains('%'));
     }
 
@@ -1656,15 +1629,18 @@ mod tests {
             "creditUsagePercent": 12.4,
             "currentPeriod": {"type": "USAGE_PERIOD_TYPE_SOMETHING_ELSE"}
         });
-        let text = format_subscription_usage(&body, None);
-        assert_eq!(text, "xAI usage: 12.4%");
+        let block = subscription_from_billing(&body, None);
+        let text = crate::subscription_usage::render(&[block], None);
+        assert_eq!(text, "xAI\n  this period: 12.4% used");
         assert!(!text.contains("weekly"));
     }
 
     #[test]
     fn a_nan_percent_is_a_miss() {
         let body = serde_json::json!({"config": {"creditUsagePercent": -1.0}});
-        assert!(format_subscription_usage(&body, Some("Heavy")).contains("did not report"));
+        let block = subscription_from_billing(&body, Some("Heavy"));
+        assert_eq!(block.plan.as_deref(), Some("Heavy"));
+        assert!(block.note.expect("note").contains("did not report"));
     }
 
     #[test]

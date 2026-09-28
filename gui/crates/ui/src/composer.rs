@@ -5487,6 +5487,28 @@ mod power_slash_tests {
         assert!(rows.iter().all(|r| r.input_hint.is_none()));
     }
 
+    /// Wizard advertises `/usage` over ACP; outside power user mode it must
+    /// still be in the menu and found by typing, not only by the fuzzy ranks.
+    #[test]
+    fn normal_mode_keeps_wizards_usage_command() {
+        let advertised = invocation_candidates(
+            vec![
+                agent("cost", "show session token usage and cost", None),
+                agent(
+                    "usage",
+                    "plan limits for each signed-in subscription (xAI, ChatGPT)",
+                    None,
+                ),
+            ],
+            vec![],
+        );
+        let rows = with_workspace_commands_for(advertised, true, false);
+        let names = names(&rows);
+        assert_eq!(&names[..2], ["cost", "usage"]);
+        let found = crate::popover::filter_indices("usa", &names);
+        assert_eq!(found.first().map(|&ix| names[ix]), Some("usage"));
+    }
+
     #[test]
     fn power_mode_adds_app_commands_with_hints() {
         let advertised = invocation_candidates(

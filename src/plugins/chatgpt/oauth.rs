@@ -123,6 +123,16 @@ pub fn clear_tokens(path: &Path) -> Result<()> {
 /// Extract `chatgpt_account_id` from the id_token's `https://api.openai.com/auth`
 /// claim. `None` when the token is not a parseable JWT or lacks the claim.
 pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
+    auth_claim(id_token, "chatgpt_account_id")
+}
+
+/// `chatgpt_plan_type` from the same claim (`plus`, `pro`, …): the plan as of
+/// sign-in. `/usage` prefers the live one the usage endpoint reports.
+pub fn plan_type_from_id_token(id_token: &str) -> Option<String> {
+    auth_claim(id_token, "chatgpt_plan_type")
+}
+
+fn auth_claim(id_token: &str, field: &str) -> Option<String> {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload = id_token.split('.').nth(1)?;
@@ -130,7 +140,7 @@ pub fn account_id_from_id_token(id_token: &str) -> Option<String> {
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     claims
         .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
+        .get(field)?
         .as_str()
         .map(str::to_string)
 }
@@ -683,6 +693,7 @@ mod tests {
             account_id_from_id_token(&token).as_deref(),
             Some("acct-123")
         );
+        assert_eq!(plan_type_from_id_token(&token).as_deref(), Some("pro"));
     }
 
     #[test]

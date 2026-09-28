@@ -40,6 +40,14 @@ The `run_command` tool lets the model invoke these commands. Two gates apply, in
 A command that fails either gate is refused **in the tool result**, which is the only thing
 the model reads before the turn ends. It is never silently dropped.
 
+### Reports that leave the machine
+
+Most reports read the session. `/usage` asks the accounts instead: one block per signed-in
+subscription (xAI, ChatGPT), whichever provider is active, plus the session's token rollup
+when the active provider is an API key. It runs the same on the TUI and over ACP, so Wizard
+GUI, Zed and the Android app get the same plain text. `wizard usage --subscriptions --json`
+is the machine-readable form ([usage.md](usage.md#subscription-limits)).
+
 ## Custom slash commands
 
 Two ways to put reusable text in front of the model: `/commands` you define as markdown files, and `@path` tokens that inline file contents. Both work identically in the TUI and in headless `-p` runs: one shared preprocessing pipeline (`commands::preprocess`) handles them.

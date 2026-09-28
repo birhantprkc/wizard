@@ -6,6 +6,19 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **`/usage` covers ChatGPT sign-ins.** It shows the 5-hour and weekly windows
+  with their resets and the plan, read from the same `wham/usage` endpoint the
+  Codex CLI's `/status` uses, and falls back to the `x-codex-*` limit headers
+  of the last reply. Every signed-in subscription now gets its own block
+  whichever provider is active; on an API-key provider the session's token
+  rollup follows.
+- **`wizard usage --subscriptions [--json]`** prints the same limits outside a
+  session, as text or as JSON.
+- **Wizard GUI shows subscription usage.** Settings → Wizard has a Usage
+  section with a bar per window, reset times, and a Refresh button.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed
