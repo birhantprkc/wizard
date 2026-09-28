@@ -6,6 +6,19 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Fixed
+
+- **A chat could kill the Wizard process running it.** An agent that cleaned
+  up "stale" `wizard acp` processes (after a flaky USB bridge, say) ran
+  `kill <pid>` or `pkill -f 'wizard acp'` and took out its own host. The host
+  shuts down on SIGTERM with exit code 0, so Wizard GUI reported "Wizard exited
+  unexpectedly (exit code 0)", and every follow-up prompt started a new host
+  that the same cleanup killed again. `execute` now refuses a command that
+  signals Wizard or one of its parents, by pid, process group, `$PPID`, or a
+  `pkill`, `killall`, `pgrep | xargs kill` or `ps | grep | xargs kill` pattern
+  that matches them. The refusal names the process and says to kill by the
+  explicit pid it started instead.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed

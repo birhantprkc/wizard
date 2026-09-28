@@ -1019,6 +1019,20 @@ fn has_pipeline(command: &str) -> bool {
     false
 }
 
+/// [`host_guard::refusal`](super::host_guard::refusal), on the platforms that
+/// have signals to guard against.
+fn host_signal_refusal(command: &str, background: bool) -> Option<String> {
+    #[cfg(unix)]
+    {
+        super::host_guard::refusal(command, background)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, background);
+        None
+    }
+}
+
 /// Arguments for [`ExecuteTool`].
 #[derive(Debug, Deserialize)]
 pub struct ExecuteArgs {
@@ -1059,6 +1073,7 @@ Tips:
 - The foreground wait is short (30s by default). Past it the command keeps running as a background task and you get its id — carry on with something else and read the notification, or `task_output(id, wait_secs=N)` when you need the result before your next move. Pass `timeout_secs` up front when you would rather wait inline.
 - Durable services (HTTP, QEMU, anything a later verifier must reach): `nohup <cmd> > log 2>&1 &`, then `curl`/`ss`/`pgrep`. Do **not** use `run_in_background=true` for those — that mode does not outlive the agent.
 - Use `run_in_background=true` only for agent-scoped jobs you will poll or cancel (long builds).
+- Never signal the process running you or its parents: a `kill` of their pid, or a `pkill -f`/`killall` pattern that matches `wizard`, is refused and not run. Stop what you started by its own pid (`$!`, a pidfile) or `task_kill`.
 - After system-installing a package with native extensions, verify from `cd /tmp` so a local checkout cannot mask a bad install; reinstall after later source edits.
 - Before finishing: `ls` required deliverable paths; for JSON/JSONL, parse and assert task-listed tokens/IDs."#
     }
@@ -1082,6 +1097,12 @@ Tips:
                 tool: self.name().to_string(),
                 message: "command must not be empty".to_string(),
             });
+        }
+
+        // Before anything is spawned: the command that signals the host never
+        // returns, so nothing afterwards could tell the model what happened.
+        if let Some(reason) = host_signal_refusal(&args.command, args.run_in_background) {
+            return Ok(ToolOutput::error(reason));
         }
 
         let timeout = match args.timeout_secs {
@@ -1551,6 +1572,55 @@ mod tests {
             .await
             .expect_err("blank command must be rejected");
         assert!(matches!(err, ToolError::InvalidArgs { .. }));
+    }
+
+    /// A command that signals the process running the agent is refused before
+    /// anything runs, in the foreground and as a background task.
+    ///
+    /// `kill -0` sends nothing, so a regression fails this test instead of
+    /// ending the run that reports it. The `touch` proves the refused line
+    /// never started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_refuses_a_command_that_signals_the_host() {
+        let tmp = TempDir::new();
+        let ctx = tmp.ctx();
+        let host = std::process::id();
+        for background in [false, true] {
+            let out = ExecuteTool
+                .execute(
+                    json!({
+                        "command": format!("touch ran; kill -0 {host}"),
+                        "run_in_background": background,
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("a refusal is a result the model reads, not a tool failure");
+            assert!(out.is_error, "background={background}: {}", out.content);
+            assert!(
+                out.content.starts_with("Refused, and not run"),
+                "{}",
+                out.content
+            );
+            assert!(
+                out.content.contains(&format!("pid {host}")),
+                "the refusal names the process: {}",
+                out.content
+            );
+            assert!(
+                !tmp.0.join("ran").exists(),
+                "background={background}: the refused line ran"
+            );
+        }
+
+        // Signalling anything else still works.
+        let out = ExecuteTool
+            .execute(json!({ "command": "kill -0 $$ && echo alive" }), &ctx)
+            .await
+            .expect("execute");
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("alive"), "{}", out.content);
     }
 
     #[tokio::test]
