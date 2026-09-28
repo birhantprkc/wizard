@@ -6,6 +6,26 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Wizard GUI updates itself.** It checks the GitHub releases on launch and
+  every six hours, and a sidebar banner offers Update, a progress bar, then
+  Restart to update once no agent run or terminal would be cut off. Settings
+  → About shows the version, the last check and an "Install updates
+  automatically" toggle (off by default). Releases have to verify against the
+  same signing key `wizard update` uses. macOS swaps the app bundle, Linux
+  installs the new version beside the old one, and Windows replaces the
+  portable exe; each keeps the previous version. Copies it cannot replace
+  link to the download instead. `wizard-gui update` does the same from a
+  terminal.
+
+### Changed
+
+- **The Linux GUI package installs into `~/.local/share/wizard-gui/<version>`**
+  with `~/.local/bin/wizard-gui` linked through a `current` symlink, so
+  updates can swap versions. An install from an older package is moved over
+  on its first update.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed

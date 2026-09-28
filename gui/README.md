@@ -38,11 +38,27 @@ Screenshots are in [docs/screenshots/power-user](docs/screenshots/power-user).
 
 Every Wizard release from 3.5.0 on carries the app:
 
-- Linux: `wizard-gui-<version>-linux-<arch>.tar.gz`. Unpack it and run `./install.sh`, which puts `wizard-gui` in `~/.local/bin` and adds a Wizard GUI desktop entry.
+- Linux: `wizard-gui-<version>-linux-<arch>.tar.gz`. Unpack it and run `./install.sh`, which installs it under `~/.local/share/wizard-gui`, links `wizard-gui` into `~/.local/bin` and adds a Wizard GUI desktop entry.
 - macOS (Apple silicon): `wizard-gui-<version>-macos-arm64.dmg`. It is not signed or notarized unless the release had signing credentials, so the first launch needs right click, Open. Drag `Wizard GUI.app` into Applications; `wizard gui` finds it there.
 - Windows: `wizard-gui-<version>-windows-x86_64.zip`. Unpack it and run `zeron.exe`.
 
-Updates come from the same releases page; the app does not update itself.
+## Updating
+
+The app checks Wizard's GitHub releases when it starts and every six hours after. When there is a newer version, a banner at the bottom of the sidebar offers **Update** and **What's new**. Update downloads it with a progress bar; once it is ready, **Restart to update** swaps it in and reopens the app. That button only shows while no agent is running and no terminal is open. A downloaded update also installs whenever you quit.
+
+Settings → About shows the version, where the app is installed, **Check for updates** with the time of the last check, and **Install updates automatically** (off by default). With it on, updates download in the background and install the next time the app quits or restarts. The command palette has Check for updates, Update Wizard GUI and Restart to update, and `wizard-gui update` does the same from a terminal (`--check` only reports, exiting 1 when an update is out).
+
+Nothing installs unless it verifies: `gui-checksums.txt` has to carry a minisign signature from the key in [`wizard-release.pub`](../wizard-release.pub), the same key `wizard update` trusts, and the download has to match its checksum there. The previous version is kept: macOS leaves it next to the app as `.Wizard GUI.app.previous`, Linux keeps its directory under `~/.local/share/wizard-gui`.
+
+What can update itself:
+
+- macOS: `Wizard GUI.app` in a folder your account can write, such as `/Applications` for an admin or `~/Applications`.
+- Linux: an install from `install.sh`. One from an older `install.sh` (a plain file in `~/.local/bin`) moves to the new layout on its first update.
+- Windows: the unpacked portable zip.
+
+Anything else (a read-only `/Applications`, the app still inside the disk image, an AppImage, a Nix or system package, a source build) shows **Download** with the reason, and gets updated the way it was installed.
+
+`WIZARD_GUI_RELEASES_URL` points the updater at a mirror laid out like GitHub's releases (`latest/download/…`, `download/v<version>/…`). It has to be HTTPS, and the signature check does not change.
 
 ## Build from source
 
