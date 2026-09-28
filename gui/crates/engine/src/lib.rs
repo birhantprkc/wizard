@@ -42,6 +42,7 @@ pub mod titles;
 mod transcript_history;
 pub mod uploads;
 pub mod wizard_auth;
+pub mod wizard_plugins;
 pub mod workspace_files;
 pub mod workspace_host;
 
