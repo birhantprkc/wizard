@@ -29,12 +29,14 @@ fn parse_max_hours(raw: &str) -> Result<f64, String> {
 #[derive(Debug, Clone, Parser)]
 #[command(name = "wizard", version = crate::update::display_version(), about, long_about = None)]
 pub struct Cli {
-    /// Personality mode: genie (interactive TUI) or sovereign (autonomous).
+    /// Personality mode: genie (interactive TUI), sovereign (autonomous), or
+    /// chat (conversation with web search, no project tools).
     #[arg(long, value_enum)]
     pub mode: Option<Mode>,
 
     /// Initial task. Pre-fills the first message in genie mode; the task to
-    /// complete in sovereign / evolve mode. A pasted task can start with
+    /// complete in sovereign / evolve mode; the one question to answer in
+    /// chat mode. A pasted task can start with
     /// `-` (a list item, a diff line), so the value is taken as written:
     /// put it last, or write `--prompt=TEXT`, since a flag right after
     /// `--prompt` is read as the task.
@@ -1161,6 +1163,9 @@ mod tests {
         let cli = parse(&["-p", "-x", "--mode", "sovereign"]).expect("later flags still parse");
         assert_eq!(cli.prompt.as_deref(), Some("-x"));
         assert_eq!(cli.mode, Some(Mode::Sovereign));
+
+        let cli = parse(&["--mode", "chat", "-p", "what's new?"]).expect("chat mode parses");
+        assert_eq!(cli.mode, Some(Mode::Chat));
 
         let err = parse(&["-p"]).expect_err("a bare -p still needs a value");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);

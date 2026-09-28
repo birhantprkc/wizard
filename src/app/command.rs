@@ -417,6 +417,11 @@ impl CommandContext<'_> {
                 detail: "autonomous — works continuously; self-directing".to_string(),
                 current: self.app.mode() == Mode::Sovereign,
             },
+            PickerItem {
+                value: "chat".to_string(),
+                detail: "conversation — web search only, no project tools".to_string(),
+                current: self.app.mode() == Mode::Chat,
+            },
         ];
         let selected = items.iter().position(|item| item.current).unwrap_or(0);
         self.app.picker = Some(Picker {
@@ -783,7 +788,7 @@ impl CommandContext<'_> {
             Mode::Sovereign => {
                 self.app.config.max_steps = self.app.config.max_steps.for_mode(Mode::Sovereign);
             }
-            Mode::Genie => {
+            Mode::Genie | Mode::Chat => {
                 self.app.config.max_steps = self.genie_max_steps;
             }
         }

@@ -443,10 +443,11 @@ fn collect_gateway(terminal: &mut Tui) -> Result<Option<GatewayAnswers>> {
 /// is written to `[web] search_backend` and used as the credentials key name.
 const WEB_SEARCH_OPTIONS: &[(&str, &str, &str)] = &[
     (
-        "DuckDuckGo",
-        "free · no API key (recommended)",
-        "duckduckgo",
+        "Automatic",
+        "Grok when signed in with xAI, else DuckDuckGo (recommended)",
+        "auto",
     ),
+    ("DuckDuckGo", "free · no API key", "duckduckgo"),
     ("Brave Search", "API key · brave.com/search/api", "brave"),
     ("Tavily", "API key · tavily.com", "tavily"),
     ("Exa", "API key · exa.ai", "exa"),
@@ -473,9 +474,9 @@ fn collect_web_search(terminal: &mut Tui) -> Result<Option<(String, Option<Strin
     };
     let (label, _, id) = WEB_SEARCH_OPTIONS[index];
 
-    // DuckDuckGo: no key.
-    if id == "duckduckgo" {
-        return Ok(Some(("duckduckgo".to_string(), None)));
+    // Automatic and DuckDuckGo: no key.
+    if id == "auto" || id == "duckduckgo" {
+        return Ok(Some((id.to_string(), None)));
     }
 
     // xAI: reuse an existing sign-in; otherwise let them paste a key or defer.

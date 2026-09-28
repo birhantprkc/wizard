@@ -3185,11 +3185,7 @@ impl App {
                             AppAction::Command(SlashCommand::Model(Some(item.value.clone())))
                         }
                         PickerKind::Mode => {
-                            let mode = if item.value == "sovereign" {
-                                Mode::Sovereign
-                            } else {
-                                Mode::Genie
-                            };
+                            let mode = Mode::parse(&item.value).unwrap_or(Mode::Genie);
                             AppAction::Command(SlashCommand::Mode(Some(mode)))
                         }
                         PickerKind::Effort => {

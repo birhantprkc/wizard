@@ -104,7 +104,7 @@ impl Answers {
             gateway_allowed_chat_ids: Vec::new(),
             mode: Mode::Genie,
             skin: None,
-            web_search_backend: "duckduckgo".to_string(),
+            web_search_backend: crate::config::AUTO_SEARCH_BACKEND.to_string(),
             web_search_api_key: None,
             gateway_bot_token: None,
             claude_import: None,
@@ -1975,7 +1975,7 @@ mod tests {
         assert_eq!(config.active().kind, ProviderKind::XAI_OAUTH);
         assert_eq!(config.mode, Mode::Genie);
         assert_eq!(config.gateway.kind, GatewayKind::None);
-        assert_eq!(config.web.search_backend, "duckduckgo");
+        assert_eq!(config.web.search_backend, "auto");
         // Never asked, so never written: `WIZARD_SKIN` keeps working.
         assert_eq!(config.ui.skin, None);
     }

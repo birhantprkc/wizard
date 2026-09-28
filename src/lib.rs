@@ -539,6 +539,15 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
             app::run_tui(config, cli, first_run).await
         }
         Mode::Sovereign => headless::run(config, cli).await,
+        // `wizard --mode chat -p "question"` answers once and exits, which is
+        // what a script or a quick question from a shell wants. Without `-p`
+        // it is the TUI, in chat mode.
+        Mode::Chat if cli.prompt.is_some() => headless::run(config, cli).await,
+        Mode::Chat => {
+            update::print_startup_notice(&config.update);
+            update::maybe_check_on_startup(&config.update).await;
+            app::run_tui(config, cli, first_run).await
+        }
     }
 }
 
@@ -558,11 +567,12 @@ fn doctor_request(cli: &cli::Cli) -> Option<bool> {
     }
 }
 
-/// A prompt run with no human at it: sovereign or continuous with `-p`.
+/// A prompt run with no human at it: sovereign, chat or continuous with `-p`.
 /// The one case a missing config is not an error, because such a run is
 /// configured by its environment.
 fn headless_job(cli: &cli::Cli) -> bool {
-    cli.prompt.is_some() && (cli.mode == Some(Mode::Sovereign) || cli.continuous)
+    cli.prompt.is_some()
+        && (matches!(cli.mode, Some(Mode::Sovereign | Mode::Chat)) || cli.continuous)
 }
 
 /// `wizard setup` is `wizard --onboard` spelled as a subcommand: the full
@@ -679,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_sovereign_or_continuous_prompt_is_a_headless_job() {
+    fn only_a_sovereign_chat_or_continuous_prompt_is_a_headless_job() {
         assert!(headless_job(&parse(&[
             "wizard",
             "--mode",
@@ -687,9 +697,13 @@ mod tests {
             "-p",
             "t"
         ])));
+        assert!(headless_job(&parse(&[
+            "wizard", "--mode", "chat", "-p", "t"
+        ])));
         assert!(headless_job(&parse(&["wizard", "--continuous", "-p", "t"])));
         assert!(!headless_job(&parse(&["wizard", "-p", "t"])));
         assert!(!headless_job(&parse(&["wizard", "--mode", "sovereign"])));
+        assert!(!headless_job(&parse(&["wizard", "--mode", "chat"])));
     }
 
     #[test]

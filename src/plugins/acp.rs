@@ -477,6 +477,13 @@ async fn set_config_option(
             selection.mode = mode;
             agent.set_mode(mode);
         }
+        models::SEARCH_OPTION => {
+            let backend = models::parse_search_backend(&value).ok_or_else(|| {
+                acp::Error::invalid_params().data(format!("unknown search backend {value}"))
+            })?;
+            agent.set_search_backend(&backend);
+            selection.search_backend = backend;
+        }
         _ => return Err(acp::Error::invalid_params()),
     }
     drop(agent);

@@ -19,6 +19,23 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 - **Wizard GUI shows subscription usage.** Settings → Wizard has a Usage
   section with a bar per window, reset times, and a Refresh button.
 
+- **Chat mode.** `wizard --mode chat`, `/mode chat` (or `/chat`), and `chat` in
+  the ACP `wizard_mode` option. It is plain conversation: a short prompt that
+  knows today's date and cites its sources, and only `web_search`, `web_fetch`
+  and, when the active provider is xAI, `x_search`. No file, shell, edit or
+  subagent tools. `--mode chat -p "..."` prints one answer and exits.
+
+- **`search_backend` ACP config option**, so a client can switch a session's
+  web search between `auto`, `grok` and `duckduckgo`.
+
+### Changed
+
+- **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a
+  stored key, or `XAI_API_KEY`) `web_search` uses Grok's server-side search and
+  its cited results; without them it is DuckDuckGo as before. `grok` is now the
+  documented name for the xAI backend, and `xai` still works. A config that
+  names a backend keeps it.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed

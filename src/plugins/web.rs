@@ -1369,19 +1369,19 @@ impl WebSearchTool {
     /// Build the configured backend, reading any API key from the
     /// environment at call time (keys are never stored).
     fn backend(ctx: &ToolContext) -> Result<Box<dyn SearchBackend>, String> {
-        let name = ctx.web.search_backend.trim().to_ascii_lowercase();
+        let name = ctx.web.effective_search_backend();
         match name.as_str() {
-            "" | "duckduckgo" => Ok(Box::new(DuckDuckGoHtml::new())),
+            "duckduckgo" => Ok(Box::new(DuckDuckGoHtml::new())),
             "brave" => Ok(Box::new(BraveSearch::new(Self::api_key(ctx, "brave")?))),
             "tavily" => Ok(Box::new(TavilySearch::new(Self::api_key(ctx, "tavily")?))),
             "exa" => Ok(Box::new(ExaSearch::new(Self::api_key(ctx, "exa")?))),
             "serper" => Ok(Box::new(SerperSearch::new(Self::api_key(ctx, "serper")?))),
-            "xai" | "grok" => Ok(Box::new(
+            "grok" => Ok(Box::new(
                 resolve_xai_auth(ctx)?.with_server_tool(XaiServerTool::WebSearch),
             )),
             other => Err(format!(
                 "unknown [web] search_backend '{other}' \
-                 (expected duckduckgo, brave, tavily, exa, serper, or xai) — \
+                 (expected auto, grok, duckduckgo, brave, tavily, exa, or serper) — \
                  run /settings to configure web search"
             )),
         }
@@ -2706,6 +2706,94 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "web_search");
         let prompt = body["input"][0]["content"].as_str().expect("prompt");
         assert!(prompt.contains("web_search"), "{prompt}");
+    }
+
+    /// The whole Grok web search request, recorded off the wire: a POST to
+    /// the Responses endpoint with the bearer token, the `web_search` server
+    /// tool, and inline citations turned off so the answer text stays clean.
+    /// The reply is a recorded shape, prose with `url_citation` annotations,
+    /// which is what Grok sends when it ignores the JSON envelope.
+    #[tokio::test]
+    async fn grok_web_search_posts_a_responses_request_and_keeps_the_citations() {
+        let reply = json!({
+            "id": "resp_1",
+            "object": "response",
+            "model": XAI_SEARCH_MODEL,
+            "output": [
+                { "type": "web_search_call", "id": "ws_1", "status": "completed",
+                  "action": { "type": "search", "query": "artemis ii" } },
+                { "type": "message", "role": "assistant", "content": [{
+                    "type": "output_text",
+                    "text": "Artemis II flew in April 2026.",
+                    "annotations": [
+                        { "type": "url_citation", "url": "https://www.nasa.gov/artemis-ii",
+                          "title": "Artemis II", "start_index": 0, "end_index": 10 },
+                        { "type": "url_citation", "url": "https://en.wikipedia.org/wiki/Artemis_II",
+                          "title": "Artemis II - Wikipedia", "start_index": 11, "end_index": 20 }
+                    ]
+                }]}
+            ]
+        })
+        .to_string();
+        let raw = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::clone(&raw);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 16384];
+            let mut read = 0;
+            // Read until the whole body named by Content-Length is in.
+            loop {
+                let n = socket.read(&mut buf[read..]).await.unwrap_or(0);
+                read += n;
+                let text = String::from_utf8_lossy(&buf[..read]).to_string();
+                let done = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    head.to_ascii_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|len| len.trim().parse::<usize>().ok())
+                        .is_some_and(|len| body.len() >= len)
+                });
+                if n == 0 || done {
+                    *seen.lock().expect("lock") = text;
+                    break;
+                }
+            }
+            let _ = socket
+                .write_all(http_response("application/json", &reply).as_bytes())
+                .await;
+            let _ = socket.shutdown().await;
+        });
+
+        let backend = XaiSearch::api_key("test-key").with_base_url(format!("http://{addr}/v1"));
+        let results = backend.search("artemis ii", 5).await.expect("search ok");
+
+        let request = raw.lock().expect("lock").clone();
+        let (head, body) = request.split_once("\r\n\r\n").expect("a whole request");
+        assert!(head.starts_with("POST /v1/responses "), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: bearer test-key"),
+            "{head}"
+        );
+        let body: Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(body["model"], XAI_SEARCH_MODEL);
+        assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
+        assert_eq!(body["include"], json!(["no_inline_citations"]));
+        assert_eq!(body["input"][0]["role"], "user");
+
+        let urls: Vec<&str> = results.iter().map(|hit| hit.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://www.nasa.gov/artemis-ii",
+                "https://en.wikipedia.org/wiki/Artemis_II"
+            ]
+        );
+        assert_eq!(results[1].title, "Artemis II - Wikipedia");
     }
 
     #[test]

@@ -939,7 +939,10 @@ pub async fn run(config: Config, cli: Cli) -> Result<i32> {
     // Is the claim of done reviewed before the loop acts on it? Headless is
     // never the interactive surface, so this is the config key or the default
     // for an unattended run, which is yes.
-    let review_on = critic::review_enabled(config.completion_review, false);
+    // Chat mode has nothing to review: it answers a question and cannot write
+    // a file or run a command.
+    let review_on = config.mode != crate::config::Mode::Chat
+        && critic::review_enabled(config.completion_review, false);
     // Iterations spent on a review's rework, which extend the `--loop` bound
     // for the same reason gate remediation does: `--loop` is the budget for
     // the work, and a review with no turn to fix what it found is a review

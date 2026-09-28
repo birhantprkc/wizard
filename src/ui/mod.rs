@@ -673,11 +673,13 @@ pub(super) fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Colored span for a mode name: genie is quiet, sovereign is a warning.
+/// Colored span for a mode name: genie is quiet, sovereign is a warning,
+/// chat is an accent (it has none of the project tools, which is worth seeing).
 pub(super) fn mode_span(mode: Mode) -> Span<'static> {
     match mode {
         Mode::Genie => Span::styled("genie", muted()),
         Mode::Sovereign => Span::styled("sovereign", warning().bold()),
+        Mode::Chat => Span::styled("chat", accent().bold()),
     }
 }
 
@@ -1664,7 +1666,7 @@ pub(super) fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, suggesti
     // here: `genie` is the default and says nothing, and the branch names the
     // repo (`/status` has the path).
     let mut spans = vec![Span::raw(" "), model_span(app)];
-    if app.status.mode == Mode::Sovereign {
+    if app.status.mode != Mode::Genie {
         spans.push(sep());
         spans.push(mode_span(app.status.mode));
     }
