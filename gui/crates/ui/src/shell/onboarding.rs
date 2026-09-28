@@ -74,6 +74,10 @@ pub(super) struct Onboarding {
     step: Step,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     installing: Option<HarnessId>,
+    /// The engine's last answer about `installing`.
+    install_progress: Option<zeron_harness::install_progress::InstallProgress>,
+    /// The last failed install, shown under its agent with a Retry.
+    install_error: Option<(HarnessId, String)>,
     default_agent: HarnessId,
     credentials: Loadable<Vec<DetectedCredential>>,
     importing: Option<CredentialSource>,
@@ -93,6 +97,8 @@ impl Onboarding {
             step: Step::Welcome,
             harnesses: Loadable::Idle,
             installing: None,
+            install_progress: None,
+            install_error: None,
             default_agent: HarnessId::Wizard,
             credentials: Loadable::Idle,
             importing: None,
@@ -203,7 +209,28 @@ impl Shell {
             return;
         }
         onboarding.installing = Some(harness);
+        onboarding.install_progress = None;
+        onboarding.install_error = None;
         onboarding.error = None;
+        let poll = crate::install_bar::poll(
+            engine.clone(),
+            serde_json::json!({"harness": harness}),
+            cx,
+            move |shell: &mut Shell, progress| match shell.onboarding.as_mut() {
+                Some(onboarding) if onboarding.installing == Some(harness) => {
+                    // The last poll can land after the install finished.
+                    if progress.is_some() {
+                        onboarding.install_progress = progress;
+                    }
+                    true
+                }
+                _ => false,
+            },
+        );
+        let Some(onboarding) = self.onboarding.as_mut() else {
+            return;
+        };
+        onboarding.tasks.push(poll);
         let task = cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -220,14 +247,13 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 if let Some(onboarding) = shell.onboarding.as_mut() {
                     onboarding.installing = None;
+                    onboarding.install_progress = None;
                     match result {
                         Ok(list) => {
                             onboarding.harnesses = Loadable::Ready(list);
                             crate::pickers::bump_harness_catalog(cx);
                         }
-                        Err(error) => {
-                            onboarding.error = Some(format!("Installation failed — {error}"))
-                        }
+                        Err(error) => onboarding.install_error = Some((harness, error)),
                     }
                 }
                 cx.notify();
@@ -493,9 +519,14 @@ impl Shell {
                 let installed = onboarding.installed(harness);
                 let installing = onboarding.installing == Some(harness);
                 let selected = onboarding.default_agent == harness;
+                let failed = onboarding
+                    .install_error
+                    .as_ref()
+                    .filter(|(id, _)| *id == harness)
+                    .map(|(_, error)| error.clone());
                 let (brand, tint) = crate::pickers::harness_brand_icon(harness);
                 let status: AnyElement = if installing {
-                    status_text(theme, "Installing…")
+                    status_text(theme, "")
                 } else {
                     match installed {
                         None => status_text(theme, ""),
@@ -535,6 +566,8 @@ impl Shell {
                             })
                             .child(if selected { "Default" } else { "Make default" })
                             .into_any_element(),
+                        // A failed install's Retry sits with its output below.
+                        Some(false) if failed.is_some() => status_text(theme, ""),
                         Some(false) if onboarding.can_install(harness) => {
                             popover::btn_primary(theme, "Install")
                                 .id(SharedString::from(format!(
@@ -549,7 +582,7 @@ impl Shell {
                         Some(false) => status_text(theme, "Not installed"),
                     }
                 };
-                div()
+                let row = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -591,7 +624,31 @@ impl Shell {
                                     .child(*blurb),
                             ),
                     )
-                    .child(div().flex_none().child(status))
+                    .child(div().flex_none().child(status));
+                // Installs report under their row, indented to the text.
+                let below: Option<AnyElement> = if installing {
+                    Some(crate::install_bar::render(
+                        theme,
+                        format!("onboarding-install-progress-{harness:?}"),
+                        onboarding.install_progress.as_ref(),
+                    ))
+                } else {
+                    failed.map(|error| {
+                        crate::install_bar::render_error(
+                            theme,
+                            format!("onboarding-install-error-{harness:?}"),
+                            &format!("Couldn't install {name}: {error}"),
+                            cx.listener(move |this, _, _, cx| this.onboarding_install(harness, cx)),
+                        )
+                    })
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(row)
+                    .when_some(below, |el, below| {
+                        el.child(div().pl(px(46.0)).pb(px(8.0)).child(below))
+                    })
                     .into_any_element()
             })
             .collect();

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -14,10 +15,16 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+plist.workspace = true
+zip.workspace = true
+libc.workspace = true
+semver = "1"
+# minisign signatures: ed25519 over a blake2b-512 prehash, the same crates
+# `wizard update` verifies releases with.
+base64 = "0.22"
+blake2 = "0.10"
+ed25519-dalek = "3"
 
 [target."cfg(windows)".dependencies]
-tempfile.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

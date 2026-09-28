@@ -176,11 +176,22 @@ fn find_npm_with(
 }
 
 pub(crate) fn find_npm() -> Option<PathBuf> {
+    let platform = crate::executable::Platform::current();
     find_npm_with(
         &|key| std::env::var_os(key),
         crate::shell_env::login_shell_path().map(OsString::from),
-        crate::executable::Platform::current(),
+        platform,
     )
+    .or_else(|| {
+        (platform != crate::executable::Platform::Windows)
+            .then(|| {
+                crate::gui_path::well_known_bins()
+                    .into_iter()
+                    .map(|dir| dir.join("npm"))
+                    .find(|npm| npm.is_file())
+            })
+            .flatten()
+    })
 }
 
 fn node_sibling_for_npm(npm: &Path, platform: crate::executable::Platform) -> Option<PathBuf> {

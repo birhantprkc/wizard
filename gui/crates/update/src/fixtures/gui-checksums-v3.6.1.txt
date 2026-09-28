@@ -1,0 +1,4 @@
+35f0e0e36fe671f3c4222e4aa88aa34136e49fce3616d79ab991e192bc338303  wizard-gui-3.6.1-linux-aarch64.tar.gz
+a26420b4f9d23813102706e91b138d0b79af11b2a936e2202b86743de7733f70  wizard-gui-3.6.1-linux-x86_64.tar.gz
+a070d5b8c4cbd7d3c4b46cec94b87e2bedb2b7d204e7f9fcbd4c009da6710304  wizard-gui-3.6.1-macos-arm64.dmg
+f8179b9e143c37a8710142b70ef82dffe57b2fb3c69ef01ae8bed17d989ed562  wizard-gui-3.6.1-windows-x86_64.zip

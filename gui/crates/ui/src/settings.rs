@@ -16,6 +16,7 @@ use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 use zeron_proto::{AuthState, WorkspaceScope};
 
+pub mod about;
 pub mod accounts;
 pub mod appearance;
 pub mod archived;
@@ -844,6 +845,9 @@ pub struct UiSettings {
     pub transcript_compact_mode: bool,
     /// Set once the first-run onboarding finishes or is skipped.
     pub onboarding_completed: bool,
+    /// Download Wizard GUI updates in the background and install them when
+    /// the app next quits or restarts. Off by default.
+    pub auto_install_updates: bool,
     /// Show the bundled Starship artwork behind the new-chat composer when no
     /// custom background is chosen, whatever the agent. The key keeps its old
     /// name so existing settings files still read.
@@ -933,6 +937,7 @@ impl Default for UiSettings {
             open_web_links_in_zeron: true,
             transcript_compact_mode: true,
             onboarding_completed: false,
+            auto_install_updates: false,
             new_thread_wizard_background: true,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
@@ -2307,6 +2312,7 @@ mod tests {
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
             onboarding_completed: true,
+            auto_install_updates: true,
             new_thread_wizard_background: false,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,

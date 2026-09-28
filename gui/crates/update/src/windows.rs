@@ -20,80 +20,50 @@ const BACKUP: &str = "zeron.exe.old";
 /// crash between the two renames leaves at most this file behind.
 const INCOMING: &str = ".zeron-update-incoming.exe";
 
-#[derive(serde::Deserialize)]
-struct Config {
-    releases_url: String,
-}
-
+/// The portable package ships this file next to `zeron.exe`; its presence is
+/// what marks a copy as the portable install (a source build has none).
 pub(super) fn is_managed(exe: &Path) -> bool {
     exe.file_name().is_some_and(|name| name == "zeron.exe")
         && exe.parent().is_some_and(|dir| dir.join(CONFIG).is_file())
 }
 
-pub(super) fn release_url() -> anyhow::Result<Option<String>> {
-    let exe = std::env::current_exe()?;
-    if !is_managed(&exe) {
-        return Ok(None);
-    }
-    let config: Config = serde_json::from_slice(&std::fs::read(exe.with_file_name(CONFIG))?)
-        .context("reading Windows update configuration")?;
-    super::validate_release_override(&config.releases_url).map(Some)
-}
-
-pub fn artifact(version: &str) -> String {
-    format!("zeron-{version}-windows-{}.exe", std::env::consts::ARCH)
-}
-
-/// Download next to the installation, verifying its mandatory checksum.
-/// Each attempt has its own directory, so failed or concurrent downloads cannot
-/// leave a reusable, partially staged executable.
-pub async fn stage(
-    edge_url: &str,
-    manifest: &super::Manifest,
-    directory: &Path,
-) -> anyhow::Result<PathBuf> {
-    ensure!(
-        manifest
-            .version
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
-        "invalid Windows release version"
-    );
-    let file = artifact(&manifest.version);
-    let expected = manifest
-        .files
-        .get(&file)
-        .and_then(|meta| meta.sha256.as_deref())
-        .context("Windows updates require a SHA-256 checksum")?;
-    ensure!(
-        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
-        "invalid SHA-256 checksum"
-    );
+/// Take `zeron.exe` out of the verified portable zip into a fresh directory
+/// beside the installation, record its digest for [`apply`] to re-check, and
+/// make sure it runs and reports `version`.
+pub(super) fn stage(zip: &Path, directory: &Path, version: &str) -> anyhow::Result<PathBuf> {
     let temporary = tempfile::Builder::new()
         .prefix(".zeron-update-")
         .tempdir_in(directory)?;
     let staged = temporary.path().join("zeron.exe");
-    super::download_release_file(edge_url, manifest, &file, &staged).await?;
-    std::fs::write(temporary.path().join("sha256"), expected)?;
-    verify(&staged)?;
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::process::Command::new(&staged)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("staged executable version check timed out")??;
+    extract_exe(zip, &staged)?;
+    std::fs::write(temporary.path().join("sha256"), file_digest(&staged)?)?;
+    let output = std::process::Command::new(&staged)
+        .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("running the staged executable")?;
     ensure!(
         output.status.success()
-            && String::from_utf8_lossy(&output.stdout).trim()
-                == format!("zeron {}", manifest.version),
-        "staged executable has the wrong version or cannot run"
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .last()
+                == Some(version),
+        "the staged executable has the wrong version or cannot run"
     );
     let _ = temporary.keep();
     Ok(staged)
+}
+
+/// Copy the zip's top-level `zeron.exe` to `dest`.
+pub(super) fn extract_exe(zip: &Path, dest: &Path) -> anyhow::Result<()> {
+    let mut archive =
+        zip::ZipArchive::new(std::fs::File::open(zip)?).context("reading the downloaded zip")?;
+    let mut entry = archive
+        .by_name("zeron.exe")
+        .context("the downloaded zip has no zeron.exe")?;
+    let mut out = std::fs::File::create(dest)?;
+    std::io::copy(&mut entry, &mut out).context("unpacking zeron.exe")?;
+    Ok(())
 }
 
 fn verify(staged: &Path) -> anyhow::Result<()> {
@@ -101,7 +71,7 @@ fn verify(staged: &Path) -> anyhow::Result<()> {
     verify_digest(staged, expected.trim())
 }
 
-fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
+fn file_digest(path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 65536];
@@ -112,8 +82,12 @@ fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
         }
         hasher.update(&buffer[..count]);
     }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_digest(path: &Path, expected: &str) -> anyhow::Result<()> {
     ensure!(
-        format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected),
+        file_digest(path)?.eq_ignore_ascii_case(expected),
         "staged update checksum mismatch"
     );
     Ok(())
@@ -396,58 +370,27 @@ mod tests {
         assert!(!backup.exists());
     }
 
-    #[tokio::test]
-    async fn missing_checksum_is_rejected_before_download() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = super::super::Manifest {
-            version: "1.2.3".into(),
-            ..Default::default()
-        };
-        assert!(
-            stage("http://127.0.0.1:1", &manifest, dir.path())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("checksum")
-        );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    fn zip_with(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        use std::io::Write as _;
+        let path = dir.join("package.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+        path
     }
 
-    #[tokio::test]
-    async fn corrupt_download_preserves_install_and_removes_staging() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0u8; 4096];
-            let _ = socket.read(&mut request).unwrap();
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt",
-                )
-                .unwrap();
-        });
+    #[test]
+    fn the_portable_zips_executable_is_extracted() {
         let dir = tempfile::tempdir().unwrap();
-        let installed = dir.path().join("zeron.exe");
-        std::fs::write(&installed, b"existing installation").unwrap();
-        let manifest = super::super::Manifest {
-            version: "1.2.3".into(),
-            files: [(
-                artifact("1.2.3"),
-                super::super::FileMeta {
-                    sha256: Some(format!("{:x}", Sha256::digest(b"expected"))),
-                },
-            )]
-            .into(),
-        };
-        let error = stage(&base, &manifest, dir.path()).await.unwrap_err();
-        server.join().unwrap();
-        assert!(error.to_string().contains("checksum mismatch"));
-        assert_eq!(std::fs::read(&installed).unwrap(), b"existing installation");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let zip = zip_with(dir.path(), "zeron.exe", b"new image");
+        let dest = dir.path().join("out.exe");
+        extract_exe(&zip, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new image");
+
+        let zip = zip_with(dir.path(), "other.exe", b"x");
+        let err = extract_exe(&zip, &dest).unwrap_err();
+        assert!(err.to_string().contains("no zeron.exe"), "{err}");
     }
 }

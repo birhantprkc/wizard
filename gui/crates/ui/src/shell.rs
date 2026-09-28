@@ -35,6 +35,7 @@ use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
+use crate::settings::about::AboutPage;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
@@ -87,6 +88,7 @@ actions!(
         NewSession,
         OpenSettings,
         OpenWizardSettings,
+        CheckForUpdates,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -452,10 +454,12 @@ pub enum SettingsSection {
     Shortcuts,
     Appshots,
     Archived,
+    /// Version, update checks, and automatic updates.
+    About,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 12] = [
         SettingsSection::Devices,
         SettingsSection::Wizard,
         SettingsSection::Harnesses,
@@ -467,6 +471,7 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Archived,
+        SettingsSection::About,
     ];
 
     /// Sidebar + header label (zeron settings-sidebar.tsx SECTIONS / __root.tsx
@@ -484,6 +489,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::About => "About",
         }
     }
 }
@@ -1127,15 +1133,6 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
-    Idle,
-    Downloading,
-    /// Staged bundle ready to swap in — one click restarts into it.
-    Ready(PathBuf),
-    Failed(SharedString),
-}
-
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
@@ -1479,7 +1476,6 @@ enum PendingExit {
     CloseWindow,
     Quit,
     RuntimeChange,
-    InstallUpdate(PathBuf),
 }
 
 pub struct Shell {
@@ -1572,6 +1568,7 @@ pub struct Shell {
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    about_page: Option<Entity<AboutPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -1647,17 +1644,9 @@ pub struct Shell {
     new_thread_wizard_artwork: bool,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
-    /// download/stage of it has come in this process.
-    update_flow: UpdateFlow,
-    update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
-    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
+    /// In-app updates, shared with Settings → About (see `crate::updates`).
+    updates: Entity<crate::updates::Updates>,
+    _updates_observation: Subscription,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1895,6 +1884,8 @@ impl Shell {
             }
         });
         let data_dir = boot.data_dir.clone();
+        let updates = crate::updates::global(cx)
+            .unwrap_or_else(|| crate::updates::init(state.clone(), data_dir.clone(), cx));
         let settings = settings::current(cx);
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
@@ -1926,6 +1917,7 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("settings/about") => Route::Settings(SettingsSection::About),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -2014,6 +2006,7 @@ impl Shell {
             nav,
             devices_page: None,
             archived_page: None,
+            about_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -2063,10 +2056,8 @@ impl Shell {
             new_thread_wizard_artwork: false,
             onboarding: None,
             sidebar_notice: None,
-            update_flow: UpdateFlow::Idle,
-            update_task: None,
-            update_dismissed: None,
-            install: zeron_update::detect_install(),
+            _updates_observation: cx.observe(&updates, |_, _, cx| cx.notify()),
+            updates,
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -3814,6 +3805,7 @@ impl Shell {
         self.settings.diff_split = current.diff_split;
         self.settings.code_fences_fit_content = current.code_fences_fit_content;
         self.settings.onboarding_completed = current.onboarding_completed;
+        self.settings.auto_install_updates = current.auto_install_updates;
         self.settings.new_thread_wizard_background = current.new_thread_wizard_background;
     }
 
@@ -3914,6 +3906,12 @@ impl Shell {
         self.nav.push(NavEntry::Settings(section));
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Settings → About, with a fresh check under way.
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(SettingsSection::About, cx);
+        self.updates.update(cx, |updates, cx| updates.check_now(cx));
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4225,6 +4223,13 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::About => {
+                let updates = self.updates.clone();
+                self.about_page
+                    .get_or_insert_with(|| cx.new(|cx| AboutPage::new(updates, cx)))
+                    .clone()
+                    .into_any_element()
             }
         }
     }
@@ -5873,6 +5878,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::About => icons::INFO_CIRCLE,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -7134,139 +7140,178 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
+    /// Update banner above the settings button: shown while a newer Wizard
+    /// GUI is out, and it walks the whole update: Update and What's new, the
+    /// progress bar while it downloads and verifies, then Restart to update
+    /// once nothing is running. A copy that can't replace itself gets a
+    /// Download link and the reason instead.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
+        let updates = self.updates.read(cx);
+        if !updates.banner_visible(cx) {
             return None;
         }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let desktop_update = self.install.supports_desktop_update();
+        let latest = updates.available(cx)?;
+        let notes = updates.notes_url(cx);
+        let manual = updates.install_kind().manual_reason().map(str::to_string);
+        let idle = updates.idle(cx);
+        let flow = updates.flow().clone();
+        let progress = updates.progress();
 
-        let (label, clickable): (SharedString, bool) = if desktop_update {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Follow the selected spectrum with a low-emphasis glass tint rather
-        // than painting the bright text accent as a solid slab.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            (theme.accent_wash, theme.accent.opacity(0.16))
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(crate::typography::ui_rems(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !self.install.supports_desktop_update() {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        let install = self.install.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            install.stage_desktop(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
+        let small = |label: &str, primary: bool| {
+            let button = if primary {
+                crate::popover::btn_primary(theme, label)
+            } else {
+                crate::popover::btn_ghost(theme, label, format!("update-{label}"))
             };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
+            button
+                .px(px(8.0))
+                .py(px(3.0))
+                .text_size(crate::typography::ui_rems(11.5))
+        };
+        let open_notes = |id: &'static str, label: &str, primary: bool| {
+            let url = notes.clone();
+            small(label, primary)
+                .id(id)
+                .on_click(move |_, _, cx| {
+                    if let Some(url) = &url {
+                        cx.open_url(url);
                     }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
+                })
+                .into_any_element()
+        };
+        let muted_line = |text: String| {
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(text))
+                .into_any_element()
+        };
+        let updates = self.updates.clone();
+        let action = |id: &'static str,
+                      label: &str,
+                      primary: bool,
+                      run: fn(
+            &mut crate::updates::Updates,
+            &mut Context<crate::updates::Updates>,
+        )| {
+            let updates = updates.clone();
+            small(label, primary)
+                .id(id)
+                .on_click(move |_, _, cx| updates.update(cx, run))
+                .into_any_element()
+        };
 
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
-            return;
-        }
-        match self.install.apply_desktop(&staged) {
-            Ok(()) => {
-                crate::app_menus::quit_after_save(cx);
+        let title = |text: String, tone: gpui::Hsla| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(crate::typography::ui_rems(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tone)
+                .child(SharedString::from(text))
+        };
+        let close = {
+            let updates = self.updates.clone();
+            div()
+                .id("update-dismiss")
+                .flex_none()
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .child(
+                    crate::icons::icon(crate::icons::CLOSE)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                )
+                .on_click(move |_, _, cx| updates.update(cx, |updates, cx| updates.dismiss(cx)))
+        };
+
+        let mut body: Vec<AnyElement> = Vec::new();
+        let mut buttons: Vec<AnyElement> = Vec::new();
+        let mut dismissable = false;
+        let mut head = title(format!("Wizard GUI {latest} is available"), theme.text);
+        match (&manual, &flow) {
+            (Some(reason), _) => {
+                dismissable = true;
+                body.push(muted_line(reason.clone()));
+                buttons.push(open_notes("update-download", "Download", true));
             }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
+            (None, crate::updates::Flow::Idle) => {
+                dismissable = true;
+                buttons.push(action("update-start", "Update", true, |u, cx| u.start(cx)));
+                buttons.push(open_notes("update-notes", "What's new", false));
+            }
+            (None, crate::updates::Flow::Downloading) => {
+                body.push(crate::install_bar::render(
+                    theme,
+                    "update-progress",
+                    crate::updates::bar_progress(progress).as_ref(),
+                ));
+            }
+            (None, crate::updates::Flow::Ready(_)) => {
+                head = title(format!("Wizard GUI {latest} is ready"), theme.text);
+                if idle {
+                    buttons.push(action(
+                        "update-restart",
+                        "Restart to update",
+                        true,
+                        |u, cx| u.restart(cx),
+                    ));
+                } else {
+                    body.push(muted_line(
+                        "Restart once agent runs and terminals finish, or it installs when you quit."
+                            .into(),
+                    ));
+                }
+                buttons.push(open_notes("update-notes", "What's new", false));
+            }
+            (None, crate::updates::Flow::Failed(message)) => {
+                head = title("Update failed".into(), theme.danger);
+                body.push(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.danger)
+                        .line_clamp(3)
+                        .child(SharedString::from(message.clone()))
+                        .into_any_element(),
+                );
+                buttons.push(action("update-retry", "Retry", true, |u, cx| u.start(cx)));
+                buttons.push(open_notes("update-download", "Download", false));
             }
         }
+
+        Some(
+            div()
+                .id("update-strip")
+                .mx(px(Theme::SPACE_SM))
+                .px(px(Theme::SPACE_SM))
+                .py(px(8.0))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .bg(theme.accent_wash)
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(head)
+                        .when(dismissable, |el| el.child(close)),
+                )
+                .children(body)
+                .when(!buttons.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(6.0))
+                            .children(buttons),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
@@ -10575,9 +10620,6 @@ impl Render for Shell {
                                 }
                             }
                             PendingExit::RuntimeChange => shell.quit_for_runtime_change(cx),
-                            PendingExit::InstallUpdate(staged) => {
-                                shell.apply_staged_update(staged, cx)
-                            }
                             PendingExit::Quit => unreachable!(),
                         })
                         .ok();
@@ -10829,6 +10871,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &OpenWizardSettings, _, cx| {
                 this.open_settings(SettingsSection::Wizard, cx)
             }))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.cycle_session(true, cx)))
@@ -13337,12 +13380,6 @@ mod exit_regressions {
                         Some(PendingExit::RuntimeChange)
                     ));
                     assert!(shell.runtime_change_task.is_none());
-                    shell.apply_staged_update(PathBuf::from("must-not-install"), cx);
-                    assert!(matches!(
-                        shell.pending_exit,
-                        Some(PendingExit::InstallUpdate(_))
-                    ));
-                    assert!(matches!(shell.update_flow, UpdateFlow::Idle));
                     shell.cancel_file_close(RightSurface::File(0), cx);
                     assert!(shell.pending_exit.is_none());
                 })

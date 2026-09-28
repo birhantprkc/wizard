@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # macOS packaging: build the release binary for the host arch and produce
-#   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
-#   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
+#   target/package/zeron-<version>-macos-<arch>.dmg
+# containing "Wizard GUI.app" (unsigned unless CODESIGN_IDENTITY is set). The
+# in-app updater installs from the same dmg. The file name keeps the zeron-
+# prefix; release.yml renames it to wizard-gui-*.
 #
 # Usage: scripts/package-macos.sh
-# Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
+# Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
+#        CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
 #        API key (.p8) for notarization; all three set → notarize + staple the
 #        app and the dmg, which removes the Gatekeeper warning entirely.
@@ -14,34 +16,39 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+PROFILE="${PROFILE:-release}"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Zeron.app"
+APP_NAME="Wizard GUI.app"
+APP="$OUT_DIR/$APP_NAME"
 DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p zeron
+if [[ "$PROFILE" == "release" ]]; then
+  cargo build --release -p zeron
+else
+  cargo build -p zeron
+fi
 
-rm -rf "$APP" "$DMG" "$APP_TARBALL"
+rm -rf "$APP" "$DMG"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
+install -m 755 "$ROOT/target/$PROFILE/zeron" "$APP/Contents/MacOS/wizard-gui"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
 # baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
-# applied ahead of time; dist/zeron.png stays the full-bleed shared artwork).
-ICONSET="$OUT_DIR/zeron.iconset"
+# applied ahead of time; dist/wizard-gui.png stays the full-bleed shared artwork).
+ICONSET="$OUT_DIR/wizard-gui.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
   retina=$((size * 2))
   sips -z "$retina" "$retina" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/zeron.icns"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/wizard-gui.icns"
 rm -rf "$ICONSET"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
@@ -66,8 +73,8 @@ NOTARIZE=false
 [[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] && NOTARIZE=true
 
 if $NOTARIZE; then
-  # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
-  # no dmg involved, so the tarball copy must carry its own ticket to pass
+  # Staple the bundle itself, not only the dmg: the in-app updater copies the
+  # .app out of the dmg, so the app must carry its own ticket to pass
   # Gatekeeper offline.
   ZIP="$OUT_DIR/zeron-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
@@ -75,10 +82,6 @@ if $NOTARIZE; then
   rm -f "$ZIP"
   xcrun stapler staple "$APP"
 fi
-
-# The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
-echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
 # ascii-hands artwork (committed renders from scripts/dmg-background.py).
@@ -101,12 +104,12 @@ import dmgbuild
 app = os.environ["APP"]
 dmgbuild.build_dmg(
     filename=os.environ["DMG"],
-    volume_name="Zeron",
+    volume_name="Wizard GUI",
     settings={
         "format": "UDZO",
         "files": [app],
         "symlinks": {"Applications": "/Applications"},
-        "icon": os.path.join(app, "Contents/Resources/zeron.icns"),
+        "icon": os.path.join(app, "Contents/Resources/wizard-gui.icns"),
         "background": os.environ["BG_TIFF"],
         "show_status_bar": False,
         "show_tab_view": False,
@@ -118,7 +121,7 @@ dmgbuild.build_dmg(
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,
-        "icon_locations": {"Zeron.app": (165, 195), "Applications": (495, 195)},
+        "icon_locations": {os.path.basename(app): (165, 195), "Applications": (495, 195)},
     },
 )
 PY

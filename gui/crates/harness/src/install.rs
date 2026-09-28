@@ -6,6 +6,7 @@ use zeron_proto::HarnessId;
 
 use crate::{
     CancellationToken, Harness, HarnessError, StderrTail,
+    install_progress::{Progress, Stage},
     process::{Command, Stdio},
 };
 
@@ -191,6 +192,34 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
     }
 }
 
+fn display_name(id: HarnessId) -> &'static str {
+    use HarnessId::*;
+    match id {
+        ClaudeCode => "Claude Code",
+        Codex => "Codex",
+        Cursor => "Cursor",
+        Opencode => "OpenCode",
+        Pi => "Pi",
+        Grok => "Grok",
+        Hermes => "Hermes",
+        Devin => "Devin",
+        Wizard => "Wizard",
+        Antigravity => "Antigravity",
+        Mock => "Mock",
+    }
+}
+
+/// Installers whose scripts were read to check that a `curl` with its meter
+/// on changes nothing but stderr: none of them folds curl's stderr into
+/// output it parses.
+fn meters_curl(id: HarnessId, method: Method) -> bool {
+    matches!(method, Method::Shell(..))
+        && matches!(
+            id,
+            HarnessId::ClaudeCode | HarnessId::Pi | HarnessId::Wizard
+        )
+}
+
 pub fn installed(id: HarnessId) -> bool {
     use HarnessId::*;
     match id {
@@ -237,26 +266,31 @@ pub fn cli_command(program: &std::path::Path) -> Command {
 }
 
 fn configure(command: &mut Command) {
+    configure_with(command, &[]);
+}
+
+/// The installer's environment. PATH is `front`, then ours, the login
+/// shell's, npm's directory, and the places a GUI launch's PATH misses
+/// (Homebrew above all), so an installer run from the Dock sees the same
+/// node and npm a terminal would.
+fn configure_with(command: &mut Command, front: &[PathBuf]) {
     crate::acp::child::configure(command);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("ZERON_") {
             command.env_remove(key);
         }
     }
-    // Preserve explicit PATH additions and include the user's login-shell toolchains.
-    let mut paths: Vec<_> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if let Some(path) = crate::shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(path));
-    }
-    // npm can be found in a managed toolchain even when shell startup was disabled.
-    if let Some(npm) =
-        crate::adapter_install::find_npm().and_then(|p| p.parent().map(PathBuf::from))
-    {
-        paths.push(npm);
-    }
-    if let Ok(path) = std::env::join_paths(paths) {
+    let mut back: Vec<PathBuf> = crate::adapter_install::find_npm()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .into_iter()
+        .collect();
+    back.extend(crate::gui_path::well_known_bins());
+    if let Some(path) = crate::gui_path::compose(
+        front,
+        std::env::var_os("PATH").as_deref(),
+        crate::shell_env::login_shell_path(),
+        &back,
+    ) {
         command.env("PATH", path);
     }
     command
@@ -269,7 +303,7 @@ fn configure(command: &mut Command) {
         .kill_on_drop(true);
 }
 
-fn command(method: Method) -> Result<Command, HarnessError> {
+fn command(method: Method, front: &[PathBuf]) -> Result<Command, HarnessError> {
     let missing = || HarnessError::Install("installer prerequisite is no longer available".into());
     let mut command = match method {
         Method::PowerShell(script) => {
@@ -294,8 +328,10 @@ fn command(method: Method) -> Result<Command, HarnessError> {
             cmd
         }
         Method::Shell(script, _) => shell_command(script)?,
+        // loglevel=http prints one line per fetched package: the progress
+        // there is to show.
         Method::Npm(package, ignore_scripts) => shell_command(&format!(
-            "npm install -g {}{package}",
+            "npm install -g --loglevel=http --no-fund --no-audit {}{package}",
             if ignore_scripts {
                 "--ignore-scripts "
             } else {
@@ -305,7 +341,7 @@ fn command(method: Method) -> Result<Command, HarnessError> {
         Method::Brew => shell_command("brew install --cask devin-cli")?,
         Method::Archive => unreachable!("archives have a separate executor"),
     };
-    configure(&mut command);
+    configure_with(&mut command, front);
     Ok(command)
 }
 
@@ -317,24 +353,90 @@ fn shell_command(script: &str) -> Result<Command, HarnessError> {
 }
 
 /// Only the explicit Install RPC may call this; dropping the future also kills its process group.
-pub async fn install_harness(id: HarnessId, cancel: CancellationToken) -> Result<(), HarnessError> {
-    let method = selected(id).ok_or_else(|| {
+pub async fn install_harness(
+    id: HarnessId,
+    cancel: CancellationToken,
+    progress: Progress,
+) -> Result<(), HarnessError> {
+    // Choosing the method and asking whether Node is there both run the
+    // login-shell probe the first time, which can take seconds.
+    let (method, needs_node) = tokio::task::spawn_blocking(move || {
+        let method = selected(id);
+        let needs_node = id == HarnessId::Pi
+            && matches!(method, Some(Method::Shell(..) | Method::Npm(..)))
+            && !cfg!(windows)
+            && !crate::node_bootstrap::has_usable_node();
+        (method, needs_node)
+    })
+    .await
+    .map_err(|e| HarnessError::Install(e.to_string()))?;
+    let method = method.ok_or_else(|| {
         HarnessError::Install(
             "No supported installer or required tools available on this device".into(),
         )
     })?;
-    let result = if method == Method::Archive {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(HarnessError::Install("installation cancelled".into())),
-            result = tokio::time::timeout(DEADLINE, crate::acp::install_harness(id)) => result.unwrap_or_else(|_| Err(HarnessError::Install("installation timed out after 15 minutes".into()))),
+    let name = display_name(id);
+    progress.start(
+        name,
+        crate::install_progress::plan(id, matches!(method, Method::Npm(..)), needs_node),
+    );
+    let result = async {
+        if method == Method::Archive {
+            progress.enter(Stage::Download);
+            return tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(HarnessError::Install("installation cancelled".into())),
+                result = tokio::time::timeout(DEADLINE, crate::acp::install_harness(id)) => result.unwrap_or_else(|_| Err(HarnessError::Install("installation timed out after 15 minutes".into()))),
+            };
         }
-    } else {
-        run(command(method)?, cancel, DEADLINE).await
-    };
+        let mut front = Vec::new();
+        if needs_node {
+            progress.enter(Stage::Node);
+            front.push(crate::node_bootstrap::install(&progress, &cancel).await?);
+        } else if id == HarnessId::Pi
+            && let Some(bin) = crate::node_bootstrap::standalone_bin()
+        {
+            front.push(bin);
+        }
+        #[cfg(unix)]
+        let shim = if meters_curl(id, method) {
+            resolve("curl").and_then(|curl| {
+                crate::install_progress::CurlMeterShim::new(&curl)
+                    .map_err(|e| tracing::warn!("curl progress shim: {e}"))
+                    .ok()
+            })
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        if let Some(shim) = &shim {
+            front.insert(0, shim.dir().to_path_buf());
+        }
+        progress.enter(match method {
+            Method::Npm(..) => Stage::Npm,
+            _ if matches!(id, HarnessId::Pi | HarnessId::ClaudeCode | HarnessId::Wizard) => {
+                Stage::Download
+            }
+            _ => Stage::Run,
+        });
+        run(command(method, &front)?, cancel.clone(), DEADLINE, Some(&progress)).await
+    }
+    .await;
     invalidate_versions(id);
     result?;
-    post_install(id)
+    if id == HarnessId::Pi && installed(id) {
+        // Pi's first chat would otherwise start by installing its ACP adapter
+        // in the background. Best effort: a failure here leaves Pi installed
+        // and the chat-time install as the fallback.
+        progress.enter(Stage::Adapter);
+        if let Err(error) = crate::acp::install_pi_adapter().await {
+            tracing::warn!("installing the Pi adapter after Pi failed: {error}");
+        }
+    }
+    progress.enter(Stage::Checking);
+    tokio::task::spawn_blocking(move || post_install(id))
+        .await
+        .map_err(|e| HarnessError::Install(e.to_string()))?
 }
 
 /// Injection seam for integration tests; unavailable in production builds.
@@ -346,25 +448,43 @@ pub async fn install_with_command(
 ) -> Result<(), HarnessError> {
     let mut cmd = shell_command(script)?;
     configure(&mut cmd);
-    let result = run(cmd, cancel, DEADLINE).await;
+    let result = run(cmd, cancel, DEADLINE, None).await;
     invalidate_versions(id);
     result?;
     post_install(id)
 }
 
-async fn capture(mut pipe: impl AsyncRead + Unpin, tail: StderrTail) {
+/// Whether a line belongs in the error tail. curl's meter and npm's fetch
+/// log are progress, and would push the real error out of the tail.
+fn worth_keeping(line: &str) -> bool {
+    let line = line.trim();
+    !(line.starts_with("npm http fetch")
+        || crate::install_progress::CurlMeter::parse(line).is_some()
+        || crate::install_progress::CurlMeter::is_header(line))
+}
+
+async fn capture(mut pipe: impl AsyncRead + Unpin, tail: StderrTail, progress: Option<Progress>) {
     // Fixed-size chunks also bound memory for installers emitting an enormous line.
     // Retain a partial line until newline, and discard overflow until that newline so
     // a credential split across reads can never leak as an unmarked continuation.
     let mut chunk = [0; 1024];
     let mut line = Vec::new();
+    let emit = |line: &[u8]| {
+        let text = crate::redact_secrets(&String::from_utf8_lossy(line));
+        if let Some(progress) = &progress {
+            progress.line(&text);
+        }
+        if worth_keeping(&text) {
+            tail.push(&text);
+        }
+    };
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 for byte in &chunk[..n] {
                     if *byte == b'\n' || *byte == b'\r' {
-                        tail.push(&crate::redact_secrets(&String::from_utf8_lossy(&line)));
+                        emit(&line);
                         line.clear();
                     } else if line.len() < 4096 {
                         line.push(*byte);
@@ -373,13 +493,14 @@ async fn capture(mut pipe: impl AsyncRead + Unpin, tail: StderrTail) {
             }
         }
     }
-    tail.push(&crate::redact_secrets(&String::from_utf8_lossy(&line)));
+    emit(&line);
 }
 
 async fn run(
     mut command: Command,
     cancel: CancellationToken,
     deadline: Duration,
+    progress: Option<&Progress>,
 ) -> Result<(), HarnessError> {
     if cancel.is_cancelled() {
         return Err(HarnessError::Install("installation cancelled".into()));
@@ -390,8 +511,16 @@ async fn run(
             .map_err(|e| HarnessError::Install(e.to_string()))?,
     );
     let tail = StderrTail::default();
-    let stdout = capture(child.stdout.take().expect("piped stdout"), tail.clone());
-    let stderr = capture(child.stderr.take().expect("piped stderr"), tail.clone());
+    let stdout = capture(
+        child.stdout.take().expect("piped stdout"),
+        tail.clone(),
+        progress.cloned(),
+    );
+    let stderr = capture(
+        child.stderr.take().expect("piped stderr"),
+        tail.clone(),
+        progress.cloned(),
+    );
     let result = tokio::select! {
         biased;
         _ = cancel.cancelled() => Err("installation cancelled".to_string()),
@@ -471,7 +600,7 @@ mod tests {
         let tail = StderrTail::default();
         let mut bytes = vec![b'x'; 200_000];
         bytes.extend_from_slice(b"\nAuthorization: Bearer private-token\napi_key=secret\n");
-        capture(bytes.as_slice(), tail.clone()).await;
+        capture(bytes.as_slice(), tail.clone(), None).await;
         let text = tail.snapshot().unwrap();
         assert!(text.len() <= 1400);
         assert!(!text.contains("private-token"));
@@ -494,6 +623,7 @@ mod tests {
             fixture("test \"$CI\" = 1 && test -z \"$CLAUDECODE\" && test ! -t 0"),
             CancellationToken::new(),
             Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap();
@@ -501,6 +631,7 @@ mod tests {
             fixture("echo stdout-message; echo 'api_key=private' >&2; exit 7"),
             CancellationToken::new(),
             Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap_err()
@@ -512,6 +643,7 @@ mod tests {
             fixture("sleep 60"),
             CancellationToken::new(),
             Duration::from_millis(30),
+            None,
         )
         .await
         .unwrap_err()
@@ -520,7 +652,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(
-            run(fixture("exit 0"), cancel, DEADLINE)
+            run(fixture("exit 0"), cancel, DEADLINE, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -537,7 +669,7 @@ mod tests {
             let mut command = fixture("sleep 60 & echo $! > \"$PIDFILE\"; wait");
             command.env("PIDFILE", &pidfile);
             let cancel = CancellationToken::new();
-            let task = tokio::spawn(run(command, cancel.clone(), DEADLINE));
+            let task = tokio::spawn(run(command, cancel.clone(), DEADLINE, None));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !pidfile.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;

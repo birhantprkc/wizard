@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Wizard GUI
+GenericName=Coding Agent GUI
+Comment=Run Wizard, Pi, and Claude Code across your projects and machines
+Exec=wizard-gui %u
+TryExec=wizard-gui
+Icon=wizard-gui
+Terminal=false
+Categories=Development;Utility;
+Keywords=wizard;agent;pi;claude;ai;coding;
+StartupWMClass=wizard-gui
+MimeType=x-scheme-handler/zeron;

@@ -41,6 +41,11 @@ enum Entry {
     NewChat,
     NewProject,
     Settings,
+    CheckForUpdates,
+    /// Download and stage a newer Wizard GUI.
+    InstallUpdate,
+    /// Quit into the staged update.
+    RestartToUpdate,
     Theme(AppearanceMode),
     Chat(String),
 }
@@ -51,6 +56,9 @@ impl Entry {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
+            Self::CheckForUpdates => Some(("Check for updates", icons::REFRESH)),
+            Self::InstallUpdate => Some(("Update Wizard GUI", icons::ARROW_DOWN)),
+            Self::RestartToUpdate => Some(("Restart to update", icons::RESTART)),
             Self::Theme(mode) => Some((
                 match mode {
                     AppearanceMode::System => "Switch to system theme",
@@ -69,18 +77,23 @@ fn matches_query(query: &str, text: &str) -> bool {
     query.split_whitespace().all(|word| text.contains(word))
 }
 
-fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
+/// `update` is the update step on offer right now ([`Entry::InstallUpdate`]
+/// or [`Entry::RestartToUpdate`]), if any.
+fn actions_for(query: &str, is_dark: bool, update: Option<Entry>) -> Vec<Entry> {
     [
-        Entry::NewChat,
-        Entry::NewProject,
-        Entry::Settings,
-        Entry::Theme(if is_dark {
+        Some(Entry::NewChat),
+        Some(Entry::NewProject),
+        Some(Entry::Settings),
+        update,
+        Some(Entry::CheckForUpdates),
+        Some(Entry::Theme(if is_dark {
             AppearanceMode::Light
         } else {
             AppearanceMode::Dark
-        }),
+        })),
     ]
     .into_iter()
+    .flatten()
     .filter(|entry| matches_query(query, entry.action().unwrap().0))
     .collect()
 }
@@ -138,7 +151,11 @@ impl Shell {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
-        let mut entries = actions_for(&query, Theme::of(cx).appearance.is_dark());
+        let mut entries = actions_for(
+            &query,
+            Theme::of(cx).appearance.is_dark(),
+            self.update_command(cx),
+        );
         let state = self.state.read(cx);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
@@ -182,6 +199,21 @@ impl Shell {
         entries
     }
 
+    fn update_command(&self, cx: &App) -> Option<Entry> {
+        let updates = self.updates.read(cx);
+        updates.available(cx)?;
+        if !updates.install_kind().can_self_update() {
+            return None;
+        }
+        match updates.flow() {
+            crate::updates::Flow::Idle | crate::updates::Flow::Failed(_) => {
+                Some(Entry::InstallUpdate)
+            }
+            crate::updates::Flow::Ready(_) if updates.idle(cx) => Some(Entry::RestartToUpdate),
+            _ => None,
+        }
+    }
+
     fn activate_command(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
         if let Entry::Theme(mode) = entry {
             // Keep the palette open so this ordinary action updates to its next state.
@@ -194,6 +226,9 @@ impl Shell {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
+            Entry::CheckForUpdates => self.check_for_updates(cx),
+            Entry::InstallUpdate => self.updates.update(cx, |updates, cx| updates.start(cx)),
+            Entry::RestartToUpdate => self.updates.update(cx, |updates, cx| updates.restart(cx)),
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -537,42 +572,51 @@ mod tests {
     #[test]
     fn action_search_hides_empty_section_and_preserves_order() {
         assert_eq!(
-            actions_for("", true),
+            actions_for("", true, None),
             vec![
                 Entry::NewChat,
                 Entry::NewProject,
                 Entry::Settings,
+                Entry::CheckForUpdates,
                 Entry::Theme(AppearanceMode::Light)
             ]
         );
         assert_eq!(
-            actions_for("new", true),
+            actions_for("new", true, None),
             vec![Entry::NewChat, Entry::NewProject]
         );
-        assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
+        assert_eq!(actions_for("settings", true, None), vec![Entry::Settings]);
         assert_eq!(
-            actions_for("theme", true),
+            actions_for("theme", true, None),
             vec![Entry::Theme(AppearanceMode::Light)]
         );
-        assert!(actions_for("deployment", true).is_empty());
+        assert!(actions_for("deployment", true, None).is_empty());
+        assert_eq!(
+            actions_for("update", true, Some(Entry::RestartToUpdate)),
+            vec![Entry::RestartToUpdate, Entry::CheckForUpdates]
+        );
+        assert_eq!(
+            actions_for("update wizard", true, Some(Entry::InstallUpdate)),
+            vec![Entry::InstallUpdate]
+        );
     }
 
     #[test]
     fn theme_action_targets_the_opposite_resolved_appearance() {
         assert_eq!(
-            actions_for("theme", true),
+            actions_for("theme", true, None),
             vec![Entry::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            actions_for("theme", false),
+            actions_for("theme", false, None),
             vec![Entry::Theme(AppearanceMode::Dark)]
         );
         assert_eq!(
-            actions_for("light", true),
+            actions_for("light", true, None),
             vec![Entry::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            actions_for("dark", false),
+            actions_for("dark", false, None),
             vec![Entry::Theme(AppearanceMode::Dark)]
         );
     }

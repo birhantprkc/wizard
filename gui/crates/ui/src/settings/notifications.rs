@@ -326,7 +326,7 @@ impl Render for NotificationsPage {
                                     div()
                                         .child(SharedString::from(
                                             "Show a system banner on the same events, so pings \
-                                             reach you while Zeron is in the background.",
+                                             reach you while Wizard GUI is in the background.",
                                         ))
                                         .into_any_element(),
                                 ],
