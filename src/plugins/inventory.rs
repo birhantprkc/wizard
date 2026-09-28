@@ -1,4 +1,4 @@
-//! `wizard plugin`: what this binary has, what it does not, and how to change
+//! `wizard builtins`: what this binary has, what it does not, and how to change
 //! either.
 //!
 //! # Why this surface exists
@@ -14,13 +14,13 @@
 //!
 //! So this is a read-only report, and the honesty is the point: every number in
 //! it comes from the running kernel rather than from a `#[cfg]` at the print
-//! site. `wizard plugin list` asks the kernel what loaded, not what should have
+//! site. `wizard builtins list` asks the kernel what loaded, not what should have
 //! loaded, which is why a plugin that panicked in `apply` (see
 //! [`super::load_rust`], which survives one) is missing from the listing and
 //! present in [`super::catalogue`] — exactly the discrepancy somebody
 //! debugging that would need to see.
 //!
-//! # Why there is no `wizard plugin install`
+//! # Why there is no `wizard builtins install`
 //!
 //! Deliberately deferred, and not for lack of a mechanism: `~/.wizard/plugins/`
 //! already loads a `plugin.lua` or `plugin.js` dropped into it, bounded, as
@@ -42,7 +42,7 @@
 //!   than a command that pretends to have verified something.
 //!
 //! What is here instead is the half that makes the other half safe to write
-//! later: `wizard plugin show` prints the capabilities a plugin declared and
+//! later: `wizard builtins show` prints the capabilities a plugin declared and
 //! what each one grants, in the same words
 //! [`crate::registry_client::grant_prompt`] uses, so the sentence an installer
 //! would have to put in front of a yes/no already exists and is already read
@@ -56,7 +56,7 @@ use crate::cli::PluginCmd;
 use crate::kernel::PluginReport;
 use crate::kernel::manifest::PluginSource;
 
-/// Run `wizard plugin <verb>`. Always exits 0 except when a name was not found.
+/// Run `wizard builtins <verb>`. Always exits 0 except when a name was not found.
 ///
 /// `boot` has already run — every arm of [`crate::run`] is below it — so the
 /// kernel holds the Rust plugins, the bundled scripted ones, and anything the
@@ -108,7 +108,7 @@ fn list_text() {
         println!(
             "No plugins. This binary was built with `--no-default-features`, so it has no\n\
              provider transport, no tools beyond core's, and no plugin-owned subcommands.\n\
-             `wizard plugin missing` lists what a flag would bring back."
+             `wizard builtins missing` lists what a flag would bring back."
         );
         return;
     }
@@ -164,11 +164,11 @@ fn tail() -> String {
     match missing {
         0 => lines.push("Every plugin feature in the tree is in this build.".to_string()),
         1 => lines.push(
-            "One plugin feature is not in this build; `wizard plugin missing` names it."
+            "One plugin feature is not in this build; `wizard builtins missing` names it."
                 .to_string(),
         ),
         n => lines.push(format!(
-            "{n} plugin features are not in this build; `wizard plugin missing` names them."
+            "{n} plugin features are not in this build; `wizard builtins missing` names them."
         )),
     }
     lines.push(format!(
@@ -176,7 +176,8 @@ fn tail() -> String {
         super::kernel().plugin_root().display()
     ));
     lines.push(
-        "`wizard plugin show <name>` for one plugin's capabilities and registrations.".to_string(),
+        "`wizard builtins show <name>` for one plugin's capabilities and registrations."
+            .to_string(),
     );
     lines.join("\n")
 }
@@ -307,8 +308,8 @@ fn show(name: &str, as_json: bool) -> Result<i32> {
     }
 
     eprintln!(
-        "no plugin called `{name}`. `wizard plugin list` shows what this build has, and \
-         `wizard plugin missing` what it does not."
+        "no plugin called `{name}`. `wizard builtins list` shows what this build has, and \
+         `wizard builtins missing` what it does not."
     );
     Ok(1)
 }
@@ -465,7 +466,7 @@ fn missing_text() {
         println!("{}", wrapped(&how_to_get(entry), 2, 78));
         println!();
     }
-    println!("A profile is the shorter way to ask for a set of these: `wizard plugin profiles`.");
+    println!("A profile is the shorter way to ask for a set of these: `wizard builtins profiles`.");
 }
 
 /// The two routes back, and which one is offered depends on whether a stock
@@ -537,7 +538,7 @@ fn profiles_text() {
     if active.is_none() {
         println!(
             "This binary matches no profile: it was built with a hand-picked feature list.\n\
-             `wizard plugin list` shows what it has."
+             `wizard builtins list` shows what it has."
         );
     }
 }
@@ -606,7 +607,7 @@ mod tests {
     /// The input that made this necessary is `wizard peers`' own `about`: it is
     /// a paragraph, because the same string is the first thing
     /// `wizard peers --help` prints, and unwrapped it ran a hundred and sixty
-    /// columns off the side of `wizard plugin show mesh`.
+    /// columns off the side of `wizard builtins show mesh`.
     #[test]
     fn wrapping_respects_the_budget_and_keeps_every_word() {
         let text = "Mesh peers: other machines running Wizard, and what this one \

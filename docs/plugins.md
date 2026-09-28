@@ -12,7 +12,7 @@ apart, and no core module names a plugin.
 
 This page is about those. `wizard plugins` (plural) installs Pi packages, which add
 skills and commands rather than kernel plugins; see [pi-plugins.md](pi-plugins.md).
-`wizard plugin` (singular) lists the kernel plugins in this build.
+`wizard builtins` lists the kernel plugins in this build.
 
 ## Where this stands
 
@@ -353,7 +353,7 @@ not a checkbox list. `--features` is already the checkbox list, and it is the
 wrong shape for the question somebody has while a `curl | bash` is running —
 nobody knows whether they want `graph` before they have used the explorer.
 
-`install.sh` picks one with `WIZARD_PROFILE`; `wizard plugin profiles` prints
+`install.sh` picks one with `WIZARD_PROFILE`; `wizard builtins profiles` prints
 them off an installed binary and marks the one it is.
 
 | Profile | Features | For |
@@ -395,7 +395,7 @@ OpenRouter, vLLM, LM Studio, DeepSeek and the `compat.rs` presets, and
 
 **`custom` is not a profile.** `--features a,b,c` already is one, and giving it
 a name would only add a spelling. A binary built from a hand-picked list reports
-`custom` in `wizard plugin`, which is a description rather than a thing you can
+`custom` in `wizard builtins`, which is a description rather than a thing you can
 ask for.
 
 **`WIZARD_MINIMAL` does not mean `WIZARD_PROFILE=minimal` and must not.** It
@@ -409,7 +409,7 @@ There is also no `~/.wizard/plugins.toml`. The half of a profile that is a cargo
 feature set is fixed at build time and cannot be edited afterwards, and the half
 that is files is `~/.wizard/plugins/`, which is a directory the loader reads —
 so a second file recording what is in it would be a copy that can disagree with
-the thing it describes. `wizard plugin list` reads the loader.
+the thing it describes. `wizard builtins list` reads the loader.
 
 ## The async model, as proven
 
@@ -3111,7 +3111,7 @@ Still open, specific to this:
   `ctx.on` are implemented and tested; `json` uses neither, so the shipped
   surface is one tool.
 
-## As built: profiles are five names and a cargo flag, and `wizard plugin` is how you see any of it
+## As built: profiles are five names and a cargo flag, and `wizard builtins` is how you see any of it
 
 Everything above this line is machinery. Eighteen cargo features, three plugin
 backends, a rule that any one plugin can be deleted, and two scripts that prove
@@ -3121,7 +3121,7 @@ and no way to ask a binary what it had. A feature flag whose effect nobody can
 see is indistinguishable from no feature flag.
 
 This is the half a user touches. It is two things: `WIZARD_PROFILE`, which
-picks a feature set at build time, and `wizard plugin`, which reports one at
+picks a feature set at build time, and `wizard builtins`, which reports one at
 run time.
 
 ### The profile table is the design sketch, corrected in four places
@@ -3135,7 +3135,7 @@ redefined to mean `WIZARD_PROFILE=minimal` because it already means something
 else in `install.sh` and provisioning scripts already set it.
 
 The one addition is `default`. The stock build had no name, so
-`wizard plugin profiles` had nothing to point at when somebody asked which one
+`wizard builtins profiles` had nothing to point at when somebody asked which one
 they had — and every release binary is that build.
 
 ### A profile is arithmetic on Cargo's `default`, not a copy of it
@@ -3201,13 +3201,13 @@ manifest is a value a compiled-in plugin returns — which is why the coverage i
 completed by `contrib/check-tool-plugins.sh`: between its legs and the default
 build, every plugin is loaded in some run of that test.
 
-### `wizard plugin` is a core subcommand, and could not have been a plugin's
+### `wizard builtins` is a core subcommand, and could not have been a plugin's
 
 Every other subcommand whose body ships in a plugin is owned by *one* plugin,
 which registers an `Entrypoint` under a name core looks up. This one is about
 all of them at once, and about the ones that are absent, so there is no plugin
 that could own it — and the build where it matters most is
-`--no-default-features`, where a plugin-owned `wizard plugin` would itself be
+`--no-default-features`, where a plugin-owned `wizard builtins` would itself be
 missing. A surface whose job is to explain an empty build cannot be a member of
 the set it is explaining.
 
@@ -3227,7 +3227,7 @@ every load and unload in the process for as long as a terminal took to scroll.
 ### `entrypoint::description`, and the one place the type parameter is paid for
 
 `entrypoint::installed` is a `TypeId` downcast, so a caller has to already know
-which argument shape a surface was registered at. `wizard plugin` is the first
+which argument shape a surface was registered at. `wizard builtins` is the first
 caller that cannot: it reads a service name off a ledger and has nothing else to
 go on.
 
@@ -3244,7 +3244,7 @@ not a CLI surface at all is told apart from one that is. The mesh registers
 counting those as entrypoints would tell the reader there is a
 `wizard session-tee`. The listing counts them apart for exactly that reason.
 
-### There is no `wizard plugin install`, and that is a decision
+### There is no `wizard builtins install`, and that is a decision
 
 Not for lack of a mechanism. `~/.wizard/plugins/<name>/` already loads a
 `plugin.lua` or a `plugin.js` dropped into it, bounded, as
@@ -3264,7 +3264,7 @@ Not for lack of a mechanism. `~/.wizard/plugins/<name>/` already loads a
   command that pretends to have verified something.
 
 What is built instead is the half that makes the other half safe to write:
-`wizard plugin show` prints the capabilities a plugin declared and what each one
+`wizard builtins show` prints the capabilities a plugin declared and what each one
 grants, in the same words `registry_client::grant_prompt` uses, read off the
 manifest rather than restated. The sentence an installer would have to put in
 front of a yes/no already exists.
@@ -3278,7 +3278,7 @@ binaries.
 The four sets that mode used to build were invented in the script and matched
 nothing a user could ask for — one of them was called `no-mesh` and left `graph`
 in, which turns the mesh back on. It now reads the profile table off a binary
-(`wizard plugin profiles --json`), builds each one, and asks the result which
+(`wizard builtins profiles --json`), builds each one, and asks the result which
 profile it thinks it is. A name that comes back wrong is reported as a mismatch
 rather than as a number, because without that check every row still prints a
 plausible size.
@@ -3343,7 +3343,7 @@ turns "a new plugin should be added to the catalogue too" from a sentence in
 this document into a test failure.
 
 The surface itself is verified on the real binary rather than only in tests:
-`wizard plugin` on a stock build and on a `--no-default-features` one, which are
+`wizard builtins` on a stock build and on a `--no-default-features` one, which are
 the two ends of the range and the second of which is the build the surface
 exists for.
 
@@ -3354,11 +3354,11 @@ exists for.
   so a `minimal` or `pi` install compiles. Publishing a `pi` asset for
   `aarch64` is the obvious next step and it is a release-workflow change, not a
   client one.
-- **`wizard plugin` cannot unload anything.** `Kernel::unload` exists and is
+- **`wizard builtins` cannot unload anything.** `Kernel::unload` exists and is
   exact; there is no verb in front of it. A `/plugin unload` inside a session
   is the shape that was sketched, and it is a different surface from this one.
 - **A profile is not recorded anywhere on the installed machine.** It does not
-  need to be — `wizard plugin profiles` recomputes it from the `cfg!` set the
+  need to be — `wizard builtins profiles` recomputes it from the `cfg!` set the
   binary was built with, which cannot go stale the way a written record can —
   but it does mean `install.sh` cannot tell you what the binary already sitting
   in `/usr/local/bin` is. Running it is the answer.

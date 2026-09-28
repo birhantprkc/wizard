@@ -50,7 +50,7 @@ wizard/
 │   ├── kernel/              # the plugin host: Ctx, event bus, services, Lua VMs
 │   ├── plugins/             # every compiled-in plugin, one per cargo feature (see plugins.md)
 │   │                        #   catalogue.rs / profile.rs / inventory.rs: the feature table,
-│   │                        #   the named build profiles, and `wizard plugin`
+│   │                        #   the named build profiles, and `wizard builtins`
 │   ├── evolve/              # tiered self-extension + publish
 │   ├── commands/            # slash-command registry, shared by every surface
 │   ├── entrypoint.rs        # the lookup a CLI subcommand whose body ships in a plugin goes through

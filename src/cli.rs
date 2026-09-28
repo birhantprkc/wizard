@@ -503,9 +503,12 @@ pub enum Command {
     // name core looks up. This one is about all of them at once and about the
     // ones that are absent, so there is no plugin that could own it: on the
     // build where it matters most — `--no-default-features`, nothing loaded —
-    // a plugin-owned `wizard plugin` would itself be missing. It reads the same
+    // a plugin-owned `wizard builtins` would itself be missing. It reads the same
     // registry the lookups read (`crate::entrypoint::description`) rather than
     // holding a second one.
+    // Spelled `builtins` so it can't be mistaken for `wizard plugins`, which
+    // installs Pi packages. `plugin` stays as a hidden alias for old scripts.
+    #[command(name = "builtins", alias = "plugin")]
     Plugin {
         #[command(subcommand)]
         cmd: Option<PluginCmd>,
@@ -607,14 +610,14 @@ pub enum ComputerDriverArg {
     Scripted,
 }
 
-/// `wizard plugin` subcommands.
+/// `wizard builtins` subcommands.
 ///
 /// Four verbs over one question — "what is in this binary" — split by who is
 /// asking. `list` and `show` are for somebody holding a build they did not
 /// make; `missing` and `profiles` are for somebody about to make one.
 ///
 /// `--json` is per-verb rather than a top-level flag because clap puts a
-/// top-level flag *before* the subcommand (`wizard plugin --json list`), which
+/// top-level flag *before* the subcommand (`wizard builtins --json list`), which
 /// is the wrong way round for something people will type from memory.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum PluginCmd {
@@ -630,7 +633,7 @@ pub enum PluginCmd {
     /// what each one grants, and every tool, command, provider and entrypoint
     /// it registered. Exits 1 if this build does not have it.
     Show {
-        /// The plugin's name, as `wizard plugin list` prints it.
+        /// The plugin's name, as `wizard builtins list` prints it.
         name: String,
         /// Emit JSON instead of a report.
         #[arg(long)]
@@ -1403,12 +1406,20 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Acp)));
     }
 
-    /// `wizard plugin` with no verb is the listing, and each verb parses.
+    /// `wizard builtins` with no verb is the listing, and each verb parses.
     ///
     /// The bare form is the one people will type, so the `Option` on the
     /// subcommand is load-bearing rather than permissive: without it clap
-    /// answers `wizard plugin` with a usage error instead of the report, which
+    /// answers `wizard builtins` with a usage error instead of the report, which
     /// is the whole surface refusing its most obvious invocation.
+    #[test]
+    fn builtins_is_the_name_and_plugin_still_parses() {
+        let cli = parse(&["builtins"]).expect("bare `builtins` parses");
+        assert!(matches!(cli.command, Some(Command::Plugin { cmd: None })));
+        let cli = parse(&["plugins", "list"]).expect("`plugins list` is the Pi installer");
+        assert!(matches!(cli.command, Some(Command::Plugins { .. })));
+    }
+
     #[test]
     fn plugin_subcommands_parse_and_the_bare_form_is_allowed() {
         let cli = parse(&["plugin"]).expect("bare `plugin` parses");

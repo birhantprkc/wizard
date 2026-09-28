@@ -34,7 +34,7 @@
 //!   every provider — stays.
 //! - [`DEFAULT`] is what `cargo install --path .` builds and what every
 //!   published release binary is. It is in the list so that
-//!   `wizard plugin profiles` can say "you have this one" rather than leaving
+//!   `wizard builtins profiles` can say "you have this one" rather than leaving
 //!   the stock build unnamed.
 //!
 //! There is deliberately no profile per feature and no `custom` row.
@@ -73,7 +73,7 @@ enum Shape {
 /// A named plugin set.
 #[derive(Debug, Clone, Copy)]
 pub struct Profile {
-    /// What `WIZARD_PROFILE` and `wizard plugin profiles` call it.
+    /// What `WIZARD_PROFILE` and `wizard builtins profiles` call it.
     pub name: &'static str,
     /// Who it is for, in one line. The question this whole file answers, so it
     /// is phrased as a person and a machine rather than as a feature count.
@@ -111,7 +111,7 @@ pub const DEFAULT: Profile = Profile {
 
 /// Every profile, smallest first.
 ///
-/// The order is the order `wizard plugin profiles` prints, and it is by size
+/// The order is the order `wizard builtins profiles` prints, and it is by size
 /// because that is the axis somebody scanning the list is choosing along.
 pub const PROFILES: &[Profile] = &[MINIMAL, PI, SERVER, DEFAULT];
 

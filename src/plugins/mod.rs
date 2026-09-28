@@ -78,7 +78,7 @@ pub mod bundled;
 // Three ungated modules, and none of them is a plugin. `catalogue` is the one
 // table naming every plugin *feature* — including the ones a build left out,
 // which is the half `compiled_in` below cannot describe; `profile` is the named
-// sets over it; `inventory` is `wizard plugin`, which renders both against the
+// sets over it; `inventory` is `wizard builtins`, which renders both against the
 // running kernel. They live here rather than in core proper so that a plugin
 // added to `compiled_in` and missing from the catalogue is one directory
 // listing apart, and `catalogue`'s tests turn that into a failure.

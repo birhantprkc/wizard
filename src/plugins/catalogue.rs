@@ -41,7 +41,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The word `wizard plugin` prints. Lowercase because it appears in a
+    /// The word `wizard builtins` prints. Lowercase because it appears in a
     /// column beside plugin names, not at the start of a sentence.
     pub fn name(self) -> &'static str {
         match self {
@@ -58,7 +58,7 @@ pub struct Entry {
     /// The cargo feature name, which is what `--features` takes.
     pub feature: &'static str,
     /// The plugin's manifest name, which is what the kernel keys on and what
-    /// `wizard plugin show` takes.
+    /// `wizard builtins show` takes.
     ///
     /// [`None`] for `plugin-js`, which is the one feature in the tree that is
     /// a *backend* rather than a plugin: it registers nothing and its whole
@@ -245,7 +245,7 @@ pub fn feature(name: &str) -> Option<&'static Entry> {
 
 /// The row for one plugin, by the name its manifest carries.
 ///
-/// This is the lookup `wizard plugin show <name>` falls back to when the
+/// This is the lookup `wizard builtins show <name>` falls back to when the
 /// kernel has never heard of the name: on a build without `mesh`, `mesh` is
 /// not a typo, it is a plugin somebody left out, and those two deserve
 /// different answers.
@@ -256,7 +256,7 @@ pub fn plugin(name: &str) -> Option<&'static Entry> {
 /// Feature names this binary was built with, in catalogue order.
 ///
 /// The only place the `cfg!` set is turned back into strings, which is what
-/// [`super::profile::active`] compares against and what `wizard plugin` prints.
+/// [`super::profile::active`] compares against and what `wizard builtins` prints.
 pub fn compiled_features() -> Vec<&'static str> {
     CATALOGUE
         .iter()
@@ -274,7 +274,7 @@ mod tests {
     ///
     /// The failure this catches is a new plugin whose feature nobody added
     /// here: it would load fine, work fine, and be invisible to
-    /// `wizard plugin`, which is the one surface whose entire job is to be
+    /// `wizard builtins`, which is the one surface whose entire job is to be
     /// complete. Asserted against the *process* kernel rather than against
     /// [`super::super::compiled_in`] so it covers the scripted plugins too —
     /// they are a second table and would otherwise need a second test that

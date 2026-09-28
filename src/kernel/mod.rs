@@ -868,7 +868,7 @@ impl Kernel {
     ///
     /// [`manifest_of`] answered half of this already and every other half was
     /// reachable only by asking a different registry a different question and
-    /// hoping nothing moved in between. `wizard plugin show` needs all of it at
+    /// hoping nothing moved in between. `wizard builtins show` needs all of it at
     /// once and needs it to be one consistent picture, so this reads the
     /// `LoadedPlugin` once and hands back an owned snapshot.
     ///

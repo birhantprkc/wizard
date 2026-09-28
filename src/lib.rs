@@ -129,12 +129,12 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         return harness::run(cmd.clone()).map(|()| 0);
     }
 
-    // `wizard plugin`: the report on this binary's own plugin set. Self-
+    // `wizard builtins`: the report on this binary's own plugin set. Self-
     // contained — no config, no onboarding, no LLM — and dispatched here rather
     // than further down for a reason specific to it: the whole point of the
     // surface is that it works on a build where nothing else does. A
     // `--no-default-features` binary has no provider to load a config against,
-    // so a `wizard plugin list` placed after the config load would fail on the
+    // so a `wizard builtins list` placed after the config load would fail on the
     // one build somebody most needs to inspect.
     //
     // `plugins::boot` has already run at the top of this function, so the
@@ -144,7 +144,7 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
     if let Some(cli::Command::Plugin { cmd }) = &cli.command {
         let cmd = cmd
             .clone()
-            // A bare `wizard plugin` is the listing. Every other verb has to be
+            // A bare `wizard builtins` is the listing. Every other verb has to be
             // typed, and the one people will type most is the one they should
             // not have to.
             .unwrap_or(cli::PluginCmd::List { json: false });

@@ -402,7 +402,7 @@ pub fn installed_subcommand(name: &str) -> Option<Arc<Subcommand>> {
 /// The one place the type parameter's sharp edge is paid for deliberately
 /// rather than tripped over. [`installed`] is a `TypeId` downcast, so a caller
 /// that does not already know which argument shape a name was registered at
-/// cannot ask — and `wizard plugin` is exactly that caller: it reads a service
+/// cannot ask — and `wizard builtins` is exactly that caller: it reads a service
 /// name off a plugin's ledger and has nothing else to go on. The three
 /// argument types below are core's own `clap` types, which core already names
 /// in [`crate::cli`] and in its own dispatch chain, so listing them here adds
@@ -410,7 +410,7 @@ pub fn installed_subcommand(name: &str) -> Option<Arc<Subcommand>> {
 /// fourth argument shape lands, instead of a silent [`None`] at the surface.
 ///
 /// [`None`] for a service that is not a surface at all — the mesh's tee
-/// factory is one — and `wizard plugin` prints the bare name for those, which
+/// factory is one — and `wizard builtins` prints the bare name for those, which
 /// is the honest answer rather than a guess.
 pub fn description(name: &str) -> Option<&'static str> {
     if let Some(entry) = installed::<Config>(name) {
