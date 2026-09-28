@@ -74,6 +74,13 @@ enum Command {
         #[command(subcommand)]
         command: WizardAuthCommand,
     },
+    /// Install an agent's CLI the way the Install button does, printing each
+    /// progress change. Exits non-zero unless the agent is installed after.
+    #[command(name = "install-agent", hide = true)]
+    InstallAgent {
+        /// `pi`, `claude-code`, `wizard`, …
+        harness: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -232,6 +239,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Some(Command::InstallAgent { harness }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(install_agent(&harness))
+        }
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -673,5 +684,44 @@ fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+async fn install_agent(harness: &str) -> anyhow::Result<()> {
+    use zeron_harness::install_progress::Progress;
+    let id: zeron_proto::HarnessId = serde_json::from_value(serde_json::json!(harness))
+        .map_err(|_| anyhow::anyhow!("unknown agent {harness:?}"))?;
+    let progress = Progress::default();
+    let task = tokio::spawn(zeron_harness::install::install_harness(
+        id,
+        zeron_harness::CancellationToken::new(),
+        progress.clone(),
+    ));
+    // One line per status or detail change, or per 5% of bar.
+    let mut last = None;
+    let report = |last: &mut Option<(String, Option<String>, u32)>| {
+        let Some(p) = progress.snapshot() else {
+            return;
+        };
+        let percent = (p.fraction * 100.0).floor() as u32;
+        let key = (p.status.clone(), p.detail.clone(), percent / 5);
+        if last.as_ref() != Some(&key) {
+            let detail = p.detail.map(|d| format!("  ({d})")).unwrap_or_default();
+            println!("{percent:>3}%  {}{detail}", p.status);
+            *last = Some(key);
+        }
+    };
+    while !task.is_finished() {
+        report(&mut last);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    report(&mut last);
+    let result = task.await?;
+    let installed = zeron_harness::install::installed(id);
+    println!("installed={installed}");
+    match result {
+        Ok(()) if installed => Ok(()),
+        Ok(()) => anyhow::bail!("the installer finished but {harness} is not installed"),
+        Err(error) => anyhow::bail!("{error}"),
     }
 }
