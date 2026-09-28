@@ -1,0 +1,131 @@
+name: GUI install smoke
+
+# Builds Wizard GUI, installs agents the way its Install button does from the
+# environment a Dock or desktop-launcher start gets (empty HOME, launchd's
+# PATH, no terminal), and on macOS launches the packaged app on the runner's
+# desktop session and screenshots it. Manual, or on pushes to the branch that
+# carries GUI install work.
+on:
+  workflow_dispatch:
+  push:
+    branches: [gui-macos-fixes]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: gui
+
+jobs:
+  macos:
+    name: Install smoke and app launch (macos arm64)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+      - name: Package
+        run: scripts/package-macos.sh
+      - name: Bundle, dock and dmg names
+        run: |
+          set -eux
+          app="target/package/Wizard GUI.app"
+          plutil -p "$app/Contents/Info.plist"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleName)" = "Wizard GUI"
+          test "$(defaults read "$PWD/$app/Contents/Info" CFBundleDisplayName)" = "Wizard GUI"
+          test -x "$app/Contents/MacOS/wizard-gui"
+          test -f "$app/Contents/Resources/wizard-gui.icns"
+          codesign --verify --verbose "$app"
+          dmg="$(ls target/package/*.dmg)"
+          hdiutil attach -nobrowse -readonly "$dmg"
+          ls -la "/Volumes/Wizard GUI"
+          test -d "/Volumes/Wizard GUI/Wizard GUI.app"
+          hdiutil detach "/Volumes/Wizard GUI"
+          tar -tzf target/package/*-app.tar.gz | head -3
+      - name: Install Pi, Claude Code and Wizard from a launchd environment
+        env:
+          HIDE_NODE: /opt/homebrew/bin /usr/local/bin
+        run: |
+          scripts/install-smoke.sh target/release/zeron "$RUNNER_TEMP/smoke" \
+            pi pi-no-shell claude-code wizard pi-no-node
+      - name: Harness install tests on macOS
+        run: cargo test --locked -p zeron-harness --lib -- install_progress gui_path node_bootstrap "install::"
+      - name: Launch the app and walk onboarding
+        env:
+          STEPS: |
+            wait 3
+            shot 02-welcome
+            clickc 193 58 03-get-started
+            burst 04-agents 2
+            clickc 209 38 05-install-pi
+            burst 06-pi 8
+            wait 20
+            shot 07-pi-done
+            clickc 209 110 08-install-claude
+            burst 09-claude 10
+            wait 30
+            shot 10-claude-done
+        run: |
+          cp -R "target/package/Wizard GUI.app" /Applications/
+          scripts/macos-gui-smoke.sh "/Applications/Wizard GUI.app" "$RUNNER_TEMP/shots"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: macos-smoke
+          path: |
+            ${{ runner.temp }}/smoke
+            ${{ runner.temp }}/shots
+
+  linux:
+    name: Install smoke (linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: gpui system libraries
+        run: |
+          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: gui
+      - name: Package
+        run: |
+          PROFILE=debug scripts/package-linux.sh
+          tar -tzf target/package/wizard-gui-*-linux-*.tar.gz
+      - name: Install Pi, Claude Code and Wizard from a desktop-launcher environment
+        env:
+          HIDE_NODE: /usr/local/bin /usr/bin
+        run: |
+          command -v node && node --version || true
+          scripts/install-smoke.sh target/debug/zeron "$RUNNER_TEMP/smoke" \
+            pi pi-no-shell claude-code wizard pi-no-node
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: linux-smoke
+          path: ${{ runner.temp }}/smoke
