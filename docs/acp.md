@@ -148,14 +148,28 @@ as typed.
 
 ## Protocol and scope
 
-`agent-client-protocol` 2.0. Implemented: `initialize`, `authenticate` (a
-no-op — Wizard authenticates to its own providers from `~/.wizard`, so the
-editor never signs it in), `session/new`, `session/list`, `session/load`,
+`agent-client-protocol` 2.0. Implemented: `initialize`, `authenticate` (see
+below), `session/new`, `session/list`, `session/load`,
 `session/set_config_option`, `session/prompt`, `session/cancel`, and the
 `available_commands_update` and `config_option_update` notifications. Everything
 else the crate declares — `session/set_mode`, `session/set_model` (the model is
 a config option instead), session forking, resuming, and deleting — answers
 "method not found".
+
+An editor on a machine where someone already ran `wizard --login` or the
+first-run screen never needs `authenticate`. A client with no terminal, such
+as an app running `wizard acp` on a phone, signs in through it instead.
+`initialize` lists the methods this build can use:
+
+| `methodId` | What it does |
+|---|---|
+| `xai-oauth` | Binds xAI's callback on `127.0.0.1:56121`, sends the sign-in URL as a `_wizard/auth_url` notification (`{"methodId", "url"}`) and to `$BROWSER`, and answers once the browser comes back, within five minutes. An xAI session already on disk is reused unless `_meta.force` is `true`. |
+| `chatgpt-oauth` | The same for ChatGPT, on `localhost:1455`. |
+| `api-key` | `_meta.provider` names a provider from the first-run key list (`xai`, `claude`, `openai`, `openrouter`, `gemini`, `deepseek`, ...) and `_meta.apiKey` its key; `_meta.model` and `_meta.baseUrl` are optional. The key goes to `~/.wizard/credentials.toml`. |
+
+Each one makes its provider the active one in `config.toml`, so the next
+`session/new` uses it. A second `authenticate` cancels an OAuth wait still in
+flight, which frees the callback port for it.
 
 `session/list` pages through `~/.wizard/sessions`, newest first, filtered to
 the client's working directory when it names one; each entry's title is the

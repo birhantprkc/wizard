@@ -519,7 +519,10 @@ async fn an_exec_keeps_its_own_budget_past_the_shell_tools_foreground_one() {
     // One second of foreground budget, and a command asking for five to run
     // for two. Under the old clamp this came back `timed_out = 1`.
     let mut ctx = ToolContext::new(&dir.path);
-    ctx.shell = Arc::new(crate::config::ShellConfig { timeout_secs: 1 });
+    ctx.shell = Arc::new(crate::config::ShellConfig {
+        timeout_secs: 1,
+        ..Default::default()
+    });
     host.bind(binding(ctx, "").0);
 
     let out = call(

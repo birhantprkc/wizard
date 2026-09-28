@@ -462,7 +462,7 @@ pub fn xai_search_credentials() -> bool {
 
 /// Shell tool settings (`[shell]` in `config.toml`).
 ///
-/// These govern `execute` only. The git tools, `search_files` and scripted
+/// The budget governs `execute` only. The git tools, `search_files` and scripted
 /// tools run short commands whose *result* is the whole point of the call, so
 /// they keep their own fixed budgets and are not configurable here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,12 +485,21 @@ pub struct ShellConfig {
     ///
     /// [`BACKGROUND_TIMEOUT`]: crate::tools::tasks::BACKGROUND_TIMEOUT
     pub timeout_secs: u64,
+    /// The shell every command line runs through (`execute`, background
+    /// tasks, hooks, MCP stdio servers). Unset means `sh` from `PATH`, or on
+    /// Android `$SHELL` and then `/system/bin/sh`; see
+    /// [`crate::platform::shell`]. Unlike the budget above this is not
+    /// `execute`'s alone, because two shells in one process is the bug that
+    /// module exists to rule out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             timeout_secs: crate::tools::shell::DEFAULT_FOREGROUND_SECS,
+            program: None,
         }
     }
 }
@@ -1439,6 +1448,9 @@ impl Config {
             Self::default()
         };
         config.apply_env();
+        if let Some(program) = config.shell.program.as_deref().filter(|p| !p.is_empty()) {
+            crate::platform::shell::set_program(program);
+        }
 
         if let Some(name) = config.active_provider_mismatch() {
             tracing::warn!(

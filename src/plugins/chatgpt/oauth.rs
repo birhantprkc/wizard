@@ -280,7 +280,7 @@ where
         "open this URL to sign in with your ChatGPT account:\n{}",
         pending.authorize_url
     ));
-    open_browser(&pending.authorize_url);
+    oauth_callback::open_browser(&pending.authorize_url);
     if let Some(hint) = pending
         .callback_port()
         .and_then(oauth_callback::remote_hint)
@@ -497,20 +497,6 @@ fn bind_callback_listener() -> Result<(TcpListener, u16)> {
         "could not bind the sign-in callback port ({preferred} or {fallback}); \
          is another Codex/wizard sign-in already running?"
     )
-}
-
-fn open_browser(url: &str) {
-    for opener in ["xdg-open", "open"] {
-        if std::process::Command::new(opener)
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok()
-        {
-            return;
-        }
-    }
 }
 
 /// Classify a request target (`/auth/callback?code=…&state=…`).

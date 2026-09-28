@@ -552,6 +552,8 @@ struct AcpSession {
     stdin: std::process::ChildStdin,
     lines: mpsc::Receiver<String>,
     session_id: String,
+    /// The `initialize` reply.
+    initialized: serde_json::Value,
     chats: Chats,
     next_id: u64,
     _server: Server,
@@ -598,15 +600,18 @@ impl AcpSession {
             stdin,
             lines,
             session_id: String::new(),
+            initialized: serde_json::Value::Null,
             chats,
             next_id: 1,
             _server: server,
             _home: home,
         };
-        acp.call(
-            "initialize",
-            serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
-        );
+        acp.initialized = acp
+            .call(
+                "initialize",
+                serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}}),
+            )
+            .0;
         let cwd = acp._home.0.display().to_string();
         let (reply, _) = acp.call(
             "session/new",
@@ -823,4 +828,51 @@ fn acp_unknown_slash_command_goes_to_the_model() {
             .any(|body| body.contains("/frobnicate the widget")),
         "the prompt reached the model as typed: {turns:?}"
     );
+}
+
+/// A client with no terminal to run `wizard --login` in signs in over ACP:
+/// `initialize` lists the methods, and `api-key` makes the key's provider the
+/// active one, with the key in `credentials.toml` and not in `config.toml`.
+#[cfg(feature = "provider-openai")]
+#[test]
+fn acp_api_key_sign_in_makes_its_provider_active() {
+    let mut acp = AcpSession::start("auth");
+    let methods: Vec<String> = acp.initialized["result"]["authMethods"]
+        .as_array()
+        .expect("initialize lists auth methods")
+        .iter()
+        .filter_map(|method| method["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(methods.iter().any(|id| id == "api-key"), "{methods:?}");
+
+    let (reply, _) = acp.call(
+        "authenticate",
+        serde_json::json!({
+            "methodId": "api-key",
+            "_meta": {
+                "provider": "openai",
+                "apiKey": "sk-itest-5f3a",
+                "model": "grok-4.6",
+                "baseUrl": "http://127.0.0.1:9/v1",
+            },
+        }),
+    );
+    assert!(reply.get("error").is_none(), "{reply}");
+    let dir = acp._home.0.join(".wizard");
+    let config = std::fs::read_to_string(dir.join("config.toml")).expect("config.toml");
+    assert!(config.contains("active_provider = \"openai\""), "{config}");
+    assert!(config.contains("http://127.0.0.1:9/v1"), "{config}");
+    assert!(
+        !config.contains("sk-itest-5f3a"),
+        "the key leaked into {config}"
+    );
+    let credentials =
+        std::fs::read_to_string(dir.join("credentials.toml")).expect("credentials.toml");
+    assert!(credentials.contains("sk-itest-5f3a"), "{credentials}");
+
+    let (reply, _) = acp.call(
+        "authenticate",
+        serde_json::json!({ "methodId": "no-such-method" }),
+    );
+    assert!(reply.get("error").is_some(), "{reply}");
 }

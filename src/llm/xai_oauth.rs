@@ -505,7 +505,7 @@ where
         "open this URL to sign in with your xAI account:\n{}",
         pending.authorize_url
     ));
-    open_browser(&pending.authorize_url);
+    oauth_callback::open_browser(&pending.authorize_url);
     if let Some(hint) = oauth_callback::remote_hint(pending.port) {
         report(&hint);
     }
@@ -575,21 +575,6 @@ async fn bind_callback_listener() -> Result<TcpListener> {
                     )
                 });
             }
-        }
-    }
-}
-
-/// Best-effort browser launch; the URL is always printed as a fallback.
-fn open_browser(url: &str) {
-    for opener in ["xdg-open", "open"] {
-        if std::process::Command::new(opener)
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok()
-        {
-            return;
         }
     }
 }
