@@ -125,7 +125,11 @@ pub(crate) async fn list(
             result
         }
     });
-    let result = if disk.is_some() {
+    // A plain load answers from disk when discovery is slow, so the picker
+    // paints at once. A forced one is the caller asking for the live list
+    // (it keeps showing what it has meanwhile), so it waits for discovery;
+    // otherwise it would only ever see the previous refresh's result.
+    let result = if disk.is_some() && !force {
         tokio::time::timeout(Duration::from_millis(100), &mut refresh)
             .await
             .ok()
@@ -339,6 +343,19 @@ mod tests {
             "static"
         );
         assert!(!dir.path().join("model-catalogs/codex/2.json").exists());
+    }
+    #[tokio::test]
+    async fn forced_load_waits_for_a_slow_live_probe_instead_of_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        let context = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &context);
+        let mut old = models();
+        old[0].id = "old-live".into();
+        save(&path, &context, &old).unwrap();
+        probe.delay.store(true, SeqCst);
+        assert_eq!(list(dir.path(), probe, true).await.unwrap(), models());
+        assert_eq!(read(&path, &context), Some(models()));
     }
     #[tokio::test]
     async fn slow_live_probe_returns_disk_and_finishes_in_background() {

@@ -22,9 +22,8 @@ const FILE_NAME: &str = "composer-defaults.json";
 /// Model option picks: option id → choice id (the `ChatConfig` shape).
 pub type ModelOptions = serde_json::Map<String, serde_json::Value>;
 
-/// Remembered model per harness — id plus display label, mirroring zeron's
-/// `modelByHarness` storing the full `Model` object "so the pill never flashes
-/// a raw id or 'Default'".
+/// A model the user pinned for a harness — id plus display label, so the pill
+/// never flashes a raw id or 'Default' before the catalog loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RememberedModel {
@@ -46,8 +45,12 @@ pub struct FavoriteModel {
 pub struct ComposerDefaults {
     /// Last harness picked on the new-chat canvas.
     pub harness: Option<HarnessId>,
-    /// Last model picked, per harness (restored on harness switch).
-    pub model_by_harness: HashMap<HarnessId, RememberedModel>,
+    /// The model new chats start on, per harness, when the user pinned one
+    /// in the picker. Unpinned harnesses start on their catalog's first row —
+    /// the CLI's recommended model, newest first — so a release becomes the
+    /// default without anyone re-picking. Replaces the sticky `modelByHarness`
+    /// (whatever was picked last, kept forever), which is ignored on load.
+    pub default_model_by_harness: HashMap<HarnessId, RememberedModel>,
     /// Last reasoning level picked (global, like zeron's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
     /// Last non-default model option picks (option id → choice id), per
@@ -117,16 +120,24 @@ impl ComposerDefaults {
         data_dir.join(FILE_NAME)
     }
 
-    /// The remembered model for a harness, if any.
-    pub fn model_for(&self, harness: HarnessId) -> Option<&RememberedModel> {
-        self.model_by_harness.get(&harness)
+    /// The model the user pinned for a harness's new chats, if any.
+    pub fn pinned_model(&self, harness: HarnessId) -> Option<&RememberedModel> {
+        self.default_model_by_harness.get(&harness)
     }
 
-    /// Remember a pick (zeron `saveDefaults({ harness, modelByHarness })`).
-    pub fn remember_model(&mut self, harness: HarnessId, id: String, label: String) {
-        self.harness = Some(harness);
-        self.model_by_harness
+    pub fn is_pinned(&self, harness: HarnessId, model: &str) -> bool {
+        self.pinned_model(harness).is_some_and(|m| m.id == model)
+    }
+
+    /// Start this harness's new chats on `id` until unpinned.
+    pub fn pin_model(&mut self, harness: HarnessId, id: String, label: String) {
+        self.default_model_by_harness
             .insert(harness, RememberedModel { id, label });
+    }
+
+    /// Back to the catalog's first row. True when something was pinned.
+    pub fn unpin_model(&mut self, harness: HarnessId) -> bool {
+        self.default_model_by_harness.remove(&harness).is_some()
     }
 
     /// The remembered option picks for one model, if any.
@@ -202,12 +213,12 @@ mod tests {
             reasoning: Some(ReasoningLevel::XHigh),
             ..Default::default()
         };
-        defaults.remember_model(
+        defaults.pin_model(
             HarnessId::ClaudeCode,
             "claude-fable-5".into(),
             "Fable 5".into(),
         );
-        defaults.remember_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
+        defaults.pin_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
         defaults
             .model_options_mut(HarnessId::ClaudeCode, "claude-fable-5")
             .insert("contextWindow".into(), "1m".into());
@@ -215,7 +226,9 @@ mod tests {
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded, defaults);
         assert_eq!(
-            loaded.model_for(HarnessId::ClaudeCode).map(|m| &*m.label),
+            loaded
+                .pinned_model(HarnessId::ClaudeCode)
+                .map(|m| &*m.label),
             Some("Fable 5")
         );
     }
@@ -277,15 +290,33 @@ mod tests {
     }
 
     #[test]
-    fn remember_model_updates_harness_and_row() {
+    fn a_pin_replaces_the_last_and_unpins_per_harness() {
         let mut defaults = ComposerDefaults::default();
-        defaults.remember_model(HarnessId::Codex, "m1".into(), "One".into());
-        defaults.remember_model(HarnessId::Codex, "m2".into(), "Two".into());
-        assert_eq!(defaults.harness, Some(HarnessId::Codex));
-        assert_eq!(
-            defaults.model_for(HarnessId::Codex).map(|m| &*m.id),
-            Some("m2")
-        );
-        assert!(defaults.model_for(HarnessId::ClaudeCode).is_none());
+        defaults.pin_model(HarnessId::Codex, "m1".into(), "One".into());
+        defaults.pin_model(HarnessId::Codex, "m2".into(), "Two".into());
+        assert!(defaults.is_pinned(HarnessId::Codex, "m2"));
+        assert!(!defaults.is_pinned(HarnessId::Codex, "m1"));
+        assert!(defaults.pinned_model(HarnessId::ClaudeCode).is_none());
+        assert!(defaults.unpin_model(HarnessId::Codex));
+        assert!(!defaults.unpin_model(HarnessId::Codex));
+        assert!(defaults.pinned_model(HarnessId::Codex).is_none());
+    }
+
+    /// The old sticky last pick is not a pin: new chats go back to the
+    /// newest model, and the next save drops the key.
+    #[test]
+    fn a_legacy_last_pick_is_not_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ComposerDefaults::path(dir.path()),
+            r#"{"harness":"claude-code","modelByHarness":{"claude-code":{"id":"claude-opus-4-8","label":"Opus 4.8"}}}"#,
+        )
+        .unwrap();
+        let loaded = ComposerDefaults::load(dir.path());
+        assert_eq!(loaded.harness, Some(HarnessId::ClaudeCode));
+        assert!(loaded.pinned_model(HarnessId::ClaudeCode).is_none());
+        loaded.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(ComposerDefaults::path(dir.path())).unwrap();
+        assert!(!text.contains("modelByHarness"));
     }
 }
