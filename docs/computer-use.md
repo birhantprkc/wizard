@@ -1,148 +1,172 @@
-# Computer use (desktop control)
+# Computer use
 
-Wizard can drive your desktop — move and click the mouse, type, press key
-chords, scroll, and take screenshots — through the native `computer` tool. A
-vision-capable model uses it to operate GUI applications the same way a person
-would: look at the screen, decide, act, look again.
+Wizard can drive a desktop through the native `computer` tool: take
+screenshots, move and click the mouse, type, press key chords and scroll. A
+vision-capable model uses it to operate GUI programs the way a person would:
+look, act, look again.
 
-This is real control of your machine, and like every Wizard tool it runs with
-your privileges. **There is no per-action approval gate**: a click, a keystroke
-and a drag happen the moment the model asks for them, with nothing between the
-request and your desktop. `computer` is an `Execute`-access tool, which means
-plan mode refuses it and a read-only subagent never gets it — that is the whole
-of what the access class does. Read [SECURITY.md](../SECURITY.md) and prefer a
-VM or a throwaway session for autonomous runs.
+Computer use is off until you set it up. With it off, the model does not get
+the tool at all; if a task needs a screen, it tells you and offers to set it
+up.
+
+**There is no per-action approval gate.** A click or a keystroke happens the
+moment the model asks for it. `computer` is an `Execute`-access tool, which
+means plan mode refuses it and read-only subagents never get it, and that is
+all the access class does. Read [SECURITY.md](../SECURITY.md). The VM backend
+exists so an autonomous run does not have to touch your own desktop.
 
 > **Vision required.** Screenshots are only useful to a model that can see
-> images: Claude, GPT-4o-class, Grok vision, or a local vision model (e.g. a
-> Qwen-VL / Llama-Vision GGUF). A text-only model can still move the mouse and
-> type from coordinates you give it, but it cannot read the screen.
+> images (Claude, GPT-4o class, Grok, or a local vision model).
 
-## One-time setup
-
-Run the bundled setup command, then follow its final instructions:
+## Setting it up
 
 ```bash
-wizard desktop-setup
+wizard computer setup
 ```
 
-### Linux
+It reports what it found (OS, Wayland or X11, compositor, which tools are
+installed, whether Docker or Podman is available), asks whether to use a VM or
+this desktop, checks the choice by taking a screenshot and moving the pointer
+one pixel and back, and only then writes this to `~/.wizard/config.toml`:
 
-`desktop-setup` detects your distribution and installs the pieces Wizard shells
-out to:
+```toml
+[computer]
+enabled = true
+backend = "vm"        # or "host"
+driver = "native"     # host only: "native" or "scripted"
+```
 
-- **`ydotool`** (+ the `ydotoold` daemon) — input synthesis via the kernel
-  `uinput` interface, so it works on **Wayland and X11** alike.
-- **`grim`** (Wayland) and **`maim`** (X11) — screen capture. Both are
-  installed, because which one is the working tool is a property of the session
-  you happen to be logged into, not of the machine. On X11, ImageMagick's
-  `import` is used as a fallback if it is already present; it is not installed
-  for you.
-- **`slurp`** — the region picker `grim` pairs with. Wizard never invokes it
-  itself (it captures whole screens); it is installed so the same setup covers
-  taking a region by hand.
-- **`at-spi2-core`**, **`xdg-desktop-portal(-gtk)`** — the accessibility and
-  portal stack used by modern desktops.
+In a running session, `/reload` picks it up. `/computer` shows the same report
+as `wizard computer status`. You can also just ask the agent to set it up; the
+`computer` page of its manual tells it how.
 
-It also installs a `udev` rule so the `input` group can open `/dev/uinput`, adds
-you to that group, and enables the `ydotoold` user service.
+Other commands:
 
-**You must log out and back in** (or reboot) after setup — group membership
-does not apply to existing sessions, and until it does `/dev/uinput` access is
-denied.
+| command | what it does |
+| --- | --- |
+| `wizard computer status` | the report, changes nothing |
+| `wizard computer setup --backend vm --yes` | set up without questions |
+| `wizard computer check [--backend host\|vm] [--save shot.png]` | screenshot plus a one-pixel pointer nudge |
+| `wizard computer vm up [--rebuild]` / `down` / `status` | run the VM |
+| `wizard computer disable` | turn it off again |
 
-Supported package managers: `apt` (Debian/Ubuntu/Pop!_OS/Mint), `dnf`
-(Fedora/RHEL/Rocky), `pacman` (Arch/CachyOS/EndeavourOS), `zypper` (openSUSE).
-Other distros: install the packages above by hand, then re-run `desktop-setup`
-to finish the udev/group/service steps.
+## Backends
 
-#### NixOS
+### VM (recommended)
 
-NixOS is declarative, so `desktop-setup` prints the config to add instead of
-installing imperatively:
+A desktop in a local container: Alpine with Xvfb, the fluxbox window manager,
+xterm and x11vnc. `wizard computer vm up` builds the image the first time (the
+recipe is `contrib/computer-vm/`, compiled into the binary), starts the
+container, and publishes VNC on `127.0.0.1:5905` only. The `computer` tool
+talks RFB (VNC) to it for both screenshots and input. Right-click the desktop
+for its menu.
+
+No GPU is needed. Settings live under `[computer.vm]`: `engine` (`docker` or
+`podman`), `image`, `container`, `port`, `width`, `height`. To drive a VM you
+run yourself, such as QEMU with `-vnc :1`, set `address = "127.0.0.1:5901"`;
+Wizard then connects there and leaves starting and stopping to you. The VNC
+server must not ask for a password, so keep it on localhost.
+
+VNC was chosen over running `xdotool` inside the container because one
+connection carries both frames and input with no process per action, the same
+client serves Wizard GUI's live panel and its take-control mode, and any VM
+that speaks VNC works unchanged.
+
+### This desktop, built-in driver
+
+| system | driver |
+| --- | --- |
+| Linux, X11 | ydotool input, maim capture |
+| Linux, Wayland on Hyprland, sway, river, wayfire and other wlroots compositors | ydotool input, grim capture |
+| macOS | CoreGraphics input, `screencapture` (not verified on real hardware yet) |
+
+`wizard desktop-setup` installs the Linux tools (apt, dnf, pacman, zypper),
+adds a uinput udev rule, puts you in the `input` group and enables
+`ydotoold`. Log out and back in afterwards. On NixOS it prints the config to
+add instead:
 
 ```nix
-programs.ydotool.enable = true;            # ydotool + ydotoold + uinput rule
-environment.systemPackages = with pkgs; [
-  grim slurp maim ydotool                  # capture (Wayland + X11) + input
-  at-spi2-core xdg-desktop-portal xdg-desktop-portal-gtk
-];
+programs.ydotool.enable = true;
+environment.systemPackages = with pkgs; [ grim slurp maim ydotool ];
 users.users.<you>.extraGroups = [ "input" "uinput" ];
 ```
 
-Then `sudo nixos-rebuild switch` and re-log. To try it without a rebuild:
-`nix profile install nixpkgs#ydotool nixpkgs#grim nixpkgs#slurp nixpkgs#maim`
-and `systemctl --user start ydotoold`. `desktop-setup` closes by naming which of
-the four binaries are not on `PATH` yet.
+On macOS, grant Accessibility and Screen Recording to the terminal you run
+Wizard from, under System Settings, Privacy & Security, then restart it.
 
-### macOS
+### This desktop, generated driver
 
-Nothing to install — input goes through the built-in **CoreGraphics**
-(`CGEvent`) automation API and capture through `screencapture`. You only have to
-grant two permissions to the terminal (or app bundle) you launch Wizard from,
-under **System Settings → Privacy & Security**:
+Some desktops have no built-in driver: GNOME and KDE on Wayland (grim needs
+wlr-screencopy, which their compositors do not offer), other Wayland
+compositors Wizard does not know, Windows, and WSL. There, `setup` shows a
+plan (for example spectacle for capture on KDE, the GNOME Shell screenshot
+D-Bus call on GNOME, PowerShell on Windows) and asks whether the agent should
+write the tools. On yes it runs the agent, which writes
+`~/.wizard/tools/computer_driver.toml` and `computer_driver.lua`, a normal
+LuaJIT scripted tool, then checks it the same way as the others and sets
+`driver = "scripted"`.
 
-1. **Accessibility** — enable your terminal (Terminal, iTerm, Ghostty, VS Code,
-   …). Without it, mouse and keyboard events are silently dropped.
-2. **Screen Recording** — enable the same terminal. Without it, screenshots come
-   back blank.
+The driver is called once per action with an `args` table:
 
-Fully quit and reopen the terminal after granting each one. `wizard
-desktop-setup` prints these steps on macOS.
+| `action` | other fields | must |
+| --- | --- | --- |
+| `screenshot` | `path` | write a PNG of the whole screen to `path` |
+| `move` | `x`, `y` | move the pointer |
+| `click` | `button` (`left`, `right`, `middle`), `count` | click where the pointer is |
+| `drag` | `x`, `y` | press, move to `(x, y)`, release |
+| `type` | `text` | type it |
+| `key` | `chord` | press a chord like `ctrl+c` |
+| `scroll` | `direction`, `amount` | scroll |
+| `cursor` | | print `x,y`, or error |
 
-## Verifying
+A Lua error fails the action. You can read, edit or delete the files like any
+other scripted tool. The Windows and WSL plans are written but not verified.
 
-```bash
-wizard -p "take a screenshot of my desktop and describe what you see"
-```
+## Watching it in Wizard GUI
 
-A vision model should return a description. If input fails, re-check the log
-out/in step (Linux) or the Accessibility grant (macOS).
+When computer use is active, Wizard GUI shows a small live screen card in the
+top right of the window. Click it to open it large. For the VM it is live: the
+GUI opens its own VNC connection to the address `vm up` recorded in
+`~/.wizard/computer/vm.json`. For this desktop it shows the agent's latest
+screenshot. Either way the agent's last action is drawn on top: a ripple where
+it clicked, a caption for what it typed.
+
+**Take control** pauses the agent and, for the VM, sends your mouse and
+keyboard to that screen. The GUI writes `~/.wizard/computer/control`; while it
+exists the `computer` tool holds every action except screenshots for up to 30
+seconds, then tells the model you have the screen and to look again before
+acting. **Give back** removes it. A lease left by a process that has exited is
+ignored.
+
+The terminal UI and sovereign mode show only the tool call lines, as before.
 
 ## How the model drives it
 
-The tool exposes a single `computer` function with an `action` argument:
+One `computer` function with an `action` argument:
 
-| action            | arguments                          | effect                                   |
-| ----------------- | ---------------------------------- | ---------------------------------------- |
-| `screenshot`      | —                                  | capture the screen, return the image     |
-| `mouse_move`      | `x`, `y`                           | move the pointer                         |
-| `left_click`      | `x`, `y` (optional)                | click (at a point, or where it is)       |
-| `right_click`     | `x`, `y` (optional)                | right click                              |
-| `middle_click`    | `x`, `y` (optional)                | middle click                             |
-| `double_click`    | `x`, `y` (optional)                | double click                             |
-| `left_click_drag` | `x`, `y`                           | press, drag to `(x, y)`, release         |
-| `type`            | `text`                             | type a string                            |
-| `key`             | `text` (e.g. `ctrl+c`, `Return`)   | press a key chord                        |
-| `scroll`          | `scroll_direction`, `scroll_amount`| scroll up/down/left/right                |
-| `cursor_position` | —                                  | report the pointer position (if known)   |
-| `wait`            | `duration` (seconds)               | pause (e.g. for a UI to settle)          |
+| action | arguments | effect |
+| --- | --- | --- |
+| `screenshot` | | capture the screen, return the image |
+| `mouse_move` | `x`, `y` | move the pointer |
+| `left_click`, `right_click`, `middle_click`, `double_click` | `x`, `y` (optional) | click at a point, or where the pointer is |
+| `left_click_drag` | `x`, `y` | press, drag to `(x, y)`, release |
+| `type` | `text` | type a string |
+| `key` | `text` (`ctrl+c`, `Return`) | press a chord |
+| `scroll` | `scroll_direction`, `scroll_amount` | scroll |
+| `cursor_position` | | report the pointer position, if known |
+| `wait` | `duration` (seconds) | pause |
 
-`x`/`y` may also be given as a `coordinate: [x, y]` array.
-
-### Coordinates
-
-Coordinates are **real screen pixels**, origin top-left. Every `screenshot`
-reports the true screen size, and the model works in that space — so its clicks
-map back to the screen 1:1. The returned image may be downscaled for transport
-(to keep large or multi-monitor captures from bloating the request); the model
-reasons about positions proportionally against the reported size.
-
-### Key chords
-
-`key` accepts `+`-separated chords: modifiers `ctrl`, `shift`, `alt`/`option`,
-`meta`/`super`/`cmd`, plus a key name (`Return`, `Tab`, `Escape`, `Up`, `Home`,
-`PageDown`, `F5`, a letter, a digit, …). Examples: `ctrl+c`, `cmd+shift+t`,
-`alt+Tab`.
+Coordinates are real screen pixels with the origin top left; `coordinate:
+[x, y]` works too. Every screenshot reports the true screen size, and the
+image may be downscaled for transport. Chords join modifiers (`ctrl`, `shift`,
+`alt`, `super`/`cmd`) and a key (`Return`, `Tab`, `Escape`, `Up`, `PageDown`,
+`F5`, a letter, a digit) with `+`.
 
 ## Limitations
 
-- **Scroll on Linux** is approximated with arrow keys — `ydotool` 1.0 has no
-  wheel command. It works for most scrollable views; macOS uses real wheel
-  events.
-- **`cursor_position` on Linux** is only available where the compositor can
-  report it (e.g. Hyprland via `hyprctl`); elsewhere it returns "unsupported".
-- **Fractional / HiDPI scaling on Wayland** can offset coordinates on some
-  compositors; capture and click are most reliable at scale 1. macOS reports
-  logical points and is Retina-correct.
-- Windows is not supported.
+- On the Linux host driver, scroll is arrow keys (ydotool 1.0 has no wheel).
+  The VM gets real wheel events.
+- `cursor_position` works on Hyprland and in the VM (last known position),
+  and returns "unsupported" elsewhere on Linux.
+- Fractional scaling on Wayland can offset coordinates on some compositors.
+- The VM backend connects only to VNC servers without a password.

@@ -592,6 +592,18 @@ pub async fn dispatch<S: CommandSurface + Send + ?Sized>(command: SlashCommand, 
             let subscriptions = crate::subscription_usage::collect().await;
             surface.notice(usage_report(&session, &subscriptions));
         }
+        SlashCommand::Computer => {
+            // The file, not this session's copy: `wizard computer setup` runs
+            // in its own process. Blocking because the report asks docker
+            // whether the VM is up.
+            let text = tokio::task::spawn_blocking(|| {
+                let computer = crate::config::Config::computer_on_disk().unwrap_or_default();
+                crate::tools::computer::command::status_report(&computer)
+            })
+            .await
+            .unwrap_or_else(|err| format!("computer: {err}"));
+            surface.notice(text);
+        }
         SlashCommand::Status => {
             let text = status_report(&surface.snapshot());
             surface.notice(text);

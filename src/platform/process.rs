@@ -102,6 +102,28 @@ pub fn terminate_group(leader: u32) {
     }
 }
 
+/// Whether a process with this pid exists.
+///
+/// `true` where the platform cannot be asked, which is the answer that keeps
+/// a lease or a lock honoured rather than broken under a live holder.
+pub fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 delivers nothing; it only checks that the pid
+        // exists. EPERM means it exists and belongs to someone else.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Whether this process is in the foreground process group of its controlling
 /// terminal, i.e. whether it is the thing the keyboard is currently talking to.
 ///

@@ -8,13 +8,24 @@
 //! space the model reasons in is always the real screen size, so clicks map
 //! back 1:1 without any stateful scaling).
 //!
-//! Input and capture are delegated to a per-OS [`Backend`]:
-//! - **Linux** ([`linux`]): `ydotool` for input (works on Wayland and X11 via
-//!   the kernel uinput interface) and `grim`/`maim`/ImageMagick for capture.
-//!   Run `wizard desktop-setup` once to install and enable these.
-//! - **macOS** ([`macos`]): the CoreGraphics event API (`CGEvent`) for input
-//!   and `screencapture` for capture. Requires Accessibility and Screen
-//!   Recording permission for the terminal running Wizard.
+//! Computer use is off until the user sets it up: the tool is registered only
+//! when `[computer] enabled = true`, which `wizard computer setup` writes
+//! after it has checked a backend works ([`command`]). Input and capture are
+//! delegated to a [`Backend`] chosen by `[computer]`:
+//! - **host, native, Linux** ([`linux`]): `ydotool` for input (works on
+//!   Wayland and X11 via the kernel uinput interface) and `grim`/`maim`/
+//!   ImageMagick for capture. `wizard desktop-setup` installs these.
+//! - **host, native, macOS** ([`macos`]): the CoreGraphics event API
+//!   (`CGEvent`) for input and `screencapture` for capture. Requires
+//!   Accessibility and Screen Recording permission for the terminal running
+//!   Wizard.
+//! - **host, scripted** ([`driver`]): a LuaJIT driver the agent generated for
+//!   a system the native one does not cover ([`detect`] decides which).
+//! - **vm** ([`vm`]): a desktop in a local container, over VNC ([`rfb`]).
+//!
+//! Each action is also written to `~/.wizard/computer/` ([`state`]) for Wizard
+//! GUI's live screen panel, and input actions wait while the user holds the
+//! screen through that panel's "Take control".
 //!
 //! Like `execute`, this is real control of the user's machine — and, like
 //! `execute`, nothing gates an individual action. [`ToolAccess::Execute`]
@@ -23,7 +34,13 @@
 //! `ToolAccess`'s own doc says so. There is no per-action approval gate in
 //! Wizard, for this tool or any other (see `SECURITY.md`).
 
+pub mod command;
+pub mod detect;
+pub mod driver;
+pub mod rfb;
 pub mod setup;
+pub mod state;
+pub mod vm;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -34,9 +51,18 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::config::{ComputerBackend, ComputerConfig, HostDriver};
 use crate::llm::Image;
 
+use super::registry::ToolRegistry;
 use super::{Tool, ToolAccess, ToolContext, ToolError, ToolOutput, parse_args};
+
+/// The tool's advertised name.
+pub const TOOL_NAME: &str = "computer";
+
+/// How long an input action waits for the user to give the screen back
+/// before it fails and tells the model why.
+const CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest-side pixel cap applied to a screenshot before it is sent to the
 /// model. Keeps a 4K / multi-monitor capture from ballooning the request;
@@ -93,10 +119,43 @@ pub(crate) trait Backend: Send + Sync {
     fn cursor_position(&self) -> anyhow::Result<(i32, i32)>;
 }
 
-/// Build the backend for the current OS. Always succeeds (the backend checks
-/// its own dependencies per operation); unsupported OSes get a stub whose
-/// every method explains the limitation.
-pub(crate) fn detect() -> Box<dyn Backend> {
+/// The backend `config` selects. Always succeeds: each backend checks its
+/// own dependencies per operation and explains what is missing.
+pub(crate) fn backend_for(config: &ComputerConfig) -> Box<dyn Backend> {
+    match (config.backend, config.driver) {
+        (ComputerBackend::Vm, _) => Box::new(vm::VmBackend::new(config.vm.vnc_address())),
+        (ComputerBackend::Host, HostDriver::Scripted) => Box::new(driver::ScriptedBackend::new()),
+        (ComputerBackend::Host, HostDriver::Native) => native(),
+    }
+}
+
+/// Register the `computer` tool for `config`, or take it out when computer
+/// use is not set up.
+///
+/// [`ToolRegistry::with_native_tools`] carries the tool, so its name stays
+/// reserved against scripted, MCP and registry tools and the harness export
+/// still has its description. Every surface that builds a registry for a
+/// model to use calls this afterwards; with `enabled = false` (the default)
+/// the model never sees a tool that can only fail.
+pub fn configure(registry: &mut ToolRegistry, config: &ComputerConfig) {
+    if config.enabled {
+        registry.register(std::sync::Arc::new(ComputerTool::new(config.clone())));
+    } else {
+        registry.remove(TOOL_NAME);
+    }
+}
+
+/// Locate `bin` on `PATH`.
+pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The built-in driver for this OS. Unsupported OSes get a stub whose every
+/// method explains the limitation.
+fn native() -> Box<dyn Backend> {
     #[cfg(target_os = "linux")]
     {
         Box::new(linux::LinuxBackend::new())
@@ -191,11 +250,26 @@ impl ComputerArgs {
     }
 }
 
-/// `computer` — drive the local desktop: screenshot, move/click the mouse,
-/// type, press keys, scroll.
-pub struct ComputerTool;
+/// `computer` — drive the configured desktop: screenshot, move/click the
+/// mouse, type, press keys, scroll.
+#[derive(Default)]
+pub struct ComputerTool {
+    config: ComputerConfig,
+}
 
 impl ComputerTool {
+    /// The tool for `config`.
+    pub fn new(config: ComputerConfig) -> Self {
+        Self { config }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self.config.backend {
+            ComputerBackend::Host => "host",
+            ComputerBackend::Vm => "vm",
+        }
+    }
+
     fn invalid(&self, message: impl Into<String>) -> ToolError {
         ToolError::InvalidArgs {
             tool: "computer".to_string(),
@@ -213,16 +287,27 @@ impl ComputerTool {
 #[async_trait]
 impl Tool for ComputerTool {
     fn name(&self) -> &str {
-        "computer"
+        TOOL_NAME
     }
 
     fn description(&self) -> &str {
-        "Control the local desktop (computer use): take a screenshot, move and click the mouse, \
-         type text, press key chords, and scroll. Coordinates are real screen pixels with the \
-         origin at the top-left; a 'screenshot' reports the true screen size and returns the \
-         image, so call it first to see the screen and after actions to observe the result. \
-         Requires desktop control to be set up (run `wizard desktop-setup` on Linux; grant \
-         Accessibility + Screen Recording permission on macOS)."
+        match self.config.backend {
+            ComputerBackend::Vm => {
+                "Control a desktop in a local VM (computer use): take a screenshot, move and \
+                 click the mouse, type text, press key chords, and scroll. It is not the user's \
+                 own screen; right-click the desktop for its menu. Coordinates are real screen \
+                 pixels with the origin at the top-left; a 'screenshot' reports the true screen \
+                 size and returns the image, so call it first to see the screen and after \
+                 actions to observe the result."
+            }
+            ComputerBackend::Host => {
+                "Control the user's desktop (computer use): take a screenshot, move and click \
+                 the mouse, type text, press key chords, and scroll. Coordinates are real screen \
+                 pixels with the origin at the top-left; a 'screenshot' reports the true screen \
+                 size and returns the image, so call it first to see the screen and after \
+                 actions to observe the result."
+            }
+        }
     }
 
     fn parameters(&self) -> Value {
@@ -305,14 +390,36 @@ impl Tool for ComputerTool {
         };
         let text = args.text.clone();
 
+        // The user took the screen through Wizard GUI's panel. Looking is fine;
+        // acting is not until they give it back.
+        let is_input = !matches!(action.as_str(), "screenshot" | "cursor_position");
+        if is_input && let Some(holder) = wait_for_control(CONTROL_WAIT).await {
+            return Ok(ToolOutput::error(format!(
+                "The user has taken control of the screen ({holder}) and has not given it back. \
+                 Do not act on it now: wait, then take a screenshot before your next action, \
+                 since they may have changed what is on screen."
+            )));
+        }
+
+        state::record_action(self.backend_name(), &action, target, text.as_deref());
+        let config = self.config.clone();
+        let keep_frame = config.backend == ComputerBackend::Host;
+
         // All backend work is synchronous (shell-outs / native API calls), so
         // run it off the async runtime.
         let result = tokio::task::spawn_blocking(move || {
-            let backend = detect();
+            let backend = backend_for(&config);
             // Tag failures with the active backend so the model (and user)
             // can see which control path was used.
-            run_action(&*backend, &action, target, scroll, text.as_deref())
-                .map_err(|err| err.context(format!("backend: {}", backend.label())))
+            run_action(
+                &*backend,
+                &action,
+                target,
+                scroll,
+                text.as_deref(),
+                keep_frame,
+            )
+            .map_err(|err| err.context(format!("backend: {}", backend.label())))
         })
         .await
         .map_err(|err| ToolError::Execution {
@@ -335,9 +442,10 @@ fn run_action(
     target: Option<(i32, i32)>,
     scroll: Option<(ScrollDirection, u32)>,
     text: Option<&str>,
+    keep_frame: bool,
 ) -> anyhow::Result<ToolOutput> {
     match action {
-        "screenshot" => capture(backend),
+        "screenshot" => capture(backend, keep_frame),
         "mouse_move" => {
             let (x, y) = target.expect("validated");
             backend.mouse_move(x, y)?;
@@ -394,9 +502,12 @@ fn run_action(
 /// Take a screenshot, downscale for transport, and package it as a tool
 /// output carrying the base64 PNG plus a text note giving the real screen
 /// size (the model's coordinate space).
-fn capture(backend: &dyn Backend) -> anyhow::Result<ToolOutput> {
+fn capture(backend: &dyn Backend, keep_frame: bool) -> anyhow::Result<ToolOutput> {
     let shot = backend.screenshot()?;
     let (w, h) = (shot.width, shot.height);
+    if keep_frame {
+        state::record_frame(&shot.png);
+    }
     let delivered = downscale_png(shot.png, SCREENSHOT_MAX_EDGE);
     // `from_bytes` sniffs the media type and enforces the shared image size
     // cap, so an oversized capture is refused here rather than by the provider
@@ -414,6 +525,27 @@ fn capture(backend: &dyn Backend) -> anyhow::Result<ToolOutput> {
         is_error: false,
         images: vec![image],
     })
+}
+
+/// Wait up to `limit` for the user to give the screen back. Returns who
+/// still holds it when the wait runs out, `None` once it is free.
+async fn wait_for_control(limit: std::time::Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let lease = tokio::task::spawn_blocking(state::control_held)
+            .await
+            .ok()
+            .flatten()?;
+        if tokio::time::Instant::now() >= deadline {
+            let holder = if lease.holder.is_empty() {
+                format!("pid {}", lease.pid)
+            } else {
+                lease.holder
+            };
+            return Some(holder);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Read width/height from a PNG's IHDR chunk without decoding the image.
@@ -517,7 +649,7 @@ mod tests {
     #[test]
     fn the_docs_do_not_promise_an_approval_gate_this_tool_does_not_have() {
         assert_eq!(
-            ComputerTool.access(),
+            ComputerTool::default().access(),
             ToolAccess::Execute,
             "if this ever stops being execute-class the docs below are wrong too"
         );
@@ -597,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn missing_coordinates_for_mouse_move_is_invalid_args() {
         let ctx = ToolContext::new(std::env::temp_dir());
-        let err = ComputerTool
+        let err = ComputerTool::default()
             .execute(json!({ "action": "mouse_move" }), &ctx)
             .await
             .expect_err("mouse_move without coords must be rejected");
@@ -607,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn scroll_without_direction_is_invalid_args() {
         let ctx = ToolContext::new(std::env::temp_dir());
-        let err = ComputerTool
+        let err = ComputerTool::default()
             .execute(json!({ "action": "scroll" }), &ctx)
             .await
             .expect_err("scroll without direction must be rejected");
@@ -617,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn wait_action_returns_without_a_backend() {
         let ctx = ToolContext::new(std::env::temp_dir());
-        let out = ComputerTool
+        let out = ComputerTool::default()
             .execute(json!({ "action": "wait", "duration": 0.01 }), &ctx)
             .await
             .expect("wait runs");
@@ -625,10 +757,25 @@ mod tests {
         assert!(out.content.contains("Waited"));
     }
 
+    /// While the user holds the screen, input waits and then fails with a
+    /// message that tells the model to look again before acting.
+    #[tokio::test]
+    async fn input_waits_while_the_user_holds_the_screen() {
+        state::take_control("test panel").expect("write the lease");
+        let held = wait_for_control(std::time::Duration::from_millis(300)).await;
+        state::give_back();
+        assert_eq!(held.as_deref(), Some("test panel"));
+        assert_eq!(
+            wait_for_control(std::time::Duration::from_millis(300)).await,
+            None,
+            "a released screen does not wait"
+        );
+    }
+
     #[test]
     fn computer_tool_is_execute_access() {
-        assert_eq!(ComputerTool.access(), ToolAccess::Execute);
-        assert_eq!(ComputerTool.name(), "computer");
+        assert_eq!(ComputerTool::default().access(), ToolAccess::Execute);
+        assert_eq!(ComputerTool::default().name(), "computer");
     }
 
     /// Full screenshot path: capture → downscale → base64 → tool output with
@@ -638,7 +785,7 @@ mod tests {
     #[ignore = "requires a live display server"]
     async fn screenshot_action_returns_a_valid_png_image() {
         let ctx = ToolContext::new(std::env::temp_dir());
-        let out = ComputerTool
+        let out = ComputerTool::default()
             .execute(json!({ "action": "screenshot" }), &ctx)
             .await
             .expect("screenshot executes");

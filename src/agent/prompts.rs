@@ -329,7 +329,7 @@ choices, vetoes, endorsements, attractor sightings).";
 const CHARTER_DIGEST_LEAD: &str = "\
 Your operating charter (`WIZARD.md`) is bundled in this binary. What follows \
 is its index, not its text: to read a section in full, call the `manual` tool \
-with one of the topic ids below. Read the section before you act on its \
+with a topic id below. Read the section before you act on its \
 subject rather than guessing what it says.";
 
 /// The charter rules that stay resident.
@@ -391,8 +391,43 @@ pub fn manual_pages() -> Vec<ManualPage> {
         title: "Turing: preference log".to_string(),
         body: TURING_RULES.to_string(),
     });
+    // Fixed id for the same reason as `memory`: the charter's ladder points
+    // at topic `computer` by name.
+    pages.push(ManualPage {
+        id: unique_id(&pages, "computer"),
+        title: "Computer use".to_string(),
+        body: format!(
+            "{COMPUTER_USE_RULES}\n\nDriver contract:\n{}",
+            crate::tools::computer::driver::DRIVER_CONTRACT
+        ),
+    });
     pages
 }
+
+/// The `computer` manual page, less the driver contract appended to it.
+const COMPUTER_USE_RULES: &str = "\
+The `computer` tool (screenshots, mouse, keyboard) is built in but off until \
+the user sets it up. If it is not in your tool list, it is not set up.
+
+When a task needs a GUI and the tool is missing:
+1. Say so and offer to set it up. Do not pretend to see a screen you cannot.
+2. With a yes, run `wizard computer status` (execute tool) to see the system \
+and what can drive it.
+3. Prefer the VM, a desktop in a local container apart from the user's own: \
+`wizard computer setup --backend vm --yes`. It needs Docker or Podman.
+4. For the user's own desktop: `wizard computer setup --backend host`. Where \
+Wizard has no built-in driver (GNOME or KDE on Wayland, Windows, WSL) the \
+driver is yours to write: follow the contract below, then check it with \
+`wizard computer check --driver scripted`, then set `[computer] enabled = \
+true`, `driver = \"scripted\"` in ~/.wizard/config.toml.
+5. Run /reload so the tool appears in this session.
+
+Driving it: screenshot first, act, then screenshot again to see what \
+happened. Coordinates are real screen pixels. In the VM, right-click the \
+desktop for its menu; the terminal is there.
+
+If an action says the user has taken control of the screen, stop acting on \
+it, and take a fresh screenshot before your next action.";
 
 /// Look up one manual page by `topic`, the way a user or a model would type
 /// it: the advertised id, a section number (`4`, `§4`), an id prefix, or any

@@ -888,6 +888,11 @@ impl CommandContext<'_> {
         else {
             return;
         };
+        // `wizard computer setup` in another terminal writes `[computer]`;
+        // this is where a running session picks it up.
+        if let Some(computer) = crate::config::Config::computer_on_disk() {
+            self.app.config.computer = computer;
+        }
         match build_registry(&self.app.config, &manager, self.client, &hooks).await {
             Ok((registry, subagent_model)) => {
                 let tool_count = registry.len();

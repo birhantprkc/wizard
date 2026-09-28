@@ -157,6 +157,14 @@ pub async fn run(mut cli: cli::Cli) -> Result<i32> {
         return tools::computer::setup::run().map(|()| 0);
     }
 
+    // `wizard computer`: detection, the VM and the setup flow. Like
+    // `desktop-setup` it starts no agent itself; the one step that needs a
+    // model (writing a driver) runs a child `wizard -p`.
+    if let Some(cli::Command::Computer { cmd }) = &cli.command {
+        let cmd = cmd.clone().unwrap_or(cli::ComputerCmd::Status);
+        return tools::computer::command::run(cmd);
+    }
+
     // MCP server: expose Wizard's tools over stdio to another MCP client.
     // Self-contained — no config, no onboarding, no LLM — so it dispatches
     // before the config load like the other tooling subcommands.

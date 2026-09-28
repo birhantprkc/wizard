@@ -504,6 +504,93 @@ impl Default for ShellConfig {
     }
 }
 
+/// Computer use settings (`[computer]` in `config.toml`).
+///
+/// Off by default. The `computer` tool is not registered at all until
+/// `enabled` is true, so a model on an unprovisioned machine never sees a tool
+/// that can only fail. `wizard computer setup` detects the system, picks a
+/// backend with the user, verifies it, and only then writes `enabled = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerConfig {
+    /// Register the `computer` tool.
+    pub enabled: bool,
+    /// Which screen the tool drives.
+    pub backend: ComputerBackend,
+    /// How the host backend reaches the screen. Ignored for `vm`.
+    pub driver: HostDriver,
+    /// The VM the `vm` backend drives.
+    pub vm: ComputerVmConfig,
+}
+
+/// The screen `computer` drives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputerBackend {
+    /// This machine's own desktop.
+    #[default]
+    Host,
+    /// A desktop in a local container, reached over VNC.
+    Vm,
+}
+
+/// How the host backend sends input and captures the screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostDriver {
+    /// Built in: ydotool plus grim/maim on Linux, CoreGraphics on macOS.
+    #[default]
+    Native,
+    /// The generated LuaJIT driver at `~/.wizard/tools/computer_driver.lua`,
+    /// for systems the built-in driver does not cover.
+    Scripted,
+}
+
+/// The `vm` backend's desktop (`[computer.vm]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerVmConfig {
+    /// Container engine binary: `docker` or `podman`.
+    pub engine: String,
+    /// Image tag `wizard computer vm up` builds and runs.
+    pub image: String,
+    /// Container name.
+    pub container: String,
+    /// Host port the VNC server is published on, bound to 127.0.0.1.
+    pub port: u16,
+    /// Desktop size in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// `host:port` of a VNC server Wizard does not manage (a QEMU `-vnc`
+    /// display, say). When set, `vm up`/`down` leave it alone and the tool
+    /// connects here instead of to the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+impl Default for ComputerVmConfig {
+    fn default() -> Self {
+        Self {
+            engine: "docker".to_string(),
+            image: "wizard-computer-vm".to_string(),
+            container: "wizard-computer-vm".to_string(),
+            port: 5905,
+            width: 1280,
+            height: 800,
+            address: None,
+        }
+    }
+}
+
+impl ComputerVmConfig {
+    /// Where the VNC server listens.
+    pub fn vnc_address(&self) -> String {
+        self.address
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", self.port))
+    }
+}
+
 /// Per-file checkpoint settings (`[checkpoints]` in `config.toml`).
 /// Snapshots of files edited by Wizard land under
 /// `<project>/.wizard/checkpoints/` and power `/rewind` and the perpetual
@@ -1204,6 +1291,10 @@ pub struct Config {
     /// loud failure. See docs/code-mode.md.
     #[serde(default)]
     pub code_mode: bool,
+    /// Computer use (`[computer]`): off until `wizard computer setup` turns it
+    /// on. See [`ComputerConfig`].
+    #[serde(default)]
+    pub computer: ComputerConfig,
 }
 
 /// Default port for the local llama.cpp `llama-server`. Deliberately not 8080:
@@ -1260,6 +1351,7 @@ impl Default for Config {
             fusion: None,
             ultra: None,
             code_mode: false,
+            computer: ComputerConfig::default(),
         }
     }
 }
@@ -1707,6 +1799,25 @@ impl Config {
         let raw = toml::to_string_pretty(self).context("serializing config")?;
         crate::platform::secrets::write_atomic(&path, raw.as_bytes())
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The `[computer]` table as it is on disk now, or `None` when there is no
+    /// config file or it does not parse.
+    ///
+    /// `wizard computer setup` runs in its own process and writes the file,
+    /// so a session that loaded its config before that asks here on `/reload`
+    /// (and the ACP server on every new session) instead of needing a restart
+    /// to see the tool it was just told to set up.
+    pub fn computer_on_disk() -> Option<ComputerConfig> {
+        #[derive(Deserialize)]
+        struct OnlyComputer {
+            #[serde(default)]
+            computer: ComputerConfig,
+        }
+        let raw = std::fs::read_to_string(Self::path().ok()?).ok()?;
+        toml::from_str::<OnlyComputer>(&raw)
+            .ok()
+            .map(|only| only.computer)
     }
 
     /// Apply CLI flag overrides on top of file/env config for this run.

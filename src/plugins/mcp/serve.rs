@@ -32,6 +32,12 @@ use super::{McpToolInfo, PROTOCOL_VERSION};
 /// from `~/.wizard/tools/`.
 pub async fn run(scripted: bool) -> Result<()> {
     let mut registry = ToolRegistry::with_native_tools();
+    // Same rule as the agent: no `computer` unless the user set it up. A
+    // config that does not load leaves it off.
+    let computer = Config::load()
+        .map(|config| config.computer)
+        .unwrap_or_default();
+    crate::tools::computer::configure(&mut registry, &computer);
     if scripted {
         // Best-effort: a missing or malformed tools dir must not stop the
         // server from serving the native tools it already has.
