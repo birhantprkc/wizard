@@ -358,7 +358,8 @@ impl Client {
                     // The X byte is padding; make the buffer honest RGBA.
                     for dy in 0..usize::from(rect.height) {
                         let start = (usize::from(rect.y) + dy) * stride + usize::from(rect.x) * 4;
-                        for px in self.framebuffer[start..start + row].chunks_exact_mut(4) {
+                        let (pixels, _) = self.framebuffer[start..start + row].as_chunks_mut::<4>();
+                        for px in pixels {
                             px[3] = 255;
                         }
                     }

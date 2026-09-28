@@ -200,10 +200,8 @@ impl Backend for VmBackend {
 /// RGBA framebuffer to PNG, dropping the alpha channel (it is always opaque).
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     use image::ImageEncoder;
-    let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
+    let (pixels, _) = rgba.as_chunks::<4>();
+    let rgb: Vec<u8> = pixels.iter().flat_map(|px| [px[0], px[1], px[2]]).collect();
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new_with_quality(
         &mut out,
