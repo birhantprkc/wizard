@@ -207,6 +207,10 @@ impl InstallKind {
                 let id = read_bundle_info(bundle)?.id;
                 let check = |path: &Path| verify_bundle(path, &id, &staged.version);
                 apply_mac(&staged.path, bundle, &check)?;
+                // The staged copy under updates/<version> is spent.
+                if let Some(dir) = staged.path.parent() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
                 if relaunch {
                     relaunch_after_exit(&["/usr/bin/open".as_ref(), bundle.as_os_str()]);
                 }
