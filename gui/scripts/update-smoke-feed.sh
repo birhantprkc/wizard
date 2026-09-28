@@ -16,19 +16,27 @@ cmd="$1"
 dir="$(mkdir -p "$2" && cd "$2" && pwd)"
 shift 2
 
+# macOS's own openssl is LibreSSL, whose certificates here did not verify;
+# use Homebrew's OpenSSL 3 when it is there.
+OPENSSL=openssl
+for candidate in /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+  [ -x "$candidate" ] && OPENSSL="$candidate" && break
+done
+
 case "$cmd" in
 keys)
   for name in test other; do
     [ -f "$dir/$name.key" ] || minisign -G -W -p "$dir/$name.pub" -s "$dir/$name.key" >/dev/null
   done
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=wizard-gui smoke CA" \
+  "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=wizard-gui smoke CA" \
     -keyout "$dir/ca.key" -out "$dir/ca.pem" \
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
-  openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" \
+  "$OPENSSL" req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" \
     -keyout "$dir/server.key" -out "$dir/server.csr" 2>/dev/null
   printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' >"$dir/server.ext"
-  openssl x509 -req -in "$dir/server.csr" -CA "$dir/ca.pem" -CAkey "$dir/ca.key" \
+  "$OPENSSL" x509 -req -in "$dir/server.csr" -CA "$dir/ca.pem" -CAkey "$dir/ca.key" \
     -CAcreateserial -days 2 -extfile "$dir/server.ext" -out "$dir/server.pem" 2>/dev/null
+  "$OPENSSL" verify -CAfile "$dir/ca.pem" "$dir/server.pem"
   echo "keys in $dir: test.pub (trusted), other.pub (not), ca.pem"
   ;;
 publish)
