@@ -294,8 +294,39 @@ fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx
     }
 }
 
+/// The first window's size: 1320×880, shrunk to leave a margin on a smaller
+/// screen. `Bounds::centered` with the full size put the window's left edge
+/// at x = -148 on a 1024×768 display, traffic lights and all off screen, and
+/// 20px off a 1280×800 MacBook.
+fn default_window_size(visible: Option<(f32, f32)>) -> (f32, f32) {
+    const WANT: (f32, f32) = (1320.0, 880.0);
+    let Some((w, h)) = visible.filter(|(w, h)| *w > 0.0 && *h > 0.0) else {
+        return WANT;
+    };
+    let fit = |want: f32, room: f32| want.min((room * 0.92).floor());
+    (fit(WANT.0, w), fit(WANT.1, h))
+}
+
+fn default_main_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+    let Some(visible) = cx.primary_display().map(|display| display.visible_bounds()) else {
+        return Bounds::centered(None, size(px(1320.), px(880.)), cx);
+    };
+    let (width, height) = default_window_size(Some((
+        f32::from(visible.size.width),
+        f32::from(visible.size.height),
+    )));
+    let size = size(px(width), px(height));
+    Bounds::new(
+        gpui::point(
+            visible.origin.x + (visible.size.width - size.width) / 2.0,
+            visible.origin.y + (visible.size.height - size.height) / 2.0,
+        ),
+        size,
+    )
+}
+
 fn restored_main_window_bounds(cx: &App) -> (Bounds<gpui::Pixels>, Option<gpui::DisplayId>) {
-    let fallback = (Bounds::centered(None, size(px(1320.), px(880.)), cx), None);
+    let fallback = (default_main_window_bounds(cx), None);
     let Some(saved) = settings::current(cx).window_geometry else {
         return fallback;
     };
@@ -480,6 +511,23 @@ fn start_appshot_capture(
         cx.background_executor()
             .spawn(async { appshots::capture_active_window().await }),
     )
+}
+
+#[cfg(test)]
+mod default_window_tests {
+    use super::default_window_size;
+
+    #[test]
+    fn the_first_window_fits_small_screens_and_keeps_its_size_on_big_ones() {
+        assert_eq!(default_window_size(None), (1320.0, 880.0));
+        assert_eq!(default_window_size(Some((2560.0, 1415.0))), (1320.0, 880.0));
+        // A 1280×800 MacBook, menu bar and Dock taken off.
+        let (w, h) = default_window_size(Some((1280.0, 775.0)));
+        assert!(w < 1280.0 && h < 775.0, "{w}×{h}");
+        // The macOS runner's 1024×768.
+        let (w, h) = default_window_size(Some((1024.0, 743.0)));
+        assert!(w <= 1024.0 && h <= 743.0, "{w}×{h}");
+    }
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
