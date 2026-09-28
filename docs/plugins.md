@@ -10,6 +10,10 @@ behind a cargo feature, **or** a script loaded at runtime from
 `~/.wizard/plugins/` — LuaJIT or JavaScript. The kernel cannot tell the three
 apart, and no core module names a plugin.
 
+This page is about those. `wizard plugins` (plural) installs Pi packages, which add
+skills and commands rather than kernel plugins; see [pi-plugins.md](pi-plugins.md).
+`wizard plugin` (singular) lists the kernel plugins in this build.
+
 ## Where this stands
 
 The sections below marked **As built** are a chronological record: each one

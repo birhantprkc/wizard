@@ -6,6 +6,22 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+### Added
+
+- **Pi plugins in Wizard (beta).** `wizard plugins search|inspect|install|list|remove`
+  installs a Pi package for Wizard, for Pi (`--for pi` runs `pi install`), or for
+  both. Skills are copied into `~/.wizard/skills`, and prompt templates become
+  commands that expand Pi's placeholders. Extensions and themes are listed as not
+  supported yet. `/plugins` does the same in the TUI with pickers. See
+  [docs/pi-plugins.md](docs/pi-plugins.md).
+
+### Changed
+
+- **Wizard GUI's Pi extensions page is now Plugins.** Install asks whether a
+  package goes to Pi and Wizard, only Wizard, or only Pi, shows what would work
+  in Wizard first, and the installed list has Remove for each. Devices without
+  Wizard keep the Pi-only page.
+
 ## [3.6.1] - 2026-09-27
 
 ### Fixed
