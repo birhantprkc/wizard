@@ -64,6 +64,45 @@ fn slow_catalog_delay() -> Option<std::time::Duration> {
         .map(std::time::Duration::from_millis)
 }
 
+/// How often an open window reloads the model lists it has.
+const CATALOG_POLL: Duration = Duration::from_secs(30 * 60);
+
+/// How long after a cached load its revalidation asks again. Discovery (a
+/// CLI's `initialize`, an ACP `session/new`) takes a few seconds; by this
+/// point the harness's in-memory catalog holds the live answer.
+const REVALIDATE_AFTER: Duration = Duration::from_secs(15);
+
+/// How a model list is fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelLoad {
+    /// Whatever the engine has at once: its disk snapshot when discovery is
+    /// slow. A [`ModelLoad::Revalidate`] follows so live rows replace it.
+    Cached,
+    /// Wait for live discovery (`force`): the picker is open on these rows.
+    Live,
+    /// The follow-up to [`ModelLoad::Cached`]; it schedules nothing further.
+    Revalidate,
+}
+
+struct ModelPinTooltip(&'static str);
+
+impl Render for ModelPinTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Catalog invalidation (Settings → Agents toggles)
 // ---------------------------------------------------------------------------
@@ -515,8 +554,8 @@ struct SettingGroup {
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
-    /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
-    /// new-chat chips and is rewritten on every new-chat pick.
+    /// Sticky new-chat picks (zeron `zeron.composer.defaults:v1`): harness,
+    /// reasoning, options, favorites, and the models pinned as defaults.
     defaults: ComposerDefaults,
     /// Where [`Self::defaults`] persists (`{data_dir}/composer-defaults.json`);
     /// `None` before bootstrap stamps the state (writes are skipped).
@@ -600,6 +639,8 @@ pub struct Pickers {
     _state_observe: Subscription,
     _catalog_observe: Subscription,
     _models_observe: Subscription,
+    /// Reloads the loaded model lists every [`CATALOG_POLL`].
+    _catalog_poll: Task<()>,
 }
 
 impl Pickers {
@@ -710,8 +751,22 @@ impl Pickers {
         if let Some(kind) = boot_open {
             open.open(kind);
         }
-        // Sticky last-used picks: loaded synchronously so the very first frame
-        // shows the remembered harness/model/reasoning, never a placeholder.
+        // A window stays open for days while catalogs move under it (a CLI
+        // update ships a model, a sign-in widens the list): reload whatever
+        // is loaded on a slow cadence.
+        let catalog_poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CATALOG_POLL).await;
+                if this
+                    .update(cx, |pickers, cx| pickers.reload_loaded_models(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // Sticky picks: loaded synchronously so the very first frame shows
+        // the remembered harness/pinned model/reasoning, never a placeholder.
         let data_dir = state.read(cx).data_dir.clone();
         let defaults = data_dir
             .as_deref()
@@ -770,6 +825,7 @@ impl Pickers {
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
             _models_observe: models_observe,
+            _catalog_poll: catalog_poll,
         }
     }
 
@@ -841,7 +897,8 @@ impl Pickers {
     }
 
     /// Effective model id: the draft pick, the selected chat's config, or (on
-    /// the new-chat canvas) the remembered last-used model for the harness.
+    /// the new-chat canvas) the model pinned for the harness. `None` there
+    /// means the catalog's first row — the harness's newest/recommended one.
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -850,7 +907,7 @@ impl Pickers {
             return chat.config.as_ref().and_then(|c| c.model.as_deref());
         }
         let harness = self.effective_harness(cx)?;
-        self.defaults.model_for(harness).map(|m| m.id.as_str())
+        self.defaults.pinned_model(harness).map(|m| m.id.as_str())
     }
 
     /// Effective reasoning — always concrete once the model is known: the
@@ -886,7 +943,7 @@ impl Pickers {
             .or_else(|| {
                 let remembered = self
                     .effective_harness(cx)
-                    .and_then(|h| self.defaults.model_for(h));
+                    .and_then(|h| self.defaults.pinned_model(h));
                 match self.effective_model_id(cx) {
                     Some(id) => Some(
                         remembered
@@ -1267,9 +1324,32 @@ impl Pickers {
         if !reload {
             return;
         }
+        let load = if force {
+            ModelLoad::Live
+        } else {
+            ModelLoad::Cached
+        };
+        self.load_models(harness, load, cx);
+    }
+
+    /// Reload every list that is already loaded (the [`CATALOG_POLL`] tick).
+    fn reload_loaded_models(&mut self, cx: &mut Context<Self>) {
+        let loaded: Vec<HarnessId> = self
+            .models
+            .iter()
+            .filter(|(_, slot)| matches!(slot, Loadable::Ready(_)))
+            .map(|(harness, _)| *harness)
+            .collect();
+        for harness in loaded {
+            self.load_models(harness, ModelLoad::Cached, cx);
+        }
+    }
+
+    fn load_models(&mut self, harness: HarnessId, load: ModelLoad, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        let force = load == ModelLoad::Live;
         let target = self.space_target(cx);
         let generation = self.target_generation;
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
@@ -1329,7 +1409,30 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                let ready = matches!(loaded, Loadable::Ready(_));
                 pickers.apply_model_catalog(harness, loaded, cx);
+                if ready && load == ModelLoad::Cached {
+                    pickers.schedule_revalidation(harness, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fetch `harness`'s list again once the discovery its cached load
+    /// started has had time to land, so the live rows replace the snapshot
+    /// without anyone reopening the picker.
+    fn schedule_revalidation(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let generation = self.target_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REVALIDATE_AFTER).await;
+            this.update(cx, |pickers, cx| {
+                if pickers.target_generation == generation
+                    && matches!(pickers.models.get(&harness), Some(Loadable::Ready(_)))
+                {
+                    pickers.load_models(harness, ModelLoad::Revalidate, cx);
+                }
             })
             .ok();
         })
@@ -1352,6 +1455,13 @@ impl Pickers {
         {
             tracing::warn!(%error, ?harness, "Model refresh failed; retaining visible rows");
             cx.notify();
+            return;
+        }
+        if let (Loadable::Ready(models), Some(Loadable::Ready(shown))) =
+            (&loaded, self.models.get(&harness))
+            && models == shown
+        {
+            // A revalidation that found nothing new: keep the rows as they are.
             return;
         }
         if let Loadable::Ready(models) = &loaded {
@@ -1550,7 +1660,7 @@ impl Pickers {
             return;
         }
         if self.config.harness != Some(harness) {
-            // The remembered model for this harness takes over via the
+            // The harness's pinned model, or its newest, takes over via the
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
             self.config.reasoning = None;
@@ -1575,19 +1685,9 @@ impl Pickers {
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
         } else {
-            // New chat: draft pick + sticky last-used memory for this harness.
-            self.config.model = Some(model_id.clone());
-            if let Some(harness) = self.effective_harness(cx) {
-                let label = self
-                    .models
-                    .get(&harness)
-                    .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| model_id.clone());
-                self.defaults.remember_model(harness, model_id, label);
-                self.save_defaults();
-            }
+            // New chat: this chat only. Later chats keep starting on the
+            // pinned model, or the newest one; the row's pin changes that.
+            self.config.model = Some(model_id);
         }
         cx.notify();
     }
@@ -1917,6 +2017,20 @@ impl Pickers {
         // starred row instead left its cursor wash next to the selected
         // row's ring: "two highlighted rows" (user report, twice).
         self.active = self.selected_model_index(cx);
+        cx.notify();
+    }
+
+    /// Pin `model` as the harness's default for new chats, or unpin it so
+    /// new chats go back to the catalog's first (newest) row.
+    fn toggle_default_model(&mut self, harness: HarnessId, model: &Model, cx: &mut Context<Self>) {
+        if self.defaults.is_pinned(harness, &model.id) {
+            self.defaults.unpin_model(harness);
+        } else {
+            self.defaults
+                .pin_model(harness, model.id.clone(), model.label.clone());
+        }
+        self.save_defaults();
+        self.catalog_rev += 1;
         cx.notify();
     }
 
@@ -4007,6 +4121,8 @@ impl Pickers {
                 == Some(row.model.id.as_str());
         let is_active = ix == self.active;
         let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
+        let is_pinned = self.defaults.is_pinned(row.harness, &row.model.id);
+        let pin_model = row.model.clone();
         let (icon_path, tint) = harness_brand_icon(row.harness);
         let label: SharedString = row.model.label.clone().into();
         let harness_name = row.harness_name.clone();
@@ -4152,6 +4268,47 @@ impl Pickers {
             .child(body);
         if ix < 9 {
             el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+        }
+        // The pin sits on the hovered row and stays on the pinned one, so the
+        // list is not a column of pins while still saying which is default.
+        if is_pinned || is_active {
+            el = el.child(
+                div()
+                    .id(("model-pin", ix))
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(popover::MENU_ITEM_RADIUS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(crate::theme::ink(0.08)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_default_model(harness, &pin_model, cx);
+                    }))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| {
+                            ModelPinTooltip(if is_pinned {
+                                "New chats start on this model. Click to follow the newest again"
+                            } else {
+                                "Start new chats on this model"
+                            })
+                        })
+                        .into()
+                    })
+                    .tooltip_show_delay(std::time::Duration::from_millis(350))
+                    .child(
+                        crate::icons::icon(crate::icons::PIN)
+                            .size(px(13.0))
+                            .text_color(if is_pinned {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                    ),
+            );
         }
         el = el.child(
             div()
@@ -6386,6 +6543,10 @@ mod tests {
 
             pickers.pick_model("haiku".into(), cx);
             assert!(pickers.resolved(cx).model_options.is_empty());
+            // Pinned, so Haiku is what a new chat sends after a restart.
+            pickers
+                .defaults
+                .pin_model(HarnessId::ClaudeCode, "haiku".into(), "Haiku".into());
 
             // Restart (draft cleared) and send before the catalog is usable.
             for catalog in [
@@ -6603,7 +6764,7 @@ mod tests {
         );
         assert_eq!(
             models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            vec!["Opus 5.5", "Fable 5", "Sonnet 5", "Haiku 4.5", "Nova 1"]
+            vec!["Opus 5.5", "Fable 5", "Sonnet 5.5", "Haiku 4.5", "Nova 1"]
         );
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
@@ -6882,6 +7043,45 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    /// A pick is for the chat it was made in. New chats start on the first
+    /// catalog row — so a release the CLI lists first becomes the default on
+    /// its own — unless a model is pinned, which holds through refreshes.
+    #[gpui::test]
+    fn new_chats_follow_the_newest_model_unless_one_is_pinned(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults.harness = Some(HarnessId::ClaudeCode);
+            let catalog =
+                |ids: &[&str]| Loadable::Ready(ids.iter().map(|id| bare_model(id, id)).collect());
+            pickers
+                .models
+                .insert(HarnessId::ClaudeCode, catalog(&["opus-5", "sonnet-5"]));
+            pickers.pick_model("sonnet-5".into(), cx);
+            assert_eq!(pickers.resolved(cx).model.as_deref(), Some("sonnet-5"));
+
+            // Next new chat: back to the newest.
+            pickers.config = DraftConfig::default();
+            assert_eq!(pickers.resolved(cx).model.as_deref(), Some("opus-5"));
+            pickers.models.insert(
+                HarnessId::ClaudeCode,
+                catalog(&["opus-6", "opus-5", "sonnet-5"]),
+            );
+            assert_eq!(pickers.resolved(cx).model.as_deref(), Some("opus-6"));
+
+            // Pinned: kept when a newer model arrives, until unpinned.
+            let sonnet = bare_model("sonnet-5", "sonnet-5");
+            pickers.toggle_default_model(HarnessId::ClaudeCode, &sonnet, cx);
+            pickers.models.insert(
+                HarnessId::ClaudeCode,
+                catalog(&["opus-7", "opus-6", "opus-5", "sonnet-5"]),
+            );
+            assert_eq!(pickers.resolved(cx).model.as_deref(), Some("sonnet-5"));
+            pickers.toggle_default_model(HarnessId::ClaudeCode, &sonnet, cx);
+            assert_eq!(pickers.resolved(cx).model.as_deref(), Some("opus-7"));
+        });
     }
 
     #[test]

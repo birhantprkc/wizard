@@ -83,6 +83,12 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ### Changed
 
+- **New chats in Wizard GUI start on the newest model.** Picking a model is
+  for that chat only; pin a model on its picker row to make it the default for
+  new chats. Model lists refresh from live discovery instead of showing the
+  previous refresh's list, and Claude Code's models follow the CLI's own order,
+  with Sonnet 5.5 added.
+
 - **Web search defaults to `auto`.** With xAI credentials (`/login xai`, a
   stored key, or `XAI_API_KEY`) `web_search` uses Grok's server-side search and
   its cited results; without them it is DuckDuckGo as before. `grok` is now the
@@ -112,6 +118,17 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
   under the new names.
 
 ### Fixed
+
+- **A chat could kill the Wizard process running it.** An agent that cleaned
+  up "stale" `wizard acp` processes (after a flaky USB bridge, say) ran
+  `kill <pid>` or `pkill -f 'wizard acp'` and took out its own host. The host
+  shuts down on SIGTERM with exit code 0, so Wizard GUI reported "Wizard exited
+  unexpectedly (exit code 0)", and every follow-up prompt started a new host
+  that the same cleanup killed again. `execute` now refuses a command that
+  signals Wizard or one of its parents, by pid, process group, `$PPID`, or a
+  `pkill`, `killall`, `pgrep | xargs kill` or `ps | grep | xargs kill` pattern
+  that matches them. The refusal names the process and says to kill by the
+  explicit pid it started instead.
 
 - **Pi would not install on macOS.** pi.dev's installer needs Node.js 22
   and only offers to install it from a terminal, so an app started from the

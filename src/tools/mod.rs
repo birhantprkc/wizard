@@ -10,6 +10,9 @@ pub mod compact;
 pub mod computer;
 pub mod evolve;
 pub mod file;
+/// Refuses an `execute` that would signal Wizard's own process or its parents.
+#[cfg(unix)]
+pub mod host_guard;
 /// The client, the SSRF guard, the redirect walk and the body cap. Core, and
 /// shared by the web plugin, the image downloader and a Lua plugin's
 /// `wizard.http`; see the module doc for where that line is drawn.
