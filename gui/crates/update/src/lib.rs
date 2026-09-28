@@ -508,7 +508,23 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Zeron.app`
+/// Bundle layouts an app tarball may carry, newest first: `Wizard GUI.app`
+/// with its `wizard-gui` executable, then the upstream `Zeron.app`.
+const MAC_APP_LAYOUTS: [(&str, &str); 2] = [
+    ("Wizard GUI.app", "Contents/MacOS/wizard-gui"),
+    ("Zeron.app", "Contents/MacOS/zeron"),
+];
+
+/// The complete bundle unpacked in `dir`, if any.
+fn staged_mac_bundle(dir: &Path) -> Option<PathBuf> {
+    MAC_APP_LAYOUTS
+        .iter()
+        .map(|(bundle, exe)| (dir.join(bundle), *exe))
+        .find(|(bundle, exe)| bundle.join(exe).exists())
+        .map(|(bundle, _)| bundle)
+}
+
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
@@ -519,8 +535,7 @@ pub async fn stage_mac_app(
     require_mac_app_update_platform()?;
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
-    let staged = dir.join("Zeron.app");
-    if staged.join("Contents/MacOS/zeron").exists() {
+    if let Some(staged) = staged_mac_bundle(&dir) {
         return Ok(staged);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -538,10 +553,8 @@ pub async fn stage_mac_app(
         ],
     )?;
     std::fs::remove_file(&tarball).ok();
-    if !staged.join("Contents/MacOS/zeron").exists() {
-        bail!("app tarball {file} did not contain Zeron.app");
-    }
-    Ok(staged)
+    staged_mac_bundle(&dir)
+        .with_context(|| format!("app tarball {file} did not contain Wizard GUI.app"))
 }
 
 /// Swap the installed bundle for the staged one: `ditto` the staged copy next to
@@ -967,6 +980,20 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+    }
+
+    #[test]
+    fn staged_mac_bundle_prefers_the_wizard_gui_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(staged_mac_bundle(dir.path()), None);
+        let legacy = dir.path().join("Zeron.app");
+        std::fs::create_dir_all(legacy.join("Contents/MacOS")).unwrap();
+        std::fs::write(legacy.join("Contents/MacOS/zeron"), "").unwrap();
+        assert_eq!(staged_mac_bundle(dir.path()), Some(legacy));
+        let current = dir.path().join("Wizard GUI.app");
+        std::fs::create_dir_all(current.join("Contents/MacOS")).unwrap();
+        std::fs::write(current.join("Contents/MacOS/wizard-gui"), "").unwrap();
+        assert_eq!(staged_mac_bundle(dir.path()), Some(current));
     }
 
     #[test]

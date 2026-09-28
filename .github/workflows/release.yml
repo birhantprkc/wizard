@@ -803,8 +803,8 @@ jobs:
           mkdir out
           for f in gui-dist/*; do
             base="$(basename "$f")"
-            # zeron-<app version>-<platform>.<ext> -> wizard-gui-<ver>-<platform>.<ext>
-            platform="$(printf '%s' "$base" | sed -E 's/^zeron-[0-9][^-]*-//')"
+            # {zeron,wizard-gui}-<app version>-<platform>.<ext> -> wizard-gui-<ver>-<platform>.<ext>
+            platform="$(printf '%s' "$base" | sed -E 's/^(zeron|wizard-gui)-[0-9][^-]*-//')"
             cp "$f" "out/wizard-gui-${ver}-${platform}"
           done
           ls -l out

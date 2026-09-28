@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Linux packaging: build the release binary and produce
-#   target/package/zeron-<version>-linux-<arch>.tar.gz
-# containing the binary, the .desktop entry, and the icon, plus an install.sh
-# that drops them into ~/.local (XDG) paths.
+#   target/package/wizard-gui-<version>-linux-<arch>.tar.gz
+# containing the binary (as wizard-gui), the .desktop entry, and the icon, plus
+# an install.sh that drops them into ~/.local (XDG) paths.
 #
 # Usage: scripts/package-linux.sh
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
@@ -15,7 +15,7 @@ PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 OUT_DIR="$ROOT/target/package"
-STAGE="$OUT_DIR/zeron-$VERSION-linux-$ARCH"
+STAGE="$OUT_DIR/wizard-gui-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
@@ -29,23 +29,33 @@ fi
 
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
-install -m 755 "$BIN" "$STAGE/zeron"
-install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
-install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
+install -m 755 "$BIN" "$STAGE/wizard-gui"
+install -m 644 "$ROOT/dist/wizard-gui.desktop" "$STAGE/wizard-gui.desktop"
+install -m 644 "$ROOT/dist/wizard-gui.png" "$STAGE/wizard-gui.png"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
-# Install Zeron into ~/.local (no root needed).
+# Install Wizard GUI into ~/.local (no root needed).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-install -Dm755 "$HERE/zeron" "$HOME/.local/bin/zeron"
-install -Dm644 "$HERE/zeron.desktop" "$HOME/.local/share/applications/zeron.desktop"
-install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/zeron.png"
+APPS="$HOME/.local/share/applications"
+ICONS="$HOME/.local/share/icons/hicolor/1024x1024/apps"
+install -Dm755 "$HERE/wizard-gui" "$HOME/.local/bin/wizard-gui"
+install -Dm644 "$HERE/wizard-gui.desktop" "$APPS/wizard-gui.desktop"
+install -Dm644 "$HERE/wizard-gui.png" "$ICONS/wizard-gui.png"
+# Earlier packages installed the same app as zeron. Drop that launcher entry
+# (only if it is ours) so the menu does not list Wizard GUI twice.
+if [ -f "$APPS/zeron.desktop" ] && grep -q '^Name=Wizard GUI$' "$APPS/zeron.desktop"; then
+  rm -f "$APPS/zeron.desktop" "$ICONS/zeron.png"
+  if [ -e "$HOME/.local/bin/zeron" ]; then
+    echo "An older copy is still at ~/.local/bin/zeron; remove it if nothing else uses it."
+  fi
+fi
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
-echo "Installed. Make sure ~/.local/bin is on your PATH."
+echo "Installed. Open Wizard GUI from your app menu, or run wizard-gui (~/.local/bin must be on PATH)."
 INSTALL
 chmod 755 "$STAGE/install.sh"
 

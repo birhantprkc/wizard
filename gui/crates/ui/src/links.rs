@@ -52,7 +52,7 @@ pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
 pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
     let rest = url
         .strip_prefix("zeron://open/chat/")
-        .ok_or("not a Zeron conversation link")?;
+        .ok_or("not a Wizard GUI conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
         return Err("invalid conversation id");

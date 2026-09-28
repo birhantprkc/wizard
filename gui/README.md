@@ -38,8 +38,8 @@ Screenshots are in [docs/screenshots/power-user](docs/screenshots/power-user).
 
 Every Wizard release from 3.5.0 on carries the app:
 
-- Linux: `wizard-gui-<version>-linux-<arch>.tar.gz`. Unpack it and run `./install.sh`, which puts `zeron` in `~/.local/bin` and adds a desktop entry.
-- macOS (Apple silicon): `wizard-gui-<version>-macos-arm64.dmg`. It is not signed or notarized unless the release had signing credentials, so the first launch needs right click, Open.
+- Linux: `wizard-gui-<version>-linux-<arch>.tar.gz`. Unpack it and run `./install.sh`, which puts `wizard-gui` in `~/.local/bin` and adds a Wizard GUI desktop entry.
+- macOS (Apple silicon): `wizard-gui-<version>-macos-arm64.dmg`. It is not signed or notarized unless the release had signing credentials, so the first launch needs right click, Open. Drag `Wizard GUI.app` into Applications; `wizard gui` finds it there.
 - Windows: `wizard-gui-<version>-windows-x86_64.zip`. Unpack it and run `zeron.exe`.
 
 Updates come from the same releases page; the app does not update itself.
@@ -53,13 +53,13 @@ cargo run --release -p zeron
 
 Linux needs the gpui libraries: xkbcommon, wayland, x11/xcb, fontconfig, freetype, alsa, vulkan and webkit2gtk-4.1 (the list the release workflow installs is in `.github/workflows/release.yml`). The sidebar browser also needs the [Linux browser runtime](docs/reference/linux-browser.md). Windows source builds are covered in [docs/reference/windows-development.md](docs/reference/windows-development.md).
 
-Day to day:
+Day to day (a source build's binary is `target/release/zeron`; the Linux package installs it as `wizard-gui`):
 
 ```bash
-zeron status
-zeron daemon start|stop|restart|status
+wizard-gui status
+wizard-gui daemon start|stop|restart|status
 ```
 
-Everything is local by default. The optional multi-device sync (`zeron login`) goes through Zeron's hosted service.
+Everything is local by default. The optional multi-device sync (`wizard-gui login`) goes through Zeron's hosted service.
 
 How the pieces fit is in [ARCHITECTURE.md](ARCHITECTURE.md).

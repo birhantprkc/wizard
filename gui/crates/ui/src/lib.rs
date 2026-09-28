@@ -407,7 +407,7 @@ fn open_main_window(
                 // — if these two ever disagree, vibrancy dies on the first theme
                 // change and never comes back.
                 window_background: theme::Theme::of(cx).window_background_appearance(),
-                app_id: Some("zeron".into()),
+                app_id: Some("wizard-gui".into()),
                 ..Default::default()
             },
             move |window, cx| {
