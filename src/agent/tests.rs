@@ -4230,6 +4230,7 @@ fn tool_names(registry: &ToolRegistry) -> Vec<String> {
 
 /// Chat mode is the web tools and nothing else. `x_search` rides along only
 /// when the active provider is xAI, by key or by sign-in.
+#[cfg(feature = "tool-web")]
 #[tokio::test]
 async fn chat_mode_offers_only_the_web_tools_and_x_search_only_on_xai() {
     use crate::llm::registry::ProviderKind;
@@ -4263,6 +4264,7 @@ async fn chat_mode_offers_only_the_web_tools_and_x_search_only_on_xai() {
 
 /// What reaches the provider is what counts: a chat turn's request carries the
 /// web tools and no `execute`, file, edit or subagent tool.
+#[cfg(feature = "tool-web")]
 #[tokio::test]
 async fn a_chat_turn_sends_only_the_web_tools() {
     let tmp = TempDir::new();
@@ -4287,6 +4289,7 @@ async fn a_chat_turn_sends_only_the_web_tools() {
 
 /// `/mode chat` and back: the project tools are set aside, not lost, and a
 /// `/reload` while chatting keeps the chat cut.
+#[cfg(feature = "tool-web")]
 #[tokio::test]
 async fn switching_to_chat_and_back_restores_the_project_tools() {
     let tmp = TempDir::new();
