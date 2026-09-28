@@ -1,14 +1,21 @@
-//! Settings → Pi extensions: browse the Pi package gallery, install with one
-//! click, and manage the packages the selected device's Pi loads.
+//! Settings → Plugins: browse the Pi package gallery and install a package
+//! for Pi, for Wizard, or both, on the selected device.
 //!
 //! Pi packages bundle extensions, skills, prompt templates, and themes. The
 //! gallery is every npm package tagged `pi-package` (what pi.dev/packages
-//! lists), searched straight from the npm registry by this viewport. Package
-//! state lives with Pi on the target device, so installs, removals, and
-//! updates go through the engine's relay-forwardable `*PiPackage*` RPCs, and
-//! the page-header device switcher (the Agents pattern) retargets them.
+//! lists), searched straight from the npm registry by this viewport.
+//!
+//! Pi keeps its packages itself, so its half goes through the engine's
+//! relay-forwardable `*PiPackage*` RPCs (`pi install`). Wizard can use the
+//! same packages in beta: skills and prompt templates work, extensions and
+//! themes don't yet. Its half goes through the `*WizardPlugin*` RPCs, which
+//! run `wizard plugins … --json` on the device, and an Install first asks
+//! Wizard what would work (`inspect`) so the choice is made knowing. The
+//! page-header device switcher (the Agents pattern) retargets all of it; a
+//! device without Wizard, or with a Wizard too old for plugins, gets the
+//! Pi-only page it always had.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use gpui::{
@@ -16,7 +23,8 @@ use gpui::{
     div, prelude::*, px,
 };
 use serde::Deserialize;
-use zeron_engine::pi_packages::{PiPackage, PiPackageKind, PiPackages};
+use zeron_engine::pi_packages::{PiPackage, PiPackageKind, PiPackages, package_key};
+use zeron_engine::wizard_plugins::{WizardPlugin, WizardPluginChange, WizardPlugins};
 use zeron_proto::HarnessId;
 use zeron_rpc::methods;
 
@@ -31,6 +39,8 @@ const GALLERY_SEARCH_URL: &str = "https://registry.npmjs.org/-/v1/search";
 const GALLERY_PAGE_URL: &str = "https://pi.dev/packages";
 const GALLERY_SIZE: &str = "40";
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+const BETA_LINE: &str =
+    "Wizard can use Pi plugins in beta: skills and prompts work, extensions don't yet.";
 
 /// One gallery result (an npm search hit tagged `pi-package`).
 #[derive(Clone, Debug, PartialEq)]
@@ -43,29 +53,166 @@ struct GalleryPackage {
     url: String,
 }
 
+/// Which harness an install goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallTarget {
+    Both,
+    Wizard,
+    Pi,
+}
+
+impl InstallTarget {
+    fn label(self) -> &'static str {
+        match self {
+            InstallTarget::Both => "Pi and Wizard",
+            InstallTarget::Wizard => "Only Wizard",
+            InstallTarget::Pi => "Only Pi",
+        }
+    }
+
+    fn wizard(self) -> bool {
+        matches!(self, InstallTarget::Both | InstallTarget::Wizard)
+    }
+
+    fn pi(self) -> bool {
+        matches!(self, InstallTarget::Both | InstallTarget::Pi)
+    }
+}
+
+/// The choices the "Install for" row offers, given which agents can take a
+/// package on this device.
+pub(crate) fn target_options(pi: bool, wizard: bool) -> Vec<InstallTarget> {
+    let mut options = Vec::new();
+    if pi && wizard {
+        options.push(InstallTarget::Both);
+    }
+    if wizard {
+        options.push(InstallTarget::Wizard);
+    }
+    if pi {
+        options.push(InstallTarget::Pi);
+    }
+    options
+}
+
+/// The preselected choice: both when both agents are here and neither has
+/// the package, otherwise whichever is still missing it. `None` when no
+/// agent can take it.
+pub(crate) fn default_target(
+    pi: bool,
+    wizard: bool,
+    in_pi: bool,
+    in_wizard: bool,
+) -> Option<InstallTarget> {
+    match (pi, wizard) {
+        (true, true) => Some(match (in_pi, in_wizard) {
+            (true, false) => InstallTarget::Wizard,
+            (false, true) => InstallTarget::Pi,
+            _ => InstallTarget::Both,
+        }),
+        (false, true) => Some(InstallTarget::Wizard),
+        (true, false) => Some(InstallTarget::Pi),
+        (false, false) => None,
+    }
+}
+
+/// One line on what Wizard makes of a package.
+pub(crate) fn support_line(plugin: &WizardPlugin) -> String {
+    let (works, missing) = plugin.support();
+    match (works.is_empty(), missing.is_empty()) {
+        (true, true) => "Wizard found no skills, prompts, or extensions in it.".to_string(),
+        (true, false) => format!("Nothing in it runs in Wizard yet ({missing})."),
+        (false, true) => format!("In Wizard: {works}."),
+        (false, false) => format!("In Wizard: {works}. Not supported yet: {missing}."),
+    }
+}
+
+/// A package installed for Pi, Wizard, or both, keyed the way Pi tells
+/// packages apart.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InstalledRow {
+    pub key: String,
+    pub pi: Option<PiPackage>,
+    pub wizard: Option<WizardPlugin>,
+}
+
+impl InstalledRow {
+    fn name(&self) -> String {
+        self.wizard
+            .as_ref()
+            .map(|w| w.name.clone())
+            .or_else(|| self.pi.as_ref().map(|p| p.name.clone()))
+            .unwrap_or_else(|| self.key.clone())
+    }
+}
+
+pub(crate) fn merge_installed(pi: &[PiPackage], wizard: &[WizardPlugin]) -> Vec<InstalledRow> {
+    let mut rows: BTreeMap<String, InstalledRow> = BTreeMap::new();
+    for package in pi {
+        rows.entry(package.name.clone())
+            .or_insert_with(|| InstalledRow {
+                key: package.name.clone(),
+                pi: None,
+                wizard: None,
+            })
+            .pi = Some(package.clone());
+    }
+    for plugin in wizard {
+        let key = package_key(&plugin.source);
+        rows.entry(key.clone())
+            .or_insert_with(|| InstalledRow {
+                key,
+                pi: None,
+                wizard: None,
+            })
+            .wizard = Some(plugin.clone());
+    }
+    rows.into_values().collect()
+}
+
+/// The "Install for" chooser, open under the row (or source field) it
+/// belongs to.
+#[derive(Clone, Debug)]
+struct Choice {
+    source: String,
+    target: InstallTarget,
+    /// Opened from the typed source field rather than a gallery row.
+    typed: bool,
+    /// What Wizard would install, when Wizard is one of the options.
+    inspect: Loadable<WizardPlugin>,
+}
+
 /// The one package operation in flight — Pi serializes them anyway, and one
 /// at a time keeps each row's spinner honest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pending {
     InstallPi,
-    Install(String),
-    Remove(String),
+    Install {
+        source: String,
+        target: InstallTarget,
+    },
+    RemovePi(String),
+    RemoveWizard(String),
     Update(Option<String>),
 }
 
-pub struct PiExtensionsPage {
+pub struct PluginsPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
-    /// Which device's Pi is shown/edited; `None` = this device.
+    /// Which device's agents are shown/edited; `None` = this device.
     target_device: Option<String>,
     device_menu_open: bool,
     device_menu_pressed_open: bool,
     packages: Loadable<PiPackages>,
+    wizard: Loadable<WizardPlugins>,
     load_task: Option<Task<()>>,
+    wizard_task: Option<Task<()>>,
     pending: Option<Pending>,
     op_task: Option<Task<()>>,
     error: Option<String>,
     notice: Option<String>,
+    choice: Option<Choice>,
+    inspect_task: Option<Task<()>>,
     search: Entity<ComposerInput>,
     source: Entity<ComposerInput>,
     gallery: Loadable<Vec<GalleryPackage>>,
@@ -74,7 +221,7 @@ pub struct PiExtensionsPage {
     _subscriptions: Vec<Subscription>,
 }
 
-impl PiExtensionsPage {
+impl PluginsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| {
             ComposerInput::new("Search the Pi gallery", cx)
@@ -114,11 +261,15 @@ impl PiExtensionsPage {
             device_menu_open: false,
             device_menu_pressed_open: false,
             packages: Loadable::Idle,
+            wizard: Loadable::Idle,
             load_task: None,
+            wizard_task: None,
             pending: None,
             op_task: None,
             error: None,
             notice: None,
+            choice: None,
+            inspect_task: None,
             search,
             source,
             gallery: Loadable::Idle,
@@ -150,22 +301,60 @@ impl PiExtensionsPage {
         self.op_task = None;
         self.error = None;
         self.notice = None;
+        self.choice = None;
+        self.inspect_task = None;
         self.packages = Loadable::Idle;
+        self.wizard = Loadable::Idle;
         self.load(cx);
         cx.notify();
     }
 
+    /// Pi can take a package on the target device.
+    fn pi_ready(&self) -> bool {
+        self.packages.ready().is_some_and(|p| p.pi_installed)
+    }
+
+    /// Wizard can take a package on the target device. An engine too old to
+    /// know the Wizard RPCs answers with an error, which reads as "no".
+    fn wizard_ready(&self) -> bool {
+        self.wizard.ready().is_some_and(WizardPlugins::available)
+    }
+
+    fn wizard_plugins(&self) -> &[WizardPlugin] {
+        self.wizard
+            .ready()
+            .map(|w| w.plugins.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn pi_packages(&self) -> &[PiPackage] {
+        self.packages
+            .ready()
+            .filter(|p| p.pi_installed)
+            .map(|p| p.packages.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Both lists, in parallel. Each reply is dropped if the device switcher
+    /// moved on while it was in flight.
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         let params = self.with_target(serde_json::json!({}));
+        if !matches!(self.packages, Loadable::Ready(_)) {
+            self.packages = Loadable::Loading;
+        }
+        if !matches!(self.wizard, Loadable::Ready(_)) {
+            self.wizard = Loadable::Loading;
+        }
         let target = self.target_device.clone();
-        self.packages = Loadable::Loading;
+        let pi_engine = engine.clone();
+        let pi_params = params.clone();
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
+            let result = pi_engine
                 .client()
-                .call(methods::LIST_PI_PACKAGES, params)
+                .call(methods::LIST_PI_PACKAGES, pi_params)
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| {
@@ -183,10 +372,129 @@ impl PiExtensionsPage {
             })
             .ok();
         }));
+        let target = self.target_device.clone();
+        self.wizard_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_WIZARD_PLUGINS, params)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<WizardPlugins>(value).map_err(|e| e.to_string())
+                });
+            this.update(cx, |page, cx| {
+                if page.target_device != target {
+                    return;
+                }
+                page.wizard = match result {
+                    Ok(list) => Loadable::Ready(list),
+                    Err(error) => Loadable::Error(error),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
-    /// Run one package operation on the target device; every reply carries
-    /// the refreshed package list.
+    /// Start an install: open the "Install for" chooser when Wizard is an
+    /// option (it shows what would work there), or go straight to Pi when
+    /// Pi is the only agent that can take it.
+    fn begin_install(&mut self, source: String, typed: bool, cx: &mut Context<Self>) {
+        if self.pending.is_some() {
+            return;
+        }
+        let pi = self.pi_ready();
+        let wizard = self.wizard_ready();
+        if !wizard {
+            if pi {
+                self.run(
+                    Pending::Install {
+                        source,
+                        target: InstallTarget::Pi,
+                    },
+                    cx,
+                );
+            }
+            return;
+        }
+        let key = package_key(&source);
+        let in_pi = self.pi_packages().iter().any(|p| p.name == key);
+        let in_wizard = self
+            .wizard_plugins()
+            .iter()
+            .any(|p| package_key(&p.source) == key);
+        let target = default_target(pi, wizard, in_pi, in_wizard).unwrap_or(InstallTarget::Wizard);
+        self.error = None;
+        self.notice = None;
+        self.choice = Some(Choice {
+            source: source.clone(),
+            target,
+            typed,
+            inspect: Loadable::Loading,
+        });
+        self.inspect(source, cx);
+        cx.notify();
+    }
+
+    fn inspect(&mut self, source: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({ "source": source }));
+        self.inspect_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::INSPECT_WIZARD_PLUGIN, params)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<WizardPlugin>(value).map_err(|e| e.to_string())
+                });
+            this.update(cx, |page, cx| {
+                if let Some(choice) = page.choice.as_mut()
+                    && choice.source == source
+                {
+                    choice.inspect = match result {
+                        Ok(plugin) => {
+                            // Nothing Wizard can run: Pi is the only
+                            // sensible target, when Pi is here.
+                            if plugin.support().0.is_empty() && choice.target == InstallTarget::Both
+                            {
+                                choice.target = InstallTarget::Pi;
+                            }
+                            Loadable::Ready(plugin)
+                        }
+                        Err(error) => Loadable::Error(error),
+                    };
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn confirm_choice(&mut self, cx: &mut Context<Self>) {
+        let Some(choice) = self.choice.take() else {
+            return;
+        };
+        self.inspect_task = None;
+        self.run(
+            Pending::Install {
+                source: choice.source,
+                target: choice.target,
+            },
+            cx,
+        );
+    }
+
+    fn cancel_choice(&mut self, cx: &mut Context<Self>) {
+        self.choice = None;
+        self.inspect_task = None;
+        cx.notify();
+    }
+
+    /// Run one package operation on the target device: its RPCs in order,
+    /// stopping at the first failure, then both lists refreshed.
     fn run(&mut self, pending: Pending, cx: &mut Context<Self>) {
         if self.pending.is_some() {
             return;
@@ -194,65 +502,91 @@ impl PiExtensionsPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let (method, params) = match &pending {
-            Pending::InstallPi => (
+        let calls: Vec<(&'static str, serde_json::Value)> = match &pending {
+            Pending::InstallPi => vec![(
                 methods::INSTALL_HARNESS,
                 serde_json::json!({ "harness": HarnessId::Pi }),
-            ),
-            Pending::Install(source) => (
-                methods::INSTALL_PI_PACKAGE,
-                serde_json::json!({ "source": source }),
-            ),
-            Pending::Remove(source) => (
+            )],
+            Pending::Install { source, target } => {
+                let mut calls = Vec::new();
+                if target.wizard() {
+                    calls.push((
+                        methods::INSTALL_WIZARD_PLUGIN,
+                        serde_json::json!({ "source": source }),
+                    ));
+                }
+                if target.pi() {
+                    calls.push((
+                        methods::INSTALL_PI_PACKAGE,
+                        serde_json::json!({ "source": source }),
+                    ));
+                }
+                calls
+            }
+            Pending::RemovePi(source) => vec![(
                 methods::REMOVE_PI_PACKAGE,
                 serde_json::json!({ "source": source }),
-            ),
-            Pending::Update(source) => (
+            )],
+            Pending::RemoveWizard(name) => vec![(
+                methods::REMOVE_WIZARD_PLUGIN,
+                serde_json::json!({ "name": name }),
+            )],
+            Pending::Update(source) => vec![(
                 methods::UPDATE_PI_PACKAGES,
                 match source {
                     Some(source) => serde_json::json!({ "source": source }),
                     None => serde_json::json!({}),
                 },
-            ),
+            )],
         };
-        let params = self.with_target(params);
+        let calls: Vec<_> = calls
+            .into_iter()
+            .map(|(method, params)| (method, self.with_target(params)))
+            .collect();
         let target = self.target_device.clone();
         self.pending = Some(pending.clone());
         self.error = None;
         self.notice = None;
         self.op_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(method, params)
-                .await
-                .map_err(|error| error.to_string());
+            let mut done: Vec<&'static str> = Vec::new();
+            let mut installed: Option<WizardPlugin> = None;
+            let mut failure: Option<String> = None;
+            for (method, params) in calls {
+                match engine.client().call(method, params).await {
+                    Ok(value) => {
+                        if method == methods::INSTALL_WIZARD_PLUGIN {
+                            installed = serde_json::from_value::<WizardPluginChange>(value)
+                                .ok()
+                                .map(|change| change.plugin);
+                        }
+                        done.push(method);
+                    }
+                    Err(error) => {
+                        failure = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
             this.update(cx, |page, cx| {
                 if page.target_device != target {
                     return;
                 }
                 page.pending = None;
-                match result {
-                    Ok(value) => match &pending {
-                        // InstallHarness replies with the harness catalog;
-                        // re-probe Pi and let the composer see the new agent.
-                        Pending::InstallPi => {
+                match failure {
+                    None => {
+                        if pending == Pending::InstallPi {
+                            // InstallHarness replies with the harness catalog;
+                            // let the composer see the new agent.
                             crate::pickers::bump_harness_catalog(cx);
-                            page.notice = Some("Pi is installed. Add extensions below.".into());
-                            page.load(cx);
                         }
-                        _ => match serde_json::from_value::<PiPackages>(value) {
-                            Ok(list) => {
-                                page.notice = Some(success_notice(&pending));
-                                if matches!(pending, Pending::Install(_)) {
-                                    page.source.update(cx, |input, cx| input.set_text("", cx));
-                                }
-                                page.packages = Loadable::Ready(list);
-                            }
-                            Err(error) => page.error = Some(error.to_string()),
-                        },
-                    },
-                    Err(error) => page.error = Some(failure_notice(&pending, &error)),
+                        if matches!(pending, Pending::Install { .. }) {
+                            page.source.update(cx, |input, cx| input.set_text("", cx));
+                        }
+                        page.notice = Some(success_notice(&pending, installed.as_ref()));
+                    }
+                    Some(error) => page.error = Some(failure_notice(&pending, &done, &error)),
                 }
+                page.load(cx);
                 cx.notify();
             })
             .ok();
@@ -266,7 +600,7 @@ impl PiExtensionsPage {
             return;
         }
         match zeron_engine::pi_packages::normalize_source(&typed) {
-            Ok(source) => self.run(Pending::Install(source), cx),
+            Ok(source) => self.begin_install(source, true, cx),
             Err(message) => {
                 self.error = Some(message);
                 cx.notify();
@@ -353,7 +687,7 @@ impl PiExtensionsPage {
 
         let mut trigger =
             div()
-                .id("pi-extensions-device-switcher")
+                .id("plugins-device-switcher")
                 .flex_none()
                 .h(px(28.0))
                 .px(px(8.0))
@@ -427,8 +761,8 @@ impl PiExtensionsPage {
                     let glyph = platform_glyph(&d.platform);
                     let name: SharedString = d.name.clone().into();
                     let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("pi-extensions-device-row-{ix}"))
-                        .id(("pi-extensions-device-row", ix))
+                    popover::menu_row(theme, is_active, format!("plugins-device-row-{ix}"))
+                        .id(("plugins-device-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let target = (!is_local).then(|| pick_id.clone());
                             this.set_target_device(target, cx);
@@ -462,11 +796,7 @@ impl PiExtensionsPage {
                         )
                 }))
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu(
-                "pi-extensions-device-menu",
-                menu,
-                None,
-            ));
+            trigger = trigger.child(popover::anchored_menu("plugins-device-menu", menu, None));
         }
         trigger.into_any_element()
     }
@@ -516,18 +846,36 @@ impl PiExtensionsPage {
             .into_any_element()
     }
 
+    /// The "Beta" pill and the one line about what Wizard runs.
+    fn beta_line(&self, theme: &Theme) -> AnyElement {
+        div()
+            .mt(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_muted)
+            .child(widgets::badge(theme, "Beta"))
+            .child(div().min_w_0().child(SharedString::from(BETA_LINE)))
+            .into_any_element()
+    }
+
     fn render_install_pi(
         &self,
         packages: &PiPackages,
+        wizard: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let installing = self.pending == Some(Pending::InstallPi);
         let mut meta = vec![
             div()
-                .child(SharedString::from(
-                    "Extensions run inside the Pi coding agent. Install Pi on this device to add them.",
-                ))
+                .child(SharedString::from(if wizard {
+                    "Wizard can take plugins already. Install Pi to add them there too."
+                } else {
+                    "Extensions run inside the Pi coding agent. Install Pi on this device to add them."
+                }))
                 .into_any_element(),
         ];
         if installing {
@@ -575,11 +923,12 @@ impl PiExtensionsPage {
 
     fn render_installed(
         &self,
-        packages: &PiPackages,
+        rows: &[InstalledRow],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let updating_all = self.pending == Some(Pending::Update(None));
+        let any_pi = rows.iter().any(|row| row.pi.is_some());
         let header = div()
             .mt(px(28.0))
             .flex()
@@ -587,7 +936,7 @@ impl PiExtensionsPage {
             .items_center()
             .justify_between()
             .child(widgets::field_label(theme, "Installed"))
-            .when(!packages.packages.is_empty(), |el| {
+            .when(any_pi, |el| {
                 el.child(if updating_all {
                     self.spinner_line("pi-update-all-spinner".into(), "Updating…", theme, cx)
                 } else {
@@ -600,24 +949,22 @@ impl PiExtensionsPage {
                     )
                 })
             });
-        let card = if packages.packages.is_empty() {
+        let card = if rows.is_empty() {
             widgets::section_card(theme).mt(px(10.0)).child(
                 widgets::card_row(theme, true).child(
                     div()
                         .text_size(crate::typography::ui_rems(widgets::ROW_DESCRIPTION_SIZE))
                         .text_color(theme.text_muted.opacity(0.8))
                         .child(SharedString::from(
-                            "No extensions yet. Pick one from the gallery below.",
+                            "No plugins yet. Pick one from the gallery below.",
                         )),
                 ),
             )
         } else {
             widgets::section_card(theme).mt(px(10.0)).children(
-                packages
-                    .packages
-                    .iter()
+                rows.iter()
                     .enumerate()
-                    .map(|(ix, package)| self.installed_row(ix, package, theme, cx)),
+                    .map(|(ix, row)| self.installed_row(ix, row, theme, cx)),
             )
         };
         div().child(header).child(card).into_any_element()
@@ -626,55 +973,93 @@ impl PiExtensionsPage {
     fn installed_row(
         &self,
         ix: usize,
-        package: &PiPackage,
+        row: &InstalledRow,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let removing = self.pending == Some(Pending::Remove(package.source.clone()));
-        let updating = self.pending == Some(Pending::Update(Some(package.source.clone())));
-        let mut meta = vec![
-            div()
-                .child(SharedString::from(match package.kind {
-                    PiPackageKind::Npm => "npm",
-                    PiPackageKind::Git => "git",
-                    PiPackageKind::Local => "local",
-                }))
-                .into_any_element(),
-        ];
-        if let Some(version) = &package.version {
+        let pi_source = row.pi.as_ref().map(|p| p.source.clone());
+        let wizard_name = row.wizard.as_ref().map(|w| w.name.clone());
+        let removing_pi = pi_source
+            .as_ref()
+            .is_some_and(|s| self.pending == Some(Pending::RemovePi(s.clone())));
+        let removing_wizard = wizard_name
+            .as_ref()
+            .is_some_and(|n| self.pending == Some(Pending::RemoveWizard(n.clone())));
+        let updating = pi_source
+            .as_ref()
+            .is_some_and(|s| self.pending == Some(Pending::Update(Some(s.clone()))));
+        let mut meta: Vec<AnyElement> = Vec::new();
+        let version = row
+            .pi
+            .as_ref()
+            .and_then(|p| p.version.clone())
+            .or_else(|| row.wizard.as_ref().and_then(|w| w.version.clone()));
+        if let Some(version) = version {
             meta.push(
                 div()
                     .child(SharedString::from(format!("v{version}")))
                     .into_any_element(),
             );
         }
-        if package.filtered {
+        if let Some(package) = &row.pi {
             meta.push(
                 div()
-                    .child(SharedString::from("filtered"))
+                    .child(SharedString::from(match package.kind {
+                        PiPackageKind::Npm => "npm",
+                        PiPackageKind::Git => "git",
+                        PiPackageKind::Local => "local",
+                    }))
                     .into_any_element(),
             );
+            if package.filtered {
+                meta.push(
+                    div()
+                        .child(SharedString::from("filtered"))
+                        .into_any_element(),
+                );
+            }
         }
-        if let Some(description) = &package.description {
+        if let Some(plugin) = &row.wizard {
             meta.push(
                 div()
                     .min_w_0()
                     .truncate()
-                    .child(SharedString::from(description.clone()))
+                    .child(SharedString::from(support_line(plugin)))
+                    .into_any_element(),
+            );
+        } else if let Some(description) = row.pi.as_ref().and_then(|p| p.description.clone()) {
+            meta.push(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from(description))
                     .into_any_element(),
             );
         }
-        if removing {
-            meta.push(self.spinner_line(format!("pi-remove-spinner-{ix}"), "Removing…", theme, cx));
+        if removing_pi || removing_wizard {
+            meta.push(self.spinner_line(
+                format!("plugin-remove-spinner-{ix}"),
+                "Removing…",
+                theme,
+                cx,
+            ));
         }
         if updating {
-            meta.push(self.spinner_line(format!("pi-update-spinner-{ix}"), "Updating…", theme, cx));
+            meta.push(self.spinner_line(
+                format!("plugin-update-spinner-{ix}"),
+                "Updating…",
+                theme,
+                cx,
+            ));
         }
-        let busy = removing || updating;
-        let update_source = package.source.clone();
-        let remove_source = package.source.clone();
+        let busy = removing_pi || removing_wizard || updating;
+        let both = row.pi.is_some() && row.wizard.is_some();
+        let can_update = row
+            .pi
+            .as_ref()
+            .is_some_and(|p| p.kind != PiPackageKind::Local);
         widgets::card_row(theme, ix == 0)
-            .id(("pi-installed-row", ix))
+            .id(("plugin-installed-row", ix))
             .child(widgets::row_tile(theme, icons::WIDGET))
             .child(
                 div()
@@ -682,41 +1067,184 @@ impl PiExtensionsPage {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(widgets::row_title(theme, package.name.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .min_w_0()
+                            .child(widgets::row_title(theme, row.name()))
+                            .when(row.pi.is_some(), |el| el.child(widgets::badge(theme, "Pi")))
+                            .when(row.wizard.is_some(), |el| {
+                                el.child(widgets::badge(theme, "Wizard · beta"))
+                            }),
+                    )
                     .child(widgets::meta_line(theme, meta)),
             )
-            .when(!busy && package.kind != PiPackageKind::Local, |el| {
+            .when(!busy && can_update, |el| {
+                let source = pi_source.clone().unwrap_or_default();
                 el.child(self.action(
                     theme,
-                    ("pi-update", ix),
+                    ("plugin-update", ix),
                     "Update",
-                    move |this, cx| this.run(Pending::Update(Some(update_source.clone())), cx),
+                    move |this, cx| this.run(Pending::Update(Some(source.clone())), cx),
                     cx,
                 ))
             })
-            .when(!busy, |el| {
+            .when_some(pi_source.clone().filter(|_| !busy), |el, source| {
                 el.child(self.action(
                     theme,
-                    ("pi-remove", ix),
-                    "Remove",
-                    move |this, cx| this.run(Pending::Remove(remove_source.clone()), cx),
+                    ("plugin-remove-pi", ix),
+                    if both { "Remove from Pi" } else { "Remove" },
+                    move |this, cx| this.run(Pending::RemovePi(source.clone()), cx),
+                    cx,
+                ))
+            })
+            .when_some(wizard_name.clone().filter(|_| !busy), |el, name| {
+                el.child(self.action(
+                    theme,
+                    ("plugin-remove-wizard", ix),
+                    if both { "Remove from Wizard" } else { "Remove" },
+                    move |this, cx| this.run(Pending::RemoveWizard(name.clone()), cx),
                     cx,
                 ))
             })
             .into_any_element()
     }
 
+    /// The "Install for" chooser: targets, the beta line, what Wizard makes
+    /// of the package, and Install / Cancel.
+    fn render_choice(&self, choice: &Choice, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let options = target_options(self.pi_ready(), self.wizard_ready());
+        let pills = options
+            .into_iter()
+            .enumerate()
+            .map(|(ix, option)| {
+                let selected = option == choice.target;
+                div()
+                    .id(("plugin-target", ix))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if selected { theme.accent } else { theme.border })
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .text_color(if selected {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(option.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(choice) = this.choice.as_mut() {
+                            choice.target = option;
+                            cx.notify();
+                        }
+                    }))
+                    .child(SharedString::from(option.label()))
+            })
+            .collect::<Vec<_>>();
+        let wizard_note: Option<AnyElement> =
+            choice.target.wizard().then(|| match &choice.inspect {
+                Loadable::Idle | Loadable::Loading => self.spinner_line(
+                    "plugin-inspect-spinner".into(),
+                    "Checking what works in Wizard…",
+                    theme,
+                    cx,
+                ),
+                Loadable::Ready(plugin) => div()
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(support_line(plugin)))
+                    .into_any_element(),
+                Loadable::Error(error) => div()
+                    .text_color(theme.warning_muted.opacity(0.9))
+                    .child(SharedString::from(format!(
+                        "Couldn't check it in Wizard: {error}"
+                    )))
+                    .into_any_element(),
+            });
+        let nothing_for_wizard = matches!(&choice.inspect, Loadable::Ready(plugin)
+            if plugin.support().0.is_empty());
+        // Wizard refuses a package it can run nothing of, so neither Wizard
+        // choice can go ahead.
+        let blocked = choice.target.wizard() && nothing_for_wizard;
+        div()
+            .px(px(16.0))
+            .py(px(12.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .text_size(crate::typography::ui_rems(12.5))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_color(theme.text)
+                            .child(SharedString::from("Install for")),
+                    )
+                    .children(pills),
+            )
+            .when(self.wizard_ready(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .text_color(theme.text_muted)
+                        .child(widgets::badge(theme, "Beta"))
+                        .child(div().min_w_0().child(SharedString::from(BETA_LINE))),
+                )
+            })
+            .children(wizard_note)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id("plugin-choice-cancel")
+                            .hover(|s| widgets::ghost_hover(theme, s))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_choice(cx)))
+                            .child(SharedString::from("Cancel")),
+                    )
+                    .child(
+                        popover::btn_primary(theme, "Install")
+                            .id("plugin-choice-install")
+                            .when(blocked, |el| el.opacity(0.4).cursor_default())
+                            .when(!blocked, |el| {
+                                el.on_click(cx.listener(|this, _, _, cx| this.confirm_choice(cx)))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_gallery(
         &self,
-        packages: &PiPackages,
+        installed: &[InstalledRow],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let installed: HashSet<&str> = packages
-            .packages
+        // "Installed" means installed everywhere it could go; a package only
+        // Pi has still offers Install, so it can be added to Wizard.
+        let (pi, wizard) = (self.pi_ready(), self.wizard_ready());
+        let complete: HashSet<&str> = installed
             .iter()
-            .filter(|p| p.kind == PiPackageKind::Npm)
-            .map(|p| p.name.as_str())
+            .filter(|row| (!pi || row.pi.is_some()) && (!wizard || row.wizard.is_some()))
+            .map(|row| row.key.as_str())
             .collect();
         let header = div()
             .mt(px(28.0))
@@ -727,7 +1255,7 @@ impl PiExtensionsPage {
             .child(widgets::field_label(theme, "Gallery"))
             .child(
                 widgets::ghost_action(theme)
-                    .id("pi-gallery-open-site")
+                    .id("plugins-gallery-open-site")
                     .flex_none()
                     .hover(|s| widgets::ghost_hover(theme, s))
                     .on_click(|_, _, cx| cx.open_url(GALLERY_PAGE_URL))
@@ -758,7 +1286,7 @@ impl PiExtensionsPage {
                 .mt(px(10.0))
                 .p(px(16.0))
                 .child(popover::skeleton_rows(
-                    "pi-gallery-skeleton",
+                    "plugins-gallery-skeleton",
                     theme,
                     4,
                     cx.entity_id(),
@@ -772,7 +1300,7 @@ impl PiExtensionsPage {
                 ))
                 .child(
                     widgets::ghost_action(theme)
-                        .id("pi-gallery-retry")
+                        .id("plugins-gallery-retry")
                         .mt(px(8.0))
                         .hover(|s| widgets::ghost_hover(theme, s))
                         .on_click(cx.listener(|this, _, _, cx| this.search_gallery(true, cx)))
@@ -796,7 +1324,7 @@ impl PiExtensionsPage {
                     self.gallery_row(
                         ix,
                         result,
-                        installed.contains(result.name.as_str()),
+                        complete.contains(result.name.as_str()),
                         theme,
                         cx,
                     )
@@ -819,7 +1347,12 @@ impl PiExtensionsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let source = format!("npm:{}", package.name);
-        let installing = self.pending == Some(Pending::Install(source.clone()));
+        let installing =
+            matches!(&self.pending, Some(Pending::Install { source: s, .. }) if *s == source);
+        let choosing = self
+            .choice
+            .as_ref()
+            .filter(|choice| !choice.typed && choice.source == source);
         let mut meta = Vec::new();
         if let Some(description) = &package.description {
             meta.push(
@@ -848,15 +1381,15 @@ impl PiExtensionsPage {
         }
         if installing {
             meta.push(self.spinner_line(
-                format!("pi-gallery-spinner-{ix}"),
+                format!("plugins-gallery-spinner-{ix}"),
                 "Installing…",
                 theme,
                 cx,
             ));
         }
         let url = package.url.clone();
-        widgets::card_row(theme, ix == 0)
-            .id(("pi-gallery-row", ix))
+        let row = widgets::card_row(theme, ix == 0)
+            .id(("plugins-gallery-row", ix))
             .items_start()
             .child(widgets::row_tile(theme, icons::WIDGET))
             .child(
@@ -879,7 +1412,7 @@ impl PiExtensionsPage {
             )
             .child(
                 div()
-                    .id(("pi-gallery-link", ix))
+                    .id(("plugins-gallery-link", ix))
                     .flex_none()
                     .size(px(28.0))
                     .rounded(px(8.0))
@@ -901,25 +1434,33 @@ impl PiExtensionsPage {
             .map(|el| {
                 if installed {
                     el.child(widgets::badge_active(theme, "Installed"))
-                } else if installing {
+                } else if installing || choosing.is_some() {
                     el
                 } else {
                     el.child(self.action(
                         theme,
-                        ("pi-gallery-install", ix),
+                        ("plugins-gallery-install", ix),
                         "Install",
-                        move |this, cx| this.run(Pending::Install(source.clone()), cx),
+                        move |this, cx| this.begin_install(source.clone(), false, cx),
                         cx,
                     ))
                 }
+            });
+        div()
+            .flex()
+            .flex_col()
+            .child(row)
+            .when_some(choosing, |el, choice| {
+                el.child(self.render_choice(choice, theme, cx))
             })
             .into_any_element()
     }
 
     fn render_source_install(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let installing_typed = matches!(&self.pending, Some(Pending::Install(source))
+        let installing_typed = matches!(&self.pending, Some(Pending::Install { source, .. })
             if !source.starts_with("npm:") || !matches!(&self.gallery, Loadable::Ready(list)
                 if list.iter().any(|p| source == &format!("npm:{}", p.name))));
+        let choosing = self.choice.as_ref().filter(|choice| choice.typed);
         div()
             .child(
                 div()
@@ -939,17 +1480,24 @@ impl PiExtensionsPage {
                             .min_w_0(),
                     )
                     .child(if installing_typed {
-                        self.spinner_line("pi-source-spinner".into(), "Installing…", theme, cx)
+                        self.spinner_line("plugins-source-spinner".into(), "Installing…", theme, cx)
                     } else {
                         self.action(
                             theme,
-                            "pi-source-install",
+                            "plugins-source-install",
                             "Install",
                             |this, cx| this.install_from_source(cx),
                             cx,
                         )
                     }),
             )
+            .when_some(choosing, |el, choice| {
+                el.child(
+                    widgets::section_card(theme)
+                        .mt(px(10.0))
+                        .child(self.render_choice(choice, theme, cx)),
+                )
+            })
             .child(
                 div()
                     .mt(px(6.0))
@@ -963,7 +1511,7 @@ impl PiExtensionsPage {
     }
 }
 
-impl popover::ScrollRailHost for PiExtensionsPage {
+impl popover::ScrollRailHost for PluginsPage {
     fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
         self.scroll.rail_bar()
     }
@@ -973,30 +1521,39 @@ impl popover::ScrollRailHost for PiExtensionsPage {
     }
 }
 
-impl Render for PiExtensionsPage {
+impl Render for PluginsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let count = self
-            .packages
-            .ready()
-            .filter(|p| p.pi_installed)
-            .map(|p| p.packages.len());
+        let settled = !matches!(self.packages, Loadable::Idle | Loadable::Loading)
+            && !matches!(self.wizard, Loadable::Idle | Loadable::Loading);
+        let installed = merge_installed(self.pi_packages(), self.wizard_plugins());
+        let (pi, wizard) = (self.pi_ready(), self.wizard_ready());
+        let count = (settled && (pi || wizard)).then_some(installed.len());
+        let wizard_warning: Option<String> = match self.wizard.ready() {
+            Some(list) if list.wizard_installed && !list.supported => Some(
+                "This device's Wizard is too old for Pi plugins. Update Wizard to install them \
+                 for it too."
+                    .to_string(),
+            ),
+            Some(list) => list.error.clone(),
+            None => None,
+        };
         let body: AnyElement = match &self.packages {
-            Loadable::Idle | Loadable::Loading => widgets::section_card(&theme)
+            _ if !settled => widgets::section_card(&theme)
                 .p(px(16.0))
                 .child(popover::skeleton_rows(
-                    "pi-extensions-skeleton",
+                    "plugins-skeleton",
                     &theme,
                     3,
                     cx.entity_id(),
                     cx,
                 ))
                 .into_any_element(),
-            Loadable::Error(message) => div()
+            Loadable::Error(message) if !wizard => div()
                 .child(widgets::error_strip(&theme, message.clone()))
                 .child(
                     widgets::ghost_action(&theme)
-                        .id("pi-extensions-retry")
+                        .id("plugins-retry")
                         .mt(px(8.0))
                         .hover(|s| widgets::ghost_hover(&theme, s))
                         .on_click(cx.listener(|page, _, _, cx| {
@@ -1006,18 +1563,29 @@ impl Render for PiExtensionsPage {
                         .child(SharedString::from("Retry")),
                 )
                 .into_any_element(),
-            Loadable::Ready(packages) if !packages.pi_installed => {
+            Loadable::Ready(packages) if !packages.pi_installed && !wizard => {
                 let packages = packages.clone();
-                self.render_install_pi(&packages, &theme, cx)
+                self.render_install_pi(&packages, false, &theme, cx)
             }
-            Loadable::Ready(packages) => {
-                let packages = packages.clone();
+            packages => {
+                let install_pi = packages
+                    .ready()
+                    .filter(|p| !p.pi_installed)
+                    .cloned()
+                    .map(|p| self.render_install_pi(&p, true, &theme, cx));
+                let settings_error = match packages {
+                    Loadable::Error(message) => {
+                        Some(format!("Couldn't read Pi's packages — {message}"))
+                    }
+                    other => other.ready().and_then(|p| p.settings_error.clone()),
+                };
                 div()
-                    .when_some(packages.settings_error.clone(), |el, message| {
+                    .children(install_pi)
+                    .when_some(settings_error, |el, message| {
                         el.child(widgets::warning_strip(&theme, message))
                     })
-                    .child(self.render_installed(&packages, &theme, cx))
-                    .child(self.render_gallery(&packages, &theme, cx))
+                    .child(self.render_installed(&installed, &theme, cx))
+                    .child(self.render_gallery(&installed, &theme, cx))
                     .child(self.render_source_install(&theme, cx))
                     .into_any_element()
             }
@@ -1040,16 +1608,16 @@ impl Render for PiExtensionsPage {
                 .into_any_element()
         });
         let switcher = self.render_device_switcher(&theme, cx);
-        let scrollbar = popover::rail(self, "pi-extensions-page-scrollbar", &theme, cx);
+        let scrollbar = popover::rail(self, "plugins-page-scrollbar", &theme, cx);
 
         div()
-            .id("pi-extensions-page-host")
+            .id("plugins-page-host")
             .relative()
             .size_full()
             .on_hover(cx.listener(Self::on_scroll_hovered))
             .child(
                 div()
-                    .id("pi-extensions-page")
+                    .id("plugins-page")
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll.scroll)
@@ -1061,18 +1629,29 @@ impl Render for PiExtensionsPage {
                                     .flex_row()
                                     .items_center()
                                     .justify_between()
-                                    .child(widgets::page_header(&theme, "Pi extensions", count))
+                                    .child(widgets::page_header(&theme, "Plugins", count))
                                     .child(switcher),
                             )
                             .child(
                                 widgets::page_subtitle(
                                     &theme,
-                                    "Add extensions, skills, prompt templates, and themes to the Pi agent \
-                                     on the selected device. New Pi chats load them automatically.",
+                                    if wizard || !settled {
+                                        "Install Pi packages (extensions, skills, prompt \
+                                         templates, and themes) for Pi, for Wizard, or both, on \
+                                         the selected device. New chats load them automatically."
+                                    } else {
+                                        "Add extensions, skills, prompt templates, and themes to \
+                                         the Pi agent on the selected device. New Pi chats load \
+                                         them automatically."
+                                    },
                                 )
                                 .max_w(px(512.0))
                                 .line_height(px(20.0)),
                             )
+                            .when(settled && wizard, |el| el.child(self.beta_line(&theme)))
+                            .when_some(wizard_warning.filter(|_| settled), |el, message| {
+                                el.child(widgets::warning_strip(&theme, message))
+                            })
                             .children(error)
                             .children(notice)
                             .child(body)
@@ -1093,8 +1672,9 @@ impl Render for PiExtensionsPage {
                                             .flex_none(),
                                     )
                                     .child(SharedString::from(
-                                        "Pi packages run with full access to the device. Only install \
-                                         packages you trust, and review third-party source first.",
+                                        "Pi packages run with full access to the device, and \
+                                         their skills steer the agent. Only install packages \
+                                         you trust, and review third-party source first.",
                                     )),
                             ),
                     ),
@@ -1103,31 +1683,53 @@ impl Render for PiExtensionsPage {
     }
 }
 
-fn success_notice(pending: &Pending) -> String {
+fn package_label(source: &str) -> String {
+    package_key(source)
+}
+
+fn success_notice(pending: &Pending, wizard: Option<&WizardPlugin>) -> String {
     match pending {
         Pending::InstallPi => "Pi is installed.".into(),
-        Pending::Install(source) => format!(
-            "Installed {}. New Pi chats load it.",
-            display_source(source)
-        ),
-        Pending::Remove(source) => format!("Removed {}.", display_source(source)),
-        Pending::Update(Some(source)) => format!("Updated {}.", display_source(source)),
+        Pending::Install { source, target } => {
+            let name = package_label(source);
+            let whom = match target {
+                InstallTarget::Both => "Pi and Wizard",
+                InstallTarget::Wizard => "Wizard",
+                InstallTarget::Pi => "Pi",
+            };
+            let mut text = format!("Installed {name} for {whom}. New chats load it.");
+            if let Some(plugin) = wizard {
+                text.push(' ');
+                text.push_str(&support_line(plugin));
+            }
+            text
+        }
+        Pending::RemovePi(source) => format!("Removed {} from Pi.", package_label(source)),
+        Pending::RemoveWizard(name) => format!("Removed {name} from Wizard."),
+        Pending::Update(Some(source)) => format!("Updated {}.", package_label(source)),
         Pending::Update(None) => "Updated all Pi packages.".into(),
     }
 }
 
-fn failure_notice(pending: &Pending, error: &str) -> String {
-    let verb = match pending {
-        Pending::InstallPi => return format!("Pi installation failed — {error}"),
-        Pending::Install(_) => "Install",
-        Pending::Remove(_) => "Remove",
-        Pending::Update(_) => "Update",
-    };
-    format!("{verb} failed — {error}")
-}
-
-fn display_source(source: &str) -> &str {
-    source.strip_prefix("npm:").unwrap_or(source)
+/// What failed, and what had already gone through before it did.
+fn failure_notice(pending: &Pending, done: &[&str], error: &str) -> String {
+    match pending {
+        Pending::InstallPi => format!("Pi installation failed — {error}"),
+        Pending::Install { source, target } => {
+            let name = package_label(source);
+            let wizard_done = done.contains(&methods::INSTALL_WIZARD_PLUGIN);
+            match (target, wizard_done) {
+                (InstallTarget::Both, true) => {
+                    format!("Installed {name} for Wizard, but Pi's install failed — {error}")
+                }
+                (InstallTarget::Pi, _) => format!("Install for Pi failed — {error}"),
+                _ => format!("Install for Wizard failed — {error}"),
+            }
+        }
+        Pending::RemovePi(_) => format!("Remove from Pi failed — {error}"),
+        Pending::RemoveWizard(_) => format!("Remove from Wizard failed — {error}"),
+        Pending::Update(_) => format!("Update failed — {error}"),
+    }
 }
 
 /// `337311` → `337k`, `1126822` → `1.1M`.
@@ -1242,6 +1844,41 @@ async fn fetch_gallery(query: &str) -> Result<Vec<GalleryPackage>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_engine::wizard_plugins::WizardPluginItem;
+
+    fn item(kind: &str, status: &str) -> WizardPluginItem {
+        WizardPluginItem {
+            kind: kind.into(),
+            name: format!("{kind}-x"),
+            status: status.into(),
+            reason: None,
+            notes: Vec::new(),
+            path: None,
+            loaded: None,
+        }
+    }
+
+    fn plugin(name: &str, source: &str, items: Vec<WizardPluginItem>) -> WizardPlugin {
+        WizardPlugin {
+            name: name.into(),
+            source: source.into(),
+            version: Some("1.0.0".into()),
+            description: None,
+            items,
+            notes: Vec::new(),
+        }
+    }
+
+    fn pi_package(source: &str, name: &str, kind: PiPackageKind) -> PiPackage {
+        PiPackage {
+            source: source.into(),
+            kind,
+            name: name.into(),
+            version: None,
+            description: None,
+            filtered: false,
+        }
+    }
 
     #[test]
     fn compact_counts_read_naturally() {
@@ -1272,14 +1909,119 @@ mod tests {
     }
 
     #[test]
-    fn notices_name_the_package() {
-        assert_eq!(
-            success_notice(&Pending::Install("npm:pi-tools".into())),
-            "Installed pi-tools. New Pi chats load it."
+    fn install_targets_follow_the_agents_on_the_device() {
+        use InstallTarget::*;
+        assert_eq!(target_options(true, true), vec![Both, Wizard, Pi]);
+        assert_eq!(target_options(false, true), vec![Wizard]);
+        assert_eq!(target_options(true, false), vec![Pi]);
+        assert!(target_options(false, false).is_empty());
+
+        // Both agents and a fresh package: both, the default the page asks for.
+        assert_eq!(default_target(true, true, false, false), Some(Both));
+        // Whichever side is still missing it.
+        assert_eq!(default_target(true, true, true, false), Some(Wizard));
+        assert_eq!(default_target(true, true, false, true), Some(Pi));
+        assert_eq!(default_target(true, true, true, true), Some(Both));
+        assert_eq!(default_target(false, true, false, false), Some(Wizard));
+        assert_eq!(default_target(true, false, false, false), Some(Pi));
+        assert_eq!(default_target(false, false, false, false), None);
+
+        assert!(Both.wizard() && Both.pi());
+        assert!(Wizard.wizard() && !Wizard.pi());
+        assert!(!Pi.wizard() && Pi.pi());
+    }
+
+    #[test]
+    fn the_support_line_says_what_works_and_what_does_not() {
+        let mixed = plugin(
+            "p",
+            "npm:p",
+            vec![
+                item("skill", "ready"),
+                item("skill", "ready"),
+                item("prompt", "installed"),
+                item("extension", "unsupported"),
+            ],
         );
         assert_eq!(
-            failure_notice(&Pending::Remove("git:github.com/o/r".into()), "boom"),
-            "Remove failed — boom"
+            support_line(&mixed),
+            "In Wizard: 2 skills, 1 prompt. Not supported yet: 1 extension."
+        );
+        let only_ext = plugin("p", "npm:p", vec![item("extension", "unsupported")]);
+        assert_eq!(
+            support_line(&only_ext),
+            "Nothing in it runs in Wizard yet (1 extension)."
+        );
+        let skills = plugin("p", "npm:p", vec![item("skill", "installed")]);
+        assert_eq!(support_line(&skills), "In Wizard: 1 skill.");
+    }
+
+    #[test]
+    fn installed_rows_line_wizard_up_with_pi() {
+        let pi = vec![
+            pi_package("npm:@s/both@^1", "@s/both", PiPackageKind::Npm),
+            pi_package(
+                "git:github.com/o/r@v1",
+                "github.com/o/r",
+                PiPackageKind::Git,
+            ),
+            pi_package("npm:pi-only", "pi-only", PiPackageKind::Npm),
+        ];
+        let wizard = vec![
+            plugin("@s/both", "npm:@s/both", vec![item("skill", "installed")]),
+            // Git packages match on the repo, whatever package.json calls it.
+            plugin("repo-pkg", "git:github.com/o/r", vec![]),
+            plugin("wiz-only", "npm:wiz-only", vec![]),
+        ];
+        let rows = merge_installed(&pi, &wizard);
+        let shape: Vec<(&str, bool, bool)> = rows
+            .iter()
+            .map(|r| (r.key.as_str(), r.pi.is_some(), r.wizard.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("@s/both", true, true),
+                ("github.com/o/r", true, true),
+                ("pi-only", true, false),
+                ("wiz-only", false, true),
+            ]
+        );
+        assert_eq!(rows[1].name(), "repo-pkg");
+        assert_eq!(rows[2].name(), "pi-only");
+    }
+
+    #[test]
+    fn notices_name_the_package_and_the_target() {
+        let skills = plugin("pi-tools", "npm:pi-tools", vec![item("skill", "installed")]);
+        assert_eq!(
+            success_notice(
+                &Pending::Install {
+                    source: "npm:pi-tools".into(),
+                    target: InstallTarget::Both,
+                },
+                Some(&skills)
+            ),
+            "Installed pi-tools for Pi and Wizard. New chats load it. In Wizard: 1 skill."
+        );
+        assert_eq!(
+            success_notice(&Pending::RemoveWizard("pi-tools".into()), None),
+            "Removed pi-tools from Wizard."
+        );
+        assert_eq!(
+            failure_notice(
+                &Pending::Install {
+                    source: "npm:pi-tools".into(),
+                    target: InstallTarget::Both,
+                },
+                &[methods::INSTALL_WIZARD_PLUGIN],
+                "boom"
+            ),
+            "Installed pi-tools for Wizard, but Pi's install failed — boom"
+        );
+        assert_eq!(
+            failure_notice(&Pending::RemovePi("git:github.com/o/r".into()), &[], "boom"),
+            "Remove from Pi failed — boom"
         );
     }
 }

@@ -24,7 +24,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
-pub mod pi_extensions;
+pub mod plugins;
 pub mod shortcuts;
 pub mod widgets;
 pub mod wizard_providers;
