@@ -589,18 +589,68 @@ fn staging_dir() -> Result<PathBuf> {
     paths::staging_dir("update")
 }
 
-/// Query the GitHub releases API for the newest tag (`tag_name`). Network and
-/// rate-limit failures return `Err` so callers can degrade gracefully.
+/// The newest release tag. `github.com/<repo>/releases/latest` redirects to
+/// `/releases/tag/<tag>`, and reading that redirect costs no API budget; the
+/// API (60 unauthenticated requests an hour per IP) is only the fallback, and
+/// it sends `GITHUB_TOKEN` or `GH_TOKEN` when one is set. Network failures
+/// return `Err` so callers can degrade gracefully.
 async fn fetch_latest_tag(repo: &str, timeout: Duration) -> Result<String> {
+    match latest_tag_from_redirect(repo, timeout).await {
+        Ok(tag) => Ok(tag),
+        Err(redirect_err) => latest_tag_from_api(repo, timeout)
+            .await
+            .with_context(|| format!("after the release redirect failed: {redirect_err:#}")),
+    }
+}
+
+async fn latest_tag_from_redirect(repo: &str, timeout: Duration) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(user_agent())
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building HTTP client")?;
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let response = client
+        .head(&url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {url}"))?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .with_context(|| format!("{url} answered {} with no redirect", response.status()))?;
+    tag_from_release_location(location)
+        .with_context(|| format!("{url} redirected to {location}, which names no release tag"))
+}
+
+/// `https://github.com/o/r/releases/tag/v3.7.0` -> `v3.7.0`. A repo with no
+/// releases redirects to `/releases` instead, which is `None`.
+fn tag_from_release_location(location: &str) -> Option<String> {
+    let path = location.split(['?', '#']).next()?;
+    let tag = path.rsplit_once("/releases/tag/")?.1.trim_end_matches('/');
+    (!tag.is_empty() && !tag.contains('/')).then(|| tag.to_string())
+}
+
+async fn latest_tag_from_api(repo: &str, timeout: Duration) -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent(user_agent())
         .timeout(timeout)
         .build()
         .context("building HTTP client")?;
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let body: serde_json::Value = client
+    let mut request = client
         .get(&url)
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|t| !t.trim().is_empty())
+    {
+        request = request.bearer_auth(token.trim());
+    }
+    let body: serde_json::Value = request
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -1754,6 +1804,21 @@ pub fn print_startup_notice(cfg: &UpdateConfig) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_latest_tag_comes_from_the_release_redirect() {
+        use super::tag_from_release_location as tag;
+        assert_eq!(
+            tag("https://github.com/teddytennant/wizard/releases/tag/v3.7.0").as_deref(),
+            Some("v3.7.0")
+        );
+        assert_eq!(
+            tag("/o/r/releases/tag/v1.2.3/?x=1").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(tag("https://github.com/o/r/releases"), None);
+        assert_eq!(tag("https://github.com/o/r/releases/tag/"), None);
+    }
+
     use super::*;
 
     #[test]
