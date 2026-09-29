@@ -6,6 +6,16 @@ Releases before 2.0.0 (v1.6.0 through v1.8.0) predate this file; their notes are
 
 ## [Unreleased]
 
+## [3.7.1] - 2026-09-28
+
+### Fixed
+
+- **`wizard update` failed with "403 rate limit exceeded".** It asked the
+  GitHub API for the latest release, which allows 60 requests an hour per IP
+  without a token, so a shared or busy network ran out. It now reads the tag
+  from the `releases/latest` redirect, which has no such budget, and only
+  falls back to the API, sending `GITHUB_TOKEN` or `GH_TOKEN` when set.
+
 ## [3.7.0] - 2026-09-28
 
 ### Added
