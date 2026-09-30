@@ -3449,10 +3449,12 @@ fn turn_status(app: &App) -> Option<TurnStatus> {
         ));
     }
 
-    // Right-hand side: the turn timer, the token count, and `[stop]` as its
-    // own span (`P/src/views/turn_status.rs`). Timer and tokens stay dim; the
-    // stop label is faint so it reads as a chip rather than more of the clock.
-    let tokens = app.status.prompt_tokens + app.status.completion_tokens;
+    // Right-hand side: the turn timer, the context count, and `[stop]` as its
+    // own span (`P/src/views/turn_status.rs`). The ⇣ is context used, the same
+    // figure the top-right chip shows (`P/src/app/agent_view/render.rs` passes
+    // `context_state.used`). Session lifetime totals are for `/cost`; summing
+    // them recounts every resent prompt and runs ahead of the window.
+    let tokens = app.status.context_tokens;
     let mut right = Vec::new();
     if let Some(started) = app.turn_started {
         right.push(Span::styled(format_duration(started.elapsed()), gray));

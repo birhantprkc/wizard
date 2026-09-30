@@ -1644,6 +1644,26 @@ fn the_status_row_freezes_into_a_diamond_when_the_agent_is_blocked_on_you() {
 }
 
 #[test]
+fn the_turn_arrow_counts_context_not_the_session_lifetime() {
+    let mut app = app();
+    app.status.busy = true;
+    // Each model call re-sends the history, so the lifetime sum (what `/cost`
+    // prices) runs far ahead of the window. The ⇣ must not follow it.
+    app.status.prompt_tokens = 400_000;
+    app.status.completion_tokens = 80_000;
+    app.status.context_tokens = 12_300;
+    let rendered = text(&turn_status(&app).expect("busy").line(80));
+    assert!(
+        rendered.contains("\u{21e3}12.3k"),
+        "arrow should be context used, got {rendered}"
+    );
+    assert!(
+        !rendered.contains("480"),
+        "session lifetime must not land on the arrow: {rendered}"
+    );
+}
+
+#[test]
 fn an_idle_session_with_background_work_still_says_so() {
     let mut app = app();
     app.status.background_tasks = 1;
